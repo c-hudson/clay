@@ -1,0 +1,138 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Clay MUD Client</title>
+    <link rel="stylesheet" href="/style.css">
+</head>
+<body>
+    <div id="app">
+        <!-- Main output area -->
+        <div id="output-container">
+            <div id="output"></div>
+        </div>
+
+        <!-- Separator bar (like console) -->
+        <div id="status-bar">
+            <span id="status-indicator">___________</span>
+            <span id="world-name"></span>
+            <span id="activity-indicator"></span>
+            <span id="separator-fill"></span>
+            <span id="status-time"></span>
+        </div>
+
+        <!-- Input area -->
+        <div id="input-container">
+            <span id="prompt"></span>
+            <textarea id="input" autocomplete="off" autofocus rows="1"></textarea>
+            <button id="send-btn">Send</button>
+        </div>
+
+        <!-- Authentication modal -->
+        <div id="auth-modal" class="modal">
+            <div class="modal-content">
+                <h2>Authentication Required</h2>
+                <p>Enter the WebSocket password to connect:</p>
+                <input type="password" id="auth-password" autocomplete="off">
+                <div id="auth-error" class="error"></div>
+                <button id="auth-submit">Connect</button>
+            </div>
+        </div>
+
+        <!-- Connection status overlay -->
+        <div id="connecting-overlay" class="overlay">
+            <div class="overlay-content">
+                <div class="spinner"></div>
+                <p>Connecting...</p>
+            </div>
+        </div>
+
+        <!-- Actions popup -->
+        <div id="actions-modal" class="modal">
+            <div class="modal-content actions-modal-content">
+                <h2>Actions</h2>
+                <div class="actions-layout">
+                    <!-- Actions list -->
+                    <div class="actions-list-container">
+                        <div id="actions-list" class="actions-list"></div>
+                        <div class="actions-list-buttons">
+                            <button id="action-new-btn" class="action-btn">New</button>
+                            <button id="action-delete-btn" class="action-btn">Delete</button>
+                        </div>
+                    </div>
+                    <!-- Action editor -->
+                    <div class="action-editor">
+                        <div class="action-field">
+                            <label for="action-name">Name:</label>
+                            <input type="text" id="action-name" autocomplete="off">
+                        </div>
+                        <div class="action-field">
+                            <label for="action-world">World:</label>
+                            <input type="text" id="action-world" autocomplete="off" placeholder="(empty = all worlds)">
+                        </div>
+                        <div class="action-field">
+                            <label for="action-pattern">Pattern:</label>
+                            <input type="text" id="action-pattern" autocomplete="off" placeholder="(regex, empty = manual only)">
+                        </div>
+                        <div class="action-field">
+                            <label for="action-command">Command:</label>
+                            <textarea id="action-command" rows="3" autocomplete="off" placeholder="Commands (semicolon-separated)"></textarea>
+                        </div>
+                        <div id="action-error" class="error"></div>
+                    </div>
+                </div>
+                <div class="modal-buttons">
+                    <button id="action-save-btn">Save</button>
+                    <button id="action-cancel-btn">Cancel</button>
+                </div>
+            </div>
+        </div>
+
+        <!-- Worlds list popup (/worlds or /l) -->
+        <div id="worlds-modal" class="modal">
+            <div class="modal-content worlds-modal-content">
+                <h2>Connected Worlds</h2>
+                <div id="worlds-table-container">
+                    <table id="worlds-table">
+                        <thead>
+                            <tr>
+                                <th>World</th>
+                                <th>Status</th>
+                                <th>Unseen</th>
+                            </tr>
+                        </thead>
+                        <tbody id="worlds-table-body"></tbody>
+                    </table>
+                </div>
+                <div class="modal-buttons">
+                    <button id="worlds-close-btn">Close</button>
+                </div>
+            </div>
+        </div>
+
+        <!-- World selector popup (/world) -->
+        <div id="world-selector-modal" class="modal">
+            <div class="modal-content world-selector-modal-content">
+                <h2>World Selector</h2>
+                <div class="world-selector-filter">
+                    <input type="text" id="world-filter" placeholder="Filter worlds..." autocomplete="off">
+                </div>
+                <div id="world-selector-list" class="world-selector-list"></div>
+                <div class="modal-buttons">
+                    <button id="world-connect-btn">Connect</button>
+                    <button id="world-switch-btn">Switch</button>
+                    <button id="world-selector-cancel-btn">Cancel</button>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        // WebSocket configuration injected by server
+        window.WS_PORT = {{WS_PORT}};
+        window.WS_PROTOCOL = '{{WS_PROTOCOL}}';
+    </script>
+    <script src="/app.js"></script>
+</body>
+</html>

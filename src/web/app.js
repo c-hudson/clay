@@ -1,0 +1,1532 @@
+// Clay MUD Client - Web Interface
+
+(function() {
+    'use strict';
+
+    // DOM elements
+    const elements = {
+        output: document.getElementById('output'),
+        outputContainer: document.getElementById('output-container'),
+        statusIndicator: document.getElementById('status-indicator'),
+        worldName: document.getElementById('world-name'),
+        activityIndicator: document.getElementById('activity-indicator'),
+        separatorFill: document.getElementById('separator-fill'),
+        statusTime: document.getElementById('status-time'),
+        prompt: document.getElementById('prompt'),
+        input: document.getElementById('input'),
+        sendBtn: document.getElementById('send-btn'),
+        authModal: document.getElementById('auth-modal'),
+        authPassword: document.getElementById('auth-password'),
+        authError: document.getElementById('auth-error'),
+        authSubmit: document.getElementById('auth-submit'),
+        connectingOverlay: document.getElementById('connecting-overlay'),
+        // Actions popup
+        actionsModal: document.getElementById('actions-modal'),
+        actionsList: document.getElementById('actions-list'),
+        actionName: document.getElementById('action-name'),
+        actionWorld: document.getElementById('action-world'),
+        actionPattern: document.getElementById('action-pattern'),
+        actionCommand: document.getElementById('action-command'),
+        actionError: document.getElementById('action-error'),
+        actionNewBtn: document.getElementById('action-new-btn'),
+        actionDeleteBtn: document.getElementById('action-delete-btn'),
+        actionSaveBtn: document.getElementById('action-save-btn'),
+        actionCancelBtn: document.getElementById('action-cancel-btn'),
+        // Worlds list popup
+        worldsModal: document.getElementById('worlds-modal'),
+        worldsTableBody: document.getElementById('worlds-table-body'),
+        worldsCloseBtn: document.getElementById('worlds-close-btn'),
+        // World selector popup
+        worldSelectorModal: document.getElementById('world-selector-modal'),
+        worldFilter: document.getElementById('world-filter'),
+        worldSelectorList: document.getElementById('world-selector-list'),
+        worldConnectBtn: document.getElementById('world-connect-btn'),
+        worldSwitchBtn: document.getElementById('world-switch-btn'),
+        worldSelectorCancelBtn: document.getElementById('world-selector-cancel-btn')
+    };
+
+    // State
+    let ws = null;
+    let authenticated = false;
+    let worlds = [];
+    let currentWorldIndex = 0;
+    let commandHistory = [];
+    let historyIndex = -1;
+    let connectionFailures = 0;
+    let inputHeight = 1;
+
+    // Cached rendered output per world (array of DOM elements)
+    let worldOutputCache = [];
+
+    // More-mode state (per world)
+    let moreModeEnabled = true;
+    let paused = false;
+    let pendingLines = [];
+    let linesSincePause = 0;
+
+    // Settings
+    let worldSwitchMode = 'Unseen First';  // 'Unseen First' or 'Alphabetical'
+
+    // Actions state
+    let actions = [];
+    let actionsPopupOpen = false;
+    let selectedActionIndex = -1;
+    let editingNewAction = false;
+
+    // Tag display state
+    let showTags = false;
+
+    // World popup state
+    let worldsPopupOpen = false;
+    let worldSelectorPopupOpen = false;
+    let selectedWorldIndex = -1;
+    let selectedWorldsRowIndex = -1; // For worlds list popup (/worlds)
+
+    // Initialize
+    function init() {
+        setupEventListeners();
+        connect();
+        updateTime();
+        setInterval(updateTime, 1000);
+    }
+
+    // Get visible line count in output area
+    function getVisibleLineCount() {
+        const lineHeight = 14 * 1.2; // font-size * line-height
+        return Math.floor(elements.outputContainer.clientHeight / lineHeight);
+    }
+
+    // Check if scrolled to bottom
+    function isAtBottom() {
+        const container = elements.outputContainer;
+        return container.scrollHeight - container.scrollTop <= container.clientHeight + 5;
+    }
+
+    // Connect to WebSocket server
+    function connect() {
+        showConnecting(true);
+
+        const host = window.location.hostname;
+        const wsUrl = `${window.WS_PROTOCOL}://${host}:${window.WS_PORT}`;
+
+        try {
+            ws = new WebSocket(wsUrl);
+
+            ws.onopen = function() {
+                connectionFailures = 0;
+                hideCertWarning();
+                showConnecting(false);
+                showAuthModal(true);
+                elements.authPassword.focus();
+            };
+
+            ws.onclose = function() {
+                authenticated = false;
+                showConnecting(false);
+                connectionFailures++;
+                // If using wss:// and connection keeps failing, show certificate warning
+                if (window.WS_PROTOCOL === 'wss' && connectionFailures >= 2) {
+                    showCertWarning();
+                }
+                setTimeout(connect, 3000); // Reconnect after 3 seconds
+            };
+
+            ws.onerror = function() {
+                showConnecting(false);
+            };
+
+            ws.onmessage = function(event) {
+                try {
+                    const msg = JSON.parse(event.data);
+                    handleMessage(msg);
+                } catch (e) {
+                    console.error('Failed to parse message:', e);
+                }
+            };
+        } catch (e) {
+            showConnecting(false);
+            console.error('Failed to connect:', e);
+            setTimeout(connect, 3000);
+        }
+    }
+
+    // Handle incoming messages
+    function handleMessage(msg) {
+        switch (msg.type) {
+            case 'AuthResponse':
+                if (msg.success) {
+                    authenticated = true;
+                    showAuthModal(false);
+                    elements.authError.textContent = '';
+                } else {
+                    elements.authError.textContent = msg.error || 'Authentication failed';
+                    elements.authPassword.value = '';
+                    elements.authPassword.focus();
+                }
+                break;
+
+            case 'InitialState':
+                worlds = msg.worlds || [];
+                currentWorldIndex = msg.current_world_index || 0;
+                actions = msg.actions || [];
+                // Initialize output cache for each world (empty - will be populated on render)
+                worldOutputCache = worlds.map(() => []);
+                // Ensure output_lines arrays exist
+                worlds.forEach((world) => {
+                    if (!world.output_lines) {
+                        world.output_lines = [];
+                    }
+                });
+                if (msg.settings) {
+                    if (msg.settings.input_height) {
+                        setInputHeight(msg.settings.input_height);
+                    }
+                    if (msg.settings.more_mode_enabled !== undefined) {
+                        moreModeEnabled = msg.settings.more_mode_enabled;
+                    }
+                    if (msg.settings.show_tags !== undefined) {
+                        showTags = msg.settings.show_tags;
+                    }
+                    if (msg.settings.world_switch_mode !== undefined) {
+                        worldSwitchMode = msg.settings.world_switch_mode;
+                    }
+                }
+                renderOutput();
+                updateStatusBar();
+                break;
+
+            case 'ServerData':
+                if (msg.world_index !== undefined && worlds[msg.world_index]) {
+                    const world = worlds[msg.world_index];
+                    if (!world.output_lines) world.output_lines = [];
+                    // Ensure cache exists for this world
+                    if (!worldOutputCache[msg.world_index]) {
+                        worldOutputCache[msg.world_index] = [];
+                    }
+                    if (msg.data) {
+                        // Split multi-line data into individual lines
+                        const lines = msg.data.split('\n');
+                        lines.forEach(line => {
+                            // Filter out keep-alive idler message lines
+                            if (line.includes('###_idler_message_') && line.includes('_###')) {
+                                return; // Skip this line
+                            }
+                            const lineIndex = world.output_lines.length;
+                            world.output_lines.push(line);
+                            if (msg.world_index === currentWorldIndex) {
+                                handleIncomingLine(line, msg.world_index, lineIndex);
+                            } else {
+                                world.unseen_lines = (world.unseen_lines || 0) + 1;
+                            }
+                        });
+                        if (msg.world_index !== currentWorldIndex) {
+                            updateStatusBar();
+                        }
+                    }
+                }
+                break;
+
+            case 'WorldConnected':
+                if (msg.world_index !== undefined && worlds[msg.world_index]) {
+                    worlds[msg.world_index].connected = true;
+                    updateStatusBar();
+                }
+                break;
+
+            case 'WorldDisconnected':
+                if (msg.world_index !== undefined && worlds[msg.world_index]) {
+                    worlds[msg.world_index].connected = false;
+                    updateStatusBar();
+                }
+                break;
+
+            case 'WorldSwitched':
+                // Console switched worlds - we ignore this to maintain independent view
+                // Web interface tracks its own current world separately
+                break;
+
+            case 'PromptUpdate':
+                if (msg.world_index === currentWorldIndex && msg.prompt) {
+                    // Parse ANSI codes in prompt
+                    elements.prompt.innerHTML = parseAnsi(msg.prompt);
+                }
+                break;
+
+            case 'GlobalSettingsUpdated':
+                if (msg.settings) {
+                    if (msg.settings.input_height) {
+                        setInputHeight(msg.settings.input_height);
+                    }
+                    if (msg.settings.more_mode_enabled !== undefined) {
+                        moreModeEnabled = msg.settings.more_mode_enabled;
+                    }
+                    if (msg.settings.show_tags !== undefined) {
+                        const oldShowTags = showTags;
+                        showTags = msg.settings.show_tags;
+                        if (oldShowTags !== showTags) {
+                            renderOutput(); // Re-render with new tag visibility
+                        }
+                    }
+                    if (msg.settings.world_switch_mode !== undefined) {
+                        worldSwitchMode = msg.settings.world_switch_mode;
+                    }
+                }
+                break;
+
+            case 'Pong':
+                // Keepalive response
+                break;
+
+            case 'ActionsUpdated':
+                actions = msg.actions || [];
+                if (actionsPopupOpen) {
+                    renderActionsList();
+                }
+                break;
+
+            default:
+                console.log('Unknown message type:', msg.type);
+        }
+    }
+
+    // Handle incoming line with more-mode logic
+    function handleIncomingLine(text, worldIndex, lineIndex) {
+        if (!text) return;
+
+        const visibleLines = getVisibleLineCount();
+        const threshold = Math.max(1, visibleLines - 2);
+
+        if (paused) {
+            // Already paused, queue the line info
+            pendingLines.push({ text, worldIndex, lineIndex });
+            updateStatusBar();
+        } else if (moreModeEnabled && linesSincePause >= threshold) {
+            // Trigger pause
+            paused = true;
+            pendingLines.push({ text, worldIndex, lineIndex });
+            // Scroll to bottom to show what we have so far
+            scrollToBottom();
+            updateStatusBar();
+        } else {
+            // Normal display - append the line
+            linesSincePause++;
+            appendNewLine(text, worldIndex, lineIndex);
+        }
+    }
+
+    // Release one screenful of pending lines
+    function releaseScreenful() {
+        if (!paused || pendingLines.length === 0) return;
+
+        const count = Math.max(1, getVisibleLineCount() - 2);
+        const toRelease = pendingLines.splice(0, count);
+
+        toRelease.forEach(item => {
+            appendNewLine(item.text, item.worldIndex, item.lineIndex);
+        });
+
+        if (pendingLines.length === 0) {
+            paused = false;
+            linesSincePause = 0;
+        }
+
+        updateStatusBar();
+    }
+
+    // Release all pending lines
+    function releaseAll() {
+        if (!paused) return;
+
+        pendingLines.forEach(item => {
+            appendNewLine(item.text, item.worldIndex, item.lineIndex);
+        });
+        pendingLines = [];
+        paused = false;
+        linesSincePause = 0;
+
+        updateStatusBar();
+    }
+
+    // Send message to server
+    function send(msg) {
+        if (ws && ws.readyState === WebSocket.OPEN) {
+            ws.send(JSON.stringify(msg));
+        }
+    }
+
+    // Authenticate
+    function authenticate() {
+        const password = elements.authPassword.value;
+        if (!password) return;
+
+        // Hash password with SHA-256
+        hashPassword(password).then(hash => {
+            send({ type: 'AuthRequest', password_hash: hash });
+        });
+    }
+
+    // SHA-256 hash
+    async function hashPassword(password) {
+        const encoder = new TextEncoder();
+        const data = encoder.encode(password);
+        const hashBuffer = await crypto.subtle.digest('SHA-256', data);
+        const hashArray = Array.from(new Uint8Array(hashBuffer));
+        return hashArray.map(b => b.toString(16).padStart(2, '0')).join('');
+    }
+
+    // Send command
+    function sendCommand() {
+        const cmd = elements.input.value;
+        if (cmd.length === 0 && !authenticated) return;
+
+        const trimmedCmd = cmd.trim();
+
+        // Check for local commands
+        if (trimmedCmd === '/actions') {
+            elements.input.value = '';
+            openActionsPopup();
+            return;
+        }
+
+        // /worlds or /l - show worlds list popup
+        if (trimmedCmd === '/worlds' || trimmedCmd === '/l') {
+            elements.input.value = '';
+            openWorldsPopup();
+            return;
+        }
+
+        // /world (no args) - show world selector popup
+        if (trimmedCmd === '/world') {
+            elements.input.value = '';
+            openWorldSelectorPopup();
+            return;
+        }
+
+        // /world <name> - switch to or connect to named world
+        if (trimmedCmd.startsWith('/world ')) {
+            const worldName = trimmedCmd.substring(7).trim();
+            if (worldName) {
+                elements.input.value = '';
+                handleWorldCommand(worldName);
+                return;
+            }
+        }
+
+        // Release all pending lines when sending a command
+        if (paused) {
+            releaseAll();
+        }
+
+        // Reset lines since pause counter on user input
+        linesSincePause = 0;
+
+        send({
+            type: 'SendCommand',
+            world_index: currentWorldIndex,
+            command: cmd
+        });
+
+        if (cmd.length > 0) {
+            commandHistory.push(cmd);
+            if (commandHistory.length > 1000) {
+                commandHistory.shift();
+            }
+        }
+        historyIndex = -1;
+        elements.input.value = '';
+        elements.prompt.textContent = '';
+    }
+
+    // Switch world locally (does not affect console)
+    function switchWorldLocal(index) {
+        if (index >= 0 && index < worlds.length && index !== currentWorldIndex) {
+            currentWorldIndex = index;
+            // Reset more-mode state for new world
+            paused = false;
+            pendingLines = [];
+            linesSincePause = 0;
+            renderOutput();
+            updateStatusBar();
+        }
+    }
+
+    // Render output - uses cached pre-parsed HTML for fast world switching
+    function renderOutput() {
+        elements.output.innerHTML = '';
+
+        const world = worlds[currentWorldIndex];
+        if (!world) return;
+
+        // Ensure cache exists
+        if (!worldOutputCache[currentWorldIndex]) {
+            worldOutputCache[currentWorldIndex] = [];
+        }
+
+        const cache = worldOutputCache[currentWorldIndex];
+        const lines = world.output_lines || [];
+
+        // Use document fragment for batch DOM insertion (single reflow)
+        const fragment = document.createDocumentFragment();
+
+        for (let i = 0; i < lines.length; i++) {
+            const div = document.createElement('div');
+            div.className = 'line';
+            // Use cached parsed HTML if available and showTags hasn't changed
+            if (cache[i] && cache[i].showTags === showTags) {
+                div.innerHTML = cache[i].html;
+            } else {
+                // Parse and cache
+                const displayText = showTags ? lines[i] : stripMudTag(lines[i]);
+                const html = parseAnsi(displayText);
+                cache[i] = { html, showTags };
+                div.innerHTML = html;
+            }
+            fragment.appendChild(div);
+        }
+
+        elements.output.appendChild(fragment);
+
+        // Clear unseen for current world
+        world.unseen_lines = 0;
+
+        scrollToBottom();
+    }
+
+    // Create cached HTML for a line
+    function cacheLineHtml(worldIndex, lineIndex, text) {
+        if (!worldOutputCache[worldIndex]) {
+            worldOutputCache[worldIndex] = [];
+        }
+        const displayText = showTags ? text : stripMudTag(text);
+        const html = parseAnsi(displayText);
+        worldOutputCache[worldIndex][lineIndex] = { html, showTags };
+        return html;
+    }
+
+    // Append a new line to current world's output (already visible)
+    function appendNewLine(text, worldIndex, lineIndex) {
+        const displayText = showTags ? text : stripMudTag(text);
+        const html = parseAnsi(displayText);
+
+        // Cache the parsed HTML
+        if (!worldOutputCache[worldIndex]) {
+            worldOutputCache[worldIndex] = [];
+        }
+        worldOutputCache[worldIndex][lineIndex] = { html, showTags };
+
+        // Append to DOM
+        const div = document.createElement('div');
+        div.className = 'line';
+        div.innerHTML = html;
+        elements.output.appendChild(div);
+
+        scrollToBottom();
+    }
+
+    // Parse ANSI escape codes
+    function parseAnsi(text) {
+        // Handle various escape character representations
+        // Some systems send \x1b, others might send \u001b, or the character might be escaped in JSON
+        // Normalize to the standard ESC character
+        text = text.replace(/\\x1b/gi, '\x1b');
+        text = text.replace(/\\u001b/gi, '\x1b');
+        text = text.replace(/\\e/gi, '\x1b');
+
+        // First, strip ALL ANSI CSI sequences (not just SGR)
+        // This handles cursor control, screen clearing, etc.
+        // CSI format: ESC [ <params> <final byte>
+        // Final byte is in range 0x40-0x7E (@ through ~)
+        text = text.replace(/\x1b\[[0-9;?]*[A-Za-z@`~]/g, function(match) {
+            // Only keep SGR sequences (ending in 'm') for color processing
+            if (match.endsWith('m')) {
+                return match; // Keep for color parsing below
+            }
+            return ''; // Strip other CSI sequences
+        });
+
+        // Now parse SGR (color/style) sequences
+        const ansiRegex = /\x1b\[([0-9;]*)m/g;
+        let result = '';
+        let lastIndex = 0;
+        let currentClasses = [];
+
+        let match;
+        while ((match = ansiRegex.exec(text)) !== null) {
+            // Add text before this escape sequence
+            if (match.index > lastIndex) {
+                const textBefore = escapeHtml(text.substring(lastIndex, match.index));
+                if (currentClasses.length > 0) {
+                    result += `<span class="${currentClasses.join(' ')}">${textBefore}</span>`;
+                } else {
+                    result += textBefore;
+                }
+            }
+
+            // Parse the codes
+            const codes = match[1].split(';').map(c => parseInt(c, 10) || 0);
+            codes.forEach(code => {
+                if (code === 0) {
+                    currentClasses = [];
+                } else if (code === 1) {
+                    currentClasses.push('ansi-bold');
+                } else if (code === 3) {
+                    currentClasses.push('ansi-italic');
+                } else if (code === 4) {
+                    currentClasses.push('ansi-underline');
+                } else if (code >= 30 && code <= 37) {
+                    // Remove old foreground color
+                    currentClasses = currentClasses.filter(c => !c.startsWith('ansi-') || c.includes('bg-'));
+                    const colors = ['black', 'red', 'green', 'yellow', 'blue', 'magenta', 'cyan', 'white'];
+                    currentClasses.push('ansi-' + colors[code - 30]);
+                } else if (code >= 90 && code <= 97) {
+                    currentClasses = currentClasses.filter(c => !c.startsWith('ansi-') || c.includes('bg-'));
+                    const colors = ['black', 'red', 'green', 'yellow', 'blue', 'magenta', 'cyan', 'white'];
+                    currentClasses.push('ansi-bright-' + colors[code - 90]);
+                }
+            });
+
+            lastIndex = match.index + match[0].length;
+        }
+
+        // Add remaining text
+        if (lastIndex < text.length) {
+            const remaining = escapeHtml(text.substring(lastIndex));
+            if (currentClasses.length > 0) {
+                result += `<span class="${currentClasses.join(' ')}">${remaining}</span>`;
+            } else {
+                result += remaining;
+            }
+        }
+
+        result = result || escapeHtml(text);
+
+        // Final cleanup: strip any orphaned ANSI-like patterns that weren't matched
+        // (e.g., [0m, [1;32m, [37m) - these appear when ESC char was lost
+        result = result.replace(/\[([0-9;]*)m/g, '');
+
+        return result;
+    }
+
+    // Escape HTML
+    function escapeHtml(text) {
+        const div = document.createElement('div');
+        div.textContent = text;
+        return div.innerHTML;
+    }
+
+    // Strip MUD tags like [channel:] or [channel(player)] from start of line
+    // Preserves leading whitespace and ANSI codes
+    function stripMudTag(text) {
+        if (!text) return text;
+
+        // Find leading whitespace
+        const trimmed = text.trimStart();
+        const leadingWsLen = text.length - trimmed.length;
+        const leadingWs = text.substring(0, leadingWsLen);
+
+        // Parse through ANSI codes to find actual content start
+        let i = 0;
+        let ansiPrefix = '';
+        let inAnsi = false;
+
+        while (i < trimmed.length) {
+            const c = trimmed[i];
+            if (c === '\x1b' && trimmed[i + 1] === '[') {
+                ansiPrefix += c;
+                inAnsi = true;
+                i++;
+            } else if (inAnsi) {
+                ansiPrefix += c;
+                if (/[a-zA-Z]/.test(c)) {
+                    inAnsi = false;
+                }
+                i++;
+            } else if (c === '[') {
+                // Found start of potential tag
+                const rest = trimmed.substring(i + 1);
+                const endBracket = rest.indexOf(']');
+                if (endBracket >= 0) {
+                    const tag = rest.substring(0, endBracket);
+                    // Check if it looks like a MUD tag (contains : or parentheses)
+                    if (tag.includes(':') || tag.includes('(')) {
+                        // It's a MUD tag, skip it
+                        let afterTag = rest.substring(endBracket + 1);
+                        // Strip one space after tag if present
+                        if (afterTag.startsWith(' ')) {
+                            afterTag = afterTag.substring(1);
+                        }
+                        return leadingWs + ansiPrefix + afterTag;
+                    }
+                }
+                // Not a MUD tag, return original
+                return text;
+            } else {
+                // Not a tag start, return original
+                return text;
+            }
+        }
+
+        return text;
+    }
+
+    // Scroll to bottom
+    function scrollToBottom() {
+        elements.outputContainer.scrollTop = elements.outputContainer.scrollHeight;
+    }
+
+    // Format count for status indicator (matches console behavior)
+    function formatCount(n) {
+        if (n >= 1000000) return 'Alot';
+        if (n >= 10000) return ' ' + Math.floor(n / 1000) + 'K';
+        return n.toString().padStart(4, ' ');
+    }
+
+    // Update status bar (console-style with underscores)
+    function updateStatusBar() {
+        const world = worlds[currentWorldIndex];
+
+        // Status indicator: shows More/Hist when active, underscores when idle
+        if (paused && pendingLines.length > 0) {
+            elements.statusIndicator.textContent = 'More:' + formatCount(pendingLines.length);
+            elements.statusIndicator.className = 'paused';
+        } else if (!isAtBottom()) {
+            // Calculate lines from bottom
+            const container = elements.outputContainer;
+            const lineHeight = 14 * 1.2;
+            const linesFromBottom = Math.floor((container.scrollHeight - container.scrollTop - container.clientHeight) / lineHeight);
+            elements.statusIndicator.textContent = 'Hist:' + formatCount(linesFromBottom);
+            elements.statusIndicator.className = 'scrolled';
+        } else {
+            elements.statusIndicator.textContent = '___________';
+            elements.statusIndicator.className = '';
+        }
+
+        if (world) {
+            elements.worldName.textContent = ' ' + (world.name || '');
+        }
+
+        // Activity indicator
+        let unseenCount = 0;
+        worlds.forEach((w, i) => {
+            if (i !== currentWorldIndex && w.unseen_lines > 0) {
+                unseenCount++;
+            }
+        });
+        elements.activityIndicator.textContent = unseenCount > 0 ? ` (Activity: ${unseenCount})` : '';
+
+        // Fill remaining space with underscores
+        elements.separatorFill.textContent = '_'.repeat(100);
+    }
+
+    // Update time
+    function updateTime() {
+        const now = new Date();
+        const hours = now.getHours().toString().padStart(2, '0');
+        const minutes = now.getMinutes().toString().padStart(2, '0');
+        elements.statusTime.textContent = `${hours}:${minutes}`;
+    }
+
+    // Set input area height (number of lines)
+    function setInputHeight(lines) {
+        inputHeight = Math.max(1, Math.min(15, lines));
+        const lineHeight = 1.2 * 14; // line-height * font-size
+        elements.input.style.height = (inputHeight * lineHeight) + 'px';
+        elements.input.rows = inputHeight;
+    }
+
+    // Show/hide connecting overlay
+    function showConnecting(show) {
+        elements.connectingOverlay.className = 'overlay' + (show ? ' visible' : '');
+    }
+
+    // Show/hide auth modal
+    function showAuthModal(show) {
+        elements.authModal.className = 'modal' + (show ? ' visible' : '');
+        if (show) {
+            elements.authPassword.value = '';
+            elements.authError.textContent = '';
+        }
+    }
+
+    // Actions popup functions
+    function openActionsPopup() {
+        actionsPopupOpen = true;
+        selectedActionIndex = actions.length > 0 ? 0 : -1;
+        editingNewAction = false;
+        elements.actionsModal.className = 'modal visible';
+        elements.actionError.textContent = '';
+        renderActionsList();
+        loadSelectedAction();
+        elements.actionName.focus();
+    }
+
+    function closeActionsPopup() {
+        actionsPopupOpen = false;
+        elements.actionsModal.className = 'modal';
+        elements.input.focus();
+    }
+
+    function renderActionsList() {
+        elements.actionsList.innerHTML = '';
+        actions.forEach((action, index) => {
+            const div = document.createElement('div');
+            div.className = 'actions-list-item' + (index === selectedActionIndex ? ' selected' : '');
+            div.textContent = action.name || '(unnamed)';
+            div.onclick = () => selectAction(index);
+            elements.actionsList.appendChild(div);
+        });
+        // Add "new action" item if editing new
+        if (editingNewAction) {
+            const div = document.createElement('div');
+            div.className = 'actions-list-item selected new-item';
+            div.textContent = '(new action)';
+            elements.actionsList.appendChild(div);
+        }
+    }
+
+    function selectAction(index) {
+        // Save current edits before switching (if valid)
+        if (selectedActionIndex >= 0 && selectedActionIndex < actions.length) {
+            saveCurrentActionEdits();
+        }
+        selectedActionIndex = index;
+        editingNewAction = false;
+        renderActionsList();
+        loadSelectedAction();
+    }
+
+    function loadSelectedAction() {
+        if (editingNewAction) {
+            elements.actionName.value = '';
+            elements.actionWorld.value = '';
+            elements.actionPattern.value = '';
+            elements.actionCommand.value = '';
+        } else if (selectedActionIndex >= 0 && selectedActionIndex < actions.length) {
+            const action = actions[selectedActionIndex];
+            elements.actionName.value = action.name || '';
+            elements.actionWorld.value = action.world || '';
+            elements.actionPattern.value = action.pattern || '';
+            elements.actionCommand.value = action.command || '';
+        } else {
+            elements.actionName.value = '';
+            elements.actionWorld.value = '';
+            elements.actionPattern.value = '';
+            elements.actionCommand.value = '';
+        }
+        elements.actionError.textContent = '';
+    }
+
+    function saveCurrentActionEdits() {
+        if (selectedActionIndex >= 0 && selectedActionIndex < actions.length) {
+            actions[selectedActionIndex] = {
+                name: elements.actionName.value.trim(),
+                world: elements.actionWorld.value.trim(),
+                pattern: elements.actionPattern.value,
+                command: elements.actionCommand.value
+            };
+        }
+    }
+
+    function createNewAction() {
+        // Save current edits first
+        if (selectedActionIndex >= 0 && selectedActionIndex < actions.length) {
+            saveCurrentActionEdits();
+        }
+        selectedActionIndex = -1;
+        editingNewAction = true;
+        renderActionsList();
+        loadSelectedAction();
+        elements.actionName.focus();
+    }
+
+    function deleteSelectedAction() {
+        if (selectedActionIndex >= 0 && selectedActionIndex < actions.length) {
+            actions.splice(selectedActionIndex, 1);
+            if (selectedActionIndex >= actions.length) {
+                selectedActionIndex = actions.length - 1;
+            }
+            editingNewAction = false;
+            renderActionsList();
+            loadSelectedAction();
+        } else if (editingNewAction) {
+            editingNewAction = false;
+            selectedActionIndex = actions.length > 0 ? 0 : -1;
+            renderActionsList();
+            loadSelectedAction();
+        }
+    }
+
+    function validateAction(name) {
+        if (!name) {
+            return 'Name is required';
+        }
+        // Check for duplicate names (excluding current)
+        const duplicateIndex = actions.findIndex((a, i) =>
+            a.name.toLowerCase() === name.toLowerCase() &&
+            (editingNewAction || i !== selectedActionIndex)
+        );
+        if (duplicateIndex >= 0) {
+            return 'An action with this name already exists';
+        }
+        // Check for internal command conflicts
+        const internalCommands = ['help', 'connect', 'disconnect', 'dc', 'setup', 'world', 'worlds', 'l', 'keepalive', 'reload', 'quit', 'actions', 'gag'];
+        if (internalCommands.includes(name.toLowerCase())) {
+            return 'Cannot use internal command name';
+        }
+        return null;
+    }
+
+    function saveActions() {
+        const name = elements.actionName.value.trim();
+        const error = validateAction(name);
+        if (error) {
+            elements.actionError.textContent = error;
+            return;
+        }
+
+        const actionData = {
+            name: name,
+            world: elements.actionWorld.value.trim(),
+            pattern: elements.actionPattern.value,
+            command: elements.actionCommand.value
+        };
+
+        if (editingNewAction) {
+            actions.push(actionData);
+            selectedActionIndex = actions.length - 1;
+            editingNewAction = false;
+        } else if (selectedActionIndex >= 0 && selectedActionIndex < actions.length) {
+            actions[selectedActionIndex] = actionData;
+        }
+
+        // Send to server
+        send({
+            type: 'UpdateActions',
+            actions: actions
+        });
+
+        closeActionsPopup();
+    }
+
+    // Worlds list popup functions (/worlds, /l)
+    function openWorldsPopup() {
+        worldsPopupOpen = true;
+        selectedWorldsRowIndex = currentWorldIndex;
+        elements.worldsModal.className = 'modal visible';
+        renderWorldsTable();
+    }
+
+    function closeWorldsPopup() {
+        worldsPopupOpen = false;
+        elements.worldsModal.className = 'modal';
+        elements.input.focus();
+    }
+
+    // Scroll the selected row into view in worlds table
+    function scrollSelectedRowIntoView() {
+        const container = document.getElementById('worlds-table-container');
+        const selectedRow = container?.querySelector('tr.selected-row');
+        if (selectedRow && container) {
+            selectedRow.scrollIntoView({ block: 'nearest', behavior: 'auto' });
+        }
+    }
+
+    function renderWorldsTable() {
+        elements.worldsTableBody.innerHTML = '';
+        worlds.forEach((world, index) => {
+            const tr = document.createElement('tr');
+            let classes = [];
+            if (index === currentWorldIndex) {
+                classes.push('current-world');
+            }
+            if (index === selectedWorldsRowIndex) {
+                classes.push('selected-row');
+            }
+            if (classes.length > 0) {
+                tr.className = classes.join(' ');
+            }
+
+            // World name
+            const tdName = document.createElement('td');
+            tdName.textContent = world.name || '(unnamed)';
+            tr.appendChild(tdName);
+
+            // Status
+            const tdStatus = document.createElement('td');
+            tdStatus.textContent = world.connected ? 'Connected' : 'Disconnected';
+            tdStatus.className = world.connected ? 'status-connected' : 'status-disconnected';
+            tr.appendChild(tdStatus);
+
+            // Unseen
+            const tdUnseen = document.createElement('td');
+            const unseen = world.unseen_lines || 0;
+            tdUnseen.textContent = unseen > 0 ? unseen.toString() : '';
+            if (unseen > 0) tdUnseen.className = 'unseen-count';
+            tr.appendChild(tdUnseen);
+
+            // Click to select and double-click to switch
+            tr.onclick = () => {
+                selectedWorldsRowIndex = index;
+                renderWorldsTable();
+            };
+            tr.ondblclick = () => {
+                switchWorldLocal(index);
+                closeWorldsPopup();
+            };
+
+            elements.worldsTableBody.appendChild(tr);
+        });
+    }
+
+    // World selector popup functions (/world)
+    function openWorldSelectorPopup() {
+        worldSelectorPopupOpen = true;
+        selectedWorldIndex = currentWorldIndex;
+        elements.worldFilter.value = '';
+        elements.worldSelectorModal.className = 'modal visible';
+        renderWorldSelectorList();
+        elements.worldFilter.focus();
+    }
+
+    function closeWorldSelectorPopup() {
+        worldSelectorPopupOpen = false;
+        elements.worldSelectorModal.className = 'modal';
+        elements.input.focus();
+    }
+
+    function renderWorldSelectorList() {
+        const filter = elements.worldFilter.value.toLowerCase();
+        elements.worldSelectorList.innerHTML = '';
+
+        worlds.forEach((world, index) => {
+            // Filter by name, hostname, or user
+            const name = (world.name || '').toLowerCase();
+            const hostname = (world.settings?.hostname || '').toLowerCase();
+            const user = (world.settings?.user || '').toLowerCase();
+
+            if (filter && !name.includes(filter) && !hostname.includes(filter) && !user.includes(filter)) {
+                return; // Skip non-matching worlds
+            }
+
+            const div = document.createElement('div');
+            div.className = 'world-selector-item';
+            if (index === selectedWorldIndex) div.className += ' selected';
+            if (index === currentWorldIndex) div.className += ' current';
+
+            // World info (name + host)
+            const infoDiv = document.createElement('div');
+            infoDiv.className = 'world-info';
+
+            const nameSpan = document.createElement('span');
+            nameSpan.className = 'world-name';
+            nameSpan.textContent = world.name || '(unnamed)';
+            infoDiv.appendChild(nameSpan);
+
+            if (world.settings?.hostname) {
+                const hostSpan = document.createElement('span');
+                hostSpan.className = 'world-host';
+                hostSpan.textContent = world.settings.hostname + (world.settings.port ? ':' + world.settings.port : '');
+                infoDiv.appendChild(hostSpan);
+            }
+
+            div.appendChild(infoDiv);
+
+            // Status indicator
+            const statusSpan = document.createElement('span');
+            statusSpan.className = 'world-status ' + (world.connected ? 'connected' : 'disconnected');
+            statusSpan.textContent = world.connected ? '●' : '○';
+            div.appendChild(statusSpan);
+
+            div.onclick = () => selectWorld(index);
+            div.ondblclick = () => {
+                selectWorld(index);
+                switchToSelectedWorld();
+            };
+
+            elements.worldSelectorList.appendChild(div);
+        });
+    }
+
+    function selectWorld(index) {
+        selectedWorldIndex = index;
+        renderWorldSelectorList();
+    }
+
+    // Get indices of worlds that match the current filter
+    function getFilteredWorldIndices() {
+        const filter = elements.worldFilter.value.toLowerCase();
+        const indices = [];
+        worlds.forEach((world, index) => {
+            const name = (world.name || '').toLowerCase();
+            const hostname = (world.settings?.hostname || '').toLowerCase();
+            const user = (world.settings?.user || '').toLowerCase();
+            if (!filter || name.includes(filter) || hostname.includes(filter) || user.includes(filter)) {
+                indices.push(index);
+            }
+        });
+        return indices;
+    }
+
+    function switchToSelectedWorld() {
+        if (selectedWorldIndex >= 0 && selectedWorldIndex < worlds.length) {
+            switchWorldLocal(selectedWorldIndex);
+            closeWorldSelectorPopup();
+        }
+    }
+
+    function connectSelectedWorld() {
+        if (selectedWorldIndex >= 0 && selectedWorldIndex < worlds.length) {
+            const world = worlds[selectedWorldIndex];
+            // Switch to the world first
+            switchWorldLocal(selectedWorldIndex);
+            // Send connect command to server
+            send({
+                type: 'ConnectWorld',
+                world_index: selectedWorldIndex
+            });
+            closeWorldSelectorPopup();
+        }
+    }
+
+    // Handle /world <name> command
+    function handleWorldCommand(worldName) {
+        // Find world by name (case-insensitive)
+        const lowerName = worldName.toLowerCase();
+        const worldIndex = worlds.findIndex(w =>
+            (w.name || '').toLowerCase() === lowerName
+        );
+
+        if (worldIndex >= 0) {
+            const world = worlds[worldIndex];
+            // Switch to the world
+            switchWorldLocal(worldIndex);
+            // If not connected, connect
+            if (!world.connected) {
+                send({
+                    type: 'ConnectWorld',
+                    world_index: worldIndex
+                });
+            }
+        } else {
+            // World not found - send command to server to create/handle it
+            send({
+                type: 'SendCommand',
+                world_index: currentWorldIndex,
+                command: '/world ' + worldName
+            });
+        }
+    }
+
+    // Check if any popup is open
+    function isAnyPopupOpen() {
+        return actionsPopupOpen || worldsPopupOpen || worldSelectorPopupOpen;
+    }
+
+    // Check if a world should be included in cycling (connected OR has unseen output)
+    function isWorldActive(world) {
+        return world.connected || (world.unseen_lines && world.unseen_lines > 0);
+    }
+
+    // Check if a world has unseen output (for pending_first prioritization)
+    function worldHasPending(world) {
+        return world.unseen_lines && world.unseen_lines > 0;
+    }
+
+    // Get list of active world indices, sorted alphabetically
+    function getActiveWorldIndices() {
+        const activeWorlds = [];
+        worlds.forEach((world, index) => {
+            if (isWorldActive(world)) {
+                activeWorlds.push({
+                    index,
+                    name: (world.name || '').toLowerCase()
+                });
+            }
+        });
+        // Sort alphabetically
+        activeWorlds.sort((a, b) => a.name.localeCompare(b.name));
+        return activeWorlds.map(w => w.index);
+    }
+
+    // Get next active world index (cycling forward)
+    function getNextActiveWorld() {
+        const activeIndices = getActiveWorldIndices();
+        if (activeIndices.length <= 1) return currentWorldIndex;
+
+        // If worldSwitchMode is 'Unseen First', check for OTHER worlds with unseen output first
+        if (worldSwitchMode === 'Unseen First') {
+            const unseenWorlds = activeIndices
+                .filter(i => i !== currentWorldIndex && worldHasPending(worlds[i]))
+                .sort((a, b) => (worlds[a].name || '').toLowerCase().localeCompare((worlds[b].name || '').toLowerCase()));
+
+            if (unseenWorlds.length > 0) {
+                return unseenWorlds[0]; // Go to first world with unseen output
+            }
+        }
+
+        // Fall back to alphabetical cycling
+        const currentPos = activeIndices.indexOf(currentWorldIndex);
+        if (currentPos === -1) {
+            return activeIndices[0];
+        }
+        return activeIndices[(currentPos + 1) % activeIndices.length];
+    }
+
+    // Get previous active world index (cycling backward)
+    function getPrevActiveWorld() {
+        const activeIndices = getActiveWorldIndices();
+        if (activeIndices.length <= 1) return currentWorldIndex;
+
+        // If worldSwitchMode is 'Unseen First', check for OTHER worlds with unseen output first
+        if (worldSwitchMode === 'Unseen First') {
+            const unseenWorlds = activeIndices
+                .filter(i => i !== currentWorldIndex && worldHasPending(worlds[i]))
+                .sort((a, b) => (worlds[a].name || '').toLowerCase().localeCompare((worlds[b].name || '').toLowerCase()));
+
+            if (unseenWorlds.length > 0) {
+                return unseenWorlds[0]; // Go to first world with unseen output
+            }
+        }
+
+        // Fall back to alphabetical cycling
+        const currentPos = activeIndices.indexOf(currentWorldIndex);
+        if (currentPos === -1) {
+            return activeIndices[activeIndices.length - 1];
+        }
+        return activeIndices[(currentPos - 1 + activeIndices.length) % activeIndices.length];
+    }
+
+    // Setup event listeners
+    function setupEventListeners() {
+        // Send button
+        elements.sendBtn.onclick = sendCommand;
+
+        // Click anywhere to focus input
+        document.body.onclick = function(e) {
+            // Don't steal focus from modals
+            if (!elements.authModal.classList.contains('visible') &&
+                !elements.actionsModal.classList.contains('visible') &&
+                !elements.worldsModal.classList.contains('visible') &&
+                !elements.worldSelectorModal.classList.contains('visible')) {
+                elements.input.focus();
+            }
+        };
+
+        // Scroll event to update status bar (for Hist indicator)
+        elements.outputContainer.onscroll = function() {
+            updateStatusBar();
+            // If user scrolls up, trigger pause (like console behavior)
+            if (moreModeEnabled && !paused && !isAtBottom()) {
+                paused = true;
+                updateStatusBar();
+            }
+            // If user scrolls to bottom, unpause
+            if (paused && isAtBottom() && pendingLines.length === 0) {
+                paused = false;
+                linesSincePause = 0;
+                updateStatusBar();
+            }
+        };
+
+        // Document-level keyboard handler for navigation keys
+        document.onkeydown = function(e) {
+            // Skip if auth modal is visible
+            if (elements.authModal.classList.contains('visible')) return;
+
+            // Handle actions popup
+            if (actionsPopupOpen) {
+                if (e.key === 'Escape') {
+                    e.preventDefault();
+                    closeActionsPopup();
+                }
+                return; // Don't handle other keys when popup is open
+            }
+
+            // Handle worlds list popup
+            if (worldsPopupOpen) {
+                if (e.key === 'Escape') {
+                    e.preventDefault();
+                    e.stopPropagation();
+                    closeWorldsPopup();
+                } else if (e.key === 'ArrowUp') {
+                    e.preventDefault();
+                    e.stopPropagation();
+                    if (selectedWorldsRowIndex > 0) {
+                        selectedWorldsRowIndex--;
+                    } else if (worlds.length > 0) {
+                        selectedWorldsRowIndex = worlds.length - 1; // Wrap to bottom
+                    }
+                    renderWorldsTable();
+                    scrollSelectedRowIntoView();
+                } else if (e.key === 'ArrowDown') {
+                    e.preventDefault();
+                    e.stopPropagation();
+                    if (selectedWorldsRowIndex < worlds.length - 1) {
+                        selectedWorldsRowIndex++;
+                    } else if (worlds.length > 0) {
+                        selectedWorldsRowIndex = 0; // Wrap to top
+                    }
+                    renderWorldsTable();
+                    scrollSelectedRowIntoView();
+                } else if (e.key === 'Enter') {
+                    e.preventDefault();
+                    e.stopPropagation();
+                    if (selectedWorldsRowIndex >= 0 && selectedWorldsRowIndex < worlds.length) {
+                        switchWorldLocal(selectedWorldsRowIndex);
+                        closeWorldsPopup();
+                    }
+                }
+                return;
+            }
+
+            // Handle world selector popup
+            if (worldSelectorPopupOpen) {
+                if (e.key === 'Escape') {
+                    e.preventDefault();
+                    closeWorldSelectorPopup();
+                } else if (e.key === 'ArrowUp') {
+                    e.preventDefault();
+                    // Move selection up
+                    const visibleWorlds = getFilteredWorldIndices();
+                    const currentPos = visibleWorlds.indexOf(selectedWorldIndex);
+                    if (currentPos > 0) {
+                        selectWorld(visibleWorlds[currentPos - 1]);
+                    } else if (visibleWorlds.length > 0) {
+                        selectWorld(visibleWorlds[visibleWorlds.length - 1]);
+                    }
+                } else if (e.key === 'ArrowDown') {
+                    e.preventDefault();
+                    // Move selection down
+                    const visibleWorlds = getFilteredWorldIndices();
+                    const currentPos = visibleWorlds.indexOf(selectedWorldIndex);
+                    if (currentPos < visibleWorlds.length - 1) {
+                        selectWorld(visibleWorlds[currentPos + 1]);
+                    } else if (visibleWorlds.length > 0) {
+                        selectWorld(visibleWorlds[0]);
+                    }
+                } else if (e.key === 'Enter') {
+                    e.preventDefault();
+                    switchToSelectedWorld();
+                }
+                return;
+            }
+
+            // Handle navigation keys at document level
+            if (e.key === 'Tab' && !e.shiftKey && !e.ctrlKey) {
+                e.preventDefault();
+                if (paused && pendingLines.length > 0) {
+                    releaseScreenful();
+                }
+                elements.input.focus();
+            } else if (e.key === 'j' && e.altKey) {
+                e.preventDefault();
+                releaseAll();
+                scrollToBottom();
+                elements.input.focus();
+            } else if (e.key === 'PageUp') {
+                e.preventDefault();
+                elements.outputContainer.scrollBy(0, -elements.outputContainer.clientHeight);
+            } else if (e.key === 'PageDown') {
+                e.preventDefault();
+                elements.outputContainer.scrollBy(0, elements.outputContainer.clientHeight);
+                if (isAtBottom() && pendingLines.length === 0) {
+                    paused = false;
+                    linesSincePause = 0;
+                    updateStatusBar();
+                }
+            } else if (e.key === 'ArrowUp' && !e.ctrlKey && document.activeElement !== elements.input) {
+                // Up: Switch to previous active world (when not in input)
+                e.preventDefault();
+                const prevWorld = getPrevActiveWorld();
+                if (prevWorld !== currentWorldIndex) {
+                    switchWorldLocal(prevWorld);
+                }
+                elements.input.focus();
+            } else if (e.key === 'ArrowDown' && !e.ctrlKey && document.activeElement !== elements.input) {
+                // Down: Switch to next active world (when not in input)
+                e.preventDefault();
+                const nextWorld = getNextActiveWorld();
+                if (nextWorld !== currentWorldIndex) {
+                    switchWorldLocal(nextWorld);
+                }
+                elements.input.focus();
+            } else if (e.key === 'F2') {
+                // F2: Toggle MUD tag display
+                e.preventDefault();
+                showTags = !showTags;
+                renderOutput();
+            }
+        };
+
+        // Keyboard controls (console-style) - input-specific
+        elements.input.onkeydown = function(e) {
+            if (e.key === 'Enter' && !e.shiftKey) {
+                // Send command (also releases all pending)
+                e.preventDefault();
+                sendCommand();
+            } else if (e.key === 'Tab' && !e.shiftKey && !e.ctrlKey) {
+                // Tab: Release one screenful of pending lines
+                e.preventDefault(); // Always prevent default tab behavior
+                if (paused && pendingLines.length > 0) {
+                    releaseScreenful();
+                }
+            } else if (e.key === 'j' && e.altKey) {
+                // Alt+j: Jump to end, release all pending
+                e.preventDefault();
+                releaseAll();
+                scrollToBottom();
+            } else if (e.key === 'ArrowUp' && e.ctrlKey) {
+                // Ctrl+Up: Increase input height
+                e.preventDefault();
+                if (inputHeight < 15) {
+                    setInputHeight(inputHeight + 1);
+                }
+            } else if (e.key === 'ArrowDown' && e.ctrlKey) {
+                // Ctrl+Down: Decrease input height
+                e.preventDefault();
+                if (inputHeight > 1) {
+                    setInputHeight(inputHeight - 1);
+                }
+            } else if (e.key === 'ArrowUp' && !e.ctrlKey) {
+                // Up: Switch to previous active world (local only, doesn't affect console)
+                e.preventDefault();
+                const prevWorld = getPrevActiveWorld();
+                if (prevWorld !== currentWorldIndex) {
+                    switchWorldLocal(prevWorld);
+                }
+            } else if (e.key === 'ArrowDown' && !e.ctrlKey) {
+                // Down: Switch to next active world (local only, doesn't affect console)
+                e.preventDefault();
+                const nextWorld = getNextActiveWorld();
+                if (nextWorld !== currentWorldIndex) {
+                    switchWorldLocal(nextWorld);
+                }
+            } else if (e.key === 'p' && e.ctrlKey) {
+                // Ctrl+P: Previous command in history
+                e.preventDefault();
+                if (commandHistory.length > 0) {
+                    if (historyIndex === -1) {
+                        historyIndex = commandHistory.length - 1;
+                    } else if (historyIndex > 0) {
+                        historyIndex--;
+                    }
+                    elements.input.value = commandHistory[historyIndex];
+                }
+            } else if (e.key === 'n' && e.ctrlKey) {
+                // Ctrl+N: Next command in history
+                e.preventDefault();
+                if (historyIndex !== -1) {
+                    if (historyIndex < commandHistory.length - 1) {
+                        historyIndex++;
+                        elements.input.value = commandHistory[historyIndex];
+                    } else {
+                        historyIndex = -1;
+                        elements.input.value = '';
+                    }
+                }
+            } else if (e.key === 'u' && e.ctrlKey) {
+                // Ctrl+U: Clear input
+                e.preventDefault();
+                elements.input.value = '';
+                historyIndex = -1;
+            } else if (e.key === 'w' && e.ctrlKey) {
+                // Ctrl+W: Delete word before cursor
+                e.preventDefault();
+                const input = elements.input;
+                const pos = input.selectionStart;
+                const text = input.value;
+                // Find start of word before cursor
+                let start = pos;
+                while (start > 0 && text[start - 1] === ' ') start--;
+                while (start > 0 && text[start - 1] !== ' ') start--;
+                input.value = text.substring(0, start) + text.substring(pos);
+                input.selectionStart = input.selectionEnd = start;
+            } else if (e.key === 'l' && e.ctrlKey) {
+                // Ctrl+L: Redraw screen
+                e.preventDefault();
+                renderOutput();
+            } else if (e.key === 'PageUp') {
+                // PageUp: Scroll output up (triggers pause via scroll handler)
+                e.preventDefault();
+                elements.outputContainer.scrollBy(0, -elements.outputContainer.clientHeight);
+            } else if (e.key === 'PageDown') {
+                // PageDown: Scroll output down
+                e.preventDefault();
+                elements.outputContainer.scrollBy(0, elements.outputContainer.clientHeight);
+                // If at bottom now and no pending, unpause
+                if (isAtBottom() && pendingLines.length === 0) {
+                    paused = false;
+                    linesSincePause = 0;
+                    updateStatusBar();
+                }
+            }
+        };
+
+        // Auth submit
+        elements.authSubmit.onclick = authenticate;
+        elements.authPassword.onkeydown = function(e) {
+            if (e.key === 'Enter') {
+                authenticate();
+            }
+        };
+
+        // Actions popup
+        elements.actionNewBtn.onclick = createNewAction;
+        elements.actionDeleteBtn.onclick = deleteSelectedAction;
+        elements.actionSaveBtn.onclick = saveActions;
+        elements.actionCancelBtn.onclick = closeActionsPopup;
+
+        // Worlds list popup
+        elements.worldsCloseBtn.onclick = closeWorldsPopup;
+
+        // World selector popup
+        elements.worldConnectBtn.onclick = connectSelectedWorld;
+        elements.worldSwitchBtn.onclick = switchToSelectedWorld;
+        elements.worldSelectorCancelBtn.onclick = closeWorldSelectorPopup;
+        elements.worldFilter.oninput = function() {
+            // Update selection if current selection is filtered out
+            const visibleIndices = getFilteredWorldIndices();
+            if (!visibleIndices.includes(selectedWorldIndex)) {
+                selectedWorldIndex = visibleIndices.length > 0 ? visibleIndices[0] : -1;
+            }
+            renderWorldSelectorList();
+        };
+
+        // Keepalive ping every 30 seconds
+        setInterval(function() {
+            if (ws && ws.readyState === WebSocket.OPEN && authenticated) {
+                send({ type: 'Ping' });
+            }
+        }, 30000);
+    }
+
+    // Show certificate warning for wss:// self-signed cert issues
+    function showCertWarning() {
+        let warning = document.getElementById('cert-warning');
+        if (!warning) {
+            warning = document.createElement('div');
+            warning.id = 'cert-warning';
+            warning.style.cssText = 'position:fixed;top:10px;left:50%;transform:translateX(-50%);background:#c00;color:#fff;padding:15px 20px;border-radius:8px;z-index:2000;text-align:center;max-width:90%;';
+            const host = window.location.hostname;
+            const certUrl = `https://${host}:${window.WS_PORT}/`;
+            warning.innerHTML = `
+                <div style="margin-bottom:10px;font-weight:bold;">WebSocket Connection Failed</div>
+                <div style="margin-bottom:10px;">If using a self-signed certificate, you need to accept it for the WebSocket port.</div>
+                <a href="${certUrl}" target="_blank" style="color:#fff;text-decoration:underline;">Click here to accept the certificate for port ${window.WS_PORT}</a>
+                <div style="margin-top:10px;font-size:12px;">Then refresh this page.</div>
+            `;
+            document.body.appendChild(warning);
+        }
+        warning.style.display = 'block';
+    }
+
+    function hideCertWarning() {
+        const warning = document.getElementById('cert-warning');
+        if (warning) {
+            warning.style.display = 'none';
+        }
+    }
+
+    // Start the app
+    init();
+})();

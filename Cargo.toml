@@ -1,0 +1,48 @@
+[package]
+name = "clay"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+ratatui = "0.29"
+crossterm = { version = "0.28", features = ["event-stream"] }
+tokio = { version = "1", features = ["full"] }
+ansi-to-tui = "7"
+bytes = "1"
+strsim = "0.11"
+libc = "0.2"
+unicode-width = "0.2"
+regex = "1"
+futures = "0.3"
+aes-gcm = "0.10"
+base64 = "0.22"
+
+# TLS support - native-tls by default, rustls for static builds
+tokio-native-tls = { version = "0.3", optional = true }
+native-tls = { version = "0.2", optional = true }
+tokio-rustls = { version = "0.26", optional = true, default-features = false, features = ["ring"] }
+rustls = { version = "0.23", optional = true, default-features = false, features = ["ring", "std", "tls12"] }
+rustls-pemfile = { version = "2", optional = true }
+webpki-roots = { version = "0.26", optional = true }
+rustls-webpki = { version = "0.103", optional = true, default-features = false, features = ["ring", "std"] }
+
+# WebSocket support (TLS features are conditional on backend)
+tokio-tungstenite = "0.26"
+
+# Serialization for WebSocket protocol
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Password hashing for WebSocket authentication
+sha2 = "0.10"
+hex = "0.4"
+
+# GUI client (optional)
+eframe = { version = "0.30", optional = true, default-features = false, features = ["default_fonts", "glow", "x11"] }
+egui = { version = "0.30", optional = true }
+
+[features]
+default = ["native-tls-backend"]
+native-tls-backend = ["tokio-native-tls", "native-tls", "tokio-tungstenite/native-tls"]
+rustls-backend = ["tokio-rustls", "rustls", "rustls-pemfile", "webpki-roots", "rustls-webpki"]
+remote-gui = ["eframe", "egui"]

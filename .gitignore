@@ -1,0 +1,20 @@
+# Build artifacts
+/target/
+
+# Claude Code local settings
+.claude/
+
+# Debug/trace files
+trace.txt
+*.log
+
+# Editor files
+*.swp
+*.swo
+*~
+.idea/
+.vscode/
+
+# OS files
+.DS_Store
+Thumbs.db
