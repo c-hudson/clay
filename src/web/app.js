@@ -204,12 +204,19 @@
                         worldOutputCache[msg.world_index] = [];
                     }
                     if (msg.data) {
-                        // Split multi-line data into individual lines
-                        const lines = msg.data.split('\n');
-                        lines.forEach(line => {
+                        // Split by any line ending
+                        const rawLines = msg.data.split(/\r\n|\n|\r/);
+                        rawLines.forEach(line => {
+                            // Strip ANSI codes to check if line has actual content
+                            // Some MUDs send trailing ANSI reset codes after newlines
+                            const strippedLine = line.replace(/\x1b\[[0-9;]*[A-Za-z]/g, '');
+                            // Skip lines that are empty or whitespace-only after stripping ANSI
+                            if (!strippedLine || strippedLine.trim().length === 0) {
+                                return;
+                            }
                             // Filter out keep-alive idler message lines
                             if (line.includes('###_idler_message_') && line.includes('_###')) {
-                                return; // Skip this line
+                                return;
                             }
                             const lineIndex = world.output_lines.length;
                             world.output_lines.push(line);
@@ -450,41 +457,31 @@
         }
     }
 
-    // Render output - uses cached pre-parsed HTML for fast world switching
+    // Render output - render all lines as text with line breaks
     function renderOutput() {
         elements.output.innerHTML = '';
 
         const world = worlds[currentWorldIndex];
         if (!world) return;
 
-        // Ensure cache exists
-        if (!worldOutputCache[currentWorldIndex]) {
-            worldOutputCache[currentWorldIndex] = [];
-        }
-
-        const cache = worldOutputCache[currentWorldIndex];
         const lines = world.output_lines || [];
 
-        // Use document fragment for batch DOM insertion (single reflow)
-        const fragment = document.createDocumentFragment();
-
+        // Build all lines as HTML with explicit <br> line breaks
+        const htmlParts = [];
         for (let i = 0; i < lines.length; i++) {
-            const div = document.createElement('div');
-            div.className = 'line';
-            // Use cached parsed HTML if available and showTags hasn't changed
-            if (cache[i] && cache[i].showTags === showTags) {
-                div.innerHTML = cache[i].html;
-            } else {
-                // Parse and cache
-                const displayText = showTags ? lines[i] : stripMudTag(lines[i]);
-                const html = parseAnsi(displayText);
-                cache[i] = { html, showTags };
-                div.innerHTML = html;
-            }
-            fragment.appendChild(div);
+            const rawLine = lines[i];
+            if (rawLine === undefined || rawLine === null) continue;
+
+            // Strip newlines/carriage returns
+            const cleanLine = String(rawLine).replace(/[\r\n]+/g, '');
+
+            const displayText = showTags ? cleanLine : stripMudTag(cleanLine);
+            const html = parseAnsi(displayText);
+            htmlParts.push(html);
         }
 
-        elements.output.appendChild(fragment);
+        // Join with <br> tags for explicit line breaks
+        elements.output.innerHTML = htmlParts.join('<br>');
 
         // Clear unseen for current world
         world.unseen_lines = 0;
@@ -505,20 +502,18 @@
 
     // Append a new line to current world's output (already visible)
     function appendNewLine(text, worldIndex, lineIndex) {
-        const displayText = showTags ? text : stripMudTag(text);
+        // Strip newlines/carriage returns
+        const cleanText = String(text).replace(/[\r\n]+/g, '');
+
+        const displayText = showTags ? cleanText : stripMudTag(cleanText);
         const html = parseAnsi(displayText);
 
-        // Cache the parsed HTML
-        if (!worldOutputCache[worldIndex]) {
-            worldOutputCache[worldIndex] = [];
+        // Append to output with a <br> prefix (if not first line)
+        if (elements.output.innerHTML.length > 0) {
+            elements.output.innerHTML += '<br>' + html;
+        } else {
+            elements.output.innerHTML = html;
         }
-        worldOutputCache[worldIndex][lineIndex] = { html, showTags };
-
-        // Append to DOM
-        const div = document.createElement('div');
-        div.className = 'line';
-        div.innerHTML = html;
-        elements.output.appendChild(div);
 
         scrollToBottom();
     }

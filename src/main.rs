@@ -2619,13 +2619,20 @@ impl App {
     /// Build initial state message for a newly authenticated client
     fn build_initial_state(&self) -> WsMessage {
         let worlds: Vec<WorldStateMsg> = self.worlds.iter().enumerate().map(|(idx, world)| {
+            // Strip carriage returns from output/pending lines for web clients
+            let clean_output: Vec<String> = world.output_lines.iter()
+                .map(|s| s.replace('\r', ""))
+                .collect();
+            let clean_pending: Vec<String> = world.pending_lines.iter()
+                .map(|s| s.replace('\r', ""))
+                .collect();
             WorldStateMsg {
                 index: idx,
                 name: world.name.clone(),
                 connected: world.connected,
-                output_lines: world.output_lines.clone(),
-                pending_lines: world.pending_lines.clone(),
-                prompt: world.prompt.clone(),
+                output_lines: clean_output,
+                pending_lines: clean_pending,
+                prompt: world.prompt.replace('\r', ""),
                 scroll_offset: world.scroll_offset,
                 paused: world.paused,
                 unseen_lines: world.unseen_lines,
@@ -6996,9 +7003,11 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                     terminal.clear()?;
                                 }
                                 // Broadcast filtered data to WebSocket clients
+                                // Strip carriage returns - some MUDs send \r\n or bare \r
+                                let ws_data = filtered_data.replace('\r', "");
                                 app.ws_broadcast(WsMessage::ServerData {
                                     world_index: world_idx,
-                                    data: filtered_data.clone(),
+                                    data: ws_data,
                                 });
                             }
 
@@ -7443,9 +7452,11 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                 app.worlds[world_idx].needs_redraw = false;
                                 let _ = terminal.clear();
                             }
+                            // Strip carriage returns for WebSocket - some MUDs send \r\n or bare \r
+                            let ws_data = filtered_data.replace('\r', "");
                             app.ws_broadcast(WsMessage::ServerData {
                                 world_index: world_idx,
-                                data: filtered_data.clone(),
+                                data: ws_data,
                             });
                         }
 

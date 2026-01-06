@@ -51,10 +51,13 @@ body {
 #output {
     white-space: pre-wrap;
     word-wrap: break-word;
+    line-height: 1.2;
 }
 
 #output .line {
-    min-height: 1.2em;
+    line-height: 1.2;
+    margin: 0;
+    padding: 0;
 }
 
 /* ANSI color classes - match terminal colors */
