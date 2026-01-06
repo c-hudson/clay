@@ -7648,9 +7648,10 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
             }
         }
 
-        // If we processed events in try_recv, loop back to redraw before waiting in select
+        // If we processed events in try_recv, redraw before waiting in select
         if processed_events {
-            continue;
+            terminal.draw(|f| ui(f, &mut app))?;
+            render_output_crossterm(&app);
         }
     }
 }
