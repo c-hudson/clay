@@ -858,7 +858,12 @@
         elements.activityIndicator.textContent = unseenCount > 0 ? ` (Activity: ${unseenCount})` : '';
 
         // Fill remaining space with underscores
-        elements.separatorFill.textContent = '_'.repeat(100);
+        // Calculate how many underscores fit based on container width and font size
+        const fillWidth = elements.separatorFill.offsetWidth || window.innerWidth;
+        const fontSize = fontSizes[currentFontSize] || 14;
+        const charWidth = fontSize * 0.6; // Approximate width ratio for monospace
+        const numUnderscores = Math.ceil(fillWidth / charWidth) + 20; // Add buffer
+        elements.separatorFill.textContent = '_'.repeat(Math.max(200, numUnderscores));
     }
 
     // Update time
@@ -1523,6 +1528,11 @@
             e.stopPropagation();
             setFontSize('large');
         };
+
+        // Window resize handler to update separator fill
+        window.addEventListener('resize', function() {
+            updateStatusBar();
+        });
 
         // Click anywhere to focus input and close menu
         document.body.onclick = function(e) {
