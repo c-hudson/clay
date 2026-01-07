@@ -476,7 +476,7 @@
             const cleanLine = String(rawLine).replace(/[\r\n]+/g, '');
 
             const displayText = showTags ? cleanLine : stripMudTag(cleanLine);
-            const html = parseAnsi(displayText);
+            const html = linkifyUrls(parseAnsi(displayText));
             htmlParts.push(html);
         }
 
@@ -495,7 +495,7 @@
             worldOutputCache[worldIndex] = [];
         }
         const displayText = showTags ? text : stripMudTag(text);
-        const html = parseAnsi(displayText);
+        const html = linkifyUrls(parseAnsi(displayText));
         worldOutputCache[worldIndex][lineIndex] = { html, showTags };
         return html;
     }
@@ -506,7 +506,7 @@
         const cleanText = String(text).replace(/[\r\n]+/g, '');
 
         const displayText = showTags ? cleanText : stripMudTag(cleanText);
-        const html = parseAnsi(displayText);
+        const html = linkifyUrls(parseAnsi(displayText));
 
         // Append to output with a <br> prefix (if not first line)
         if (elements.output.innerHTML.length > 0) {
@@ -607,6 +607,21 @@
         const div = document.createElement('div');
         div.textContent = text;
         return div.innerHTML;
+    }
+
+    // Linkify URLs in HTML text (after ANSI parsing)
+    // Matches http://, https://, and www. URLs
+    function linkifyUrls(html) {
+        // URL pattern that works on HTML-escaped text
+        // Matches http://, https://, or www. followed by non-whitespace
+        // Stops at HTML tags, quotes, or common punctuation at end
+        const urlPattern = /(\b(?:https?:\/\/|www\.)[^\s<>"']*[^\s<>"'.,;:!?\)\]}>])/gi;
+
+        return html.replace(urlPattern, function(url) {
+            // Add protocol if missing (for www. URLs)
+            const href = url.startsWith('www.') ? 'https://' + url : url;
+            return `<a href="${href}" target="_blank" rel="noopener" class="output-link">${url}</a>`;
+        });
     }
 
     // Strip MUD tags like [channel:] or [channel(player)] from start of line
@@ -908,12 +923,14 @@
         worldsPopupOpen = true;
         selectedWorldsRowIndex = currentWorldIndex;
         elements.worldsModal.className = 'modal visible';
+        elements.worldsModal.style.display = 'flex';
         renderWorldsTable();
     }
 
     function closeWorldsPopup() {
         worldsPopupOpen = false;
         elements.worldsModal.className = 'modal';
+        elements.worldsModal.style.display = 'none';
         elements.input.focus();
     }
 
@@ -979,6 +996,7 @@
         selectedWorldIndex = currentWorldIndex;
         elements.worldFilter.value = '';
         elements.worldSelectorModal.className = 'modal visible';
+        elements.worldSelectorModal.style.display = 'flex';
         renderWorldSelectorList();
         elements.worldFilter.focus();
     }
@@ -986,6 +1004,7 @@
     function closeWorldSelectorPopup() {
         worldSelectorPopupOpen = false;
         elements.worldSelectorModal.className = 'modal';
+        elements.worldSelectorModal.style.display = 'none';
         elements.input.focus();
     }
 
@@ -1198,6 +1217,11 @@
 
         // Click anywhere to focus input
         document.body.onclick = function(e) {
+            // Don't steal focus if user has selected text (for copy)
+            const selection = window.getSelection();
+            if (selection && selection.toString().length > 0) {
+                return;
+            }
             // Don't steal focus from modals
             if (!elements.authModal.classList.contains('visible') &&
                 !elements.actionsModal.classList.contains('visible') &&
@@ -1354,10 +1378,11 @@
         };
 
         // Keyboard controls (console-style) - input-specific
-        elements.input.onkeydown = function(e) {
+        elements.input.addEventListener('keydown', function(e) {
             if (e.key === 'Enter' && !e.shiftKey) {
                 // Send command (also releases all pending)
                 e.preventDefault();
+                e.stopPropagation();  // Prevent document-level handler from catching this
                 sendCommand();
             } else if (e.key === 'Tab' && !e.shiftKey && !e.ctrlKey) {
                 // Tab: Release one screenful of pending lines
@@ -1455,7 +1480,7 @@
                     updateStatusBar();
                 }
             }
-        };
+        });
 
         // Auth submit
         elements.authSubmit.onclick = authenticate;

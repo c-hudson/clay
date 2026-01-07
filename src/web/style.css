@@ -81,6 +81,17 @@ body {
 .ansi-italic { font-style: italic; }
 .ansi-underline { text-decoration: underline; }
 
+/* Clickable URLs in output */
+.output-link {
+    color: #00cdcd;
+    text-decoration: underline;
+    cursor: pointer;
+}
+
+.output-link:hover {
+    color: #00ffff;
+}
+
 /* Separator bar - matches console layout */
 #status-bar {
     display: flex;
