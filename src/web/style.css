@@ -91,34 +91,15 @@ body {
     background-color: #444;
 }
 
-/* Hamburger icon - CSS-based for reliable rendering */
+/* Hamburger button with SVG icon */
 .hamburger-btn {
     padding: 6px 10px;
     min-width: 40px;
     min-height: 36px;
 }
 
-.hamburger-icon {
-    display: flex;
-    flex-direction: column;
-    justify-content: space-between;
-    width: 18px;
-    height: 14px;
-}
-
-.hamburger-icon::before,
-.hamburger-icon::after {
-    content: '';
+.hamburger-btn svg {
     display: block;
-    width: 18px;
-    height: 2px;
-    background-color: var(--text-color);
-    flex-shrink: 0;
-}
-
-/* Middle line using a box-shadow on the element itself */
-.hamburger-icon {
-    background: linear-gradient(var(--text-color), var(--text-color)) no-repeat center/18px 2px;
 }
 
 /* Dropdown menu */
