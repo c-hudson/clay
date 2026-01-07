@@ -1660,7 +1660,11 @@
             if (e.key === 'Tab' && !e.shiftKey && !e.ctrlKey) {
                 e.preventDefault();
                 if (paused && pendingLines.length > 0) {
+                    // Release one screenful of pending lines
                     releaseScreenful();
+                } else {
+                    // Scroll down one screenful (like more)
+                    elements.outputContainer.scrollBy(0, elements.outputContainer.clientHeight);
                 }
                 elements.input.focus();
             } else if (e.key === 'j' && e.altKey) {
@@ -1711,10 +1715,13 @@
                 e.stopPropagation();  // Prevent document-level handler from catching this
                 sendCommand();
             } else if (e.key === 'Tab' && !e.shiftKey && !e.ctrlKey) {
-                // Tab: Release one screenful of pending lines
+                // Tab: Release one screenful of pending lines, or scroll down
                 e.preventDefault(); // Always prevent default tab behavior
                 if (paused && pendingLines.length > 0) {
                     releaseScreenful();
+                } else {
+                    // Scroll down one screenful (like more)
+                    elements.outputContainer.scrollBy(0, elements.outputContainer.clientHeight);
                 }
             } else if (e.key === 'j' && e.altKey) {
                 // Alt+j: Jump to end, release all pending
