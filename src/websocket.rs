@@ -39,6 +39,7 @@ pub enum WsMessage {
     WorldSwitched { new_index: usize },
     PromptUpdate { world_index: usize, prompt: String },
     PendingLinesUpdate { world_index: usize, count: usize },
+    UnseenCleared { world_index: usize },
 
     // Commands (client -> server)
     SendCommand { world_index: usize, command: String },
@@ -47,6 +48,7 @@ pub enum WsMessage {
     DisconnectWorld { world_index: usize },
     CreateWorld { name: String },
     ReleasePending { world_index: usize },
+    MarkWorldSeen { world_index: usize },
 
     // Settings updates (client -> server)
     UpdateWorldSettings {
@@ -94,6 +96,11 @@ pub struct WorldStateMsg {
     pub prompt: String,
     pub unseen_lines: usize,
     pub settings: WorldSettingsMsg,
+    // Timing info (seconds since event, None if never)
+    pub last_send_secs: Option<u64>,
+    pub last_recv_secs: Option<u64>,
+    pub last_nop_secs: Option<u64>,
+    pub keep_alive_type: String,
 }
 
 /// World settings for WebSocket protocol (password intentionally omitted)

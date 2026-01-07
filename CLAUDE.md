@@ -5,9 +5,8 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## Build Commands
 
 ```bash
-cargo build                          # Build debug
+cargo build                          # Build debug (dynamically linked)
 cargo build --features remote-gui    # Build with remote GUI client (requires X11/Wayland)
-CC=musl-gcc cargo build --target x86_64-unknown-linux-musl --no-default-features --features rustls-backend  # Static build
 cargo run                            # Run the client
 cargo run -- --remote=host:port      # Run as remote GUI client
 cargo test                           # Run all tests
@@ -16,6 +15,29 @@ cargo clippy                         # Lint
 cargo fmt                            # Format code
 cargo fmt -- --check                 # Check formatting without changes
 ```
+
+### Static/Portable Build (musl)
+
+For a portable binary that works on any Linux x86_64 system regardless of glibc version:
+
+```bash
+# Install musl target (one-time setup)
+rustup target add x86_64-unknown-linux-musl
+
+# Build static binary with musl and rustls (no OpenSSL dependency)
+cargo build --target x86_64-unknown-linux-musl --no-default-features --features rustls-backend
+
+# Output: target/x86_64-unknown-linux-musl/debug/clay (or release/)
+```
+
+**Why musl instead of glibc static linking:**
+- glibc static builds cause SIGFPE crashes during DNS resolution (`getaddrinfo`)
+- glibc's NSS (Name Service Switch) requires dynamic loading even in static builds
+- musl handles DNS resolution properly in fully static binaries
+
+**Why rustls instead of native-tls:**
+- native-tls requires OpenSSL, which needs cross-compilation setup for musl
+- rustls is pure Rust and works seamlessly with musl builds
 
 ## Architecture
 

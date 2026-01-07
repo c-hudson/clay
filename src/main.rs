@@ -25,6 +25,7 @@ pub use websocket::{
 use std::io::{self, stdout, BufRead, Write as IoWrite};
 use std::os::unix::io::{AsRawFd, FromRawFd, RawFd};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicPtr, AtomicU32, Ordering};
 use std::time::Duration;
 
 use aes_gcm::{
@@ -1937,10 +1938,115 @@ fn check_action_triggers(
 }
 
 const RELOAD_FDS_ENV: &str = "CLAY_RELOAD_FDS";
+const CRASH_COUNT_ENV: &str = "CLAY_CRASH_COUNT";
+const MAX_CRASH_RESTARTS: u32 = 2;
+
+// Static pointer to App for crash recovery - set when app is running
+static APP_PTR: AtomicPtr<App> = AtomicPtr::new(std::ptr::null_mut());
+// Track current crash count to avoid re-reading env var
+static CRASH_COUNT: AtomicU32 = AtomicU32::new(0);
 
 fn get_reload_state_path() -> PathBuf {
     let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
     PathBuf::from(home).join(".clay.reload")
+}
+
+/// Get the current crash count from environment variable
+fn get_crash_count() -> u32 {
+    std::env::var(CRASH_COUNT_ENV)
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0)
+}
+
+/// Clear the crash count (called after successful operation)
+fn clear_crash_count() {
+    std::env::remove_var(CRASH_COUNT_ENV);
+    CRASH_COUNT.store(0, Ordering::SeqCst);
+}
+
+/// Set the global app pointer for crash recovery
+fn set_app_ptr(app: *mut App) {
+    APP_PTR.store(app, Ordering::SeqCst);
+}
+
+/// Get the global app pointer
+fn get_app_ptr() -> *mut App {
+    APP_PTR.load(Ordering::SeqCst)
+}
+
+/// Attempt to restart after a crash
+fn crash_restart() {
+    let crash_count = CRASH_COUNT.load(Ordering::SeqCst);
+    if crash_count >= MAX_CRASH_RESTARTS {
+        // Already crashed too many times, don't restart
+        eprintln!("Maximum crash restarts ({}) reached, not restarting.", MAX_CRASH_RESTARTS);
+        return;
+    }
+
+    // Try to save state from the app pointer
+    let app_ptr = get_app_ptr();
+    if !app_ptr.is_null() {
+        // SAFETY: We set this pointer in run_app and it remains valid until run_app returns
+        let app = unsafe { &*app_ptr };
+
+        // Try to save state
+        if let Err(e) = save_reload_state(app) {
+            eprintln!("Failed to save state during crash: {}", e);
+        }
+
+        // Clear CLOEXEC on socket fds so they survive exec
+        for world in &app.worlds {
+            if let Some(fd) = world.socket_fd {
+                let _ = clear_cloexec(fd);
+            }
+        }
+
+        // Pass fd list via environment
+        let fds_str: String = app.worlds
+            .iter()
+            .filter_map(|w| w.socket_fd)
+            .map(|fd| fd.to_string())
+            .collect::<Vec<_>>()
+            .join(",");
+        std::env::set_var(RELOAD_FDS_ENV, &fds_str);
+    }
+
+    // Increment crash count in env
+    let new_count = crash_count + 1;
+    std::env::set_var(CRASH_COUNT_ENV, new_count.to_string());
+
+    // Try to exec the binary
+    if let Ok((exe, _)) = get_executable_path() {
+        use std::os::unix::process::CommandExt;
+        let mut args: Vec<String> = std::env::args()
+            .skip(1)
+            .filter(|a| a != "--reload" && a != "--crash")
+            .collect();
+        args.push("--crash".to_string());
+
+        // This replaces the current process if successful
+        let _ = std::process::Command::new(&exe).args(&args).exec();
+    }
+}
+
+/// Set up the crash handler (panic hook)
+fn setup_crash_handler() {
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |panic_info| {
+        // Restore terminal first to ensure output is visible
+        let _ = disable_raw_mode();
+        let _ = execute!(std::io::stdout(), LeaveAlternateScreen);
+
+        // Print the panic info using the default handler
+        eprintln!("\n\nClay crashed! Attempting to restart...\n");
+        default_hook(panic_info);
+
+        // Attempt to restart
+        crash_restart();
+
+        // If we get here, restart failed - exit normally
+    }));
 }
 
 struct World {
@@ -2323,11 +2429,23 @@ impl App {
     }
 
     fn current_world(&self) -> &World {
-        &self.worlds[self.current_world_index]
+        // Safety: clamp index to valid range to prevent panic
+        let idx = if self.worlds.is_empty() {
+            0  // Will panic below, but ensure_has_world() should prevent this
+        } else {
+            self.current_world_index.min(self.worlds.len() - 1)
+        };
+        &self.worlds[idx]
     }
 
     fn current_world_mut(&mut self) -> &mut World {
-        &mut self.worlds[self.current_world_index]
+        // Safety: clamp index to valid range to prevent panic
+        let idx = if self.worlds.is_empty() {
+            0  // Will panic below, but ensure_has_world() should prevent this
+        } else {
+            self.current_world_index.min(self.worlds.len() - 1)
+        };
+        &mut self.worlds[idx]
     }
 
     fn switch_world(&mut self, index: usize) {
@@ -2497,6 +2615,9 @@ impl App {
     fn next_world_all(&mut self) {
         // Cycle through all worlds that have ever been connected (alphabetically)
         let sorted = self.get_sorted_world_indices();
+        if sorted.is_empty() {
+            return;
+        }
         let current_pos = sorted.iter().position(|&i| i == self.current_world_index).unwrap_or(0);
         let len = sorted.len();
 
@@ -2514,6 +2635,9 @@ impl App {
     fn prev_world_all(&mut self) {
         // Cycle through all worlds that have ever been connected (alphabetically)
         let sorted = self.get_sorted_world_indices();
+        if sorted.is_empty() {
+            return;
+        }
         let current_pos = sorted.iter().position(|&i| i == self.current_world_index).unwrap_or(0);
         let len = sorted.len();
 
@@ -2647,6 +2771,10 @@ impl App {
                     keep_alive_type: world.settings.keep_alive_type.name().to_string(),
                     keep_alive_cmd: world.settings.keep_alive_cmd.clone(),
                 },
+                last_send_secs: world.last_send_time.map(|t| t.elapsed().as_secs()),
+                last_recv_secs: world.last_receive_time.map(|t| t.elapsed().as_secs()),
+                last_nop_secs: world.last_nop_time.map(|t| t.elapsed().as_secs()),
+                keep_alive_type: world.settings.keep_alive_type.name().to_string(),
             }
         }).collect();
 
@@ -2794,8 +2922,8 @@ impl App {
     fn scroll_output_up(&mut self) {
         let more_mode = self.settings.more_mode_enabled;
         let target_visual_lines = (self.output_height as usize).saturating_sub(2).max(1);
-        let visible_height = self.output_height as usize;
-        let width = self.output_width as usize;
+        let visible_height = (self.output_height as usize).max(1);
+        let width = (self.output_width as usize).max(1);
         let world = self.current_world_mut();
 
         // Calculate the minimum scroll_offset where line 0 is at the top
@@ -2842,7 +2970,7 @@ impl App {
 
     fn scroll_output_down(&mut self) {
         let target_visual_lines = (self.output_height as usize).saturating_sub(2).max(1);
-        let width = self.output_width as usize;
+        let width = (self.output_width as usize).max(1);
         let world = self.current_world_mut();
         let max_scroll = world.output_lines.len().saturating_sub(1);
 
@@ -4363,6 +4491,12 @@ mod remote_gui {
                             // Update local actions from server
                             self.actions = actions;
                         }
+                        WsMessage::UnseenCleared { world_index } => {
+                            // Another client (console or web) has viewed this world
+                            if world_index < self.worlds.len() {
+                                self.worlds[world_index].unseen_lines = 0;
+                            }
+                        }
                         _ => {}
                     }
                 }
@@ -5270,6 +5404,10 @@ mod remote_gui {
                             self.current_world = new_world;
                             self.worlds[new_world].unseen_lines = 0;
                             self.scroll_offset = None; // Reset scroll
+                            // Notify server so other clients sync their unseen counts
+                            if let Some(ref tx) = self.ws_tx {
+                                let _ = tx.send(WsMessage::MarkWorldSeen { world_index: new_world });
+                            }
                         }
                     }
 
@@ -6300,6 +6438,29 @@ async fn main() -> io::Result<()> {
         }
     }
 
+    // Set up SIGFPE handler to print debug info before crashing
+    unsafe {
+        extern "C" fn sigfpe_handler(_: libc::c_int) {
+            // Restore terminal before printing
+            let _ = disable_raw_mode();
+            let _ = execute!(std::io::stdout(), LeaveAlternateScreen);
+            eprintln!("\n\n=== SIGFPE (Floating Point Exception) detected! ===");
+            eprintln!("This is typically caused by division by zero.");
+            eprintln!("Please report this bug with the steps to reproduce.");
+
+            // Try to print a backtrace
+            eprintln!("\nBacktrace:");
+            let bt = std::backtrace::Backtrace::force_capture();
+            eprintln!("{}", bt);
+
+            std::process::exit(136);  // 128 + 8 (SIGFPE)
+        }
+        libc::signal(libc::SIGFPE, sigfpe_handler as libc::sighandler_t);
+    }
+
+    // Set up crash handler for automatic recovery
+    setup_crash_handler();
+
     enable_raw_mode()?;
     let mut stdout = stdout();
     // Use explicit cursor positioning and clearing for Windows 11 compatibility
@@ -6331,15 +6492,31 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
 
     // Check if we're in reload mode (via --reload command line argument)
     let is_reload = std::env::args().any(|a| a == "--reload");
+    // Check if we're recovering from a crash (via --crash command line argument)
+    let is_crash = std::env::args().any(|a| a == "--crash");
+
+    // Initialize crash count from environment variable
+    let crash_count = get_crash_count();
+    CRASH_COUNT.store(crash_count, Ordering::SeqCst);
 
     // Collect any startup messages to display after ensuring we have a world
     let mut startup_messages: Vec<String> = Vec::new();
 
-    if is_reload {
+    // Crash recovery also loads state like reload
+    let should_load_state = is_reload || is_crash;
+
+    if should_load_state {
         // Load the reload state
         match load_reload_state(&mut app) {
             Ok(true) => {
-                startup_messages.push("Hot reload successful!".to_string());
+                if is_crash {
+                    startup_messages.push(format!(
+                        "Crash recovery successful (attempt {}/{})",
+                        crash_count, MAX_CRASH_RESTARTS
+                    ));
+                } else {
+                    startup_messages.push("Hot reload successful!".to_string());
+                }
             }
             Ok(false) => {
                 startup_messages.push("Warning: No reload state found, starting fresh.".to_string());
@@ -6371,8 +6548,8 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
 
     let (event_tx, mut event_rx) = mpsc::channel::<AppEvent>(100);
 
-    // If in reload mode, reconstruct connections from saved fds
-    if is_reload {
+    // If in reload or crash recovery mode, reconstruct connections from saved fds
+    if should_load_state {
         // First pass: identify TLS worlds that need to be disconnected
         let mut tls_disconnect_worlds: Vec<usize> = Vec::new();
         for (world_idx, world) in app.worlds.iter().enumerate() {
@@ -6382,13 +6559,16 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
         }
 
         // Disconnect TLS worlds
+        let tls_msg = if is_crash {
+            "TLS connection was closed during crash recovery. Use /connect to reconnect."
+        } else {
+            "TLS connection was closed during reload. Use /connect to reconnect."
+        };
         for world_idx in tls_disconnect_worlds {
             app.worlds[world_idx].connected = false;
             app.worlds[world_idx].command_tx = None;
             app.worlds[world_idx].socket_fd = None;
-            app.worlds[world_idx]
-                .output_lines
-                .push("TLS connection was closed during reload. Use /connect to reconnect.".to_string());
+            app.worlds[world_idx].output_lines.push(tls_msg.to_string());
         }
 
         // Second pass: reconstruct plain TCP connections
@@ -6504,14 +6684,13 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                     }
 
                                     // Send cleaned data to main loop
-                                    if !cleaned.is_empty() {
-                                        if event_tx_read
+                                    if !cleaned.is_empty()
+                                        && event_tx_read
                                             .send(AppEvent::ServerData(world_idx, cleaned))
                                             .await
                                             .is_err()
-                                        {
-                                            break;
-                                        }
+                                    {
+                                        break;
                                     }
                                 }
                             }
@@ -6746,6 +6925,14 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
     // Skip the first tick which fires immediately
     keepalive_interval.tick().await;
 
+    // Set the app pointer for crash recovery
+    // SAFETY: app lives for the duration of this function and the pointer is only used
+    // in the panic hook which only runs while this function is on the stack
+    set_app_ptr(&mut app as *mut App);
+
+    // Track if we've cleared the crash count after successful user input
+    let mut crash_count_cleared = false;
+
     loop {
         // Use tokio::select! to efficiently wait for events without busy-polling
         tokio::select! {
@@ -6777,6 +6964,13 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                             }
                         }
                         KeyAction::SendCommand(cmd) => {
+                            // Clear crash count after first successful user input
+                            // This indicates the client is stable and running normally
+                            if !crash_count_cleared {
+                                clear_crash_count();
+                                crash_count_cleared = true;
+                            }
+
                             app.spell_state.reset();
                             app.suggestion_message = None;
 
@@ -6930,6 +7124,10 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                     app.add_output("HTTPS web interface stopped.");
                                 }
                             }
+                        }
+                        KeyAction::SwitchedWorld(world_index) => {
+                            // Console switched to a new world, broadcast to remote clients
+                            app.ws_broadcast(WsMessage::UnseenCleared { world_index });
                         }
                         KeyAction::None => {}
                     }
@@ -7131,7 +7329,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                         world_index,
                                         data: actions_text,
                                     });
-                                } else if command.starts_with('/') && !is_internal_command(&command[1..].split_whitespace().next().unwrap_or("")) {
+                                } else if command.starts_with('/') && !is_internal_command(command[1..].split_whitespace().next().unwrap_or("")) {
                                     // Check if this is an action command
                                     let action_name = command[1..].split_whitespace().next().unwrap_or("");
                                     if let Some(action) = app.settings.actions.iter().find(|a| a.name.eq_ignore_ascii_case(action_name)) {
@@ -7205,6 +7403,14 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                     // Mark the restored world as seen (data may have arrived during disconnect)
                                     app.current_world_mut().mark_seen();
                                     // WorldDisconnected broadcast happens via AppEvent::Disconnected
+                                }
+                            }
+                            WsMessage::MarkWorldSeen { world_index } => {
+                                // A remote client has viewed this world - clear unseen count
+                                if world_index < app.worlds.len() {
+                                    app.worlds[world_index].mark_seen();
+                                    // Broadcast to all clients so they update their UI
+                                    app.ws_broadcast(WsMessage::UnseenCleared { world_index });
                                 }
                             }
                             WsMessage::UpdateWorldSettings { world_index, name, hostname, port, user, use_ssl, keep_alive_type, keep_alive_cmd } => {
@@ -7566,7 +7772,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                     lines.join("\n")
                                 };
                                 app.ws_broadcast(WsMessage::ServerData { world_index, data: actions_text });
-                            } else if command.starts_with('/') && !is_internal_command(&command[1..].split_whitespace().next().unwrap_or("")) {
+                            } else if command.starts_with('/') && !is_internal_command(command[1..].split_whitespace().next().unwrap_or("")) {
                                 let action_name = command[1..].split_whitespace().next().unwrap_or("");
                                 if let Some(action) = app.settings.actions.iter().find(|a| a.name.eq_ignore_ascii_case(action_name)) {
                                     let commands = split_action_commands(&action.command);
@@ -7674,6 +7880,7 @@ enum KeyAction {
     Redraw,  // Force screen redraw
     Reload,  // Trigger /reload
     UpdateWebSocket, // Check and update WebSocket server state
+    SwitchedWorld(usize), // Console switched to this world, broadcast unseen clear
     None,
 }
 
@@ -8587,11 +8794,11 @@ fn handle_key_event(key: KeyEvent, app: &mut App) -> KeyAction {
         // Switch worlds (Up/Down without modifiers)
         (KeyModifiers::NONE, KeyCode::Up) => {
             app.prev_world();
-            KeyAction::None
+            KeyAction::SwitchedWorld(app.current_world_index)
         }
         (KeyModifiers::NONE, KeyCode::Down) => {
             app.next_world();
-            KeyAction::None
+            KeyAction::SwitchedWorld(app.current_world_index)
         }
 
         // Resize input area
@@ -8607,11 +8814,11 @@ fn handle_key_event(key: KeyEvent, app: &mut App) -> KeyAction {
         // Switch worlds (all that have been connected)
         (KeyModifiers::SHIFT, KeyCode::Up) => {
             app.prev_world_all();
-            KeyAction::None
+            KeyAction::SwitchedWorld(app.current_world_index)
         }
         (KeyModifiers::SHIFT, KeyCode::Down) => {
             app.next_world_all();
-            KeyAction::None
+            KeyAction::SwitchedWorld(app.current_world_index)
         }
 
         // Clear input
@@ -9104,14 +9311,13 @@ async fn handle_command(cmd: &str, app: &mut App, event_tx: mpsc::Sender<AppEven
                                         }
 
                                         // Send cleaned data to main loop
-                                        if !cleaned.is_empty() {
-                                            if event_tx_read
+                                        if !cleaned.is_empty()
+                                            && event_tx_read
                                                 .send(AppEvent::ServerData(world_idx, cleaned))
                                                 .await
                                                 .is_err()
-                                            {
-                                                break;
-                                            }
+                                        {
+                                            break;
                                         }
                                     }
                                 }
@@ -9387,7 +9593,7 @@ async fn handle_command(cmd: &str, app: &mut App, event_tx: mpsc::Sender<AppEven
 }
 
 fn ui(f: &mut Frame, app: &mut App) {
-    let total_height = f.area().height;
+    let total_height = f.area().height.max(3);  // Minimum 3 lines for output + separator + input
 
     // Layout: output area, separator bar (1 line), input area
     let separator_height = 1;
@@ -9395,8 +9601,9 @@ fn ui(f: &mut Frame, app: &mut App) {
     let output_height = total_height.saturating_sub(separator_height + input_total_height);
 
     // Store output dimensions for scrolling and more-mode calculations
-    app.output_height = output_height;
-    app.output_width = f.area().width;
+    // Use max(1) to prevent any division by zero elsewhere
+    app.output_height = output_height.max(1);
+    app.output_width = f.area().width.max(1);
 
     let chunks = Layout::default()
         .direction(Direction::Vertical)
@@ -9453,8 +9660,8 @@ fn render_output_crossterm(app: &App) {
 
     let mut stdout = std::io::stdout();
     let world = app.current_world();
-    let visible_height = app.output_height as usize;
-    let term_width = app.output_width as usize;
+    let visible_height = (app.output_height as usize).max(1);
+    let term_width = (app.output_width as usize).max(1);
 
     // Calculate visible width of a string (excluding ANSI escape sequences)
     fn visible_width(s: &str) -> usize {
@@ -9609,7 +9816,8 @@ fn render_output_crossterm(app: &App) {
     let input_area_y = app.output_height + separator_height;
     let prompt = &app.current_world().prompt;
     let prompt_visible_len = visible_width(prompt);
-    let input_width = app.output_width as usize;
+    // Use max(1) to prevent division by zero
+    let input_width = (app.output_width as usize).max(1);
     let chars_before_cursor = app.input.buffer[..app.input.cursor_position].chars().count();
 
     let effective_chars = if app.input.viewport_start_line == 0 {
@@ -10698,21 +10906,18 @@ fn render_world_selector_popup(f: &mut Frame, app: &App) {
         .map(|w| w.name.chars().count())
         .max()
         .unwrap_or(5)
-        .max(5)  // Minimum "World"
-        .min(20); // Max 20
+        .clamp(5, 20); // Min "World", max 20
     let host_width = app.worlds.iter()
         .map(|w| w.settings.hostname.chars().count())
         .max()
         .unwrap_or(8)
-        .max(8)  // Minimum "Hostname"
-        .min(25); // Max 25
+        .clamp(8, 25); // Min "Hostname", max 25
     let port_width = 6; // Fixed for "Port" and typical values
     let user_width = app.worlds.iter()
         .map(|w| w.settings.user.chars().count())
         .max()
         .unwrap_or(4)
-        .max(4)  // Minimum "User"
-        .min(15); // Max 15
+        .clamp(4, 15); // Min "User", max 15
 
     // Calculate total content width: marker(2) + columns + spacing(6) + some padding(4)
     let content_width = 2 + name_width + host_width + port_width + user_width + 6 + 4;
@@ -10721,7 +10926,7 @@ fn render_world_selector_popup(f: &mut Frame, app: &App) {
 
     // Add borders (2) and apply screen limits
     let popup_width = ((min_content_width + 2) as u16).min(area.width.saturating_sub(4));
-    let popup_height = ((filtered_indices.len() + 8) as u16).min(area.height.saturating_sub(4)).max(10).min(20);
+    let popup_height = ((filtered_indices.len() + 8) as u16).min(area.height.saturating_sub(4)).clamp(10, 20);
 
     let x = area.width.saturating_sub(popup_width) / 2;
     let y = area.height.saturating_sub(popup_height) / 2;

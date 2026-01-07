@@ -8,6 +8,26 @@
 </head>
 <body>
     <div id="app">
+        <!-- Toolbar -->
+        <div id="toolbar">
+            <div id="toolbar-left">
+                <button id="menu-btn" class="toolbar-btn" title="Menu">☰</button>
+                <div id="menu-dropdown" class="dropdown">
+                    <div class="dropdown-item" data-action="worlds">Worlds List</div>
+                    <div class="dropdown-item" data-action="world-selector">World Selector</div>
+                    <div class="dropdown-item" data-action="actions">Actions</div>
+                    <div class="dropdown-divider"></div>
+                    <div class="dropdown-item" data-action="toggle-tags">Toggle Tags</div>
+                </div>
+            </div>
+            <div id="toolbar-center">
+                <button id="font-small" class="font-btn" title="Small font (phone)">S</button>
+                <button id="font-medium" class="font-btn active" title="Medium font (default)">M</button>
+                <button id="font-large" class="font-btn" title="Large font (tablet)">L</button>
+            </div>
+            <div id="toolbar-right"></div>
+        </div>
+
         <!-- Main output area -->
         <div id="output-container">
             <div id="output"></div>
@@ -98,8 +118,10 @@
                         <thead>
                             <tr>
                                 <th>World</th>
-                                <th>Status</th>
                                 <th>Unseen</th>
+                                <th>Send/Recv</th>
+                                <th>KeepAlive</th>
+                                <th>Last/Next</th>
                             </tr>
                         </thead>
                         <tbody id="worlds-table-body"></tbody>
@@ -120,6 +142,7 @@
                 </div>
                 <div id="world-selector-list" class="world-selector-list"></div>
                 <div class="modal-buttons">
+                    <button id="world-edit-btn">Edit</button>
                     <button id="world-connect-btn">Connect</button>
                     <button id="world-switch-btn">Switch</button>
                     <button id="world-selector-cancel-btn">Cancel</button>

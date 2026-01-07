@@ -39,6 +39,107 @@ body {
     overflow: hidden;
 }
 
+/* Toolbar */
+#toolbar {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 4px 8px;
+    background-color: #111;
+    border-bottom: 1px solid var(--separator-color);
+    min-height: 32px;
+}
+
+#toolbar-left {
+    position: relative;
+}
+
+#toolbar-center {
+    display: flex;
+    gap: 4px;
+}
+
+#toolbar-right {
+    min-width: 40px;
+}
+
+.toolbar-btn {
+    background-color: #222;
+    border: 1px solid var(--separator-color);
+    color: var(--text-color);
+    padding: 4px 10px;
+    cursor: pointer;
+    font-family: inherit;
+    font-size: 16px;
+    border-radius: 3px;
+}
+
+.toolbar-btn:hover {
+    background-color: #333;
+}
+
+.toolbar-btn:active {
+    background-color: #444;
+}
+
+/* Dropdown menu */
+.dropdown {
+    display: none;
+    position: absolute;
+    top: 100%;
+    left: 0;
+    background-color: #1a1a1a;
+    border: 1px solid var(--separator-color);
+    min-width: 160px;
+    z-index: 1001;
+    margin-top: 2px;
+    border-radius: 3px;
+    box-shadow: 0 4px 8px rgba(0, 0, 0, 0.5);
+}
+
+.dropdown.visible {
+    display: block;
+}
+
+.dropdown-item {
+    padding: 8px 12px;
+    cursor: pointer;
+    color: var(--text-color);
+}
+
+.dropdown-item:hover {
+    background-color: #333;
+}
+
+.dropdown-divider {
+    height: 1px;
+    background-color: var(--separator-color);
+    margin: 4px 0;
+}
+
+/* Font size buttons */
+.font-btn {
+    background-color: #222;
+    border: 1px solid var(--separator-color);
+    color: var(--text-color);
+    padding: 4px 10px;
+    cursor: pointer;
+    font-family: inherit;
+    font-size: 12px;
+    min-width: 28px;
+    border-radius: 3px;
+}
+
+.font-btn:hover {
+    background-color: #333;
+}
+
+.font-btn.active {
+    background-color: var(--accent-color);
+    color: #000;
+    border-color: var(--accent-color);
+}
+
 /* Output area - main display */
 #output-container {
     flex: 1;
@@ -600,10 +701,14 @@ body {
 .world-selector-item .world-info {
     display: flex;
     flex-direction: column;
+    align-items: flex-start;
+    text-align: left;
 }
 
 .world-selector-item .world-name {
     font-weight: bold;
+    text-align: left;
+    white-space: normal;
 }
 
 .world-selector-item .world-host {

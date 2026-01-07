@@ -20,6 +20,12 @@
         authError: document.getElementById('auth-error'),
         authSubmit: document.getElementById('auth-submit'),
         connectingOverlay: document.getElementById('connecting-overlay'),
+        // Toolbar
+        menuBtn: document.getElementById('menu-btn'),
+        menuDropdown: document.getElementById('menu-dropdown'),
+        fontSmall: document.getElementById('font-small'),
+        fontMedium: document.getElementById('font-medium'),
+        fontLarge: document.getElementById('font-large'),
         // Actions popup
         actionsModal: document.getElementById('actions-modal'),
         actionsList: document.getElementById('actions-list'),
@@ -40,6 +46,7 @@
         worldSelectorModal: document.getElementById('world-selector-modal'),
         worldFilter: document.getElementById('world-filter'),
         worldSelectorList: document.getElementById('world-selector-list'),
+        worldEditBtn: document.getElementById('world-edit-btn'),
         worldConnectBtn: document.getElementById('world-connect-btn'),
         worldSwitchBtn: document.getElementById('world-switch-btn'),
         worldSelectorCancelBtn: document.getElementById('world-selector-cancel-btn')
@@ -82,6 +89,17 @@
     let selectedWorldIndex = -1;
     let selectedWorldsRowIndex = -1; // For worlds list popup (/worlds)
 
+    // Menu state
+    let menuOpen = false;
+
+    // Font size state: 'small' (11px), 'medium' (14px), 'large' (18px)
+    let currentFontSize = 'medium';
+    const fontSizes = {
+        small: 11,   // Phone
+        medium: 14,  // Default
+        large: 18    // Tablet
+    };
+
     // Initialize
     function init() {
         setupEventListeners();
@@ -92,7 +110,8 @@
 
     // Get visible line count in output area
     function getVisibleLineCount() {
-        const lineHeight = 14 * 1.2; // font-size * line-height
+        const fontSize = fontSizes[currentFontSize] || 14;
+        const lineHeight = fontSize * 1.2; // font-size * line-height
         return Math.floor(elements.outputContainer.clientHeight / lineHeight);
     }
 
@@ -291,6 +310,14 @@
                 }
                 break;
 
+            case 'UnseenCleared':
+                // Another client (console, web, or GUI) has viewed this world
+                if (msg.world_index !== undefined && worlds[msg.world_index]) {
+                    worlds[msg.world_index].unseen_lines = 0;
+                    updateStatusBar();
+                }
+                break;
+
             default:
                 console.log('Unknown message type:', msg.type);
         }
@@ -454,6 +481,8 @@
             linesSincePause = 0;
             renderOutput();
             updateStatusBar();
+            // Notify server that this world has been seen (syncs unseen count)
+            send({ type: 'MarkWorldSeen', world_index: index });
         }
     }
 
@@ -518,7 +547,7 @@
         scrollToBottom();
     }
 
-    // Parse ANSI escape codes
+    // Parse ANSI escape codes (supports 16, 256, and true color)
     function parseAnsi(text) {
         // Handle various escape character representations
         // Some systems send \x1b, others might send \u001b, or the character might be escaped in JSON
@@ -539,19 +568,48 @@
             return ''; // Strip other CSI sequences
         });
 
+        // 256-color palette (first 16 are standard, 16-231 are RGB cube, 232-255 are grayscale)
+        function color256ToRgb(n) {
+            if (n < 16) {
+                // Standard colors
+                const standard = [
+                    [0, 0, 0], [205, 0, 0], [0, 205, 0], [205, 205, 0],
+                    [0, 0, 205], [205, 0, 205], [0, 205, 205], [192, 192, 192],
+                    [128, 128, 128], [255, 0, 0], [0, 255, 0], [255, 255, 0],
+                    [0, 0, 255], [255, 0, 255], [0, 255, 255], [255, 255, 255]
+                ];
+                return standard[n];
+            } else if (n < 232) {
+                // 216 color cube (6x6x6)
+                n -= 16;
+                const r = Math.floor(n / 36) * 51;
+                const g = Math.floor((n % 36) / 6) * 51;
+                const b = (n % 6) * 51;
+                return [r, g, b];
+            } else {
+                // Grayscale (24 shades)
+                const gray = (n - 232) * 10 + 8;
+                return [gray, gray, gray];
+            }
+        }
+
         // Now parse SGR (color/style) sequences
         const ansiRegex = /\x1b\[([0-9;]*)m/g;
         let result = '';
         let lastIndex = 0;
         let currentClasses = [];
+        let currentFgStyle = '';
+        let currentBgStyle = '';
 
         let match;
         while ((match = ansiRegex.exec(text)) !== null) {
             // Add text before this escape sequence
             if (match.index > lastIndex) {
                 const textBefore = escapeHtml(text.substring(lastIndex, match.index));
-                if (currentClasses.length > 0) {
-                    result += `<span class="${currentClasses.join(' ')}">${textBefore}</span>`;
+                const classes = currentClasses.length > 0 ? ` class="${currentClasses.join(' ')}"` : '';
+                const styles = (currentFgStyle || currentBgStyle) ? ` style="${currentFgStyle}${currentBgStyle}"` : '';
+                if (classes || styles) {
+                    result += `<span${classes}${styles}>${textBefore}</span>`;
                 } else {
                     result += textBefore;
                 }
@@ -559,9 +617,14 @@
 
             // Parse the codes
             const codes = match[1].split(';').map(c => parseInt(c, 10) || 0);
-            codes.forEach(code => {
+            let i = 0;
+            while (i < codes.length) {
+                const code = codes[i];
                 if (code === 0) {
+                    // Reset all
                     currentClasses = [];
+                    currentFgStyle = '';
+                    currentBgStyle = '';
                 } else if (code === 1) {
                     currentClasses.push('ansi-bold');
                 } else if (code === 3) {
@@ -569,16 +632,76 @@
                 } else if (code === 4) {
                     currentClasses.push('ansi-underline');
                 } else if (code >= 30 && code <= 37) {
-                    // Remove old foreground color
-                    currentClasses = currentClasses.filter(c => !c.startsWith('ansi-') || c.includes('bg-'));
+                    // Basic foreground colors
+                    currentClasses = currentClasses.filter(c => !c.startsWith('ansi-') || c.startsWith('ansi-bg-') || c === 'ansi-bold' || c === 'ansi-italic' || c === 'ansi-underline');
+                    currentFgStyle = '';
                     const colors = ['black', 'red', 'green', 'yellow', 'blue', 'magenta', 'cyan', 'white'];
                     currentClasses.push('ansi-' + colors[code - 30]);
+                } else if (code === 38) {
+                    // Extended foreground color
+                    if (codes[i + 1] === 5 && codes.length > i + 2) {
+                        // 256-color mode: 38;5;N
+                        const colorNum = codes[i + 2];
+                        const rgb = color256ToRgb(colorNum);
+                        currentClasses = currentClasses.filter(c => !c.startsWith('ansi-') || c.startsWith('ansi-bg-') || c === 'ansi-bold' || c === 'ansi-italic' || c === 'ansi-underline');
+                        currentFgStyle = `color:rgb(${rgb[0]},${rgb[1]},${rgb[2]});`;
+                        i += 2;
+                    } else if (codes[i + 1] === 2 && codes.length > i + 4) {
+                        // True color mode: 38;2;R;G;B
+                        const r = codes[i + 2];
+                        const g = codes[i + 3];
+                        const b = codes[i + 4];
+                        currentClasses = currentClasses.filter(c => !c.startsWith('ansi-') || c.startsWith('ansi-bg-') || c === 'ansi-bold' || c === 'ansi-italic' || c === 'ansi-underline');
+                        currentFgStyle = `color:rgb(${r},${g},${b});`;
+                        i += 4;
+                    }
+                } else if (code === 39) {
+                    // Default foreground color
+                    currentClasses = currentClasses.filter(c => !c.startsWith('ansi-') || c.startsWith('ansi-bg-') || c === 'ansi-bold' || c === 'ansi-italic' || c === 'ansi-underline');
+                    currentFgStyle = '';
+                } else if (code >= 40 && code <= 47) {
+                    // Basic background colors
+                    currentClasses = currentClasses.filter(c => !c.startsWith('ansi-bg-'));
+                    currentBgStyle = '';
+                    const colors = ['black', 'red', 'green', 'yellow', 'blue', 'magenta', 'cyan', 'white'];
+                    currentClasses.push('ansi-bg-' + colors[code - 40]);
+                } else if (code === 48) {
+                    // Extended background color
+                    if (codes[i + 1] === 5 && codes.length > i + 2) {
+                        // 256-color mode: 48;5;N
+                        const colorNum = codes[i + 2];
+                        const rgb = color256ToRgb(colorNum);
+                        currentClasses = currentClasses.filter(c => !c.startsWith('ansi-bg-'));
+                        currentBgStyle = `background-color:rgb(${rgb[0]},${rgb[1]},${rgb[2]});`;
+                        i += 2;
+                    } else if (codes[i + 1] === 2 && codes.length > i + 4) {
+                        // True color mode: 48;2;R;G;B
+                        const r = codes[i + 2];
+                        const g = codes[i + 3];
+                        const b = codes[i + 4];
+                        currentClasses = currentClasses.filter(c => !c.startsWith('ansi-bg-'));
+                        currentBgStyle = `background-color:rgb(${r},${g},${b});`;
+                        i += 4;
+                    }
+                } else if (code === 49) {
+                    // Default background color
+                    currentClasses = currentClasses.filter(c => !c.startsWith('ansi-bg-'));
+                    currentBgStyle = '';
                 } else if (code >= 90 && code <= 97) {
-                    currentClasses = currentClasses.filter(c => !c.startsWith('ansi-') || c.includes('bg-'));
+                    // Bright foreground colors
+                    currentClasses = currentClasses.filter(c => !c.startsWith('ansi-') || c.startsWith('ansi-bg-') || c === 'ansi-bold' || c === 'ansi-italic' || c === 'ansi-underline');
+                    currentFgStyle = '';
                     const colors = ['black', 'red', 'green', 'yellow', 'blue', 'magenta', 'cyan', 'white'];
                     currentClasses.push('ansi-bright-' + colors[code - 90]);
+                } else if (code >= 100 && code <= 107) {
+                    // Bright background colors
+                    currentClasses = currentClasses.filter(c => !c.startsWith('ansi-bg-'));
+                    currentBgStyle = '';
+                    const colors = ['black', 'red', 'green', 'yellow', 'blue', 'magenta', 'cyan', 'white'];
+                    currentClasses.push('ansi-bg-bright-' + colors[code - 100]);
                 }
-            });
+                i++;
+            }
 
             lastIndex = match.index + match[0].length;
         }
@@ -586,8 +709,10 @@
         // Add remaining text
         if (lastIndex < text.length) {
             const remaining = escapeHtml(text.substring(lastIndex));
-            if (currentClasses.length > 0) {
-                result += `<span class="${currentClasses.join(' ')}">${remaining}</span>`;
+            const classes = currentClasses.length > 0 ? ` class="${currentClasses.join(' ')}"` : '';
+            const styles = (currentFgStyle || currentBgStyle) ? ` style="${currentFgStyle}${currentBgStyle}"` : '';
+            if (classes || styles) {
+                result += `<span${classes}${styles}>${remaining}</span>`;
             } else {
                 result += remaining;
             }
@@ -607,6 +732,13 @@
         const div = document.createElement('div');
         div.textContent = text;
         return div.innerHTML;
+    }
+
+    // Strip ANSI escape codes from text
+    function stripAnsi(text) {
+        if (!text) return text;
+        // Remove all ANSI CSI sequences
+        return text.replace(/\x1b\[[0-9;]*[A-Za-z@`~]/g, '').replace(/[\x00-\x1f]/g, '');
     }
 
     // Linkify URLs in HTML text (after ANSI parsing)
@@ -702,7 +834,8 @@
         } else if (!isAtBottom()) {
             // Calculate lines from bottom
             const container = elements.outputContainer;
-            const lineHeight = 14 * 1.2;
+            const fontSize = fontSizes[currentFontSize] || 14;
+            const lineHeight = fontSize * 1.2;
             const linesFromBottom = Math.floor((container.scrollHeight - container.scrollTop - container.clientHeight) / lineHeight);
             elements.statusIndicator.textContent = 'Hist:' + formatCount(linesFromBottom);
             elements.statusIndicator.className = 'scrolled';
@@ -739,7 +872,8 @@
     // Set input area height (number of lines)
     function setInputHeight(lines) {
         inputHeight = Math.max(1, Math.min(15, lines));
-        const lineHeight = 1.2 * 14; // line-height * font-size
+        const fontSize = fontSizes[currentFontSize] || 14;
+        const lineHeight = 1.2 * fontSize; // line-height * font-size
         elements.input.style.height = (inputHeight * lineHeight) + 'px';
         elements.input.rows = inputHeight;
     }
@@ -936,22 +1070,75 @@
 
     // Scroll the selected row into view in worlds table
     function scrollSelectedRowIntoView() {
-        const container = document.getElementById('worlds-table-container');
-        const selectedRow = container?.querySelector('tr.selected-row');
-        if (selectedRow && container) {
-            selectedRow.scrollIntoView({ block: 'nearest', behavior: 'auto' });
-        }
+        // Use requestAnimationFrame to ensure DOM is updated before scrolling
+        requestAnimationFrame(() => {
+            const container = document.getElementById('worlds-table-container');
+            const selectedRow = container?.querySelector('tr.selected-row');
+            if (selectedRow && container) {
+                // Calculate if element is visible in the scrollable container
+                const containerRect = container.getBoundingClientRect();
+                const rowRect = selectedRow.getBoundingClientRect();
+
+                // Check if row is above or below the visible area
+                if (rowRect.top < containerRect.top) {
+                    // Row is above visible area - scroll up
+                    selectedRow.scrollIntoView({ block: 'start', behavior: 'auto' });
+                } else if (rowRect.bottom > containerRect.bottom) {
+                    // Row is below visible area - scroll down
+                    selectedRow.scrollIntoView({ block: 'end', behavior: 'auto' });
+                }
+            }
+        });
+    }
+
+    // Format elapsed seconds like the console
+    function formatElapsed(secs) {
+        if (secs === null || secs === undefined) return '-';
+        if (secs < 60) return secs + 's';
+        if (secs < 3600) return Math.floor(secs / 60) + 'm';
+        if (secs < 86400) return Math.floor(secs / 3600) + 'h';
+        return Math.floor(secs / 86400) + 'd';
+    }
+
+    // Calculate next keepalive time
+    function formatNextKA(lastSendSecs, lastRecvSecs) {
+        const KEEPALIVE_SECS = 5 * 60; // 5 minutes
+        const lastActivity = Math.min(
+            lastSendSecs !== null && lastSendSecs !== undefined ? lastSendSecs : KEEPALIVE_SECS,
+            lastRecvSecs !== null && lastRecvSecs !== undefined ? lastRecvSecs : KEEPALIVE_SECS
+        );
+        const remaining = Math.max(0, KEEPALIVE_SECS - lastActivity);
+        if (remaining < 60) return remaining + 's';
+        return Math.floor(remaining / 60) + 'm';
     }
 
     function renderWorldsTable() {
         elements.worldsTableBody.innerHTML = '';
-        worlds.forEach((world, index) => {
+
+        // Only show connected worlds (matching GUI behavior)
+        const connectedWorlds = worlds
+            .map((world, index) => ({ world, index }))
+            .filter(({ world }) => world.connected);
+
+        if (connectedWorlds.length === 0) {
+            const tr = document.createElement('tr');
+            const td = document.createElement('td');
+            td.colSpan = 5;
+            td.textContent = 'No worlds connected.';
+            td.style.textAlign = 'center';
+            td.style.color = '#888';
+            tr.appendChild(td);
+            elements.worldsTableBody.appendChild(tr);
+            return;
+        }
+
+        connectedWorlds.forEach(({ world, index }, listIndex) => {
             const tr = document.createElement('tr');
             let classes = [];
             if (index === currentWorldIndex) {
                 classes.push('current-world');
             }
-            if (index === selectedWorldsRowIndex) {
+            if (listIndex === selectedWorldsRowIndex) {
                 classes.push('selected-row');
             }
             if (classes.length > 0) {
@@ -960,14 +1147,8 @@
 
             // World name
             const tdName = document.createElement('td');
-            tdName.textContent = world.name || '(unnamed)';
+            tdName.textContent = stripAnsi(world.name || '(unnamed)').trim();
             tr.appendChild(tdName);
-
-            // Status
-            const tdStatus = document.createElement('td');
-            tdStatus.textContent = world.connected ? 'Connected' : 'Disconnected';
-            tdStatus.className = world.connected ? 'status-connected' : 'status-disconnected';
-            tr.appendChild(tdStatus);
 
             // Unseen
             const tdUnseen = document.createElement('td');
@@ -976,9 +1157,27 @@
             if (unseen > 0) tdUnseen.className = 'unseen-count';
             tr.appendChild(tdUnseen);
 
+            // Send/Recv
+            const tdSendRecv = document.createElement('td');
+            tdSendRecv.textContent = formatElapsed(world.last_send_secs) + '/' + formatElapsed(world.last_recv_secs);
+            tr.appendChild(tdSendRecv);
+
+            // KeepAlive type
+            const tdKA = document.createElement('td');
+            tdKA.textContent = world.keep_alive_type || 'NOP';
+            tr.appendChild(tdKA);
+
+            // Last/Next KA
+            const tdLastNext = document.createElement('td');
+            tdLastNext.textContent = formatElapsed(world.last_nop_secs) + '/' + formatNextKA(world.last_send_secs, world.last_recv_secs);
+            tr.appendChild(tdLastNext);
+
+            // Store the actual world index for switching
+            tr.dataset.worldIndex = index;
+
             // Click to select and double-click to switch
             tr.onclick = () => {
-                selectedWorldsRowIndex = index;
+                selectedWorldsRowIndex = listIndex;
                 renderWorldsTable();
             };
             tr.ondblclick = () => {
@@ -1033,7 +1232,7 @@
 
             const nameSpan = document.createElement('span');
             nameSpan.className = 'world-name';
-            nameSpan.textContent = world.name || '(unnamed)';
+            nameSpan.textContent = stripAnsi(world.name || '(unnamed)').trim();
             infoDiv.appendChild(nameSpan);
 
             if (world.settings?.hostname) {
@@ -1064,6 +1263,25 @@
     function selectWorld(index) {
         selectedWorldIndex = index;
         renderWorldSelectorList();
+        scrollSelectedWorldIntoView();
+    }
+
+    // Scroll the selected world into view in world selector list
+    function scrollSelectedWorldIntoView() {
+        requestAnimationFrame(() => {
+            const container = elements.worldSelectorList;
+            const selectedItem = container?.querySelector('.world-selector-item.selected');
+            if (selectedItem && container) {
+                const containerRect = container.getBoundingClientRect();
+                const itemRect = selectedItem.getBoundingClientRect();
+
+                if (itemRect.top < containerRect.top) {
+                    selectedItem.scrollIntoView({ block: 'start', behavior: 'auto' });
+                } else if (itemRect.bottom > containerRect.bottom) {
+                    selectedItem.scrollIntoView({ block: 'end', behavior: 'auto' });
+                }
+            }
+        });
     }
 
     // Get indices of worlds that match the current filter
@@ -1097,6 +1315,19 @@
             send({
                 type: 'ConnectWorld',
                 world_index: selectedWorldIndex
+            });
+            closeWorldSelectorPopup();
+        }
+    }
+
+    function editSelectedWorld() {
+        if (selectedWorldIndex >= 0 && selectedWorldIndex < worlds.length) {
+            const world = worlds[selectedWorldIndex];
+            // Send command to open world editor on server
+            send({
+                type: 'SendCommand',
+                command: '/world -e ' + world.name,
+                world_index: currentWorldIndex
             });
             closeWorldSelectorPopup();
         }
@@ -1210,23 +1441,107 @@
         return activeIndices[(currentPos - 1 + activeIndices.length) % activeIndices.length];
     }
 
+    // Toggle hamburger menu
+    function toggleMenu() {
+        menuOpen = !menuOpen;
+        elements.menuDropdown.className = 'dropdown' + (menuOpen ? ' visible' : '');
+    }
+
+    // Close hamburger menu
+    function closeMenu() {
+        menuOpen = false;
+        elements.menuDropdown.className = 'dropdown';
+    }
+
+    // Handle menu item click
+    function handleMenuItem(action) {
+        closeMenu();
+        switch (action) {
+            case 'worlds':
+                openWorldsPopup();
+                break;
+            case 'world-selector':
+                openWorldSelectorPopup();
+                break;
+            case 'actions':
+                openActionsPopup();
+                break;
+            case 'toggle-tags':
+                showTags = !showTags;
+                renderOutput();
+                break;
+        }
+    }
+
+    // Set font size
+    function setFontSize(size) {
+        currentFontSize = size;
+        const px = fontSizes[size];
+
+        // Update body font size
+        document.body.style.fontSize = px + 'px';
+
+        // Update active button
+        elements.fontSmall.className = 'font-btn' + (size === 'small' ? ' active' : '');
+        elements.fontMedium.className = 'font-btn' + (size === 'medium' ? ' active' : '');
+        elements.fontLarge.className = 'font-btn' + (size === 'large' ? ' active' : '');
+
+        // Re-render to update line height calculations
+        updateStatusBar();
+    }
+
     // Setup event listeners
     function setupEventListeners() {
         // Send button
         elements.sendBtn.onclick = sendCommand;
 
-        // Click anywhere to focus input
+        // Hamburger menu
+        elements.menuBtn.onclick = function(e) {
+            e.stopPropagation();
+            toggleMenu();
+        };
+
+        // Menu items
+        elements.menuDropdown.onclick = function(e) {
+            e.stopPropagation();
+            const item = e.target.closest('.dropdown-item');
+            if (item) {
+                handleMenuItem(item.dataset.action);
+            }
+        };
+
+        // Font size buttons
+        elements.fontSmall.onclick = function(e) {
+            e.stopPropagation();
+            setFontSize('small');
+        };
+        elements.fontMedium.onclick = function(e) {
+            e.stopPropagation();
+            setFontSize('medium');
+        };
+        elements.fontLarge.onclick = function(e) {
+            e.stopPropagation();
+            setFontSize('large');
+        };
+
+        // Click anywhere to focus input and close menu
         document.body.onclick = function(e) {
+            // Close menu if open
+            if (menuOpen) {
+                closeMenu();
+            }
+
             // Don't steal focus if user has selected text (for copy)
             const selection = window.getSelection();
             if (selection && selection.toString().length > 0) {
                 return;
             }
-            // Don't steal focus from modals
+            // Don't steal focus from modals or toolbar
             if (!elements.authModal.classList.contains('visible') &&
                 !elements.actionsModal.classList.contains('visible') &&
                 !elements.worldsModal.classList.contains('visible') &&
-                !elements.worldSelectorModal.classList.contains('visible')) {
+                !elements.worldSelectorModal.classList.contains('visible') &&
+                !e.target.closest('#toolbar')) {
                 elements.input.focus();
             }
         };
@@ -1263,6 +1578,11 @@
 
             // Handle worlds list popup
             if (worldsPopupOpen) {
+                // Get connected worlds for navigation
+                const connectedWorlds = worlds
+                    .map((world, index) => ({ world, index }))
+                    .filter(({ world }) => world.connected);
+
                 if (e.key === 'Escape') {
                     e.preventDefault();
                     e.stopPropagation();
@@ -1270,28 +1590,34 @@
                 } else if (e.key === 'ArrowUp') {
                     e.preventDefault();
                     e.stopPropagation();
-                    if (selectedWorldsRowIndex > 0) {
-                        selectedWorldsRowIndex--;
-                    } else if (worlds.length > 0) {
-                        selectedWorldsRowIndex = worlds.length - 1; // Wrap to bottom
+                    if (connectedWorlds.length > 0) {
+                        if (selectedWorldsRowIndex > 0) {
+                            selectedWorldsRowIndex--;
+                        } else {
+                            selectedWorldsRowIndex = connectedWorlds.length - 1; // Wrap to bottom
+                        }
+                        renderWorldsTable();
+                        scrollSelectedRowIntoView();
                     }
-                    renderWorldsTable();
-                    scrollSelectedRowIntoView();
                 } else if (e.key === 'ArrowDown') {
                     e.preventDefault();
                     e.stopPropagation();
-                    if (selectedWorldsRowIndex < worlds.length - 1) {
-                        selectedWorldsRowIndex++;
-                    } else if (worlds.length > 0) {
-                        selectedWorldsRowIndex = 0; // Wrap to top
+                    if (connectedWorlds.length > 0) {
+                        if (selectedWorldsRowIndex < connectedWorlds.length - 1) {
+                            selectedWorldsRowIndex++;
+                        } else {
+                            selectedWorldsRowIndex = 0; // Wrap to top
+                        }
+                        renderWorldsTable();
+                        scrollSelectedRowIntoView();
                     }
-                    renderWorldsTable();
-                    scrollSelectedRowIntoView();
                 } else if (e.key === 'Enter') {
                     e.preventDefault();
                     e.stopPropagation();
-                    if (selectedWorldsRowIndex >= 0 && selectedWorldsRowIndex < worlds.length) {
-                        switchWorldLocal(selectedWorldsRowIndex);
+                    if (selectedWorldsRowIndex >= 0 && selectedWorldsRowIndex < connectedWorlds.length) {
+                        // Use the actual world index from connected worlds
+                        const actualIndex = connectedWorlds[selectedWorldsRowIndex].index;
+                        switchWorldLocal(actualIndex);
                         closeWorldsPopup();
                     }
                 }
@@ -1500,6 +1826,7 @@
         elements.worldsCloseBtn.onclick = closeWorldsPopup;
 
         // World selector popup
+        elements.worldEditBtn.onclick = editSelectedWorld;
         elements.worldConnectBtn.onclick = connectSelectedWorld;
         elements.worldSwitchBtn.onclick = switchToSelectedWorld;
         elements.worldSelectorCancelBtn.onclick = closeWorldSelectorPopup;
