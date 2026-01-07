@@ -96,6 +96,7 @@ body {
     padding: 6px 10px;
     min-width: 40px;
     min-height: 36px;
+    background-color: #c00 !important; /* DEBUG: bright red to verify visibility */
 }
 
 .hamburger-btn svg {
