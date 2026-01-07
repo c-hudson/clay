@@ -47,21 +47,18 @@ body {
 
 /* Toolbar */
 #toolbar {
-    display: flex !important;
+    display: flex;
     align-items: center;
     padding: 4px 8px;
-    background-color: #f00 !important; /* DEBUG: bright red */
+    background-color: #111;
     border-bottom: 1px solid var(--separator-color);
-    min-height: 50px !important;
-    height: 50px !important;
+    min-height: 36px;
     font-size: 14px;
-    flex-shrink: 0 !important;
+    flex-shrink: 0;
     position: sticky;
     top: 0;
-    left: 0;
-    right: 0;
-    z-index: 9999;
-    order: -1; /* Ensure toolbar is first */
+    z-index: 100;
+    order: -1; /* Ensure toolbar is first on mobile */
 }
 
 #toolbar-left {
@@ -109,7 +106,6 @@ body {
     padding: 6px 10px;
     min-width: 40px;
     min-height: 36px;
-    background-color: #c00 !important; /* DEBUG: bright red to verify visibility */
 }
 
 .hamburger-btn svg {
