@@ -306,6 +306,17 @@ Works with updated binaries: On Linux, when the binary is rebuilt while running,
 - Debug fixes can be deployed without reconnecting
 - External scripts can trigger reload via SIGUSR1
 
+### Crash Handler
+
+The client includes automatic crash recovery:
+
+- On panic, saves application state and attempts to restart
+- Maximum 2 restart attempts to prevent infinite crash loops
+- Terminal state is restored before showing crash info
+- TCP connections are preserved across restarts (same as hot reload)
+- Crash count is cleared after first successful user input
+- Uses `--crash` flag to distinguish crash restarts from normal reloads
+
 ### Settings Persistence
 
 - Settings automatically loaded from `~/.mudclient.dat` on startup
@@ -333,8 +344,14 @@ The client includes an embedded WebSocket server that allows remote GUI clients 
 
 **Protocol:**
 - JSON over WebSocket
-- Message types: AuthRequest, AuthResponse, InitialState, ServerData, WorldConnected, WorldDisconnected, WorldSwitched, PromptUpdate, SendCommand, SwitchWorld, ConnectWorld, DisconnectWorld, Ping, Pong
+- Message types: AuthRequest, AuthResponse, InitialState, ServerData, WorldConnected, WorldDisconnected, WorldSwitched, PromptUpdate, SendCommand, SwitchWorld, ConnectWorld, DisconnectWorld, MarkWorldSeen, UnseenCleared, Ping, Pong
 - Password is hashed with SHA-256 before transmission
+
+**Cross-Interface Sync:**
+- When any interface (console, web, or GUI) switches to a world, the unseen count is cleared
+- `MarkWorldSeen` message sent by web/GUI clients when switching worlds
+- `UnseenCleared` message broadcast to all clients to sync activity indicators
+- Console broadcasts `UnseenCleared` when user switches worlds via keyboard
 
 **Allow List Whitelist:**
 
@@ -367,7 +384,7 @@ A browser-based client that connects via WebSocket to control MUD sessions.
 
 **Features:**
 - Full MUD client in the browser
-- ANSI color rendering
+- ANSI color rendering (including 256-color and true color support)
 - Clickable URLs in output (cyan, underlined, opens in new tab)
 - More-mode pausing with Tab/Alt+j
 - Command history (Ctrl+P/N)
@@ -379,11 +396,25 @@ A browser-based client that connects via WebSocket to control MUD sessions.
 - Keep-alive/idler message filtering (same as console)
 - Independent view from console (world switching is local)
 - Text selection for copying (right-click for browser context menu)
+- Toolbar with hamburger menu and font size controls
+- Cross-interface unseen indicator sync (console, web, GUI stay in sync)
+
+**Web Toolbar:**
+- Hamburger menu (☰) in upper left with dropdown:
+  - Worlds List - Opens connected worlds list popup
+  - World Selector - Opens world selector popup
+  - Actions - Opens actions editor popup
+  - Toggle Tags - Show/hide MUD tags (same as F2)
+- Font size buttons (S/M/L) next to hamburger:
+  - **S** (Small, 11px) - Optimized for phone displays
+  - **M** (Medium, 14px) - Default size
+  - **L** (Large, 18px) - Optimized for tablet displays
+- Active font button highlighted in cyan
 
 **Web Interface Controls:**
 - `Up/Down` - Switch between active worlds
 - `PageUp/PageDown` - Scroll output history
-- `Tab` - Release one screenful when paused
+- `Tab` - Release one screenful when paused; scroll down one screenful otherwise (like `more`)
 - `Alt+j` - Jump to end, release all pending
 - `Ctrl+P/N` - Command history navigation
 - `Ctrl+U` - Clear input
