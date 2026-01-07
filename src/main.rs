@@ -3003,6 +3003,7 @@ pub enum AppEvent {
     Disconnected(usize),         // world_index
     TelnetDetected(usize),       // world_index - telnet negotiation detected
     Prompt(usize, Vec<u8>),      // world_index, prompt bytes (from telnet GA)
+    SystemMessage(String),       // message to display in current world's output
     // WebSocket events
     WsClientConnected(u64),                    // client_id
     WsClientDisconnected(u64),                 // client_id
@@ -7293,6 +7294,10 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                             }
                         }
                     }
+                    AppEvent::SystemMessage(message) => {
+                        // Display system message in current world's output
+                        app.add_output(&message);
+                    }
                     // WebSocket events
                     AppEvent::WsClientConnected(_client_id) => {
                         // Client connected but not yet authenticated - nothing to do
@@ -7744,6 +7749,10 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                             }
                         }
                     }
+                }
+                AppEvent::SystemMessage(message) => {
+                    // Display system message in current world's output
+                    app.add_output(&message);
                 }
                 // WebSocket events (drain loop - complex handlers use primary loop)
                 AppEvent::WsClientConnected(_) => {}

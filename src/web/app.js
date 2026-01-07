@@ -724,6 +724,10 @@
         // (e.g., [0m, [1;32m, [37m) - these appear when ESC char was lost
         result = result.replace(/\[([0-9;]*)m/g, '');
 
+        // Strip orphan ESC characters and the control picture symbol for ESC (␛ U+241B)
+        // These can appear when ANSI sequences are incomplete or corrupted
+        result = result.replace(/[\x1b\u001b\u241b]/g, '');
+
         return result;
     }
 

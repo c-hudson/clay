@@ -395,8 +395,9 @@ pub async fn start_websocket_server(
                                             }
                                         }
                                         Err(e) => {
-                                            // TLS handshake failed - log for debugging
-                                            eprintln!("WSS TLS handshake failed from {}: {}", client_addr, e);
+                                            // TLS handshake failed - send to output area
+                                            let msg = format!("WSS TLS handshake failed from {}: {}", client_addr, e);
+                                            let _ = event_tx.send(AppEvent::SystemMessage(msg)).await;
                                         }
                                     }
                                 } else if let Err(_e) = handle_ws_client(

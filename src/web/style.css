@@ -46,7 +46,9 @@ body {
     padding: 4px 8px;
     background-color: #111;
     border-bottom: 1px solid var(--separator-color);
-    min-height: 32px;
+    min-height: 36px;
+    font-size: 14px; /* Prevent body font-size from affecting toolbar */
+    flex-shrink: 0;
 }
 
 #toolbar-left {
@@ -56,15 +58,29 @@ body {
     position: relative;
 }
 
+#toolbar-title {
+    color: var(--accent-color);
+    font-weight: bold;
+    padding-left: 8px;
+    font-size: 14px;
+}
+
 .toolbar-btn {
     background-color: #222;
     border: 1px solid var(--separator-color);
     color: var(--text-color);
     padding: 4px 10px;
     cursor: pointer;
-    font-family: inherit;
+    font-family: 'Segoe UI Symbol', 'Apple Symbols', sans-serif;
     font-size: 16px;
     border-radius: 3px;
+    min-width: 36px;
+    min-height: 32px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    -webkit-tap-highlight-color: transparent;
+    touch-action: manipulation;
 }
 
 .toolbar-btn:hover {
@@ -73,6 +89,38 @@ body {
 
 .toolbar-btn:active {
     background-color: #444;
+}
+
+/* Hamburger icon - CSS-based for reliable rendering */
+.hamburger-btn {
+    padding: 8px;
+}
+
+.hamburger-icon {
+    display: block;
+    width: 18px;
+    height: 2px;
+    background-color: var(--text-color);
+    position: relative;
+}
+
+.hamburger-icon::before,
+.hamburger-icon::after {
+    content: '';
+    display: block;
+    width: 18px;
+    height: 2px;
+    background-color: var(--text-color);
+    position: absolute;
+    left: 0;
+}
+
+.hamburger-icon::before {
+    top: -6px;
+}
+
+.hamburger-icon::after {
+    top: 6px;
 }
 
 /* Dropdown menu */
