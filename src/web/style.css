@@ -93,15 +93,17 @@ body {
 
 /* Hamburger icon - CSS-based for reliable rendering */
 .hamburger-btn {
-    padding: 8px;
+    padding: 6px 10px;
+    min-width: 40px;
+    min-height: 36px;
 }
 
 .hamburger-icon {
-    display: block;
+    display: flex;
+    flex-direction: column;
+    justify-content: space-between;
     width: 18px;
-    height: 2px;
-    background-color: var(--text-color);
-    position: relative;
+    height: 14px;
 }
 
 .hamburger-icon::before,
@@ -111,16 +113,12 @@ body {
     width: 18px;
     height: 2px;
     background-color: var(--text-color);
-    position: absolute;
-    left: 0;
+    flex-shrink: 0;
 }
 
-.hamburger-icon::before {
-    top: -6px;
-}
-
-.hamburger-icon::after {
-    top: 6px;
+/* Middle line using a box-shadow on the element itself */
+.hamburger-icon {
+    background: linear-gradient(var(--text-color), var(--text-color)) no-repeat center/18px 2px;
 }
 
 /* Dropdown menu */
