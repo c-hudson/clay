@@ -22,6 +22,10 @@ html, body {
     height: 100%;
     width: 100%;
     overflow: hidden;
+    margin: 0;
+    padding: 0;
+    /* Prevent iOS Safari from adding extra space */
+    -webkit-text-size-adjust: 100%;
 }
 
 body {
@@ -36,6 +40,8 @@ body {
     display: flex;
     flex-direction: column;
     height: 100vh;
+    height: 100dvh; /* Dynamic viewport height - works better on mobile */
+    min-height: -webkit-fill-available; /* iOS Safari fallback */
     overflow: hidden;
 }
 
@@ -50,8 +56,12 @@ body {
     height: 50px !important;
     font-size: 14px;
     flex-shrink: 0 !important;
-    position: relative;
+    position: sticky;
+    top: 0;
+    left: 0;
+    right: 0;
     z-index: 9999;
+    order: -1; /* Ensure toolbar is first */
 }
 
 #toolbar-left {
