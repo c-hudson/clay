@@ -57,6 +57,10 @@ body {
     font-size: 14px;
     flex-shrink: 0;
     z-index: 100;
+    position: fixed;
+    top: 0;
+    left: 0;
+    right: 0;
 }
 
 #toolbar-left {
@@ -174,6 +178,7 @@ body {
     overflow-y: auto;
     overflow-x: hidden;
     padding: 2px 4px;
+    padding-top: 40px; /* Space for fixed toolbar */
     background-color: var(--bg-color);
     -webkit-overflow-scrolling: touch; /* Smooth scrolling on iOS */
     overscroll-behavior: contain; /* Prevent scroll chaining to parent */
