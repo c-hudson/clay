@@ -314,6 +314,26 @@ The client includes an embedded WebSocket server that allows remote GUI clients 
 - Message types: AuthRequest, AuthResponse, InitialState, ServerData, WorldConnected, WorldDisconnected, WorldSwitched, PromptUpdate, SendCommand, SwitchWorld, ConnectWorld, DisconnectWorld, Ping, Pong
 - Password is hashed with SHA-256 before transmission
 
+**Allow List Whitelist:**
+
+The WebSocket server supports dynamic whitelisting based on the allow list:
+
+- `WS allow list` - CSV list of IPs that *can* be whitelisted (not auto-authenticated)
+- Empty allow list = always require password for all connections
+- Whitelisting happens when a client from an allow-list IP authenticates with password:
+  - That IP gets whitelisted for future connections (auto-authenticated)
+  - Any previously whitelisted IP is cleared (only ONE whitelisted IP at a time)
+- Non-allow-list IPs can authenticate with password but are never whitelisted
+
+**Behavior:**
+1. Client connects from IP in allow list → must authenticate with password first time
+2. After successful auth → IP is whitelisted
+3. Future connections from that IP → auto-authenticated (no password needed)
+4. Different allow-list IP authenticates → previous whitelist cleared, new IP whitelisted
+5. Client connects from IP NOT in allow list → must always authenticate with password
+
+**Use case:** Allows trusted IPs (e.g., home network) to authenticate once, then reconnect without password. Moving to a new location and authenticating clears the old whitelist.
+
 ### HTTPS Web Interface
 
 A browser-based client that connects via WebSocket to control MUD sessions.
@@ -326,6 +346,7 @@ A browser-based client that connects via WebSocket to control MUD sessions.
 **Features:**
 - Full MUD client in the browser
 - ANSI color rendering
+- Clickable URLs in output (cyan, underlined, opens in new tab)
 - More-mode pausing with Tab/Alt+j
 - Command history (Ctrl+P/N)
 - Multiple world support with world switching
@@ -335,6 +356,7 @@ A browser-based client that connects via WebSocket to control MUD sessions.
 - MUD tag stripping toggle (F2)
 - Keep-alive/idler message filtering (same as console)
 - Independent view from console (world switching is local)
+- Text selection for copying (right-click for browser context menu)
 
 **Web Interface Controls:**
 - `Up/Down` - Switch between active worlds
