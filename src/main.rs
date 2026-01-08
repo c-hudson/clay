@@ -5465,7 +5465,12 @@ mod remote_gui {
                     });
                 }
 
-                egui::TopBottomPanel::top("menu_bar").show(ctx, |ui| {
+                egui::TopBottomPanel::top("menu_bar")
+                    .frame(egui::Frame::none()
+                        .fill(theme.bg())
+                        .inner_margin(egui::Margin::symmetric(4.0, 2.0))
+                        .stroke(egui::Stroke::NONE))
+                    .show(ctx, |ui| {
                     ui.horizontal(|ui| {
                         // Hamburger menu (☰)
                         ui.menu_button("☰", |ui| {
@@ -5574,6 +5579,10 @@ mod remote_gui {
 
                 egui::TopBottomPanel::bottom("input_panel")
                     .exact_height(input_height)
+                    .frame(egui::Frame::none()
+                        .fill(theme.bg())
+                        .inner_margin(egui::Margin::same(2.0))
+                        .stroke(egui::Stroke::NONE))
                     .show(ctx, |ui| {
                         ui.spacing_mut().item_spacing.x = 0.0; // Remove horizontal spacing
                         ui.horizontal(|ui| {
@@ -5737,7 +5746,10 @@ mod remote_gui {
                 };
                 egui::TopBottomPanel::bottom("separator_bar")
                     .exact_height(20.0)
-                    .frame(egui::Frame::none().fill(separator_bg))
+                    .frame(egui::Frame::none()
+                        .fill(separator_bg)
+                        .inner_margin(egui::Margin::same(0.0))
+                        .stroke(egui::Stroke::NONE))
                     .show(ctx, |ui| {
                         ui.horizontal(|ui| {
                             // Get current world info
@@ -5819,9 +5831,12 @@ mod remote_gui {
                         });
                 }
 
-                // Main output area with scrollbar (no frame/border)
+                // Main output area with scrollbar (no frame/border/margin)
                 egui::CentralPanel::default()
-                    .frame(egui::Frame::none().fill(theme.bg()))
+                    .frame(egui::Frame::none()
+                        .fill(theme.bg())
+                        .inner_margin(egui::Margin::same(0.0))
+                        .stroke(egui::Stroke::NONE))
                     .show(ctx, |ui| {
                     if let Some(world) = self.worlds.get(self.current_world) {
                         // Keep original lines with ANSI for coloring
