@@ -96,12 +96,33 @@
     let currentFontSize = 'medium';
     const fontSizes = {
         small: 11,   // Phone
-        medium: 14,  // Default
-        large: 18    // Tablet
+        medium: 14,  // Tablet
+        large: 18    // Desktop
     };
+
+    // Detect device type and return appropriate font size
+    function detectDeviceFontSize() {
+        const width = window.innerWidth;
+        const hasTouch = 'ontouchstart' in window || navigator.maxTouchPoints > 0;
+
+        // Phone: narrow screen (< 768px)
+        if (width < 768) {
+            return 'small';
+        }
+        // Tablet: medium screen with touch (768-1024px)
+        if (width <= 1024 && hasTouch) {
+            return 'medium';
+        }
+        // Desktop: wide screen or no touch
+        return 'large';
+    }
 
     // Initialize
     function init() {
+        // Set font size based on device type
+        const deviceFontSize = detectDeviceFontSize();
+        setFontSize(deviceFontSize);
+
         setupEventListeners();
         connect();
         updateTime();
