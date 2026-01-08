@@ -1910,22 +1910,6 @@ impl ActionsPopup {
         self.view = ActionsView::List;
     }
 
-    fn load_selected_action(&mut self) {
-        if let Some(action) = self.actions.get(self.selected_index) {
-            self.edit_name = action.name.clone();
-            self.edit_world = action.world.clone();
-            self.edit_pattern = action.pattern.clone();
-            self.edit_command = action.command.clone();
-        } else {
-            self.edit_name.clear();
-            self.edit_world.clear();
-            self.edit_pattern.clear();
-            self.edit_command.clear();
-        }
-        self.cursor_pos = 0;
-        self.command_expanded = false;
-    }
-
     fn save_current_action(&mut self) -> bool {
         // Validate name
         let name = self.edit_name.trim();
