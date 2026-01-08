@@ -35,18 +35,28 @@
         mobileUpBtn: document.getElementById('mobile-up-btn'),
         mobileDownBtn: document.getElementById('mobile-down-btn'),
         mobilePgDnBtn: document.getElementById('mobile-pgdn-btn'),
-        // Actions popup
-        actionsModal: document.getElementById('actions-modal'),
+        // Actions List popup
+        actionsListModal: document.getElementById('actions-list-modal'),
         actionsList: document.getElementById('actions-list'),
+        actionAddBtn: document.getElementById('action-add-btn'),
+        actionEditBtn: document.getElementById('action-edit-btn'),
+        actionDeleteBtn: document.getElementById('action-delete-btn'),
+        actionCancelBtn: document.getElementById('action-cancel-btn'),
+        // Actions Editor popup
+        actionsEditorModal: document.getElementById('actions-editor-modal'),
+        actionEditorTitle: document.getElementById('action-editor-title'),
         actionName: document.getElementById('action-name'),
         actionWorld: document.getElementById('action-world'),
         actionPattern: document.getElementById('action-pattern'),
         actionCommand: document.getElementById('action-command'),
         actionError: document.getElementById('action-error'),
-        actionNewBtn: document.getElementById('action-new-btn'),
-        actionDeleteBtn: document.getElementById('action-delete-btn'),
         actionSaveBtn: document.getElementById('action-save-btn'),
-        actionCancelBtn: document.getElementById('action-cancel-btn'),
+        actionEditorCancelBtn: document.getElementById('action-editor-cancel-btn'),
+        // Actions Confirm Delete popup
+        actionConfirmModal: document.getElementById('action-confirm-modal'),
+        actionConfirmText: document.getElementById('action-confirm-text'),
+        actionConfirmYesBtn: document.getElementById('action-confirm-yes-btn'),
+        actionConfirmNoBtn: document.getElementById('action-confirm-no-btn'),
         // Worlds list popup
         worldsModal: document.getElementById('worlds-modal'),
         worldsTableBody: document.getElementById('worlds-table-body'),
@@ -85,9 +95,11 @@
 
     // Actions state
     let actions = [];
-    let actionsPopupOpen = false;
+    let actionsListPopupOpen = false;
+    let actionsEditorPopupOpen = false;
+    let actionsConfirmPopupOpen = false;
     let selectedActionIndex = -1;
-    let editingNewAction = false;
+    let editingActionIndex = -1;  // -1 = new action, >=0 = editing existing
 
     // Tag display state
     let showTags = false;
@@ -366,7 +378,7 @@
 
             case 'ActionsUpdated':
                 actions = msg.actions || [];
-                if (actionsPopupOpen) {
+                if (actionsListPopupOpen) {
                     renderActionsList();
                 }
                 break;
@@ -980,122 +992,140 @@
         }
     }
 
-    // Actions popup functions
-    function openActionsPopup() {
-        actionsPopupOpen = true;
+    // Actions popup functions (split into List and Editor)
+
+    // Open Actions List popup
+    function openActionsListPopup() {
+        actionsListPopupOpen = true;
         selectedActionIndex = actions.length > 0 ? 0 : -1;
-        editingNewAction = false;
-        elements.actionsModal.className = 'modal visible';
-        elements.actionError.textContent = '';
+        elements.actionsListModal.className = 'modal visible';
         renderActionsList();
-        loadSelectedAction();
-        elements.actionName.focus();
     }
 
-    function closeActionsPopup() {
-        actionsPopupOpen = false;
-        elements.actionsModal.className = 'modal';
+    // Close Actions List popup
+    function closeActionsListPopup() {
+        actionsListPopupOpen = false;
+        elements.actionsListModal.className = 'modal';
         elements.input.focus();
     }
 
+    // Render actions list with Name, World, Pattern columns
     function renderActionsList() {
         elements.actionsList.innerHTML = '';
+        if (actions.length === 0) {
+            const div = document.createElement('div');
+            div.style.padding = '8px';
+            div.style.color = '#888';
+            div.textContent = 'No actions defined.';
+            elements.actionsList.appendChild(div);
+            return;
+        }
         actions.forEach((action, index) => {
             const div = document.createElement('div');
             div.className = 'actions-list-item' + (index === selectedActionIndex ? ' selected' : '');
-            div.textContent = action.name || '(unnamed)';
-            div.onclick = () => selectAction(index);
+
+            const nameSpan = document.createElement('span');
+            nameSpan.className = 'action-name';
+            nameSpan.textContent = action.name || '(unnamed)';
+            div.appendChild(nameSpan);
+
+            const worldSpan = document.createElement('span');
+            worldSpan.className = 'action-world';
+            worldSpan.textContent = action.world || '(all)';
+            div.appendChild(worldSpan);
+
+            const patternSpan = document.createElement('span');
+            patternSpan.className = 'action-pattern';
+            patternSpan.textContent = action.pattern || '(manual)';
+            div.appendChild(patternSpan);
+
+            div.onclick = () => {
+                selectedActionIndex = index;
+                renderActionsList();
+            };
+            div.ondblclick = () => {
+                selectedActionIndex = index;
+                openActionsEditorPopup(index);
+            };
             elements.actionsList.appendChild(div);
         });
-        // Add "new action" item if editing new
-        if (editingNewAction) {
-            const div = document.createElement('div');
-            div.className = 'actions-list-item selected new-item';
-            div.textContent = '(new action)';
-            elements.actionsList.appendChild(div);
-        }
     }
 
-    function selectAction(index) {
-        // Save current edits before switching (if valid)
-        if (selectedActionIndex >= 0 && selectedActionIndex < actions.length) {
-            saveCurrentActionEdits();
-        }
-        selectedActionIndex = index;
-        editingNewAction = false;
-        renderActionsList();
-        loadSelectedAction();
-    }
+    // Open Actions Editor popup
+    function openActionsEditorPopup(editIndex) {
+        actionsEditorPopupOpen = true;
+        editingActionIndex = editIndex;
+        elements.actionsListModal.className = 'modal';  // Hide list
+        elements.actionsEditorModal.className = 'modal visible';
 
-    function loadSelectedAction() {
-        if (editingNewAction) {
-            elements.actionName.value = '';
-            elements.actionWorld.value = '';
-            elements.actionPattern.value = '';
-            elements.actionCommand.value = '';
-        } else if (selectedActionIndex >= 0 && selectedActionIndex < actions.length) {
-            const action = actions[selectedActionIndex];
+        if (editIndex >= 0 && editIndex < actions.length) {
+            // Editing existing action
+            elements.actionEditorTitle.textContent = 'Edit Action';
+            const action = actions[editIndex];
             elements.actionName.value = action.name || '';
             elements.actionWorld.value = action.world || '';
             elements.actionPattern.value = action.pattern || '';
             elements.actionCommand.value = action.command || '';
         } else {
+            // New action
+            elements.actionEditorTitle.textContent = 'New Action';
             elements.actionName.value = '';
             elements.actionWorld.value = '';
             elements.actionPattern.value = '';
             elements.actionCommand.value = '';
         }
         elements.actionError.textContent = '';
-    }
-
-    function saveCurrentActionEdits() {
-        if (selectedActionIndex >= 0 && selectedActionIndex < actions.length) {
-            actions[selectedActionIndex] = {
-                name: elements.actionName.value.trim(),
-                world: elements.actionWorld.value.trim(),
-                pattern: elements.actionPattern.value,
-                command: elements.actionCommand.value
-            };
-        }
-    }
-
-    function createNewAction() {
-        // Save current edits first
-        if (selectedActionIndex >= 0 && selectedActionIndex < actions.length) {
-            saveCurrentActionEdits();
-        }
-        selectedActionIndex = -1;
-        editingNewAction = true;
-        renderActionsList();
-        loadSelectedAction();
         elements.actionName.focus();
     }
 
-    function deleteSelectedAction() {
+    // Close Actions Editor popup (return to list)
+    function closeActionsEditorPopup() {
+        actionsEditorPopupOpen = false;
+        elements.actionsEditorModal.className = 'modal';
+        elements.actionsListModal.className = 'modal visible';
+        actionsListPopupOpen = true;
+        renderActionsList();
+    }
+
+    // Open delete confirmation popup
+    function openActionsConfirmPopup() {
+        if (selectedActionIndex < 0 || selectedActionIndex >= actions.length) return;
+        actionsConfirmPopupOpen = true;
+        const actionName = actions[selectedActionIndex].name || '(unnamed)';
+        elements.actionConfirmText.textContent = `Delete action '${actionName}'?`;
+        elements.actionConfirmModal.className = 'modal visible';
+    }
+
+    // Close delete confirmation popup
+    function closeActionsConfirmPopup() {
+        actionsConfirmPopupOpen = false;
+        elements.actionConfirmModal.className = 'modal';
+    }
+
+    // Confirm delete action
+    function confirmDeleteAction() {
         if (selectedActionIndex >= 0 && selectedActionIndex < actions.length) {
             actions.splice(selectedActionIndex, 1);
             if (selectedActionIndex >= actions.length) {
                 selectedActionIndex = actions.length - 1;
             }
-            editingNewAction = false;
+            // Send to server
+            send({
+                type: 'UpdateActions',
+                actions: actions
+            });
             renderActionsList();
-            loadSelectedAction();
-        } else if (editingNewAction) {
-            editingNewAction = false;
-            selectedActionIndex = actions.length > 0 ? 0 : -1;
-            renderActionsList();
-            loadSelectedAction();
         }
+        closeActionsConfirmPopup();
     }
 
-    function validateAction(name) {
+    function validateAction(name, editIndex) {
         if (!name) {
             return 'Name is required';
         }
-        // Check for duplicate names (excluding current)
+        // Check for duplicate names (excluding current if editing)
         const duplicateIndex = actions.findIndex((a, i) =>
-            a.name.toLowerCase() === name.toLowerCase() &&
-            (editingNewAction || i !== selectedActionIndex)
+            a.name.toLowerCase() === name.toLowerCase() && i !== editIndex
         );
         if (duplicateIndex >= 0) {
             return 'An action with this name already exists';
@@ -1108,9 +1138,9 @@
         return null;
     }
 
-    function saveActions() {
+    function saveAction() {
         const name = elements.actionName.value.trim();
-        const error = validateAction(name);
+        const error = validateAction(name, editingActionIndex);
         if (error) {
             elements.actionError.textContent = error;
             return;
@@ -1123,12 +1153,13 @@
             command: elements.actionCommand.value
         };
 
-        if (editingNewAction) {
+        if (editingActionIndex < 0) {
+            // New action
             actions.push(actionData);
             selectedActionIndex = actions.length - 1;
-            editingNewAction = false;
-        } else if (selectedActionIndex >= 0 && selectedActionIndex < actions.length) {
-            actions[selectedActionIndex] = actionData;
+        } else {
+            // Update existing
+            actions[editingActionIndex] = actionData;
         }
 
         // Send to server
@@ -1137,7 +1168,22 @@
             actions: actions
         });
 
-        closeActionsPopup();
+        closeActionsEditorPopup();
+    }
+
+    // Legacy function for compatibility
+    function openActionsPopup() {
+        openActionsListPopup();
+    }
+
+    function closeActionsPopup() {
+        if (actionsEditorPopupOpen) {
+            closeActionsEditorPopup();
+        } else if (actionsConfirmPopupOpen) {
+            closeActionsConfirmPopup();
+        } else {
+            closeActionsListPopup();
+        }
     }
 
     // Worlds list popup functions (/worlds, /l)
@@ -1452,7 +1498,7 @@
 
     // Check if any popup is open
     function isAnyPopupOpen() {
-        return actionsPopupOpen || worldsPopupOpen || worldSelectorPopupOpen;
+        return actionsListPopupOpen || actionsEditorPopupOpen || actionsConfirmPopupOpen || worldsPopupOpen || worldSelectorPopupOpen;
     }
 
     // Check if a world should be included in cycling (connected OR has unseen output)
@@ -1756,13 +1802,31 @@
             // Skip if auth modal is visible
             if (elements.authModal.classList.contains('visible')) return;
 
-            // Handle actions popup
-            if (actionsPopupOpen) {
+            // Handle actions confirm popup
+            if (actionsConfirmPopupOpen) {
                 if (e.key === 'Escape') {
                     e.preventDefault();
-                    closeActionsPopup();
+                    closeActionsConfirmPopup();
                 }
-                return; // Don't handle other keys when popup is open
+                return;
+            }
+
+            // Handle actions editor popup
+            if (actionsEditorPopupOpen) {
+                if (e.key === 'Escape') {
+                    e.preventDefault();
+                    closeActionsEditorPopup();
+                }
+                return;
+            }
+
+            // Handle actions list popup
+            if (actionsListPopupOpen) {
+                if (e.key === 'Escape') {
+                    e.preventDefault();
+                    closeActionsListPopup();
+                }
+                return;
             }
 
             // Handle worlds list popup
@@ -2012,11 +2076,23 @@
             }
         };
 
-        // Actions popup
-        elements.actionNewBtn.onclick = createNewAction;
-        elements.actionDeleteBtn.onclick = deleteSelectedAction;
-        elements.actionSaveBtn.onclick = saveActions;
-        elements.actionCancelBtn.onclick = closeActionsPopup;
+        // Actions List popup
+        elements.actionAddBtn.onclick = () => openActionsEditorPopup(-1);
+        elements.actionEditBtn.onclick = () => {
+            if (selectedActionIndex >= 0 && selectedActionIndex < actions.length) {
+                openActionsEditorPopup(selectedActionIndex);
+            }
+        };
+        elements.actionDeleteBtn.onclick = openActionsConfirmPopup;
+        elements.actionCancelBtn.onclick = closeActionsListPopup;
+
+        // Actions Editor popup
+        elements.actionSaveBtn.onclick = saveAction;
+        elements.actionEditorCancelBtn.onclick = closeActionsEditorPopup;
+
+        // Actions Confirm Delete popup
+        elements.actionConfirmYesBtn.onclick = confirmDeleteAction;
+        elements.actionConfirmNoBtn.onclick = closeActionsConfirmPopup;
 
         // Worlds list popup
         elements.worldsCloseBtn.onclick = closeWorldsPopup;

@@ -86,43 +86,55 @@
             </div>
         </div>
 
-        <!-- Actions popup -->
-        <div id="actions-modal" class="modal">
-            <div class="modal-content actions-modal-content">
+        <!-- Actions List popup (first window) -->
+        <div id="actions-list-modal" class="modal">
+            <div class="modal-content actions-list-modal-content">
                 <h2>Actions</h2>
-                <div class="actions-layout">
-                    <!-- Actions list -->
-                    <div class="actions-list-container">
-                        <div id="actions-list" class="actions-list"></div>
-                        <div class="actions-list-buttons">
-                            <button id="action-new-btn" class="action-btn">New</button>
-                            <button id="action-delete-btn" class="action-btn">Delete</button>
-                        </div>
-                    </div>
-                    <!-- Action editor -->
-                    <div class="action-editor">
-                        <div class="action-field">
-                            <label for="action-name">Name:</label>
-                            <input type="text" id="action-name" autocomplete="off">
-                        </div>
-                        <div class="action-field">
-                            <label for="action-world">World:</label>
-                            <input type="text" id="action-world" autocomplete="off" placeholder="(empty = all worlds)">
-                        </div>
-                        <div class="action-field">
-                            <label for="action-pattern">Pattern:</label>
-                            <input type="text" id="action-pattern" autocomplete="off" placeholder="(regex, empty = manual only)">
-                        </div>
-                        <div class="action-field">
-                            <label for="action-command">Command:</label>
-                            <textarea id="action-command" rows="3" autocomplete="off" placeholder="Commands (semicolon-separated)"></textarea>
-                        </div>
-                        <div id="action-error" class="error"></div>
-                    </div>
+                <div id="actions-list" class="actions-list"></div>
+                <div class="modal-buttons">
+                    <button id="action-add-btn" class="action-btn">Add</button>
+                    <button id="action-edit-btn" class="action-btn">Edit</button>
+                    <button id="action-delete-btn" class="action-btn">Delete</button>
+                    <button id="action-cancel-btn" class="action-btn">Cancel</button>
                 </div>
+            </div>
+        </div>
+
+        <!-- Actions Editor popup (second window) -->
+        <div id="actions-editor-modal" class="modal">
+            <div class="modal-content actions-editor-modal-content">
+                <h2 id="action-editor-title">Edit Action</h2>
+                <div class="action-field">
+                    <label for="action-name">Name:</label>
+                    <input type="text" id="action-name" autocomplete="off">
+                </div>
+                <div class="action-field">
+                    <label for="action-world">World:</label>
+                    <input type="text" id="action-world" autocomplete="off" placeholder="(empty = all worlds)">
+                </div>
+                <div class="action-field">
+                    <label for="action-pattern">Pattern:</label>
+                    <input type="text" id="action-pattern" autocomplete="off" placeholder="(regex, empty = manual only)">
+                </div>
+                <div class="action-field">
+                    <label for="action-command">Command:</label>
+                    <textarea id="action-command" rows="5" autocomplete="off" placeholder="Commands (semicolon-separated)"></textarea>
+                </div>
+                <div id="action-error" class="error"></div>
                 <div class="modal-buttons">
                     <button id="action-save-btn">Save</button>
-                    <button id="action-cancel-btn">Cancel</button>
+                    <button id="action-editor-cancel-btn">Cancel</button>
+                </div>
+            </div>
+        </div>
+
+        <!-- Action Delete Confirmation popup -->
+        <div id="action-confirm-modal" class="modal">
+            <div class="modal-content action-confirm-modal-content">
+                <p id="action-confirm-text">Delete this action?</p>
+                <div class="modal-buttons">
+                    <button id="action-confirm-yes-btn">Yes</button>
+                    <button id="action-confirm-no-btn">No</button>
                 </div>
             </div>
         </div>

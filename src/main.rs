@@ -474,6 +474,139 @@ async fn start_https_server(
     Ok(())
 }
 
+// ============================================================================
+// HTTP Web Interface Server (no TLS)
+// ============================================================================
+
+/// HTTP server state for the web interface (no TLS)
+struct HttpServer {
+    running: Arc<RwLock<bool>>,
+    shutdown_tx: Option<tokio::sync::oneshot::Sender<()>>,
+    port: u16,
+}
+
+impl HttpServer {
+    fn new(port: u16) -> Self {
+        Self {
+            running: Arc::new(RwLock::new(false)),
+            shutdown_tx: None,
+            port,
+        }
+    }
+}
+
+/// Handle an HTTP connection (plain TCP, no TLS)
+async fn handle_http_client(
+    mut stream: TcpStream,
+    ws_port: u16,
+    ws_use_tls: bool,
+) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let mut buf = [0u8; 4096];
+    let n = match stream.read(&mut buf).await {
+        Ok(n) if n > 0 => n,
+        _ => return,
+    };
+
+    let request = String::from_utf8_lossy(&buf[..n]);
+
+    // Reuse the parse function from either TLS backend
+    fn parse_request(request: &str) -> Option<(&str, &str)> {
+        let first_line = request.lines().next()?;
+        let mut parts = first_line.split_whitespace();
+        let method = parts.next()?;
+        let path = parts.next()?;
+        Some((method, path))
+    }
+
+    fn build_response(status: u16, status_text: &str, content_type: &str, body: &str) -> Vec<u8> {
+        format!(
+            "HTTP/1.1 {} {}\r\n\
+             Content-Type: {}; charset=utf-8\r\n\
+             Content-Length: {}\r\n\
+             Connection: close\r\n\
+             \r\n\
+             {}",
+            status, status_text, content_type, body.len(), body
+        ).into_bytes()
+    }
+
+    if let Some((method, path)) = parse_request(&request) {
+        if method != "GET" {
+            let response = build_response(405, "Method Not Allowed", "text/plain", "Method Not Allowed");
+            let _ = stream.write_all(&response).await;
+            return;
+        }
+
+        // Read embedded files at compile time
+        const HTTP_INDEX_HTML: &str = include_str!("web/index.html");
+        const HTTP_STYLE_CSS: &str = include_str!("web/style.css");
+        const HTTP_APP_JS: &str = include_str!("web/app.js");
+
+        let response = match path {
+            "/" | "/index.html" => {
+                // Inject WebSocket configuration into the HTML
+                let html = HTTP_INDEX_HTML
+                    .replace("{{WS_PORT}}", &ws_port.to_string())
+                    .replace("{{WS_PROTOCOL}}", if ws_use_tls { "wss" } else { "ws" });
+                build_response(200, "OK", "text/html", &html)
+            }
+            "/style.css" => {
+                build_response(200, "OK", "text/css", HTTP_STYLE_CSS)
+            }
+            "/app.js" => {
+                build_response(200, "OK", "application/javascript", HTTP_APP_JS)
+            }
+            _ => {
+                build_response(404, "Not Found", "text/plain", "Not Found")
+            }
+        };
+
+        let _ = stream.write_all(&response).await;
+    }
+}
+
+/// Start the HTTP server (plain TCP, no TLS)
+async fn start_http_server(
+    server: &mut HttpServer,
+    ws_port: u16,
+    ws_use_tls: bool,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let addr = format!("0.0.0.0:{}", server.port);
+    let listener = TcpListener::bind(&addr).await
+        .map_err(|e| format!("Failed to bind HTTP to port {}: {}", server.port, e))?;
+
+    let (shutdown_tx, mut shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+    server.shutdown_tx = Some(shutdown_tx);
+
+    let running = Arc::clone(&server.running);
+    *running.write().await = true;
+
+    tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                result = listener.accept() => {
+                    match result {
+                        Ok((stream, _addr)) => {
+                            tokio::spawn(async move {
+                                handle_http_client(stream, ws_port, ws_use_tls).await;
+                            });
+                        }
+                        Err(_) => break,
+                    }
+                }
+                _ = &mut shutdown_rx => {
+                    break;
+                }
+            }
+        }
+        *running.write().await = false;
+    });
+
+    Ok(())
+}
+
 
 #[derive(Clone, Copy, PartialEq)]
 enum SettingsField {
@@ -509,6 +642,8 @@ enum SettingsField {
     WsCertFile,
     WsKeyFile,
     WsUseTls,
+    HttpEnabled,
+    HttpPort,
     HttpsEnabled,
     HttpsPort,
     SaveSetup,
@@ -531,6 +666,7 @@ impl SettingsField {
                 | SettingsField::WsAllowList
                 | SettingsField::WsCertFile
                 | SettingsField::WsKeyFile
+                | SettingsField::HttpPort
                 | SettingsField::HttpsPort
         )
     }
@@ -614,7 +750,9 @@ impl SettingsField {
             SettingsField::WsAllowList => SettingsField::WsCertFile,
             SettingsField::WsCertFile => SettingsField::WsKeyFile,
             SettingsField::WsKeyFile => SettingsField::WsUseTls,
-            SettingsField::WsUseTls => SettingsField::HttpsEnabled,
+            SettingsField::WsUseTls => SettingsField::HttpEnabled,
+            SettingsField::HttpEnabled => SettingsField::HttpPort,
+            SettingsField::HttpPort => SettingsField::HttpsEnabled,
             SettingsField::HttpsEnabled => SettingsField::HttpsPort,
             SettingsField::HttpsPort => SettingsField::SaveSetup,
             SettingsField::SaveSetup => SettingsField::CancelSetup,
@@ -642,7 +780,9 @@ impl SettingsField {
             SettingsField::WsCertFile => SettingsField::WsAllowList,
             SettingsField::WsKeyFile => SettingsField::WsCertFile,
             SettingsField::WsUseTls => SettingsField::WsKeyFile,
-            SettingsField::HttpsEnabled => SettingsField::WsUseTls,
+            SettingsField::HttpEnabled => SettingsField::WsUseTls,
+            SettingsField::HttpPort => SettingsField::HttpEnabled,
+            SettingsField::HttpsEnabled => SettingsField::HttpPort,
             SettingsField::HttpsPort => SettingsField::HttpsEnabled,
             SettingsField::SaveSetup => SettingsField::HttpsPort,
             SettingsField::CancelSetup => SettingsField::SaveSetup,
@@ -689,6 +829,8 @@ struct SettingsPopup {
     temp_ws_cert_file: String,
     temp_ws_key_file: String,
     temp_ws_use_tls: bool,
+    temp_http_enabled: bool,
+    temp_http_port: String,
     temp_https_enabled: bool,
     temp_https_port: String,
 }
@@ -724,14 +866,16 @@ impl SettingsPopup {
             temp_theme: Theme::Dark,
             temp_gui_theme: Theme::Dark,
             temp_ws_enabled: false,
-            temp_ws_port: "9001".to_string(),
+            temp_ws_port: "9002".to_string(),
             temp_ws_password: String::new(),
             temp_ws_allow_list: String::new(),
             temp_ws_cert_file: String::new(),
             temp_ws_key_file: String::new(),
             temp_ws_use_tls: false,
+            temp_http_enabled: false,
+            temp_http_port: "9000".to_string(),
             temp_https_enabled: false,
-            temp_https_port: "9000".to_string(),
+            temp_https_port: "9001".to_string(),
         }
     }
 
@@ -783,6 +927,8 @@ impl SettingsPopup {
         self.temp_ws_cert_file = settings.websocket_cert_file.clone();
         self.temp_ws_key_file = settings.websocket_key_file.clone();
         self.temp_ws_use_tls = settings.websocket_use_tls;
+        self.temp_http_enabled = settings.http_enabled;
+        self.temp_http_port = settings.http_port.to_string();
         self.temp_https_enabled = settings.https_enabled;
         self.temp_https_port = settings.https_port.to_string();
     }
@@ -825,6 +971,7 @@ impl SettingsPopup {
             SettingsField::WsAllowList => self.temp_ws_allow_list.clone(),
             SettingsField::WsCertFile => self.temp_ws_cert_file.clone(),
             SettingsField::WsKeyFile => self.temp_ws_key_file.clone(),
+            SettingsField::HttpPort => self.temp_http_port.clone(),
             SettingsField::HttpsPort => self.temp_https_port.clone(),
             _ => String::new(),
         };
@@ -862,6 +1009,7 @@ impl SettingsPopup {
             SettingsField::WsAllowList => self.temp_ws_allow_list = self.edit_buffer.clone(),
             SettingsField::WsCertFile => self.temp_ws_cert_file = self.edit_buffer.clone(),
             SettingsField::WsKeyFile => self.temp_ws_key_file = self.edit_buffer.clone(),
+            SettingsField::HttpPort => self.temp_http_port = self.edit_buffer.clone(),
             SettingsField::HttpsPort => self.temp_https_port = self.edit_buffer.clone(),
             _ => {}
         }
@@ -882,6 +1030,7 @@ impl SettingsPopup {
             SettingsField::ShowTags => self.temp_show_tags = !self.temp_show_tags,
             SettingsField::WsEnabled => self.temp_ws_enabled = !self.temp_ws_enabled,
             SettingsField::WsUseTls => self.temp_ws_use_tls = !self.temp_ws_use_tls,
+            SettingsField::HttpEnabled => self.temp_http_enabled = !self.temp_http_enabled,
             SettingsField::HttpsEnabled => self.temp_https_enabled = !self.temp_https_enabled,
             SettingsField::InputHeight => {
                 // Cycle through 1-15
@@ -960,6 +1109,11 @@ impl SettingsPopup {
         settings.websocket_cert_file = self.temp_ws_cert_file.clone();
         settings.websocket_key_file = self.temp_ws_key_file.clone();
         settings.websocket_use_tls = self.temp_ws_use_tls;
+        // HTTP settings
+        settings.http_enabled = self.temp_http_enabled;
+        if let Ok(port) = self.temp_http_port.parse::<u16>() {
+            settings.http_port = port;
+        }
         // HTTPS settings
         settings.https_enabled = self.temp_https_enabled;
         if let Ok(port) = self.temp_https_port.parse::<u16>() {
@@ -1478,26 +1632,45 @@ impl HelpPopup {
     }
 }
 
+/// Which view the actions popup is showing
+#[derive(Clone, Copy, PartialEq)]
+enum ActionsView {
+    List,           // List of actions with Add/Edit/Delete/Cancel
+    Editor,         // Editing a single action
+    ConfirmDelete,  // Confirming deletion
+}
+
+/// Which field in the action list view is focused
+#[derive(Clone, Copy, PartialEq)]
+enum ActionListField {
+    List,           // Action list (selecting which action)
+    AddButton,
+    EditButton,
+    DeleteButton,
+    CancelButton,
+}
+
 /// Which field in the action editor is focused
 #[derive(Clone, Copy, PartialEq)]
-enum ActionField {
-    List,           // Action list (selecting which action to edit)
+enum ActionEditorField {
     Name,
     World,
     Pattern,
     Command,
     SaveButton,
     CancelButton,
-    AddButton,
-    DeleteButton,
 }
 
 /// Popup for editing actions/triggers
 struct ActionsPopup {
     visible: bool,
+    view: ActionsView,              // Current view mode
     actions: Vec<Action>,           // Working copy of actions
     selected_index: usize,          // Currently selected action in list
-    current_field: ActionField,     // Currently focused field
+    editing_index: Option<usize>,   // Index being edited (None = new action)
+    list_field: ActionListField,    // Current field in list view
+    editor_field: ActionEditorField, // Current field in editor view
+    confirm_selected: bool,         // Yes (true) or No (false) in confirm dialog
     scroll_offset: usize,           // Scroll offset for action list
     // Editing state for current action
     edit_name: String,
@@ -1513,9 +1686,13 @@ impl ActionsPopup {
     fn new() -> Self {
         Self {
             visible: false,
+            view: ActionsView::List,
             actions: Vec::new(),
             selected_index: 0,
-            current_field: ActionField::List,
+            editing_index: None,
+            list_field: ActionListField::List,
+            editor_field: ActionEditorField::Name,
+            confirm_selected: false,
             scroll_offset: 0,
             edit_name: String::new(),
             edit_world: String::new(),
@@ -1529,18 +1706,60 @@ impl ActionsPopup {
 
     fn open(&mut self, actions: &[Action]) {
         self.visible = true;
+        self.view = ActionsView::List;
         self.actions = actions.to_vec();
-        self.selected_index = 0;
-        self.current_field = ActionField::List;
+        self.selected_index = if actions.is_empty() { 0 } else { 0 };
+        self.editing_index = None;
+        self.list_field = ActionListField::List;
         self.scroll_offset = 0;
         self.error_message = None;
         self.command_expanded = false;
-        self.load_selected_action();
     }
 
     fn close(&mut self) {
         self.visible = false;
+        self.view = ActionsView::List;
         self.error_message = None;
+    }
+
+    fn open_editor(&mut self, index: Option<usize>) {
+        self.view = ActionsView::Editor;
+        self.editing_index = index;
+        self.editor_field = ActionEditorField::Name;
+        self.error_message = None;
+        self.cursor_pos = 0;
+        self.command_expanded = false;
+
+        if let Some(idx) = index {
+            if let Some(action) = self.actions.get(idx) {
+                self.edit_name = action.name.clone();
+                self.edit_world = action.world.clone();
+                self.edit_pattern = action.pattern.clone();
+                self.edit_command = action.command.clone();
+            }
+        } else {
+            // New action
+            self.edit_name.clear();
+            self.edit_world.clear();
+            self.edit_pattern.clear();
+            self.edit_command.clear();
+        }
+    }
+
+    fn close_editor(&mut self) {
+        self.view = ActionsView::List;
+        self.error_message = None;
+    }
+
+    fn open_confirm_delete(&mut self) {
+        if self.selected_index < self.actions.len() {
+            self.view = ActionsView::ConfirmDelete;
+            self.confirm_selected = false; // Default to No
+        }
+    }
+
+    fn close_confirm_delete(&mut self) {
+        self.view = ActionsView::List;
     }
 
     fn load_selected_action(&mut self) {
@@ -1570,9 +1789,10 @@ impl ActionsPopup {
             self.error_message = Some(format!("'{}' is a reserved command name", name));
             return false;
         }
-        // Check for duplicate names (excluding current action)
+        // Check for duplicate names (excluding current action if editing)
+        let editing_idx = self.editing_index;
         for (i, action) in self.actions.iter().enumerate() {
-            if i != self.selected_index && action.name.eq_ignore_ascii_case(name) {
+            if Some(i) != editing_idx && action.name.eq_ignore_ascii_case(name) {
                 self.error_message = Some(format!("Action '{}' already exists", name));
                 return false;
             }
@@ -1586,9 +1806,13 @@ impl ActionsPopup {
             command: self.edit_command.clone(),
         };
 
-        if self.selected_index < self.actions.len() {
-            self.actions[self.selected_index] = action;
+        if let Some(idx) = self.editing_index {
+            // Update existing
+            if idx < self.actions.len() {
+                self.actions[idx] = action;
+            }
         } else {
+            // New action
             self.actions.push(action);
             self.selected_index = self.actions.len() - 1;
         }
@@ -1597,45 +1821,32 @@ impl ActionsPopup {
         true
     }
 
-    fn add_new_action(&mut self) {
-        // Save current action first if editing
-        if !self.edit_name.trim().is_empty() {
-            let _ = self.save_current_action();
-        }
-        // Add new empty action
-        self.actions.push(Action::new());
-        self.selected_index = self.actions.len() - 1;
-        self.load_selected_action();
-        self.current_field = ActionField::Name;
-    }
-
-    fn delete_current_action(&mut self) {
+    fn delete_selected_action(&mut self) {
         if self.selected_index < self.actions.len() && !self.actions.is_empty() {
             self.actions.remove(self.selected_index);
             if self.selected_index >= self.actions.len() && !self.actions.is_empty() {
                 self.selected_index = self.actions.len() - 1;
             }
-            self.load_selected_action();
         }
     }
 
     fn current_field_text(&self) -> &str {
-        match self.current_field {
-            ActionField::Name => &self.edit_name,
-            ActionField::World => &self.edit_world,
-            ActionField::Pattern => &self.edit_pattern,
-            ActionField::Command => &self.edit_command,
+        match self.editor_field {
+            ActionEditorField::Name => &self.edit_name,
+            ActionEditorField::World => &self.edit_world,
+            ActionEditorField::Pattern => &self.edit_pattern,
+            ActionEditorField::Command => &self.edit_command,
             _ => "",
         }
     }
 
     fn insert_char(&mut self, c: char) {
         let cursor = self.cursor_pos;
-        let text = match self.current_field {
-            ActionField::Name => &mut self.edit_name,
-            ActionField::World => &mut self.edit_world,
-            ActionField::Pattern => &mut self.edit_pattern,
-            ActionField::Command => &mut self.edit_command,
+        let text = match self.editor_field {
+            ActionEditorField::Name => &mut self.edit_name,
+            ActionEditorField::World => &mut self.edit_world,
+            ActionEditorField::Pattern => &mut self.edit_pattern,
+            ActionEditorField::Command => &mut self.edit_command,
             _ => return,
         };
         if cursor <= text.len() {
@@ -1649,11 +1860,11 @@ impl ActionsPopup {
         if cursor == 0 {
             return;
         }
-        let text = match self.current_field {
-            ActionField::Name => &mut self.edit_name,
-            ActionField::World => &mut self.edit_world,
-            ActionField::Pattern => &mut self.edit_pattern,
-            ActionField::Command => &mut self.edit_command,
+        let text = match self.editor_field {
+            ActionEditorField::Name => &mut self.edit_name,
+            ActionEditorField::World => &mut self.edit_world,
+            ActionEditorField::Pattern => &mut self.edit_pattern,
+            ActionEditorField::Command => &mut self.edit_command,
             _ => return,
         };
         // Find the character boundary before cursor
@@ -1695,32 +1906,48 @@ impl ActionsPopup {
         self.cursor_pos = self.current_field_text().len();
     }
 
-    fn next_field(&mut self) {
-        self.current_field = match self.current_field {
-            ActionField::List => ActionField::Name,
-            ActionField::Name => ActionField::World,
-            ActionField::World => ActionField::Pattern,
-            ActionField::Pattern => ActionField::Command,
-            ActionField::Command => ActionField::AddButton,
-            ActionField::AddButton => ActionField::DeleteButton,
-            ActionField::DeleteButton => ActionField::SaveButton,
-            ActionField::SaveButton => ActionField::CancelButton,
-            ActionField::CancelButton => ActionField::List,
+    // List view field navigation
+    fn next_list_field(&mut self) {
+        self.list_field = match self.list_field {
+            ActionListField::List => ActionListField::AddButton,
+            ActionListField::AddButton => ActionListField::EditButton,
+            ActionListField::EditButton => ActionListField::DeleteButton,
+            ActionListField::DeleteButton => ActionListField::CancelButton,
+            ActionListField::CancelButton => ActionListField::List,
+        };
+    }
+
+    fn prev_list_field(&mut self) {
+        self.list_field = match self.list_field {
+            ActionListField::List => ActionListField::CancelButton,
+            ActionListField::AddButton => ActionListField::List,
+            ActionListField::EditButton => ActionListField::AddButton,
+            ActionListField::DeleteButton => ActionListField::EditButton,
+            ActionListField::CancelButton => ActionListField::DeleteButton,
+        };
+    }
+
+    // Editor view field navigation
+    fn next_editor_field(&mut self) {
+        self.editor_field = match self.editor_field {
+            ActionEditorField::Name => ActionEditorField::World,
+            ActionEditorField::World => ActionEditorField::Pattern,
+            ActionEditorField::Pattern => ActionEditorField::Command,
+            ActionEditorField::Command => ActionEditorField::SaveButton,
+            ActionEditorField::SaveButton => ActionEditorField::CancelButton,
+            ActionEditorField::CancelButton => ActionEditorField::Name,
         };
         self.cursor_pos = self.current_field_text().len();
     }
 
-    fn prev_field(&mut self) {
-        self.current_field = match self.current_field {
-            ActionField::List => ActionField::CancelButton,
-            ActionField::Name => ActionField::List,
-            ActionField::World => ActionField::Name,
-            ActionField::Pattern => ActionField::World,
-            ActionField::Command => ActionField::Pattern,
-            ActionField::AddButton => ActionField::Command,
-            ActionField::DeleteButton => ActionField::AddButton,
-            ActionField::SaveButton => ActionField::DeleteButton,
-            ActionField::CancelButton => ActionField::SaveButton,
+    fn prev_editor_field(&mut self) {
+        self.editor_field = match self.editor_field {
+            ActionEditorField::Name => ActionEditorField::CancelButton,
+            ActionEditorField::World => ActionEditorField::Name,
+            ActionEditorField::Pattern => ActionEditorField::World,
+            ActionEditorField::Command => ActionEditorField::Pattern,
+            ActionEditorField::SaveButton => ActionEditorField::Command,
+            ActionEditorField::CancelButton => ActionEditorField::SaveButton,
         };
         self.cursor_pos = self.current_field_text().len();
     }
@@ -1728,14 +1955,21 @@ impl ActionsPopup {
     fn select_prev_action(&mut self) {
         if self.selected_index > 0 {
             self.selected_index -= 1;
-            self.load_selected_action();
+        }
+        // Update scroll offset to keep selection visible
+        if self.selected_index < self.scroll_offset {
+            self.scroll_offset = self.selected_index;
         }
     }
 
     fn select_next_action(&mut self) {
         if self.selected_index + 1 < self.actions.len() {
             self.selected_index += 1;
-            self.load_selected_action();
+        }
+        // Update scroll offset to keep selection visible (assuming 5 visible items)
+        let visible_items = 5;
+        if self.selected_index >= self.scroll_offset + visible_items {
+            self.scroll_offset = self.selected_index - visible_items + 1;
         }
     }
 }
@@ -1760,9 +1994,12 @@ struct Settings {
     websocket_use_tls: bool,       // Use WSS (TLS) instead of WS
     websocket_cert_file: String,   // Path to TLS certificate file (PEM)
     websocket_key_file: String,    // Path to TLS private key file (PEM)
+    // HTTP web interface settings
+    http_enabled: bool,            // Enable/disable HTTP web server
+    http_port: u16,                // Port for HTTP web interface (default 9000)
     // HTTPS web interface settings
     https_enabled: bool,           // Enable/disable HTTPS web server
-    https_port: u16,               // Port for HTTPS web interface (default 9000)
+    https_port: u16,               // Port for HTTPS web interface (default 9001)
     // User-defined actions/triggers
     actions: Vec<Action>,
 }
@@ -1779,15 +2016,17 @@ impl Default for Settings {
             font_name: String::new(),  // Empty means use system default
             font_size: 14.0,
             websocket_enabled: false,
-            websocket_port: 9001,
+            websocket_port: 9002,
             websocket_password: String::new(),
             websocket_allow_list: String::new(),
             websocket_whitelisted_host: None,
             websocket_use_tls: false,
             websocket_cert_file: String::new(),
             websocket_key_file: String::new(),
+            http_enabled: false,
+            http_port: 9000,
             https_enabled: false,
-            https_port: 9000,
+            https_port: 9001,
             actions: Vec::new(),
         }
     }
@@ -2371,6 +2610,8 @@ struct App {
     show_tags: bool, // F2 toggles - false = hide tags (default), true = show tags
     // WebSocket server
     ws_server: Option<WebSocketServer>,
+    // HTTP web interface server (no TLS)
+    http_server: Option<HttpServer>,
     // HTTPS web interface server
     #[cfg(feature = "native-tls-backend")]
     https_server: Option<HttpsServer>,
@@ -2404,6 +2645,7 @@ impl App {
             last_escape: None,
             show_tags: false, // Default: hide tags
             ws_server: None,
+            http_server: None,
             #[cfg(feature = "native-tls-backend")]
             https_server: None,
             #[cfg(feature = "rustls-backend")]
@@ -2794,6 +3036,10 @@ impl App {
             font_name: self.settings.font_name.clone(),
             font_size: self.settings.font_size,
             ws_allow_list: self.settings.websocket_allow_list.clone(),
+            http_enabled: self.settings.http_enabled,
+            http_port: self.settings.http_port,
+            https_enabled: self.settings.https_enabled,
+            https_port: self.settings.https_port,
         };
 
         WsMessage::InitialState {
@@ -3175,6 +3421,8 @@ fn save_settings(app: &App) -> io::Result<()> {
     if !app.settings.websocket_key_file.is_empty() {
         writeln!(file, "websocket_key_file={}", app.settings.websocket_key_file)?;
     }
+    writeln!(file, "http_enabled={}", app.settings.http_enabled)?;
+    writeln!(file, "http_port={}", app.settings.http_port)?;
     writeln!(file, "https_enabled={}", app.settings.https_enabled)?;
     writeln!(file, "https_port={}", app.settings.https_port)?;
 
@@ -3332,6 +3580,14 @@ fn load_settings(app: &mut App) -> io::Result<()> {
                     "websocket_key_file" => {
                         app.settings.websocket_key_file = value.to_string();
                     }
+                    "http_enabled" => {
+                        app.settings.http_enabled = value == "true";
+                    }
+                    "http_port" => {
+                        if let Ok(p) = value.parse::<u16>() {
+                            app.settings.http_port = p;
+                        }
+                    }
                     "https_enabled" => {
                         app.settings.https_enabled = value == "true";
                     }
@@ -3435,6 +3691,8 @@ fn save_reload_state(app: &App) -> io::Result<()> {
     if !app.settings.websocket_key_file.is_empty() {
         writeln!(file, "websocket_key_file={}", app.settings.websocket_key_file)?;
     }
+    writeln!(file, "http_enabled={}", app.settings.http_enabled)?;
+    writeln!(file, "http_port={}", app.settings.http_port)?;
     writeln!(file, "https_enabled={}", app.settings.https_enabled)?;
     writeln!(file, "https_port={}", app.settings.https_port)?;
 
@@ -3703,6 +3961,14 @@ fn load_reload_state(app: &mut App) -> io::Result<bool> {
                     "websocket_key_file" => {
                         app.settings.websocket_key_file = value.to_string();
                     }
+                    "http_enabled" => {
+                        app.settings.http_enabled = value == "true";
+                    }
+                    "http_port" => {
+                        if let Ok(p) = value.parse::<u16>() {
+                            app.settings.http_port = p;
+                        }
+                    }
                     "https_enabled" => {
                         app.settings.https_enabled = value == "true";
                     }
@@ -3933,6 +4199,9 @@ mod remote_gui {
         Setup,
         Font,
         Help,
+        ActionsList,           // Actions list (first window)
+        ActionEditor(usize),   // Action editor (second window) - index of action being edited
+        ActionConfirmDelete,   // Delete confirmation dialog
     }
 
     /// Remote GUI client application state
@@ -4114,6 +4383,14 @@ mod remote_gui {
         filter_active: bool,
         /// WebSocket allow list (CSV of hosts that can connect without password)
         ws_allow_list: String,
+        /// HTTP server enabled
+        http_enabled: bool,
+        /// HTTP server port
+        http_port: u16,
+        /// HTTPS server enabled
+        https_enabled: bool,
+        /// HTTPS server port
+        https_port: u16,
         /// World switching mode (Unseen First or Alphabetical)
         world_switch_mode: WorldSwitchMode,
         /// Debug logging enabled (synced from server, not used locally)
@@ -4126,6 +4403,15 @@ mod remote_gui {
         suggestion_message: Option<String>,
         /// Actions synced from server
         actions: Vec<Action>,
+        /// Selected action index in actions list
+        actions_selected: usize,
+        /// Action editor temp fields
+        edit_action_name: String,
+        edit_action_world: String,
+        edit_action_pattern: String,
+        edit_action_command: String,
+        /// Action error message
+        action_error: Option<String>,
     }
 
     impl RemoteGuiApp {
@@ -4171,12 +4457,22 @@ mod remote_gui {
                 filter_text: String::new(),
                 filter_active: false,
                 ws_allow_list: String::new(),
+                http_enabled: false,
+                http_port: 9000,
+                https_enabled: false,
+                https_port: 9001,
                 world_switch_mode: WorldSwitchMode::UnseenFirst,
                 debug_enabled: false,
                 spell_checker: SpellChecker::new(),
                 spell_state: SpellState::new(),
                 suggestion_message: None,
                 actions: Vec::new(),
+                actions_selected: 0,
+                edit_action_name: String::new(),
+                edit_action_world: String::new(),
+                edit_action_pattern: String::new(),
+                edit_action_command: String::new(),
+                action_error: None,
             }
         }
 
@@ -4427,6 +4723,10 @@ mod remote_gui {
                             self.font_name = settings.font_name;
                             self.font_size = settings.font_size;
                             self.ws_allow_list = settings.ws_allow_list;
+                            self.http_enabled = settings.http_enabled;
+                            self.http_port = settings.http_port;
+                            self.https_enabled = settings.https_enabled;
+                            self.https_port = settings.https_port;
                             self.world_switch_mode = WorldSwitchMode::from_name(&settings.world_switch_mode);
                             self.debug_enabled = settings.debug_enabled;
                             self.actions = actions;
@@ -4491,6 +4791,10 @@ mod remote_gui {
                             self.font_name = settings.font_name;
                             self.font_size = settings.font_size;
                             self.ws_allow_list = settings.ws_allow_list;
+                            self.http_enabled = settings.http_enabled;
+                            self.http_port = settings.http_port;
+                            self.https_enabled = settings.https_enabled;
+                            self.https_port = settings.https_port;
                             self.world_switch_mode = WorldSwitchMode::from_name(&settings.world_switch_mode);
                             self.debug_enabled = settings.debug_enabled;
                         }
@@ -4718,6 +5022,18 @@ mod remote_gui {
                     font_name: self.font_name.clone(),
                     font_size: self.font_size,
                     ws_allow_list: self.ws_allow_list.clone(),
+                    http_enabled: self.http_enabled,
+                    http_port: self.http_port,
+                    https_enabled: self.https_enabled,
+                    https_port: self.https_port,
+                });
+            }
+        }
+
+        fn update_actions(&mut self) {
+            if let Some(ref tx) = self.ws_tx {
+                let _ = tx.send(WsMessage::UpdateActions {
+                    actions: self.actions.clone(),
                 });
             }
         }
@@ -5540,10 +5856,9 @@ mod remote_gui {
                         self.world_list_selected = self.current_world;
                     }
                     Some("actions") => {
-                        // Actions popup not yet implemented in GUI
-                        if let Some(world) = self.worlds.get_mut(self.current_world) {
-                            world.output_lines.push("Actions editor not yet available in GUI.".to_string());
-                        }
+                        self.popup_state = PopupState::ActionsList;
+                        self.actions_selected = 0;
+                        self.action_error = None;
                     }
                     Some("edit_current") => self.open_world_editor(self.current_world),
                     Some("setup") => self.popup_state = PopupState::Setup,
@@ -6440,6 +6755,38 @@ mod remote_gui {
                                         .hint_text("localhost, 192.168.*")
                                         .desired_width(200.0));
                                     ui.end_row();
+
+                                    ui.label("HTTP enabled:");
+                                    let http_text = if self.http_enabled { "On" } else { "Off" };
+                                    if ui.button(http_text).clicked() {
+                                        self.http_enabled = !self.http_enabled;
+                                    }
+                                    ui.end_row();
+
+                                    ui.label("HTTP port:");
+                                    let mut http_port_str = self.http_port.to_string();
+                                    if ui.add(egui::TextEdit::singleline(&mut http_port_str).desired_width(80.0)).changed() {
+                                        if let Ok(port) = http_port_str.parse::<u16>() {
+                                            self.http_port = port;
+                                        }
+                                    }
+                                    ui.end_row();
+
+                                    ui.label("HTTPS enabled:");
+                                    let https_text = if self.https_enabled { "On" } else { "Off" };
+                                    if ui.button(https_text).clicked() {
+                                        self.https_enabled = !self.https_enabled;
+                                    }
+                                    ui.end_row();
+
+                                    ui.label("HTTPS port:");
+                                    let mut https_port_str = self.https_port.to_string();
+                                    if ui.add(egui::TextEdit::singleline(&mut https_port_str).desired_width(80.0)).changed() {
+                                        if let Ok(port) = https_port_str.parse::<u16>() {
+                                            self.https_port = port;
+                                        }
+                                    }
+                                    ui.end_row();
                                 });
                             ui.separator();
                             ui.label(format!("Connected to: {}", self.ws_url));
@@ -6599,6 +6946,227 @@ mod remote_gui {
                             ui.horizontal(|ui| {
                                 if ui.button("OK").clicked() {
                                     close_popup = true;
+                                }
+                            });
+                        });
+                }
+
+                // Actions List popup (first window)
+                if self.popup_state == PopupState::ActionsList {
+                    egui::Window::new("Actions")
+                        .collapsible(false)
+                        .resizable(true)
+                        .default_size([450.0, 300.0])
+                        .show(ctx, |ui| {
+                            if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+                                close_popup = true;
+                            }
+
+                            // Actions list with columns: Name, World, Pattern
+                            ui.label(egui::RichText::new("Saved Actions").strong());
+                            ui.separator();
+
+                            if self.actions.is_empty() {
+                                ui.label("No actions defined.");
+                            } else {
+                                egui::ScrollArea::vertical()
+                                    .max_height(180.0)
+                                    .show(ui, |ui| {
+                                        egui::Grid::new("actions_list_grid")
+                                            .num_columns(3)
+                                            .min_col_width(80.0)
+                                            .spacing([10.0, 4.0])
+                                            .striped(true)
+                                            .show(ui, |ui| {
+                                                // Header
+                                                ui.label(egui::RichText::new("Name").strong());
+                                                ui.label(egui::RichText::new("World").strong());
+                                                ui.label(egui::RichText::new("Pattern").strong());
+                                                ui.end_row();
+
+                                                // Actions
+                                                for (idx, action) in self.actions.iter().enumerate() {
+                                                    let is_selected = idx == self.actions_selected;
+                                                    let name_text = if is_selected {
+                                                        egui::RichText::new(&action.name).strong().color(egui::Color32::WHITE)
+                                                    } else {
+                                                        egui::RichText::new(&action.name)
+                                                    };
+                                                    if ui.selectable_label(is_selected, name_text).clicked() {
+                                                        self.actions_selected = idx;
+                                                    }
+                                                    let world_display = if action.world.is_empty() { "(all)" } else { &action.world };
+                                                    ui.label(world_display);
+                                                    let pattern_display = if action.pattern.is_empty() { "(manual)" } else { &action.pattern };
+                                                    ui.label(pattern_display);
+                                                    ui.end_row();
+                                                }
+                                            });
+                                    });
+                            }
+
+                            ui.separator();
+
+                            // Buttons: Add, Edit, Delete, Cancel
+                            ui.horizontal(|ui| {
+                                if ui.button("Add").clicked() {
+                                    // Create new action and open editor
+                                    self.edit_action_name = String::new();
+                                    self.edit_action_world = String::new();
+                                    self.edit_action_pattern = String::new();
+                                    self.edit_action_command = String::new();
+                                    self.action_error = None;
+                                    self.popup_state = PopupState::ActionEditor(usize::MAX); // MAX = new action
+                                }
+                                if ui.button("Edit").clicked() && !self.actions.is_empty() {
+                                    // Load selected action into editor
+                                    if let Some(action) = self.actions.get(self.actions_selected) {
+                                        self.edit_action_name = action.name.clone();
+                                        self.edit_action_world = action.world.clone();
+                                        self.edit_action_pattern = action.pattern.clone();
+                                        self.edit_action_command = action.command.clone();
+                                        self.action_error = None;
+                                        self.popup_state = PopupState::ActionEditor(self.actions_selected);
+                                    }
+                                }
+                                if ui.button("Delete").clicked() && !self.actions.is_empty() {
+                                    self.popup_state = PopupState::ActionConfirmDelete;
+                                }
+                                if ui.button("Cancel").clicked() {
+                                    close_popup = true;
+                                }
+                            });
+                        });
+                }
+
+                // Actions Editor popup (second window)
+                if let PopupState::ActionEditor(edit_idx) = self.popup_state.clone() {
+                    let title = if edit_idx == usize::MAX { "New Action" } else { "Edit Action" };
+                    egui::Window::new(title)
+                        .collapsible(false)
+                        .resizable(true)
+                        .default_size([400.0, 350.0])
+                        .show(ctx, |ui| {
+                            if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+                                // Return to actions list
+                                self.popup_state = PopupState::ActionsList;
+                            }
+
+                            egui::Grid::new("action_editor_grid")
+                                .num_columns(2)
+                                .spacing([10.0, 8.0])
+                                .show(ui, |ui| {
+                                    ui.label("Name:");
+                                    ui.add(egui::TextEdit::singleline(&mut self.edit_action_name)
+                                        .desired_width(250.0));
+                                    ui.end_row();
+
+                                    ui.label("World:");
+                                    ui.add(egui::TextEdit::singleline(&mut self.edit_action_world)
+                                        .hint_text("(empty = all worlds)")
+                                        .desired_width(250.0));
+                                    ui.end_row();
+
+                                    ui.label("Pattern:");
+                                    ui.add(egui::TextEdit::singleline(&mut self.edit_action_pattern)
+                                        .hint_text("(regex, empty = manual only)")
+                                        .desired_width(250.0));
+                                    ui.end_row();
+
+                                    ui.label("Command:");
+                                    ui.end_row();
+                                });
+
+                            // Larger command area
+                            ui.add(egui::TextEdit::multiline(&mut self.edit_action_command)
+                                .hint_text("Commands (semicolon-separated)")
+                                .desired_width(f32::INFINITY)
+                                .desired_rows(5));
+
+                            // Error message
+                            if let Some(ref err) = self.action_error {
+                                ui.colored_label(egui::Color32::RED, err);
+                            }
+
+                            ui.separator();
+
+                            // Buttons: Save, Cancel
+                            ui.horizontal(|ui| {
+                                if ui.button("Save").clicked() {
+                                    // Validate
+                                    let name = self.edit_action_name.trim();
+                                    if name.is_empty() {
+                                        self.action_error = Some("Name is required".to_string());
+                                    } else {
+                                        // Check for duplicates (excluding current if editing)
+                                        let mut duplicate = false;
+                                        for (i, a) in self.actions.iter().enumerate() {
+                                            if (edit_idx == usize::MAX || i != edit_idx) &&
+                                               a.name.eq_ignore_ascii_case(name) {
+                                                self.action_error = Some(format!("Action '{}' already exists", name));
+                                                duplicate = true;
+                                                break;
+                                            }
+                                        }
+                                        if !duplicate {
+                                            let new_action = Action {
+                                                name: name.to_string(),
+                                                world: self.edit_action_world.trim().to_string(),
+                                                pattern: self.edit_action_pattern.clone(),
+                                                command: self.edit_action_command.clone(),
+                                            };
+                                            if edit_idx == usize::MAX {
+                                                // New action
+                                                self.actions.push(new_action);
+                                                self.actions_selected = self.actions.len() - 1;
+                                            } else {
+                                                // Update existing
+                                                self.actions[edit_idx] = new_action;
+                                            }
+                                            // Send updated actions to server
+                                            self.update_actions();
+                                            self.popup_state = PopupState::ActionsList;
+                                        }
+                                    }
+                                }
+                                if ui.button("Cancel").clicked() {
+                                    self.popup_state = PopupState::ActionsList;
+                                }
+                            });
+                        });
+                }
+
+                // Action delete confirmation popup
+                if self.popup_state == PopupState::ActionConfirmDelete {
+                    egui::Window::new("Confirm Delete")
+                        .collapsible(false)
+                        .resizable(false)
+                        .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+                        .show(ctx, |ui| {
+                            if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+                                self.popup_state = PopupState::ActionsList;
+                            }
+
+                            let action_name = self.actions.get(self.actions_selected)
+                                .map(|a| a.name.as_str())
+                                .unwrap_or("(unknown)");
+                            ui.label(format!("Delete action '{}'?", action_name));
+                            ui.add_space(8.0);
+
+                            ui.horizontal(|ui| {
+                                if ui.button("Yes").clicked() {
+                                    if self.actions_selected < self.actions.len() {
+                                        self.actions.remove(self.actions_selected);
+                                        if self.actions_selected >= self.actions.len() && !self.actions.is_empty() {
+                                            self.actions_selected = self.actions.len() - 1;
+                                        }
+                                        // Send updated actions to server
+                                        self.update_actions();
+                                    }
+                                    self.popup_state = PopupState::ActionsList;
+                                }
+                                if ui.button("No").clicked() {
+                                    self.popup_state = PopupState::ActionsList;
                                 }
                             });
                         });
@@ -7081,6 +7649,27 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
         }
     }
 
+    // Start HTTP web interface server if enabled
+    if app.settings.http_enabled {
+        let mut http_server = HttpServer::new(app.settings.http_port);
+        match start_http_server(
+            &mut http_server,
+            app.settings.websocket_port,
+            app.settings.websocket_use_tls,
+        ).await {
+            Ok(()) => {
+                app.add_output(&format!("HTTP web interface started on port {}", app.settings.http_port));
+                app.http_server = Some(http_server);
+            }
+            Err(e) => {
+                let err_str = e.to_string();
+                if !err_str.contains("Address in use") && !err_str.contains("address already in use") {
+                    app.add_output(&format!("Warning: Failed to start HTTP server: {}", e));
+                }
+            }
+        }
+    }
+
     // Start HTTPS web interface server if enabled and TLS cert/key are configured
     #[cfg(feature = "native-tls-backend")]
     if app.settings.https_enabled
@@ -7289,6 +7878,34 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                 }
                                 app.ws_server = None;
                                 app.add_output("WebSocket server stopped.");
+                            }
+
+                            // Check if we need to start or stop the HTTP server
+                            {
+                                let http_enabled = app.settings.http_enabled;
+                                let http_running = app.http_server.is_some();
+
+                                if http_enabled && !http_running {
+                                    // Start the HTTP server
+                                    let mut http_server = HttpServer::new(app.settings.http_port);
+                                    match start_http_server(
+                                        &mut http_server,
+                                        app.settings.websocket_port,
+                                        app.settings.websocket_use_tls,
+                                    ).await {
+                                        Ok(()) => {
+                                            app.add_output(&format!("HTTP web interface started on port {}", app.settings.http_port));
+                                            app.http_server = Some(http_server);
+                                        }
+                                        Err(e) => {
+                                            app.add_output(&format!("Warning: Failed to start HTTP server: {}", e));
+                                        }
+                                    }
+                                } else if !http_enabled && http_running {
+                                    // Stop the HTTP server
+                                    app.http_server = None;
+                                    app.add_output("HTTP web interface stopped.");
+                                }
                             }
 
                             // Check if we need to start or stop the HTTPS server
@@ -7680,7 +8297,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                     });
                                 }
                             }
-                            WsMessage::UpdateGlobalSettings { console_theme, gui_theme, input_height, font_name, font_size, ws_allow_list } => {
+                            WsMessage::UpdateGlobalSettings { console_theme, gui_theme, input_height, font_name, font_size, ws_allow_list, http_enabled, http_port, https_enabled, https_port } => {
                                 // Update global settings from remote client
                                 // Console theme affects the TUI on the server
                                 app.settings.theme = Theme::from_name(&console_theme);
@@ -7695,6 +8312,11 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                 if let Some(ref server) = app.ws_server {
                                     server.update_allow_list(&ws_allow_list);
                                 }
+                                // Update HTTP/HTTPS settings
+                                app.settings.http_enabled = http_enabled;
+                                app.settings.http_port = http_port;
+                                app.settings.https_enabled = https_enabled;
+                                app.settings.https_port = https_port;
                                 // Save settings to persist changes
                                 let _ = save_settings(&app);
                                 // Build settings message for broadcast
@@ -7710,6 +8332,10 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                     font_name: app.settings.font_name.clone(),
                                     font_size: app.settings.font_size,
                                     ws_allow_list: app.settings.websocket_allow_list.clone(),
+                                    http_enabled: app.settings.http_enabled,
+                                    http_port: app.settings.http_port,
+                                    https_enabled: app.settings.https_enabled,
+                                    https_port: app.settings.https_port,
                                 };
                                 // Broadcast update to all clients
                                 app.ws_broadcast(WsMessage::GlobalSettingsUpdated {
@@ -8066,7 +8692,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                 app.ws_broadcast(WsMessage::WorldSettingsUpdated { world_index, settings: settings_msg, name });
                             }
                         }
-                        WsMessage::UpdateGlobalSettings { console_theme, gui_theme, input_height, font_name, font_size, ws_allow_list } => {
+                        WsMessage::UpdateGlobalSettings { console_theme, gui_theme, input_height, font_name, font_size, ws_allow_list, http_enabled, http_port, https_enabled, https_port } => {
                             app.settings.theme = Theme::from_name(&console_theme);
                             app.settings.gui_theme = Theme::from_name(&gui_theme);
                             app.input_height = input_height.clamp(1, 15);
@@ -8077,6 +8703,10 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                             if let Some(ref server) = app.ws_server {
                                 server.update_allow_list(&ws_allow_list);
                             }
+                            app.settings.http_enabled = http_enabled;
+                            app.settings.http_port = http_port;
+                            app.settings.https_enabled = https_enabled;
+                            app.settings.https_port = https_port;
                             let _ = save_settings(&app);
                             let settings_msg = GlobalSettingsMsg {
                                 more_mode_enabled: app.settings.more_mode_enabled,
@@ -8090,6 +8720,10 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                 font_name: app.settings.font_name.clone(),
                                 font_size: app.settings.font_size,
                                 ws_allow_list: app.settings.websocket_allow_list.clone(),
+                                http_enabled: app.settings.http_enabled,
+                                http_port: app.settings.http_port,
+                                https_enabled: app.settings.https_enabled,
+                                https_port: app.settings.https_port,
                             };
                             app.ws_broadcast(WsMessage::GlobalSettingsUpdated { settings: settings_msg, input_height: app.input_height });
                         }
@@ -8221,129 +8855,214 @@ fn handle_key_event(key: KeyEvent, app: &mut App) -> KeyAction {
         return KeyAction::None;
     }
 
-    // Handle actions popup input
+    // Handle actions popup input (split into List, Editor, and ConfirmDelete views)
     if app.actions_popup.visible {
-        match key.code {
-            KeyCode::Esc => {
-                // Cancel without saving
-                app.actions_popup.close();
-            }
-            KeyCode::Tab => {
-                if key.modifiers.contains(KeyModifiers::SHIFT) {
-                    app.actions_popup.prev_field();
-                } else {
-                    app.actions_popup.next_field();
-                }
-            }
-            KeyCode::Up => {
-                if app.actions_popup.current_field == ActionField::List {
-                    app.actions_popup.select_prev_action();
-                } else {
-                    app.actions_popup.prev_field();
-                }
-            }
-            KeyCode::Down => {
-                if app.actions_popup.current_field == ActionField::List {
-                    app.actions_popup.select_next_action();
-                } else {
-                    app.actions_popup.next_field();
-                }
-            }
-            KeyCode::Left => {
-                match app.actions_popup.current_field {
-                    ActionField::Name | ActionField::World | ActionField::Pattern | ActionField::Command => {
-                        app.actions_popup.move_cursor_left();
+        match app.actions_popup.view {
+            ActionsView::ConfirmDelete => {
+                // Confirm delete dialog
+                match key.code {
+                    KeyCode::Esc => {
+                        app.actions_popup.close_confirm_delete();
                     }
-                    ActionField::SaveButton => {
-                        app.actions_popup.current_field = ActionField::DeleteButton;
+                    KeyCode::Left | KeyCode::Right | KeyCode::Tab => {
+                        app.actions_popup.confirm_selected = !app.actions_popup.confirm_selected;
                     }
-                    ActionField::CancelButton => {
-                        app.actions_popup.current_field = ActionField::SaveButton;
+                    KeyCode::Char('y') | KeyCode::Char('Y') => {
+                        // Delete and return to list
+                        app.actions_popup.delete_selected_action();
+                        app.settings.actions = app.actions_popup.actions.clone();
+                        let _ = save_settings(app);
+                        app.ws_broadcast(WsMessage::ActionsUpdated {
+                            actions: app.settings.actions.clone(),
+                        });
+                        app.actions_popup.close_confirm_delete();
                     }
-                    ActionField::DeleteButton => {
-                        app.actions_popup.current_field = ActionField::AddButton;
+                    KeyCode::Char('n') | KeyCode::Char('N') => {
+                        app.actions_popup.close_confirm_delete();
                     }
-                    _ => {}
-                }
-            }
-            KeyCode::Right => {
-                match app.actions_popup.current_field {
-                    ActionField::Name | ActionField::World | ActionField::Pattern | ActionField::Command => {
-                        app.actions_popup.move_cursor_right();
-                    }
-                    ActionField::AddButton => {
-                        app.actions_popup.current_field = ActionField::DeleteButton;
-                    }
-                    ActionField::DeleteButton => {
-                        app.actions_popup.current_field = ActionField::SaveButton;
-                    }
-                    ActionField::SaveButton => {
-                        app.actions_popup.current_field = ActionField::CancelButton;
-                    }
-                    _ => {}
-                }
-            }
-            KeyCode::Home => {
-                app.actions_popup.move_cursor_home();
-            }
-            KeyCode::End => {
-                app.actions_popup.move_cursor_end();
-            }
-            KeyCode::Backspace => {
-                app.actions_popup.delete_char();
-            }
-            KeyCode::Enter => {
-                match app.actions_popup.current_field {
-                    ActionField::List => {
-                        // Start editing the selected action
-                        app.actions_popup.current_field = ActionField::Name;
-                        app.actions_popup.cursor_pos = app.actions_popup.edit_name.len();
-                    }
-                    ActionField::SaveButton => {
-                        // Save current action and close
-                        if app.actions_popup.save_current_action() {
-                            // Copy actions back to settings
+                    KeyCode::Enter => {
+                        if app.actions_popup.confirm_selected {
+                            // Yes - delete
+                            app.actions_popup.delete_selected_action();
                             app.settings.actions = app.actions_popup.actions.clone();
                             let _ = save_settings(app);
-                            // Broadcast to WebSocket clients
                             app.ws_broadcast(WsMessage::ActionsUpdated {
                                 actions: app.settings.actions.clone(),
                             });
-                            app.actions_popup.close();
                         }
-                    }
-                    ActionField::CancelButton => {
-                        app.actions_popup.close();
-                    }
-                    ActionField::AddButton => {
-                        app.actions_popup.add_new_action();
-                    }
-                    ActionField::DeleteButton => {
-                        app.actions_popup.delete_current_action();
-                    }
-                    _ => {
-                        // In text fields, move to next field
-                        app.actions_popup.next_field();
-                    }
-                }
-            }
-            KeyCode::Char(c) => {
-                // Insert character into current text field
-                match app.actions_popup.current_field {
-                    ActionField::Name | ActionField::World | ActionField::Pattern | ActionField::Command => {
-                        app.actions_popup.insert_char(c);
-                    }
-                    ActionField::List => {
-                        // Start editing with this character
-                        app.actions_popup.current_field = ActionField::Name;
-                        app.actions_popup.edit_name.clear();
-                        app.actions_popup.cursor_pos = 0;
-                        app.actions_popup.insert_char(c);
+                        app.actions_popup.close_confirm_delete();
                     }
                     _ => {}
                 }
             }
-            _ => {}
+            ActionsView::Editor => {
+                // Editor view
+                match key.code {
+                    KeyCode::Esc => {
+                        app.actions_popup.close_editor();
+                    }
+                    KeyCode::Tab => {
+                        if key.modifiers.contains(KeyModifiers::SHIFT) {
+                            app.actions_popup.prev_editor_field();
+                        } else {
+                            app.actions_popup.next_editor_field();
+                        }
+                    }
+                    KeyCode::Up => {
+                        app.actions_popup.prev_editor_field();
+                    }
+                    KeyCode::Down => {
+                        app.actions_popup.next_editor_field();
+                    }
+                    KeyCode::Left => {
+                        match app.actions_popup.editor_field {
+                            ActionEditorField::Name | ActionEditorField::World |
+                            ActionEditorField::Pattern | ActionEditorField::Command => {
+                                app.actions_popup.move_cursor_left();
+                            }
+                            ActionEditorField::CancelButton => {
+                                app.actions_popup.editor_field = ActionEditorField::SaveButton;
+                            }
+                            _ => {}
+                        }
+                    }
+                    KeyCode::Right => {
+                        match app.actions_popup.editor_field {
+                            ActionEditorField::Name | ActionEditorField::World |
+                            ActionEditorField::Pattern | ActionEditorField::Command => {
+                                app.actions_popup.move_cursor_right();
+                            }
+                            ActionEditorField::SaveButton => {
+                                app.actions_popup.editor_field = ActionEditorField::CancelButton;
+                            }
+                            _ => {}
+                        }
+                    }
+                    KeyCode::Home => {
+                        app.actions_popup.move_cursor_home();
+                    }
+                    KeyCode::End => {
+                        app.actions_popup.move_cursor_end();
+                    }
+                    KeyCode::Backspace => {
+                        app.actions_popup.delete_char();
+                    }
+                    KeyCode::Enter => {
+                        match app.actions_popup.editor_field {
+                            ActionEditorField::SaveButton => {
+                                if app.actions_popup.save_current_action() {
+                                    app.settings.actions = app.actions_popup.actions.clone();
+                                    let _ = save_settings(app);
+                                    app.ws_broadcast(WsMessage::ActionsUpdated {
+                                        actions: app.settings.actions.clone(),
+                                    });
+                                    app.actions_popup.close_editor();
+                                }
+                            }
+                            ActionEditorField::CancelButton => {
+                                app.actions_popup.close_editor();
+                            }
+                            _ => {
+                                app.actions_popup.next_editor_field();
+                            }
+                        }
+                    }
+                    KeyCode::Char(c) => {
+                        match app.actions_popup.editor_field {
+                            ActionEditorField::Name | ActionEditorField::World |
+                            ActionEditorField::Pattern | ActionEditorField::Command => {
+                                app.actions_popup.insert_char(c);
+                            }
+                            _ => {}
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            ActionsView::List => {
+                // List view
+                match key.code {
+                    KeyCode::Esc => {
+                        app.actions_popup.close();
+                    }
+                    KeyCode::Tab => {
+                        if key.modifiers.contains(KeyModifiers::SHIFT) {
+                            app.actions_popup.prev_list_field();
+                        } else {
+                            app.actions_popup.next_list_field();
+                        }
+                    }
+                    KeyCode::Up => {
+                        if app.actions_popup.list_field == ActionListField::List {
+                            app.actions_popup.select_prev_action();
+                        } else {
+                            app.actions_popup.list_field = ActionListField::List;
+                        }
+                    }
+                    KeyCode::Down => {
+                        if app.actions_popup.list_field == ActionListField::List {
+                            app.actions_popup.select_next_action();
+                        } else {
+                            app.actions_popup.list_field = ActionListField::List;
+                        }
+                    }
+                    KeyCode::Left => {
+                        match app.actions_popup.list_field {
+                            ActionListField::EditButton => {
+                                app.actions_popup.list_field = ActionListField::AddButton;
+                            }
+                            ActionListField::DeleteButton => {
+                                app.actions_popup.list_field = ActionListField::EditButton;
+                            }
+                            ActionListField::CancelButton => {
+                                app.actions_popup.list_field = ActionListField::DeleteButton;
+                            }
+                            _ => {}
+                        }
+                    }
+                    KeyCode::Right => {
+                        match app.actions_popup.list_field {
+                            ActionListField::AddButton => {
+                                app.actions_popup.list_field = ActionListField::EditButton;
+                            }
+                            ActionListField::EditButton => {
+                                app.actions_popup.list_field = ActionListField::DeleteButton;
+                            }
+                            ActionListField::DeleteButton => {
+                                app.actions_popup.list_field = ActionListField::CancelButton;
+                            }
+                            _ => {}
+                        }
+                    }
+                    KeyCode::Enter => {
+                        match app.actions_popup.list_field {
+                            ActionListField::List => {
+                                // Edit selected action
+                                if !app.actions_popup.actions.is_empty() {
+                                    let idx = app.actions_popup.selected_index;
+                                    app.actions_popup.open_editor(Some(idx));
+                                }
+                            }
+                            ActionListField::AddButton => {
+                                app.actions_popup.open_editor(None);
+                            }
+                            ActionListField::EditButton => {
+                                if !app.actions_popup.actions.is_empty() {
+                                    let idx = app.actions_popup.selected_index;
+                                    app.actions_popup.open_editor(Some(idx));
+                                }
+                            }
+                            ActionListField::DeleteButton => {
+                                app.actions_popup.open_confirm_delete();
+                            }
+                            ActionListField::CancelButton => {
+                                app.actions_popup.close();
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
         }
         return KeyAction::None;
     }
@@ -10820,6 +11539,8 @@ fn render_settings_popup(f: &mut Frame, app: &App) {
             render_text_field("TLS Cert File:", &popup.temp_ws_cert_file, SettingsField::WsCertFile, w),
             render_text_field("TLS Key File:", &popup.temp_ws_key_file, SettingsField::WsKeyFile, w),
             render_toggle_field("WS Use TLS:", popup.temp_ws_use_tls, SettingsField::WsUseTls, w),
+            render_toggle_field("HTTP enabled:", popup.temp_http_enabled, SettingsField::HttpEnabled, w),
+            render_text_field("HTTP port:", &popup.temp_http_port, SettingsField::HttpPort, w),
             render_toggle_field("HTTPS enabled:", popup.temp_https_enabled, SettingsField::HttpsEnabled, w),
             render_text_field("HTTPS port:", &popup.temp_https_port, SettingsField::HttpsPort, w),
             Line::from(""),
@@ -11366,48 +12087,7 @@ fn render_actions_popup(f: &mut Frame, app: &App) {
     let popup = &app.actions_popup;
     let theme = app.settings.theme;
 
-    // Calculate dynamic width based on content
-    // Action list display: "name (world) [pattern]"
-    let max_action_display = popup.actions.iter().map(|a| {
-        let display_len = if a.pattern.is_empty() {
-            if a.world.is_empty() {
-                a.name.chars().count() + 3 // " /name"
-            } else {
-                a.name.chars().count() + a.world.chars().count() + 6 // " /name (world)"
-            }
-        } else if a.world.is_empty() {
-            a.name.chars().count() + 25 // "name [pattern...]"
-        } else {
-            a.name.chars().count() + a.world.chars().count() + 25 // "name (world) [pattern...]"
-        };
-        display_len
-    }).max().unwrap_or(30);
-
-    // Calculate minimum width based on buttons and fields
-    let buttons_width = 52; // "[ Add ]  [ Delete ]      [ Save ]  [ Cancel ]"
-    let field_width_needed = 60; // Reasonable width for editing fields
-    let content_width = max_action_display.max(buttons_width).max(field_width_needed);
-
-    // Add borders (4) and apply screen limits
-    let popup_width = ((content_width + 4) as u16).min(area.width.saturating_sub(4));
-
-    // Calculate height: 1 header + 5 list + 1 sep + 4 fields + cmd lines + 1 sep + 1 error + 1 buttons + borders
-    let cmd_extra_lines = if popup.command_expanded || popup.edit_command.contains(';') { 2 } else { 0 };
-    let needed_height = 1 + 5 + 1 + 5 + cmd_extra_lines + 1 + 1 + 1 + 2; // +2 for borders
-    let popup_height = (needed_height as u16).min(area.height.saturating_sub(2)).max(16);
-
-    let x = area.width.saturating_sub(popup_width) / 2;
-    let y = area.height.saturating_sub(popup_height) / 2;
-
-    let popup_area = Rect::new(x, y, popup_width, popup_height);
-
-    // Clear the background
-    f.render_widget(ratatui::widgets::Clear, popup_area);
-
-    let mut lines: Vec<Line<'static>> = Vec::new();
-    let inner_width = popup_width.saturating_sub(4) as usize;
-
-    // Field styles
+    // Common styles
     let label_style = Style::default().fg(theme.fg());
     let value_style = Style::default().fg(theme.fg());
     let selected_style = Style::default().fg(theme.button_selected_fg()).bg(theme.button_selected_bg());
@@ -11418,162 +12098,257 @@ fn render_actions_popup(f: &mut Frame, app: &App) {
         .add_modifier(Modifier::BOLD);
     let error_style = Style::default().fg(Color::Red);
 
-    // Action list section (top portion)
-    lines.push(Line::from(Span::styled("Actions:", label_style)));
-
-    let list_height = 5usize;
-    let actions_len = popup.actions.len();
-    let scroll = popup.scroll_offset;
-
-    for i in 0..list_height {
-        let action_idx = scroll + i;
-        if action_idx < actions_len {
-            let action = &popup.actions[action_idx];
-            let is_selected = action_idx == popup.selected_index;
-            let marker = if is_selected { ">" } else { " " };
-            let style = if popup.current_field == ActionField::List && is_selected {
-                selected_style
-            } else if is_selected {
-                Style::default().fg(theme.fg_accent())
-            } else {
-                value_style
-            };
-
-            // Format: name (world) [pattern]
-            let display = if action.pattern.is_empty() {
-                if action.world.is_empty() {
-                    format!("{} /{}", marker, action.name)
+    match popup.view {
+        ActionsView::List => {
+            // List view - show actions with Add/Edit/Delete/Cancel buttons
+            let max_action_display = popup.actions.iter().map(|a| {
+                let display_len = if a.pattern.is_empty() {
+                    if a.world.is_empty() {
+                        a.name.chars().count() + 3
+                    } else {
+                        a.name.chars().count() + a.world.chars().count() + 6
+                    }
+                } else if a.world.is_empty() {
+                    a.name.chars().count() + 25
                 } else {
-                    format!("{} /{} ({})", marker, action.name, action.world)
-                }
-            } else if action.world.is_empty() {
-                format!("{} {} [{}]", marker, action.name, truncate_str(&action.pattern, 20))
-            } else {
-                format!("{} {} ({}) [{}]", marker, action.name, action.world, truncate_str(&action.pattern, 15))
-            };
+                    a.name.chars().count() + a.world.chars().count() + 25
+                };
+                display_len
+            }).max().unwrap_or(30);
 
-            lines.push(Line::from(Span::styled(
-                truncate_str(&display, inner_width),
-                style,
-            )));
-        } else {
+            let buttons_width = 48; // "[ Add ]  [ Edit ]  [ Delete ]  [ Cancel ]"
+            let content_width = max_action_display.max(buttons_width).max(40);
+            let popup_width = ((content_width + 4) as u16).min(area.width.saturating_sub(4));
+            let list_height = 8usize;
+            let popup_height = ((list_height + 5) as u16).min(area.height.saturating_sub(2));
+
+            let x = area.width.saturating_sub(popup_width) / 2;
+            let y = area.height.saturating_sub(popup_height) / 2;
+            let popup_area = Rect::new(x, y, popup_width, popup_height);
+
+            f.render_widget(ratatui::widgets::Clear, popup_area);
+
+            let mut lines: Vec<Line<'static>> = Vec::new();
+            let inner_width = popup_width.saturating_sub(4) as usize;
+
             lines.push(Line::from(""));
-        }
-    }
 
-    lines.push(Line::from("")); // Separator
+            let actions_len = popup.actions.len();
+            let scroll = popup.scroll_offset;
 
-    // Edit fields for selected action
-    let name_style = if popup.current_field == ActionField::Name { selected_style } else { value_style };
-    let world_style = if popup.current_field == ActionField::World { selected_style } else { value_style };
-    let pattern_style = if popup.current_field == ActionField::Pattern { selected_style } else { value_style };
-    let command_style = if popup.current_field == ActionField::Command { selected_style } else { value_style };
+            for i in 0..list_height {
+                let action_idx = scroll + i;
+                if action_idx < actions_len {
+                    let action = &popup.actions[action_idx];
+                    let is_selected = action_idx == popup.selected_index;
+                    let marker = if is_selected { ">" } else { " " };
+                    let style = if popup.list_field == ActionListField::List && is_selected {
+                        selected_style
+                    } else if is_selected {
+                        Style::default().fg(theme.fg_accent())
+                    } else {
+                        value_style
+                    };
 
-    // Helper to format field with cursor
-    fn format_field_with_cursor(value: &str, cursor: usize, is_current: bool, max_len: usize) -> String {
-        if is_current {
-            let before = &value[..cursor.min(value.len())];
-            let after = &value[cursor.min(value.len())..];
-            let cursor_char = if cursor < value.len() { "" } else { "_" };
-            let display = format!("{}{}{}", before, cursor_char, after);
-            truncate_str(&display, max_len).to_string()
-        } else {
-            truncate_str(value, max_len).to_string()
-        }
-    }
+                    let display = if action.pattern.is_empty() {
+                        if action.world.is_empty() {
+                            format!("{} /{}", marker, action.name)
+                        } else {
+                            format!("{} /{} ({})", marker, action.name, action.world)
+                        }
+                    } else if action.world.is_empty() {
+                        format!("{} {} [{}]", marker, action.name, truncate_str(&action.pattern, 20))
+                    } else {
+                        format!("{} {} ({}) [{}]", marker, action.name, action.world, truncate_str(&action.pattern, 15))
+                    };
 
-    let field_width = inner_width.saturating_sub(12);
-
-    // Name field
-    lines.push(Line::from(vec![
-        Span::styled("Name:    ", label_style),
-        Span::styled(
-            format_field_with_cursor(&popup.edit_name, popup.cursor_pos, popup.current_field == ActionField::Name, field_width),
-            name_style,
-        ),
-    ]));
-
-    // World field (optional)
-    lines.push(Line::from(vec![
-        Span::styled("World:   ", label_style),
-        Span::styled(
-            format_field_with_cursor(&popup.edit_world, popup.cursor_pos, popup.current_field == ActionField::World, field_width),
-            world_style,
-        ),
-    ]));
-
-    // Pattern field
-    lines.push(Line::from(vec![
-        Span::styled("Pattern: ", label_style),
-        Span::styled(
-            format_field_with_cursor(&popup.edit_pattern, popup.cursor_pos, popup.current_field == ActionField::Pattern, field_width),
-            pattern_style,
-        ),
-    ]));
-
-    // Command field (may be multi-line)
-    lines.push(Line::from(Span::styled("Command:", label_style)));
-
-    // Show command indented by 2 spaces, split by semicolons for display
-    let cmd_display = format_field_with_cursor(&popup.edit_command, popup.cursor_pos, popup.current_field == ActionField::Command, inner_width.saturating_sub(2));
-    lines.push(Line::from(vec![
-        Span::styled("  ", label_style),
-        Span::styled(cmd_display, command_style),
-    ]));
-
-    // If command is longer or has semicolons, show additional lines
-    if popup.command_expanded || popup.edit_command.contains(';') {
-        let commands: Vec<&str> = popup.edit_command.split(';').collect();
-        if commands.len() > 1 {
-            for cmd in commands.iter().skip(1).take(2) {
-                lines.push(Line::from(vec![
-                    Span::styled("  ", label_style),
-                    Span::styled(format!(";{}", truncate_str(cmd.trim(), inner_width.saturating_sub(3))), value_style),
-                ]));
+                    lines.push(Line::from(Span::styled(
+                        truncate_str(&display, inner_width),
+                        style,
+                    )));
+                } else {
+                    lines.push(Line::from(""));
+                }
             }
+
+            lines.push(Line::from(""));
+
+            // Buttons row
+            let add_style = if popup.list_field == ActionListField::AddButton { button_selected_style } else { button_style };
+            let edit_style = if popup.list_field == ActionListField::EditButton { button_selected_style } else { button_style };
+            let del_style = if popup.list_field == ActionListField::DeleteButton { button_selected_style } else { button_style };
+            let cancel_style = if popup.list_field == ActionListField::CancelButton { button_selected_style } else { button_style };
+
+            lines.push(Line::from(vec![
+                Span::styled("[ Add ]", add_style),
+                Span::raw("  "),
+                Span::styled("[ Edit ]", edit_style),
+                Span::raw("  "),
+                Span::styled("[ Delete ]", del_style),
+                Span::raw("  "),
+                Span::styled("[ Cancel ]", cancel_style),
+            ]));
+
+            let popup_block = Block::default()
+                .title(" Actions ")
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(theme.popup_border()))
+                .style(Style::default().bg(theme.popup_bg()));
+
+            let popup_text = Paragraph::new(lines).block(popup_block);
+            f.render_widget(popup_text, popup_area);
+        }
+
+        ActionsView::Editor => {
+            // Editor view - show name/world/pattern/command with Save/Cancel
+            let popup_width = 60u16.min(area.width.saturating_sub(4));
+            let popup_height = 14u16.min(area.height.saturating_sub(2));
+
+            let x = area.width.saturating_sub(popup_width) / 2;
+            let y = area.height.saturating_sub(popup_height) / 2;
+            let popup_area = Rect::new(x, y, popup_width, popup_height);
+
+            f.render_widget(ratatui::widgets::Clear, popup_area);
+
+            let mut lines: Vec<Line<'static>> = Vec::new();
+            let inner_width = popup_width.saturating_sub(4) as usize;
+            let field_width = inner_width.saturating_sub(12);
+
+            fn format_field_with_cursor(value: &str, cursor: usize, is_current: bool, max_len: usize) -> String {
+                if is_current {
+                    let before = &value[..cursor.min(value.len())];
+                    let after = &value[cursor.min(value.len())..];
+                    let cursor_char = if cursor < value.len() { "" } else { "_" };
+                    let display = format!("{}{}{}", before, cursor_char, after);
+                    truncate_str(&display, max_len).to_string()
+                } else {
+                    truncate_str(value, max_len).to_string()
+                }
+            }
+
+            let name_style = if popup.editor_field == ActionEditorField::Name { selected_style } else { value_style };
+            let world_style = if popup.editor_field == ActionEditorField::World { selected_style } else { value_style };
+            let pattern_style = if popup.editor_field == ActionEditorField::Pattern { selected_style } else { value_style };
+            let command_style = if popup.editor_field == ActionEditorField::Command { selected_style } else { value_style };
+
+            lines.push(Line::from(""));
+
+            lines.push(Line::from(vec![
+                Span::styled("Name:    ", label_style),
+                Span::styled(
+                    format_field_with_cursor(&popup.edit_name, popup.cursor_pos, popup.editor_field == ActionEditorField::Name, field_width),
+                    name_style,
+                ),
+            ]));
+
+            lines.push(Line::from(vec![
+                Span::styled("World:   ", label_style),
+                Span::styled(
+                    format_field_with_cursor(&popup.edit_world, popup.cursor_pos, popup.editor_field == ActionEditorField::World, field_width),
+                    world_style,
+                ),
+            ]));
+
+            lines.push(Line::from(vec![
+                Span::styled("Pattern: ", label_style),
+                Span::styled(
+                    format_field_with_cursor(&popup.edit_pattern, popup.cursor_pos, popup.editor_field == ActionEditorField::Pattern, field_width),
+                    pattern_style,
+                ),
+            ]));
+
+            lines.push(Line::from(Span::styled("Command:", label_style)));
+            let cmd_display = format_field_with_cursor(&popup.edit_command, popup.cursor_pos, popup.editor_field == ActionEditorField::Command, inner_width.saturating_sub(2));
+            lines.push(Line::from(vec![
+                Span::styled("  ", label_style),
+                Span::styled(cmd_display, command_style),
+            ]));
+
+            // Show additional command lines if expanded
+            if popup.command_expanded || popup.edit_command.contains(';') {
+                let commands: Vec<&str> = popup.edit_command.split(';').collect();
+                if commands.len() > 1 {
+                    for cmd in commands.iter().skip(1).take(3) {
+                        lines.push(Line::from(vec![
+                            Span::styled("  ", label_style),
+                            Span::styled(format!(";{}", truncate_str(cmd.trim(), inner_width.saturating_sub(3))), value_style),
+                        ]));
+                    }
+                }
+            }
+
+            lines.push(Line::from(""));
+
+            // Error message if any
+            if let Some(ref error) = popup.error_message {
+                lines.push(Line::from(Span::styled(error.clone(), error_style)));
+            } else {
+                lines.push(Line::from(""));
+            }
+
+            // Buttons row
+            let save_style = if popup.editor_field == ActionEditorField::SaveButton { button_selected_style } else { button_style };
+            let cancel_style = if popup.editor_field == ActionEditorField::CancelButton { button_selected_style } else { button_style };
+
+            lines.push(Line::from(vec![
+                Span::styled("[ Save ]", save_style),
+                Span::raw("  "),
+                Span::styled("[ Cancel ]", cancel_style),
+            ]));
+
+            let title = if popup.editing_index.is_some() { " Edit Action " } else { " New Action " };
+            let popup_block = Block::default()
+                .title(title)
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(theme.popup_border()))
+                .style(Style::default().bg(theme.popup_bg()));
+
+            let popup_text = Paragraph::new(lines).block(popup_block);
+            f.render_widget(popup_text, popup_area);
+        }
+
+        ActionsView::ConfirmDelete => {
+            // Confirm delete dialog
+            let popup_width = 40u16.min(area.width.saturating_sub(4));
+            let popup_height = 6u16.min(area.height.saturating_sub(2));
+
+            let x = area.width.saturating_sub(popup_width) / 2;
+            let y = area.height.saturating_sub(popup_height) / 2;
+            let popup_area = Rect::new(x, y, popup_width, popup_height);
+
+            f.render_widget(ratatui::widgets::Clear, popup_area);
+
+            let action_name = popup.actions.get(popup.selected_index)
+                .map(|a| a.name.as_str())
+                .unwrap_or("this action");
+
+            let yes_style = if popup.confirm_selected { button_selected_style } else { button_style };
+            let no_style = if !popup.confirm_selected { button_selected_style } else { button_style };
+
+            let lines = vec![
+                Line::from(""),
+                Line::from(Span::styled(
+                    format!("Delete '{}'?", truncate_str(action_name, 20)),
+                    label_style,
+                )),
+                Line::from(""),
+                Line::from(vec![
+                    Span::styled("[ Yes ]", yes_style),
+                    Span::raw("    "),
+                    Span::styled("[ No ]", no_style),
+                ]),
+            ];
+
+            let popup_block = Block::default()
+                .title(" Confirm Delete ")
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(theme.popup_border()))
+                .style(Style::default().bg(theme.popup_bg()));
+
+            let popup_text = Paragraph::new(lines).block(popup_block);
+            f.render_widget(popup_text, popup_area);
         }
     }
-
-    lines.push(Line::from("")); // Separator
-
-    // Error message if any
-    if let Some(ref error) = popup.error_message {
-        lines.push(Line::from(Span::styled(error.clone(), error_style)));
-    } else {
-        lines.push(Line::from(""));
-    }
-
-    // Buttons row
-    let add_style = if popup.current_field == ActionField::AddButton { button_selected_style } else { button_style };
-    let del_style = if popup.current_field == ActionField::DeleteButton { button_selected_style } else { button_style };
-    let save_style = if popup.current_field == ActionField::SaveButton { button_selected_style } else { button_style };
-    let cancel_style = if popup.current_field == ActionField::CancelButton { button_selected_style } else { button_style };
-
-    lines.push(Line::from(vec![
-        Span::styled("[ Add ]", add_style),
-        Span::raw("  "),
-        Span::styled("[ Delete ]", del_style),
-        Span::raw("      "),
-        Span::styled("[ Save ]", save_style),
-        Span::raw("  "),
-        Span::styled("[ Cancel ]", cancel_style),
-    ]));
-
-    // Pad remaining space
-    let target_lines = (popup_height as usize).saturating_sub(2);
-    while lines.len() < target_lines {
-        lines.push(Line::from(""));
-    }
-
-    let popup_block = Block::default()
-        .title(" Actions / Triggers ")
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(theme.popup_border()))
-        .style(Style::default().bg(theme.popup_bg()));
-
-    let popup_text = Paragraph::new(lines).block(popup_block);
-
-    f.render_widget(popup_text, popup_area);
 }
 
 #[cfg(test)]

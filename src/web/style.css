@@ -529,43 +529,33 @@ body {
     background: #444;
 }
 
-/* Actions popup */
-.actions-modal-content {
-    min-width: 500px;
-    max-width: 700px;
+/* Actions List popup */
+.actions-list-modal-content {
+    min-width: 400px;
+    max-width: 550px;
     width: 90%;
     padding: 12px;
 }
 
-.actions-modal-content h2 {
+.actions-list-modal-content h2 {
     margin-bottom: 8px;
-}
-
-.actions-layout {
-    display: flex;
-    gap: 12px;
-    margin-bottom: 8px;
-}
-
-.actions-list-container {
-    flex: 0 0 160px;
-    display: flex;
-    flex-direction: column;
 }
 
 .actions-list {
     border: 1px solid var(--separator-color);
     background-color: #000;
-    min-height: 120px;
-    max-height: 200px;
+    min-height: 150px;
+    max-height: 250px;
     overflow-y: auto;
-    margin-bottom: 6px;
+    margin-bottom: 10px;
 }
 
 .actions-list-item {
-    padding: 3px 6px;
+    padding: 4px 8px;
     cursor: pointer;
     border-bottom: 1px solid #222;
+    display: flex;
+    gap: 12px;
 }
 
 .actions-list-item:hover {
@@ -577,36 +567,50 @@ body {
     color: #000;
 }
 
-.actions-list-item.new-item {
-    color: var(--accent-color);
-    font-style: italic;
-}
-
-.actions-list-buttons {
-    display: flex;
-    gap: 4px;
-}
-
-.actions-list-buttons .action-btn {
+.actions-list-item .action-name {
     flex: 1;
-    padding: 4px;
-    background-color: #333;
-    color: var(--text-color);
-    border: 1px solid var(--separator-color);
-    cursor: pointer;
-    font-family: inherit;
-    font-size: 12px;
+    font-weight: bold;
 }
 
-.actions-list-buttons .action-btn:hover {
-    background-color: #444;
+.actions-list-item .action-world {
+    flex: 0 0 80px;
+    color: #888;
 }
 
-.action-editor {
-    flex: 1;
-    display: flex;
-    flex-direction: column;
-    gap: 4px;
+.actions-list-item .action-pattern {
+    flex: 0 0 100px;
+    color: #666;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.actions-list-item.selected .action-world,
+.actions-list-item.selected .action-pattern {
+    color: #000;
+}
+
+/* Actions Editor popup */
+.actions-editor-modal-content {
+    min-width: 350px;
+    max-width: 500px;
+    width: 90%;
+    padding: 12px;
+}
+
+.actions-editor-modal-content h2 {
+    margin-bottom: 10px;
+}
+
+/* Action confirm delete popup */
+.action-confirm-modal-content {
+    min-width: 250px;
+    padding: 16px;
+    text-align: center;
+}
+
+.action-confirm-modal-content p {
+    margin-bottom: 12px;
 }
 
 .action-field {
