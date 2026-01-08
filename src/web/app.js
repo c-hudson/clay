@@ -520,7 +520,7 @@
             const cleanLine = String(rawLine).replace(/[\r\n]+/g, '');
 
             const displayText = showTags ? cleanLine : stripMudTag(cleanLine);
-            const html = linkifyUrls(parseAnsi(displayText));
+            const html = convertDiscordEmojis(linkifyUrls(parseAnsi(displayText)));
             htmlParts.push(html);
         }
 
@@ -539,7 +539,7 @@
             worldOutputCache[worldIndex] = [];
         }
         const displayText = showTags ? text : stripMudTag(text);
-        const html = linkifyUrls(parseAnsi(displayText));
+        const html = convertDiscordEmojis(linkifyUrls(parseAnsi(displayText)));
         worldOutputCache[worldIndex][lineIndex] = { html, showTags };
         return html;
     }
@@ -550,7 +550,7 @@
         const cleanText = String(text).replace(/[\r\n]+/g, '');
 
         const displayText = showTags ? cleanText : stripMudTag(cleanText);
-        const html = linkifyUrls(parseAnsi(displayText));
+        const html = convertDiscordEmojis(linkifyUrls(parseAnsi(displayText)));
 
         // Append to output with a <br> prefix (if not first line)
         if (elements.output.innerHTML.length > 0) {
@@ -744,6 +744,17 @@
         result = result.replace(/[\x1b\u001b\u241b]/g, '');
 
         return result;
+    }
+
+    // Convert Discord custom emoji tags to images
+    // Format: <:name:id> or <a:name:id> (animated)
+    function convertDiscordEmojis(html) {
+        // Match Discord emoji format: <:name:id> or <a:name:id>
+        return html.replace(/&lt;(a?):([^:]+):(\d+)&gt;/g, function(match, animated, name, id) {
+            const ext = animated ? 'gif' : 'png';
+            const url = `https://cdn.discordapp.com/emojis/${id}.${ext}`;
+            return `<img src="${url}" alt=":${name}:" title=":${name}:" class="discord-emoji" style="height: 1.2em; vertical-align: middle;">`;
+        });
     }
 
     // Escape HTML

@@ -7,7 +7,7 @@ pub mod util;
 pub mod websocket;
 
 // Re-export commonly used types from modules
-pub use encoding::{Encoding, Theme, WorldSwitchMode, is_visually_empty, strip_non_sgr_sequences};
+pub use encoding::{Encoding, Theme, WorldSwitchMode, convert_discord_emojis, is_visually_empty, strip_non_sgr_sequences};
 pub use telnet::{
     WriteCommand, StreamReader, StreamWriter, AutoConnectType, KeepAliveType,
     process_telnet, find_safe_split_point,
@@ -2133,6 +2133,10 @@ impl World {
         output_width: u16,
         clear_splash: bool,
     ) {
+        // Convert Discord custom emojis to Unicode or :name: fallback
+        let text = convert_discord_emojis(text);
+        let text = text.as_str();
+
         // Clear splash mode when MUD data is received (not for client messages)
         if clear_splash && self.showing_splash {
             self.showing_splash = false;
