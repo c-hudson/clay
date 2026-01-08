@@ -3917,6 +3917,10 @@ mod remote_gui {
         pub settings: RemoteWorldSettings,
         pub unseen_lines: usize,
         pub pending_count: usize,  // Count of pending lines (for pending_first sorting)
+        // Timing info (seconds since event, None if never)
+        pub last_send_secs: Option<u64>,
+        pub last_recv_secs: Option<u64>,
+        pub last_nop_secs: Option<u64>,
     }
 
     /// Which popup is currently open
@@ -3924,6 +3928,7 @@ mod remote_gui {
     enum PopupState {
         None,
         WorldList,
+        ConnectedWorlds,  // /worlds or /l - shows connected worlds with stats
         WorldEditor(usize),  // world index being edited
         Setup,
         Font,
@@ -4407,11 +4412,14 @@ mod remote_gui {
                                     port: w.settings.port,
                                     user: w.settings.user,
                                     use_ssl: w.settings.use_ssl,
-                                    keep_alive_type: w.settings.keep_alive_type.clone(),
+                                    keep_alive_type: w.keep_alive_type.clone(),
                                     keep_alive_cmd: w.settings.keep_alive_cmd.clone(),
                                 },
                                 unseen_lines: w.unseen_lines,
                                 pending_count: w.pending_lines.len(),
+                                last_send_secs: w.last_send_secs,
+                                last_recv_secs: w.last_recv_secs,
+                                last_nop_secs: w.last_nop_secs,
                             }).collect();
                             self.current_world = current_world_index;
                             self.console_theme = GuiTheme::from_name(&settings.console_theme);
@@ -5458,39 +5466,61 @@ mod remote_gui {
                 }
 
                 egui::TopBottomPanel::top("menu_bar").show(ctx, |ui| {
-                    egui::menu::bar(ui, |ui| {
-                        ui.menu_button("Options", |ui| {
-                            if ui.button("World List...").clicked() {
+                    ui.horizontal(|ui| {
+                        // Hamburger menu (☰)
+                        ui.menu_button("☰", |ui| {
+                            if ui.button("Worlds List").clicked() {
+                                action = Some("connected_worlds");
+                                ui.close_menu();
+                            }
+                            if ui.button("World Selector").clicked() {
                                 action = Some("world_list");
                                 ui.close_menu();
                             }
-                            if ui.button("World Editor...").clicked() {
-                                action = Some("edit_current");
-                                ui.close_menu();
-                            }
-                            if ui.button("Setup...").clicked() {
-                                action = Some("setup");
-                                ui.close_menu();
-                            }
-                            if ui.button("Font...").clicked() {
-                                action = Some("font");
+                            if ui.button("Actions").clicked() {
+                                action = Some("actions");
                                 ui.close_menu();
                             }
                             ui.separator();
-                            if ui.button("Connect").clicked() {
-                                action = Some("connect");
-                                ui.close_menu();
-                            }
-                            if ui.button("Disconnect").clicked() {
-                                action = Some("disconnect");
-                                ui.close_menu();
-                            }
-                            ui.separator();
-                            if ui.button("Help...").clicked() {
-                                action = Some("help");
+                            if ui.button("Toggle Tags").clicked() {
+                                action = Some("toggle_tags");
                                 ui.close_menu();
                             }
                         });
+
+                        ui.separator();
+
+                        // S/M/L font size buttons (15% larger text)
+                        let btn_size = 16.0;  // Base size, 15% larger than default ~14
+                        let small_text = if self.font_size <= 12.0 {
+                            egui::RichText::new("S").size(btn_size).strong()
+                        } else {
+                            egui::RichText::new("S").size(btn_size)
+                        };
+                        if ui.button(small_text).on_hover_text("Small font").clicked() {
+                            self.font_size = 12.0;
+                            action = Some("font_changed");
+                        }
+
+                        let medium_text = if self.font_size > 12.0 && self.font_size <= 16.0 {
+                            egui::RichText::new("M").size(btn_size).strong()
+                        } else {
+                            egui::RichText::new("M").size(btn_size)
+                        };
+                        if ui.button(medium_text).on_hover_text("Medium font").clicked() {
+                            self.font_size = 14.0;
+                            action = Some("font_changed");
+                        }
+
+                        let large_text = if self.font_size > 16.0 {
+                            egui::RichText::new("L").size(btn_size).strong()
+                        } else {
+                            egui::RichText::new("L").size(btn_size)
+                        };
+                        if ui.button(large_text).on_hover_text("Large font").clicked() {
+                            self.font_size = 18.0;
+                            action = Some("font_changed");
+                        }
                     });
                 });
 
@@ -5500,6 +5530,16 @@ mod remote_gui {
                         self.popup_state = PopupState::WorldList;
                         self.world_list_selected = self.current_world;
                     }
+                    Some("connected_worlds") => {
+                        self.popup_state = PopupState::ConnectedWorlds;
+                        self.world_list_selected = self.current_world;
+                    }
+                    Some("actions") => {
+                        // Actions popup not yet implemented in GUI
+                        if let Some(world) = self.worlds.get_mut(self.current_world) {
+                            world.output_lines.push("Actions editor not yet available in GUI.".to_string());
+                        }
+                    }
                     Some("edit_current") => self.open_world_editor(self.current_world),
                     Some("setup") => self.popup_state = PopupState::Setup,
                     Some("font") => {
@@ -5507,8 +5547,13 @@ mod remote_gui {
                         self.edit_font_size = self.font_size.to_string();
                         self.popup_state = PopupState::Font;
                     }
+                    Some("font_changed") => {
+                        // Font size was changed via S/M/L buttons - update server settings
+                        self.update_global_settings();
+                    }
                     Some("connect") => self.connect_world(self.current_world),
                     Some("disconnect") => self.disconnect_world(self.current_world),
+                    Some("toggle_tags") => self.show_tags = !self.show_tags,
                     Some("spell_check") => {
                         if let Some(message) = self.handle_spell_check() {
                             // Add suggestion message to current world's output
@@ -5659,6 +5704,11 @@ mod remote_gui {
                                         }
                                         "/world" => {
                                             self.popup_state = PopupState::WorldList;
+                                            self.world_list_selected = self.current_world;
+                                        }
+                                        "/worlds" | "/l" => {
+                                            self.popup_state = PopupState::ConnectedWorlds;
+                                            self.world_list_selected = self.current_world;
                                         }
                                         "/font" => {
                                             self.edit_font_name = self.font_name.clone();
@@ -5769,8 +5819,10 @@ mod remote_gui {
                         });
                 }
 
-                // Main output area with scrollbar
-                egui::CentralPanel::default().show(ctx, |ui| {
+                // Main output area with scrollbar (no frame/border)
+                egui::CentralPanel::default()
+                    .frame(egui::Frame::none().fill(theme.bg()))
+                    .show(ctx, |ui| {
                     if let Some(world) = self.worlds.get(self.current_world) {
                         // Keep original lines with ANSI for coloring
                         let colored_lines: Vec<&String> = world.output_lines.iter()
@@ -6070,6 +6122,9 @@ mod remote_gui {
                         .resizable(true)
                         .default_size([400.0, 300.0])
                         .show(ctx, |ui| {
+                            if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+                                close_popup = true;
+                            }
                             ScrollArea::vertical().max_height(200.0).show(ui, |ui| {
                                 for (idx, world) in self.worlds.iter().enumerate() {
                                     let status = if world.connected { "●" } else { "○" };
@@ -6101,12 +6156,162 @@ mod remote_gui {
                         });
                 }
 
+                // Connected Worlds popup (/worlds or /l)
+                if self.popup_state == PopupState::ConnectedWorlds {
+                    // Helper to format elapsed seconds
+                    fn format_elapsed_secs(secs: Option<u64>) -> String {
+                        match secs {
+                            None => "-".to_string(),
+                            Some(s) => {
+                                if s < 60 {
+                                    format!("{}s", s)
+                                } else if s < 3600 {
+                                    format!("{}m", s / 60)
+                                } else if s < 86400 {
+                                    format!("{}h", s / 3600)
+                                } else {
+                                    format!("{}d", s / 86400)
+                                }
+                            }
+                        }
+                    }
+
+                    // Helper to calculate time until next NOP (based on 5 min keepalive)
+                    fn format_next_nop(last_send: Option<u64>, last_recv: Option<u64>) -> String {
+                        const KEEPALIVE_SECS: u64 = 5 * 60;
+                        let elapsed = match (last_send, last_recv) {
+                            (Some(s), Some(r)) => s.min(r),  // Use more recent (smaller elapsed)
+                            (Some(s), None) => s,
+                            (None, Some(r)) => r,
+                            (None, None) => KEEPALIVE_SECS,
+                        };
+                        let remaining = KEEPALIVE_SECS.saturating_sub(elapsed);
+                        if remaining < 60 {
+                            format!("{}s", remaining)
+                        } else {
+                            format!("{}m", remaining / 60)
+                        }
+                    }
+
+                    egui::Window::new("Connected Worlds")
+                        .collapsible(false)
+                        .resizable(true)
+                        .default_size([620.0, 250.0])
+                        .show(ctx, |ui| {
+                            if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+                                close_popup = true;
+                            }
+                            // Table header - matches console columns exactly
+                            egui::Grid::new("worlds_header")
+                                .num_columns(7)
+                                .min_col_width(55.0)
+                                .spacing([10.0, 4.0])
+                                .show(ui, |ui| {
+                                    ui.label(egui::RichText::new("World").strong());
+                                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                        ui.label(egui::RichText::new("Unseen").strong());
+                                    });
+                                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                        ui.label(egui::RichText::new("LastSend").strong());
+                                    });
+                                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                        ui.label(egui::RichText::new("LastRecv").strong());
+                                    });
+                                    ui.label(egui::RichText::new("KeepAlive").strong());
+                                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                        ui.label(egui::RichText::new("LastKA").strong());
+                                    });
+                                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                        ui.label(egui::RichText::new("NextKA").strong());
+                                    });
+                                    ui.end_row();
+                                });
+                            ui.separator();
+
+                            // Check if any worlds are connected
+                            let has_connected = self.worlds.iter().any(|w| w.connected);
+                            if !has_connected {
+                                ui.label("No worlds connected.");
+                            } else {
+                                ScrollArea::vertical().max_height(150.0).show(ui, |ui| {
+                                    egui::Grid::new("worlds_grid")
+                                        .num_columns(7)
+                                        .min_col_width(55.0)
+                                        .spacing([10.0, 4.0])
+                                        .show(ui, |ui| {
+                                            for (idx, world) in self.worlds.iter().enumerate() {
+                                                // Only show connected worlds
+                                                if !world.connected {
+                                                    continue;
+                                                }
+                                                let is_current = idx == self.current_world;
+                                                let name_text = if is_current {
+                                                    format!("* {}", world.name)
+                                                } else {
+                                                    format!("  {}", world.name)
+                                                };
+                                                let name_label = if is_current {
+                                                    egui::RichText::new(&name_text).strong().color(egui::Color32::WHITE)
+                                                } else {
+                                                    egui::RichText::new(&name_text)
+                                                };
+                                                if ui.selectable_label(idx == self.world_list_selected, name_label).clicked() {
+                                                    self.world_list_selected = idx;
+                                                }
+                                                // Unseen column (right-aligned)
+                                                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                                    if world.unseen_lines > 0 {
+                                                        ui.label(egui::RichText::new(format!("{}", world.unseen_lines))
+                                                            .color(egui::Color32::YELLOW));
+                                                    } else {
+                                                        ui.label("");
+                                                    }
+                                                });
+                                                // Send column (right-aligned)
+                                                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                                    ui.label(format_elapsed_secs(world.last_send_secs));
+                                                });
+                                                // Recv column (right-aligned)
+                                                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                                    ui.label(format_elapsed_secs(world.last_recv_secs));
+                                                });
+                                                // KeepAlive type
+                                                ui.label(&world.settings.keep_alive_type);
+                                                // Last column (right-aligned)
+                                                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                                    ui.label(format_elapsed_secs(world.last_nop_secs));
+                                                });
+                                                // Next column (right-aligned)
+                                                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                                    ui.label(format_next_nop(world.last_send_secs, world.last_recv_secs));
+                                                });
+                                                ui.end_row();
+                                            }
+                                        });
+                                });
+                            }
+                            ui.separator();
+                            ui.horizontal(|ui| {
+                                if ui.button("Switch To").clicked() {
+                                    popup_action = Some(("switch", self.world_list_selected));
+                                    close_popup = true;
+                                }
+                                if ui.button("Close").clicked() {
+                                    close_popup = true;
+                                }
+                            });
+                        });
+                }
+
                 // World Editor popup
                 if let PopupState::WorldEditor(world_idx) = self.popup_state {
                     egui::Window::new("World Editor")
                         .collapsible(false)
                         .resizable(false)
                         .show(ctx, |ui| {
+                            if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+                                close_popup = true;
+                            }
                             egui::Grid::new("world_editor_grid")
                                 .num_columns(2)
                                 .spacing([10.0, 8.0])
@@ -6180,6 +6385,9 @@ mod remote_gui {
                         .collapsible(false)
                         .resizable(false)
                         .show(ctx, |ui| {
+                            if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+                                close_popup = true;
+                            }
                             ui.label("Global settings");
                             ui.separator();
                             egui::Grid::new("setup_grid")
@@ -6257,6 +6465,9 @@ mod remote_gui {
                         .collapsible(false)
                         .resizable(false)
                         .show(ctx, |ui| {
+                            if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+                                close_popup = true;
+                            }
                             egui::Grid::new("font_grid")
                                 .num_columns(2)
                                 .spacing([10.0, 8.0])
