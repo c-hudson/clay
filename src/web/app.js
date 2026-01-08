@@ -1538,6 +1538,19 @@
             updateStatusBar();
         });
 
+        // Handle mobile keyboard visibility - keep toolbar at visual viewport top
+        if (window.visualViewport) {
+            const toolbar = document.getElementById('toolbar');
+            window.visualViewport.addEventListener('resize', function() {
+                // When keyboard appears, visualViewport height shrinks
+                // Keep toolbar at the top of the visual viewport
+                toolbar.style.top = window.visualViewport.offsetTop + 'px';
+            });
+            window.visualViewport.addEventListener('scroll', function() {
+                toolbar.style.top = window.visualViewport.offsetTop + 'px';
+            });
+        }
+
         // Click anywhere to focus input and close menu
         document.body.onclick = function(e) {
             // Close menu if open
