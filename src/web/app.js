@@ -272,9 +272,17 @@
                 break;
 
             case 'PromptUpdate':
-                if (msg.world_index === currentWorldIndex && msg.prompt) {
-                    // Parse ANSI codes in prompt
-                    elements.prompt.innerHTML = parseAnsi(msg.prompt);
+                // Always store the prompt in the world object
+                if (msg.world_index >= 0 && msg.world_index < worlds.length) {
+                    worlds[msg.world_index].prompt = msg.prompt || '';
+                }
+                // Update display if it's the current world
+                if (msg.world_index === currentWorldIndex) {
+                    if (msg.prompt) {
+                        elements.prompt.innerHTML = parseAnsi(msg.prompt);
+                    } else {
+                        elements.prompt.textContent = '';
+                    }
                 }
                 break;
 
