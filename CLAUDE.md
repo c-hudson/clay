@@ -400,7 +400,7 @@ A browser-based client that connects via WebSocket to control MUD sessions.
 - Cross-interface unseen indicator sync (console, web, GUI stay in sync)
 
 **Web Toolbar:**
-- Hamburger menu (☰) in upper left with dropdown:
+- Hamburger menu (SVG icon) in upper left with dropdown:
   - Worlds List - Opens connected worlds list popup
   - World Selector - Opens world selector popup
   - Actions - Opens actions editor popup
@@ -409,7 +409,17 @@ A browser-based client that connects via WebSocket to control MUD sessions.
   - **S** (Small, 11px) - Optimized for phone displays
   - **M** (Medium, 14px) - Default size
   - **L** (Large, 18px) - Optimized for tablet displays
+- "Clay" title displayed after font buttons
 - Active font button highlighted in cyan
+
+**Mobile Web Interface:**
+- Toolbar uses `position: fixed` to stay visible during scrolling and keyboard display
+- Uses `100dvh` (dynamic viewport height) instead of `100vh` for proper mobile sizing
+- Visual Viewport API tracks keyboard appearance and adjusts toolbar position
+- `overscroll-behavior: contain` prevents scroll chaining to parent elements
+- `-webkit-overflow-scrolling: touch` for smooth iOS scrolling
+- `interactive-widget=resizes-content` viewport meta for proper keyboard handling
+- Hamburger icon uses inline SVG for reliable cross-browser rendering
 
 **Web Interface Controls:**
 - `Up/Down` - Switch between active worlds
