@@ -260,6 +260,7 @@ Prompts that are auto-answered are immediately cleared and not displayed in the 
   - `-n` - Send without end-of-line marker (CR/LF)
   - No flags: Send to current world
 - `/setup` - Open Global Settings popup (more mode, spell check, pending first, show tags, input height)
+- `/web` - Open Web Settings popup (HTTP/HTTPS servers, WebSocket settings, TLS configuration)
 - `/world` - Open World Selector popup (list all worlds, filter, connect or edit)
 - `/world <name>` - Connect to world if exists (opens editor if no hostname/port configured), otherwise create and open editor
 - `/world -e [name]` - Open World Settings editor for current world or specified world (creates if needed)
@@ -328,9 +329,9 @@ The client includes automatic crash recovery:
 
 The client includes an embedded WebSocket server that allows remote GUI clients to connect and control the MUD sessions.
 
-**Configuration (in Global Settings - /setup):**
+**Configuration (in Web Settings - /web):**
 - `WS enabled` - Enable/disable the WebSocket server
-- `WS port` - Port to listen on (default: 9001)
+- `WS port` - Port to listen on (default: 9002)
 - `WS password` - Password required for authentication (stored encrypted)
 
 **Server Behavior:**
@@ -373,14 +374,18 @@ The WebSocket server supports dynamic whitelisting based on the allow list:
 
 **Use case:** Allows trusted IPs (e.g., home network) to authenticate once, then reconnect without password. Moving to a new location and authenticating clears the old whitelist.
 
-### HTTPS Web Interface
+### HTTP/HTTPS Web Interface
 
 A browser-based client that connects via WebSocket to control MUD sessions.
 
-**Configuration (in Global Settings - /setup):**
-- `HTTPS enabled` - Enable/disable the HTTPS web server
-- `HTTPS port` - Port to listen on (default: 9000)
-- Reuses TLS cert/key from WebSocket settings
+**Configuration (in Web Settings - /web):**
+- `HTTP enabled` - Enable/disable the HTTP web server (uses ws://)
+- `HTTP port` - Port for HTTP server (default: 9000)
+- `HTTPS enabled` - Enable/disable the HTTPS web server (uses wss://)
+- `HTTPS port` - Port for HTTPS server (default: 9001)
+- Reuses TLS cert/key from WebSocket settings for HTTPS
+
+Note: HTTP automatically starts the non-secure WebSocket server if not already running.
 
 **Features:**
 - Full MUD client in the browser
@@ -559,19 +564,39 @@ Opened with `/world -e` command:
 - World Switching - World cycling behavior (Unseen First, Alphabetical)
 - Show tags - Show/hide MUD tags at start of lines (default: hidden)
 - Input height - Default input area height (1-15 lines)
-- WS enabled - Enable/disable WebSocket server
-- WS port - WebSocket server port (default: 9001)
-- WS password - Password for WebSocket authentication (encrypted storage)
-- WS TLS cert - Path to TLS certificate file for secure WebSocket (wss://)
-- WS TLS key - Path to TLS private key file for secure WebSocket
-- HTTPS enabled - Enable/disable HTTPS web interface
-- HTTPS port - Port for HTTPS web server (default: 9000)
+- Console Theme - Theme for console interface (dark, light)
+- GUI Theme - Theme for remote GUI client (dark, light)
 
 **Actions (right-aligned buttons):**
 - Save - Save settings and close popup
 - Cancel - Close popup without saving
 - Delete - Delete the world (shows confirmation dialog)
 - Connect - Connect to world using current settings (saves first)
+
+### Web Settings Popup
+
+Opened with `/web` command:
+
+**WebSocket (secure wss://):**
+- WS enabled - Enable/disable secure WebSocket server
+- WS port - Port for secure WebSocket (default: 9002)
+- WS password - Password for authentication (required, encrypted storage)
+- WS Allow List - CSV list of IPs that can be whitelisted
+- TLS Cert File - Path to TLS certificate file
+- TLS Key File - Path to TLS private key file
+- WS Use TLS - Enable TLS for secure WebSocket
+
+**WebSocket (non-secure ws://):**
+- WS Nonsecure - Enable/disable non-secure WebSocket server
+- WS NS port - Port for non-secure WebSocket (default: 9003)
+
+**HTTP/HTTPS Web Interface:**
+- HTTP enabled - Enable/disable HTTP web server
+- HTTP port - Port for HTTP server (default: 9000)
+- HTTPS enabled - Enable/disable HTTPS web server
+- HTTPS port - Port for HTTPS server (default: 9001)
+
+Note: HTTP server automatically starts the non-secure WebSocket server (ws://) if not already running.
 
 ### Filter Popup
 

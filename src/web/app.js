@@ -1711,6 +1711,9 @@
 
     // Set font size
     function setFontSize(size) {
+        // Check if we were at the bottom before changing size
+        const wasAtBottom = isAtBottom();
+
         currentFontSize = size;
         const px = fontSizes[size];
 
@@ -1721,6 +1724,11 @@
         elements.fontSmall.className = 'font-btn' + (size === 'small' ? ' active' : '');
         elements.fontMedium.className = 'font-btn' + (size === 'medium' ? ' active' : '');
         elements.fontLarge.className = 'font-btn' + (size === 'large' ? ' active' : '');
+
+        // If we were at the bottom, stay at the bottom after font size change
+        if (wasAtBottom) {
+            scrollToBottom();
+        }
 
         // Re-render to update line height calculations
         updateStatusBar();
