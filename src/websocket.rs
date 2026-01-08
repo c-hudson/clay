@@ -331,6 +331,9 @@ pub async fn start_websocket_server(
                 result = listener.accept() => {
                     match result {
                         Ok((stream, client_addr)) => {
+                            // Disable Nagle's algorithm for lower latency
+                            let _ = stream.set_nodelay(true);
+
                             let client_id = {
                                 let mut id = next_client_id.lock().unwrap();
                                 let current = *id;

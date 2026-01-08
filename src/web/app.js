@@ -1772,7 +1772,7 @@
             }
             // Don't steal focus from modals or toolbars
             if (!elements.authModal.classList.contains('visible') &&
-                !elements.actionsModal.classList.contains('visible') &&
+                !elements.actionsListModal.classList.contains('visible') &&
                 !elements.worldsModal.classList.contains('visible') &&
                 !elements.worldSelectorModal.classList.contains('visible') &&
                 !e.target.closest('#toolbar') &&

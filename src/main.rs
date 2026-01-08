@@ -269,6 +269,8 @@ async fn start_https_server(
                 result = listener.accept() => {
                     match result {
                         Ok((stream, _addr)) => {
+                            // Disable Nagle's algorithm for lower latency
+                            let _ = stream.set_nodelay(true);
                             let tls_acceptor = tls_acceptor.clone();
                             tokio::spawn(async move {
                                 if let Ok(tls_stream) = tls_acceptor.accept(stream).await {
@@ -453,6 +455,8 @@ async fn start_https_server(
                 result = listener.accept() => {
                     match result {
                         Ok((stream, _addr)) => {
+                            // Disable Nagle's algorithm for lower latency
+                            let _ = stream.set_nodelay(true);
                             let tls_acceptor = tls_acceptor.clone();
                             tokio::spawn(async move {
                                 if let Ok(tls_stream) = tls_acceptor.accept(stream).await {
@@ -589,6 +593,8 @@ async fn start_http_server(
                 result = listener.accept() => {
                     match result {
                         Ok((stream, _addr)) => {
+                            // Disable Nagle's algorithm for lower latency
+                            let _ = stream.set_nodelay(true);
                             tokio::spawn(async move {
                                 handle_http_client(stream, ws_port, ws_use_tls).await;
                             });
@@ -635,17 +641,6 @@ enum SettingsField {
     InputHeight,
     Theme,          // Console theme
     GuiTheme,       // GUI theme
-    WsEnabled,
-    WsPort,
-    WsPassword,
-    WsAllowList,
-    WsCertFile,
-    WsKeyFile,
-    WsUseTls,
-    HttpEnabled,
-    HttpPort,
-    HttpsEnabled,
-    HttpsPort,
     SaveSetup,
     CancelSetup,
 }
@@ -661,13 +656,6 @@ impl SettingsField {
                 | SettingsField::Password
                 | SettingsField::LogFile
                 | SettingsField::KeepAliveCmd
-                | SettingsField::WsPort
-                | SettingsField::WsPassword
-                | SettingsField::WsAllowList
-                | SettingsField::WsCertFile
-                | SettingsField::WsKeyFile
-                | SettingsField::HttpPort
-                | SettingsField::HttpsPort
         )
     }
 
@@ -743,18 +731,7 @@ impl SettingsField {
             SettingsField::ShowTags => SettingsField::InputHeight,
             SettingsField::InputHeight => SettingsField::Theme,
             SettingsField::Theme => SettingsField::GuiTheme,
-            SettingsField::GuiTheme => SettingsField::WsEnabled,
-            SettingsField::WsEnabled => SettingsField::WsPort,
-            SettingsField::WsPort => SettingsField::WsPassword,
-            SettingsField::WsPassword => SettingsField::WsAllowList,
-            SettingsField::WsAllowList => SettingsField::WsCertFile,
-            SettingsField::WsCertFile => SettingsField::WsKeyFile,
-            SettingsField::WsKeyFile => SettingsField::WsUseTls,
-            SettingsField::WsUseTls => SettingsField::HttpEnabled,
-            SettingsField::HttpEnabled => SettingsField::HttpPort,
-            SettingsField::HttpPort => SettingsField::HttpsEnabled,
-            SettingsField::HttpsEnabled => SettingsField::HttpsPort,
-            SettingsField::HttpsPort => SettingsField::SaveSetup,
+            SettingsField::GuiTheme => SettingsField::SaveSetup,
             SettingsField::SaveSetup => SettingsField::CancelSetup,
             SettingsField::CancelSetup => SettingsField::MoreMode,
             // World fields wrap to global fields
@@ -773,18 +750,7 @@ impl SettingsField {
             SettingsField::InputHeight => SettingsField::ShowTags,
             SettingsField::Theme => SettingsField::InputHeight,
             SettingsField::GuiTheme => SettingsField::Theme,
-            SettingsField::WsEnabled => SettingsField::GuiTheme,
-            SettingsField::WsPort => SettingsField::WsEnabled,
-            SettingsField::WsPassword => SettingsField::WsPort,
-            SettingsField::WsAllowList => SettingsField::WsPassword,
-            SettingsField::WsCertFile => SettingsField::WsAllowList,
-            SettingsField::WsKeyFile => SettingsField::WsCertFile,
-            SettingsField::WsUseTls => SettingsField::WsKeyFile,
-            SettingsField::HttpEnabled => SettingsField::WsUseTls,
-            SettingsField::HttpPort => SettingsField::HttpEnabled,
-            SettingsField::HttpsEnabled => SettingsField::HttpPort,
-            SettingsField::HttpsPort => SettingsField::HttpsEnabled,
-            SettingsField::SaveSetup => SettingsField::HttpsPort,
+            SettingsField::SaveSetup => SettingsField::GuiTheme,
             SettingsField::CancelSetup => SettingsField::SaveSetup,
             // World fields wrap to global fields
             _ => SettingsField::CancelSetup,
@@ -822,17 +788,6 @@ struct SettingsPopup {
     temp_input_height: u16,
     temp_theme: Theme,
     temp_gui_theme: Theme,
-    temp_ws_enabled: bool,
-    temp_ws_port: String,
-    temp_ws_password: String,
-    temp_ws_allow_list: String,
-    temp_ws_cert_file: String,
-    temp_ws_key_file: String,
-    temp_ws_use_tls: bool,
-    temp_http_enabled: bool,
-    temp_http_port: String,
-    temp_https_enabled: bool,
-    temp_https_port: String,
 }
 
 impl SettingsPopup {
@@ -865,17 +820,6 @@ impl SettingsPopup {
             temp_input_height: 3,
             temp_theme: Theme::Dark,
             temp_gui_theme: Theme::Dark,
-            temp_ws_enabled: false,
-            temp_ws_port: "9002".to_string(),
-            temp_ws_password: String::new(),
-            temp_ws_allow_list: String::new(),
-            temp_ws_cert_file: String::new(),
-            temp_ws_key_file: String::new(),
-            temp_ws_use_tls: false,
-            temp_http_enabled: false,
-            temp_http_port: "9000".to_string(),
-            temp_https_enabled: false,
-            temp_https_port: "9001".to_string(),
         }
     }
 
@@ -920,17 +864,6 @@ impl SettingsPopup {
         self.temp_input_height = input_height;
         self.temp_theme = settings.theme;
         self.temp_gui_theme = settings.gui_theme;
-        self.temp_ws_enabled = settings.websocket_enabled;
-        self.temp_ws_port = settings.websocket_port.to_string();
-        self.temp_ws_password = settings.websocket_password.clone();
-        self.temp_ws_allow_list = settings.websocket_allow_list.clone();
-        self.temp_ws_cert_file = settings.websocket_cert_file.clone();
-        self.temp_ws_key_file = settings.websocket_key_file.clone();
-        self.temp_ws_use_tls = settings.websocket_use_tls;
-        self.temp_http_enabled = settings.http_enabled;
-        self.temp_http_port = settings.http_port.to_string();
-        self.temp_https_enabled = settings.https_enabled;
-        self.temp_https_port = settings.https_port.to_string();
     }
 
     fn close(&mut self) {
@@ -966,13 +899,6 @@ impl SettingsPopup {
             SettingsField::Password => self.temp_password.clone(),
             SettingsField::LogFile => self.temp_log_file.clone(),
             SettingsField::KeepAliveCmd => self.temp_keep_alive_cmd.clone(),
-            SettingsField::WsPort => self.temp_ws_port.clone(),
-            SettingsField::WsPassword => self.temp_ws_password.clone(),
-            SettingsField::WsAllowList => self.temp_ws_allow_list.clone(),
-            SettingsField::WsCertFile => self.temp_ws_cert_file.clone(),
-            SettingsField::WsKeyFile => self.temp_ws_key_file.clone(),
-            SettingsField::HttpPort => self.temp_http_port.clone(),
-            SettingsField::HttpsPort => self.temp_https_port.clone(),
             _ => String::new(),
         };
         self.edit_cursor = self.edit_buffer.len();
@@ -1004,13 +930,6 @@ impl SettingsPopup {
             SettingsField::Password => self.temp_password = self.edit_buffer.clone(),
             SettingsField::LogFile => self.temp_log_file = self.edit_buffer.clone(),
             SettingsField::KeepAliveCmd => self.temp_keep_alive_cmd = self.edit_buffer.clone(),
-            SettingsField::WsPort => self.temp_ws_port = self.edit_buffer.clone(),
-            SettingsField::WsPassword => self.temp_ws_password = self.edit_buffer.clone(),
-            SettingsField::WsAllowList => self.temp_ws_allow_list = self.edit_buffer.clone(),
-            SettingsField::WsCertFile => self.temp_ws_cert_file = self.edit_buffer.clone(),
-            SettingsField::WsKeyFile => self.temp_ws_key_file = self.edit_buffer.clone(),
-            SettingsField::HttpPort => self.temp_http_port = self.edit_buffer.clone(),
-            SettingsField::HttpsPort => self.temp_https_port = self.edit_buffer.clone(),
             _ => {}
         }
         self.editing = false;
@@ -1028,10 +947,6 @@ impl SettingsPopup {
             SettingsField::WorldSwitching => self.temp_world_switch_mode = self.temp_world_switch_mode.next(),
             SettingsField::Debug => self.temp_debug_enabled = !self.temp_debug_enabled,
             SettingsField::ShowTags => self.temp_show_tags = !self.temp_show_tags,
-            SettingsField::WsEnabled => self.temp_ws_enabled = !self.temp_ws_enabled,
-            SettingsField::WsUseTls => self.temp_ws_use_tls = !self.temp_ws_use_tls,
-            SettingsField::HttpEnabled => self.temp_http_enabled = !self.temp_http_enabled,
-            SettingsField::HttpsEnabled => self.temp_https_enabled = !self.temp_https_enabled,
             SettingsField::InputHeight => {
                 // Cycle through 1-15
                 self.temp_input_height = if self.temp_input_height >= 15 {
@@ -1099,7 +1014,239 @@ impl SettingsPopup {
         settings.debug_enabled = self.temp_debug_enabled;
         settings.theme = self.temp_theme;
         settings.gui_theme = self.temp_gui_theme;
-        // WebSocket settings
+        (self.temp_input_height, self.temp_show_tags)
+    }
+}
+
+// ============================================================================
+// Web Settings Popup (/web command)
+// ============================================================================
+
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum WebField {
+    // WebSocket settings (secure - wss://)
+    WsEnabled,
+    WsPort,
+    WsPassword,
+    WsAllowList,
+    WsCertFile,
+    WsKeyFile,
+    WsUseTls,
+    // WebSocket settings (non-secure - ws://)
+    WsNonsecureEnabled,
+    WsNonsecurePort,
+    // HTTP/HTTPS settings
+    HttpEnabled,
+    HttpPort,
+    HttpsEnabled,
+    HttpsPort,
+    // Buttons
+    SaveWeb,
+    CancelWeb,
+}
+
+impl WebField {
+    fn is_text_field(&self) -> bool {
+        matches!(
+            self,
+            WebField::WsPort
+                | WebField::WsPassword
+                | WebField::WsAllowList
+                | WebField::WsCertFile
+                | WebField::WsKeyFile
+                | WebField::WsNonsecurePort
+                | WebField::HttpPort
+                | WebField::HttpsPort
+        )
+    }
+
+    fn is_button(&self) -> bool {
+        matches!(self, WebField::SaveWeb | WebField::CancelWeb)
+    }
+
+    fn next(&self) -> Self {
+        match self {
+            WebField::WsEnabled => WebField::WsPort,
+            WebField::WsPort => WebField::WsPassword,
+            WebField::WsPassword => WebField::WsAllowList,
+            WebField::WsAllowList => WebField::WsCertFile,
+            WebField::WsCertFile => WebField::WsKeyFile,
+            WebField::WsKeyFile => WebField::WsUseTls,
+            WebField::WsUseTls => WebField::WsNonsecureEnabled,
+            WebField::WsNonsecureEnabled => WebField::WsNonsecurePort,
+            WebField::WsNonsecurePort => WebField::HttpEnabled,
+            WebField::HttpEnabled => WebField::HttpPort,
+            WebField::HttpPort => WebField::HttpsEnabled,
+            WebField::HttpsEnabled => WebField::HttpsPort,
+            WebField::HttpsPort => WebField::SaveWeb,
+            WebField::SaveWeb => WebField::CancelWeb,
+            WebField::CancelWeb => WebField::WsEnabled,
+        }
+    }
+
+    fn prev(&self) -> Self {
+        match self {
+            WebField::WsEnabled => WebField::CancelWeb,
+            WebField::WsPort => WebField::WsEnabled,
+            WebField::WsPassword => WebField::WsPort,
+            WebField::WsAllowList => WebField::WsPassword,
+            WebField::WsCertFile => WebField::WsAllowList,
+            WebField::WsKeyFile => WebField::WsCertFile,
+            WebField::WsUseTls => WebField::WsKeyFile,
+            WebField::WsNonsecureEnabled => WebField::WsUseTls,
+            WebField::WsNonsecurePort => WebField::WsNonsecureEnabled,
+            WebField::HttpEnabled => WebField::WsNonsecurePort,
+            WebField::HttpPort => WebField::HttpEnabled,
+            WebField::HttpsEnabled => WebField::HttpPort,
+            WebField::HttpsPort => WebField::HttpsEnabled,
+            WebField::SaveWeb => WebField::HttpsPort,
+            WebField::CancelWeb => WebField::SaveWeb,
+        }
+    }
+}
+
+struct WebPopup {
+    visible: bool,
+    selected_field: WebField,
+    editing: bool,
+    edit_buffer: String,
+    edit_cursor: usize,
+    edit_scroll_offset: usize,
+    // Temp values for web settings
+    temp_ws_enabled: bool,
+    temp_ws_port: String,
+    temp_ws_password: String,
+    temp_ws_allow_list: String,
+    temp_ws_cert_file: String,
+    temp_ws_key_file: String,
+    temp_ws_use_tls: bool,
+    temp_ws_nonsecure_enabled: bool,
+    temp_ws_nonsecure_port: String,
+    temp_http_enabled: bool,
+    temp_http_port: String,
+    temp_https_enabled: bool,
+    temp_https_port: String,
+}
+
+impl WebPopup {
+    fn new() -> Self {
+        Self {
+            visible: false,
+            selected_field: WebField::WsEnabled,
+            editing: false,
+            edit_buffer: String::new(),
+            edit_cursor: 0,
+            edit_scroll_offset: 0,
+            temp_ws_enabled: false,
+            temp_ws_port: "9002".to_string(),
+            temp_ws_password: String::new(),
+            temp_ws_allow_list: String::new(),
+            temp_ws_cert_file: String::new(),
+            temp_ws_key_file: String::new(),
+            temp_ws_use_tls: false,
+            temp_ws_nonsecure_enabled: false,
+            temp_ws_nonsecure_port: "9003".to_string(),
+            temp_http_enabled: false,
+            temp_http_port: "9000".to_string(),
+            temp_https_enabled: false,
+            temp_https_port: "9001".to_string(),
+        }
+    }
+
+    fn open(&mut self, settings: &Settings) {
+        self.visible = true;
+        self.selected_field = WebField::WsEnabled;
+        self.editing = false;
+        // Load from settings
+        self.temp_ws_enabled = settings.websocket_enabled;
+        self.temp_ws_port = settings.websocket_port.to_string();
+        self.temp_ws_password = settings.websocket_password.clone();
+        self.temp_ws_allow_list = settings.websocket_allow_list.clone();
+        self.temp_ws_cert_file = settings.websocket_cert_file.clone();
+        self.temp_ws_key_file = settings.websocket_key_file.clone();
+        self.temp_ws_use_tls = settings.websocket_use_tls;
+        self.temp_ws_nonsecure_enabled = settings.ws_nonsecure_enabled;
+        self.temp_ws_nonsecure_port = settings.ws_nonsecure_port.to_string();
+        self.temp_http_enabled = settings.http_enabled;
+        self.temp_http_port = settings.http_port.to_string();
+        self.temp_https_enabled = settings.https_enabled;
+        self.temp_https_port = settings.https_port.to_string();
+    }
+
+    fn close(&mut self) {
+        self.visible = false;
+        self.editing = false;
+    }
+
+    fn next_field(&mut self) {
+        self.selected_field = self.selected_field.next();
+    }
+
+    fn prev_field(&mut self) {
+        self.selected_field = self.selected_field.prev();
+    }
+
+    fn start_edit(&mut self) {
+        self.editing = true;
+        self.edit_buffer = match self.selected_field {
+            WebField::WsPort => self.temp_ws_port.clone(),
+            WebField::WsPassword => self.temp_ws_password.clone(),
+            WebField::WsAllowList => self.temp_ws_allow_list.clone(),
+            WebField::WsCertFile => self.temp_ws_cert_file.clone(),
+            WebField::WsKeyFile => self.temp_ws_key_file.clone(),
+            WebField::WsNonsecurePort => self.temp_ws_nonsecure_port.clone(),
+            WebField::HttpPort => self.temp_http_port.clone(),
+            WebField::HttpsPort => self.temp_https_port.clone(),
+            _ => String::new(),
+        };
+        self.edit_cursor = self.edit_buffer.len();
+        self.edit_scroll_offset = 0;
+    }
+
+    fn commit_edit(&mut self) {
+        match self.selected_field {
+            WebField::WsPort => self.temp_ws_port = self.edit_buffer.clone(),
+            WebField::WsPassword => self.temp_ws_password = self.edit_buffer.clone(),
+            WebField::WsAllowList => self.temp_ws_allow_list = self.edit_buffer.clone(),
+            WebField::WsCertFile => self.temp_ws_cert_file = self.edit_buffer.clone(),
+            WebField::WsKeyFile => self.temp_ws_key_file = self.edit_buffer.clone(),
+            WebField::WsNonsecurePort => self.temp_ws_nonsecure_port = self.edit_buffer.clone(),
+            WebField::HttpPort => self.temp_http_port = self.edit_buffer.clone(),
+            WebField::HttpsPort => self.temp_https_port = self.edit_buffer.clone(),
+            _ => {}
+        }
+        self.editing = false;
+    }
+
+    fn cancel_edit(&mut self) {
+        self.editing = false;
+    }
+
+    fn toggle_option(&mut self) {
+        match self.selected_field {
+            WebField::WsEnabled => self.temp_ws_enabled = !self.temp_ws_enabled,
+            WebField::WsUseTls => self.temp_ws_use_tls = !self.temp_ws_use_tls,
+            WebField::WsNonsecureEnabled => self.temp_ws_nonsecure_enabled = !self.temp_ws_nonsecure_enabled,
+            WebField::HttpEnabled => self.temp_http_enabled = !self.temp_http_enabled,
+            WebField::HttpsEnabled => self.temp_https_enabled = !self.temp_https_enabled,
+            _ => {}
+        }
+    }
+
+    /// Adjust scroll offset to keep cursor visible within given visible width
+    fn adjust_scroll(&mut self, visible_width: usize) {
+        if visible_width == 0 {
+            return;
+        }
+        let margin = 2.min(visible_width / 4);
+        if self.edit_cursor < self.edit_scroll_offset + margin {
+            self.edit_scroll_offset = self.edit_cursor.saturating_sub(margin);
+        } else if self.edit_cursor >= self.edit_scroll_offset + visible_width - margin {
+            self.edit_scroll_offset = self.edit_cursor.saturating_sub(visible_width - margin - 1);
+        }
+    }
+
+    fn apply(&self, settings: &mut Settings) {
         settings.websocket_enabled = self.temp_ws_enabled;
         if let Ok(port) = self.temp_ws_port.parse::<u16>() {
             settings.websocket_port = port;
@@ -1109,17 +1256,18 @@ impl SettingsPopup {
         settings.websocket_cert_file = self.temp_ws_cert_file.clone();
         settings.websocket_key_file = self.temp_ws_key_file.clone();
         settings.websocket_use_tls = self.temp_ws_use_tls;
-        // HTTP settings
+        settings.ws_nonsecure_enabled = self.temp_ws_nonsecure_enabled;
+        if let Ok(port) = self.temp_ws_nonsecure_port.parse::<u16>() {
+            settings.ws_nonsecure_port = port;
+        }
         settings.http_enabled = self.temp_http_enabled;
         if let Ok(port) = self.temp_http_port.parse::<u16>() {
             settings.http_port = port;
         }
-        // HTTPS settings
         settings.https_enabled = self.temp_https_enabled;
         if let Ok(port) = self.temp_https_port.parse::<u16>() {
             settings.https_port = port;
         }
-        (self.temp_input_height, self.temp_show_tags)
     }
 }
 
@@ -1985,15 +2133,18 @@ struct Settings {
     // Remote GUI font settings
     font_name: String,
     font_size: f32,
-    // WebSocket server settings
-    websocket_enabled: bool,
-    websocket_port: u16,
+    // WebSocket server settings (secure - wss://)
+    websocket_enabled: bool,       // Enable secure WebSocket server (wss://)
+    websocket_port: u16,           // Port for secure WebSocket (default 9002)
     websocket_password: String,
     websocket_allow_list: String,  // CSV list of hosts that can be whitelisted
     websocket_whitelisted_host: Option<String>,  // Currently whitelisted host (authenticated from allow list)
-    websocket_use_tls: bool,       // Use WSS (TLS) instead of WS
+    websocket_use_tls: bool,       // Legacy - always true for wss://
     websocket_cert_file: String,   // Path to TLS certificate file (PEM)
     websocket_key_file: String,    // Path to TLS private key file (PEM)
+    // Non-secure WebSocket server settings (ws://)
+    ws_nonsecure_enabled: bool,    // Enable non-secure WebSocket server (ws://)
+    ws_nonsecure_port: u16,        // Port for non-secure WebSocket (default 9003)
     // HTTP web interface settings
     http_enabled: bool,            // Enable/disable HTTP web server
     http_port: u16,                // Port for HTTP web interface (default 9000)
@@ -2023,6 +2174,8 @@ impl Default for Settings {
             websocket_use_tls: false,
             websocket_cert_file: String::new(),
             websocket_key_file: String::new(),
+            ws_nonsecure_enabled: false,
+            ws_nonsecure_port: 9003,
             http_enabled: false,
             http_port: 9000,
             https_enabled: false,
@@ -2605,11 +2758,14 @@ struct App {
     filter_popup: FilterPopup,
     help_popup: HelpPopup,
     actions_popup: ActionsPopup,
+    web_popup: WebPopup,
     last_ctrl_c: Option<std::time::Instant>,
     last_escape: Option<std::time::Instant>, // For Escape+key sequences (Alt emulation)
     show_tags: bool, // F2 toggles - false = hide tags (default), true = show tags
-    // WebSocket server
+    // WebSocket server (secure, wss://)
     ws_server: Option<WebSocketServer>,
+    // Non-secure WebSocket server (ws://)
+    ws_nonsecure_server: Option<WebSocketServer>,
     // HTTP web interface server (no TLS)
     http_server: Option<HttpServer>,
     // HTTPS web interface server
@@ -2641,10 +2797,12 @@ impl App {
             filter_popup: FilterPopup::new(),
             help_popup: HelpPopup::new(),
             actions_popup: ActionsPopup::new(),
+            web_popup: WebPopup::new(),
             last_ctrl_c: None,
             last_escape: None,
             show_tags: false, // Default: hide tags
             ws_server: None,
+            ws_nonsecure_server: None,
             http_server: None,
             #[cfg(feature = "native-tls-backend")]
             https_server: None,
@@ -2956,7 +3114,24 @@ impl App {
 
     /// Broadcast a message to all authenticated WebSocket clients
     fn ws_broadcast(&self, msg: WsMessage) {
+        // Broadcast to secure WebSocket server (wss://)
         if let Some(ref server) = self.ws_server {
+            let clients = server.clients.clone();
+            let msg_clone = msg.clone();
+            tokio::spawn(async move {
+                let clients_guard = clients.read().await;
+                if let Ok(json) = serde_json::to_string(&msg_clone) {
+                    for client in clients_guard.values() {
+                        if client.authenticated {
+                            let _ = client.tx.send(msg_clone.clone());
+                        }
+                    }
+                    drop(json); // Used to validate serialization works
+                }
+            });
+        }
+        // Broadcast to non-secure WebSocket server (ws://)
+        if let Some(ref server) = self.ws_nonsecure_server {
             let clients = server.clients.clone();
             let msg_clone = msg;
             tokio::spawn(async move {
@@ -2973,9 +3148,21 @@ impl App {
         }
     }
 
-    /// Send a message to a specific WebSocket client
+    /// Send a message to a specific WebSocket client (checks both servers)
     fn ws_send_to_client(&self, client_id: u64, msg: WsMessage) {
+        // Try secure server first
         if let Some(ref server) = self.ws_server {
+            let clients = server.clients.clone();
+            let msg_clone = msg.clone();
+            tokio::spawn(async move {
+                let clients_guard = clients.read().await;
+                if let Some(client) = clients_guard.get(&client_id) {
+                    let _ = client.tx.send(msg_clone);
+                }
+            });
+        }
+        // Try non-secure server
+        if let Some(ref server) = self.ws_nonsecure_server {
             let clients = server.clients.clone();
             tokio::spawn(async move {
                 let clients_guard = clients.read().await;
@@ -3425,6 +3612,8 @@ fn save_settings(app: &App) -> io::Result<()> {
     writeln!(file, "http_port={}", app.settings.http_port)?;
     writeln!(file, "https_enabled={}", app.settings.https_enabled)?;
     writeln!(file, "https_port={}", app.settings.https_port)?;
+    writeln!(file, "ws_nonsecure_enabled={}", app.settings.ws_nonsecure_enabled)?;
+    writeln!(file, "ws_nonsecure_port={}", app.settings.ws_nonsecure_port)?;
 
     // Save each world's settings
     for world in &app.worlds {
@@ -3596,6 +3785,14 @@ fn load_settings(app: &mut App) -> io::Result<()> {
                             app.settings.https_port = p;
                         }
                     }
+                    "ws_nonsecure_enabled" => {
+                        app.settings.ws_nonsecure_enabled = value == "true";
+                    }
+                    "ws_nonsecure_port" => {
+                        if let Ok(p) = value.parse::<u16>() {
+                            app.settings.ws_nonsecure_port = p;
+                        }
+                    }
                     // Legacy: ignore global encoding, it's now per-world
                     "encoding" => {}
                     _ => {}
@@ -3695,6 +3892,8 @@ fn save_reload_state(app: &App) -> io::Result<()> {
     writeln!(file, "http_port={}", app.settings.http_port)?;
     writeln!(file, "https_enabled={}", app.settings.https_enabled)?;
     writeln!(file, "https_port={}", app.settings.https_port)?;
+    writeln!(file, "ws_nonsecure_enabled={}", app.settings.ws_nonsecure_enabled)?;
+    writeln!(file, "ws_nonsecure_port={}", app.settings.ws_nonsecure_port)?;
 
     // Save input history (base64 encode each line to handle special chars)
     writeln!(file, "history_count={}", app.input.history.len())?;
@@ -3975,6 +4174,14 @@ fn load_reload_state(app: &mut App) -> io::Result<bool> {
                     "https_port" => {
                         if let Ok(p) = value.parse::<u16>() {
                             app.settings.https_port = p;
+                        }
+                    }
+                    "ws_nonsecure_enabled" => {
+                        app.settings.ws_nonsecure_enabled = value == "true";
+                    }
+                    "ws_nonsecure_port" => {
+                        if let Ok(p) = value.parse::<u16>() {
+                            app.settings.ws_nonsecure_port = p;
                         }
                     }
                     // Legacy: ignore global encoding, it's now per-world
@@ -7649,16 +7856,37 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
         }
     }
 
-    // Start HTTP web interface server if enabled
+    // Start non-secure WebSocket server (ws://) if enabled OR if HTTP is enabled (HTTP requires ws://)
+    if (app.settings.ws_nonsecure_enabled || app.settings.http_enabled) && !app.settings.websocket_password.is_empty() {
+        let mut server = WebSocketServer::new(
+            &app.settings.websocket_password,
+            app.settings.ws_nonsecure_port,
+            &app.settings.websocket_allow_list,
+            app.settings.websocket_whitelisted_host.clone(),
+        );
+        // No TLS configuration for non-secure server
+
+        if let Err(e) = start_websocket_server(&mut server, event_tx.clone()).await {
+            let err_str = e.to_string();
+            if !err_str.contains("Address in use") && !err_str.contains("address already in use") {
+                app.add_output(&format!("Warning: Failed to start non-secure WebSocket server: {}", e));
+            }
+        } else {
+            app.add_output(&format!("Non-secure WebSocket server started on port {} (ws)", app.settings.ws_nonsecure_port));
+            app.ws_nonsecure_server = Some(server);
+        }
+    }
+
+    // Start HTTP web interface server if enabled (uses ws:// non-secure WebSocket)
     if app.settings.http_enabled {
         let mut http_server = HttpServer::new(app.settings.http_port);
         match start_http_server(
             &mut http_server,
-            app.settings.websocket_port,
-            app.settings.websocket_use_tls,
+            app.settings.ws_nonsecure_port,
+            false, // HTTP uses non-secure WebSocket (ws://)
         ).await {
             Ok(()) => {
-                app.add_output(&format!("HTTP web interface started on port {}", app.settings.http_port));
+                app.add_output(&format!("HTTP web interface started on port {} (ws://localhost:{})", app.settings.http_port, app.settings.ws_nonsecure_port));
                 app.http_server = Some(http_server);
             }
             Err(e) => {
@@ -7670,7 +7898,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
         }
     }
 
-    // Start HTTPS web interface server if enabled and TLS cert/key are configured
+    // Start HTTPS web interface server if enabled and TLS cert/key are configured (uses wss:// secure WebSocket)
     #[cfg(feature = "native-tls-backend")]
     if app.settings.https_enabled
         && !app.settings.websocket_cert_file.is_empty()
@@ -7682,10 +7910,10 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
             &app.settings.websocket_cert_file,
             &app.settings.websocket_key_file,
             app.settings.websocket_port,
-            app.settings.websocket_use_tls,
+            true, // HTTPS uses secure WebSocket (wss://)
         ).await {
             Ok(()) => {
-                app.add_output(&format!("HTTPS web interface started on port {}", app.settings.https_port));
+                app.add_output(&format!("HTTPS web interface started on port {} (wss://localhost:{})", app.settings.https_port, app.settings.websocket_port));
                 app.https_server = Some(https_server);
             }
             Err(e) => {
@@ -7697,7 +7925,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
         }
     }
 
-    // Start HTTPS web interface server if enabled and TLS cert/key are configured (rustls version)
+    // Start HTTPS web interface server if enabled and TLS cert/key are configured (rustls version, uses wss://)
     #[cfg(feature = "rustls-backend")]
     if app.settings.https_enabled
         && !app.settings.websocket_cert_file.is_empty()
@@ -7709,10 +7937,10 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
             &app.settings.websocket_cert_file,
             &app.settings.websocket_key_file,
             app.settings.websocket_port,
-            app.settings.websocket_use_tls,
+            true, // HTTPS uses secure WebSocket (wss://)
         ).await {
             Ok(()) => {
-                app.add_output(&format!("HTTPS web interface started on port {}", app.settings.https_port));
+                app.add_output(&format!("HTTPS web interface started on port {} (wss://localhost:{})", app.settings.https_port, app.settings.websocket_port));
                 app.https_server = Some(https_server);
             }
             Err(e) => {
@@ -7880,7 +8108,45 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                 app.add_output("WebSocket server stopped.");
                             }
 
-                            // Check if we need to start or stop the HTTP server
+                            // Check if we need to start or stop the non-secure WebSocket server (ws://)
+                            // Note: HTTP also requires the non-secure WebSocket server
+                            {
+                                let ws_ns_enabled = app.settings.ws_nonsecure_enabled;
+                                let http_enabled = app.settings.http_enabled;
+                                let needs_ws_ns = ws_ns_enabled || http_enabled;
+                                let has_password = !app.settings.websocket_password.is_empty();
+                                let is_running = app.ws_nonsecure_server.is_some();
+
+                                if needs_ws_ns && has_password && !is_running {
+                                    // Start the non-secure server
+                                    let mut server = WebSocketServer::new(
+                                        &app.settings.websocket_password,
+                                        app.settings.ws_nonsecure_port,
+                                        &app.settings.websocket_allow_list,
+                                        app.settings.websocket_whitelisted_host.clone(),
+                                    );
+                                    // No TLS configuration for non-secure server
+
+                                    if let Err(e) = start_websocket_server(&mut server, event_tx.clone()).await {
+                                        let err_str = e.to_string();
+                                        if !err_str.contains("Address in use") && !err_str.contains("address already in use") {
+                                            app.add_output(&format!("Warning: Failed to start non-secure WebSocket server: {}", e));
+                                        }
+                                    } else {
+                                        app.add_output(&format!("Non-secure WebSocket server started on port {} (ws)", app.settings.ws_nonsecure_port));
+                                        app.ws_nonsecure_server = Some(server);
+                                    }
+                                } else if (!needs_ws_ns || !has_password) && is_running {
+                                    // Stop the server
+                                    if let Some(ref mut server) = app.ws_nonsecure_server {
+                                        server.stop();
+                                    }
+                                    app.ws_nonsecure_server = None;
+                                    app.add_output("Non-secure WebSocket server stopped.");
+                                }
+                            }
+
+                            // Check if we need to start or stop the HTTP server (uses ws:// non-secure WebSocket)
                             {
                                 let http_enabled = app.settings.http_enabled;
                                 let http_running = app.http_server.is_some();
@@ -7890,11 +8156,11 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                     let mut http_server = HttpServer::new(app.settings.http_port);
                                     match start_http_server(
                                         &mut http_server,
-                                        app.settings.websocket_port,
-                                        app.settings.websocket_use_tls,
+                                        app.settings.ws_nonsecure_port,
+                                        false, // HTTP uses non-secure WebSocket (ws://)
                                     ).await {
                                         Ok(()) => {
-                                            app.add_output(&format!("HTTP web interface started on port {}", app.settings.http_port));
+                                            app.add_output(&format!("HTTP web interface started on port {} (ws://localhost:{})", app.settings.http_port, app.settings.ws_nonsecure_port));
                                             app.http_server = Some(http_server);
                                         }
                                         Err(e) => {
@@ -7908,7 +8174,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                 }
                             }
 
-                            // Check if we need to start or stop the HTTPS server
+                            // Check if we need to start or stop the HTTPS server (uses wss:// secure WebSocket)
                             #[cfg(feature = "native-tls-backend")]
                             {
                                 let https_enabled = app.settings.https_enabled;
@@ -7924,10 +8190,10 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                         &app.settings.websocket_cert_file,
                                         &app.settings.websocket_key_file,
                                         app.settings.websocket_port,
-                                        app.settings.websocket_use_tls,
+                                        true, // HTTPS uses secure WebSocket (wss://)
                                     ).await {
                                         Ok(()) => {
-                                            app.add_output(&format!("HTTPS web interface started on port {}", app.settings.https_port));
+                                            app.add_output(&format!("HTTPS web interface started on port {} (wss://localhost:{})", app.settings.https_port, app.settings.websocket_port));
                                             app.https_server = Some(https_server);
                                         }
                                         Err(e) => {
@@ -7956,10 +8222,10 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                         &app.settings.websocket_cert_file,
                                         &app.settings.websocket_key_file,
                                         app.settings.websocket_port,
-                                        app.settings.websocket_use_tls,
+                                        true, // HTTPS uses secure WebSocket (wss://)
                                     ).await {
                                         Ok(()) => {
-                                            app.add_output(&format!("HTTPS web interface started on port {}", app.settings.https_port));
+                                            app.add_output(&format!("HTTPS web interface started on port {} (wss://localhost:{})", app.settings.https_port, app.settings.websocket_port));
                                             app.https_server = Some(https_server);
                                         }
                                         Err(e) => {
@@ -8444,7 +8710,8 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
             || app.worlds_popup.visible
             || app.filter_popup.visible
             || app.help_popup.visible
-            || app.actions_popup.visible;
+            || app.actions_popup.visible
+            || app.web_popup.visible;
 
         // If transitioning from no popup to popup, clear terminal to sync ratatui with terminal state
         if any_popup_visible && !app.popup_was_visible {
@@ -9461,6 +9728,173 @@ fn handle_key_event(key: KeyEvent, app: &mut App) -> KeyAction {
         return KeyAction::None;
     }
 
+    // Handle web popup input
+    if app.web_popup.visible {
+        if app.web_popup.editing {
+            // Text editing mode
+            match key.code {
+                KeyCode::Esc => {
+                    app.web_popup.cancel_edit();
+                    app.web_popup.close();
+                }
+                KeyCode::Backspace => {
+                    if app.web_popup.edit_cursor > 0 {
+                        app.web_popup.edit_cursor -= 1;
+                        app.web_popup.edit_buffer.remove(app.web_popup.edit_cursor);
+                        app.web_popup.adjust_scroll(33);
+                    }
+                }
+                KeyCode::Delete => {
+                    if app.web_popup.edit_cursor < app.web_popup.edit_buffer.len() {
+                        app.web_popup.edit_buffer.remove(app.web_popup.edit_cursor);
+                    }
+                }
+                KeyCode::Left => {
+                    if app.web_popup.edit_cursor > 0 {
+                        app.web_popup.edit_cursor -= 1;
+                        app.web_popup.adjust_scroll(33);
+                    }
+                }
+                KeyCode::Right => {
+                    if app.web_popup.edit_cursor < app.web_popup.edit_buffer.len() {
+                        app.web_popup.edit_cursor += 1;
+                        app.web_popup.adjust_scroll(33);
+                    }
+                }
+                KeyCode::Home => {
+                    app.web_popup.edit_cursor = 0;
+                    app.web_popup.adjust_scroll(33);
+                }
+                KeyCode::End => {
+                    app.web_popup.edit_cursor = app.web_popup.edit_buffer.len();
+                    app.web_popup.adjust_scroll(33);
+                }
+                KeyCode::Up => {
+                    app.web_popup.commit_edit();
+                    app.web_popup.prev_field();
+                    if app.web_popup.selected_field.is_text_field() {
+                        app.web_popup.start_edit();
+                    }
+                }
+                KeyCode::Down | KeyCode::Enter | KeyCode::Tab => {
+                    app.web_popup.commit_edit();
+                    app.web_popup.next_field();
+                    if app.web_popup.selected_field.is_text_field() {
+                        app.web_popup.start_edit();
+                    }
+                }
+                KeyCode::Char(c) => {
+                    app.web_popup.edit_buffer.insert(app.web_popup.edit_cursor, c);
+                    app.web_popup.edit_cursor += 1;
+                    app.web_popup.adjust_scroll(33);
+                }
+                _ => {}
+            }
+        } else {
+            // Navigation mode
+            match key.code {
+                KeyCode::Esc => {
+                    app.web_popup.close();
+                }
+                KeyCode::Enter => {
+                    if app.web_popup.selected_field.is_text_field() {
+                        app.web_popup.start_edit();
+                    } else if app.web_popup.selected_field.is_button() {
+                        match app.web_popup.selected_field {
+                            WebField::SaveWeb => {
+                                app.web_popup.apply(&mut app.settings);
+                                if let Err(e) = save_settings(app) {
+                                    app.add_output(&format!("Warning: Could not save settings: {}", e));
+                                }
+                                app.web_popup.close();
+                                return KeyAction::UpdateWebSocket;
+                            }
+                            WebField::CancelWeb => {
+                                app.web_popup.close();
+                            }
+                            _ => {}
+                        }
+                    } else {
+                        app.web_popup.toggle_option();
+                    }
+                }
+                KeyCode::Up => {
+                    if app.web_popup.selected_field.is_button() {
+                        app.web_popup.selected_field = match app.web_popup.selected_field {
+                            WebField::SaveWeb => WebField::CancelWeb,
+                            WebField::CancelWeb => WebField::SaveWeb,
+                            other => other,
+                        };
+                    } else {
+                        app.web_popup.prev_field();
+                        if app.web_popup.selected_field.is_text_field() {
+                            app.web_popup.start_edit();
+                        }
+                    }
+                }
+                KeyCode::Down => {
+                    if app.web_popup.selected_field.is_button() {
+                        app.web_popup.selected_field = match app.web_popup.selected_field {
+                            WebField::SaveWeb => WebField::CancelWeb,
+                            WebField::CancelWeb => WebField::SaveWeb,
+                            other => other,
+                        };
+                    } else {
+                        app.web_popup.next_field();
+                        if app.web_popup.selected_field.is_text_field() {
+                            app.web_popup.start_edit();
+                        }
+                    }
+                }
+                KeyCode::Tab => {
+                    app.web_popup.next_field();
+                    if app.web_popup.selected_field.is_text_field() {
+                        app.web_popup.start_edit();
+                    }
+                }
+                KeyCode::Left | KeyCode::Right => {
+                    if app.web_popup.selected_field.is_button() {
+                        app.web_popup.selected_field = match app.web_popup.selected_field {
+                            WebField::SaveWeb => WebField::CancelWeb,
+                            WebField::CancelWeb => WebField::SaveWeb,
+                            other => other,
+                        };
+                    }
+                }
+                KeyCode::Char(' ') => {
+                    if app.web_popup.selected_field.is_text_field() {
+                        app.web_popup.start_edit();
+                        app.web_popup.edit_buffer.push(' ');
+                        app.web_popup.edit_cursor += 1;
+                        app.web_popup.adjust_scroll(33);
+                    } else if !app.web_popup.selected_field.is_button() {
+                        app.web_popup.toggle_option();
+                    }
+                }
+                KeyCode::Char('s') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    app.web_popup.apply(&mut app.settings);
+                    app.web_popup.close();
+                    if let Err(e) = save_settings(app) {
+                        app.add_output(&format!("Warning: Could not save settings: {}", e));
+                    } else {
+                        app.add_output("Web settings saved");
+                    }
+                    return KeyAction::UpdateWebSocket;
+                }
+                KeyCode::Char(c) => {
+                    if app.web_popup.selected_field.is_text_field() {
+                        app.web_popup.start_edit();
+                        app.web_popup.edit_buffer.push(c);
+                        app.web_popup.edit_cursor += 1;
+                        app.web_popup.adjust_scroll(33);
+                    }
+                }
+                _ => {}
+            }
+        }
+        return KeyAction::None;
+    }
+
     // Handle world selector popup input
     if app.world_selector.visible {
         if app.world_selector.editing_filter {
@@ -9897,6 +10331,10 @@ async fn handle_command(cmd: &str, app: &mut App, event_tx: mpsc::Sender<AppEven
         Some("/setup") => {
             // Open settings popup for global settings only
             app.settings_popup.open_setup(&app.settings, app.input_height, app.show_tags);
+        }
+        Some("/web") => {
+            // Open web settings popup
+            app.web_popup.open(&app.settings);
         }
         Some("/world") => {
             if parts.len() < 2 {
@@ -10590,6 +11028,7 @@ fn ui(f: &mut Frame, app: &mut App) {
 
     // Render popups if visible (confirm dialog last so it's on top)
     render_settings_popup(f, app);
+    render_web_popup(f, app);
     render_world_selector_popup(f, app);
     render_confirm_dialog(f, app);
     render_worlds_popup(f, app);
@@ -10611,7 +11050,8 @@ fn render_output_crossterm(app: &App) {
         || app.worlds_popup.visible
         || app.filter_popup.visible
         || app.help_popup.visible
-        || app.actions_popup.visible;
+        || app.actions_popup.visible
+        || app.web_popup.visible;
     if app.current_world().showing_splash || any_popup_visible {
         return;
     }
@@ -10816,7 +11256,8 @@ fn render_output_area(f: &mut Frame, app: &App, area: Rect) {
         || app.worlds_popup.visible
         || app.filter_popup.visible
         || app.help_popup.visible
-        || app.actions_popup.visible;
+        || app.actions_popup.visible
+        || app.web_popup.visible;
 
     // If no popup is visible, raw crossterm will handle output rendering
     // (it provides better ANSI color handling)
@@ -11532,17 +11973,6 @@ fn render_settings_popup(f: &mut Frame, app: &App) {
                     field_style(SettingsField::GuiTheme),
                 ),
             ]),
-            render_toggle_field("WS enabled:", popup.temp_ws_enabled, SettingsField::WsEnabled, w),
-            render_text_field("WS port:", &popup.temp_ws_port, SettingsField::WsPort, w),
-            render_text_field("WS password:", &popup.temp_ws_password, SettingsField::WsPassword, w),
-            render_text_field("WS Allow List:", &popup.temp_ws_allow_list, SettingsField::WsAllowList, w),
-            render_text_field("TLS Cert File:", &popup.temp_ws_cert_file, SettingsField::WsCertFile, w),
-            render_text_field("TLS Key File:", &popup.temp_ws_key_file, SettingsField::WsKeyFile, w),
-            render_toggle_field("WS Use TLS:", popup.temp_ws_use_tls, SettingsField::WsUseTls, w),
-            render_toggle_field("HTTP enabled:", popup.temp_http_enabled, SettingsField::HttpEnabled, w),
-            render_text_field("HTTP port:", &popup.temp_http_port, SettingsField::HttpPort, w),
-            render_toggle_field("HTTPS enabled:", popup.temp_https_enabled, SettingsField::HttpsEnabled, w),
-            render_text_field("HTTPS port:", &popup.temp_https_port, SettingsField::HttpsPort, w),
             Line::from(""),
             Line::from(vec![
                 render_button("Save", SettingsField::SaveSetup),
@@ -11622,11 +12052,20 @@ fn render_settings_popup(f: &mut Frame, app: &App) {
     }).max().unwrap_or(20);
 
     // Add borders (2) and some padding (2)
-    let popup_width = ((max_content_width + 4) as u16).min(area.width.saturating_sub(4));
-    let popup_height = ((lines.len() + 2) as u16).min(area.height.saturating_sub(2)); // +2 for borders
+    let popup_width = ((max_content_width + 4) as u16).min(area.width.saturating_sub(2));
+
+    // Calculate required height for all content + borders
+    let required_height = (lines.len() + 2) as u16; // +2 for borders
+    // Use full terminal height minus 1 for margin if content doesn't fit
+    let max_available_height = area.height.saturating_sub(1);
+    let popup_height = required_height.min(max_available_height);
 
     let x = area.width.saturating_sub(popup_width) / 2;
-    let y = area.height.saturating_sub(popup_height) / 2;
+    let y = if popup_height >= area.height {
+        0 // Start at top if popup fills screen
+    } else {
+        area.height.saturating_sub(popup_height) / 2
+    };
 
     let popup_area = Rect::new(x, y, popup_width, popup_height);
 
@@ -11635,6 +12074,153 @@ fn render_settings_popup(f: &mut Frame, app: &App) {
 
     let popup_block = Block::default()
         .title(title)
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(theme.popup_border()))
+        .style(Style::default().bg(theme.popup_bg()));
+
+    let popup_text = Paragraph::new(lines).block(popup_block);
+
+    f.render_widget(popup_text, popup_area);
+}
+
+fn render_web_popup(f: &mut Frame, app: &App) {
+    if !app.web_popup.visible {
+        return;
+    }
+
+    let area = f.area();
+    let popup = &app.web_popup;
+    let theme = app.settings.theme;
+
+    // Helper to get field style
+    let field_style = |field: WebField| -> Style {
+        if field == popup.selected_field {
+            if popup.editing {
+                Style::default()
+                    .fg(theme.fg_success())
+                    .add_modifier(Modifier::BOLD)
+            } else if field.is_button() {
+                Style::default()
+                    .fg(theme.button_selected_fg())
+                    .bg(theme.button_selected_bg())
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default()
+                    .fg(theme.fg_highlight())
+                    .add_modifier(Modifier::BOLD)
+            }
+        } else {
+            Style::default().fg(theme.fg())
+        }
+    };
+
+    let label_width = 17; // "WS Nonsecure:" = 13, add padding
+    let max_field_display_width = 35usize;
+
+    // Helper to render a text field with horizontal scrolling support
+    let render_text_field = |label: &str, value: &str, field: WebField, width: usize| -> Line<'static> {
+        let style = field_style(field);
+        let display_value = if field == popup.selected_field && popup.editing {
+            let buf = &popup.edit_buffer;
+            let cursor = popup.edit_cursor;
+            let scroll = popup.edit_scroll_offset;
+            let visible_width = max_field_display_width.saturating_sub(2);
+            let buf_chars: Vec<char> = buf.chars().collect();
+            let buf_len = buf_chars.len();
+            let start = scroll.min(buf_len);
+            let end = (scroll + visible_width).min(buf_len);
+            let mut display = String::new();
+            if scroll > 0 { display.push('<'); } else { display.push(' '); }
+            for (i, &c) in buf_chars.iter().enumerate() {
+                if i == cursor { display.push('|'); }
+                if i >= start && i < end { display.push(c); }
+            }
+            if cursor >= buf_len && cursor >= start { display.push('|'); }
+            if end < buf_len { display.push('>'); }
+            display
+        } else {
+            let val_chars: Vec<char> = value.chars().collect();
+            if val_chars.len() > max_field_display_width {
+                format!("{}...", val_chars[..max_field_display_width - 3].iter().collect::<String>())
+            } else {
+                value.to_string()
+            }
+        };
+        Line::from(vec![
+            Span::styled(format!("  {:<width$}", label), style),
+            Span::styled(format!("[{}]", display_value), style),
+        ])
+    };
+
+    // Helper to render a toggle field
+    let render_toggle_field = |label: &str, value: bool, field: WebField, width: usize| -> Line<'static> {
+        let style = field_style(field);
+        let value_str = if value { "on" } else { "off" };
+        Line::from(vec![
+            Span::styled(format!("  {:<width$}", label), style),
+            Span::styled(format!("[{}]", value_str), style),
+        ])
+    };
+
+    // Helper to render a button
+    let render_button = |label: &str, field: WebField| -> Span<'static> {
+        let style = field_style(field);
+        Span::styled(format!("[ {} ]", label), style)
+    };
+
+    let w = label_width;
+    let lines = vec![
+        Line::from(""),
+        Line::from(Span::styled("  -- WebSocket (secure wss://) --", Style::default().fg(theme.fg_accent()))),
+        render_toggle_field("WS enabled:", popup.temp_ws_enabled, WebField::WsEnabled, w),
+        render_text_field("WS port:", &popup.temp_ws_port, WebField::WsPort, w),
+        render_text_field("WS password:", &popup.temp_ws_password, WebField::WsPassword, w),
+        render_text_field("WS allow list:", &popup.temp_ws_allow_list, WebField::WsAllowList, w),
+        render_text_field("TLS cert file:", &popup.temp_ws_cert_file, WebField::WsCertFile, w),
+        render_text_field("TLS key file:", &popup.temp_ws_key_file, WebField::WsKeyFile, w),
+        render_toggle_field("WS Use TLS:", popup.temp_ws_use_tls, WebField::WsUseTls, w),
+        Line::from(""),
+        Line::from(Span::styled("  -- WebSocket (non-secure ws://) --", Style::default().fg(theme.fg_accent()))),
+        render_toggle_field("WS Nonsecure:", popup.temp_ws_nonsecure_enabled, WebField::WsNonsecureEnabled, w),
+        render_text_field("WS NS port:", &popup.temp_ws_nonsecure_port, WebField::WsNonsecurePort, w),
+        Line::from(""),
+        Line::from(Span::styled("  -- HTTP/HTTPS Web Interface --", Style::default().fg(theme.fg_accent()))),
+        render_toggle_field("HTTP enabled:", popup.temp_http_enabled, WebField::HttpEnabled, w),
+        render_text_field("HTTP port:", &popup.temp_http_port, WebField::HttpPort, w),
+        render_toggle_field("HTTPS enabled:", popup.temp_https_enabled, WebField::HttpsEnabled, w),
+        render_text_field("HTTPS port:", &popup.temp_https_port, WebField::HttpsPort, w),
+        Line::from(""),
+        Line::from(vec![
+            render_button("Save", WebField::SaveWeb),
+            Span::raw("  "),
+            render_button("Cancel", WebField::CancelWeb),
+            Span::raw(" "),
+        ]).alignment(Alignment::Right),
+    ];
+
+    // Calculate dynamic size
+    let max_content_width = lines.iter().map(|line| {
+        line.spans.iter().map(|span| span.content.chars().count()).sum::<usize>()
+    }).max().unwrap_or(20);
+
+    let popup_width = ((max_content_width + 4) as u16).min(area.width.saturating_sub(2));
+    let required_height = (lines.len() + 2) as u16;
+    let max_available_height = area.height.saturating_sub(1);
+    let popup_height = required_height.min(max_available_height);
+
+    let x = area.width.saturating_sub(popup_width) / 2;
+    let y = if popup_height >= area.height {
+        0
+    } else {
+        area.height.saturating_sub(popup_height) / 2
+    };
+
+    let popup_area = Rect::new(x, y, popup_width, popup_height);
+
+    f.render_widget(ratatui::widgets::Clear, popup_area);
+
+    let popup_block = Block::default()
+        .title(" Web Settings ")
         .borders(Borders::ALL)
         .border_style(Style::default().fg(theme.popup_border()))
         .style(Style::default().bg(theme.popup_bg()));
