@@ -4414,28 +4414,28 @@ mod remote_gui {
 
         fn bg(&self) -> Color32 {
             match self {
-                GuiTheme::Dark => Color32::from_rgb(30, 30, 30),
+                GuiTheme::Dark => Color32::BLACK,  // Pure black like a terminal
                 GuiTheme::Light => Color32::from_rgb(250, 250, 250),
             }
         }
 
         fn fg(&self) -> Color32 {
             match self {
-                GuiTheme::Dark => Color32::WHITE,
+                GuiTheme::Dark => Color32::from_rgb(192, 192, 192),  // Light gray like terminal default
                 GuiTheme::Light => Color32::BLACK,
             }
         }
 
         fn fg_dim(&self) -> Color32 {
             match self {
-                GuiTheme::Dark => Color32::GRAY,
+                GuiTheme::Dark => Color32::from_rgb(128, 128, 128),  // Medium gray
                 GuiTheme::Light => Color32::DARK_GRAY,
             }
         }
 
         fn accent(&self) -> Color32 {
             match self {
-                GuiTheme::Dark => Color32::from_rgb(100, 200, 255),
+                GuiTheme::Dark => Color32::from_rgb(0, 255, 255),  // Cyan like terminal
                 GuiTheme::Light => Color32::from_rgb(0, 100, 180),
             }
         }
@@ -4449,35 +4449,35 @@ mod remote_gui {
 
         fn success(&self) -> Color32 {
             match self {
-                GuiTheme::Dark => Color32::from_rgb(0, 205, 0),
+                GuiTheme::Dark => Color32::from_rgb(0, 255, 0),  // Bright green like terminal
                 GuiTheme::Light => Color32::from_rgb(0, 128, 0),
             }
         }
 
         fn error(&self) -> Color32 {
             match self {
-                GuiTheme::Dark => Color32::from_rgb(205, 0, 0),
+                GuiTheme::Dark => Color32::from_rgb(255, 0, 0),  // Bright red like terminal
                 GuiTheme::Light => Color32::from_rgb(180, 0, 0),
             }
         }
 
         fn panel_bg(&self) -> Color32 {
             match self {
-                GuiTheme::Dark => Color32::from_rgb(40, 40, 40),
+                GuiTheme::Dark => Color32::from_rgb(16, 16, 16),  // Very dark gray for panels
                 GuiTheme::Light => Color32::from_rgb(235, 235, 235),
             }
         }
 
         fn button_bg(&self) -> Color32 {
             match self {
-                GuiTheme::Dark => Color32::from_rgb(60, 60, 60),
+                GuiTheme::Dark => Color32::from_rgb(32, 32, 32),  // Dark gray for buttons
                 GuiTheme::Light => Color32::from_rgb(220, 220, 220),
             }
         }
 
         fn selection_bg(&self) -> Color32 {
             match self {
-                GuiTheme::Dark => Color32::from_rgb(80, 80, 120),
+                GuiTheme::Dark => Color32::from_rgb(0, 64, 128),  // Dark blue selection
                 GuiTheme::Light => Color32::from_rgb(180, 200, 230),
             }
         }
@@ -5652,27 +5652,53 @@ mod remote_gui {
                     ui.vertical_centered(|ui| {
                         ui.add_space(30.0);
 
-                        // Dog ASCII art and Clay title
-                        ui.horizontal(|ui| {
-                            ui.add_space(ui.available_width() / 2.0 - 200.0);
-                            ui.vertical(|ui| {
-                                ui.monospace("          (\\/\\__o");
-                                ui.monospace("  __      `-/ `_/");
-                                ui.monospace(" `--\\______/  |");
-                                ui.monospace("    /        /");
-                                ui.monospace(" -`/_------'\\_.  ");
-                            });
-                            ui.add_space(5.0);
-                            ui.vertical(|ui| {
-                                ui.add_space(20.0);
-                                ui.heading(egui::RichText::new("CLAY").size(48.0).strong());
-                            });
+                        // Dog ASCII art and Clay title - matching console splash colors
+                        // ANSI 256-color to RGB: 180=#d7af87, 209=#ff875f, 208=#ff8700, 215=#ffaf5f
+                        // 216=#ffaf87, 217=#ffafaf, 218=#ffafd7, 213=#ff87ff, 244=#808080
+                        let dog_color = egui::Color32::from_rgb(0xd7, 0xaf, 0x87);  // tan/gold (180)
+                        let clay_colors = [
+                            egui::Color32::from_rgb(0xff, 0x87, 0x5f),  // 209
+                            egui::Color32::from_rgb(0xff, 0x87, 0x00),  // 208
+                            egui::Color32::from_rgb(0xff, 0xaf, 0x5f),  // 215
+                            egui::Color32::from_rgb(0xff, 0xaf, 0x87),  // 216
+                            egui::Color32::from_rgb(0xff, 0xaf, 0xaf),  // 217
+                            egui::Color32::from_rgb(0xff, 0xaf, 0xd7),  // 218
+                        ];
+                        let tagline_color = egui::Color32::from_rgb(0xff, 0x87, 0xff);  // 213
+                        let help_color = egui::Color32::from_rgb(0x80, 0x80, 0x80);  // 244
+
+                        // Splash art: dog on left, CLAY block letters on right
+                        let dog_lines = [
+                            "          (\\/\\__o     ",
+                            "  __      `-/ `_/     ",
+                            " `--\\______/  |       ",
+                            "    /        /        ",
+                            " -`/_------'\\_.       ",
+                            "                       ",
+                        ];
+                        let clay_lines = [
+                            " ██████╗██╗      █████╗ ██╗   ██╗",
+                            "██╔════╝██║     ██╔══██╗╚██╗ ██╔╝",
+                            "██║     ██║     ███████║ ╚████╔╝ ",
+                            "██║     ██║     ██╔══██║  ╚██╔╝  ",
+                            "╚██████╗███████╗██║  ██║   ██║   ",
+                            "╚═════╝╚══════╝╚═╝  ╚═╝   ╚═╝   ",
+                        ];
+
+                        ui.vertical(|ui| {
+                            for (i, (dog, clay)) in dog_lines.iter().zip(clay_lines.iter()).enumerate() {
+                                ui.horizontal(|ui| {
+                                    ui.add_space(ui.available_width() / 2.0 - 250.0);
+                                    ui.label(egui::RichText::new(*dog).color(dog_color).monospace());
+                                    ui.label(egui::RichText::new(*clay).color(clay_colors[i]).monospace());
+                                });
+                            }
                         });
 
                         ui.add_space(10.0);
-                        ui.label(egui::RichText::new("✨ A 90dies mud client written today ✨").italics());
+                        ui.label(egui::RichText::new("✨ A 90dies mud client written today ✨").color(tagline_color).italics());
                         ui.add_space(5.0);
-                        ui.label(egui::RichText::new("/help for how to use clay").weak());
+                        ui.label(egui::RichText::new("/help for how to use clay").color(help_color));
                         ui.add_space(15.0);
 
                         ui.label(format!("Server: {}", self.ws_url));
@@ -5978,9 +6004,10 @@ mod remote_gui {
                         .inner_margin(egui::Margin::symmetric(4.0, 2.0))
                         .stroke(egui::Stroke::NONE))
                     .show(ctx, |ui| {
-                    ui.horizontal(|ui| {
-                        // Hamburger menu (☰)
-                        ui.menu_button("☰", |ui| {
+                    ui.horizontal_centered(|ui| {
+                        // Hamburger menu (☰) - 20% larger
+                        let hamburger_size = 19.2;  // 16 * 1.2 = 19.2
+                        ui.menu_button(egui::RichText::new("☰").size(hamburger_size), |ui| {
                             if ui.button("Worlds List").clicked() {
                                 action = Some("connected_worlds");
                                 ui.close_menu();
@@ -6002,8 +6029,8 @@ mod remote_gui {
 
                         ui.separator();
 
-                        // S/M/L font size buttons (15% larger text)
-                        let btn_size = 16.0;  // Base size, 15% larger than default ~14
+                        // S/M/L font size buttons (centered vertically via horizontal_centered)
+                        let btn_size = 16.0;
                         let small_text = if self.font_size <= 12.0 {
                             egui::RichText::new("S").size(btn_size).strong()
                         } else {
