@@ -172,6 +172,73 @@ body {
     border-color: var(--accent-color);
 }
 
+/* Mobile toolbar - shown on phones/tablets, hidden on desktop */
+#mobile-toolbar {
+    display: none; /* Hidden by default, shown via JS on mobile */
+    align-items: center;
+    justify-content: space-between;
+    padding: 4px 8px;
+    background-color: #111;
+    border-bottom: 1px solid var(--separator-color);
+    min-height: 40px;
+    flex-shrink: 0;
+    position: relative;
+}
+
+#mobile-toolbar.visible {
+    display: flex;
+}
+
+#mobile-toolbar-left,
+#mobile-toolbar-right {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    position: relative;
+}
+
+.mobile-btn {
+    background-color: #222;
+    border: 1px solid var(--separator-color);
+    color: var(--text-color);
+    padding: 6px 12px;
+    cursor: pointer;
+    font-family: inherit;
+    font-size: 14px;
+    border-radius: 3px;
+    min-width: 44px;
+    min-height: 36px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    -webkit-tap-highlight-color: transparent;
+    touch-action: manipulation;
+}
+
+.mobile-btn:hover {
+    background-color: #333;
+}
+
+.mobile-btn:active {
+    background-color: #444;
+}
+
+#mobile-menu-btn {
+    padding: 6px 10px;
+}
+
+#mobile-menu-btn svg {
+    display: block;
+}
+
+/* Mobile dropdown positioning */
+#mobile-menu-dropdown {
+    bottom: 100%;
+    top: auto;
+    margin-bottom: 2px;
+    margin-top: 0;
+}
+
 /* Output area - main display */
 #output-container {
     flex: 1;

@@ -20,12 +20,21 @@
         authError: document.getElementById('auth-error'),
         authSubmit: document.getElementById('auth-submit'),
         connectingOverlay: document.getElementById('connecting-overlay'),
-        // Toolbar
+        // Toolbar (desktop)
+        toolbar: document.getElementById('toolbar'),
         menuBtn: document.getElementById('menu-btn'),
         menuDropdown: document.getElementById('menu-dropdown'),
         fontSmall: document.getElementById('font-small'),
         fontMedium: document.getElementById('font-medium'),
         fontLarge: document.getElementById('font-large'),
+        // Mobile toolbar
+        mobileToolbar: document.getElementById('mobile-toolbar'),
+        mobileMenuBtn: document.getElementById('mobile-menu-btn'),
+        mobileMenuDropdown: document.getElementById('mobile-menu-dropdown'),
+        mobilePgUpBtn: document.getElementById('mobile-pgup-btn'),
+        mobileUpBtn: document.getElementById('mobile-up-btn'),
+        mobileDownBtn: document.getElementById('mobile-down-btn'),
+        mobilePgDnBtn: document.getElementById('mobile-pgdn-btn'),
         // Actions popup
         actionsModal: document.getElementById('actions-modal'),
         actionsList: document.getElementById('actions-list'),
@@ -91,6 +100,7 @@
 
     // Menu state
     let menuOpen = false;
+    let mobileMenuOpen = false;
 
     // Font size state: 'small' (11px), 'medium' (14px), 'large' (18px)
     let currentFontSize = 'medium';
@@ -100,28 +110,50 @@
         large: 18    // Desktop
     };
 
+    // Device mode: 'desktop' or 'mobile'
+    let deviceMode = 'desktop';
+
     // Detect device type and return appropriate font size
-    function detectDeviceFontSize() {
+    function detectDeviceType() {
         const width = window.innerWidth;
         const hasTouch = 'ontouchstart' in window || navigator.maxTouchPoints > 0;
 
         // Phone: narrow screen (< 768px)
         if (width < 768) {
-            return 'small';
+            return { fontSize: 'small', mode: 'mobile' };
         }
         // Tablet: medium screen with touch (768-1024px)
         if (width <= 1024 && hasTouch) {
-            return 'medium';
+            return { fontSize: 'medium', mode: 'mobile' };
         }
         // Desktop: wide screen or no touch
-        return 'large';
+        return { fontSize: 'large', mode: 'desktop' };
+    }
+
+    // Setup toolbars based on device mode
+    function setupToolbars(mode) {
+        deviceMode = mode;
+        if (mode === 'mobile') {
+            // Hide desktop toolbar, show mobile toolbar
+            elements.toolbar.style.display = 'none';
+            elements.mobileToolbar.classList.add('visible');
+            // Remove top padding since no fixed toolbar
+            elements.outputContainer.style.paddingTop = '2px';
+        } else {
+            // Show desktop toolbar, hide mobile toolbar
+            elements.toolbar.style.display = 'flex';
+            elements.mobileToolbar.classList.remove('visible');
+            // Add padding for fixed toolbar
+            elements.outputContainer.style.paddingTop = '40px';
+        }
     }
 
     // Initialize
     function init() {
-        // Set font size based on device type
-        const deviceFontSize = detectDeviceFontSize();
-        setFontSize(deviceFontSize);
+        // Detect device type and configure UI
+        const device = detectDeviceType();
+        setFontSize(device.fontSize);
+        setupToolbars(device.mode);
 
         setupEventListeners();
         connect();
@@ -1497,21 +1529,34 @@
         return activeIndices[(currentPos - 1 + activeIndices.length) % activeIndices.length];
     }
 
-    // Toggle hamburger menu
+    // Toggle hamburger menu (desktop)
     function toggleMenu() {
         menuOpen = !menuOpen;
         elements.menuDropdown.className = 'dropdown' + (menuOpen ? ' visible' : '');
     }
 
-    // Close hamburger menu
+    // Close hamburger menu (desktop)
     function closeMenu() {
         menuOpen = false;
         elements.menuDropdown.className = 'dropdown';
     }
 
+    // Toggle mobile menu
+    function toggleMobileMenu() {
+        mobileMenuOpen = !mobileMenuOpen;
+        elements.mobileMenuDropdown.className = 'dropdown' + (mobileMenuOpen ? ' visible' : '');
+    }
+
+    // Close mobile menu
+    function closeMobileMenu() {
+        mobileMenuOpen = false;
+        elements.mobileMenuDropdown.className = 'dropdown';
+    }
+
     // Handle menu item click
     function handleMenuItem(action) {
         closeMenu();
+        closeMobileMenu();
         switch (action) {
             case 'worlds':
                 openWorldsPopup();
@@ -1580,6 +1625,72 @@
             setFontSize('large');
         };
 
+        // Mobile toolbar buttons
+        elements.mobileMenuBtn.onclick = function(e) {
+            e.stopPropagation();
+            toggleMobileMenu();
+        };
+
+        elements.mobileMenuDropdown.onclick = function(e) {
+            e.stopPropagation();
+            const item = e.target.closest('.dropdown-item');
+            if (item) {
+                handleMenuItem(item.dataset.action);
+            }
+        };
+
+        elements.mobileUpBtn.onclick = function(e) {
+            e.preventDefault();
+            e.stopPropagation();
+            // Cycle to previous active world
+            const prevIndex = getPrevActiveWorld();
+            if (prevIndex !== currentWorldIndex) {
+                switchWorldLocal(prevIndex);
+            }
+            elements.input.focus();
+        };
+
+        elements.mobileDownBtn.onclick = function(e) {
+            e.preventDefault();
+            e.stopPropagation();
+            // Cycle to next active world
+            const nextIndex = getNextActiveWorld();
+            if (nextIndex !== currentWorldIndex) {
+                switchWorldLocal(nextIndex);
+            }
+            elements.input.focus();
+        };
+
+        elements.mobilePgUpBtn.onclick = function(e) {
+            e.preventDefault();
+            e.stopPropagation();
+            // Page up - scroll output
+            const container = elements.outputContainer;
+            const pageHeight = container.clientHeight * 0.9;
+            container.scrollTop = Math.max(0, container.scrollTop - pageHeight);
+            updateStatusBar();
+            elements.input.focus();
+        };
+
+        elements.mobilePgDnBtn.onclick = function(e) {
+            e.preventDefault();
+            e.stopPropagation();
+            // Page down - scroll output or release pending lines
+            const container = elements.outputContainer;
+            const world = worlds[currentWorldIndex];
+
+            if (world && world.pendingLines && world.pendingLines.length > 0) {
+                // Release one screenful of pending lines
+                releasePendingLines(getVisibleLineCount());
+            } else {
+                // Just scroll down
+                const pageHeight = container.clientHeight * 0.9;
+                container.scrollTop += pageHeight;
+            }
+            updateStatusBar();
+            elements.input.focus();
+        };
+
         // Window resize handler to update separator fill
         window.addEventListener('resize', function() {
             updateStatusBar();
@@ -1600,9 +1711,12 @@
 
         // Click anywhere to focus input and close menu
         document.body.onclick = function(e) {
-            // Close menu if open
+            // Close menus if open
             if (menuOpen) {
                 closeMenu();
+            }
+            if (mobileMenuOpen) {
+                closeMobileMenu();
             }
 
             // Don't steal focus if user has selected text (for copy)
@@ -1610,12 +1724,13 @@
             if (selection && selection.toString().length > 0) {
                 return;
             }
-            // Don't steal focus from modals or toolbar
+            // Don't steal focus from modals or toolbars
             if (!elements.authModal.classList.contains('visible') &&
                 !elements.actionsModal.classList.contains('visible') &&
                 !elements.worldsModal.classList.contains('visible') &&
                 !elements.worldSelectorModal.classList.contains('visible') &&
-                !e.target.closest('#toolbar')) {
+                !e.target.closest('#toolbar') &&
+                !e.target.closest('#mobile-toolbar')) {
                 elements.input.focus();
             }
         };

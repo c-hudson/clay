@@ -31,6 +31,26 @@
             <div id="output"></div>
         </div>
 
+        <!-- Mobile toolbar (phones/tablets only) -->
+        <div id="mobile-toolbar">
+            <div id="mobile-toolbar-left">
+                <button id="mobile-menu-btn" class="mobile-btn" title="Menu"><svg width="18" height="14" viewBox="0 0 18 14"><rect y="0" width="18" height="2" fill="#c0c0c0"/><rect y="6" width="18" height="2" fill="#c0c0c0"/><rect y="12" width="18" height="2" fill="#c0c0c0"/></svg></button>
+                <div id="mobile-menu-dropdown" class="dropdown">
+                    <div class="dropdown-item" data-action="worlds">Worlds List</div>
+                    <div class="dropdown-item" data-action="world-selector">World Selector</div>
+                    <div class="dropdown-item" data-action="actions">Actions</div>
+                    <div class="dropdown-divider"></div>
+                    <div class="dropdown-item" data-action="toggle-tags">Toggle Tags</div>
+                </div>
+                <button id="mobile-up-btn" class="mobile-btn" title="Previous World">▲</button>
+                <button id="mobile-down-btn" class="mobile-btn" title="Next World">▼</button>
+            </div>
+            <div id="mobile-toolbar-right">
+                <button id="mobile-pgup-btn" class="mobile-btn" title="Page Up">PgUp</button>
+                <button id="mobile-pgdn-btn" class="mobile-btn" title="Page Down">PgDn</button>
+            </div>
+        </div>
+
         <!-- Separator bar (like console) -->
         <div id="status-bar">
             <span id="status-indicator">___________</span>
