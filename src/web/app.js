@@ -481,6 +481,13 @@
             linesSincePause = 0;
             renderOutput();
             updateStatusBar();
+            // Update prompt to show new world's prompt
+            const world = worlds[currentWorldIndex];
+            if (world && world.prompt) {
+                elements.prompt.innerHTML = parseAnsi(world.prompt);
+            } else {
+                elements.prompt.textContent = '';
+            }
             // Notify server that this world has been seen (syncs unseen count)
             send({ type: 'MarkWorldSeen', world_index: index });
         }
