@@ -5045,6 +5045,22 @@ mod remote_gui {
                         }
                         WsMessage::ServerData { world_index, data, is_viewed } => {
                             if world_index < self.worlds.len() {
+                                // Debug: log ANSI data to file
+                                if self.worlds[world_index].output_lines.len() < 10 {
+                                    use std::io::Write;
+                                    if let Ok(mut f) = std::fs::OpenOptions::new()
+                                        .create(true).append(true)
+                                        .open("/tmp/clay_gui_debug.log")
+                                    {
+                                        let has_esc = data.contains('\x1b');
+                                        let _ = writeln!(f, "Line {}: has_esc={}, len={}, bytes={:?}",
+                                            self.worlds[world_index].output_lines.len(),
+                                            has_esc,
+                                            data.len(),
+                                            data.chars().take(100).collect::<String>().as_bytes());
+                                    }
+                                }
+
                                 // Parse and add new output lines, filtering out visually empty lines
                                 let mut lines_added = 0;
                                 for line in data.lines() {
@@ -5472,32 +5488,32 @@ mod remote_gui {
         /// Convert 256-color palette index to RGB
         fn color256_to_rgb(n: u8, is_light_theme: bool) -> (u8, u8, u8) {
             match n {
-                // Standard colors (0-7)
-                0 => (0, 0, 0),
-                1 => (205, 49, 49),
-                2 => (13, 188, 121),
-                3 => if is_light_theme { (160, 140, 0) } else { (229, 229, 16) },
-                4 => (36, 114, 200),
-                5 => (188, 63, 188),
-                6 => (17, 168, 205),
-                7 => if is_light_theme { (80, 80, 80) } else { (229, 229, 229) },
-                // High-intensity colors (8-15)
-                8 => (102, 102, 102),
-                9 => (241, 76, 76),
-                10 => (35, 209, 139),
-                11 => if is_light_theme { (180, 160, 0) } else { (245, 245, 67) },
-                12 => (59, 142, 234),
-                13 => (214, 112, 214),
-                14 => (41, 184, 219),
-                15 => if is_light_theme { (40, 40, 40) } else { (255, 255, 255) },
+                // Standard colors (0-7) - classic ANSI
+                0 => (0, 0, 0),         // Black
+                1 => (205, 0, 0),       // Red
+                2 => (0, 205, 0),       // Green
+                3 => if is_light_theme { (160, 140, 0) } else { (205, 205, 0) },  // Yellow
+                4 => (0, 0, 205),       // Blue
+                5 => (205, 0, 205),     // Magenta
+                6 => (0, 205, 205),     // Cyan
+                7 => if is_light_theme { (80, 80, 80) } else { (192, 192, 192) }, // White
+                // High-intensity colors (8-15) - bright ANSI
+                8 => (128, 128, 128),   // Bright Black
+                9 => (255, 0, 0),       // Bright Red
+                10 => (0, 255, 0),      // Bright Green
+                11 => if is_light_theme { (180, 160, 0) } else { (255, 255, 0) }, // Bright Yellow
+                12 => (0, 0, 255),      // Bright Blue
+                13 => (255, 0, 255),    // Bright Magenta
+                14 => (0, 255, 255),    // Bright Cyan
+                15 => if is_light_theme { (40, 40, 40) } else { (255, 255, 255) }, // Bright White
                 // 216 colors (16-231): 6x6x6 color cube
                 16..=231 => {
                     let n = n - 16;
                     let r = (n / 36) % 6;
                     let g = (n / 6) % 6;
                     let b = n % 6;
-                    let to_255 = |v: u8| if v == 0 { 0 } else { 55 + v * 40 };
-                    (to_255(r), to_255(g), to_255(b))
+                    // Match web interface: v * 51 gives 0, 51, 102, 153, 204, 255
+                    (r * 51, g * 51, b * 51)
                 }
                 // Grayscale (232-255): 24 shades
                 232..=255 => {
@@ -5509,7 +5525,12 @@ mod remote_gui {
 
         /// Append ANSI-colored text to an existing LayoutJob
         fn append_ansi_to_job(text: &str, default_color: egui::Color32, font_id: egui::FontId, job: &mut egui::text::LayoutJob, is_light_theme: bool) {
+            // Debug: log ANSI sequences and resulting colors
+            static DEBUG_COUNT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+            let debug_this = DEBUG_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 5 && text.contains('\x1b');
+
             let mut current_color = default_color;
+            let mut current_bg = egui::Color32::TRANSPARENT;
             let mut bold = false;
             let mut chars = text.chars().peekable();
             let mut segment = String::new();
@@ -5518,18 +5539,11 @@ mod remote_gui {
                 if c == '\x1b' && chars.peek() == Some(&'[') {
                     // Flush current segment
                     if !segment.is_empty() {
-                        let color = if bold {
-                            egui::Color32::from_rgb(
-                                (current_color.r() as u16 * 4 / 3).min(255) as u8,
-                                (current_color.g() as u16 * 4 / 3).min(255) as u8,
-                                (current_color.b() as u16 * 4 / 3).min(255) as u8,
-                            )
-                        } else {
-                            current_color
-                        };
+                        // Don't brighten colors for bold - match web behavior
                         job.append(&segment, 0.0, egui::TextFormat {
                             font_id: font_id.clone(),
-                            color,
+                            color: current_color,
+                            background: current_bg,
                             ..Default::default()
                         });
                         segment.clear();
@@ -5538,8 +5552,10 @@ mod remote_gui {
                     // Parse escape sequence
                     chars.next(); // consume '['
                     let mut code = String::new();
+                    let mut terminator = ' ';
                     while let Some(&sc) = chars.peek() {
-                        if sc.is_ascii_alphabetic() {
+                        if sc.is_ascii_alphabetic() || sc == '@' || sc == '`' || sc == '~' {
+                            terminator = sc;
                             chars.next();
                             break;
                         }
@@ -5547,50 +5563,67 @@ mod remote_gui {
                         code.push(sc);
                     }
 
+                    // Only parse SGR codes (sequences ending in 'm')
+                    // Skip other CSI sequences (cursor movement, screen clearing, etc.)
+                    if terminator != 'm' {
+                        continue;
+                    }
+
+                    // Debug: log the SGR code
+                    if debug_this {
+                        use std::io::Write;
+                        if let Ok(mut f) = std::fs::OpenOptions::new()
+                            .create(true).append(true)
+                            .open("/tmp/clay_gui_debug.log")
+                        {
+                            let _ = writeln!(f, "SGR code: [{}m", code);
+                        }
+                    }
+
                     // Parse SGR codes (semicolon-separated)
                     let parts: Vec<&str> = code.split(';').collect();
                     let mut i = 0;
                     while i < parts.len() {
                         match parts[i].parse::<u8>().unwrap_or(0) {
-                            0 => { current_color = default_color; bold = false; }
+                            0 => { current_color = default_color; current_bg = egui::Color32::TRANSPARENT; bold = false; }
                             1 => bold = true,
                             22 => bold = false,
-                            // Standard foreground colors (30-37)
-                            30 => current_color = egui::Color32::from_rgb(0, 0, 0),
-                            31 => current_color = egui::Color32::from_rgb(205, 49, 49),
-                            32 => current_color = egui::Color32::from_rgb(13, 188, 121),
+                            // Standard foreground colors (30-37) - classic ANSI colors
+                            30 => current_color = egui::Color32::from_rgb(0, 0, 0),       // Black
+                            31 => current_color = egui::Color32::from_rgb(205, 0, 0),     // Red
+                            32 => current_color = egui::Color32::from_rgb(0, 205, 0),     // Green
                             33 => current_color = if is_light_theme {
                                 egui::Color32::from_rgb(160, 140, 0)  // Darker gold for light theme
                             } else {
-                                egui::Color32::from_rgb(229, 229, 16)
+                                egui::Color32::from_rgb(205, 205, 0)  // Yellow
                             },
-                            34 => current_color = egui::Color32::from_rgb(36, 114, 200),
-                            35 => current_color = egui::Color32::from_rgb(188, 63, 188),
-                            36 => current_color = egui::Color32::from_rgb(17, 168, 205),
+                            34 => current_color = egui::Color32::from_rgb(0, 0, 205),     // Blue
+                            35 => current_color = egui::Color32::from_rgb(205, 0, 205),   // Magenta
+                            36 => current_color = egui::Color32::from_rgb(0, 205, 205),   // Cyan
                             37 => current_color = if is_light_theme {
                                 egui::Color32::from_rgb(80, 80, 80)  // Dark gray for light theme
                             } else {
-                                egui::Color32::from_rgb(229, 229, 229)
+                                egui::Color32::from_rgb(192, 192, 192)  // White (light gray)
                             },
                             39 => current_color = default_color,
                             // Bright/high-intensity foreground colors (90-97)
-                            90 => current_color = egui::Color32::from_rgb(102, 102, 102),
-                            91 => current_color = egui::Color32::from_rgb(241, 76, 76),
-                            92 => current_color = egui::Color32::from_rgb(35, 209, 139),
+                            90 => current_color = egui::Color32::from_rgb(128, 128, 128), // Bright Black
+                            91 => current_color = egui::Color32::from_rgb(255, 0, 0),     // Bright Red
+                            92 => current_color = egui::Color32::from_rgb(0, 255, 0),     // Bright Green
                             93 => current_color = if is_light_theme {
                                 egui::Color32::from_rgb(180, 160, 0)  // Darker gold for light theme
                             } else {
-                                egui::Color32::from_rgb(245, 245, 67)
+                                egui::Color32::from_rgb(255, 255, 0)  // Bright Yellow
                             },
-                            94 => current_color = egui::Color32::from_rgb(59, 142, 234),
-                            95 => current_color = egui::Color32::from_rgb(214, 112, 214),
-                            96 => current_color = egui::Color32::from_rgb(41, 184, 219),
+                            94 => current_color = egui::Color32::from_rgb(0, 0, 255),     // Bright Blue
+                            95 => current_color = egui::Color32::from_rgb(255, 0, 255),   // Bright Magenta
+                            96 => current_color = egui::Color32::from_rgb(0, 255, 255),   // Bright Cyan
                             97 => current_color = if is_light_theme {
                                 egui::Color32::from_rgb(40, 40, 40)  // Near black for light theme
                             } else {
-                                egui::Color32::from_rgb(255, 255, 255)
+                                egui::Color32::from_rgb(255, 255, 255)  // Bright White
                             },
-                            // Extended color modes
+                            // Extended foreground color modes
                             38 => {
                                 // 38;5;n = 256-color, 38;2;r;g;b = 24-bit RGB
                                 if i + 1 < parts.len() {
@@ -5619,11 +5652,69 @@ mod remote_gui {
                                     }
                                 }
                             }
-                            // Background colors (40-47, 100-107) - ignored for now as egui TextFormat
-                            // doesn't easily support per-character backgrounds
+                            // Standard background colors (40-47) - classic ANSI colors
+                            40 => current_bg = egui::Color32::from_rgb(0, 0, 0),       // Black
+                            41 => current_bg = egui::Color32::from_rgb(205, 0, 0),     // Red
+                            42 => current_bg = egui::Color32::from_rgb(0, 205, 0),     // Green
+                            43 => current_bg = egui::Color32::from_rgb(205, 205, 0),   // Yellow
+                            44 => current_bg = egui::Color32::from_rgb(0, 0, 205),     // Blue
+                            45 => current_bg = egui::Color32::from_rgb(205, 0, 205),   // Magenta
+                            46 => current_bg = egui::Color32::from_rgb(0, 205, 205),   // Cyan
+                            47 => current_bg = egui::Color32::from_rgb(192, 192, 192), // White (light gray)
+                            49 => current_bg = egui::Color32::TRANSPARENT,             // Default background
+                            // Extended background color modes
+                            48 => {
+                                // 48;5;n = 256-color, 48;2;r;g;b = 24-bit RGB
+                                if i + 1 < parts.len() {
+                                    match parts[i + 1].parse::<u8>().unwrap_or(0) {
+                                        5 => {
+                                            // 256-color mode: 48;5;n
+                                            if i + 2 < parts.len() {
+                                                if let Ok(n) = parts[i + 2].parse::<u8>() {
+                                                    let (r, g, b) = Self::color256_to_rgb(n, is_light_theme);
+                                                    current_bg = egui::Color32::from_rgb(r, g, b);
+                                                }
+                                                i += 2;
+                                            }
+                                        }
+                                        2 => {
+                                            // 24-bit RGB mode: 48;2;r;g;b
+                                            if i + 4 < parts.len() {
+                                                let r = parts[i + 2].parse::<u8>().unwrap_or(0);
+                                                let g = parts[i + 3].parse::<u8>().unwrap_or(0);
+                                                let b = parts[i + 4].parse::<u8>().unwrap_or(0);
+                                                current_bg = egui::Color32::from_rgb(r, g, b);
+                                                i += 4;
+                                            }
+                                        }
+                                        _ => {}
+                                    }
+                                }
+                            }
+                            // Bright/high-intensity background colors (100-107)
+                            100 => current_bg = egui::Color32::from_rgb(128, 128, 128), // Bright Black
+                            101 => current_bg = egui::Color32::from_rgb(255, 0, 0),     // Bright Red
+                            102 => current_bg = egui::Color32::from_rgb(0, 255, 0),     // Bright Green
+                            103 => current_bg = egui::Color32::from_rgb(255, 255, 0),   // Bright Yellow
+                            104 => current_bg = egui::Color32::from_rgb(0, 0, 255),     // Bright Blue
+                            105 => current_bg = egui::Color32::from_rgb(255, 0, 255),   // Bright Magenta
+                            106 => current_bg = egui::Color32::from_rgb(0, 255, 255),   // Bright Cyan
+                            107 => current_bg = egui::Color32::from_rgb(255, 255, 255), // Bright White
                             _ => {}
                         }
                         i += 1;
+                    }
+
+                    // Debug: log resulting color after parsing all SGR codes
+                    if debug_this {
+                        use std::io::Write;
+                        if let Ok(mut f) = std::fs::OpenOptions::new()
+                            .create(true).append(true)
+                            .open("/tmp/clay_gui_debug.log")
+                        {
+                            let _ = writeln!(f, "  -> color: rgb({},{},{}), bold: {}",
+                                current_color.r(), current_color.g(), current_color.b(), bold);
+                        }
                     }
                 } else {
                     segment.push(c);
@@ -5632,18 +5723,11 @@ mod remote_gui {
 
             // Flush remaining segment
             if !segment.is_empty() {
-                let color = if bold {
-                    egui::Color32::from_rgb(
-                        (current_color.r() as u16 * 4 / 3).min(255) as u8,
-                        (current_color.g() as u16 * 4 / 3).min(255) as u8,
-                        (current_color.b() as u16 * 4 / 3).min(255) as u8,
-                    )
-                } else {
-                    current_color
-                };
+                // Don't brighten colors for bold - match web behavior
                 job.append(&segment, 0.0, egui::TextFormat {
                     font_id: font_id.clone(),
-                    color,
+                    color: current_color,
+                    background: current_bg,
                     ..Default::default()
                 });
             }
@@ -5721,7 +5805,8 @@ mod remote_gui {
             };
 
             // Customize based on our theme
-            visuals.override_text_color = Some(theme.fg());
+            // NOTE: Do NOT set override_text_color as it overrides LayoutJob colors!
+            visuals.override_text_color = None;
             visuals.panel_fill = theme.panel_bg();
             visuals.window_fill = theme.panel_bg();
             visuals.widgets.noninteractive.bg_fill = theme.button_bg();
@@ -5729,7 +5814,25 @@ mod remote_gui {
             visuals.widgets.hovered.bg_fill = theme.selection_bg();
             visuals.widgets.active.bg_fill = theme.selection_bg();
             visuals.selection.bg_fill = theme.selection_bg();
+            // Set proper foreground strokes for buttons/widgets to be visible
+            let fg_stroke = egui::Stroke::new(1.0, theme.fg());
+            visuals.widgets.noninteractive.fg_stroke = fg_stroke;
+            visuals.widgets.inactive.fg_stroke = fg_stroke;
+            visuals.widgets.hovered.fg_stroke = fg_stroke;
+            visuals.widgets.active.fg_stroke = fg_stroke;
             ctx.set_visuals(visuals);
+
+            // Make scrollbars always visible and solid (not floating)
+            let mut style = (*ctx.style()).clone();
+            style.spacing.scroll = egui::style::ScrollStyle {
+                floating: false,  // Solid scrollbar, always takes space
+                bar_width: 10.0,
+                handle_min_length: 20.0,
+                bar_inner_margin: 2.0,
+                bar_outer_margin: 2.0,
+                ..Default::default()
+            };
+            ctx.set_style(style);
 
             // Load custom font if font name changed
             if self.loaded_font_name != self.font_name {
@@ -6109,7 +6212,7 @@ mod remote_gui {
 
                 egui::TopBottomPanel::top("menu_bar")
                     .frame(egui::Frame::none()
-                        .fill(theme.bg())
+                        .fill(theme.panel_bg())  // Slightly grey instead of pure black
                         .inner_margin(egui::Margin::symmetric(4.0, 5.0))  // 3px extra padding top/bottom
                         .stroke(egui::Stroke::NONE))
                     .show(ctx, |ui| {
@@ -6130,6 +6233,10 @@ mod remote_gui {
                                 ui.close_menu();
                             }
                             ui.separator();
+                            if ui.button("Font").clicked() {
+                                action = Some("font");
+                                ui.close_menu();
+                            }
                             if ui.button("Toggle Tags").clicked() {
                                 action = Some("toggle_tags");
                                 ui.close_menu();
@@ -6620,6 +6727,32 @@ mod remote_gui {
                         // Clone the job for the layouter closure
                         let layout_job = combined_job.clone();
 
+                        // Debug: log LayoutJob info
+                        static DEBUG_ONCE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+                        if !DEBUG_ONCE.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                            use std::io::Write;
+                            if let Ok(mut f) = std::fs::OpenOptions::new()
+                                .create(true).append(true)
+                                .open("/tmp/clay_gui_debug.log")
+                            {
+                                let _ = writeln!(f, "=== LayoutJob Debug ===");
+                                let _ = writeln!(f, "plain_text len: {}", plain_text.len());
+                                let _ = writeln!(f, "layout_job.text len: {}", layout_job.text.len());
+                                let _ = writeln!(f, "layout_job.sections: {}", layout_job.sections.len());
+                                let _ = writeln!(f, "texts_match: {}", plain_text == layout_job.text);
+                                // Log first few sections with colors
+                                for (i, section) in layout_job.sections.iter().take(10).enumerate() {
+                                    let _ = writeln!(f, "  Section {}: byte_range={:?}, color=({},{},{},{})",
+                                        i, section.byte_range,
+                                        section.format.color.r(), section.format.color.g(),
+                                        section.format.color.b(), section.format.color.a());
+                                }
+                                // Log first 200 chars of each
+                                let _ = writeln!(f, "plain_text first 200: {:?}", plain_text.chars().take(200).collect::<String>());
+                                let _ = writeln!(f, "layout_job.text first 200: {:?}", layout_job.text.chars().take(200).collect::<String>());
+                            }
+                        }
+
                         let scroll_output = scroll_area.show(ui, |ui| {
                                 ui.set_width(ui.available_width());
 
@@ -6630,6 +6763,7 @@ mod remote_gui {
                                     .desired_width(f32::INFINITY)
                                     .interactive(true)
                                     .frame(false)
+                                    .text_color_opt(None)
                                     .layouter(&mut |_ui, _string, wrap_width| {
                                         let mut job = layout_job.clone();
                                         job.wrap.max_width = wrap_width;
@@ -6643,13 +6777,17 @@ mod remote_gui {
                                 let selection_range_id = egui::Id::new("output_selection_range");
                                 if let Some(cursor_range) = response.cursor_range {
                                     if cursor_range.primary != cursor_range.secondary {
-                                        let start = cursor_range.primary.ccursor.index.min(cursor_range.secondary.ccursor.index);
-                                        let end = cursor_range.primary.ccursor.index.max(cursor_range.secondary.ccursor.index);
-                                        let selected = response.galley.text()[start..end].to_string();
+                                        let start_char = cursor_range.primary.ccursor.index.min(cursor_range.secondary.ccursor.index);
+                                        let end_char = cursor_range.primary.ccursor.index.max(cursor_range.secondary.ccursor.index);
+                                        // Convert character indices to byte indices for proper UTF-8 slicing
+                                        let text = response.galley.text();
+                                        let start_byte = text.char_indices().nth(start_char).map(|(i, _)| i).unwrap_or(text.len());
+                                        let end_byte = text.char_indices().nth(end_char).map(|(i, _)| i).unwrap_or(text.len());
+                                        let selected = text[start_byte..end_byte].to_string();
                                         // Always store selection text and range when we have one
                                         ui.ctx().data_mut(|d| {
                                             d.insert_temp(selection_id, selected);
-                                            d.insert_temp(selection_range_id, (start, end));
+                                            d.insert_temp(selection_range_id, (start_char, end_char));
                                         });
                                     }
                                 }
@@ -8700,15 +8838,119 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                             }
                                         }
                                     }
-                                    _ => {
-                                        // All other commands - send to MUD as-is
+                                    Command::Disconnect => {
+                                        // Disconnect the specified world
+                                        if world_index < app.worlds.len() && app.worlds[world_index].connected {
+                                            app.worlds[world_index].command_tx = None;
+                                            app.worlds[world_index].connected = false;
+                                            app.worlds[world_index].socket_fd = None;
+                                            app.worlds[world_index].log_handle = None;
+                                            app.worlds[world_index].prompt.clear();
+                                            app.ws_broadcast(WsMessage::ServerData {
+                                                world_index,
+                                                data: "Disconnected.".to_string(),
+                                                is_viewed: false,
+                                            });
+                                            app.ws_broadcast(WsMessage::WorldDisconnected { world_index });
+                                        } else {
+                                            app.ws_broadcast(WsMessage::ServerData {
+                                                world_index,
+                                                data: "Not connected.".to_string(),
+                                                is_viewed: false,
+                                            });
+                                        }
+                                    }
+                                    Command::Keepalive => {
+                                        // Show keepalive settings for this world
                                         if world_index < app.worlds.len() {
-                                            if let Some(tx) = &app.worlds[world_index].command_tx {
-                                                if tx.try_send(WriteCommand::Text(command)).is_ok() {
-                                                    app.worlds[world_index].last_send_time = Some(std::time::Instant::now());
-                                                    app.worlds[world_index].prompt.clear();
+                                            let world = &app.worlds[world_index];
+                                            let info = format!(
+                                                "Keepalive: {} ({})",
+                                                world.settings.keep_alive_type.name(),
+                                                if world.settings.keep_alive_type == KeepAliveType::Custom {
+                                                    world.settings.keep_alive_cmd.clone()
+                                                } else {
+                                                    world.settings.keep_alive_type.name().to_string()
+                                                }
+                                            );
+                                            app.ws_broadcast(WsMessage::ServerData {
+                                                world_index,
+                                                data: info,
+                                                is_viewed: false,
+                                            });
+                                        }
+                                    }
+                                    Command::Gag { pattern } => {
+                                        // TODO: Implement gag patterns storage
+                                        app.ws_broadcast(WsMessage::ServerData {
+                                            world_index,
+                                            data: format!("Gag pattern set: {}", pattern),
+                                            is_viewed: false,
+                                        });
+                                    }
+                                    // Commands that should be blocked from remote
+                                    Command::Quit | Command::Reload => {
+                                        app.ws_broadcast(WsMessage::ServerData {
+                                            world_index,
+                                            data: "This command is not available from remote interfaces.".to_string(),
+                                            is_viewed: false,
+                                        });
+                                    }
+                                    // UI popup commands - handled client-side, no-op on server
+                                    Command::Help | Command::Setup | Command::Web | Command::Actions |
+                                    Command::WorldsList | Command::WorldSelector | Command::WorldEdit { .. } => {
+                                        // These are handled by the GUI/web interface locally
+                                        // No server action needed
+                                    }
+                                    // Connect command is handled via ConnectWorld message
+                                    Command::Connect { .. } => {
+                                        // Remote clients should use ConnectWorld message instead
+                                        // But we can try to handle it here too
+                                        if world_index < app.worlds.len() && !app.worlds[world_index].connected {
+                                            let has_settings = !app.worlds[world_index].settings.hostname.is_empty()
+                                                && !app.worlds[world_index].settings.port.is_empty();
+                                            if has_settings {
+                                                // Save current index, connect target, restore
+                                                let prev_index = app.current_world_index;
+                                                app.current_world_index = world_index;
+                                                let _ = handle_command("/connect", &mut app, event_tx.clone()).await;
+                                                app.current_world_index = prev_index;
+                                            } else {
+                                                app.ws_broadcast(WsMessage::ServerData {
+                                                    world_index,
+                                                    data: "No hostname/port configured for this world.".to_string(),
+                                                    is_viewed: false,
+                                                });
+                                            }
+                                        }
+                                    }
+                                    // WorldSwitch and WorldConnectNoLogin need proper handling
+                                    Command::WorldSwitch { ref name } | Command::WorldConnectNoLogin { ref name } => {
+                                        if let Some(idx) = app.worlds.iter().position(|w| w.name.eq_ignore_ascii_case(name)) {
+                                            // Switch to the world
+                                            app.switch_world(idx);
+                                            app.ws_broadcast(WsMessage::WorldSwitched { new_index: idx });
+                                            // Connect if not connected and has settings
+                                            if !app.worlds[idx].connected {
+                                                let has_settings = !app.worlds[idx].settings.hostname.is_empty()
+                                                    && !app.worlds[idx].settings.port.is_empty();
+                                                if has_settings {
+                                                    // For WorldConnectNoLogin, set skip flag
+                                                    if matches!(parsed, Command::WorldConnectNoLogin { .. }) {
+                                                        app.worlds[idx].skip_auto_login = true;
+                                                    }
+                                                    let prev_index = app.current_world_index;
+                                                    app.current_world_index = idx;
+                                                    let _ = handle_command("/connect", &mut app, event_tx.clone()).await;
+                                                    app.current_world_index = prev_index;
                                                 }
                                             }
+                                        } else {
+                                            app.ws_broadcast(WsMessage::ServerData {
+                                                world_index,
+                                                data: format!("World '{}' not found.", name),
+                                                is_viewed: false,
+                                            });
                                         }
                                     }
                                 }
@@ -9275,17 +9517,91 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                         }
                                     }
                                 }
-                                _ => {
-                                    // All other commands - send to MUD as-is
-                                    // These are either handled by the GUI/web interface locally
-                                    // or should be passed through to the MUD
+                                Command::Disconnect => {
+                                    // Disconnect the specified world
+                                    if world_index < app.worlds.len() && app.worlds[world_index].connected {
+                                        app.worlds[world_index].command_tx = None;
+                                        app.worlds[world_index].connected = false;
+                                        app.worlds[world_index].socket_fd = None;
+                                        app.worlds[world_index].log_handle = None;
+                                        app.worlds[world_index].prompt.clear();
+                                        app.ws_broadcast(WsMessage::ServerData {
+                                            world_index,
+                                            data: "Disconnected.".to_string(),
+                                            is_viewed: false,
+                                        });
+                                        app.ws_broadcast(WsMessage::WorldDisconnected { world_index });
+                                    } else {
+                                        app.ws_broadcast(WsMessage::ServerData {
+                                            world_index,
+                                            data: "Not connected.".to_string(),
+                                            is_viewed: false,
+                                        });
+                                    }
+                                }
+                                Command::Keepalive => {
+                                    // Show keepalive settings for this world
                                     if world_index < app.worlds.len() {
-                                        if let Some(tx) = &app.worlds[world_index].command_tx {
-                                            if tx.try_send(WriteCommand::Text(command)).is_ok() {
-                                                app.worlds[world_index].last_send_time = Some(std::time::Instant::now());
-                                                app.worlds[world_index].prompt.clear();
+                                        let world = &app.worlds[world_index];
+                                        let info = format!(
+                                            "Keepalive: {} ({})",
+                                            world.settings.keep_alive_type.name(),
+                                            if world.settings.keep_alive_type == KeepAliveType::Custom {
+                                                world.settings.keep_alive_cmd.clone()
+                                            } else {
+                                                world.settings.keep_alive_type.name().to_string()
                                             }
-                                        }
+                                        );
+                                        app.ws_broadcast(WsMessage::ServerData {
+                                            world_index,
+                                            data: info,
+                                            is_viewed: false,
+                                        });
+                                    }
+                                }
+                                Command::Gag { pattern } => {
+                                    // TODO: Implement gag patterns storage
+                                    app.ws_broadcast(WsMessage::ServerData {
+                                        world_index,
+                                        data: format!("Gag pattern set: {}", pattern),
+                                        is_viewed: false,
+                                    });
+                                }
+                                // Commands that should be blocked from remote
+                                Command::Quit | Command::Reload => {
+                                    app.ws_broadcast(WsMessage::ServerData {
+                                        world_index,
+                                        data: "This command is not available from remote interfaces.".to_string(),
+                                        is_viewed: false,
+                                    });
+                                }
+                                // UI popup commands - handled client-side, no-op on server
+                                Command::Help | Command::Setup | Command::Web | Command::Actions |
+                                Command::WorldsList | Command::WorldSelector | Command::WorldEdit { .. } => {
+                                    // These are handled by the GUI/web interface locally
+                                    // No server action needed
+                                }
+                                // Connect command - can't do async in drain loop, use ConnectWorld message
+                                Command::Connect { .. } => {
+                                    app.ws_broadcast(WsMessage::ServerData {
+                                        world_index,
+                                        data: "Use ConnectWorld message for connection.".to_string(),
+                                        is_viewed: false,
+                                    });
+                                }
+                                // WorldSwitch - do the switch part, skip async connect
+                                Command::WorldSwitch { ref name } | Command::WorldConnectNoLogin { ref name } => {
+                                    if let Some(idx) = app.worlds.iter().position(|w| w.name.eq_ignore_ascii_case(name)) {
+                                        // Switch to the world
+                                        app.switch_world(idx);
+                                        app.ws_broadcast(WsMessage::WorldSwitched { new_index: idx });
+                                        // Note: Connection requires async, use ConnectWorld message
+                                    } else {
+                                        app.ws_broadcast(WsMessage::ServerData {
+                                            world_index,
+                                            data: format!("World '{}' not found.", name),
+                                            is_viewed: false,
+                                        });
                                     }
                                 }
                             }
