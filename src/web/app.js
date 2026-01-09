@@ -2499,6 +2499,10 @@
                 e.preventDefault();
                 elements.input.value = '';
                 historyIndex = -1;
+            } else if (e.key === 'a' && e.ctrlKey) {
+                // Ctrl+A: Move cursor to beginning of line
+                e.preventDefault();
+                elements.input.selectionStart = elements.input.selectionEnd = 0;
             } else if (e.key === 'w' && e.ctrlKey) {
                 // Ctrl+W: Delete word before cursor
                 e.preventDefault();

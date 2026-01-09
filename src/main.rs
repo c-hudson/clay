@@ -6145,6 +6145,7 @@ mod remote_gui {
             } else {
                 // Show main interface with menu bar
                 let mut action: Option<&str> = None;
+                let mut cursor_home = false;
 
                 // Handle keyboard shortcuts (only when no popup is open)
                 if self.popup_state == PopupState::None && !self.filter_active {
@@ -6190,6 +6191,9 @@ mod remote_gui {
                             } else if i.consume_key(egui::Modifiers::CTRL, egui::Key::Q) {
                                 // Ctrl+Q - spell check
                                 action = Some("spell_check");
+                            } else if i.consume_key(egui::Modifiers::CTRL, egui::Key::A) {
+                                // Ctrl+A - move cursor to beginning of line
+                                cursor_home = true;
                             }
                         } else if i.modifiers.shift {
                             // Shift+Up/Down - cycle through all worlds
@@ -6602,6 +6606,15 @@ mod remote_gui {
                                     state.cursor.set_char_range(Some(egui::text::CCursorRange::one(ccursor)));
                                     state.store(ctx, input_id);
                                 }
+                            }
+
+                            // Apply cursor_home (Ctrl+A)
+                            if cursor_home {
+                                let mut state = egui::TextEdit::load_state(ctx, input_id)
+                                    .unwrap_or_default();
+                                let ccursor = egui::text::CCursor::new(0);
+                                state.cursor.set_char_range(Some(egui::text::CCursorRange::one(ccursor)));
+                                state.store(ctx, input_id);
                             }
 
                             // Send on Enter (without Shift)
@@ -11362,7 +11375,7 @@ fn handle_key_event(key: KeyEvent, app: &mut App) -> KeyAction {
             app.input.move_cursor_right();
             KeyAction::None
         }
-        (_, KeyCode::Home) => {
+        (_, KeyCode::Home) | (KeyModifiers::CONTROL, KeyCode::Char('a')) => {
             app.input.home();
             KeyAction::None
         }
