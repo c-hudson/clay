@@ -179,6 +179,43 @@
                 </div>
             </div>
         </div>
+
+        <!-- Web Settings popup (/web) -->
+        <div id="web-modal" class="modal">
+            <div class="modal-content web-modal-content">
+                <h2>Web Settings</h2>
+                <div class="web-settings-form">
+                    <div class="web-field">
+                        <label>Protocol:</label>
+                        <button id="web-protocol-btn" class="toggle-btn">Non-Secure</button>
+                    </div>
+                    <div class="web-field">
+                        <label id="http-label">HTTP enabled:</label>
+                        <button id="web-http-enabled-btn" class="toggle-btn">off</button>
+                    </div>
+                    <div class="web-field">
+                        <label id="http-port-label">HTTP port:</label>
+                        <input type="text" id="web-http-port" autocomplete="off" class="web-input">
+                    </div>
+                    <div class="web-field">
+                        <label id="ws-label">WS enabled:</label>
+                        <button id="web-ws-enabled-btn" class="toggle-btn">off</button>
+                    </div>
+                    <div class="web-field">
+                        <label id="ws-port-label">WS port:</label>
+                        <input type="text" id="web-ws-port" autocomplete="off" class="web-input">
+                    </div>
+                    <div class="web-field">
+                        <label>Allow List:</label>
+                        <input type="text" id="web-allow-list" autocomplete="off" class="web-input" placeholder="localhost, 192.168.*">
+                    </div>
+                </div>
+                <div class="modal-buttons">
+                    <button id="web-save-btn">Save</button>
+                    <button id="web-cancel-btn">Cancel</button>
+                </div>
+            </div>
+        </div>
     </div>
 
     <script>

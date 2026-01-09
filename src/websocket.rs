@@ -68,10 +68,11 @@ pub enum WsMessage {
         font_name: String,
         font_size: f32,
         ws_allow_list: String,
+        web_secure: bool,
         http_enabled: bool,
         http_port: u16,
-        https_enabled: bool,
-        https_port: u16,
+        ws_enabled: bool,
+        ws_port: u16,
     },
 
     // Settings update confirmations (server -> client)
@@ -141,10 +142,11 @@ pub struct GlobalSettingsMsg {
     pub font_name: String,
     pub font_size: f32,
     pub ws_allow_list: String,
+    pub web_secure: bool,
     pub http_enabled: bool,
     pub http_port: u16,
-    pub https_enabled: bool,
-    pub https_port: u16,
+    pub ws_enabled: bool,
+    pub ws_port: u16,
 }
 
 /// Information about a connected WebSocket client

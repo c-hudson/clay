@@ -1024,22 +1024,19 @@ impl SettingsPopup {
 
 #[derive(Clone, Copy, PartialEq, Debug)]
 enum WebField {
-    // WebSocket settings (secure - wss://)
+    // Protocol selection (Secure/Non-Secure)
+    Protocol,
+    // HTTP/HTTPS server
+    HttpEnabled,
+    HttpPort,
+    // WebSocket server
     WsEnabled,
     WsPort,
     WsPassword,
     WsAllowList,
+    // TLS settings (only shown when Protocol is Secure)
     WsCertFile,
     WsKeyFile,
-    WsUseTls,
-    // WebSocket settings (non-secure - ws://)
-    WsNonsecureEnabled,
-    WsNonsecurePort,
-    // HTTP/HTTPS settings
-    HttpEnabled,
-    HttpPort,
-    HttpsEnabled,
-    HttpsPort,
     // Buttons
     SaveWeb,
     CancelWeb,
@@ -1049,14 +1046,12 @@ impl WebField {
     fn is_text_field(&self) -> bool {
         matches!(
             self,
-            WebField::WsPort
+            WebField::HttpPort
+                | WebField::WsPort
                 | WebField::WsPassword
                 | WebField::WsAllowList
                 | WebField::WsCertFile
                 | WebField::WsKeyFile
-                | WebField::WsNonsecurePort
-                | WebField::HttpPort
-                | WebField::HttpsPort
         )
     }
 
@@ -1064,42 +1059,40 @@ impl WebField {
         matches!(self, WebField::SaveWeb | WebField::CancelWeb)
     }
 
-    fn next(&self) -> Self {
+    /// Get next field, skipping TLS fields when not secure
+    fn next(&self, secure: bool) -> Self {
         match self {
+            WebField::Protocol => WebField::HttpEnabled,
+            WebField::HttpEnabled => WebField::HttpPort,
+            WebField::HttpPort => WebField::WsEnabled,
             WebField::WsEnabled => WebField::WsPort,
             WebField::WsPort => WebField::WsPassword,
             WebField::WsPassword => WebField::WsAllowList,
-            WebField::WsAllowList => WebField::WsCertFile,
+            WebField::WsAllowList => {
+                if secure { WebField::WsCertFile } else { WebField::SaveWeb }
+            }
             WebField::WsCertFile => WebField::WsKeyFile,
-            WebField::WsKeyFile => WebField::WsUseTls,
-            WebField::WsUseTls => WebField::WsNonsecureEnabled,
-            WebField::WsNonsecureEnabled => WebField::WsNonsecurePort,
-            WebField::WsNonsecurePort => WebField::HttpEnabled,
-            WebField::HttpEnabled => WebField::HttpPort,
-            WebField::HttpPort => WebField::HttpsEnabled,
-            WebField::HttpsEnabled => WebField::HttpsPort,
-            WebField::HttpsPort => WebField::SaveWeb,
+            WebField::WsKeyFile => WebField::SaveWeb,
             WebField::SaveWeb => WebField::CancelWeb,
-            WebField::CancelWeb => WebField::WsEnabled,
+            WebField::CancelWeb => WebField::Protocol,
         }
     }
 
-    fn prev(&self) -> Self {
+    /// Get previous field, skipping TLS fields when not secure
+    fn prev(&self, secure: bool) -> Self {
         match self {
-            WebField::WsEnabled => WebField::CancelWeb,
+            WebField::Protocol => WebField::CancelWeb,
+            WebField::HttpEnabled => WebField::Protocol,
+            WebField::HttpPort => WebField::HttpEnabled,
+            WebField::WsEnabled => WebField::HttpPort,
             WebField::WsPort => WebField::WsEnabled,
             WebField::WsPassword => WebField::WsPort,
             WebField::WsAllowList => WebField::WsPassword,
             WebField::WsCertFile => WebField::WsAllowList,
             WebField::WsKeyFile => WebField::WsCertFile,
-            WebField::WsUseTls => WebField::WsKeyFile,
-            WebField::WsNonsecureEnabled => WebField::WsUseTls,
-            WebField::WsNonsecurePort => WebField::WsNonsecureEnabled,
-            WebField::HttpEnabled => WebField::WsNonsecurePort,
-            WebField::HttpPort => WebField::HttpEnabled,
-            WebField::HttpsEnabled => WebField::HttpPort,
-            WebField::HttpsPort => WebField::HttpsEnabled,
-            WebField::SaveWeb => WebField::HttpsPort,
+            WebField::SaveWeb => {
+                if secure { WebField::WsKeyFile } else { WebField::WsAllowList }
+            }
             WebField::CancelWeb => WebField::SaveWeb,
         }
     }
@@ -1112,65 +1105,53 @@ struct WebPopup {
     edit_buffer: String,
     edit_cursor: usize,
     edit_scroll_offset: usize,
-    // Temp values for web settings
+    // Temp values for web settings (consolidated)
+    temp_web_secure: bool,     // Protocol: true=Secure, false=Non-Secure
+    temp_http_enabled: bool,
+    temp_http_port: String,
     temp_ws_enabled: bool,
     temp_ws_port: String,
     temp_ws_password: String,
     temp_ws_allow_list: String,
     temp_ws_cert_file: String,
     temp_ws_key_file: String,
-    temp_ws_use_tls: bool,
-    temp_ws_nonsecure_enabled: bool,
-    temp_ws_nonsecure_port: String,
-    temp_http_enabled: bool,
-    temp_http_port: String,
-    temp_https_enabled: bool,
-    temp_https_port: String,
 }
 
 impl WebPopup {
     fn new() -> Self {
         Self {
             visible: false,
-            selected_field: WebField::WsEnabled,
+            selected_field: WebField::Protocol,
             editing: false,
             edit_buffer: String::new(),
             edit_cursor: 0,
             edit_scroll_offset: 0,
+            temp_web_secure: false,
+            temp_http_enabled: false,
+            temp_http_port: "9000".to_string(),
             temp_ws_enabled: false,
-            temp_ws_port: "9002".to_string(),
+            temp_ws_port: "9001".to_string(),
             temp_ws_password: String::new(),
             temp_ws_allow_list: String::new(),
             temp_ws_cert_file: String::new(),
             temp_ws_key_file: String::new(),
-            temp_ws_use_tls: false,
-            temp_ws_nonsecure_enabled: false,
-            temp_ws_nonsecure_port: "9003".to_string(),
-            temp_http_enabled: false,
-            temp_http_port: "9000".to_string(),
-            temp_https_enabled: false,
-            temp_https_port: "9001".to_string(),
         }
     }
 
     fn open(&mut self, settings: &Settings) {
         self.visible = true;
-        self.selected_field = WebField::WsEnabled;
+        self.selected_field = WebField::Protocol;
         self.editing = false;
         // Load from settings
-        self.temp_ws_enabled = settings.websocket_enabled;
-        self.temp_ws_port = settings.websocket_port.to_string();
+        self.temp_web_secure = settings.web_secure;
+        self.temp_http_enabled = settings.http_enabled;
+        self.temp_http_port = settings.http_port.to_string();
+        self.temp_ws_enabled = settings.ws_enabled;
+        self.temp_ws_port = settings.ws_port.to_string();
         self.temp_ws_password = settings.websocket_password.clone();
         self.temp_ws_allow_list = settings.websocket_allow_list.clone();
         self.temp_ws_cert_file = settings.websocket_cert_file.clone();
         self.temp_ws_key_file = settings.websocket_key_file.clone();
-        self.temp_ws_use_tls = settings.websocket_use_tls;
-        self.temp_ws_nonsecure_enabled = settings.ws_nonsecure_enabled;
-        self.temp_ws_nonsecure_port = settings.ws_nonsecure_port.to_string();
-        self.temp_http_enabled = settings.http_enabled;
-        self.temp_http_port = settings.http_port.to_string();
-        self.temp_https_enabled = settings.https_enabled;
-        self.temp_https_port = settings.https_port.to_string();
     }
 
     fn close(&mut self) {
@@ -1179,24 +1160,22 @@ impl WebPopup {
     }
 
     fn next_field(&mut self) {
-        self.selected_field = self.selected_field.next();
+        self.selected_field = self.selected_field.next(self.temp_web_secure);
     }
 
     fn prev_field(&mut self) {
-        self.selected_field = self.selected_field.prev();
+        self.selected_field = self.selected_field.prev(self.temp_web_secure);
     }
 
     fn start_edit(&mut self) {
         self.editing = true;
         self.edit_buffer = match self.selected_field {
+            WebField::HttpPort => self.temp_http_port.clone(),
             WebField::WsPort => self.temp_ws_port.clone(),
             WebField::WsPassword => self.temp_ws_password.clone(),
             WebField::WsAllowList => self.temp_ws_allow_list.clone(),
             WebField::WsCertFile => self.temp_ws_cert_file.clone(),
             WebField::WsKeyFile => self.temp_ws_key_file.clone(),
-            WebField::WsNonsecurePort => self.temp_ws_nonsecure_port.clone(),
-            WebField::HttpPort => self.temp_http_port.clone(),
-            WebField::HttpsPort => self.temp_https_port.clone(),
             _ => String::new(),
         };
         self.edit_cursor = self.edit_buffer.len();
@@ -1205,14 +1184,12 @@ impl WebPopup {
 
     fn commit_edit(&mut self) {
         match self.selected_field {
+            WebField::HttpPort => self.temp_http_port = self.edit_buffer.clone(),
             WebField::WsPort => self.temp_ws_port = self.edit_buffer.clone(),
             WebField::WsPassword => self.temp_ws_password = self.edit_buffer.clone(),
             WebField::WsAllowList => self.temp_ws_allow_list = self.edit_buffer.clone(),
             WebField::WsCertFile => self.temp_ws_cert_file = self.edit_buffer.clone(),
             WebField::WsKeyFile => self.temp_ws_key_file = self.edit_buffer.clone(),
-            WebField::WsNonsecurePort => self.temp_ws_nonsecure_port = self.edit_buffer.clone(),
-            WebField::HttpPort => self.temp_http_port = self.edit_buffer.clone(),
-            WebField::HttpsPort => self.temp_https_port = self.edit_buffer.clone(),
             _ => {}
         }
         self.editing = false;
@@ -1224,11 +1201,9 @@ impl WebPopup {
 
     fn toggle_option(&mut self) {
         match self.selected_field {
-            WebField::WsEnabled => self.temp_ws_enabled = !self.temp_ws_enabled,
-            WebField::WsUseTls => self.temp_ws_use_tls = !self.temp_ws_use_tls,
-            WebField::WsNonsecureEnabled => self.temp_ws_nonsecure_enabled = !self.temp_ws_nonsecure_enabled,
+            WebField::Protocol => self.temp_web_secure = !self.temp_web_secure,
             WebField::HttpEnabled => self.temp_http_enabled = !self.temp_http_enabled,
-            WebField::HttpsEnabled => self.temp_https_enabled = !self.temp_https_enabled,
+            WebField::WsEnabled => self.temp_ws_enabled = !self.temp_ws_enabled,
             _ => {}
         }
     }
@@ -1247,27 +1222,19 @@ impl WebPopup {
     }
 
     fn apply(&self, settings: &mut Settings) {
-        settings.websocket_enabled = self.temp_ws_enabled;
+        settings.web_secure = self.temp_web_secure;
+        settings.http_enabled = self.temp_http_enabled;
+        if let Ok(port) = self.temp_http_port.parse::<u16>() {
+            settings.http_port = port;
+        }
+        settings.ws_enabled = self.temp_ws_enabled;
         if let Ok(port) = self.temp_ws_port.parse::<u16>() {
-            settings.websocket_port = port;
+            settings.ws_port = port;
         }
         settings.websocket_password = self.temp_ws_password.clone();
         settings.websocket_allow_list = self.temp_ws_allow_list.clone();
         settings.websocket_cert_file = self.temp_ws_cert_file.clone();
         settings.websocket_key_file = self.temp_ws_key_file.clone();
-        settings.websocket_use_tls = self.temp_ws_use_tls;
-        settings.ws_nonsecure_enabled = self.temp_ws_nonsecure_enabled;
-        if let Ok(port) = self.temp_ws_nonsecure_port.parse::<u16>() {
-            settings.ws_nonsecure_port = port;
-        }
-        settings.http_enabled = self.temp_http_enabled;
-        if let Ok(port) = self.temp_http_port.parse::<u16>() {
-            settings.http_port = port;
-        }
-        settings.https_enabled = self.temp_https_enabled;
-        if let Ok(port) = self.temp_https_port.parse::<u16>() {
-            settings.https_port = port;
-        }
     }
 }
 
@@ -2117,24 +2084,17 @@ struct Settings {
     // Remote GUI font settings
     font_name: String,
     font_size: f32,
-    // WebSocket server settings (secure - wss://)
-    websocket_enabled: bool,       // Enable secure WebSocket server (wss://)
-    websocket_port: u16,           // Port for secure WebSocket (default 9002)
+    // Web server settings (consolidated)
+    web_secure: bool,              // Protocol: true=Secure (https/wss), false=Non-Secure (http/ws)
+    http_enabled: bool,            // Enable HTTP/HTTPS web server (name depends on web_secure)
+    http_port: u16,                // Port for HTTP/HTTPS web interface
+    ws_enabled: bool,              // Enable WS/WSS server (name depends on web_secure)
+    ws_port: u16,                  // Port for WS/WSS server
     websocket_password: String,
     websocket_allow_list: String,  // CSV list of hosts that can be whitelisted
     websocket_whitelisted_host: Option<String>,  // Currently whitelisted host (authenticated from allow list)
-    websocket_use_tls: bool,       // Legacy - always true for wss://
-    websocket_cert_file: String,   // Path to TLS certificate file (PEM)
-    websocket_key_file: String,    // Path to TLS private key file (PEM)
-    // Non-secure WebSocket server settings (ws://)
-    ws_nonsecure_enabled: bool,    // Enable non-secure WebSocket server (ws://)
-    ws_nonsecure_port: u16,        // Port for non-secure WebSocket (default 9003)
-    // HTTP web interface settings
-    http_enabled: bool,            // Enable/disable HTTP web server
-    http_port: u16,                // Port for HTTP web interface (default 9000)
-    // HTTPS web interface settings
-    https_enabled: bool,           // Enable/disable HTTPS web server
-    https_port: u16,               // Port for HTTPS web interface (default 9001)
+    websocket_cert_file: String,   // Path to TLS certificate file (PEM) - only used when web_secure=true
+    websocket_key_file: String,    // Path to TLS private key file (PEM) - only used when web_secure=true
     // User-defined actions/triggers
     actions: Vec<Action>,
 }
@@ -2150,20 +2110,16 @@ impl Default for Settings {
             gui_theme: Theme::Dark,
             font_name: String::new(),  // Empty means use system default
             font_size: 14.0,
-            websocket_enabled: false,
-            websocket_port: 9002,
+            web_secure: false,         // Default to non-secure
+            http_enabled: false,
+            http_port: 9000,
+            ws_enabled: false,
+            ws_port: 9001,
             websocket_password: String::new(),
             websocket_allow_list: String::new(),
             websocket_whitelisted_host: None,
-            websocket_use_tls: false,
             websocket_cert_file: String::new(),
             websocket_key_file: String::new(),
-            ws_nonsecure_enabled: false,
-            ws_nonsecure_port: 9003,
-            http_enabled: false,
-            http_port: 9000,
-            https_enabled: false,
-            https_port: 9001,
             actions: Vec::new(),
         }
     }
@@ -2223,11 +2179,206 @@ impl Action {
 /// List of internal commands that cannot be overridden by actions
 const INTERNAL_COMMANDS: &[&str] = &[
     "help", "connect", "disconnect", "dc", "setup", "world", "worlds", "l",
-    "keepalive", "reload", "quit", "actions", "gag",
+    "keepalive", "reload", "quit", "actions", "gag", "web", "send",
 ];
 
 fn is_internal_command(name: &str) -> bool {
     INTERNAL_COMMANDS.contains(&name.to_lowercase().as_str())
+}
+
+// ============================================================================
+// Shared Command Parsing
+// ============================================================================
+
+/// Parsed command representation - shared across console, GUI, and web interfaces
+#[derive(Debug, Clone, PartialEq)]
+enum Command {
+    /// /help - show help popup
+    Help,
+    /// /quit - exit application
+    Quit,
+    /// /reload - hot reload binary
+    Reload,
+    /// /setup - show global settings popup
+    Setup,
+    /// /web - show web settings popup
+    Web,
+    /// /actions - show actions popup
+    Actions,
+    /// /worlds or /l - show connected worlds list
+    WorldsList,
+    /// /world (no args) - show world selector
+    WorldSelector,
+    /// /world -e [name] - edit world settings
+    WorldEdit { name: Option<String> },
+    /// /world -l <name> - connect without auto-login
+    WorldConnectNoLogin { name: String },
+    /// /world <name> - switch to or connect to named world
+    WorldSwitch { name: String },
+    /// /connect [host port [ssl]] - connect to server
+    Connect { host: Option<String>, port: Option<String>, ssl: bool },
+    /// /disconnect or /dc - disconnect current world
+    Disconnect,
+    /// /send [-W] [-w<world>] [-n] <text> - send text
+    Send { text: String, all_worlds: bool, target_world: Option<String>, no_newline: bool },
+    /// /keepalive - show keepalive settings
+    Keepalive,
+    /// /gag <pattern> - gag lines matching pattern
+    Gag { pattern: String },
+    /// /<action_name> [args] - execute action
+    ActionCommand { name: String, args: String },
+    /// Not a command (regular text to send to MUD)
+    NotACommand { text: String },
+    /// Unknown/invalid command
+    Unknown { cmd: String },
+}
+
+/// Parse a command string into a Command enum
+fn parse_command(input: &str) -> Command {
+    let trimmed = input.trim();
+
+    // Not a command if doesn't start with /
+    if !trimmed.starts_with('/') {
+        return Command::NotACommand { text: trimmed.to_string() };
+    }
+
+    let parts: Vec<&str> = trimmed.split_whitespace().collect();
+    if parts.is_empty() {
+        return Command::NotACommand { text: trimmed.to_string() };
+    }
+
+    let cmd = parts[0].to_lowercase();
+    let args = &parts[1..];
+
+    match cmd.as_str() {
+        "/help" => Command::Help,
+        "/quit" => Command::Quit,
+        "/reload" => Command::Reload,
+        "/setup" => Command::Setup,
+        "/web" => Command::Web,
+        "/actions" => Command::Actions,
+        "/worlds" | "/l" => Command::WorldsList,
+        "/world" => parse_world_command(args),
+        "/connect" => parse_connect_command(args),
+        "/disconnect" | "/dc" => Command::Disconnect,
+        "/send" => parse_send_command(args, trimmed),
+        "/keepalive" => Command::Keepalive,
+        "/gag" => {
+            if args.is_empty() {
+                Command::Unknown { cmd: trimmed.to_string() }
+            } else {
+                Command::Gag { pattern: args.join(" ") }
+            }
+        }
+        _ => {
+            // Check if it's an action command (starts with / but not a known command)
+            let action_name = cmd.trim_start_matches('/');
+            if !action_name.is_empty() {
+                Command::ActionCommand {
+                    name: action_name.to_string(),
+                    args: args.join(" "),
+                }
+            } else {
+                Command::Unknown { cmd: trimmed.to_string() }
+            }
+        }
+    }
+}
+
+/// Parse /world command with its various forms
+fn parse_world_command(args: &[&str]) -> Command {
+    if args.is_empty() {
+        return Command::WorldSelector;
+    }
+
+    match args[0] {
+        "-e" => {
+            // /world -e [name] - edit world
+            let name = if args.len() > 1 {
+                Some(args[1..].join(" "))
+            } else {
+                None
+            };
+            Command::WorldEdit { name }
+        }
+        "-l" => {
+            // /world -l <name> - connect without auto-login
+            if args.len() > 1 {
+                Command::WorldConnectNoLogin { name: args[1..].join(" ") }
+            } else {
+                Command::Unknown { cmd: "/world -l".to_string() }
+            }
+        }
+        _ => {
+            // /world <name> - switch to or connect to named world
+            Command::WorldSwitch { name: args.join(" ") }
+        }
+    }
+}
+
+/// Parse /connect command
+fn parse_connect_command(args: &[&str]) -> Command {
+    if args.is_empty() {
+        return Command::Connect { host: None, port: None, ssl: false };
+    }
+
+    let host = Some(args[0].to_string());
+    let port = args.get(1).map(|s| s.to_string());
+    let ssl = args.get(2).map(|s| s.to_lowercase() == "ssl").unwrap_or(false);
+
+    Command::Connect { host, port, ssl }
+}
+
+/// Parse /send command with flags
+fn parse_send_command(args: &[&str], full_cmd: &str) -> Command {
+    let mut all_worlds = false;
+    let mut target_world: Option<String> = None;
+    let mut no_newline = false;
+    let mut text_start = 0;
+
+    for (i, arg) in args.iter().enumerate() {
+        if *arg == "-W" {
+            all_worlds = true;
+            text_start = i + 1;
+        } else if arg.starts_with("-w") {
+            target_world = Some(arg[2..].to_string());
+            text_start = i + 1;
+        } else if *arg == "-n" {
+            no_newline = true;
+            text_start = i + 1;
+        } else {
+            break;
+        }
+    }
+
+    // Get the text after flags - use original string to preserve spacing
+    let text = if text_start < args.len() {
+        // Find position of first non-flag argument in original string
+        let mut pos = 0;
+        let mut found_flags = 0;
+        for c in full_cmd.chars() {
+            if found_flags >= text_start + 1 { // +1 for /send itself
+                break;
+            }
+            if c.is_whitespace() && pos > 0 {
+                // Check if we just finished a word
+                let prev_nonws = full_cmd[..pos].chars().rev().find(|c| !c.is_whitespace());
+                if prev_nonws.is_some() {
+                    found_flags += 1;
+                }
+            }
+            pos += c.len_utf8();
+        }
+        // Skip whitespace after last flag
+        while pos < full_cmd.len() && full_cmd[pos..].starts_with(char::is_whitespace) {
+            pos += 1;
+        }
+        full_cmd[pos..].to_string()
+    } else {
+        String::new()
+    };
+
+    Command::Send { text, all_worlds, target_world, no_newline }
 }
 
 /// Split action command string by semicolons, handling escaped semicolons (\;)
@@ -2746,10 +2897,8 @@ struct App {
     last_ctrl_c: Option<std::time::Instant>,
     last_escape: Option<std::time::Instant>, // For Escape+key sequences (Alt emulation)
     show_tags: bool, // F2 toggles - false = hide tags (default), true = show tags
-    // WebSocket server (secure, wss://)
+    // WebSocket server (ws:// or wss:// depending on web_secure setting)
     ws_server: Option<WebSocketServer>,
-    // Non-secure WebSocket server (ws://)
-    ws_nonsecure_server: Option<WebSocketServer>,
     // HTTP web interface server (no TLS)
     http_server: Option<HttpServer>,
     // HTTPS web interface server
@@ -2786,7 +2935,6 @@ impl App {
             last_escape: None,
             show_tags: false, // Default: hide tags
             ws_server: None,
-            ws_nonsecure_server: None,
             http_server: None,
             #[cfg(feature = "native-tls-backend")]
             https_server: None,
@@ -3034,39 +3182,11 @@ impl App {
                 }
             });
         }
-        // Broadcast to non-secure WebSocket server (ws://)
-        if let Some(ref server) = self.ws_nonsecure_server {
-            let clients = server.clients.clone();
-            let msg_clone = msg;
-            tokio::spawn(async move {
-                let clients_guard = clients.read().await;
-                if let Ok(json) = serde_json::to_string(&msg_clone) {
-                    for client in clients_guard.values() {
-                        if client.authenticated {
-                            let _ = client.tx.send(msg_clone.clone());
-                        }
-                    }
-                    drop(json); // Used to validate serialization works
-                }
-            });
-        }
     }
 
-    /// Send a message to a specific WebSocket client (checks both servers)
+    /// Send a message to a specific WebSocket client
     fn ws_send_to_client(&self, client_id: u64, msg: WsMessage) {
-        // Try secure server first
         if let Some(ref server) = self.ws_server {
-            let clients = server.clients.clone();
-            let msg_clone = msg.clone();
-            tokio::spawn(async move {
-                let clients_guard = clients.read().await;
-                if let Some(client) = clients_guard.get(&client_id) {
-                    let _ = client.tx.send(msg_clone);
-                }
-            });
-        }
-        // Try non-secure server
-        if let Some(ref server) = self.ws_nonsecure_server {
             let clients = server.clients.clone();
             tokio::spawn(async move {
                 let clients_guard = clients.read().await;
@@ -3127,10 +3247,11 @@ impl App {
             font_name: self.settings.font_name.clone(),
             font_size: self.settings.font_size,
             ws_allow_list: self.settings.websocket_allow_list.clone(),
+            web_secure: self.settings.web_secure,
             http_enabled: self.settings.http_enabled,
             http_port: self.settings.http_port,
-            https_enabled: self.settings.https_enabled,
-            https_port: self.settings.https_port,
+            ws_enabled: self.settings.ws_enabled,
+            ws_port: self.settings.ws_port,
         };
 
         WsMessage::InitialState {
@@ -3497,27 +3618,23 @@ fn save_settings(app: &App) -> io::Result<()> {
     writeln!(file, "gui_theme={}", app.settings.gui_theme.name())?;
     writeln!(file, "font_name={}", app.settings.font_name)?;
     writeln!(file, "font_size={}", app.settings.font_size)?;
-    writeln!(file, "websocket_enabled={}", app.settings.websocket_enabled)?;
-    writeln!(file, "websocket_port={}", app.settings.websocket_port)?;
+    writeln!(file, "web_secure={}", app.settings.web_secure)?;
+    writeln!(file, "http_enabled={}", app.settings.http_enabled)?;
+    writeln!(file, "http_port={}", app.settings.http_port)?;
+    writeln!(file, "ws_enabled={}", app.settings.ws_enabled)?;
+    writeln!(file, "ws_port={}", app.settings.ws_port)?;
     if !app.settings.websocket_password.is_empty() {
         writeln!(file, "websocket_password={}", encrypt_password(&app.settings.websocket_password))?;
     }
     if !app.settings.websocket_allow_list.is_empty() {
         writeln!(file, "websocket_allow_list={}", app.settings.websocket_allow_list)?;
     }
-    writeln!(file, "websocket_use_tls={}", app.settings.websocket_use_tls)?;
     if !app.settings.websocket_cert_file.is_empty() {
         writeln!(file, "websocket_cert_file={}", app.settings.websocket_cert_file)?;
     }
     if !app.settings.websocket_key_file.is_empty() {
         writeln!(file, "websocket_key_file={}", app.settings.websocket_key_file)?;
     }
-    writeln!(file, "http_enabled={}", app.settings.http_enabled)?;
-    writeln!(file, "http_port={}", app.settings.http_port)?;
-    writeln!(file, "https_enabled={}", app.settings.https_enabled)?;
-    writeln!(file, "https_port={}", app.settings.https_port)?;
-    writeln!(file, "ws_nonsecure_enabled={}", app.settings.ws_nonsecure_enabled)?;
-    writeln!(file, "ws_nonsecure_port={}", app.settings.ws_nonsecure_port)?;
 
     // Save each world's settings
     for world in &app.worlds {
@@ -3650,22 +3767,36 @@ fn load_settings(app: &mut App) -> io::Result<()> {
                             app.settings.font_size = s.clamp(8.0, 48.0);
                         }
                     }
-                    "websocket_enabled" => {
-                        app.settings.websocket_enabled = value == "true";
+                    "web_secure" => {
+                        app.settings.web_secure = value == "true";
                     }
+                    "ws_enabled" => {
+                        app.settings.ws_enabled = value == "true";
+                    }
+                    "ws_port" => {
+                        if let Ok(p) = value.parse::<u16>() {
+                            app.settings.ws_port = p;
+                        }
+                    }
+                    // Legacy: websocket_enabled maps to ws_enabled
+                    "websocket_enabled" => {
+                        app.settings.ws_enabled = value == "true";
+                    }
+                    // Legacy: websocket_port maps to ws_port
                     "websocket_port" => {
                         if let Ok(p) = value.parse::<u16>() {
-                            app.settings.websocket_port = p;
+                            app.settings.ws_port = p;
                         }
+                    }
+                    // Legacy: websocket_use_tls maps to web_secure
+                    "websocket_use_tls" => {
+                        app.settings.web_secure = value == "true";
                     }
                     "websocket_password" => {
                         app.settings.websocket_password = decrypt_password(value);
                     }
                     "websocket_allow_list" => {
                         app.settings.websocket_allow_list = value.to_string();
-                    }
-                    "websocket_use_tls" => {
-                        app.settings.websocket_use_tls = value == "true";
                     }
                     "websocket_cert_file" => {
                         app.settings.websocket_cert_file = value.to_string();
@@ -3681,20 +3812,35 @@ fn load_settings(app: &mut App) -> io::Result<()> {
                             app.settings.http_port = p;
                         }
                     }
+                    // Legacy fields - map https to http when web_secure, ws_nonsecure to ws when !web_secure
                     "https_enabled" => {
-                        app.settings.https_enabled = value == "true";
+                        // If https was enabled in old config, set http_enabled and web_secure
+                        if value == "true" {
+                            app.settings.http_enabled = true;
+                            app.settings.web_secure = true;
+                        }
                     }
                     "https_port" => {
+                        // Legacy: https_port was separate, now http_port is used for both
                         if let Ok(p) = value.parse::<u16>() {
-                            app.settings.https_port = p;
+                            // Only use https_port if web_secure is set
+                            if app.settings.web_secure {
+                                app.settings.http_port = p;
+                            }
                         }
                     }
                     "ws_nonsecure_enabled" => {
-                        app.settings.ws_nonsecure_enabled = value == "true";
+                        // Legacy: ws_nonsecure maps to ws_enabled when not secure
+                        if value == "true" && !app.settings.web_secure {
+                            app.settings.ws_enabled = true;
+                        }
                     }
                     "ws_nonsecure_port" => {
+                        // Legacy: ws_nonsecure_port was separate, now ws_port is used for both
                         if let Ok(p) = value.parse::<u16>() {
-                            app.settings.ws_nonsecure_port = p;
+                            if !app.settings.web_secure {
+                                app.settings.ws_port = p;
+                            }
                         }
                     }
                     // Legacy: ignore global encoding, it's now per-world
@@ -3768,8 +3914,11 @@ fn save_reload_state(app: &App) -> io::Result<()> {
     writeln!(file, "theme={}", app.settings.theme.name())?;
     writeln!(file, "font_name={}", app.settings.font_name)?;
     writeln!(file, "font_size={}", app.settings.font_size)?;
-    writeln!(file, "websocket_enabled={}", app.settings.websocket_enabled)?;
-    writeln!(file, "websocket_port={}", app.settings.websocket_port)?;
+    writeln!(file, "web_secure={}", app.settings.web_secure)?;
+    writeln!(file, "http_enabled={}", app.settings.http_enabled)?;
+    writeln!(file, "http_port={}", app.settings.http_port)?;
+    writeln!(file, "ws_enabled={}", app.settings.ws_enabled)?;
+    writeln!(file, "ws_port={}", app.settings.ws_port)?;
     if !app.settings.websocket_password.is_empty() {
         writeln!(file, "websocket_password={}", encrypt_password(&app.settings.websocket_password))?;
     }
@@ -3785,19 +3934,12 @@ fn save_reload_state(app: &App) -> io::Result<()> {
     if let Some(ref host) = whitelisted_host {
         writeln!(file, "websocket_whitelisted_host={}", host)?;
     }
-    writeln!(file, "websocket_use_tls={}", app.settings.websocket_use_tls)?;
     if !app.settings.websocket_cert_file.is_empty() {
         writeln!(file, "websocket_cert_file={}", app.settings.websocket_cert_file)?;
     }
     if !app.settings.websocket_key_file.is_empty() {
         writeln!(file, "websocket_key_file={}", app.settings.websocket_key_file)?;
     }
-    writeln!(file, "http_enabled={}", app.settings.http_enabled)?;
-    writeln!(file, "http_port={}", app.settings.http_port)?;
-    writeln!(file, "https_enabled={}", app.settings.https_enabled)?;
-    writeln!(file, "https_port={}", app.settings.https_port)?;
-    writeln!(file, "ws_nonsecure_enabled={}", app.settings.ws_nonsecure_enabled)?;
-    writeln!(file, "ws_nonsecure_port={}", app.settings.ws_nonsecure_port)?;
 
     // Save input history (base64 encode each line to handle special chars)
     writeln!(file, "history_count={}", app.input.history.len())?;
@@ -4038,13 +4180,30 @@ fn load_reload_state(app: &mut App) -> io::Result<bool> {
                             app.settings.font_size = s.clamp(8.0, 48.0);
                         }
                     }
-                    "websocket_enabled" => {
-                        app.settings.websocket_enabled = value == "true";
+                    "web_secure" => {
+                        app.settings.web_secure = value == "true";
                     }
+                    "ws_enabled" => {
+                        app.settings.ws_enabled = value == "true";
+                    }
+                    "ws_port" => {
+                        if let Ok(p) = value.parse::<u16>() {
+                            app.settings.ws_port = p;
+                        }
+                    }
+                    // Legacy: websocket_enabled maps to ws_enabled
+                    "websocket_enabled" => {
+                        app.settings.ws_enabled = value == "true";
+                    }
+                    // Legacy: websocket_port maps to ws_port
                     "websocket_port" => {
                         if let Ok(p) = value.parse::<u16>() {
-                            app.settings.websocket_port = p;
+                            app.settings.ws_port = p;
                         }
+                    }
+                    // Legacy: websocket_use_tls maps to web_secure
+                    "websocket_use_tls" => {
+                        app.settings.web_secure = value == "true";
                     }
                     "websocket_password" => {
                         app.settings.websocket_password = decrypt_password(value);
@@ -4054,9 +4213,6 @@ fn load_reload_state(app: &mut App) -> io::Result<bool> {
                     }
                     "websocket_whitelisted_host" => {
                         app.settings.websocket_whitelisted_host = Some(value.to_string());
-                    }
-                    "websocket_use_tls" => {
-                        app.settings.websocket_use_tls = value == "true";
                     }
                     "websocket_cert_file" => {
                         app.settings.websocket_cert_file = value.to_string();
@@ -4072,20 +4228,30 @@ fn load_reload_state(app: &mut App) -> io::Result<bool> {
                             app.settings.http_port = p;
                         }
                     }
+                    // Legacy fields
                     "https_enabled" => {
-                        app.settings.https_enabled = value == "true";
+                        if value == "true" {
+                            app.settings.http_enabled = true;
+                            app.settings.web_secure = true;
+                        }
                     }
                     "https_port" => {
                         if let Ok(p) = value.parse::<u16>() {
-                            app.settings.https_port = p;
+                            if app.settings.web_secure {
+                                app.settings.http_port = p;
+                            }
                         }
                     }
                     "ws_nonsecure_enabled" => {
-                        app.settings.ws_nonsecure_enabled = value == "true";
+                        if value == "true" && !app.settings.web_secure {
+                            app.settings.ws_enabled = true;
+                        }
                     }
                     "ws_nonsecure_port" => {
                         if let Ok(p) = value.parse::<u16>() {
-                            app.settings.ws_nonsecure_port = p;
+                            if !app.settings.web_secure {
+                                app.settings.ws_port = p;
+                            }
                         }
                     }
                     // Legacy: ignore global encoding, it's now per-world
@@ -4499,14 +4665,16 @@ mod remote_gui {
         filter_active: bool,
         /// WebSocket allow list (CSV of hosts that can connect without password)
         ws_allow_list: String,
-        /// HTTP server enabled
+        /// Web secure protocol (true = https/wss, false = http/ws)
+        web_secure: bool,
+        /// HTTP/HTTPS server enabled
         http_enabled: bool,
-        /// HTTP server port
+        /// HTTP/HTTPS server port
         http_port: u16,
-        /// HTTPS server enabled
-        https_enabled: bool,
-        /// HTTPS server port
-        https_port: u16,
+        /// WS/WSS server enabled
+        ws_enabled: bool,
+        /// WS/WSS server port
+        ws_port: u16,
         /// World switching mode (Unseen First or Alphabetical)
         world_switch_mode: WorldSwitchMode,
         /// Debug logging enabled (synced from server, not used locally)
@@ -4575,10 +4743,11 @@ mod remote_gui {
                 filter_text: String::new(),
                 filter_active: false,
                 ws_allow_list: String::new(),
+                web_secure: false,
                 http_enabled: false,
                 http_port: 9000,
-                https_enabled: false,
-                https_port: 9001,
+                ws_enabled: false,
+                ws_port: 9001,
                 world_switch_mode: WorldSwitchMode::UnseenFirst,
                 debug_enabled: false,
                 spell_checker: SpellChecker::new(),
@@ -4841,10 +5010,11 @@ mod remote_gui {
                             self.font_name = settings.font_name;
                             self.font_size = settings.font_size;
                             self.ws_allow_list = settings.ws_allow_list;
+                            self.web_secure = settings.web_secure;
                             self.http_enabled = settings.http_enabled;
                             self.http_port = settings.http_port;
-                            self.https_enabled = settings.https_enabled;
-                            self.https_port = settings.https_port;
+                            self.ws_enabled = settings.ws_enabled;
+                            self.ws_port = settings.ws_port;
                             self.world_switch_mode = WorldSwitchMode::from_name(&settings.world_switch_mode);
                             self.debug_enabled = settings.debug_enabled;
                             self.more_mode = settings.more_mode_enabled;
@@ -4912,10 +5082,11 @@ mod remote_gui {
                             self.font_name = settings.font_name;
                             self.font_size = settings.font_size;
                             self.ws_allow_list = settings.ws_allow_list;
+                            self.web_secure = settings.web_secure;
                             self.http_enabled = settings.http_enabled;
                             self.http_port = settings.http_port;
-                            self.https_enabled = settings.https_enabled;
-                            self.https_port = settings.https_port;
+                            self.ws_enabled = settings.ws_enabled;
+                            self.ws_port = settings.ws_port;
                             self.world_switch_mode = WorldSwitchMode::from_name(&settings.world_switch_mode);
                             self.debug_enabled = settings.debug_enabled;
                             self.more_mode = settings.more_mode_enabled;
@@ -5146,10 +5317,11 @@ mod remote_gui {
                     font_name: self.font_name.clone(),
                     font_size: self.font_size,
                     ws_allow_list: self.ws_allow_list.clone(),
+                    web_secure: self.web_secure,
                     http_enabled: self.http_enabled,
                     http_port: self.http_port,
-                    https_enabled: self.https_enabled,
-                    https_port: self.https_port,
+                    ws_enabled: self.ws_enabled,
+                    ws_port: self.ws_port,
                 });
             }
         }
@@ -5911,7 +6083,7 @@ mod remote_gui {
                 egui::TopBottomPanel::top("menu_bar")
                     .frame(egui::Frame::none()
                         .fill(theme.bg())
-                        .inner_margin(egui::Margin::symmetric(4.0, 2.0))
+                        .inner_margin(egui::Margin::symmetric(4.0, 5.0))  // 3px extra padding top/bottom
                         .stroke(egui::Stroke::NONE))
                     .show(ctx, |ui| {
                     ui.horizontal_centered(|ui| {
@@ -6147,30 +6319,52 @@ mod remote_gui {
                                 // Reset spell state when sending command
                                 self.reset_spell_state();
                                 if !cmd.is_empty() {
-                                    // Handle local GUI commands
-                                    match cmd.as_str() {
-                                        "/setup" => {
+                                    // Use shared command parsing
+                                    let parsed = super::parse_command(&cmd);
+
+                                    // Handle local GUI popup commands
+                                    match parsed {
+                                        super::Command::Setup => {
                                             self.popup_state = PopupState::Setup;
                                         }
-                                        "/web" => {
+                                        super::Command::Web => {
                                             self.popup_state = PopupState::Web;
                                         }
-                                        "/world" => {
+                                        super::Command::WorldSelector => {
                                             self.popup_state = PopupState::WorldList;
                                             self.world_list_selected = self.current_world;
                                         }
-                                        "/worlds" | "/l" => {
+                                        super::Command::WorldsList => {
                                             self.popup_state = PopupState::ConnectedWorlds;
                                             self.world_list_selected = self.current_world;
                                         }
-                                        "/font" => {
-                                            self.edit_font_name = self.font_name.clone();
-                                            self.edit_font_size = format!("{:.1}", self.font_size);
-                                            self.popup_state = PopupState::Font;
+                                        super::Command::Help => {
+                                            self.popup_state = PopupState::Help;
+                                        }
+                                        super::Command::Actions => {
+                                            self.actions_selected = 0;
+                                            self.popup_state = PopupState::ActionsList;
+                                        }
+                                        super::Command::WorldEdit { name } => {
+                                            // Open world editor
+                                            let idx = if let Some(ref world_name) = name {
+                                                self.worlds.iter().position(|w| w.name.eq_ignore_ascii_case(world_name))
+                                                    .unwrap_or(self.current_world)
+                                            } else {
+                                                self.current_world
+                                            };
+                                            self.open_world_editor(idx);
                                         }
                                         _ => {
-                                            // Send other commands to server
-                                            self.send_command(self.current_world, cmd);
+                                            // Check for /font which is GUI-specific
+                                            if cmd.trim().eq_ignore_ascii_case("/font") {
+                                                self.edit_font_name = self.font_name.clone();
+                                                self.edit_font_size = format!("{:.1}", self.font_size);
+                                                self.popup_state = PopupState::Font;
+                                            } else {
+                                                // Send other commands to server
+                                                self.send_command(self.current_world, cmd);
+                                            }
                                         }
                                     }
                                 }
@@ -6942,20 +7136,26 @@ mod remote_gui {
                                 .num_columns(2)
                                 .spacing([10.0, 8.0])
                                 .show(ui, |ui| {
-                                    ui.label("WS Allow List:");
-                                    ui.add(egui::TextEdit::singleline(&mut self.ws_allow_list)
-                                        .hint_text("localhost, 192.168.*")
-                                        .desired_width(200.0));
+                                    // Protocol selection
+                                    ui.label("Protocol:");
+                                    let proto_text = if self.web_secure { "Secure" } else { "Non-Secure" };
+                                    if ui.button(proto_text).clicked() {
+                                        self.web_secure = !self.web_secure;
+                                    }
                                     ui.end_row();
 
-                                    ui.label("HTTP enabled:");
+                                    // HTTP/HTTPS enabled (name changes based on protocol)
+                                    let http_label = if self.web_secure { "HTTPS enabled:" } else { "HTTP enabled:" };
+                                    ui.label(http_label);
                                     let http_text = if self.http_enabled { "on" } else { "off" };
                                     if ui.button(http_text).clicked() {
                                         self.http_enabled = !self.http_enabled;
                                     }
                                     ui.end_row();
 
-                                    ui.label("HTTP port:");
+                                    // HTTP/HTTPS port (name changes based on protocol)
+                                    let http_port_label = if self.web_secure { "HTTPS port:" } else { "HTTP port:" };
+                                    ui.label(http_port_label);
                                     let mut http_port_str = self.http_port.to_string();
                                     if ui.add(egui::TextEdit::singleline(&mut http_port_str).desired_width(80.0)).changed() {
                                         if let Ok(port) = http_port_str.parse::<u16>() {
@@ -6964,20 +7164,31 @@ mod remote_gui {
                                     }
                                     ui.end_row();
 
-                                    ui.label("HTTPS enabled:");
-                                    let https_text = if self.https_enabled { "on" } else { "off" };
-                                    if ui.button(https_text).clicked() {
-                                        self.https_enabled = !self.https_enabled;
+                                    // WS/WSS enabled (name changes based on protocol)
+                                    let ws_label = if self.web_secure { "WSS enabled:" } else { "WS enabled:" };
+                                    ui.label(ws_label);
+                                    let ws_text = if self.ws_enabled { "on" } else { "off" };
+                                    if ui.button(ws_text).clicked() {
+                                        self.ws_enabled = !self.ws_enabled;
                                     }
                                     ui.end_row();
 
-                                    ui.label("HTTPS port:");
-                                    let mut https_port_str = self.https_port.to_string();
-                                    if ui.add(egui::TextEdit::singleline(&mut https_port_str).desired_width(80.0)).changed() {
-                                        if let Ok(port) = https_port_str.parse::<u16>() {
-                                            self.https_port = port;
+                                    // WS/WSS port (name changes based on protocol)
+                                    let ws_port_label = if self.web_secure { "WSS port:" } else { "WS port:" };
+                                    ui.label(ws_port_label);
+                                    let mut ws_port_str = self.ws_port.to_string();
+                                    if ui.add(egui::TextEdit::singleline(&mut ws_port_str).desired_width(80.0)).changed() {
+                                        if let Ok(port) = ws_port_str.parse::<u16>() {
+                                            self.ws_port = port;
                                         }
                                     }
+                                    ui.end_row();
+
+                                    // Allow list
+                                    ui.label("Allow List:");
+                                    ui.add(egui::TextEdit::singleline(&mut self.ws_allow_list)
+                                        .hint_text("localhost, 192.168.*")
+                                        .desired_width(200.0));
                                     ui.end_row();
                                 });
                             ui.separator();
@@ -7781,28 +7992,25 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
         }
     }
 
-    // Start WebSocket server if enabled
-    if app.settings.websocket_enabled && !app.settings.websocket_password.is_empty() {
+    // Start WebSocket server if enabled (ws:// or wss:// based on web_secure setting)
+    if app.settings.ws_enabled && !app.settings.websocket_password.is_empty() {
         let mut server = WebSocketServer::new(
             &app.settings.websocket_password,
-            app.settings.websocket_port,
+            app.settings.ws_port,
             &app.settings.websocket_allow_list,
             app.settings.websocket_whitelisted_host.clone(),
         );
 
-        // Configure TLS if enabled and cert/key files are specified
+        // Configure TLS if secure mode and cert/key files are specified
         #[cfg(feature = "native-tls-backend")]
-        let tls_configured = if app.settings.websocket_use_tls
+        let tls_configured = if app.settings.web_secure
             && !app.settings.websocket_cert_file.is_empty()
             && !app.settings.websocket_key_file.is_empty()
         {
             match server.configure_tls(&app.settings.websocket_cert_file, &app.settings.websocket_key_file) {
-                Ok(()) => {
-                    app.add_output("WebSocket TLS configured successfully");
-                    true
-                }
+                Ok(()) => true,
                 Err(e) => {
-                    app.add_output(&format!("Warning: Failed to configure TLS: {}", e));
+                    app.add_output(&format!("Warning: Failed to configure WSS TLS: {}", e));
                     false
                 }
             }
@@ -7810,7 +8018,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
             false
         };
         #[cfg(feature = "rustls-backend")]
-        let tls_configured = if app.settings.websocket_use_tls
+        let tls_configured = if app.settings.web_secure
             && !app.settings.websocket_cert_file.is_empty()
             && !app.settings.websocket_key_file.is_empty()
         {
@@ -7833,102 +8041,79 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
             }
         } else {
             let protocol = if tls_configured { "wss" } else { "ws" };
-            app.add_output(&format!("WebSocket server started on port {} ({})", app.settings.websocket_port, protocol));
+            app.add_output(&format!("WebSocket server started on port {} ({})", app.settings.ws_port, protocol));
             app.ws_server = Some(server);
         }
     }
 
-    // Start non-secure WebSocket server (ws://) if enabled OR if HTTP is enabled (HTTP requires ws://)
-    if (app.settings.ws_nonsecure_enabled || app.settings.http_enabled) && !app.settings.websocket_password.is_empty() {
-        let mut server = WebSocketServer::new(
-            &app.settings.websocket_password,
-            app.settings.ws_nonsecure_port,
-            &app.settings.websocket_allow_list,
-            app.settings.websocket_whitelisted_host.clone(),
-        );
-        // No TLS configuration for non-secure server
-
-        if let Err(e) = start_websocket_server(&mut server, event_tx.clone()).await {
-            let err_str = e.to_string();
-            if !err_str.contains("Address in use") && !err_str.contains("address already in use") {
-                app.add_output(&format!("Warning: Failed to start non-secure WebSocket server: {}", e));
+    // Start HTTP/HTTPS web interface server if enabled
+    if app.settings.http_enabled {
+        if app.settings.web_secure
+            && !app.settings.websocket_cert_file.is_empty()
+            && !app.settings.websocket_key_file.is_empty()
+        {
+            // Start HTTPS server (secure mode)
+            #[cfg(feature = "native-tls-backend")]
+            {
+                let mut https_server = HttpsServer::new(app.settings.http_port);
+                match start_https_server(
+                    &mut https_server,
+                    &app.settings.websocket_cert_file,
+                    &app.settings.websocket_key_file,
+                    app.settings.ws_port,
+                    true, // HTTPS uses secure WebSocket (wss://)
+                ).await {
+                    Ok(()) => {
+                        app.add_output(&format!("HTTPS web interface started on port {} (wss://localhost:{})", app.settings.http_port, app.settings.ws_port));
+                        app.https_server = Some(https_server);
+                    }
+                    Err(e) => {
+                        let err_str = e.to_string();
+                        if !err_str.contains("Address in use") && !err_str.contains("address already in use") {
+                            app.add_output(&format!("Warning: Failed to start HTTPS server: {}", e));
+                        }
+                    }
+                }
+            }
+            #[cfg(feature = "rustls-backend")]
+            {
+                let mut https_server = HttpsServer::new(app.settings.http_port);
+                match start_https_server(
+                    &mut https_server,
+                    &app.settings.websocket_cert_file,
+                    &app.settings.websocket_key_file,
+                    app.settings.ws_port,
+                    true, // HTTPS uses secure WebSocket (wss://)
+                ).await {
+                    Ok(()) => {
+                        app.add_output(&format!("HTTPS web interface started on port {} (wss://localhost:{})", app.settings.http_port, app.settings.ws_port));
+                        app.https_server = Some(https_server);
+                    }
+                    Err(e) => {
+                        let err_str = e.to_string();
+                        if !err_str.contains("Address in use") && !err_str.contains("address already in use") {
+                            app.add_output(&format!("Warning: Failed to start HTTPS server: {}", e));
+                        }
+                    }
+                }
             }
         } else {
-            app.add_output(&format!("Non-secure WebSocket server started on port {} (ws)", app.settings.ws_nonsecure_port));
-            app.ws_nonsecure_server = Some(server);
-        }
-    }
-
-    // Start HTTP web interface server if enabled (uses ws:// non-secure WebSocket)
-    if app.settings.http_enabled {
-        let mut http_server = HttpServer::new(app.settings.http_port);
-        match start_http_server(
-            &mut http_server,
-            app.settings.ws_nonsecure_port,
-            false, // HTTP uses non-secure WebSocket (ws://)
-        ).await {
-            Ok(()) => {
-                app.add_output(&format!("HTTP web interface started on port {} (ws://localhost:{})", app.settings.http_port, app.settings.ws_nonsecure_port));
-                app.http_server = Some(http_server);
-            }
-            Err(e) => {
-                let err_str = e.to_string();
-                if !err_str.contains("Address in use") && !err_str.contains("address already in use") {
-                    app.add_output(&format!("Warning: Failed to start HTTP server: {}", e));
+            // Start HTTP server (non-secure mode)
+            let mut http_server = HttpServer::new(app.settings.http_port);
+            match start_http_server(
+                &mut http_server,
+                app.settings.ws_port,
+                false, // HTTP uses non-secure WebSocket (ws://)
+            ).await {
+                Ok(()) => {
+                    app.add_output(&format!("HTTP web interface started on port {} (ws://localhost:{})", app.settings.http_port, app.settings.ws_port));
+                    app.http_server = Some(http_server);
                 }
-            }
-        }
-    }
-
-    // Start HTTPS web interface server if enabled and TLS cert/key are configured (uses wss:// secure WebSocket)
-    #[cfg(feature = "native-tls-backend")]
-    if app.settings.https_enabled
-        && !app.settings.websocket_cert_file.is_empty()
-        && !app.settings.websocket_key_file.is_empty()
-    {
-        let mut https_server = HttpsServer::new(app.settings.https_port);
-        match start_https_server(
-            &mut https_server,
-            &app.settings.websocket_cert_file,
-            &app.settings.websocket_key_file,
-            app.settings.websocket_port,
-            true, // HTTPS uses secure WebSocket (wss://)
-        ).await {
-            Ok(()) => {
-                app.add_output(&format!("HTTPS web interface started on port {} (wss://localhost:{})", app.settings.https_port, app.settings.websocket_port));
-                app.https_server = Some(https_server);
-            }
-            Err(e) => {
-                let err_str = e.to_string();
-                if !err_str.contains("Address in use") && !err_str.contains("address already in use") {
-                    app.add_output(&format!("Warning: Failed to start HTTPS server: {}", e));
-                }
-            }
-        }
-    }
-
-    // Start HTTPS web interface server if enabled and TLS cert/key are configured (rustls version, uses wss://)
-    #[cfg(feature = "rustls-backend")]
-    if app.settings.https_enabled
-        && !app.settings.websocket_cert_file.is_empty()
-        && !app.settings.websocket_key_file.is_empty()
-    {
-        let mut https_server = HttpsServer::new(app.settings.https_port);
-        match start_https_server(
-            &mut https_server,
-            &app.settings.websocket_cert_file,
-            &app.settings.websocket_key_file,
-            app.settings.websocket_port,
-            true, // HTTPS uses secure WebSocket (wss://)
-        ).await {
-            Ok(()) => {
-                app.add_output(&format!("HTTPS web interface started on port {} (wss://localhost:{})", app.settings.https_port, app.settings.websocket_port));
-                app.https_server = Some(https_server);
-            }
-            Err(e) => {
-                let err_str = e.to_string();
-                if !err_str.contains("Address in use") && !err_str.contains("address already in use") {
-                    app.add_output(&format!("Warning: Failed to start HTTPS server: {}", e));
+                Err(e) => {
+                    let err_str = e.to_string();
+                    if !err_str.contains("Address in use") && !err_str.contains("address already in use") {
+                        app.add_output(&format!("Warning: Failed to start HTTP server: {}", e));
+                    }
                 }
             }
         }
@@ -8025,7 +8210,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                         }
                         KeyAction::UpdateWebSocket => {
                             // Check if we need to start or stop the WebSocket server
-                            let ws_enabled = app.settings.websocket_enabled;
+                            let ws_enabled = app.settings.ws_enabled;
                             let has_password = !app.settings.websocket_password.is_empty();
                             let is_running = app.ws_server.is_some();
 
@@ -8033,14 +8218,14 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                 // Start the server
                                 let mut server = WebSocketServer::new(
                                     &app.settings.websocket_password,
-                                    app.settings.websocket_port,
+                                    app.settings.ws_port,
                                     &app.settings.websocket_allow_list,
                                     app.settings.websocket_whitelisted_host.clone(),
                                 );
 
-                                // Configure TLS if enabled
+                                // Configure TLS if secure mode enabled
                                 #[cfg(feature = "native-tls-backend")]
-                                let tls_configured = if app.settings.websocket_use_tls
+                                let tls_configured = if app.settings.web_secure
                                     && !app.settings.websocket_cert_file.is_empty()
                                     && !app.settings.websocket_key_file.is_empty()
                                 {
@@ -8055,7 +8240,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                     false
                                 };
                                 #[cfg(feature = "rustls-backend")]
-                                let tls_configured = if app.settings.websocket_use_tls
+                                let tls_configured = if app.settings.web_secure
                                     && !app.settings.websocket_cert_file.is_empty()
                                     && !app.settings.websocket_key_file.is_empty()
                                 {
@@ -8078,7 +8263,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                     }
                                 } else {
                                     let protocol = if tls_configured { "wss" } else { "ws" };
-                                    app.add_output(&format!("WebSocket server started on port {} ({})", app.settings.websocket_port, protocol));
+                                    app.add_output(&format!("WebSocket server started on port {} ({})", app.settings.ws_port, protocol));
                                     app.ws_server = Some(server);
                                 }
                             } else if (!ws_enabled || !has_password) && is_running {
@@ -8090,134 +8275,87 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                 app.add_output("WebSocket server stopped.");
                             }
 
-                            // Check if we need to start or stop the non-secure WebSocket server (ws://)
-                            // Note: HTTP also requires the non-secure WebSocket server
-                            {
-                                let ws_ns_enabled = app.settings.ws_nonsecure_enabled;
-                                let http_enabled = app.settings.http_enabled;
-                                let needs_ws_ns = ws_ns_enabled || http_enabled;
-                                let has_password = !app.settings.websocket_password.is_empty();
-                                let is_running = app.ws_nonsecure_server.is_some();
-
-                                if needs_ws_ns && has_password && !is_running {
-                                    // Start the non-secure server
-                                    let mut server = WebSocketServer::new(
-                                        &app.settings.websocket_password,
-                                        app.settings.ws_nonsecure_port,
-                                        &app.settings.websocket_allow_list,
-                                        app.settings.websocket_whitelisted_host.clone(),
-                                    );
-                                    // No TLS configuration for non-secure server
-
-                                    if let Err(e) = start_websocket_server(&mut server, event_tx.clone()).await {
-                                        let err_str = e.to_string();
-                                        if !err_str.contains("Address in use") && !err_str.contains("address already in use") {
-                                            app.add_output(&format!("Warning: Failed to start non-secure WebSocket server: {}", e));
-                                        }
-                                    } else {
-                                        app.add_output(&format!("Non-secure WebSocket server started on port {} (ws)", app.settings.ws_nonsecure_port));
-                                        app.ws_nonsecure_server = Some(server);
-                                    }
-                                } else if (!needs_ws_ns || !has_password) && is_running {
-                                    // Stop the server
-                                    if let Some(ref mut server) = app.ws_nonsecure_server {
-                                        server.stop();
-                                    }
-                                    app.ws_nonsecure_server = None;
-                                    app.add_output("Non-secure WebSocket server stopped.");
-                                }
-                            }
-
-                            // Check if we need to start or stop the HTTP server (uses ws:// non-secure WebSocket)
+                            // Check if we need to start or stop the HTTP/HTTPS server
                             {
                                 let http_enabled = app.settings.http_enabled;
                                 let http_running = app.http_server.is_some();
+                                let https_running = app.https_server.is_some();
+                                let has_cert = !app.settings.websocket_cert_file.is_empty()
+                                    && !app.settings.websocket_key_file.is_empty();
+                                let web_secure = app.settings.web_secure;
 
-                                if http_enabled && !http_running {
-                                    // Start the HTTP server
+                                if http_enabled && web_secure && has_cert && !https_running {
+                                    // Stop HTTP if running, start HTTPS
+                                    if http_running {
+                                        app.http_server = None;
+                                    }
+                                    #[cfg(feature = "native-tls-backend")]
+                                    {
+                                        let mut https_server = HttpsServer::new(app.settings.http_port);
+                                        match start_https_server(
+                                            &mut https_server,
+                                            &app.settings.websocket_cert_file,
+                                            &app.settings.websocket_key_file,
+                                            app.settings.ws_port,
+                                            true,
+                                        ).await {
+                                            Ok(()) => {
+                                                app.add_output(&format!("HTTPS web interface started on port {} (wss://localhost:{})", app.settings.http_port, app.settings.ws_port));
+                                                app.https_server = Some(https_server);
+                                            }
+                                            Err(e) => {
+                                                app.add_output(&format!("Warning: Failed to start HTTPS server: {}", e));
+                                            }
+                                        }
+                                    }
+                                    #[cfg(feature = "rustls-backend")]
+                                    {
+                                        let mut https_server = HttpsServer::new(app.settings.http_port);
+                                        match start_https_server(
+                                            &mut https_server,
+                                            &app.settings.websocket_cert_file,
+                                            &app.settings.websocket_key_file,
+                                            app.settings.ws_port,
+                                            true,
+                                        ).await {
+                                            Ok(()) => {
+                                                app.add_output(&format!("HTTPS web interface started on port {} (wss://localhost:{})", app.settings.http_port, app.settings.ws_port));
+                                                app.https_server = Some(https_server);
+                                            }
+                                            Err(e) => {
+                                                app.add_output(&format!("Warning: Failed to start HTTPS server: {}", e));
+                                            }
+                                        }
+                                    }
+                                } else if http_enabled && !web_secure && !http_running {
+                                    // Stop HTTPS if running, start HTTP
+                                    if https_running {
+                                        app.https_server = None;
+                                    }
                                     let mut http_server = HttpServer::new(app.settings.http_port);
                                     match start_http_server(
                                         &mut http_server,
-                                        app.settings.ws_nonsecure_port,
-                                        false, // HTTP uses non-secure WebSocket (ws://)
+                                        app.settings.ws_port,
+                                        false,
                                     ).await {
                                         Ok(()) => {
-                                            app.add_output(&format!("HTTP web interface started on port {} (ws://localhost:{})", app.settings.http_port, app.settings.ws_nonsecure_port));
+                                            app.add_output(&format!("HTTP web interface started on port {} (ws://localhost:{})", app.settings.http_port, app.settings.ws_port));
                                             app.http_server = Some(http_server);
                                         }
                                         Err(e) => {
                                             app.add_output(&format!("Warning: Failed to start HTTP server: {}", e));
                                         }
                                     }
-                                } else if !http_enabled && http_running {
-                                    // Stop the HTTP server
-                                    app.http_server = None;
-                                    app.add_output("HTTP web interface stopped.");
-                                }
-                            }
-
-                            // Check if we need to start or stop the HTTPS server (uses wss:// secure WebSocket)
-                            #[cfg(feature = "native-tls-backend")]
-                            {
-                                let https_enabled = app.settings.https_enabled;
-                                let has_cert = !app.settings.websocket_cert_file.is_empty()
-                                    && !app.settings.websocket_key_file.is_empty();
-                                let https_running = app.https_server.is_some();
-
-                                if https_enabled && has_cert && !https_running {
-                                    // Start the HTTPS server
-                                    let mut https_server = HttpsServer::new(app.settings.https_port);
-                                    match start_https_server(
-                                        &mut https_server,
-                                        &app.settings.websocket_cert_file,
-                                        &app.settings.websocket_key_file,
-                                        app.settings.websocket_port,
-                                        true, // HTTPS uses secure WebSocket (wss://)
-                                    ).await {
-                                        Ok(()) => {
-                                            app.add_output(&format!("HTTPS web interface started on port {} (wss://localhost:{})", app.settings.https_port, app.settings.websocket_port));
-                                            app.https_server = Some(https_server);
-                                        }
-                                        Err(e) => {
-                                            app.add_output(&format!("Warning: Failed to start HTTPS server: {}", e));
-                                        }
+                                } else if !http_enabled && (http_running || https_running) {
+                                    // Stop both servers
+                                    if http_running {
+                                        app.http_server = None;
+                                        app.add_output("HTTP web interface stopped.");
                                     }
-                                } else if (!https_enabled || !has_cert) && https_running {
-                                    // Stop the HTTPS server
-                                    app.https_server = None;
-                                    app.add_output("HTTPS web interface stopped.");
-                                }
-                            }
-
-                            #[cfg(feature = "rustls-backend")]
-                            {
-                                let https_enabled = app.settings.https_enabled;
-                                let has_cert = !app.settings.websocket_cert_file.is_empty()
-                                    && !app.settings.websocket_key_file.is_empty();
-                                let https_running = app.https_server.is_some();
-
-                                if https_enabled && has_cert && !https_running {
-                                    // Start the HTTPS server
-                                    let mut https_server = HttpsServer::new(app.settings.https_port);
-                                    match start_https_server(
-                                        &mut https_server,
-                                        &app.settings.websocket_cert_file,
-                                        &app.settings.websocket_key_file,
-                                        app.settings.websocket_port,
-                                        true, // HTTPS uses secure WebSocket (wss://)
-                                    ).await {
-                                        Ok(()) => {
-                                            app.add_output(&format!("HTTPS web interface started on port {} (wss://localhost:{})", app.settings.https_port, app.settings.websocket_port));
-                                            app.https_server = Some(https_server);
-                                        }
-                                        Err(e) => {
-                                            app.add_output(&format!("Warning: Failed to start HTTPS server: {}", e));
-                                        }
+                                    if https_running {
+                                        app.https_server = None;
+                                        app.add_output("HTTPS web interface stopped.");
                                     }
-                                } else if (!https_enabled || !has_cert) && https_running {
-                                    // Stop the HTTPS server
-                                    app.https_server = None;
-                                    app.add_output("HTTPS web interface stopped.");
                                 }
                             }
                         }
@@ -8408,56 +8546,58 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                 app.ws_send_to_client(client_id, initial_state);
                             }
                             WsMessage::SendCommand { world_index, command } => {
-                                // Check for local commands first
-                                if command.trim() == "/actions" {
-                                    // Send actions list back to client
-                                    let actions_text = if app.settings.actions.is_empty() {
-                                        "No actions defined. Use the console /actions command to create actions.".to_string()
-                                    } else {
-                                        let mut lines = vec!["Actions:".to_string()];
-                                        for action in &app.settings.actions {
-                                            let world_str = if action.world.is_empty() { "*" } else { &action.world };
-                                            let pattern_str = if action.pattern.is_empty() { "(manual)" } else { &action.pattern };
-                                            lines.push(format!("  /{} [{}] pattern='{}' cmd='{}'",
-                                                action.name, world_str, pattern_str,
-                                                action.command.chars().take(40).collect::<String>()));
-                                        }
-                                        lines.join("\n")
-                                    };
-                                    // Echo back as server data
-                                    app.ws_broadcast(WsMessage::ServerData {
-                                        world_index,
-                                        data: actions_text,
-                                    });
-                                } else if command.starts_with('/') && !is_internal_command(command[1..].split_whitespace().next().unwrap_or("")) {
-                                    // Check if this is an action command
-                                    let action_name = command[1..].split_whitespace().next().unwrap_or("");
-                                    if let Some(action) = app.settings.actions.iter().find(|a| a.name.eq_ignore_ascii_case(action_name)) {
-                                        // Execute the action's commands
-                                        let commands = split_action_commands(&action.command);
-                                        if let Some(tx) = &app.worlds[world_index].command_tx {
-                                            for cmd in commands {
-                                                if cmd.eq_ignore_ascii_case("/gag") || cmd.to_lowercase().starts_with("/gag ") {
-                                                    continue;
+                                // Use shared command parsing
+                                let parsed = parse_command(&command);
+
+                                match parsed {
+                                    // Commands handled locally on server
+                                    Command::ActionCommand { name, args: _ } => {
+                                        // Execute action if it exists
+                                        if let Some(action) = app.settings.actions.iter().find(|a| a.name.eq_ignore_ascii_case(&name)) {
+                                            let commands = split_action_commands(&action.command);
+                                            if world_index < app.worlds.len() {
+                                                if let Some(tx) = &app.worlds[world_index].command_tx {
+                                                    for cmd in commands {
+                                                        if cmd.eq_ignore_ascii_case("/gag") || cmd.to_lowercase().starts_with("/gag ") {
+                                                            continue;
+                                                        }
+                                                        let _ = tx.try_send(WriteCommand::Text(cmd));
+                                                    }
+                                                    app.worlds[world_index].last_send_time = Some(std::time::Instant::now());
                                                 }
-                                                let _ = tx.try_send(WriteCommand::Text(cmd));
                                             }
-                                            app.worlds[world_index].last_send_time = Some(std::time::Instant::now());
+                                        } else {
+                                            app.ws_broadcast(WsMessage::ServerData {
+                                                world_index,
+                                                data: format!("Unknown action: /{}", name),
+                                            });
                                         }
-                                    } else {
-                                        // Unknown command - echo error back
+                                    }
+                                    Command::NotACommand { text } => {
+                                        // Regular text - send to MUD
+                                        if world_index < app.worlds.len() {
+                                            if let Some(tx) = &app.worlds[world_index].command_tx {
+                                                if tx.try_send(WriteCommand::Text(text)).is_ok() {
+                                                    app.worlds[world_index].last_send_time = Some(std::time::Instant::now());
+                                                    app.worlds[world_index].prompt.clear();
+                                                }
+                                            }
+                                        }
+                                    }
+                                    Command::Unknown { cmd } => {
                                         app.ws_broadcast(WsMessage::ServerData {
                                             world_index,
-                                            data: format!("Unknown command: {}", command),
+                                            data: format!("Unknown command: {}", cmd),
                                         });
                                     }
-                                } else {
-                                    // Forward command to the specified world
-                                    if world_index < app.worlds.len() {
-                                        if let Some(tx) = &app.worlds[world_index].command_tx {
-                                            if tx.try_send(WriteCommand::Text(command)).is_ok() {
-                                                app.worlds[world_index].last_send_time = Some(std::time::Instant::now());
-                                                app.worlds[world_index].prompt.clear();
+                                    _ => {
+                                        // All other commands - send to MUD as-is
+                                        if world_index < app.worlds.len() {
+                                            if let Some(tx) = &app.worlds[world_index].command_tx {
+                                                if tx.try_send(WriteCommand::Text(command)).is_ok() {
+                                                    app.worlds[world_index].last_send_time = Some(std::time::Instant::now());
+                                                    app.worlds[world_index].prompt.clear();
+                                                }
                                             }
                                         }
                                     }
@@ -8545,7 +8685,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                     });
                                 }
                             }
-                            WsMessage::UpdateGlobalSettings { console_theme, gui_theme, input_height, font_name, font_size, ws_allow_list, http_enabled, http_port, https_enabled, https_port } => {
+                            WsMessage::UpdateGlobalSettings { console_theme, gui_theme, input_height, font_name, font_size, ws_allow_list, web_secure, http_enabled, http_port, ws_enabled, ws_port } => {
                                 // Update global settings from remote client
                                 // Console theme affects the TUI on the server
                                 app.settings.theme = Theme::from_name(&console_theme);
@@ -8560,11 +8700,12 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                 if let Some(ref server) = app.ws_server {
                                     server.update_allow_list(&ws_allow_list);
                                 }
-                                // Update HTTP/HTTPS settings
+                                // Update web settings
+                                app.settings.web_secure = web_secure;
                                 app.settings.http_enabled = http_enabled;
                                 app.settings.http_port = http_port;
-                                app.settings.https_enabled = https_enabled;
-                                app.settings.https_port = https_port;
+                                app.settings.ws_enabled = ws_enabled;
+                                app.settings.ws_port = ws_port;
                                 // Save settings to persist changes
                                 let _ = save_settings(&app);
                                 // Build settings message for broadcast
@@ -8580,10 +8721,11 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                     font_name: app.settings.font_name.clone(),
                                     font_size: app.settings.font_size,
                                     ws_allow_list: app.settings.websocket_allow_list.clone(),
+                                    web_secure: app.settings.web_secure,
                                     http_enabled: app.settings.http_enabled,
                                     http_port: app.settings.http_port,
-                                    https_enabled: app.settings.https_enabled,
-                                    https_port: app.settings.https_port,
+                                    ws_enabled: app.settings.ws_enabled,
+                                    ws_port: app.settings.ws_port,
                                 };
                                 // Broadcast update to all clients
                                 app.ws_broadcast(WsMessage::GlobalSettingsUpdated {
@@ -8902,46 +9044,61 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                             app.ws_send_to_client(client_id, initial_state);
                         }
                         WsMessage::SendCommand { world_index, command } => {
-                            // Check for local commands first
-                            if command.trim() == "/actions" {
-                                let actions_text = if app.settings.actions.is_empty() {
-                                    "No actions defined. Use the console /actions command to create actions.".to_string()
-                                } else {
-                                    let mut lines = vec!["Actions:".to_string()];
-                                    for action in &app.settings.actions {
-                                        let world_str = if action.world.is_empty() { "*" } else { &action.world };
-                                        let pattern_str = if action.pattern.is_empty() { "(manual)" } else { &action.pattern };
-                                        lines.push(format!("  /{} [{}] pattern='{}' cmd='{}'",
-                                            action.name, world_str, pattern_str,
-                                            action.command.chars().take(40).collect::<String>()));
-                                    }
-                                    lines.join("\n")
-                                };
-                                app.ws_broadcast(WsMessage::ServerData { world_index, data: actions_text });
-                            } else if command.starts_with('/') && !is_internal_command(command[1..].split_whitespace().next().unwrap_or("")) {
-                                let action_name = command[1..].split_whitespace().next().unwrap_or("");
-                                if let Some(action) = app.settings.actions.iter().find(|a| a.name.eq_ignore_ascii_case(action_name)) {
-                                    let commands = split_action_commands(&action.command);
-                                    if let Some(tx) = &app.worlds[world_index].command_tx {
-                                        for cmd in commands {
-                                            if cmd.eq_ignore_ascii_case("/gag") || cmd.to_lowercase().starts_with("/gag ") {
-                                                continue;
+                            // Use shared command parsing
+                            let parsed = parse_command(&command);
+
+                            match parsed {
+                                // Commands handled locally on server
+                                Command::ActionCommand { name, args: _ } => {
+                                    // Execute action if it exists
+                                    if let Some(action) = app.settings.actions.iter().find(|a| a.name.eq_ignore_ascii_case(&name)) {
+                                        let commands = split_action_commands(&action.command);
+                                        if world_index < app.worlds.len() {
+                                            if let Some(tx) = &app.worlds[world_index].command_tx {
+                                                for cmd in commands {
+                                                    if cmd.eq_ignore_ascii_case("/gag") || cmd.to_lowercase().starts_with("/gag ") {
+                                                        continue;
+                                                    }
+                                                    let _ = tx.try_send(WriteCommand::Text(cmd));
+                                                }
+                                                app.worlds[world_index].last_send_time = Some(std::time::Instant::now());
                                             }
-                                            let _ = tx.try_send(WriteCommand::Text(cmd));
                                         }
-                                        app.worlds[world_index].last_send_time = Some(std::time::Instant::now());
+                                    } else {
+                                        app.ws_broadcast(WsMessage::ServerData {
+                                            world_index,
+                                            data: format!("Unknown action: /{}", name),
+                                        });
                                     }
-                                } else {
+                                }
+                                Command::NotACommand { text } => {
+                                    // Regular text - send to MUD
+                                    if world_index < app.worlds.len() {
+                                        if let Some(tx) = &app.worlds[world_index].command_tx {
+                                            if tx.try_send(WriteCommand::Text(text)).is_ok() {
+                                                app.worlds[world_index].last_send_time = Some(std::time::Instant::now());
+                                                app.worlds[world_index].prompt.clear();
+                                            }
+                                        }
+                                    }
+                                }
+                                Command::Unknown { cmd } => {
                                     app.ws_broadcast(WsMessage::ServerData {
                                         world_index,
-                                        data: format!("Unknown command: {}", command),
+                                        data: format!("Unknown command: {}", cmd),
                                     });
                                 }
-                            } else if world_index < app.worlds.len() {
-                                if let Some(tx) = &app.worlds[world_index].command_tx {
-                                    if tx.try_send(WriteCommand::Text(command)).is_ok() {
-                                        app.worlds[world_index].last_send_time = Some(std::time::Instant::now());
-                                        app.worlds[world_index].prompt.clear();
+                                _ => {
+                                    // All other commands - send to MUD as-is
+                                    // These are either handled by the GUI/web interface locally
+                                    // or should be passed through to the MUD
+                                    if world_index < app.worlds.len() {
+                                        if let Some(tx) = &app.worlds[world_index].command_tx {
+                                            if tx.try_send(WriteCommand::Text(command)).is_ok() {
+                                                app.worlds[world_index].last_send_time = Some(std::time::Instant::now());
+                                                app.worlds[world_index].prompt.clear();
+                                            }
+                                        }
                                     }
                                 }
                             }
@@ -8973,7 +9130,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                 app.ws_broadcast(WsMessage::WorldSettingsUpdated { world_index, settings: settings_msg, name });
                             }
                         }
-                        WsMessage::UpdateGlobalSettings { console_theme, gui_theme, input_height, font_name, font_size, ws_allow_list, http_enabled, http_port, https_enabled, https_port } => {
+                        WsMessage::UpdateGlobalSettings { console_theme, gui_theme, input_height, font_name, font_size, ws_allow_list, web_secure, http_enabled, http_port, ws_enabled, ws_port } => {
                             app.settings.theme = Theme::from_name(&console_theme);
                             app.settings.gui_theme = Theme::from_name(&gui_theme);
                             app.input_height = input_height.clamp(1, 15);
@@ -8984,10 +9141,11 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                             if let Some(ref server) = app.ws_server {
                                 server.update_allow_list(&ws_allow_list);
                             }
+                            app.settings.web_secure = web_secure;
                             app.settings.http_enabled = http_enabled;
                             app.settings.http_port = http_port;
-                            app.settings.https_enabled = https_enabled;
-                            app.settings.https_port = https_port;
+                            app.settings.ws_enabled = ws_enabled;
+                            app.settings.ws_port = ws_port;
                             let _ = save_settings(&app);
                             let settings_msg = GlobalSettingsMsg {
                                 more_mode_enabled: app.settings.more_mode_enabled,
@@ -9001,10 +9159,11 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                 font_name: app.settings.font_name.clone(),
                                 font_size: app.settings.font_size,
                                 ws_allow_list: app.settings.websocket_allow_list.clone(),
+                                web_secure: app.settings.web_secure,
                                 http_enabled: app.settings.http_enabled,
                                 http_port: app.settings.http_port,
-                                https_enabled: app.settings.https_enabled,
-                                https_port: app.settings.https_port,
+                                ws_enabled: app.settings.ws_enabled,
+                                ws_port: app.settings.ws_port,
                             };
                             app.ws_broadcast(WsMessage::GlobalSettingsUpdated { settings: settings_msg, input_height: app.input_height });
                         }
@@ -10363,77 +10522,62 @@ fn handle_key_event(key: KeyEvent, app: &mut App) -> KeyAction {
 }
 
 async fn handle_command(cmd: &str, app: &mut App, event_tx: mpsc::Sender<AppEvent>) -> bool {
-    let parts: Vec<&str> = cmd.split_whitespace().collect();
+    let parsed = parse_command(cmd);
 
-    match parts.first().copied() {
-        Some("/help") => {
+    match parsed {
+        Command::Help => {
             app.help_popup.open();
         }
-        Some("/quit") => {
+        Command::Quit => {
             return true; // Signal to quit
         }
-        Some("/setup") => {
+        Command::Setup => {
             // Open settings popup for global settings only
             app.settings_popup.open_setup(&app.settings, app.input_height, app.show_tags);
         }
-        Some("/web") => {
+        Command::Web => {
             // Open web settings popup
             app.web_popup.open(&app.settings);
         }
-        Some("/world") => {
-            if parts.len() < 2 {
-                // No args: show world selector popup
-                app.world_selector.open(app.current_world_index);
-                return false;
-            }
-
-            // Check for -e flag
-            if parts[1] == "-e" {
-                // /world -e or /world -e <name>
-                let idx = if parts.len() >= 3 {
-                    // /world -e <name> - find or create the world, then edit
-                    app.find_or_create_world(parts[2])
-                } else {
-                    // /world -e - edit current world
-                    app.current_world_index
-                };
-                let input_height = app.input_height;
-                let show_tags = app.show_tags;
-                app.settings_popup.open(&app.settings, &app.worlds[idx], idx, input_height, show_tags);
-                // If editing a different world, we need to track which world we're editing
-                // The settings popup already handles this via temp values
-                return false;
-            }
-
-            // Check for -l flag (connect without auto-login)
-            if parts[1] == "-l" {
-                if parts.len() < 3 {
-                    app.add_output("Usage: /world -l <name>");
-                    return false;
-                }
-                let name = parts[2];
-                if let Some(idx) = app.find_world(name) {
-                    app.switch_world(idx);
-                    if !app.current_world().connected {
-                        let has_settings = !app.current_world().settings.hostname.is_empty()
-                            && !app.current_world().settings.port.is_empty();
-                        if has_settings {
-                            // Set flag to skip auto-login
-                            app.current_world_mut().skip_auto_login = true;
-                            return Box::pin(handle_command("/connect", app, event_tx)).await;
-                        } else {
-                            app.add_output(&format!("World '{}' has no connection settings.", name));
-                        }
+        Command::WorldSelector => {
+            // /world (no args) - show world selector popup
+            app.world_selector.open(app.current_world_index);
+        }
+        Command::WorldEdit { name } => {
+            // /world -e or /world -e <name>
+            let idx = if let Some(ref world_name) = name {
+                // /world -e <name> - find or create the world, then edit
+                app.find_or_create_world(world_name)
+            } else {
+                // /world -e - edit current world
+                app.current_world_index
+            };
+            let input_height = app.input_height;
+            let show_tags = app.show_tags;
+            app.settings_popup.open(&app.settings, &app.worlds[idx], idx, input_height, show_tags);
+        }
+        Command::WorldConnectNoLogin { name } => {
+            // /world -l <name> - connect without auto-login
+            if let Some(idx) = app.find_world(&name) {
+                app.switch_world(idx);
+                if !app.current_world().connected {
+                    let has_settings = !app.current_world().settings.hostname.is_empty()
+                        && !app.current_world().settings.port.is_empty();
+                    if has_settings {
+                        // Set flag to skip auto-login
+                        app.current_world_mut().skip_auto_login = true;
+                        return Box::pin(handle_command("/connect", app, event_tx)).await;
+                    } else {
+                        app.add_output(&format!("World '{}' has no connection settings.", name));
                     }
-                } else {
-                    app.add_output(&format!("World '{}' not found.", name));
                 }
-                return false;
+            } else {
+                app.add_output(&format!("World '{}' not found.", name));
             }
-
+        }
+        Command::WorldSwitch { name } => {
             // /world <name> - connect to world if exists, else show editor for new world
-            let name = parts[1];
-            if let Some(idx) = app.find_world(name) {
+            if let Some(idx) = app.find_world(&name) {
                 // World exists - switch to it and connect if has settings
                 app.switch_world(idx);
                 if !app.current_world().connected {
@@ -10450,19 +10594,19 @@ async fn handle_command(cmd: &str, app: &mut App, event_tx: mpsc::Sender<AppEven
                 }
             } else {
                 // World doesn't exist - create it and show editor
-                let idx = app.find_or_create_world(name);
+                let idx = app.find_or_create_world(&name);
                 app.switch_world(idx);
                 let input_height = app.input_height;
                 let show_tags = app.show_tags;
                 app.settings_popup.open(&app.settings, &app.worlds[idx], idx, input_height, show_tags);
             }
         }
-        Some("/worlds") | Some("/l") => {
+        Command::WorldsList => {
             let current_idx = app.current_world_index;
             let screen_width = app.output_width;
             app.worlds_popup.show(&app.worlds, current_idx, screen_width);
         }
-        Some("/keepalive") => {
+        Command::Keepalive => {
             // Show keepalive settings for all worlds
             let current_idx = app.current_world_index;
             let lines: Vec<String> = app.worlds.iter().enumerate().map(|(idx, world)| {
@@ -10493,10 +10637,10 @@ async fn handle_command(cmd: &str, app: &mut App, event_tx: mpsc::Sender<AppEven
             app.add_output("─".repeat(70).as_str());
             app.add_output("(*=current, ✓=connected)");
         }
-        Some("/actions") => {
+        Command::Actions => {
             app.actions_popup.open(&app.settings.actions);
         }
-        Some("/connect") => {
+        Command::Connect { host: arg_host, port: arg_port, ssl: arg_ssl } => {
             if app.current_world().connected {
                 app.add_output("Already connected. Use /disconnect first.");
                 return false;
@@ -10504,9 +10648,8 @@ async fn handle_command(cmd: &str, app: &mut App, event_tx: mpsc::Sender<AppEven
 
             // Determine host/port/ssl: use args if provided, else use stored settings
             let world_settings = &app.current_world().settings;
-            let (host, port, use_ssl) = if parts.len() >= 3 {
-                let ssl = parts.get(3).map(|s| *s == "ssl").unwrap_or(false);
-                (parts[1].to_string(), parts[2].to_string(), ssl)
+            let (host, port, use_ssl) = if let (Some(h), Some(p)) = (arg_host, arg_port) {
+                (h, p, arg_ssl)
             } else if !world_settings.hostname.is_empty() && !world_settings.port.is_empty() {
                 (
                     world_settings.hostname.clone(),
@@ -10791,7 +10934,7 @@ async fn handle_command(cmd: &str, app: &mut App, event_tx: mpsc::Sender<AppEven
                 }
             }
         }
-        Some("/disconnect") | Some("/dc") => {
+        Command::Disconnect => {
             if app.current_world().connected {
                 app.current_world_mut().command_tx = None;
                 app.current_world_mut().connected = false;
@@ -10803,85 +10946,7 @@ async fn handle_command(cmd: &str, app: &mut App, event_tx: mpsc::Sender<AppEven
                 app.add_output("Not connected.");
             }
         }
-        Some("/send") => {
-            // /send [-W] [-w<world>] [-n] <text>
-            // -w<world> sends to specified world
-            // -W sends to all connected worlds
-            // -n sends without CR/LF
-            let mut send_all = false;
-            let mut no_newline = false;
-            let mut target_world: Option<String> = None;
-            let mut text_start_idx = 1;
-
-            // Parse options
-            for (i, part) in parts.iter().enumerate().skip(1) {
-                if *part == "-W" {
-                    send_all = true;
-                    text_start_idx = i + 1;
-                } else if *part == "-n" {
-                    no_newline = true;
-                    text_start_idx = i + 1;
-                } else if let Some(world_suffix) = part.strip_prefix("-w") {
-                    // -w<world> (no space) or -w <world> (space)
-                    if !world_suffix.is_empty() {
-                        // -w<world> format
-                        target_world = Some(world_suffix.to_string());
-                        text_start_idx = i + 1;
-                    } else if i + 1 < parts.len() {
-                        // -w <world> format
-                        target_world = Some(parts[i + 1].to_string());
-                        text_start_idx = i + 2;
-                    } else {
-                        app.add_output("Usage: /send [-W] [-w<world>] [-n] <text>");
-                        return false;
-                    }
-                } else if part.starts_with('-') {
-                    // Unknown option
-                    app.add_output(&format!("Unknown option: {}", part));
-                    app.add_output("Usage: /send [-W] [-w<world>] [-n] <text>");
-                    return false;
-                } else {
-                    // First non-option is start of text
-                    text_start_idx = i;
-                    break;
-                }
-            }
-
-            // Get the text to send (everything after options)
-            if text_start_idx >= parts.len() {
-                app.add_output("Usage: /send [-W] [-w<world>] [-n] <text>");
-                return false;
-            }
-
-            // Reconstruct the text from the original command to preserve spacing
-            // Find where the text starts in the original command string
-            let skip_count = text_start_idx;
-            let mut text_offset = 0;
-            let cmd_chars: Vec<char> = cmd.chars().collect();
-            let mut in_word = false;
-            let mut word_count = 0;
-
-            for (i, c) in cmd_chars.iter().enumerate() {
-                if c.is_whitespace() {
-                    if in_word {
-                        word_count += 1;
-                        in_word = false;
-                        if word_count == skip_count {
-                            // Skip leading whitespace after the last option
-                            text_offset = i;
-                            while text_offset < cmd_chars.len() && cmd_chars[text_offset].is_whitespace() {
-                                text_offset += 1;
-                            }
-                            break;
-                        }
-                    }
-                } else {
-                    in_word = true;
-                }
-            }
-
-            let text = &cmd[text_offset..];
-
+        Command::Send { text, all_worlds, target_world, no_newline } => {
             // Send the text
             let send_to_world = |world: &mut World, text: &str, no_newline: bool| -> bool {
                 if !world.connected {
@@ -10901,11 +10966,11 @@ async fn handle_command(cmd: &str, app: &mut App, event_tx: mpsc::Sender<AppEven
                 false
             };
 
-            if send_all {
+            if all_worlds {
                 // Send to all connected worlds
                 let mut sent_count = 0;
                 for world in &mut app.worlds {
-                    if send_to_world(world, text, no_newline) {
+                    if send_to_world(world, &text, no_newline) {
                         sent_count += 1;
                     }
                 }
@@ -10915,7 +10980,7 @@ async fn handle_command(cmd: &str, app: &mut App, event_tx: mpsc::Sender<AppEven
             } else if let Some(world_name) = target_world {
                 // Send to specific world
                 if let Some(idx) = app.find_world(&world_name) {
-                    if !send_to_world(&mut app.worlds[idx], text, no_newline) {
+                    if !send_to_world(&mut app.worlds[idx], &text, no_newline) {
                         app.add_output(&format!("World '{}' is not connected.", world_name));
                     }
                 } else {
@@ -10940,7 +11005,7 @@ async fn handle_command(cmd: &str, app: &mut App, event_tx: mpsc::Sender<AppEven
                 }
             }
         }
-        Some("/reload") => {
+        Command::Reload => {
             // First check if we can find the executable (handling " (deleted)" suffix)
             let exe_path = match get_executable_path() {
                 Ok((p, _)) => p,
@@ -11001,33 +11066,45 @@ async fn handle_command(cmd: &str, app: &mut App, event_tx: mpsc::Sender<AppEven
                 }
             }
         }
-        Some(unknown) => {
+        Command::Gag { pattern } => {
+            // TODO: Implement gag patterns
+            app.add_output(&format!("Gag pattern set: {}", pattern));
+        }
+        Command::ActionCommand { name, args: _ } => {
             // Check if this is an action command (/name)
-            let action_name = unknown.trim_start_matches('/');
             let action_found = app.settings.actions.iter()
-                .find(|a| a.name.eq_ignore_ascii_case(action_name))
+                .find(|a| a.name.eq_ignore_ascii_case(&name))
                 .cloned();
 
             if let Some(action) = action_found {
                 // Execute the action's commands
                 let commands = split_action_commands(&action.command);
                 if let Some(tx) = &app.current_world().command_tx {
-                    for cmd in commands {
+                    for cmd_str in commands {
                         // Skip /gag commands when invoked manually
-                        if cmd.eq_ignore_ascii_case("/gag") || cmd.to_lowercase().starts_with("/gag ") {
+                        if cmd_str.eq_ignore_ascii_case("/gag") || cmd_str.to_lowercase().starts_with("/gag ") {
                             continue;
                         }
-                        let _ = tx.try_send(WriteCommand::Text(cmd));
+                        let _ = tx.try_send(WriteCommand::Text(cmd_str));
                     }
                     app.current_world_mut().last_send_time = Some(std::time::Instant::now());
                 } else {
                     app.add_output("Not connected. Cannot execute action.");
                 }
             } else {
-                app.add_output(&format!("Unknown command: {}", unknown));
+                app.add_output(&format!("Unknown action: /{}", name));
             }
         }
-        None => {}
+        Command::NotACommand { text } => {
+            // Not a command - send to MUD as regular input
+            if let Some(tx) = &app.current_world().command_tx {
+                let _ = tx.try_send(WriteCommand::Text(text));
+                app.current_world_mut().last_send_time = Some(std::time::Instant::now());
+            }
+        }
+        Command::Unknown { cmd } => {
+            app.add_output(&format!("Unknown command: {}", cmd));
+        }
     }
     false
 }
@@ -12213,34 +12290,53 @@ fn render_web_popup(f: &mut Frame, app: &App) {
     };
 
     let w = label_width;
-    let lines = vec![
-        Line::from(""),
-        Line::from(Span::styled("  -- WebSocket (secure wss://) --", Style::default().fg(theme.fg_accent()))),
-        render_toggle_field("WS enabled:", popup.temp_ws_enabled, WebField::WsEnabled, w),
-        render_text_field("WS port:", &popup.temp_ws_port, WebField::WsPort, w),
-        render_text_field("WS password:", &popup.temp_ws_password, WebField::WsPassword, w),
-        render_text_field("WS allow list:", &popup.temp_ws_allow_list, WebField::WsAllowList, w),
-        render_text_field("TLS cert file:", &popup.temp_ws_cert_file, WebField::WsCertFile, w),
-        render_text_field("TLS key file:", &popup.temp_ws_key_file, WebField::WsKeyFile, w),
-        render_toggle_field("WS Use TLS:", popup.temp_ws_use_tls, WebField::WsUseTls, w),
-        Line::from(""),
-        Line::from(Span::styled("  -- WebSocket (non-secure ws://) --", Style::default().fg(theme.fg_accent()))),
-        render_toggle_field("WS Nonsecure:", popup.temp_ws_nonsecure_enabled, WebField::WsNonsecureEnabled, w),
-        render_text_field("WS NS port:", &popup.temp_ws_nonsecure_port, WebField::WsNonsecurePort, w),
-        Line::from(""),
-        Line::from(Span::styled("  -- HTTP/HTTPS Web Interface --", Style::default().fg(theme.fg_accent()))),
-        render_toggle_field("HTTP enabled:", popup.temp_http_enabled, WebField::HttpEnabled, w),
-        render_text_field("HTTP port:", &popup.temp_http_port, WebField::HttpPort, w),
-        render_toggle_field("HTTPS enabled:", popup.temp_https_enabled, WebField::HttpsEnabled, w),
-        render_text_field("HTTPS port:", &popup.temp_https_port, WebField::HttpsPort, w),
-        Line::from(""),
+
+    // Build dynamic field labels based on protocol
+    let http_label = if popup.temp_web_secure { "HTTPS enabled:" } else { "HTTP enabled:" };
+    let http_port_label = if popup.temp_web_secure { "HTTPS port:" } else { "HTTP port:" };
+    let ws_label = if popup.temp_web_secure { "WSS enabled:" } else { "WS enabled:" };
+    let ws_port_label = if popup.temp_web_secure { "WSS port:" } else { "WS port:" };
+    let protocol_value = if popup.temp_web_secure { "Secure" } else { "Non-Secure" };
+
+    // Helper to render protocol toggle (shows as option with current value)
+    let render_protocol_field = |label: &str, value: &str, field: WebField, width: usize| -> Line<'static> {
+        let style = field_style(field);
         Line::from(vec![
-            render_button("Save", WebField::SaveWeb),
-            Span::raw("  "),
-            render_button("Cancel", WebField::CancelWeb),
-            Span::raw(" "),
-        ]).alignment(Alignment::Right),
+            Span::styled(format!("  {:<width$}", label), style),
+            Span::styled(format!("[{}]", value), style),
+        ])
+    };
+
+    let mut lines = vec![
+        Line::from(""),
+        render_protocol_field("Protocol:", protocol_value, WebField::Protocol, w),
+        Line::from(""),
+        Line::from(Span::styled("  -- Web Interface --", Style::default().fg(theme.fg_accent()))),
+        render_toggle_field(http_label, popup.temp_http_enabled, WebField::HttpEnabled, w),
+        render_text_field(http_port_label, &popup.temp_http_port, WebField::HttpPort, w),
+        Line::from(""),
+        Line::from(Span::styled("  -- WebSocket Server --", Style::default().fg(theme.fg_accent()))),
+        render_toggle_field(ws_label, popup.temp_ws_enabled, WebField::WsEnabled, w),
+        render_text_field(ws_port_label, &popup.temp_ws_port, WebField::WsPort, w),
+        render_text_field("Password:", &popup.temp_ws_password, WebField::WsPassword, w),
+        render_text_field("Allow List:", &popup.temp_ws_allow_list, WebField::WsAllowList, w),
     ];
+
+    // Only show TLS cert/key fields when secure protocol is selected
+    if popup.temp_web_secure {
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled("  -- TLS Settings --", Style::default().fg(theme.fg_accent()))));
+        lines.push(render_text_field("TLS cert file:", &popup.temp_ws_cert_file, WebField::WsCertFile, w));
+        lines.push(render_text_field("TLS key file:", &popup.temp_ws_key_file, WebField::WsKeyFile, w));
+    }
+
+    lines.push(Line::from(""));
+    lines.push(Line::from(vec![
+        render_button("Save", WebField::SaveWeb),
+        Span::raw("  "),
+        render_button("Cancel", WebField::CancelWeb),
+        Span::raw(" "),
+    ]).alignment(Alignment::Right));
 
     // Calculate dynamic size
     let max_content_width = lines.iter().map(|line| {

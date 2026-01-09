@@ -68,7 +68,21 @@
         worldEditBtn: document.getElementById('world-edit-btn'),
         worldConnectBtn: document.getElementById('world-connect-btn'),
         worldSwitchBtn: document.getElementById('world-switch-btn'),
-        worldSelectorCancelBtn: document.getElementById('world-selector-cancel-btn')
+        worldSelectorCancelBtn: document.getElementById('world-selector-cancel-btn'),
+        // Web settings popup
+        webModal: document.getElementById('web-modal'),
+        webProtocolBtn: document.getElementById('web-protocol-btn'),
+        webHttpEnabledBtn: document.getElementById('web-http-enabled-btn'),
+        webHttpPort: document.getElementById('web-http-port'),
+        webWsEnabledBtn: document.getElementById('web-ws-enabled-btn'),
+        webWsPort: document.getElementById('web-ws-port'),
+        webAllowList: document.getElementById('web-allow-list'),
+        webSaveBtn: document.getElementById('web-save-btn'),
+        webCancelBtn: document.getElementById('web-cancel-btn'),
+        httpLabel: document.getElementById('http-label'),
+        httpPortLabel: document.getElementById('http-port-label'),
+        wsLabel: document.getElementById('ws-label'),
+        wsPortLabel: document.getElementById('ws-port-label')
     };
 
     // State
@@ -107,6 +121,15 @@
     // World popup state
     let worldsPopupOpen = false;
     let worldSelectorPopupOpen = false;
+
+    // Web settings popup state
+    let webPopupOpen = false;
+    let webSecure = false;
+    let httpEnabled = false;
+    let httpPort = 9000;
+    let wsEnabled = false;
+    let wsPort = 9001;
+    let wsAllowList = '';
     let selectedWorldIndex = -1;
     let selectedWorldsRowIndex = -1; // For worlds list popup (/worlds)
 
@@ -124,6 +147,170 @@
 
     // Device mode: 'desktop' or 'mobile'
     let deviceMode = 'desktop';
+
+    // ============================================================================
+    // Command Parsing (mirrors Rust parse_command)
+    // ============================================================================
+
+    // Command types enum (as object)
+    const CommandType = {
+        HELP: 'Help',
+        QUIT: 'Quit',
+        RELOAD: 'Reload',
+        SETUP: 'Setup',
+        WEB: 'Web',
+        ACTIONS: 'Actions',
+        WORLDS_LIST: 'WorldsList',
+        WORLD_SELECTOR: 'WorldSelector',
+        WORLD_EDIT: 'WorldEdit',
+        WORLD_CONNECT_NO_LOGIN: 'WorldConnectNoLogin',
+        WORLD_SWITCH: 'WorldSwitch',
+        CONNECT: 'Connect',
+        DISCONNECT: 'Disconnect',
+        SEND: 'Send',
+        KEEPALIVE: 'Keepalive',
+        GAG: 'Gag',
+        ACTION_COMMAND: 'ActionCommand',
+        NOT_A_COMMAND: 'NotACommand',
+        UNKNOWN: 'Unknown'
+    };
+
+    // Internal commands that are handled by the server (not action names)
+    const INTERNAL_COMMANDS = [
+        'help', 'quit', 'reload', 'setup', 'web', 'actions', 'world', 'worlds',
+        'l', 'connect', 'disconnect', 'dc', 'send', 'keepalive', 'gag'
+    ];
+
+    function isInternalCommand(name) {
+        return INTERNAL_COMMANDS.includes(name.toLowerCase());
+    }
+
+    // Parse a command string and return command object
+    function parseCommand(input) {
+        const trimmed = input.trim();
+
+        // Not a command if doesn't start with /
+        if (!trimmed.startsWith('/')) {
+            return { type: CommandType.NOT_A_COMMAND, text: trimmed };
+        }
+
+        const parts = trimmed.split(/\s+/);
+        if (parts.length === 0) {
+            return { type: CommandType.NOT_A_COMMAND, text: trimmed };
+        }
+
+        const cmd = parts[0].toLowerCase();
+        const args = parts.slice(1);
+
+        switch (cmd) {
+            case '/help':
+                return { type: CommandType.HELP };
+            case '/quit':
+                return { type: CommandType.QUIT };
+            case '/reload':
+                return { type: CommandType.RELOAD };
+            case '/setup':
+                return { type: CommandType.SETUP };
+            case '/web':
+                return { type: CommandType.WEB };
+            case '/actions':
+                return { type: CommandType.ACTIONS };
+            case '/worlds':
+            case '/l':
+                return { type: CommandType.WORLDS_LIST };
+            case '/world':
+                return parseWorldCommand(args);
+            case '/connect':
+                return parseConnectCommand(args);
+            case '/disconnect':
+            case '/dc':
+                return { type: CommandType.DISCONNECT };
+            case '/send':
+                return parseSendCommand(args, trimmed);
+            case '/keepalive':
+                return { type: CommandType.KEEPALIVE };
+            case '/gag':
+                if (args.length === 0) {
+                    return { type: CommandType.UNKNOWN, cmd: trimmed };
+                }
+                return { type: CommandType.GAG, pattern: args.join(' ') };
+            default:
+                // Check if it's an action command (starts with / but not a known command)
+                const actionName = cmd.slice(1);
+                if (actionName && !isInternalCommand(actionName)) {
+                    return { type: CommandType.ACTION_COMMAND, name: actionName, args: args.join(' ') };
+                }
+                return { type: CommandType.UNKNOWN, cmd: trimmed };
+        }
+    }
+
+    // Parse /world command variants
+    function parseWorldCommand(args) {
+        if (args.length === 0) {
+            return { type: CommandType.WORLD_SELECTOR };
+        }
+
+        if (args[0] === '-e') {
+            // /world -e [name]
+            const name = args.length > 1 ? args.slice(1).join(' ') : null;
+            return { type: CommandType.WORLD_EDIT, name: name };
+        }
+
+        if (args[0] === '-l') {
+            // /world -l <name>
+            if (args.length > 1) {
+                return { type: CommandType.WORLD_CONNECT_NO_LOGIN, name: args.slice(1).join(' ') };
+            }
+            return { type: CommandType.UNKNOWN, cmd: '/world -l' };
+        }
+
+        // /world <name>
+        return { type: CommandType.WORLD_SWITCH, name: args.join(' ') };
+    }
+
+    // Parse /connect command
+    function parseConnectCommand(args) {
+        if (args.length === 0) {
+            return { type: CommandType.CONNECT, host: null, port: null, ssl: false };
+        }
+
+        const host = args[0];
+        const port = args.length > 1 ? args[1] : null;
+        const ssl = args.length > 2 && args[2].toLowerCase() === 'ssl';
+
+        return { type: CommandType.CONNECT, host: host, port: port, ssl: ssl };
+    }
+
+    // Parse /send command with flags
+    function parseSendCommand(args, fullCmd) {
+        let allWorlds = false;
+        let targetWorld = null;
+        let noNewline = false;
+        let textStart = 0;
+
+        for (let i = 0; i < args.length; i++) {
+            const arg = args[i];
+            if (arg === '-W') {
+                allWorlds = true;
+                textStart = i + 1;
+            } else if (arg.startsWith('-w')) {
+                targetWorld = arg.slice(2) || (args[i + 1] || '');
+                textStart = arg.length > 2 ? i + 1 : i + 2;
+            } else if (arg === '-n') {
+                noNewline = true;
+                textStart = i + 1;
+            } else {
+                break;
+            }
+        }
+
+        const text = args.slice(textStart).join(' ');
+        return { type: CommandType.SEND, text: text, allWorlds: allWorlds, targetWorld: targetWorld, noNewline: noNewline };
+    }
+
+    // ============================================================================
+    // Device Detection
+    // ============================================================================
 
     // Detect device type and return appropriate font size
     function detectDeviceType() {
@@ -271,6 +458,25 @@
                     if (msg.settings.show_tags !== undefined) {
                         showTags = msg.settings.show_tags;
                     }
+                    // Web settings
+                    if (msg.settings.web_secure !== undefined) {
+                        webSecure = msg.settings.web_secure;
+                    }
+                    if (msg.settings.http_enabled !== undefined) {
+                        httpEnabled = msg.settings.http_enabled;
+                    }
+                    if (msg.settings.http_port !== undefined) {
+                        httpPort = msg.settings.http_port;
+                    }
+                    if (msg.settings.ws_enabled !== undefined) {
+                        wsEnabled = msg.settings.ws_enabled;
+                    }
+                    if (msg.settings.ws_port !== undefined) {
+                        wsPort = msg.settings.ws_port;
+                    }
+                    if (msg.settings.ws_allow_list !== undefined) {
+                        wsAllowList = msg.settings.ws_allow_list;
+                    }
                     if (msg.settings.world_switch_mode !== undefined) {
                         worldSwitchMode = msg.settings.world_switch_mode;
                     }
@@ -368,6 +574,25 @@
                     }
                     if (msg.settings.world_switch_mode !== undefined) {
                         worldSwitchMode = msg.settings.world_switch_mode;
+                    }
+                    // Web settings
+                    if (msg.settings.web_secure !== undefined) {
+                        webSecure = msg.settings.web_secure;
+                    }
+                    if (msg.settings.http_enabled !== undefined) {
+                        httpEnabled = msg.settings.http_enabled;
+                    }
+                    if (msg.settings.http_port !== undefined) {
+                        httpPort = msg.settings.http_port;
+                    }
+                    if (msg.settings.ws_enabled !== undefined) {
+                        wsEnabled = msg.settings.ws_enabled;
+                    }
+                    if (msg.settings.ws_port !== undefined) {
+                        wsPort = msg.settings.ws_port;
+                    }
+                    if (msg.settings.ws_allow_list !== undefined) {
+                        wsAllowList = msg.settings.ws_allow_list;
                     }
                 }
                 break;
@@ -575,37 +800,48 @@
         const cmd = elements.input.value;
         if (cmd.length === 0 && !authenticated) return;
 
-        const trimmedCmd = cmd.trim();
+        // Use shared command parsing
+        const parsed = parseCommand(cmd);
 
-        // Check for local commands
-        if (trimmedCmd === '/actions') {
-            elements.input.value = '';
-            openActionsPopup();
-            return;
-        }
-
-        // /worlds or /l - show worlds list popup
-        if (trimmedCmd === '/worlds' || trimmedCmd === '/l') {
-            elements.input.value = '';
-            openWorldsPopup();
-            return;
-        }
-
-        // /world (no args) - show world selector popup
-        if (trimmedCmd === '/world') {
-            elements.input.value = '';
-            openWorldSelectorPopup();
-            return;
-        }
-
-        // /world <name> - switch to or connect to named world
-        if (trimmedCmd.startsWith('/world ')) {
-            const worldName = trimmedCmd.substring(7).trim();
-            if (worldName) {
+        // Handle local popup commands
+        switch (parsed.type) {
+            case CommandType.ACTIONS:
                 elements.input.value = '';
-                handleWorldCommand(worldName);
+                openActionsPopup();
                 return;
-            }
+
+            case CommandType.WEB:
+                elements.input.value = '';
+                openWebPopup();
+                return;
+
+            case CommandType.WORLDS_LIST:
+                elements.input.value = '';
+                openWorldsPopup();
+                return;
+
+            case CommandType.WORLD_SELECTOR:
+                elements.input.value = '';
+                openWorldSelectorPopup();
+                return;
+
+            case CommandType.WORLD_SWITCH:
+                elements.input.value = '';
+                handleWorldCommand(parsed.name);
+                return;
+
+            case CommandType.WORLD_EDIT:
+                // Open world editor - for now just send to server
+                // (world editor UI not implemented in web interface yet)
+                break;
+
+            case CommandType.WORLD_CONNECT_NO_LOGIN:
+                // Connect without auto-login - send to server
+                break;
+
+            default:
+                // All other commands - continue to send to server
+                break;
         }
 
         // Release all pending lines when sending a command
@@ -1282,6 +1518,66 @@
         }
     }
 
+    // Web settings popup functions (/web)
+    function openWebPopup() {
+        webPopupOpen = true;
+        elements.webModal.className = 'modal visible';
+        elements.webModal.style.display = 'flex';
+        updateWebPopupUI();
+    }
+
+    function closeWebPopup() {
+        webPopupOpen = false;
+        elements.webModal.className = 'modal';
+        elements.webModal.style.display = 'none';
+        elements.input.focus();
+    }
+
+    function updateWebPopupUI() {
+        // Update protocol button
+        elements.webProtocolBtn.textContent = webSecure ? 'Secure' : 'Non-Secure';
+
+        // Update labels based on protocol
+        elements.httpLabel.textContent = webSecure ? 'HTTPS enabled:' : 'HTTP enabled:';
+        elements.httpPortLabel.textContent = webSecure ? 'HTTPS port:' : 'HTTP port:';
+        elements.wsLabel.textContent = webSecure ? 'WSS enabled:' : 'WS enabled:';
+        elements.wsPortLabel.textContent = webSecure ? 'WSS port:' : 'WS port:';
+
+        // Update toggle buttons
+        elements.webHttpEnabledBtn.textContent = httpEnabled ? 'on' : 'off';
+        elements.webWsEnabledBtn.textContent = wsEnabled ? 'on' : 'off';
+
+        // Update input fields
+        elements.webHttpPort.value = httpPort;
+        elements.webWsPort.value = wsPort;
+        elements.webAllowList.value = wsAllowList;
+    }
+
+    function saveWebSettings() {
+        // Read values from UI
+        httpPort = parseInt(elements.webHttpPort.value) || 9000;
+        wsPort = parseInt(elements.webWsPort.value) || 9001;
+        wsAllowList = elements.webAllowList.value;
+
+        // Send to server
+        send({
+            type: 'UpdateGlobalSettings',
+            console_theme: 'dark',
+            gui_theme: 'dark',
+            input_height: inputHeight,
+            font_name: '',
+            font_size: 14.0,
+            ws_allow_list: wsAllowList,
+            web_secure: webSecure,
+            http_enabled: httpEnabled,
+            http_port: httpPort,
+            ws_enabled: wsEnabled,
+            ws_port: wsPort
+        });
+
+        closeWebPopup();
+    }
+
     // Worlds list popup functions (/worlds, /l)
     function openWorldsPopup() {
         worldsPopupOpen = true;
@@ -1594,7 +1890,7 @@
 
     // Check if any popup is open
     function isAnyPopupOpen() {
-        return actionsListPopupOpen || actionsEditorPopupOpen || actionsConfirmPopupOpen || worldsPopupOpen || worldSelectorPopupOpen;
+        return actionsListPopupOpen || actionsEditorPopupOpen || actionsConfirmPopupOpen || worldsPopupOpen || worldSelectorPopupOpen || webPopupOpen;
     }
 
     // Check if a world should be included in cycling (connected OR has unseen output)
@@ -1947,6 +2243,15 @@
                 return;
             }
 
+            // Handle web settings popup
+            if (webPopupOpen) {
+                if (e.key === 'Escape') {
+                    e.preventDefault();
+                    closeWebPopup();
+                }
+                return;
+            }
+
             // Handle world selector popup
             if (worldSelectorPopupOpen) {
                 if (e.key === 'Escape') {
@@ -2168,6 +2473,22 @@
             }
             renderWorldSelectorList();
         };
+
+        // Web settings popup
+        elements.webProtocolBtn.onclick = function() {
+            webSecure = !webSecure;
+            updateWebPopupUI();
+        };
+        elements.webHttpEnabledBtn.onclick = function() {
+            httpEnabled = !httpEnabled;
+            updateWebPopupUI();
+        };
+        elements.webWsEnabledBtn.onclick = function() {
+            wsEnabled = !wsEnabled;
+            updateWebPopupUI();
+        };
+        elements.webSaveBtn.onclick = saveWebSettings;
+        elements.webCancelBtn.onclick = closeWebPopup;
 
         // Keepalive ping every 30 seconds
         setInterval(function() {
