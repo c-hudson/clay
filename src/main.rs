@@ -2843,12 +2843,6 @@ impl App {
         }
     }
 
-    /// Check if a world has unseen output (for pending_first prioritization)
-    fn world_has_pending(&self, idx: usize) -> bool {
-        let world = &self.worlds[idx];
-        world.unseen_lines > 0
-    }
-
     /// Switch to the world with the oldest pending output (Alt-w)
     /// Returns true if switched, false if no world has pending output
     fn switch_to_oldest_pending(&mut self) -> bool {
@@ -2888,115 +2882,41 @@ impl App {
         indices
     }
 
-    fn world_should_cycle(&self, idx: usize) -> bool {
-        // Only cycle through: connected worlds OR worlds with unseen output
-        let world = &self.worlds[idx];
-        world.connected || world.unseen_lines > 0
-    }
-
     fn next_world(&mut self) {
-        // Get list of worlds that should be included in cycling
-        let cycleable: Vec<usize> = (0..self.worlds.len())
-            .filter(|&i| self.world_should_cycle(i))
+        // Build world info for shared function
+        let world_info: Vec<crate::util::WorldSwitchInfo> = self.worlds.iter()
+            .map(|w| crate::util::WorldSwitchInfo {
+                name: w.name.clone(),
+                connected: w.connected,
+                unseen_lines: w.unseen_lines,
+            })
             .collect();
 
-        if cycleable.is_empty() {
-            return; // No worlds to cycle through
-        }
-
-        // If world switching is set to "Unseen First", check for OTHER worlds with unseen output first
-        if self.settings.world_switch_mode == WorldSwitchMode::UnseenFirst {
-            // Get worlds with unseen output, excluding current world, sorted alphabetically
-            let mut unseen_worlds: Vec<usize> = cycleable.iter()
-                .filter(|&&i| i != self.current_world_index && self.world_has_pending(i))
-                .copied()
-                .collect();
-
-            if !unseen_worlds.is_empty() {
-                // Sort alphabetically and go to first
-                unseen_worlds.sort_by(|&a, &b| {
-                    self.worlds[a].name.to_lowercase().cmp(&self.worlds[b].name.to_lowercase())
-                });
-                self.switch_world(unseen_worlds[0]);
-                return;
-            }
-        }
-
-        // Fall back to alphabetical cycling
-        let mut sorted = cycleable.clone();
-        sorted.sort_by(|&a, &b| {
-            self.worlds[a].name.to_lowercase().cmp(&self.worlds[b].name.to_lowercase())
-        });
-
-        // Find current position in the sorted cycleable list
-        let current_pos = sorted.iter().position(|&i| i == self.current_world_index);
-
-        // Find next world in sorted order
-        match current_pos {
-            Some(pos) => {
-                let next_pos = (pos + 1) % sorted.len();
-                // Don't switch if we'd switch to ourselves
-                if sorted[next_pos] != self.current_world_index {
-                    self.switch_world(sorted[next_pos]);
-                }
-            }
-            None => {
-                // Current world isn't in cycleable list, go to first cycleable world
-                self.switch_world(sorted[0]);
-            }
+        if let Some(next_idx) = crate::util::calculate_next_world(
+            &world_info,
+            self.current_world_index,
+            self.settings.world_switch_mode,
+        ) {
+            self.switch_world(next_idx);
         }
     }
 
     fn prev_world(&mut self) {
-        // Get list of worlds that should be included in cycling
-        let cycleable: Vec<usize> = (0..self.worlds.len())
-            .filter(|&i| self.world_should_cycle(i))
+        // Build world info for shared function
+        let world_info: Vec<crate::util::WorldSwitchInfo> = self.worlds.iter()
+            .map(|w| crate::util::WorldSwitchInfo {
+                name: w.name.clone(),
+                connected: w.connected,
+                unseen_lines: w.unseen_lines,
+            })
             .collect();
 
-        if cycleable.is_empty() {
-            return; // No worlds to cycle through
-        }
-
-        // If world switching is set to "Unseen First", check for OTHER worlds with unseen output first
-        if self.settings.world_switch_mode == WorldSwitchMode::UnseenFirst {
-            // Get worlds with unseen output, excluding current world, sorted alphabetically
-            let mut unseen_worlds: Vec<usize> = cycleable.iter()
-                .filter(|&&i| i != self.current_world_index && self.world_has_pending(i))
-                .copied()
-                .collect();
-
-            if !unseen_worlds.is_empty() {
-                // Sort alphabetically and go to first (same behavior as next when unseen first is on)
-                unseen_worlds.sort_by(|&a, &b| {
-                    self.worlds[a].name.to_lowercase().cmp(&self.worlds[b].name.to_lowercase())
-                });
-                self.switch_world(unseen_worlds[0]);
-                return;
-            }
-        }
-
-        // Fall back to alphabetical cycling
-        let mut sorted = cycleable.clone();
-        sorted.sort_by(|&a, &b| {
-            self.worlds[a].name.to_lowercase().cmp(&self.worlds[b].name.to_lowercase())
-        });
-
-        // Find current position in the sorted cycleable list
-        let current_pos = sorted.iter().position(|&i| i == self.current_world_index);
-
-        // Find previous world in sorted order
-        match current_pos {
-            Some(pos) => {
-                let prev_pos = if pos > 0 { pos - 1 } else { sorted.len() - 1 };
-                // Don't switch if we'd switch to ourselves
-                if sorted[prev_pos] != self.current_world_index {
-                    self.switch_world(sorted[prev_pos]);
-                }
-            }
-            None => {
-                // Current world isn't in cycleable list, go to last cycleable world
-                self.switch_world(sorted[sorted.len() - 1]);
-            }
+        if let Some(prev_idx) = crate::util::calculate_prev_world(
+            &world_info,
+            self.current_world_index,
+            self.settings.world_switch_mode,
+        ) {
+            self.switch_world(prev_idx);
         }
     }
 
@@ -4388,6 +4308,7 @@ mod remote_gui {
         ConnectedWorlds,  // /worlds or /l - shows connected worlds with stats
         WorldEditor(usize),  // world index being edited
         Setup,
+        Web,  // /web - web settings (HTTP/HTTPS/WS)
         Font,
         Help,
         ActionsList,           // Actions list (first window)
@@ -4568,6 +4489,10 @@ mod remote_gui {
         scroll_max_offset: f32,
         /// Show MUD tags
         show_tags: bool,
+        /// More mode enabled (pause on overflow)
+        more_mode: bool,
+        /// Spell check enabled
+        spell_check_enabled: bool,
         /// Filter text for output
         filter_text: String,
         /// Whether filter popup is open
@@ -4645,6 +4570,8 @@ mod remote_gui {
                 scroll_offset: None,
                 scroll_max_offset: 0.0,
                 show_tags: false,
+                more_mode: true,
+                spell_check_enabled: true,
                 filter_text: String::new(),
                 filter_active: false,
                 ws_allow_list: String::new(),
@@ -4920,6 +4847,9 @@ mod remote_gui {
                             self.https_port = settings.https_port;
                             self.world_switch_mode = WorldSwitchMode::from_name(&settings.world_switch_mode);
                             self.debug_enabled = settings.debug_enabled;
+                            self.more_mode = settings.more_mode_enabled;
+                            self.spell_check_enabled = settings.spell_check_enabled;
+                            self.show_tags = settings.show_tags;
                             self.actions = actions;
                         }
                         WsMessage::ServerData { world_index, data } => {
@@ -4988,6 +4918,9 @@ mod remote_gui {
                             self.https_port = settings.https_port;
                             self.world_switch_mode = WorldSwitchMode::from_name(&settings.world_switch_mode);
                             self.debug_enabled = settings.debug_enabled;
+                            self.more_mode = settings.more_mode_enabled;
+                            self.spell_check_enabled = settings.spell_check_enabled;
+                            self.show_tags = settings.show_tags;
                         }
                         WsMessage::PendingLinesUpdate { world_index, count } => {
                             // Update pending count for world
@@ -5838,53 +5771,30 @@ mod remote_gui {
                                 self.filter_text.clear();
                             } else if self.input_buffer.trim().is_empty() {
                                 // Up/Down arrow with empty input - cycle active worlds
-                                // Active = connected OR has pending lines
-                                let get_sorted_active = || {
-                                    let mut active: Vec<usize> = self.worlds.iter()
-                                        .enumerate()
-                                        .filter(|(_, w)| w.connected || w.pending_count > 0)
-                                        .map(|(idx, _)| idx)
-                                        .collect();
-
-                                    if self.world_switch_mode == WorldSwitchMode::UnseenFirst {
-                                        // Sort: worlds with unseen output first, then alphabetically
-                                        active.sort_by(|&a, &b| {
-                                            let a_unseen = self.worlds[a].unseen_lines > 0;
-                                            let b_unseen = self.worlds[b].unseen_lines > 0;
-                                            match (a_unseen, b_unseen) {
-                                                (true, false) => std::cmp::Ordering::Less,
-                                                (false, true) => std::cmp::Ordering::Greater,
-                                                _ => self.worlds[a].name.to_lowercase().cmp(&self.worlds[b].name.to_lowercase()),
-                                            }
-                                        });
-                                    } else {
-                                        // Sort alphabetically
-                                        active.sort_by(|&a, &b| {
-                                            self.worlds[a].name.to_lowercase().cmp(&self.worlds[b].name.to_lowercase())
-                                        });
-                                    }
-                                    active
-                                };
+                                // Use shared world switching logic
+                                let world_info: Vec<crate::util::WorldSwitchInfo> = self.worlds.iter()
+                                    .map(|w| crate::util::WorldSwitchInfo {
+                                        name: w.name.clone(),
+                                        connected: w.connected,
+                                        unseen_lines: w.unseen_lines,
+                                    })
+                                    .collect();
 
                                 if i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowUp) {
-                                    let active = get_sorted_active();
-                                    if !active.is_empty() {
-                                        if let Some(pos) = active.iter().position(|&idx| idx == self.current_world) {
-                                            let prev = if pos == 0 { active.len() - 1 } else { pos - 1 };
-                                            switch_world = Some(active[prev]);
-                                        } else if let Some(&last) = active.last() {
-                                            switch_world = Some(last);
-                                        }
+                                    if let Some(prev_idx) = crate::util::calculate_prev_world(
+                                        &world_info,
+                                        self.current_world,
+                                        self.world_switch_mode,
+                                    ) {
+                                        switch_world = Some(prev_idx);
                                     }
                                 } else if i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowDown) {
-                                    let active = get_sorted_active();
-                                    if !active.is_empty() {
-                                        if let Some(pos) = active.iter().position(|&idx| idx == self.current_world) {
-                                            let next = (pos + 1) % active.len();
-                                            switch_world = Some(active[next]);
-                                        } else if let Some(&first) = active.first() {
-                                            switch_world = Some(first);
-                                        }
+                                    if let Some(next_idx) = crate::util::calculate_next_world(
+                                        &world_info,
+                                        self.current_world,
+                                        self.world_switch_mode,
+                                    ) {
+                                        switch_world = Some(next_idx);
                                     }
                                 }
                             }
@@ -6005,8 +5915,8 @@ mod remote_gui {
                         .stroke(egui::Stroke::NONE))
                     .show(ctx, |ui| {
                     ui.horizontal_centered(|ui| {
-                        // Hamburger menu (☰) - 20% larger
-                        let hamburger_size = 19.2;  // 16 * 1.2 = 19.2
+                        // Hamburger menu (☰) - 44% larger than base
+                        let hamburger_size = 23.0;  // 16 * 1.2 * 1.2 = 23.04
                         ui.menu_button(egui::RichText::new("☰").size(hamburger_size), |ui| {
                             if ui.button("Worlds List").clicked() {
                                 action = Some("connected_worlds");
@@ -6026,8 +5936,6 @@ mod remote_gui {
                                 ui.close_menu();
                             }
                         });
-
-                        ui.separator();
 
                         // S/M/L font size buttons (centered vertically via horizontal_centered)
                         let btn_size = 16.0;
@@ -6243,6 +6151,9 @@ mod remote_gui {
                                     match cmd.as_str() {
                                         "/setup" => {
                                             self.popup_state = PopupState::Setup;
+                                        }
+                                        "/web" => {
+                                            self.popup_state = PopupState::Web;
                                         }
                                         "/world" => {
                                             self.popup_state = PopupState::WorldList;
@@ -6927,7 +6838,7 @@ mod remote_gui {
                         });
                 }
 
-                // Setup popup
+                // Setup popup (matches console /setup)
                 if self.popup_state == PopupState::Setup {
                     egui::Window::new("Setup")
                         .collapsible(false)
@@ -6942,17 +6853,37 @@ mod remote_gui {
                                 .num_columns(2)
                                 .spacing([10.0, 8.0])
                                 .show(ui, |ui| {
-                                    ui.label("Console Theme:");
-                                    let console_theme_text = if self.console_theme == GuiTheme::Dark { "Dark" } else { "Light" };
-                                    if ui.button(console_theme_text).clicked() {
-                                        self.console_theme = if self.console_theme == GuiTheme::Dark { GuiTheme::Light } else { GuiTheme::Dark };
+                                    ui.label("More mode:");
+                                    let more_text = if self.more_mode { "on" } else { "off" };
+                                    if ui.button(more_text).clicked() {
+                                        self.more_mode = !self.more_mode;
                                     }
                                     ui.end_row();
 
-                                    ui.label("GUI Theme:");
-                                    let gui_theme_text = if self.theme == GuiTheme::Dark { "Dark" } else { "Light" };
-                                    if ui.button(gui_theme_text).clicked() {
-                                        self.theme = if self.theme == GuiTheme::Dark { GuiTheme::Light } else { GuiTheme::Dark };
+                                    ui.label("Spell check:");
+                                    let spell_text = if self.spell_check_enabled { "on" } else { "off" };
+                                    if ui.button(spell_text).clicked() {
+                                        self.spell_check_enabled = !self.spell_check_enabled;
+                                    }
+                                    ui.end_row();
+
+                                    ui.label("World Switching:");
+                                    if ui.button(self.world_switch_mode.name()).clicked() {
+                                        self.world_switch_mode = self.world_switch_mode.next();
+                                    }
+                                    ui.end_row();
+
+                                    ui.label("Debug:");
+                                    let debug_text = if self.debug_enabled { "on" } else { "off" };
+                                    if ui.button(debug_text).clicked() {
+                                        self.debug_enabled = !self.debug_enabled;
+                                    }
+                                    ui.end_row();
+
+                                    ui.label("Show tags:");
+                                    let tags_text = if self.show_tags { "on" } else { "off" };
+                                    if ui.button(tags_text).clicked() {
+                                        self.show_tags = !self.show_tags;
                                     }
                                     ui.end_row();
 
@@ -6968,6 +6899,49 @@ mod remote_gui {
                                     });
                                     ui.end_row();
 
+                                    ui.label("Console Theme:");
+                                    let console_theme_text = if self.console_theme == GuiTheme::Dark { "Dark" } else { "Light" };
+                                    if ui.button(console_theme_text).clicked() {
+                                        self.console_theme = if self.console_theme == GuiTheme::Dark { GuiTheme::Light } else { GuiTheme::Dark };
+                                    }
+                                    ui.end_row();
+
+                                    ui.label("GUI Theme:");
+                                    let gui_theme_text = if self.theme == GuiTheme::Dark { "Dark" } else { "Light" };
+                                    if ui.button(gui_theme_text).clicked() {
+                                        self.theme = if self.theme == GuiTheme::Dark { GuiTheme::Light } else { GuiTheme::Dark };
+                                    }
+                                    ui.end_row();
+                                });
+                            ui.separator();
+                            ui.horizontal(|ui| {
+                                if ui.button("Save").clicked() {
+                                    // Send updated settings to server
+                                    self.update_global_settings();
+                                    close_popup = true;
+                                }
+                                if ui.button("Cancel").clicked() {
+                                    close_popup = true;
+                                }
+                            });
+                        });
+                }
+
+                // Web popup (matches console /web)
+                if self.popup_state == PopupState::Web {
+                    egui::Window::new("Web Settings")
+                        .collapsible(false)
+                        .resizable(false)
+                        .show(ctx, |ui| {
+                            if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+                                close_popup = true;
+                            }
+                            ui.label("Web server settings");
+                            ui.separator();
+                            egui::Grid::new("web_grid")
+                                .num_columns(2)
+                                .spacing([10.0, 8.0])
+                                .show(ui, |ui| {
                                     ui.label("WS Allow List:");
                                     ui.add(egui::TextEdit::singleline(&mut self.ws_allow_list)
                                         .hint_text("localhost, 192.168.*")
@@ -6975,7 +6949,7 @@ mod remote_gui {
                                     ui.end_row();
 
                                     ui.label("HTTP enabled:");
-                                    let http_text = if self.http_enabled { "On" } else { "Off" };
+                                    let http_text = if self.http_enabled { "on" } else { "off" };
                                     if ui.button(http_text).clicked() {
                                         self.http_enabled = !self.http_enabled;
                                     }
@@ -6991,7 +6965,7 @@ mod remote_gui {
                                     ui.end_row();
 
                                     ui.label("HTTPS enabled:");
-                                    let https_text = if self.https_enabled { "On" } else { "Off" };
+                                    let https_text = if self.https_enabled { "on" } else { "off" };
                                     if ui.button(https_text).clicked() {
                                         self.https_enabled = !self.https_enabled;
                                     }
@@ -7006,9 +6980,6 @@ mod remote_gui {
                                     }
                                     ui.end_row();
                                 });
-                            ui.separator();
-                            ui.label(format!("Connected to: {}", self.ws_url));
-                            ui.label(format!("Worlds: {}", self.worlds.len()));
                             ui.separator();
                             ui.horizontal(|ui| {
                                 if ui.button("Save").clicked() {
@@ -7415,14 +7386,14 @@ mod remote_gui {
         let options = eframe::NativeOptions {
             viewport: egui::ViewportBuilder::default()
                 .with_inner_size([800.0, 600.0])
-                .with_title("Clay"),
+                .with_title("Clay Mud Client"),
             ..Default::default()
         };
 
         let addr_string = addr.to_string();
 
         eframe::run_native(
-            "Clay",
+            "Clay Mud Client",
             options,
             Box::new(move |_cc| {
                 Ok(Box::new(RemoteGuiApp::new(addr_string, runtime)) as Box<dyn eframe::App>)
@@ -8630,6 +8601,38 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                     actions,
                                 });
                             }
+                            WsMessage::CalculateNextWorld { current_index } => {
+                                // Calculate next world using shared logic
+                                let world_info: Vec<crate::util::WorldSwitchInfo> = app.worlds.iter()
+                                    .map(|w| crate::util::WorldSwitchInfo {
+                                        name: w.name.clone(),
+                                        connected: w.connected,
+                                        unseen_lines: w.unseen_lines,
+                                    })
+                                    .collect();
+                                let next_idx = crate::util::calculate_next_world(
+                                    &world_info,
+                                    current_index,
+                                    app.settings.world_switch_mode,
+                                );
+                                app.ws_send_to_client(client_id, WsMessage::CalculatedWorld { index: next_idx });
+                            }
+                            WsMessage::CalculatePrevWorld { current_index } => {
+                                // Calculate prev world using shared logic
+                                let world_info: Vec<crate::util::WorldSwitchInfo> = app.worlds.iter()
+                                    .map(|w| crate::util::WorldSwitchInfo {
+                                        name: w.name.clone(),
+                                        connected: w.connected,
+                                        unseen_lines: w.unseen_lines,
+                                    })
+                                    .collect();
+                                let prev_idx = crate::util::calculate_prev_world(
+                                    &world_info,
+                                    current_index,
+                                    app.settings.world_switch_mode,
+                                );
+                                app.ws_send_to_client(client_id, WsMessage::CalculatedWorld { index: prev_idx });
+                            }
                             _ => {
                                 // Other message types handled elsewhere or ignored
                             }
@@ -9009,6 +9012,36 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                             app.settings.actions = actions.clone();
                             let _ = save_settings(&app);
                             app.ws_broadcast(WsMessage::ActionsUpdated { actions });
+                        }
+                        WsMessage::CalculateNextWorld { current_index } => {
+                            let world_info: Vec<crate::util::WorldSwitchInfo> = app.worlds.iter()
+                                .map(|w| crate::util::WorldSwitchInfo {
+                                    name: w.name.clone(),
+                                    connected: w.connected,
+                                    unseen_lines: w.unseen_lines,
+                                })
+                                .collect();
+                            let next_idx = crate::util::calculate_next_world(
+                                &world_info,
+                                current_index,
+                                app.settings.world_switch_mode,
+                            );
+                            app.ws_send_to_client(client_id, WsMessage::CalculatedWorld { index: next_idx });
+                        }
+                        WsMessage::CalculatePrevWorld { current_index } => {
+                            let world_info: Vec<crate::util::WorldSwitchInfo> = app.worlds.iter()
+                                .map(|w| crate::util::WorldSwitchInfo {
+                                    name: w.name.clone(),
+                                    connected: w.connected,
+                                    unseen_lines: w.unseen_lines,
+                                })
+                                .collect();
+                            let prev_idx = crate::util::calculate_prev_world(
+                                &world_info,
+                                current_index,
+                                app.settings.world_switch_mode,
+                            );
+                            app.ws_send_to_client(client_id, WsMessage::CalculatedWorld { index: prev_idx });
                         }
                         _ => {}
                     }

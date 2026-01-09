@@ -383,6 +383,13 @@
                 }
                 break;
 
+            case 'CalculatedWorld':
+                // Server calculated next/prev world - switch to it
+                if (msg.index !== null && msg.index !== undefined && msg.index !== currentWorldIndex) {
+                    switchWorldLocal(msg.index);
+                }
+                break;
+
             case 'UnseenCleared':
                 // Another client (console, web, or GUI) has viewed this world
                 if (msg.world_index !== undefined && worlds[msg.world_index]) {
@@ -1616,52 +1623,24 @@
         return activeWorlds.map(w => w.index);
     }
 
-    // Get next active world index (cycling forward)
-    function getNextActiveWorld() {
-        const activeIndices = getActiveWorldIndices();
-        if (activeIndices.length <= 1) return currentWorldIndex;
-
-        // If worldSwitchMode is 'Unseen First', check for OTHER worlds with unseen output first
-        if (worldSwitchMode === 'Unseen First') {
-            const unseenWorlds = activeIndices
-                .filter(i => i !== currentWorldIndex && worldHasPending(worlds[i]))
-                .sort((a, b) => (worlds[a].name || '').toLowerCase().localeCompare((worlds[b].name || '').toLowerCase()));
-
-            if (unseenWorlds.length > 0) {
-                return unseenWorlds[0]; // Go to first world with unseen output
-            }
+    // Request next world from server (uses shared world switching logic)
+    function requestNextWorld() {
+        if (ws && ws.readyState === WebSocket.OPEN) {
+            ws.send(JSON.stringify({
+                type: 'CalculateNextWorld',
+                current_index: currentWorldIndex
+            }));
         }
-
-        // Fall back to alphabetical cycling
-        const currentPos = activeIndices.indexOf(currentWorldIndex);
-        if (currentPos === -1) {
-            return activeIndices[0];
-        }
-        return activeIndices[(currentPos + 1) % activeIndices.length];
     }
 
-    // Get previous active world index (cycling backward)
-    function getPrevActiveWorld() {
-        const activeIndices = getActiveWorldIndices();
-        if (activeIndices.length <= 1) return currentWorldIndex;
-
-        // If worldSwitchMode is 'Unseen First', check for OTHER worlds with unseen output first
-        if (worldSwitchMode === 'Unseen First') {
-            const unseenWorlds = activeIndices
-                .filter(i => i !== currentWorldIndex && worldHasPending(worlds[i]))
-                .sort((a, b) => (worlds[a].name || '').toLowerCase().localeCompare((worlds[b].name || '').toLowerCase()));
-
-            if (unseenWorlds.length > 0) {
-                return unseenWorlds[0]; // Go to first world with unseen output
-            }
+    // Request previous world from server (uses shared world switching logic)
+    function requestPrevWorld() {
+        if (ws && ws.readyState === WebSocket.OPEN) {
+            ws.send(JSON.stringify({
+                type: 'CalculatePrevWorld',
+                current_index: currentWorldIndex
+            }));
         }
-
-        // Fall back to alphabetical cycling
-        const currentPos = activeIndices.indexOf(currentWorldIndex);
-        if (currentPos === -1) {
-            return activeIndices[activeIndices.length - 1];
-        }
-        return activeIndices[(currentPos - 1 + activeIndices.length) % activeIndices.length];
     }
 
     // Toggle hamburger menu (desktop)
@@ -1785,22 +1764,16 @@
         elements.mobileUpBtn.onclick = function(e) {
             e.preventDefault();
             e.stopPropagation();
-            // Cycle to previous active world
-            const prevIndex = getPrevActiveWorld();
-            if (prevIndex !== currentWorldIndex) {
-                switchWorldLocal(prevIndex);
-            }
+            // Cycle to previous active world (request from server)
+            requestPrevWorld();
             elements.input.focus();
         };
 
         elements.mobileDownBtn.onclick = function(e) {
             e.preventDefault();
             e.stopPropagation();
-            // Cycle to next active world
-            const nextIndex = getNextActiveWorld();
-            if (nextIndex !== currentWorldIndex) {
-                switchWorldLocal(nextIndex);
-            }
+            // Cycle to next active world (request from server)
+            requestNextWorld();
             elements.input.focus();
         };
 
@@ -2034,20 +2007,14 @@
                     updateStatusBar();
                 }
             } else if (e.key === 'ArrowUp' && !e.ctrlKey && document.activeElement !== elements.input) {
-                // Up: Switch to previous active world (when not in input)
+                // Up: Switch to previous active world (request from server)
                 e.preventDefault();
-                const prevWorld = getPrevActiveWorld();
-                if (prevWorld !== currentWorldIndex) {
-                    switchWorldLocal(prevWorld);
-                }
+                requestPrevWorld();
                 elements.input.focus();
             } else if (e.key === 'ArrowDown' && !e.ctrlKey && document.activeElement !== elements.input) {
-                // Down: Switch to next active world (when not in input)
+                // Down: Switch to next active world (request from server)
                 e.preventDefault();
-                const nextWorld = getNextActiveWorld();
-                if (nextWorld !== currentWorldIndex) {
-                    switchWorldLocal(nextWorld);
-                }
+                requestNextWorld();
                 elements.input.focus();
             } else if (e.key === 'F2') {
                 // F2: Toggle MUD tag display
@@ -2091,19 +2058,13 @@
                     setInputHeight(inputHeight - 1);
                 }
             } else if (e.key === 'ArrowUp' && !e.ctrlKey) {
-                // Up: Switch to previous active world (local only, doesn't affect console)
+                // Up: Switch to previous active world (request from server)
                 e.preventDefault();
-                const prevWorld = getPrevActiveWorld();
-                if (prevWorld !== currentWorldIndex) {
-                    switchWorldLocal(prevWorld);
-                }
+                requestPrevWorld();
             } else if (e.key === 'ArrowDown' && !e.ctrlKey) {
-                // Down: Switch to next active world (local only, doesn't affect console)
+                // Down: Switch to next active world (request from server)
                 e.preventDefault();
-                const nextWorld = getNextActiveWorld();
-                if (nextWorld !== currentWorldIndex) {
-                    switchWorldLocal(nextWorld);
-                }
+                requestNextWorld();
             } else if (e.key === 'p' && e.ctrlKey) {
                 // Ctrl+P: Previous command in history
                 e.preventDefault();

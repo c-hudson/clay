@@ -82,6 +82,12 @@ pub enum WsMessage {
     ActionsUpdated { actions: Vec<Action> },
     UpdateActions { actions: Vec<Action> },
 
+    // World switching calculation (client -> server)
+    CalculateNextWorld { current_index: usize },
+    CalculatePrevWorld { current_index: usize },
+    // World switching response (server -> client)
+    CalculatedWorld { index: Option<usize> },
+
     // Keepalive
     Ping,
     Pong,

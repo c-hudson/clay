@@ -146,3 +146,145 @@ pub fn truncate_str(s: &str, max_len: usize) -> String {
         s[..max_len].to_string()
     }
 }
+
+// ============================================================================
+// Shared World Switching Logic
+// ============================================================================
+
+use crate::encoding::WorldSwitchMode;
+
+/// Information about a world needed for switching calculations
+pub struct WorldSwitchInfo {
+    pub name: String,
+    pub connected: bool,
+    pub unseen_lines: usize,
+}
+
+/// Determine if a world should be included in the cycle list
+/// (connected OR has unseen output)
+pub fn world_should_cycle(info: &WorldSwitchInfo) -> bool {
+    info.connected || info.unseen_lines > 0
+}
+
+/// Check if a world has pending/unseen output
+pub fn world_has_pending(info: &WorldSwitchInfo) -> bool {
+    info.unseen_lines > 0
+}
+
+/// Get the next world index to switch to
+/// Returns None if no world to switch to, or Some(index) of the next world
+pub fn calculate_next_world(
+    worlds: &[WorldSwitchInfo],
+    current_index: usize,
+    world_switch_mode: WorldSwitchMode,
+) -> Option<usize> {
+    // Get list of worlds that should be included in cycling
+    let cycleable: Vec<usize> = worlds.iter()
+        .enumerate()
+        .filter(|(_, w)| world_should_cycle(w))
+        .map(|(i, _)| i)
+        .collect();
+
+    if cycleable.is_empty() {
+        return None;
+    }
+
+    // If world switching is set to "Unseen First", check for OTHER worlds with unseen output first
+    if world_switch_mode == WorldSwitchMode::UnseenFirst {
+        let mut unseen_worlds: Vec<usize> = cycleable.iter()
+            .filter(|&&i| i != current_index && world_has_pending(&worlds[i]))
+            .copied()
+            .collect();
+
+        if !unseen_worlds.is_empty() {
+            // Sort alphabetically and go to first
+            unseen_worlds.sort_by(|&a, &b| {
+                worlds[a].name.to_lowercase().cmp(&worlds[b].name.to_lowercase())
+            });
+            return Some(unseen_worlds[0]);
+        }
+    }
+
+    // Fall back to alphabetical cycling
+    let mut sorted = cycleable.clone();
+    sorted.sort_by(|&a, &b| {
+        worlds[a].name.to_lowercase().cmp(&worlds[b].name.to_lowercase())
+    });
+
+    // Find current position in the sorted cycleable list
+    let current_pos = sorted.iter().position(|&i| i == current_index);
+
+    match current_pos {
+        Some(pos) => {
+            let next_pos = (pos + 1) % sorted.len();
+            if sorted[next_pos] != current_index {
+                Some(sorted[next_pos])
+            } else {
+                None
+            }
+        }
+        None => {
+            // Current world isn't in cycleable list, go to first cycleable world
+            Some(sorted[0])
+        }
+    }
+}
+
+/// Get the previous world index to switch to
+/// Returns None if no world to switch to, or Some(index) of the previous world
+pub fn calculate_prev_world(
+    worlds: &[WorldSwitchInfo],
+    current_index: usize,
+    world_switch_mode: WorldSwitchMode,
+) -> Option<usize> {
+    // Get list of worlds that should be included in cycling
+    let cycleable: Vec<usize> = worlds.iter()
+        .enumerate()
+        .filter(|(_, w)| world_should_cycle(w))
+        .map(|(i, _)| i)
+        .collect();
+
+    if cycleable.is_empty() {
+        return None;
+    }
+
+    // If world switching is set to "Unseen First", check for OTHER worlds with unseen output first
+    if world_switch_mode == WorldSwitchMode::UnseenFirst {
+        let mut unseen_worlds: Vec<usize> = cycleable.iter()
+            .filter(|&&i| i != current_index && world_has_pending(&worlds[i]))
+            .copied()
+            .collect();
+
+        if !unseen_worlds.is_empty() {
+            // Sort alphabetically and go to first (same behavior as next when unseen first is on)
+            unseen_worlds.sort_by(|&a, &b| {
+                worlds[a].name.to_lowercase().cmp(&worlds[b].name.to_lowercase())
+            });
+            return Some(unseen_worlds[0]);
+        }
+    }
+
+    // Fall back to alphabetical cycling
+    let mut sorted = cycleable.clone();
+    sorted.sort_by(|&a, &b| {
+        worlds[a].name.to_lowercase().cmp(&worlds[b].name.to_lowercase())
+    });
+
+    // Find current position in the sorted cycleable list
+    let current_pos = sorted.iter().position(|&i| i == current_index);
+
+    match current_pos {
+        Some(pos) => {
+            let prev_pos = if pos > 0 { pos - 1 } else { sorted.len() - 1 };
+            if sorted[prev_pos] != current_index {
+                Some(sorted[prev_pos])
+            } else {
+                None
+            }
+        }
+        None => {
+            // Current world isn't in cycleable list, go to last cycleable world
+            Some(sorted[sorted.len() - 1])
+        }
+    }
+}
