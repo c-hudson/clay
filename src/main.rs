@@ -8270,6 +8270,11 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
     // Ensure we have at least one world (creates initial world only if no worlds loaded)
     app.ensure_has_world();
 
+    // After reload, clear unseen_lines on the current world since we're viewing it
+    if should_load_state && !app.worlds.is_empty() {
+        app.worlds[app.current_world_index].unseen_lines = 0;
+    }
+
     // Now display any startup messages
     for msg in startup_messages {
         app.add_output(&msg);
