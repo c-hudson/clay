@@ -308,6 +308,11 @@ body {
     color: #00ffff;
 }
 
+/* Timestamp prefix shown when tags are visible */
+.timestamp {
+    color: #00cdcd;
+}
+
 /* Separator bar - matches console layout */
 #status-bar {
     display: flex;

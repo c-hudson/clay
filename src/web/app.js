@@ -448,10 +448,27 @@
                 actions = msg.actions || [];
                 // Initialize output cache for each world (empty - will be populated on render)
                 worldOutputCache = worlds.map(() => []);
-                // Ensure output_lines arrays exist
+                // Ensure output_lines arrays exist, prefer timestamped versions
+                const currentTs = Math.floor(Date.now() / 1000);
                 worlds.forEach((world) => {
-                    if (!world.output_lines) {
+                    // Use output_lines_ts if available (has timestamps)
+                    if (world.output_lines_ts && world.output_lines_ts.length > 0) {
+                        world.output_lines = world.output_lines_ts;
+                    } else if (world.output_lines) {
+                        // Convert plain strings to objects with current timestamp
+                        world.output_lines = world.output_lines.map(line =>
+                            typeof line === 'string' ? { text: line, ts: currentTs } : line
+                        );
+                    } else {
                         world.output_lines = [];
+                    }
+                    // Same for pending_lines
+                    if (world.pending_lines_ts && world.pending_lines_ts.length > 0) {
+                        world.pending_lines = world.pending_lines_ts;
+                    } else if (world.pending_lines) {
+                        world.pending_lines = world.pending_lines.map(line =>
+                            typeof line === 'string' ? { text: line, ts: currentTs } : line
+                        );
                     }
                 });
                 if (msg.settings) {
@@ -506,6 +523,8 @@
                         worldOutputCache[msg.world_index] = [];
                     }
                     if (msg.data) {
+                        // Get timestamp from message or use current time
+                        const lineTs = msg.ts || Math.floor(Date.now() / 1000);
                         // Split by any line ending
                         const rawLines = msg.data.split(/\r\n|\n|\r/);
                         rawLines.forEach(line => {
@@ -521,9 +540,9 @@
                                 return;
                             }
                             const lineIndex = world.output_lines.length;
-                            world.output_lines.push(line);
+                            world.output_lines.push({ text: line, ts: lineTs });
                             if (msg.world_index === currentWorldIndex) {
-                                handleIncomingLine(line, msg.world_index, lineIndex);
+                                handleIncomingLine(line, lineTs, msg.world_index, lineIndex);
                             } else if (!msg.is_viewed) {
                                 // Only increment unseen if no other interface is viewing this world
                                 world.unseen_lines = (world.unseen_lines || 0) + 1;
@@ -648,7 +667,7 @@
     }
 
     // Handle incoming line with more-mode logic
-    function handleIncomingLine(text, worldIndex, lineIndex) {
+    function handleIncomingLine(text, ts, worldIndex, lineIndex) {
         if (!text) return;
 
         const visibleLines = getVisibleLineCount();
@@ -656,19 +675,19 @@
 
         if (paused) {
             // Already paused, queue the line info
-            pendingLines.push({ text, worldIndex, lineIndex });
+            pendingLines.push({ text, ts, worldIndex, lineIndex });
             updateStatusBar();
         } else if (moreModeEnabled && linesSincePause >= threshold) {
             // Trigger pause
             paused = true;
-            pendingLines.push({ text, worldIndex, lineIndex });
+            pendingLines.push({ text, ts, worldIndex, lineIndex });
             // Scroll to bottom to show what we have so far
             scrollToBottom();
             updateStatusBar();
         } else {
             // Normal display - append the line
             linesSincePause++;
-            appendNewLine(text, worldIndex, lineIndex);
+            appendNewLine(text, ts, worldIndex, lineIndex);
         }
     }
 
@@ -680,7 +699,7 @@
         const toRelease = pendingLines.splice(0, count);
 
         toRelease.forEach(item => {
-            appendNewLine(item.text, item.worldIndex, item.lineIndex);
+            appendNewLine(item.text, item.ts, item.worldIndex, item.lineIndex);
         });
 
         if (pendingLines.length === 0) {
@@ -696,7 +715,7 @@
         if (!paused) return;
 
         pendingLines.forEach(item => {
-            appendNewLine(item.text, item.worldIndex, item.lineIndex);
+            appendNewLine(item.text, item.ts, item.worldIndex, item.lineIndex);
         });
         pendingLines = [];
         paused = false;
@@ -922,14 +941,21 @@
         // Build all lines as HTML with explicit <br> line breaks
         const htmlParts = [];
         for (let i = 0; i < lines.length; i++) {
-            const rawLine = lines[i];
-            if (rawLine === undefined || rawLine === null) continue;
+            const lineObj = lines[i];
+            if (lineObj === undefined || lineObj === null) continue;
+
+            // Handle both old string format and new object format
+            const rawLine = typeof lineObj === 'string' ? lineObj : lineObj.text;
+            const lineTs = typeof lineObj === 'object' ? lineObj.ts : null;
 
             // Strip newlines/carriage returns
             const cleanLine = String(rawLine).replace(/[\r\n]+/g, '');
 
+            // Format timestamp prefix if showTags is enabled
+            const tsPrefix = showTags && lineTs ? `<span class="timestamp">${formatTimestamp(lineTs)}</span>` : '';
+
             const displayText = showTags ? cleanLine : stripMudTag(cleanLine);
-            const html = convertDiscordEmojis(linkifyUrls(parseAnsi(displayText)));
+            const html = tsPrefix + convertDiscordEmojis(linkifyUrls(parseAnsi(displayText)));
             htmlParts.push(html);
         }
 
@@ -954,12 +980,15 @@
     }
 
     // Append a new line to current world's output (already visible)
-    function appendNewLine(text, worldIndex, lineIndex) {
+    function appendNewLine(text, ts, worldIndex, lineIndex) {
         // Strip newlines/carriage returns
         const cleanText = String(text).replace(/[\r\n]+/g, '');
 
+        // Format timestamp prefix if showTags is enabled
+        const tsPrefix = showTags && ts ? `<span class="timestamp">${formatTimestamp(ts)}</span>` : '';
+
         const displayText = showTags ? cleanText : stripMudTag(cleanText);
-        const html = convertDiscordEmojis(linkifyUrls(parseAnsi(displayText)));
+        const html = tsPrefix + convertDiscordEmojis(linkifyUrls(parseAnsi(displayText)));
 
         // Append to output with a <br> prefix (if not first line)
         if (elements.output.innerHTML.length > 0) {
@@ -1193,6 +1222,32 @@
             const href = url.startsWith('www.') ? 'https://' + url : url;
             return `<a href="${href}" target="_blank" rel="noopener" class="output-link">${url}</a>`;
         });
+    }
+
+    // Format a timestamp for display
+    // Returns "HH:MM>" for today, "DD/MM HH:MM>" for previous days
+    function formatTimestamp(ts) {
+        if (!ts) return '';
+
+        // Convert seconds since epoch to Date
+        const date = new Date(ts * 1000);
+        const now = new Date();
+
+        const hours = date.getHours().toString().padStart(2, '0');
+        const minutes = date.getMinutes().toString().padStart(2, '0');
+
+        // Check if same day
+        const sameDay = date.getDate() === now.getDate() &&
+                        date.getMonth() === now.getMonth() &&
+                        date.getFullYear() === now.getFullYear();
+
+        if (sameDay) {
+            return `${hours}:${minutes}> `;
+        } else {
+            const day = date.getDate().toString().padStart(2, '0');
+            const month = (date.getMonth() + 1).toString().padStart(2, '0');
+            return `${day}/${month} ${hours}:${minutes}> `;
+        }
     }
 
     // Strip MUD tags like [channel:] or [channel(player)] from start of line
@@ -2457,6 +2512,11 @@
                     linesSincePause = 0;
                     updateStatusBar();
                 }
+            } else if (e.key === 'F2') {
+                // F2: Toggle MUD tag display
+                e.preventDefault();
+                showTags = !showTags;
+                renderOutput();
             }
         });
 

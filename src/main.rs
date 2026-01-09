@@ -17,7 +17,7 @@ pub use spell::{SpellChecker, SpellState};
 pub use input::InputArea;
 pub use util::{get_binary_name, strip_ansi_codes, visual_line_count, get_current_time_12hr, strip_mud_tag, truncate_str};
 pub use websocket::{
-    WsMessage, WorldStateMsg, WorldSettingsMsg, GlobalSettingsMsg,
+    WsMessage, WorldStateMsg, WorldSettingsMsg, GlobalSettingsMsg, TimestampedLine,
     WsClientInfo, WebSocketServer,
     hash_password, is_ip_in_allow_list, start_websocket_server,
 };
@@ -26,7 +26,7 @@ use std::io::{self, stdout, BufRead, Write as IoWrite};
 use std::os::unix::io::{AsRawFd, FromRawFd, RawFd};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicPtr, AtomicU32, Ordering};
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use aes_gcm::{
     aead::{Aead, KeyInit},
@@ -1647,7 +1647,7 @@ impl FilterPopup {
         self.scroll_offset = 0;
     }
 
-    fn update_filter(&mut self, output_lines: &[String]) {
+    fn update_filter(&mut self, output_lines: &[OutputLine]) {
         if self.filter_text.is_empty() {
             self.filtered_indices = (0..output_lines.len()).collect();
         } else {
@@ -1657,7 +1657,7 @@ impl FilterPopup {
                 .enumerate()
                 .filter(|(_, line)| {
                     // Strip ANSI codes for matching
-                    let plain = strip_ansi_codes(line);
+                    let plain = strip_ansi_codes(&line.text);
                     plain.to_lowercase().contains(&filter_lower)
                 })
                 .map(|(i, _)| i)
@@ -2576,15 +2576,65 @@ fn setup_crash_handler() {
     }));
 }
 
+/// Get current time as seconds since Unix epoch (for WebSocket timestamps)
+fn current_timestamp_secs() -> u64 {
+    SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs()
+}
+
+/// Output line with timestamp for F2/show tags feature
+#[derive(Clone)]
+struct OutputLine {
+    text: String,
+    timestamp: SystemTime,
+}
+
+impl OutputLine {
+    fn new(text: String) -> Self {
+        Self {
+            text,
+            timestamp: SystemTime::now(),
+        }
+    }
+
+    fn new_with_timestamp(text: String, timestamp: SystemTime) -> Self {
+        Self { text, timestamp }
+    }
+
+    /// Format timestamp for display based on whether it's from today
+    /// Same day: HH:MM>
+    /// Previous days: DD/MM HH:MM>
+    fn format_timestamp(&self) -> String {
+        let now = SystemTime::now();
+        let ts_secs = self.timestamp.duration_since(UNIX_EPOCH).unwrap_or_default().as_secs() as libc::time_t;
+        let now_secs = now.duration_since(UNIX_EPOCH).unwrap_or_default().as_secs() as libc::time_t;
+
+        let mut ts_tm: libc::tm = unsafe { std::mem::zeroed() };
+        let mut now_tm: libc::tm = unsafe { std::mem::zeroed() };
+        unsafe {
+            libc::localtime_r(&ts_secs, &mut ts_tm);
+            libc::localtime_r(&now_secs, &mut now_tm);
+        }
+
+        // Check if same day (year, day of year match)
+        let same_day = ts_tm.tm_yday == now_tm.tm_yday && ts_tm.tm_year == now_tm.tm_year;
+
+        if same_day {
+            format!("{:02}:{:02}>", ts_tm.tm_hour, ts_tm.tm_min)
+        } else {
+            format!("{:02}/{:02} {:02}:{:02}>", ts_tm.tm_mday, ts_tm.tm_mon + 1, ts_tm.tm_hour, ts_tm.tm_min)
+        }
+    }
+}
+
 struct World {
     name: String,
-    output_lines: Vec<String>,
+    output_lines: Vec<OutputLine>,
     scroll_offset: usize,
     connected: bool,
     command_tx: Option<mpsc::Sender<WriteCommand>>,
     unseen_lines: usize,
     paused: bool,
-    pending_lines: Vec<String>,
+    pending_lines: Vec<OutputLine>,
     lines_since_pause: usize,
     settings: WorldSettings,
     log_handle: Option<std::sync::Arc<std::sync::Mutex<std::fs::File>>>,
@@ -2698,14 +2748,14 @@ impl World {
         // If we had a partial line, update it in the correct list
         let start_idx = if had_partial {
             if partial_was_in_pending {
-                // Update the last pending line
+                // Update the last pending line (keep original timestamp)
                 if let Some(last) = self.pending_lines.last_mut() {
-                    *last = lines[0].to_string();
+                    last.text = lines[0].to_string();
                 }
             } else {
-                // Update the last output line
+                // Update the last output line (keep original timestamp)
                 if let Some(last) = self.output_lines.last_mut() {
-                    *last = lines[0].to_string();
+                    last.text = lines[0].to_string();
                 }
             }
             1 // Skip first line since we updated it
@@ -2751,7 +2801,7 @@ impl World {
                 if self.pending_lines.is_empty() {
                     self.pending_since = Some(std::time::Instant::now());
                 }
-                self.pending_lines.push(line.to_string());
+                self.pending_lines.push(OutputLine::new(line.to_string()));
                 if is_partial {
                     self.partial_line = line.to_string();
                     self.partial_in_pending = true;
@@ -2764,13 +2814,13 @@ impl World {
                 if self.pending_lines.is_empty() {
                     self.pending_since = Some(std::time::Instant::now());
                 }
-                self.pending_lines.push(line.to_string());
+                self.pending_lines.push(OutputLine::new(line.to_string()));
                 if is_partial {
                     self.partial_line = line.to_string();
                     self.partial_in_pending = true;
                 }
             } else {
-                self.output_lines.push(line.to_string());
+                self.output_lines.push(OutputLine::new(line.to_string()));
                 // Count visual lines (accounting for word wrap) instead of logical lines
                 let visual_lines = visual_line_count(line, output_width as usize);
                 self.lines_since_pause += visual_lines;
@@ -2806,7 +2856,7 @@ impl World {
     }
 
     fn release_pending(&mut self, count: usize) {
-        let to_release: Vec<String> = self
+        let to_release: Vec<OutputLine> = self
             .pending_lines
             .drain(..count.min(self.pending_lines.len()))
             .collect();
@@ -2850,7 +2900,7 @@ impl World {
             .saturating_sub(self.scroll_offset)
     }
 
-    fn generate_splash_lines() -> Vec<String> {
+    fn generate_splash_lines() -> Vec<OutputLine> {
         // Splash content without centering - will be centered at render time
         // Dog art:
         //           (\/\__o
@@ -2858,19 +2908,20 @@ impl World {
         //  `--\______/  |
         //     /        /
         //  -`/_------'\_.
+        let now = SystemTime::now();
         vec![
-            "".to_string(),
-            "\x1b[38;5;180m          (\\/\\__o     \x1b[38;5;209m ██████╗██╗      █████╗ ██╗   ██╗\x1b[0m".to_string(),
-            "\x1b[38;5;180m  __      `-/ `_/     \x1b[38;5;208m██╔════╝██║     ██╔══██╗╚██╗ ██╔╝\x1b[0m".to_string(),
-            "\x1b[38;5;180m `--\\______/  |       \x1b[38;5;215m██║     ██║     ███████║ ╚████╔╝ \x1b[0m".to_string(),
-            "\x1b[38;5;180m    /        /        \x1b[38;5;216m██║     ██║     ██╔══██║  ╚██╔╝  \x1b[0m".to_string(),
-            "\x1b[38;5;180m -`/_------'\\_.       \x1b[38;5;217m╚██████╗███████╗██║  ██║   ██║   \x1b[0m".to_string(),
-            "\x1b[38;5;218m                       ╚═════╝╚══════╝╚═╝  ╚═╝   ╚═╝   \x1b[0m".to_string(),
-            "".to_string(),
-            "\x1b[38;5;213m✨ A 90dies mud client written today ✨\x1b[0m".to_string(),
-            "".to_string(),
-            "\x1b[38;5;244m/help for how to use clay\x1b[0m".to_string(),
-            "".to_string(),
+            OutputLine::new_with_timestamp("".to_string(), now),
+            OutputLine::new_with_timestamp("\x1b[38;5;180m          (\\/\\__o     \x1b[38;5;209m ██████╗██╗      █████╗ ██╗   ██╗\x1b[0m".to_string(), now),
+            OutputLine::new_with_timestamp("\x1b[38;5;180m  __      `-/ `_/     \x1b[38;5;208m██╔════╝██║     ██╔══██╗╚██╗ ██╔╝\x1b[0m".to_string(), now),
+            OutputLine::new_with_timestamp("\x1b[38;5;180m `--\\______/  |       \x1b[38;5;215m██║     ██║     ███████║ ╚████╔╝ \x1b[0m".to_string(), now),
+            OutputLine::new_with_timestamp("\x1b[38;5;180m    /        /        \x1b[38;5;216m██║     ██║     ██╔══██║  ╚██╔╝  \x1b[0m".to_string(), now),
+            OutputLine::new_with_timestamp("\x1b[38;5;180m -`/_------'\\_.       \x1b[38;5;217m╚██████╗███████╗██║  ██║   ██║   \x1b[0m".to_string(), now),
+            OutputLine::new_with_timestamp("\x1b[38;5;218m                       ╚═════╝╚══════╝╚═╝  ╚═╝   ╚═╝   \x1b[0m".to_string(), now),
+            OutputLine::new_with_timestamp("".to_string(), now),
+            OutputLine::new_with_timestamp("\x1b[38;5;213m✨ A 90dies mud client written today ✨\x1b[0m".to_string(), now),
+            OutputLine::new_with_timestamp("".to_string(), now),
+            OutputLine::new_with_timestamp("\x1b[38;5;244m/help for how to use clay\x1b[0m".to_string(), now),
+            OutputLine::new_with_timestamp("".to_string(), now),
         ]
     }
 }
@@ -3213,10 +3264,23 @@ impl App {
         let worlds: Vec<WorldStateMsg> = self.worlds.iter().enumerate().map(|(idx, world)| {
             // Strip carriage returns from output/pending lines for web clients
             let clean_output: Vec<String> = world.output_lines.iter()
-                .map(|s| s.replace('\r', ""))
+                .map(|s| s.text.replace('\r', ""))
                 .collect();
             let clean_pending: Vec<String> = world.pending_lines.iter()
-                .map(|s| s.replace('\r', ""))
+                .map(|s| s.text.replace('\r', ""))
+                .collect();
+            // Create timestamped versions
+            let output_lines_ts: Vec<TimestampedLine> = world.output_lines.iter()
+                .map(|s| TimestampedLine {
+                    text: s.text.replace('\r', ""),
+                    ts: s.timestamp.duration_since(UNIX_EPOCH).unwrap_or_default().as_secs(),
+                })
+                .collect();
+            let pending_lines_ts: Vec<TimestampedLine> = world.pending_lines.iter()
+                .map(|s| TimestampedLine {
+                    text: s.text.replace('\r', ""),
+                    ts: s.timestamp.duration_since(UNIX_EPOCH).unwrap_or_default().as_secs(),
+                })
                 .collect();
             WorldStateMsg {
                 index: idx,
@@ -3224,6 +3288,8 @@ impl App {
                 connected: world.connected,
                 output_lines: clean_output,
                 pending_lines: clean_pending,
+                output_lines_ts,
+                pending_lines_ts,
                 prompt: world.prompt.replace('\r', ""),
                 scroll_offset: world.scroll_offset,
                 paused: world.paused,
@@ -3406,7 +3472,7 @@ impl App {
         let mut min_offset = 0usize;
         let mut visual_lines = 0usize;
         for (idx, line) in world.output_lines.iter().enumerate() {
-            visual_lines += visual_line_count(line, width);
+            visual_lines += visual_line_count(&line.text, width);
             if visual_lines >= visible_height {
                 min_offset = idx;
                 break;
@@ -3429,7 +3495,7 @@ impl App {
         let mut new_offset = world.scroll_offset;
 
         while visual_lines_moved < target_visual_lines {
-            visual_lines_moved += visual_line_count(&world.output_lines[new_offset], width);
+            visual_lines_moved += visual_line_count(&world.output_lines[new_offset].text, width);
             if new_offset == 0 {
                 break;
             }
@@ -3459,7 +3525,7 @@ impl App {
         let mut new_offset = world.scroll_offset + 1;
 
         while new_offset <= max_scroll && visual_lines_moved < target_visual_lines {
-            visual_lines_moved += visual_line_count(&world.output_lines[new_offset], width);
+            visual_lines_moved += visual_line_count(&world.output_lines[new_offset].text, width);
             new_offset += 1;
         }
 
@@ -4003,17 +4069,20 @@ fn save_reload_state(app: &App) -> io::Result<()> {
     }
 
     // Save output lines in a separate section (can be large)
+    // Format: timestamp_secs|escaped_text
     for (idx, world) in app.worlds.iter().enumerate() {
         writeln!(file)?;
         writeln!(file, "[output:{}]", idx)?;
         for line in &world.output_lines {
-            let escaped = line.replace('\\', "\\\\").replace('\n', "\\n");
-            writeln!(file, "{}", escaped)?;
+            let ts_secs = line.timestamp.duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
+            let escaped = line.text.replace('\\', "\\\\").replace('\n', "\\n");
+            writeln!(file, "{}|{}", ts_secs, escaped)?;
         }
         writeln!(file, "[pending:{}]", idx)?;
         for line in &world.pending_lines {
-            let escaped = line.replace('\\', "\\\\").replace('\n', "\\n");
-            writeln!(file, "{}", escaped)?;
+            let ts_secs = line.timestamp.duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
+            let escaped = line.text.replace('\\', "\\\\").replace('\n', "\\n");
+            writeln!(file, "{}|{}", ts_secs, escaped)?;
         }
     }
 
@@ -4060,17 +4129,31 @@ fn load_reload_state(app: &mut App) -> io::Result<bool> {
     // Temporary storage for world data
     struct TempWorld {
         name: String,
-        output_lines: Vec<String>,
+        output_lines: Vec<OutputLine>,
         scroll_offset: usize,
         connected: bool,
         socket_fd: Option<RawFd>,
         unseen_lines: usize,
         paused: bool,
-        pending_lines: Vec<String>,
+        pending_lines: Vec<OutputLine>,
         lines_since_pause: usize,
         is_tls: bool,
         was_connected: bool,
         settings: WorldSettings,
+    }
+
+    // Parse a saved output/pending line with timestamp (format: timestamp_secs|text)
+    fn parse_timestamped_line(line: &str) -> OutputLine {
+        if let Some(pipe_pos) = line.find('|') {
+            let ts_str = &line[..pipe_pos];
+            let text = &line[pipe_pos + 1..];
+            if let Ok(ts_secs) = ts_str.parse::<u64>() {
+                let timestamp = UNIX_EPOCH + Duration::from_secs(ts_secs);
+                return OutputLine::new_with_timestamp(unescape_string(text), timestamp);
+            }
+        }
+        // Fallback: no timestamp in old format, use current time
+        OutputLine::new(unescape_string(line))
     }
 
     let mut temp_worlds: Vec<TempWorld> = Vec::new();
@@ -4122,7 +4205,7 @@ fn load_reload_state(app: &mut App) -> io::Result<bool> {
         if current_section == "output" {
             if let Some(idx) = output_world_idx {
                 if idx < temp_worlds.len() {
-                    temp_worlds[idx].output_lines.push(unescape_string(line));
+                    temp_worlds[idx].output_lines.push(parse_timestamped_line(line));
                 }
             }
             continue;
@@ -4130,7 +4213,7 @@ fn load_reload_state(app: &mut App) -> io::Result<bool> {
         if current_section == "pending" {
             if let Some(idx) = pending_world_idx {
                 if idx < temp_worlds.len() {
-                    temp_worlds[idx].pending_lines.push(unescape_string(line));
+                    temp_worlds[idx].pending_lines.push(parse_timestamped_line(line));
                 }
             }
             continue;
@@ -4459,7 +4542,11 @@ mod remote_gui {
         pub hostname: String,
         pub port: String,
         pub user: String,
+        pub password: String,
         pub use_ssl: bool,
+        pub log_file: String,
+        pub encoding: String,
+        pub auto_login: String,
         pub keep_alive_type: String,
         pub keep_alive_cmd: String,
     }
@@ -4468,7 +4555,7 @@ mod remote_gui {
     pub struct RemoteWorld {
         pub name: String,
         pub connected: bool,
-        pub output_lines: Vec<String>,
+        pub output_lines: Vec<TimestampedLine>,
         pub prompt: String,
         pub settings: RemoteWorldSettings,
         pub unseen_lines: usize,
@@ -4486,6 +4573,7 @@ mod remote_gui {
         WorldList,
         ConnectedWorlds,  // /worlds or /l - shows connected worlds with stats
         WorldEditor(usize),  // world index being edited
+        WorldConfirmDelete(usize),  // world index to delete
         Setup,
         Web,  // /web - web settings (HTTP/HTTPS/WS)
         Font,
@@ -4637,7 +4725,11 @@ mod remote_gui {
         edit_hostname: String,
         edit_port: String,
         edit_user: String,
+        edit_password: String,
         edit_ssl: bool,
+        edit_log_file: String,
+        edit_encoding: Encoding,
+        edit_auto_login: AutoConnectType,
         edit_keep_alive_type: KeepAliveType,
         edit_keep_alive_cmd: String,
         /// Input area height in lines
@@ -4738,7 +4830,11 @@ mod remote_gui {
                 edit_hostname: String::new(),
                 edit_port: String::new(),
                 edit_user: String::new(),
+                edit_password: String::new(),
                 edit_ssl: false,
+                edit_log_file: String::new(),
+                edit_encoding: Encoding::Utf8,
+                edit_auto_login: AutoConnectType::Connect,
                 edit_keep_alive_type: KeepAliveType::Nop,
                 edit_keep_alive_cmd: String::new(),
                 input_height: 3,
@@ -5007,13 +5103,24 @@ mod remote_gui {
                             self.worlds = worlds.into_iter().map(|w| RemoteWorld {
                                 name: w.name,
                                 connected: w.connected,
-                                output_lines: w.output_lines,
+                                // Use timestamped lines if available, otherwise fall back to plain lines
+                                output_lines: if !w.output_lines_ts.is_empty() {
+                                    w.output_lines_ts
+                                } else {
+                                    // Fallback for old protocol: use current time
+                                    let now = current_timestamp_secs();
+                                    w.output_lines.into_iter().map(|text| TimestampedLine { text, ts: now }).collect()
+                                },
                                 prompt: w.prompt,
                                 settings: RemoteWorldSettings {
                                     hostname: w.settings.hostname,
                                     port: w.settings.port,
                                     user: w.settings.user,
+                                    password: String::new(),  // Password not sent from server for security
                                     use_ssl: w.settings.use_ssl,
+                                    log_file: w.settings.log_file.unwrap_or_default(),
+                                    encoding: w.settings.encoding,
+                                    auto_login: w.settings.auto_connect_type,
                                     keep_alive_type: w.keep_alive_type.clone(),
                                     keep_alive_cmd: w.settings.keep_alive_cmd.clone(),
                                 },
@@ -5043,7 +5150,7 @@ mod remote_gui {
                             self.show_tags = settings.show_tags;
                             self.actions = actions;
                         }
-                        WsMessage::ServerData { world_index, data, is_viewed } => {
+                        WsMessage::ServerData { world_index, data, is_viewed, ts } => {
                             if world_index < self.worlds.len() {
                                 // Debug: log ANSI data to file
                                 if self.worlds[world_index].output_lines.len() < 10 {
@@ -5066,7 +5173,10 @@ mod remote_gui {
                                 for line in data.lines() {
                                     // Skip visually empty lines (only ANSI codes/whitespace)
                                     if !is_visually_empty(line) {
-                                        self.worlds[world_index].output_lines.push(line.to_string());
+                                        self.worlds[world_index].output_lines.push(TimestampedLine {
+                                            text: line.to_string(),
+                                            ts,
+                                        });
                                         lines_added += 1;
                                     }
                                 }
@@ -5342,7 +5452,11 @@ mod remote_gui {
                     hostname: self.edit_hostname.clone(),
                     port: self.edit_port.clone(),
                     user: self.edit_user.clone(),
+                    password: self.edit_password.clone(),
                     use_ssl: self.edit_ssl,
+                    log_file: self.edit_log_file.clone(),
+                    encoding: self.edit_encoding.name().to_string(),
+                    auto_login: self.edit_auto_login.name().to_string(),
                     keep_alive_type: self.edit_keep_alive_type.name().to_string(),
                     keep_alive_cmd: self.edit_keep_alive_cmd.clone(),
                 });
@@ -5383,7 +5497,15 @@ mod remote_gui {
                 self.edit_hostname = world.settings.hostname.clone();
                 self.edit_port = world.settings.port.clone();
                 self.edit_user = world.settings.user.clone();
+                self.edit_password = world.settings.password.clone();
                 self.edit_ssl = world.settings.use_ssl;
+                self.edit_log_file = world.settings.log_file.clone();
+                self.edit_encoding = match world.settings.encoding.as_str() {
+                    "latin1" => Encoding::Latin1,
+                    "fansi" => Encoding::Fansi,
+                    _ => Encoding::Utf8,
+                };
+                self.edit_auto_login = AutoConnectType::from_name(&world.settings.auto_login);
                 self.edit_keep_alive_type = KeepAliveType::from_name(&world.settings.keep_alive_type);
                 self.edit_keep_alive_cmd = world.settings.keep_alive_cmd.clone();
                 self.popup_state = PopupState::WorldEditor(world_index);
@@ -5414,6 +5536,34 @@ mod remote_gui {
             }
 
             result
+        }
+
+        /// Format timestamp for GUI display
+        /// Same day: HH:MM>
+        /// Previous days: DD/MM HH:MM>
+        fn format_timestamp_gui(ts: u64) -> String {
+            use std::time::{SystemTime, UNIX_EPOCH};
+
+            let now = SystemTime::now();
+
+            let ts_secs = ts as libc::time_t;
+            let now_secs = now.duration_since(UNIX_EPOCH).unwrap_or_default().as_secs() as libc::time_t;
+
+            let mut ts_tm: libc::tm = unsafe { std::mem::zeroed() };
+            let mut now_tm: libc::tm = unsafe { std::mem::zeroed() };
+            unsafe {
+                libc::localtime_r(&ts_secs, &mut ts_tm);
+                libc::localtime_r(&now_secs, &mut now_tm);
+            }
+
+            // Check if same day (year, day of year match)
+            let same_day = ts_tm.tm_yday == now_tm.tm_yday && ts_tm.tm_year == now_tm.tm_year;
+
+            if same_day {
+                format!("{:02}:{:02}>", ts_tm.tm_hour, ts_tm.tm_min)
+            } else {
+                format!("{:02}/{:02} {:02}:{:02}>", ts_tm.tm_mday, ts_tm.tm_mon + 1, ts_tm.tm_hour, ts_tm.tm_min)
+            }
         }
 
         /// Strip MUD tags like [channel:] or [channel(player)] from start of line
@@ -6310,7 +6460,10 @@ mod remote_gui {
                         if let Some(message) = self.handle_spell_check() {
                             // Add suggestion message to current world's output
                             if let Some(world) = self.worlds.get_mut(self.current_world) {
-                                world.output_lines.push(message);
+                                world.output_lines.push(TimestampedLine {
+                                    text: message,
+                                    ts: current_timestamp_secs(),
+                                });
                             }
                         }
                     }
@@ -6419,9 +6572,10 @@ mod remote_gui {
                                     })
                             );
 
-                            // If input doesn't have focus and a printable key is pressed,
-                            // refocus the input and capture the typed text
+                            // Always keep cursor visible in input area when no popup is open
+                            // But don't steal focus if user is selecting text with mouse
                             if !response.has_focus() && self.popup_state == PopupState::None && !self.filter_active {
+                                let mouse_down = ctx.input(|i| i.pointer.any_down());
                                 let typed_text: Option<String> = ctx.input(|i| {
                                     // Find any text that was typed
                                     for e in &i.events {
@@ -6431,10 +6585,16 @@ mod remote_gui {
                                     }
                                     None
                                 });
-                                if let Some(text) = typed_text {
-                                    // Add the typed text to input buffer and refocus
-                                    self.input_buffer.push_str(&text);
+
+                                // Request focus if mouse isn't being held (not selecting text)
+                                // or if user started typing
+                                if !mouse_down || typed_text.is_some() {
                                     response.request_focus();
+                                }
+
+                                if let Some(text) = typed_text {
+                                    // Add the typed text to input buffer
+                                    self.input_buffer.push_str(&text);
                                     // Set cursor position to end of buffer (create state if needed)
                                     let mut state = egui::TextEdit::load_state(ctx, input_id)
                                         .unwrap_or_default();
@@ -6446,10 +6606,11 @@ mod remote_gui {
 
                             // Send on Enter (without Shift)
                             if response.has_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter) && !i.modifiers.shift) {
-                                if self.input_buffer.ends_with('\n') {
-                                    self.input_buffer.pop();
-                                }
-                                let cmd = std::mem::take(&mut self.input_buffer);
+                                // Remove all newlines from the command (cursor in middle causes TextEdit to insert newline)
+                                let cmd: String = std::mem::take(&mut self.input_buffer)
+                                    .chars()
+                                    .filter(|c| *c != '\n')
+                                    .collect();
                                 // Reset spell state when sending command
                                 self.reset_spell_state();
                                 if !cmd.is_empty() {
@@ -6615,18 +6776,23 @@ mod remote_gui {
 
                 // Filter popup (F4)
                 if self.filter_active {
+                    let mut filter_open = true;
                     egui::Window::new("Filter")
                         .collapsible(false)
                         .resizable(false)
                         .anchor(egui::Align2::RIGHT_TOP, [-10.0, 40.0])
+                        .open(&mut filter_open)
                         .show(ctx, |ui| {
                             ui.horizontal(|ui| {
                                 ui.label("Filter:");
                                 let response = ui.text_edit_singleline(&mut self.filter_text);
                                 response.request_focus();
                             });
-                            ui.label("(Esc or F4 to close)");
                         });
+                    if !filter_open {
+                        self.filter_active = false;
+                        self.filter_text.clear();
+                    }
                 }
 
                 // Main output area with scrollbar (no frame/border/margin)
@@ -6638,11 +6804,11 @@ mod remote_gui {
                     .show(ctx, |ui| {
                     if let Some(world) = self.worlds.get(self.current_world) {
                         // Keep original lines with ANSI for coloring
-                        let colored_lines: Vec<&String> = world.output_lines.iter()
+                        let colored_lines: Vec<&TimestampedLine> = world.output_lines.iter()
                             .filter(|line| {
                                 // Apply filter if active (filter on stripped text)
                                 if self.filter_active && !self.filter_text.is_empty() {
-                                    let stripped = Self::strip_ansi_for_copy(line);
+                                    let stripped = Self::strip_ansi_for_copy(&line.text);
                                     stripped.to_lowercase().contains(&self.filter_text.to_lowercase())
                                 } else {
                                     true
@@ -6653,9 +6819,11 @@ mod remote_gui {
                         // Build plain text version for selection (strip ANSI codes and empty lines)
                         let lines: Vec<String> = colored_lines.iter()
                             .map(|line| {
-                                let stripped = Self::strip_ansi_for_copy(line);
+                                let stripped = Self::strip_ansi_for_copy(&line.text);
                                 if self.show_tags {
-                                    stripped
+                                    // Add timestamp prefix when showing tags
+                                    let ts_prefix = Self::format_timestamp_gui(line.ts);
+                                    format!("{} {}", ts_prefix, stripped)
                                 } else {
                                     // Strip MUD tags like [channel:] or [channel(player)]
                                     Self::strip_mud_tags(&stripped)
@@ -6676,15 +6844,17 @@ mod remote_gui {
 
                         // Filter out empty lines to match console behavior
                         let non_empty_lines: Vec<_> = colored_lines.iter()
-                            .filter(|line| !Self::strip_ansi_for_copy(line).is_empty())
+                            .filter(|line| !Self::strip_ansi_for_copy(&line.text).is_empty())
                             .collect();
 
                         for (i, line) in non_empty_lines.iter().enumerate() {
                             // Apply tag stripping if needed (on the ANSI version)
                             let display_line = if self.show_tags {
-                                (**line).clone()
+                                // Add timestamp prefix when showing tags
+                                let ts_prefix = Self::format_timestamp_gui(line.ts);
+                                format!("\x1b[36m{}\x1b[0m {}", ts_prefix, line.text)
                             } else {
-                                Self::strip_mud_tags_ansi(line)
+                                Self::strip_mud_tags_ansi(&line.text)
                             };
 
                             // Parse ANSI and append to combined job
@@ -6961,43 +7131,61 @@ mod remote_gui {
 
                 // World List popup
                 if self.popup_state == PopupState::WorldList {
+                    let mut popup_open = true;
+                    let frame = egui::Frame::window(&ctx.style())
+                        .inner_margin(egui::Margin { left: 10.0, right: 10.0, top: 10.0, bottom: 10.0 });
                     egui::Window::new("World List")
                         .collapsible(false)
                         .resizable(true)
                         .default_size([400.0, 300.0])
+                        .frame(frame)
+                        .open(&mut popup_open)
                         .show(ctx, |ui| {
+                            // Minimal spacing between items
+                            ui.spacing_mut().item_spacing = egui::vec2(10.0, 0.0);
                             if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
                                 close_popup = true;
                             }
-                            ScrollArea::vertical().max_height(200.0).show(ui, |ui| {
-                                for (idx, world) in self.worlds.iter().enumerate() {
-                                    let status = if world.connected { "●" } else { "○" };
-                                    let label = format!("{} {} - {}:{}",
-                                        status, world.name,
-                                        world.settings.hostname, world.settings.port);
-                                    if ui.selectable_label(idx == self.world_list_selected, &label).clicked() {
-                                        self.world_list_selected = idx;
+                            // Get available width before ScrollArea so it fills the window
+                            let scroll_width = ui.available_width();
+                            ScrollArea::vertical()
+                                .max_height(200.0)
+                                .min_scrolled_width(scroll_width)
+                                .show(ui, |ui| {
+                                    ui.set_min_width(scroll_width - 16.0); // Account for scrollbar
+                                    for (idx, world) in self.worlds.iter().enumerate() {
+                                        let status = if world.connected { "●" } else { "○" };
+                                        let label = format!("{} {} - {}:{}",
+                                            status, world.name,
+                                            world.settings.hostname, world.settings.port);
+                                        if ui.selectable_label(idx == self.world_list_selected, &label).clicked() {
+                                            self.world_list_selected = idx;
+                                        }
                                     }
-                                }
-                            });
-                            ui.separator();
+                                });
+                            ui.add_space(10.0);
                             ui.horizontal(|ui| {
-                                if ui.button("Connect").clicked() {
-                                    popup_action = Some(("connect", self.world_list_selected));
-                                    close_popup = true;
-                                }
-                                if ui.button("Edit").clicked() {
-                                    popup_action = Some(("edit", self.world_list_selected));
-                                }
-                                if ui.button("Switch To").clicked() {
-                                    popup_action = Some(("switch", self.world_list_selected));
-                                    close_popup = true;
-                                }
-                                if ui.button("Close").clicked() {
-                                    close_popup = true;
-                                }
+                                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                    if ui.button("Close").clicked() {
+                                        close_popup = true;
+                                    }
+                                    if ui.button("Switch To").clicked() {
+                                        popup_action = Some(("switch", self.world_list_selected));
+                                        close_popup = true;
+                                    }
+                                    if ui.button("Edit").clicked() {
+                                        popup_action = Some(("edit", self.world_list_selected));
+                                    }
+                                    if ui.button("Connect").clicked() {
+                                        popup_action = Some(("connect", self.world_list_selected));
+                                        close_popup = true;
+                                    }
+                                });
                             });
                         });
+                    if !popup_open {
+                        close_popup = true;
+                    }
                 }
 
                 // Connected Worlds popup (/worlds or /l)
@@ -7037,10 +7225,12 @@ mod remote_gui {
                         }
                     }
 
+                    let mut popup_open = true;
                     egui::Window::new("Connected Worlds")
                         .collapsible(false)
                         .resizable(true)
                         .default_size([620.0, 250.0])
+                        .open(&mut popup_open)
                         .show(ctx, |ui| {
                             if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
                                 close_popup = true;
@@ -7135,24 +7325,33 @@ mod remote_gui {
                                 });
                             }
                             ui.separator();
-                            ui.horizontal(|ui| {
+                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                if ui.button("Close").clicked() {
+                                    close_popup = true;
+                                }
                                 if ui.button("Switch To").clicked() {
                                     popup_action = Some(("switch", self.world_list_selected));
                                     close_popup = true;
                                 }
-                                if ui.button("Close").clicked() {
-                                    close_popup = true;
-                                }
                             });
                         });
+                    if !popup_open {
+                        close_popup = true;
+                    }
                 }
 
                 // World Editor popup
                 if let PopupState::WorldEditor(world_idx) = self.popup_state {
+                    let mut popup_open = true;
+                    let frame = egui::Frame::window(&ctx.style())
+                        .inner_margin(egui::Margin { left: 10.0, right: 10.0, top: 10.0, bottom: 10.0 });
                     egui::Window::new("World Editor")
                         .collapsible(false)
                         .resizable(false)
+                        .frame(frame)
+                        .open(&mut popup_open)
                         .show(ctx, |ui| {
+                            ui.spacing_mut().item_spacing = egui::vec2(10.0, 0.0);
                             if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
                                 close_popup = true;
                             }
@@ -7176,8 +7375,34 @@ mod remote_gui {
                                     ui.add(TextEdit::singleline(&mut self.edit_user).desired_width(200.0));
                                     ui.end_row();
 
+                                    ui.label("Password:");
+                                    ui.add(TextEdit::singleline(&mut self.edit_password)
+                                        .password(true)
+                                        .desired_width(200.0));
+                                    ui.end_row();
+
                                     ui.label("Use SSL:");
                                     ui.checkbox(&mut self.edit_ssl, "");
+                                    ui.end_row();
+
+                                    ui.label("Log file:");
+                                    ui.add(TextEdit::singleline(&mut self.edit_log_file).desired_width(200.0));
+                                    ui.end_row();
+
+                                    ui.label("Encoding:");
+                                    if ui.button(self.edit_encoding.name()).clicked() {
+                                        self.edit_encoding = match self.edit_encoding {
+                                            Encoding::Utf8 => Encoding::Latin1,
+                                            Encoding::Latin1 => Encoding::Fansi,
+                                            Encoding::Fansi => Encoding::Utf8,
+                                        };
+                                    }
+                                    ui.end_row();
+
+                                    ui.label("Auto login:");
+                                    if ui.button(self.edit_auto_login.name()).clicked() {
+                                        self.edit_auto_login = self.edit_auto_login.next();
+                                    }
                                     ui.end_row();
 
                                     ui.label("Keep-Alive:");
@@ -7195,39 +7420,112 @@ mod remote_gui {
                                         ui.end_row();
                                     }
                                 });
-                            ui.separator();
+                            ui.add_space(10.0);
                             ui.horizontal(|ui| {
-                                if ui.button("Save").clicked() {
-                                    // Update local world settings and send to server
-                                    if let Some(world) = self.worlds.get_mut(world_idx) {
-                                        world.name = self.edit_name.clone();
-                                        world.settings.hostname = self.edit_hostname.clone();
-                                        world.settings.port = self.edit_port.clone();
-                                        world.settings.user = self.edit_user.clone();
-                                        world.settings.use_ssl = self.edit_ssl;
-                                        world.settings.keep_alive_type = self.edit_keep_alive_type.name().to_string();
-                                        world.settings.keep_alive_cmd = self.edit_keep_alive_cmd.clone();
+                                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                    if ui.button("Connect").clicked() {
+                                        popup_action = Some(("connect", world_idx));
+                                        close_popup = true;
                                     }
-                                    // Send update to server
-                                    self.update_world_settings(world_idx);
-                                    close_popup = true;
+                                    if ui.button("Delete").clicked() {
+                                        // Only allow delete if more than one world exists
+                                        if self.worlds.len() > 1 {
+                                            self.popup_state = PopupState::WorldConfirmDelete(world_idx);
+                                        }
+                                    }
+                                    if ui.button("Cancel").clicked() {
+                                        close_popup = true;
+                                    }
+                                    if ui.button("Save").clicked() {
+                                        // Update local world settings and send to server
+                                        if let Some(world) = self.worlds.get_mut(world_idx) {
+                                            world.name = self.edit_name.clone();
+                                            world.settings.hostname = self.edit_hostname.clone();
+                                            world.settings.port = self.edit_port.clone();
+                                            world.settings.user = self.edit_user.clone();
+                                            world.settings.password = self.edit_password.clone();
+                                            world.settings.use_ssl = self.edit_ssl;
+                                            world.settings.log_file = self.edit_log_file.clone();
+                                            world.settings.encoding = self.edit_encoding.name().to_string();
+                                            world.settings.auto_login = self.edit_auto_login.name().to_string();
+                                            world.settings.keep_alive_type = self.edit_keep_alive_type.name().to_string();
+                                            world.settings.keep_alive_cmd = self.edit_keep_alive_cmd.clone();
+                                        }
+                                        // Send update to server
+                                        self.update_world_settings(world_idx);
+                                        close_popup = true;
+                                    }
+                                });
+                            });
+                        });
+                    if !popup_open {
+                        close_popup = true;
+                    }
+                }
+
+                // World delete confirmation popup
+                if let PopupState::WorldConfirmDelete(world_idx) = self.popup_state {
+                    let world_name = self.worlds.get(world_idx)
+                        .map(|w| w.name.clone())
+                        .unwrap_or_default();
+                    egui::Window::new("Confirm Delete")
+                        .collapsible(false)
+                        .resizable(false)
+                        .show(ctx, |ui| {
+                            ui.label(format!("Delete world '{}'?", world_name));
+                            ui.separator();
+                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                if ui.button("No").clicked() {
+                                    // Go back to world editor
+                                    self.popup_state = PopupState::WorldEditor(world_idx);
                                 }
-                                if ui.button("Cancel").clicked() {
-                                    close_popup = true;
-                                }
-                                if ui.button("Connect").clicked() {
-                                    popup_action = Some(("connect", world_idx));
+                                if ui.button("Yes").clicked() {
+                                    // Delete the world
+                                    if world_idx < self.worlds.len() && self.worlds.len() > 1 {
+                                        self.worlds.remove(world_idx);
+                                        // Adjust current_world if needed
+                                        if self.current_world >= self.worlds.len() {
+                                            self.current_world = self.worlds.len().saturating_sub(1);
+                                        }
+                                        // Send delete request to server
+                                        if let Some(ref ws_tx) = self.ws_tx {
+                                            let msg = WsMessage::WorldRemoved { world_index: world_idx };
+                                            let _ = ws_tx.send(msg);
+                                        }
+                                    }
                                     close_popup = true;
                                 }
                             });
+                            if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+                                self.popup_state = PopupState::WorldEditor(world_idx);
+                            }
+                            if ui.input(|i| i.key_pressed(egui::Key::Y)) {
+                                // Delete the world
+                                if world_idx < self.worlds.len() && self.worlds.len() > 1 {
+                                    self.worlds.remove(world_idx);
+                                    if self.current_world >= self.worlds.len() {
+                                        self.current_world = self.worlds.len().saturating_sub(1);
+                                    }
+                                    if let Some(ref ws_tx) = self.ws_tx {
+                                        let msg = WsMessage::WorldRemoved { world_index: world_idx };
+                                        let _ = ws_tx.send(msg);
+                                    }
+                                }
+                                close_popup = true;
+                            }
+                            if ui.input(|i| i.key_pressed(egui::Key::N)) {
+                                self.popup_state = PopupState::WorldEditor(world_idx);
+                            }
                         });
                 }
 
                 // Setup popup (matches console /setup)
                 if self.popup_state == PopupState::Setup {
+                    let mut popup_open = true;
                     egui::Window::new("Setup")
                         .collapsible(false)
                         .resizable(false)
+                        .open(&mut popup_open)
                         .show(ctx, |ui| {
                             if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
                                 close_popup = true;
@@ -7299,24 +7597,29 @@ mod remote_gui {
                                     ui.end_row();
                                 });
                             ui.separator();
-                            ui.horizontal(|ui| {
+                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                if ui.button("Cancel").clicked() {
+                                    close_popup = true;
+                                }
                                 if ui.button("Save").clicked() {
                                     // Send updated settings to server
                                     self.update_global_settings();
                                     close_popup = true;
                                 }
-                                if ui.button("Cancel").clicked() {
-                                    close_popup = true;
-                                }
                             });
                         });
+                    if !popup_open {
+                        close_popup = true;
+                    }
                 }
 
                 // Web popup (matches console /web)
                 if self.popup_state == PopupState::Web {
+                    let mut popup_open = true;
                     egui::Window::new("Web Settings")
                         .collapsible(false)
                         .resizable(false)
+                        .open(&mut popup_open)
                         .show(ctx, |ui| {
                             if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
                                 close_popup = true;
@@ -7383,17 +7686,20 @@ mod remote_gui {
                                     ui.end_row();
                                 });
                             ui.separator();
-                            ui.horizontal(|ui| {
+                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                if ui.button("Cancel").clicked() {
+                                    close_popup = true;
+                                }
                                 if ui.button("Save").clicked() {
                                     // Send updated settings to server
                                     self.update_global_settings();
                                     close_popup = true;
                                 }
-                                if ui.button("Cancel").clicked() {
-                                    close_popup = true;
-                                }
                             });
                         });
+                    if !popup_open {
+                        close_popup = true;
+                    }
                 }
 
                 // Font popup
@@ -7414,9 +7720,11 @@ mod remote_gui {
                         ("Consolas", "Consolas"),
                     ];
 
+                    let mut popup_open = true;
                     egui::Window::new("Font Settings")
                         .collapsible(false)
                         .resizable(false)
+                        .open(&mut popup_open)
                         .show(ctx, |ui| {
                             if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
                                 close_popup = true;
@@ -7464,7 +7772,10 @@ mod remote_gui {
                                     ui.end_row();
                                 });
                             ui.separator();
-                            ui.horizontal(|ui| {
+                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                if ui.button("Cancel").clicked() {
+                                    close_popup = true;
+                                }
                                 if ui.button("OK").clicked() {
                                     // Parse and apply font settings
                                     self.font_name = self.edit_font_name.clone();
@@ -7475,19 +7786,21 @@ mod remote_gui {
                                     self.update_global_settings();
                                     close_popup = true;
                                 }
-                                if ui.button("Cancel").clicked() {
-                                    close_popup = true;
-                                }
                             });
                         });
+                    if !popup_open {
+                        close_popup = true;
+                    }
                 }
 
                 // Help popup
                 if self.popup_state == PopupState::Help {
+                    let mut popup_open = true;
                     egui::Window::new("Help")
                         .collapsible(false)
                         .resizable(true)
                         .default_size([450.0, 400.0])
+                        .open(&mut popup_open)
                         .show(ctx, |ui| {
                             // Check for Escape key to close
                             if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
@@ -7534,20 +7847,25 @@ mod remote_gui {
                                 });
 
                             ui.separator();
-                            ui.horizontal(|ui| {
+                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                                 if ui.button("OK").clicked() {
                                     close_popup = true;
                                 }
                             });
                         });
+                    if !popup_open {
+                        close_popup = true;
+                    }
                 }
 
                 // Actions List popup (first window)
                 if self.popup_state == PopupState::ActionsList {
+                    let mut popup_open = true;
                     egui::Window::new("Actions")
                         .collapsible(false)
                         .resizable(true)
                         .default_size([450.0, 300.0])
+                        .open(&mut popup_open)
                         .show(ctx, |ui| {
                             if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
                                 close_popup = true;
@@ -7599,15 +7917,12 @@ mod remote_gui {
                             ui.separator();
 
                             // Buttons: Add, Edit, Delete, Cancel
-                            ui.horizontal(|ui| {
-                                if ui.button("Add").clicked() {
-                                    // Create new action and open editor
-                                    self.edit_action_name = String::new();
-                                    self.edit_action_world = String::new();
-                                    self.edit_action_pattern = String::new();
-                                    self.edit_action_command = String::new();
-                                    self.action_error = None;
-                                    self.popup_state = PopupState::ActionEditor(usize::MAX); // MAX = new action
+                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                if ui.button("Cancel").clicked() {
+                                    close_popup = true;
+                                }
+                                if ui.button("Delete").clicked() && !self.actions.is_empty() {
+                                    self.popup_state = PopupState::ActionConfirmDelete;
                                 }
                                 if ui.button("Edit").clicked() && !self.actions.is_empty() {
                                     // Load selected action into editor
@@ -7620,23 +7935,31 @@ mod remote_gui {
                                         self.popup_state = PopupState::ActionEditor(self.actions_selected);
                                     }
                                 }
-                                if ui.button("Delete").clicked() && !self.actions.is_empty() {
-                                    self.popup_state = PopupState::ActionConfirmDelete;
-                                }
-                                if ui.button("Cancel").clicked() {
-                                    close_popup = true;
+                                if ui.button("Add").clicked() {
+                                    // Create new action and open editor
+                                    self.edit_action_name = String::new();
+                                    self.edit_action_world = String::new();
+                                    self.edit_action_pattern = String::new();
+                                    self.edit_action_command = String::new();
+                                    self.action_error = None;
+                                    self.popup_state = PopupState::ActionEditor(usize::MAX); // MAX = new action
                                 }
                             });
                         });
+                    if !popup_open {
+                        close_popup = true;
+                    }
                 }
 
                 // Actions Editor popup (second window)
                 if let PopupState::ActionEditor(edit_idx) = self.popup_state.clone() {
+                    let mut popup_open = true;
                     let title = if edit_idx == usize::MAX { "New Action" } else { "Edit Action" };
                     egui::Window::new(title)
                         .collapsible(false)
                         .resizable(true)
                         .default_size([400.0, 350.0])
+                        .open(&mut popup_open)
                         .show(ctx, |ui| {
                             if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
                                 // Return to actions list
@@ -7682,7 +8005,10 @@ mod remote_gui {
                             ui.separator();
 
                             // Buttons: Save, Cancel
-                            ui.horizontal(|ui| {
+                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                if ui.button("Cancel").clicked() {
+                                    self.popup_state = PopupState::ActionsList;
+                                }
                                 if ui.button("Save").clicked() {
                                     // Validate
                                     let name = self.edit_action_name.trim();
@@ -7720,11 +8046,11 @@ mod remote_gui {
                                         }
                                     }
                                 }
-                                if ui.button("Cancel").clicked() {
-                                    self.popup_state = PopupState::ActionsList;
-                                }
                             });
                         });
+                    if !popup_open {
+                        self.popup_state = PopupState::ActionsList;
+                    }
                 }
 
                 // Action delete confirmation popup
@@ -7744,7 +8070,10 @@ mod remote_gui {
                             ui.label(format!("Delete action '{}'?", action_name));
                             ui.add_space(8.0);
 
-                            ui.horizontal(|ui| {
+                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                if ui.button("No").clicked() {
+                                    self.popup_state = PopupState::ActionsList;
+                                }
                                 if ui.button("Yes").clicked() {
                                     if self.actions_selected < self.actions.len() {
                                         self.actions.remove(self.actions_selected);
@@ -7754,9 +8083,6 @@ mod remote_gui {
                                         // Send updated actions to server
                                         self.update_actions();
                                     }
-                                    self.popup_state = PopupState::ActionsList;
-                                }
-                                if ui.button("No").clicked() {
                                     self.popup_state = PopupState::ActionsList;
                                 }
                             });
@@ -7958,7 +8284,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
             app.worlds[world_idx].connected = false;
             app.worlds[world_idx].command_tx = None;
             app.worlds[world_idx].socket_fd = None;
-            app.worlds[world_idx].output_lines.push(tls_msg.to_string());
+            app.worlds[world_idx].output_lines.push(OutputLine::new(tls_msg.to_string()));
         }
 
         // Second pass: reconstruct plain TCP connections
@@ -8118,7 +8444,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                 world.connected = false;
                 world.socket_fd = None;
                 world.output_lines
-                    .push("Connection was not restored during reload. Use /connect to reconnect.".to_string());
+                    .push(OutputLine::new("Connection was not restored during reload. Use /connect to reconnect.".to_string()));
             }
             // Clear pending_lines for disconnected worlds - they're only meaningful for active connections
             if !world.connected {
@@ -8632,6 +8958,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                     world_index: world_idx,
                                     data: ws_data,
                                     is_viewed: is_current,
+                                    ts: current_timestamp_secs(),
                                 });
                             }
 
@@ -8764,6 +9091,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                                 world_index,
                                                 data: format!("Unknown action: /{}", name),
                                                 is_viewed: false,
+                                                ts: current_timestamp_secs(),
                                             });
                                         }
                                     }
@@ -8783,6 +9111,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                             world_index,
                                             data: format!("Unknown command: {}", cmd),
                                             is_viewed: false,
+                                            ts: current_timestamp_secs(),
                                         });
                                     }
                                     Command::Send { text, all_worlds, target_world, no_newline } => {
@@ -8819,6 +9148,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                                         world_index,
                                                         data: format!("World '{}' is not connected.", target),
                                                         is_viewed: false,
+                                                        ts: current_timestamp_secs(),
                                                     });
                                                 }
                                             } else {
@@ -8826,6 +9156,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                                     world_index,
                                                     data: format!("Unknown world: {}", target),
                                                     is_viewed: false,
+                                                    ts: current_timestamp_secs(),
                                                 });
                                             }
                                         } else {
@@ -8850,6 +9181,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                                 world_index,
                                                 data: "Disconnected.".to_string(),
                                                 is_viewed: false,
+                                                ts: current_timestamp_secs(),
                                             });
                                             app.ws_broadcast(WsMessage::WorldDisconnected { world_index });
                                         } else {
@@ -8857,6 +9189,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                                 world_index,
                                                 data: "Not connected.".to_string(),
                                                 is_viewed: false,
+                                                ts: current_timestamp_secs(),
                                             });
                                         }
                                     }
@@ -8877,6 +9210,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                                 world_index,
                                                 data: info,
                                                 is_viewed: false,
+                                                ts: current_timestamp_secs(),
                                             });
                                         }
                                     }
@@ -8886,6 +9220,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                             world_index,
                                             data: format!("Gag pattern set: {}", pattern),
                                             is_viewed: false,
+                                            ts: current_timestamp_secs(),
                                         });
                                     }
                                     // Commands that should be blocked from remote
@@ -8894,6 +9229,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                             world_index,
                                             data: "This command is not available from remote interfaces.".to_string(),
                                             is_viewed: false,
+                                            ts: current_timestamp_secs(),
                                         });
                                     }
                                     // UI popup commands - handled client-side, no-op on server
@@ -8920,6 +9256,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                                     world_index,
                                                     data: "No hostname/port configured for this world.".to_string(),
                                                     is_viewed: false,
+                                                    ts: current_timestamp_secs(),
                                                 });
                                             }
                                         }
@@ -8950,6 +9287,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                                 world_index,
                                                 data: format!("World '{}' not found.", name),
                                                 is_viewed: false,
+                                                ts: current_timestamp_secs(),
                                             });
                                         }
                                     }
@@ -9018,16 +9356,24 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                     app.ws_broadcast(WsMessage::UnseenCleared { world_index });
                                 }
                             }
-                            WsMessage::UpdateWorldSettings { world_index, name, hostname, port, user, use_ssl, keep_alive_type, keep_alive_cmd } => {
+                            WsMessage::UpdateWorldSettings { world_index, name, hostname, port, user, password, use_ssl, log_file, encoding, auto_login, keep_alive_type, keep_alive_cmd } => {
                                 // Update world settings from remote client
                                 if world_index < app.worlds.len() {
                                     app.worlds[world_index].name = name.clone();
                                     app.worlds[world_index].settings.hostname = hostname.clone();
                                     app.worlds[world_index].settings.port = port.clone();
                                     app.worlds[world_index].settings.user = user.clone();
+                                    app.worlds[world_index].settings.password = password.clone();
                                     app.worlds[world_index].settings.use_ssl = use_ssl;
+                                    app.worlds[world_index].settings.log_file = if log_file.is_empty() { None } else { Some(log_file.clone()) };
+                                    app.worlds[world_index].settings.encoding = match encoding.as_str() {
+                                        "latin1" => Encoding::Latin1,
+                                        "fansi" => Encoding::Fansi,
+                                        _ => Encoding::Utf8,
+                                    };
+                                    app.worlds[world_index].settings.auto_connect_type = AutoConnectType::from_name(&auto_login);
                                     app.worlds[world_index].settings.keep_alive_type = KeepAliveType::from_name(&keep_alive_type);
-                                    app.worlds[world_index].settings.keep_alive_cmd = keep_alive_cmd;
+                                    app.worlds[world_index].settings.keep_alive_cmd = keep_alive_cmd.clone();
                                     // Save settings to persist changes
                                     let _ = save_settings(&app);
                                     // Build settings message for broadcast
@@ -9036,11 +9382,11 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                         port,
                                         user,
                                         use_ssl,
-                                        log_file: app.worlds[world_index].settings.log_file.clone(),
-                                        encoding: app.worlds[world_index].settings.encoding.name().to_string(),
-                                        auto_connect_type: app.worlds[world_index].settings.auto_connect_type.name().to_string(),
-                                        keep_alive_type: app.worlds[world_index].settings.keep_alive_type.name().to_string(),
-                                        keep_alive_cmd: app.worlds[world_index].settings.keep_alive_cmd.clone(),
+                                        log_file: if log_file.is_empty() { None } else { Some(log_file) },
+                                        encoding,
+                                        auto_connect_type: auto_login,
+                                        keep_alive_type,
+                                        keep_alive_cmd,
                                     };
                                     // Broadcast update to all clients
                                     app.ws_broadcast(WsMessage::WorldSettingsUpdated {
@@ -9318,6 +9664,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                 world_index: world_idx,
                                 data: ws_data,
                                 is_viewed: is_current,
+                                ts: current_timestamp_secs(),
                             });
                         }
 
@@ -9443,6 +9790,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                             world_index,
                                             data: format!("Unknown action: /{}", name),
                                             is_viewed: false,
+                                            ts: current_timestamp_secs(),
                                         });
                                     }
                                 }
@@ -9462,6 +9810,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                         world_index,
                                         data: format!("Unknown command: {}", cmd),
                                         is_viewed: false,
+                                        ts: current_timestamp_secs(),
                                     });
                                 }
                                 Command::Send { text, all_worlds, target_world, no_newline } => {
@@ -9498,6 +9847,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                                     world_index,
                                                     data: format!("World '{}' is not connected.", target),
                                                     is_viewed: false,
+                                                    ts: current_timestamp_secs(),
                                                 });
                                             }
                                         } else {
@@ -9505,6 +9855,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                                 world_index,
                                                 data: format!("Unknown world: {}", target),
                                                 is_viewed: false,
+                                                ts: current_timestamp_secs(),
                                             });
                                         }
                                     } else {
@@ -9529,6 +9880,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                             world_index,
                                             data: "Disconnected.".to_string(),
                                             is_viewed: false,
+                                            ts: current_timestamp_secs(),
                                         });
                                         app.ws_broadcast(WsMessage::WorldDisconnected { world_index });
                                     } else {
@@ -9536,6 +9888,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                             world_index,
                                             data: "Not connected.".to_string(),
                                             is_viewed: false,
+                                            ts: current_timestamp_secs(),
                                         });
                                     }
                                 }
@@ -9556,6 +9909,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                             world_index,
                                             data: info,
                                             is_viewed: false,
+                                            ts: current_timestamp_secs(),
                                         });
                                     }
                                 }
@@ -9565,6 +9919,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                         world_index,
                                         data: format!("Gag pattern set: {}", pattern),
                                         is_viewed: false,
+                                        ts: current_timestamp_secs(),
                                     });
                                 }
                                 // Commands that should be blocked from remote
@@ -9573,6 +9928,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                         world_index,
                                         data: "This command is not available from remote interfaces.".to_string(),
                                         is_viewed: false,
+                                        ts: current_timestamp_secs(),
                                     });
                                 }
                                 // UI popup commands - handled client-side, no-op on server
@@ -9587,6 +9943,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                         world_index,
                                         data: "Use ConnectWorld message for connection.".to_string(),
                                         is_viewed: false,
+                                        ts: current_timestamp_secs(),
                                     });
                                 }
                                 // WorldSwitch - do the switch part, skip async connect
@@ -9601,6 +9958,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                             world_index,
                                             data: format!("World '{}' not found.", name),
                                             is_viewed: false,
+                                            ts: current_timestamp_secs(),
                                         });
                                     }
                                 }
@@ -9612,23 +9970,31 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                 app.ws_broadcast(WsMessage::WorldSwitched { new_index: world_index });
                             }
                         }
-                        WsMessage::UpdateWorldSettings { world_index, name, hostname, port, user, use_ssl, keep_alive_type, keep_alive_cmd } => {
+                        WsMessage::UpdateWorldSettings { world_index, name, hostname, port, user, password, use_ssl, log_file, encoding, auto_login, keep_alive_type, keep_alive_cmd } => {
                             if world_index < app.worlds.len() {
                                 app.worlds[world_index].name = name.clone();
                                 app.worlds[world_index].settings.hostname = hostname.clone();
                                 app.worlds[world_index].settings.port = port.clone();
                                 app.worlds[world_index].settings.user = user.clone();
+                                app.worlds[world_index].settings.password = password.clone();
                                 app.worlds[world_index].settings.use_ssl = use_ssl;
+                                app.worlds[world_index].settings.log_file = if log_file.is_empty() { None } else { Some(log_file.clone()) };
+                                app.worlds[world_index].settings.encoding = match encoding.as_str() {
+                                    "latin1" => Encoding::Latin1,
+                                    "fansi" => Encoding::Fansi,
+                                    _ => Encoding::Utf8,
+                                };
+                                app.worlds[world_index].settings.auto_connect_type = AutoConnectType::from_name(&auto_login);
                                 app.worlds[world_index].settings.keep_alive_type = KeepAliveType::from_name(&keep_alive_type);
-                                app.worlds[world_index].settings.keep_alive_cmd = keep_alive_cmd;
+                                app.worlds[world_index].settings.keep_alive_cmd = keep_alive_cmd.clone();
                                 let _ = save_settings(&app);
                                 let settings_msg = WorldSettingsMsg {
                                     hostname, port, user, use_ssl,
-                                    log_file: app.worlds[world_index].settings.log_file.clone(),
-                                    encoding: app.worlds[world_index].settings.encoding.name().to_string(),
-                                    auto_connect_type: app.worlds[world_index].settings.auto_connect_type.name().to_string(),
-                                    keep_alive_type: app.worlds[world_index].settings.keep_alive_type.name().to_string(),
-                                    keep_alive_cmd: app.worlds[world_index].settings.keep_alive_cmd.clone(),
+                                    log_file: if log_file.is_empty() { None } else { Some(log_file) },
+                                    encoding,
+                                    auto_connect_type: auto_login,
+                                    keep_alive_type,
+                                    keep_alive_cmd,
                                 };
                                 app.ws_broadcast(WsMessage::WorldSettingsUpdated { world_index, settings: settings_msg, name });
                             }
@@ -11766,15 +12132,16 @@ fn render_output_crossterm(app: &App) {
         let end_line = world.scroll_offset.min(world.output_lines.len().saturating_sub(1));
         let show_tags = app.show_tags;
 
-        let expand_and_wrap = |line: &str| -> Vec<String> {
+        let expand_and_wrap = |line: &OutputLine| -> Vec<String> {
             // Skip visually empty lines (only ANSI codes/whitespace)
-            if is_visually_empty(line) {
+            if is_visually_empty(&line.text) {
                 return Vec::new();
             }
             let processed = if show_tags {
-                line.to_string()
+                // Show timestamp + original text when tags are shown
+                format!("\x1b[36m{}\x1b[0m {}", line.format_timestamp(), line.text)
             } else {
-                strip_mud_tag(line)
+                strip_mud_tag(&line.text)
             };
             let expanded = processed.replace('\t', "        ");
             wrap_ansi_line(&expanded, term_width)
@@ -11909,16 +12276,17 @@ fn render_output_area(f: &mut Frame, app: &App, area: Rect) {
 
     for line in world.output_lines.iter().skip(start).take(end - start) {
         // For visually empty lines, render as blank line (don't skip - that leaves gaps)
-        if is_visually_empty(line) {
+        if is_visually_empty(&line.text) {
             lines.push(Line::from(""));
             continue;
         }
 
-        // Strip MUD tags if show_tags is disabled
+        // Strip MUD tags if show_tags is disabled, add timestamp if enabled
         let display_line = if app.show_tags {
-            line.clone()
+            // Show timestamp + original text when tags are shown
+            format!("\x1b[36m{}\x1b[0m {}", line.format_timestamp(), line.text)
         } else {
-            strip_mud_tag(line)
+            strip_mud_tag(&line.text)
         };
 
         // Parse ANSI codes and convert to ratatui spans
@@ -11975,7 +12343,7 @@ fn render_splash_centered<'a>(world: &World, visible_height: usize, area_width: 
 
     // Process and center each line
     for line in &world.output_lines {
-        let line_width = visible_width(line);
+        let line_width = visible_width(&line.text);
         let padding = if area_width > line_width {
             (area_width - line_width) / 2
         } else {
@@ -11983,7 +12351,7 @@ fn render_splash_centered<'a>(world: &World, visible_height: usize, area_width: 
         };
 
         // Create padded line
-        let padded = format!("{:width$}{}", "", line, width = padding);
+        let padded = format!("{:width$}{}", "", line.text, width = padding);
 
         // Parse ANSI codes and convert to ratatui spans
         match ansi_to_tui::IntoText::into_text(&padded) {

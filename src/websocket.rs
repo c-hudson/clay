@@ -32,7 +32,8 @@ pub enum WsMessage {
 
     // Real-time updates (server -> client)
     /// is_viewed: true if any interface (console/web/GUI) is viewing this world
-    ServerData { world_index: usize, data: String, is_viewed: bool },
+    /// ts: timestamp in seconds since Unix epoch (when the line was received)
+    ServerData { world_index: usize, data: String, is_viewed: bool, #[serde(default)] ts: u64 },
     WorldConnected { world_index: usize, name: String },
     WorldDisconnected { world_index: usize },
     WorldAdded { world: Box<WorldStateMsg> },
@@ -58,7 +59,11 @@ pub enum WsMessage {
         hostname: String,
         port: String,
         user: String,
+        password: String,
         use_ssl: bool,
+        log_file: String,
+        encoding: String,
+        auto_login: String,
         keep_alive_type: String,
         keep_alive_cmd: String,
     },
@@ -97,6 +102,13 @@ pub enum WsMessage {
     Pong,
 }
 
+/// A line of output with timestamp
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct TimestampedLine {
+    pub text: String,
+    pub ts: u64, // seconds since Unix epoch
+}
+
 /// World state for WebSocket protocol
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct WorldStateMsg {
@@ -115,6 +127,11 @@ pub struct WorldStateMsg {
     pub last_recv_secs: Option<u64>,
     pub last_nop_secs: Option<u64>,
     pub keep_alive_type: String,
+    // Timestamped versions of output/pending lines (optional for backward compat)
+    #[serde(default)]
+    pub output_lines_ts: Vec<TimestampedLine>,
+    #[serde(default)]
+    pub pending_lines_ts: Vec<TimestampedLine>,
 }
 
 /// World settings for WebSocket protocol (password intentionally omitted)
