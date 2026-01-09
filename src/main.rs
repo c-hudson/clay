@@ -2929,6 +2929,7 @@ impl World {
 struct App {
     worlds: Vec<World>,
     current_world_index: usize,
+    previous_world_index: Option<usize>, // For Alt+w fallback when no unseen/pending
     input: InputArea,
     input_height: u16,
     output_height: u16,
@@ -2969,6 +2970,7 @@ impl App {
         Self {
             worlds: Vec::new(),
             current_world_index: 0,
+            previous_world_index: None,
             input: InputArea::new(3),
             input_height: 3,
             output_height: 20, // Will be updated by ui()
@@ -3040,7 +3042,9 @@ impl App {
     }
 
     fn switch_world(&mut self, index: usize) {
-        if index < self.worlds.len() {
+        if index < self.worlds.len() && index != self.current_world_index {
+            // Track previous world for Alt+w fallback
+            self.previous_world_index = Some(self.current_world_index);
             self.current_world_index = index;
             self.worlds[index].mark_seen();
             // Broadcast to WebSocket clients that this world's unseen count is cleared
@@ -3048,9 +3052,11 @@ impl App {
         }
     }
 
-    /// Switch to the world with the oldest pending output (Alt-w)
-    /// Returns true if switched, false if no world has pending output
+    /// Switch to a world with activity (Alt-w)
+    /// Priority: 1) oldest pending output, 2) any unseen output, 3) previous world
+    /// Returns true if switched, false if nowhere to switch
     fn switch_to_oldest_pending(&mut self) -> bool {
+        // First, check for worlds with pending output (paused lines)
         let mut oldest_idx: Option<usize> = None;
         let mut oldest_time: Option<std::time::Instant> = None;
 
@@ -3069,10 +3075,26 @@ impl App {
 
         if let Some(idx) = oldest_idx {
             self.switch_world(idx);
-            true
-        } else {
-            false
+            return true;
         }
+
+        // Second, check for worlds with unseen output (activity indicator)
+        for (idx, world) in self.worlds.iter().enumerate() {
+            if idx != self.current_world_index && world.unseen_lines > 0 {
+                self.switch_world(idx);
+                return true;
+            }
+        }
+
+        // Third, fall back to previous world if it exists and is different
+        if let Some(prev_idx) = self.previous_world_index {
+            if prev_idx < self.worlds.len() && prev_idx != self.current_world_index {
+                self.switch_world(prev_idx);
+                return true;
+            }
+        }
+
+        false
     }
 
     /// Get sorted list of world indices for cycling (alphabetically by name, case-insensitive)
@@ -3803,7 +3825,23 @@ fn load_settings(app: &mut App) -> io::Result<()> {
             let key = &line[..eq_pos];
             let value = &line[eq_pos + 1..];
 
-            if current_world.is_none() {
+            // Check for action settings first (current_action takes priority)
+            if let Some(action_idx) = current_action {
+                // Action settings
+                if let Some(action) = app.settings.actions.get_mut(action_idx) {
+                    // Helper to unescape saved strings
+                    fn unescape_action_value(s: &str) -> String {
+                        s.replace("\\n", "\n").replace("\\e", "=").replace("\\\\", "\\")
+                    }
+                    match key {
+                        "name" => action.name = value.to_string(),
+                        "world" => action.world = value.to_string(),
+                        "pattern" => action.pattern = unescape_action_value(value),
+                        "command" => action.command = unescape_action_value(value),
+                        _ => {}
+                    }
+                }
+            } else if current_world.is_none() {
                 // Global settings
                 match key {
                     "more_mode" => {
@@ -3955,21 +3993,6 @@ fn load_settings(app: &mut App) -> io::Result<()> {
                         _ => {}
                     }
                 }
-            } else if let Some(action_idx) = current_action {
-                // Action settings
-                if let Some(action) = app.settings.actions.get_mut(action_idx) {
-                    // Helper to unescape saved strings
-                    fn unescape_action_value(s: &str) -> String {
-                        s.replace("\\n", "\n").replace("\\e", "=").replace("\\\\", "\\")
-                    }
-                    match key {
-                        "name" => action.name = value.to_string(),
-                        "world" => action.world = value.to_string(),
-                        "pattern" => action.pattern = unescape_action_value(value),
-                        "command" => action.command = unescape_action_value(value),
-                        _ => {}
-                    }
-                }
             }
         }
     }
@@ -4086,6 +4109,22 @@ fn save_reload_state(app: &App) -> io::Result<()> {
         }
     }
 
+    // Save actions
+    for (idx, action) in app.settings.actions.iter().enumerate() {
+        writeln!(file)?;
+        writeln!(file, "[action:{}]", idx)?;
+        writeln!(file, "name={}", action.name)?;
+        if !action.world.is_empty() {
+            writeln!(file, "world={}", action.world)?;
+        }
+        if !action.pattern.is_empty() {
+            writeln!(file, "pattern={}", action.pattern.replace('\\', "\\\\").replace('=', "\\e").replace('\n', "\\n"))?;
+        }
+        if !action.command.is_empty() {
+            writeln!(file, "command={}", action.command.replace('\\', "\\\\").replace('=', "\\e").replace('\n', "\\n"))?;
+        }
+    }
+
     Ok(())
 }
 
@@ -4197,6 +4236,10 @@ fn load_reload_state(app: &mut App) -> io::Result<bool> {
                 current_section = "pending".to_string();
                 pending_world_idx = Some(idx);
                 output_world_idx = None;
+            } else if section.starts_with("action:") {
+                // Start a new action
+                current_section = "action".to_string();
+                app.settings.actions.push(Action::new());
             }
             continue;
         }
@@ -4398,6 +4441,21 @@ fn load_reload_state(app: &mut App) -> io::Result<bool> {
                             }
                             _ => {}
                         }
+                    }
+                }
+            } else if current_section == "action" {
+                // Action settings
+                if let Some(action) = app.settings.actions.last_mut() {
+                    // Helper to unescape saved strings
+                    fn unescape_action_value(s: &str) -> String {
+                        s.replace("\\n", "\n").replace("\\e", "=").replace("\\\\", "\\")
+                    }
+                    match key {
+                        "name" => action.name = value.to_string(),
+                        "world" => action.world = value.to_string(),
+                        "pattern" => action.pattern = unescape_action_value(value),
+                        "command" => action.command = unescape_action_value(value),
+                        _ => {}
                     }
                 }
             }
