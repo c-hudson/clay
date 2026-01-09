@@ -218,7 +218,7 @@ Prompts that are auto-answered are immediately cleared and not displayed in the 
 - `Ctrl+W` - Delete word before cursor
 - `Ctrl+P/N` - Previous/Next command history
 - `Ctrl+Q` - Spell suggestions / cycle and replace
-- `Home/End` - Jump to start/end
+- `Ctrl+A` or `Home/End` - Jump to start/end (Ctrl+A = start only)
 
 **Output Scrollback:**
 - `PageUp` - Scroll back in history (enables more-pause)
@@ -434,6 +434,7 @@ Note: HTTP automatically starts the non-secure WebSocket server if not already r
 - `Ctrl+P/N` - Command history navigation
 - `Ctrl+U` - Clear input
 - `Ctrl+W` - Delete word before cursor
+- `Ctrl+A` - Move cursor to beginning of line
 - `Ctrl+Up/Down` - Resize input area
 - `F2` - Toggle MUD tag display (show/hide tags and timestamps)
 - `Enter` - Send command
@@ -493,6 +494,7 @@ The remote GUI client supports keyboard shortcuts similar to the console client:
 **Input Area:**
 - `Ctrl+U` - Clear input buffer
 - `Ctrl+W` - Delete word before cursor
+- `Ctrl+A` - Move cursor to beginning of line
 - `Ctrl+P/N` - Previous/Next command history
 - `Ctrl+Up/Down` - Resize input area (1-15 lines)
 - `Enter` - Send command
