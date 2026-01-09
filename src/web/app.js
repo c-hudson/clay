@@ -524,7 +524,8 @@
                             world.output_lines.push(line);
                             if (msg.world_index === currentWorldIndex) {
                                 handleIncomingLine(line, msg.world_index, lineIndex);
-                            } else {
+                            } else if (!msg.is_viewed) {
+                                // Only increment unseen if no other interface is viewing this world
                                 world.unseen_lines = (world.unseen_lines || 0) + 1;
                             }
                         });
@@ -1307,7 +1308,7 @@
     // Update time
     function updateTime() {
         const now = new Date();
-        const hours = now.getHours().toString().padStart(2, '0');
+        const hours = now.getHours();
         const minutes = now.getMinutes().toString().padStart(2, '0');
         elements.statusTime.textContent = `${hours}:${minutes}`;
     }

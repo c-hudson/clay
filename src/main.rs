@@ -2991,7 +2991,9 @@ impl App {
     fn switch_world(&mut self, index: usize) {
         if index < self.worlds.len() {
             self.current_world_index = index;
-            self.current_world_mut().mark_seen();
+            self.worlds[index].mark_seen();
+            // Broadcast to WebSocket clients that this world's unseen count is cleared
+            self.ws_broadcast(WsMessage::UnseenCleared { world_index: index });
         }
     }
 
@@ -5041,7 +5043,7 @@ mod remote_gui {
                             self.show_tags = settings.show_tags;
                             self.actions = actions;
                         }
-                        WsMessage::ServerData { world_index, data } => {
+                        WsMessage::ServerData { world_index, data, is_viewed } => {
                             if world_index < self.worlds.len() {
                                 // Parse and add new output lines, filtering out visually empty lines
                                 let mut lines_added = 0;
@@ -5052,8 +5054,10 @@ mod remote_gui {
                                         lines_added += 1;
                                     }
                                 }
-                                // Track unseen lines for non-current worlds
-                                if world_index != self.current_world {
+                                // Track unseen lines only if:
+                                // - This is not our current world, AND
+                                // - No other interface (console/web) is viewing this world
+                                if world_index != self.current_world && !is_viewed {
                                     self.worlds[world_index].unseen_lines += lines_added;
                                 }
                             }
@@ -6496,7 +6500,7 @@ mod remote_gui {
                                 let mins = (secs / 60) % 60;
                                 // Adjust for local timezone (rough estimate)
                                 let local_hours = (hours + 24 - 5) % 24; // UTC-5 estimate
-                                ui.label(egui::RichText::new(format!("{:02}:{:02}", local_hours, mins))
+                                ui.label(egui::RichText::new(format!("{}:{:02}", local_hours, mins))
                                     .monospace().color(theme.accent()));
                             });
                         });
@@ -8408,9 +8412,8 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                 }
                             }
                         }
-                        KeyAction::SwitchedWorld(world_index) => {
-                            // Console switched to a new world, broadcast to remote clients
-                            app.ws_broadcast(WsMessage::UnseenCleared { world_index });
+                        KeyAction::SwitchedWorld(_world_index) => {
+                            // UnseenCleared is now broadcast by switch_world() itself
                         }
                         KeyAction::None => {}
                     }
@@ -8490,6 +8493,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                 app.ws_broadcast(WsMessage::ServerData {
                                     world_index: world_idx,
                                     data: ws_data,
+                                    is_viewed: is_current,
                                 });
                             }
 
@@ -8621,6 +8625,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                             app.ws_broadcast(WsMessage::ServerData {
                                                 world_index,
                                                 data: format!("Unknown action: /{}", name),
+                                                is_viewed: false,
                                             });
                                         }
                                     }
@@ -8639,6 +8644,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                         app.ws_broadcast(WsMessage::ServerData {
                                             world_index,
                                             data: format!("Unknown command: {}", cmd),
+                                            is_viewed: false,
                                         });
                                     }
                                     _ => {
@@ -9016,6 +9022,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                             app.ws_broadcast(WsMessage::ServerData {
                                 world_index: world_idx,
                                 data: ws_data,
+                                is_viewed: is_current,
                             });
                         }
 
@@ -9140,6 +9147,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                         app.ws_broadcast(WsMessage::ServerData {
                                             world_index,
                                             data: format!("Unknown action: /{}", name),
+                                            is_viewed: false,
                                         });
                                     }
                                 }
@@ -9158,6 +9166,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                     app.ws_broadcast(WsMessage::ServerData {
                                         world_index,
                                         data: format!("Unknown command: {}", cmd),
+                                        is_viewed: false,
                                     });
                                 }
                                 _ => {

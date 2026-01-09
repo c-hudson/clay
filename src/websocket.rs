@@ -31,7 +31,8 @@ pub enum WsMessage {
     },
 
     // Real-time updates (server -> client)
-    ServerData { world_index: usize, data: String },
+    /// is_viewed: true if any interface (console/web/GUI) is viewing this world
+    ServerData { world_index: usize, data: String, is_viewed: bool },
     WorldConnected { world_index: usize, name: String },
     WorldDisconnected { world_index: usize },
     WorldAdded { world: Box<WorldStateMsg> },

@@ -91,7 +91,7 @@ pub fn get_current_time_12hr() -> String {
         hours_24 - 12
     };
 
-    format!("{:2}:{:02}", hours_12, minutes)
+    format!("{}:{:02}", hours_12, minutes)
 }
 
 /// Strip MUD tags from a line (tags like [channel:] or [channel(player)])
