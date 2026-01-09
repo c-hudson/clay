@@ -3252,6 +3252,8 @@ impl App {
             http_port: self.settings.http_port,
             ws_enabled: self.settings.ws_enabled,
             ws_port: self.settings.ws_port,
+            ws_cert_file: self.settings.websocket_cert_file.clone(),
+            ws_key_file: self.settings.websocket_key_file.clone(),
         };
 
         WsMessage::InitialState {
@@ -4675,6 +4677,10 @@ mod remote_gui {
         ws_enabled: bool,
         /// WS/WSS server port
         ws_port: u16,
+        /// TLS certificate file path
+        ws_cert_file: String,
+        /// TLS key file path
+        ws_key_file: String,
         /// World switching mode (Unseen First or Alphabetical)
         world_switch_mode: WorldSwitchMode,
         /// Debug logging enabled (synced from server, not used locally)
@@ -4748,6 +4754,8 @@ mod remote_gui {
                 http_port: 9000,
                 ws_enabled: false,
                 ws_port: 9001,
+                ws_cert_file: String::new(),
+                ws_key_file: String::new(),
                 world_switch_mode: WorldSwitchMode::UnseenFirst,
                 debug_enabled: false,
                 spell_checker: SpellChecker::new(),
@@ -5015,6 +5023,8 @@ mod remote_gui {
                             self.http_port = settings.http_port;
                             self.ws_enabled = settings.ws_enabled;
                             self.ws_port = settings.ws_port;
+                            self.ws_cert_file = settings.ws_cert_file;
+                            self.ws_key_file = settings.ws_key_file;
                             self.world_switch_mode = WorldSwitchMode::from_name(&settings.world_switch_mode);
                             self.debug_enabled = settings.debug_enabled;
                             self.more_mode = settings.more_mode_enabled;
@@ -5087,6 +5097,8 @@ mod remote_gui {
                             self.http_port = settings.http_port;
                             self.ws_enabled = settings.ws_enabled;
                             self.ws_port = settings.ws_port;
+                            self.ws_cert_file = settings.ws_cert_file;
+                            self.ws_key_file = settings.ws_key_file;
                             self.world_switch_mode = WorldSwitchMode::from_name(&settings.world_switch_mode);
                             self.debug_enabled = settings.debug_enabled;
                             self.more_mode = settings.more_mode_enabled;
@@ -5322,6 +5334,8 @@ mod remote_gui {
                     http_port: self.http_port,
                     ws_enabled: self.ws_enabled,
                     ws_port: self.ws_port,
+                    ws_cert_file: self.ws_cert_file.clone(),
+                    ws_key_file: self.ws_key_file.clone(),
                 });
             }
         }
@@ -8711,7 +8725,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                     });
                                 }
                             }
-                            WsMessage::UpdateGlobalSettings { console_theme, gui_theme, input_height, font_name, font_size, ws_allow_list, web_secure, http_enabled, http_port, ws_enabled, ws_port } => {
+                            WsMessage::UpdateGlobalSettings { console_theme, gui_theme, input_height, font_name, font_size, ws_allow_list, web_secure, http_enabled, http_port, ws_enabled, ws_port, ws_cert_file, ws_key_file } => {
                                 // Update global settings from remote client
                                 // Console theme affects the TUI on the server
                                 app.settings.theme = Theme::from_name(&console_theme);
@@ -8732,6 +8746,8 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                 app.settings.http_port = http_port;
                                 app.settings.ws_enabled = ws_enabled;
                                 app.settings.ws_port = ws_port;
+                                app.settings.websocket_cert_file = ws_cert_file;
+                                app.settings.websocket_key_file = ws_key_file;
                                 // Save settings to persist changes
                                 let _ = save_settings(&app);
                                 // Build settings message for broadcast
@@ -8752,6 +8768,8 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                     http_port: app.settings.http_port,
                                     ws_enabled: app.settings.ws_enabled,
                                     ws_port: app.settings.ws_port,
+                                    ws_cert_file: app.settings.websocket_cert_file.clone(),
+                                    ws_key_file: app.settings.websocket_key_file.clone(),
                                 };
                                 // Broadcast update to all clients
                                 app.ws_broadcast(WsMessage::GlobalSettingsUpdated {
@@ -9156,7 +9174,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                 app.ws_broadcast(WsMessage::WorldSettingsUpdated { world_index, settings: settings_msg, name });
                             }
                         }
-                        WsMessage::UpdateGlobalSettings { console_theme, gui_theme, input_height, font_name, font_size, ws_allow_list, web_secure, http_enabled, http_port, ws_enabled, ws_port } => {
+                        WsMessage::UpdateGlobalSettings { console_theme, gui_theme, input_height, font_name, font_size, ws_allow_list, web_secure, http_enabled, http_port, ws_enabled, ws_port, ws_cert_file, ws_key_file } => {
                             app.settings.theme = Theme::from_name(&console_theme);
                             app.settings.gui_theme = Theme::from_name(&gui_theme);
                             app.input_height = input_height.clamp(1, 15);
@@ -9172,6 +9190,8 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                             app.settings.http_port = http_port;
                             app.settings.ws_enabled = ws_enabled;
                             app.settings.ws_port = ws_port;
+                            app.settings.websocket_cert_file = ws_cert_file;
+                            app.settings.websocket_key_file = ws_key_file;
                             let _ = save_settings(&app);
                             let settings_msg = GlobalSettingsMsg {
                                 more_mode_enabled: app.settings.more_mode_enabled,
@@ -9190,6 +9210,8 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                 http_port: app.settings.http_port,
                                 ws_enabled: app.settings.ws_enabled,
                                 ws_port: app.settings.ws_port,
+                                ws_cert_file: app.settings.websocket_cert_file.clone(),
+                                ws_key_file: app.settings.websocket_key_file.clone(),
                             };
                             app.ws_broadcast(WsMessage::GlobalSettingsUpdated { settings: settings_msg, input_height: app.input_height });
                         }

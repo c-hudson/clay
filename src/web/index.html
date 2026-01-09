@@ -209,6 +209,14 @@
                         <label>Allow List:</label>
                         <input type="text" id="web-allow-list" autocomplete="off" class="web-input" placeholder="localhost, 192.168.*">
                     </div>
+                    <div class="web-field tls-field" id="tls-cert-field" style="display: none;">
+                        <label>TLS cert file:</label>
+                        <input type="text" id="web-cert-file" autocomplete="off" class="web-input" placeholder="/path/to/cert.pem">
+                    </div>
+                    <div class="web-field tls-field" id="tls-key-field" style="display: none;">
+                        <label>TLS key file:</label>
+                        <input type="text" id="web-key-file" autocomplete="off" class="web-input" placeholder="/path/to/key.pem">
+                    </div>
                 </div>
                 <div class="modal-buttons">
                     <button id="web-save-btn">Save</button>

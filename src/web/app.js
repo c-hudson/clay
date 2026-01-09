@@ -77,6 +77,10 @@
         webWsEnabledBtn: document.getElementById('web-ws-enabled-btn'),
         webWsPort: document.getElementById('web-ws-port'),
         webAllowList: document.getElementById('web-allow-list'),
+        webCertFile: document.getElementById('web-cert-file'),
+        webKeyFile: document.getElementById('web-key-file'),
+        tlsCertField: document.getElementById('tls-cert-field'),
+        tlsKeyField: document.getElementById('tls-key-field'),
         webSaveBtn: document.getElementById('web-save-btn'),
         webCancelBtn: document.getElementById('web-cancel-btn'),
         httpLabel: document.getElementById('http-label'),
@@ -130,6 +134,8 @@
     let wsEnabled = false;
     let wsPort = 9001;
     let wsAllowList = '';
+    let wsCertFile = '';
+    let wsKeyFile = '';
     let selectedWorldIndex = -1;
     let selectedWorldsRowIndex = -1; // For worlds list popup (/worlds)
 
@@ -477,6 +483,12 @@
                     if (msg.settings.ws_allow_list !== undefined) {
                         wsAllowList = msg.settings.ws_allow_list;
                     }
+                    if (msg.settings.ws_cert_file !== undefined) {
+                        wsCertFile = msg.settings.ws_cert_file;
+                    }
+                    if (msg.settings.ws_key_file !== undefined) {
+                        wsKeyFile = msg.settings.ws_key_file;
+                    }
                     if (msg.settings.world_switch_mode !== undefined) {
                         worldSwitchMode = msg.settings.world_switch_mode;
                     }
@@ -593,6 +605,12 @@
                     }
                     if (msg.settings.ws_allow_list !== undefined) {
                         wsAllowList = msg.settings.ws_allow_list;
+                    }
+                    if (msg.settings.ws_cert_file !== undefined) {
+                        wsCertFile = msg.settings.ws_cert_file;
+                    }
+                    if (msg.settings.ws_key_file !== undefined) {
+                        wsKeyFile = msg.settings.ws_key_file;
                     }
                 }
                 break;
@@ -1551,6 +1569,12 @@
         elements.webHttpPort.value = httpPort;
         elements.webWsPort.value = wsPort;
         elements.webAllowList.value = wsAllowList;
+        elements.webCertFile.value = wsCertFile;
+        elements.webKeyFile.value = wsKeyFile;
+
+        // Show/hide TLS fields based on protocol
+        elements.tlsCertField.style.display = webSecure ? 'flex' : 'none';
+        elements.tlsKeyField.style.display = webSecure ? 'flex' : 'none';
     }
 
     function saveWebSettings() {
@@ -1558,6 +1582,8 @@
         httpPort = parseInt(elements.webHttpPort.value) || 9000;
         wsPort = parseInt(elements.webWsPort.value) || 9001;
         wsAllowList = elements.webAllowList.value;
+        wsCertFile = elements.webCertFile.value;
+        wsKeyFile = elements.webKeyFile.value;
 
         // Send to server
         send({
@@ -1572,7 +1598,9 @@
             http_enabled: httpEnabled,
             http_port: httpPort,
             ws_enabled: wsEnabled,
-            ws_port: wsPort
+            ws_port: wsPort,
+            ws_cert_file: wsCertFile,
+            ws_key_file: wsKeyFile
         });
 
         closeWebPopup();

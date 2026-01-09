@@ -73,6 +73,8 @@ pub enum WsMessage {
         http_port: u16,
         ws_enabled: bool,
         ws_port: u16,
+        ws_cert_file: String,
+        ws_key_file: String,
     },
 
     // Settings update confirmations (server -> client)
@@ -147,6 +149,8 @@ pub struct GlobalSettingsMsg {
     pub http_port: u16,
     pub ws_enabled: bool,
     pub ws_port: u16,
+    pub ws_cert_file: String,
+    pub ws_key_file: String,
 }
 
 /// Information about a connected WebSocket client
