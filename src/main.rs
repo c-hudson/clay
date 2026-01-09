@@ -8647,6 +8647,59 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                             is_viewed: false,
                                         });
                                     }
+                                    Command::Send { text, all_worlds, target_world, no_newline } => {
+                                        // Handle /send command
+                                        // Helper to create the write command
+                                        let make_write_cmd = |t: &str| -> WriteCommand {
+                                            if no_newline {
+                                                WriteCommand::Raw(t.as_bytes().to_vec())
+                                            } else {
+                                                WriteCommand::Text(t.to_string())
+                                            }
+                                        };
+
+                                        if all_worlds {
+                                            // Send to all connected worlds
+                                            for world in app.worlds.iter_mut() {
+                                                if world.connected {
+                                                    if let Some(tx) = &world.command_tx {
+                                                        let _ = tx.try_send(make_write_cmd(&text));
+                                                        world.last_send_time = Some(std::time::Instant::now());
+                                                    }
+                                                }
+                                            }
+                                        } else if let Some(ref target) = target_world {
+                                            // Send to specific world by name
+                                            if let Some(world) = app.worlds.iter_mut().find(|w| w.name.eq_ignore_ascii_case(target)) {
+                                                if world.connected {
+                                                    if let Some(tx) = &world.command_tx {
+                                                        let _ = tx.try_send(make_write_cmd(&text));
+                                                        world.last_send_time = Some(std::time::Instant::now());
+                                                    }
+                                                } else {
+                                                    app.ws_broadcast(WsMessage::ServerData {
+                                                        world_index,
+                                                        data: format!("World '{}' is not connected.", target),
+                                                        is_viewed: false,
+                                                    });
+                                                }
+                                            } else {
+                                                app.ws_broadcast(WsMessage::ServerData {
+                                                    world_index,
+                                                    data: format!("Unknown world: {}", target),
+                                                    is_viewed: false,
+                                                });
+                                            }
+                                        } else {
+                                            // Send to current world (the one this command came from)
+                                            if world_index < app.worlds.len() {
+                                                if let Some(tx) = &app.worlds[world_index].command_tx {
+                                                    let _ = tx.try_send(make_write_cmd(&text));
+                                                    app.worlds[world_index].last_send_time = Some(std::time::Instant::now());
+                                                }
+                                            }
+                                        }
+                                    }
                                     _ => {
                                         // All other commands - send to MUD as-is
                                         if world_index < app.worlds.len() {
@@ -9168,6 +9221,59 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                         data: format!("Unknown command: {}", cmd),
                                         is_viewed: false,
                                     });
+                                }
+                                Command::Send { text, all_worlds, target_world, no_newline } => {
+                                    // Handle /send command
+                                    // Helper to create the write command
+                                    let make_write_cmd = |t: &str| -> WriteCommand {
+                                        if no_newline {
+                                            WriteCommand::Raw(t.as_bytes().to_vec())
+                                        } else {
+                                            WriteCommand::Text(t.to_string())
+                                        }
+                                    };
+
+                                    if all_worlds {
+                                        // Send to all connected worlds
+                                        for world in app.worlds.iter_mut() {
+                                            if world.connected {
+                                                if let Some(tx) = &world.command_tx {
+                                                    let _ = tx.try_send(make_write_cmd(&text));
+                                                    world.last_send_time = Some(std::time::Instant::now());
+                                                }
+                                            }
+                                        }
+                                    } else if let Some(ref target) = target_world {
+                                        // Send to specific world by name
+                                        if let Some(world) = app.worlds.iter_mut().find(|w| w.name.eq_ignore_ascii_case(target)) {
+                                            if world.connected {
+                                                if let Some(tx) = &world.command_tx {
+                                                    let _ = tx.try_send(make_write_cmd(&text));
+                                                    world.last_send_time = Some(std::time::Instant::now());
+                                                }
+                                            } else {
+                                                app.ws_broadcast(WsMessage::ServerData {
+                                                    world_index,
+                                                    data: format!("World '{}' is not connected.", target),
+                                                    is_viewed: false,
+                                                });
+                                            }
+                                        } else {
+                                            app.ws_broadcast(WsMessage::ServerData {
+                                                world_index,
+                                                data: format!("Unknown world: {}", target),
+                                                is_viewed: false,
+                                            });
+                                        }
+                                    } else {
+                                        // Send to current world (the one this command came from)
+                                        if world_index < app.worlds.len() {
+                                            if let Some(tx) = &app.worlds[world_index].command_tx {
+                                                let _ = tx.try_send(make_write_cmd(&text));
+                                                app.worlds[world_index].last_send_time = Some(std::time::Instant::now());
+                                            }
+                                        }
+                                    }
                                 }
                                 _ => {
                                     // All other commands - send to MUD as-is
