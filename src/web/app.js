@@ -34,6 +34,7 @@
         mobilePgUpBtn: document.getElementById('mobile-pgup-btn'),
         mobileUpBtn: document.getElementById('mobile-up-btn'),
         mobileDownBtn: document.getElementById('mobile-down-btn'),
+        mobileTagBtn: document.getElementById('mobile-tag-btn'),
         mobilePgDnBtn: document.getElementById('mobile-pgdn-btn'),
         // Actions List popup
         actionsListModal: document.getElementById('actions-list-modal'),
@@ -2154,6 +2155,15 @@
             e.stopPropagation();
             // Cycle to next active world (request from server)
             requestNextWorld();
+            elements.input.focus();
+        };
+
+        elements.mobileTagBtn.onclick = function(e) {
+            e.preventDefault();
+            e.stopPropagation();
+            // Toggle MUD tag display (same as F2)
+            showTags = !showTags;
+            renderOutput();
             elements.input.focus();
         };
 
