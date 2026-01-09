@@ -230,7 +230,7 @@ Prompts that are auto-answered are immediately cleared and not displayed in the 
 
 **General:**
 - `F1` - Open help popup
-- `F2` - Toggle MUD tag display (show/hide tags like `[channel:]`)
+- `F2` - Toggle MUD tag display (show/hide tags like `[channel:]` and timestamps)
 - `Ctrl+C` - Press twice within 15 seconds to quit
 - `Ctrl+L` - Redraw screen
 - `Ctrl+R` - Hot reload (same as /reload)
@@ -435,7 +435,7 @@ Note: HTTP automatically starts the non-secure WebSocket server if not already r
 - `Ctrl+U` - Clear input
 - `Ctrl+W` - Delete word before cursor
 - `Ctrl+Up/Down` - Resize input area
-- `F2` - Toggle MUD tag display
+- `F2` - Toggle MUD tag display (show/hide tags and timestamps)
 - `Enter` - Send command
 
 **Web Popup Controls:**
@@ -501,7 +501,7 @@ The remote GUI client supports keyboard shortcuts similar to the console client:
 - `PageUp/PageDown` - Scroll output up/down
 
 **Display:**
-- `F2` - Toggle MUD tag display (show/hide `[channel:]` tags)
+- `F2` - Toggle MUD tag display (show/hide `[channel:]` tags and timestamps)
 - `F4` - Open filter popup to search output
 - `Esc` or `F4` - Close filter popup
 
@@ -621,7 +621,12 @@ Toggle with `F2`:
 
 - MUD tags are prefixes like `[channel:]` or `[channel(player)]` at the start of lines
 - When hidden (default), tags are stripped from display but preserved in buffer
-- When shown, full lines including tags are displayed
+- When shown, full lines including tags are displayed with timestamps
+- **Timestamps**: Each line shows when it was received
+  - Format: `HH:MM>` for lines from today
+  - Format: `DD/MM HH:MM>` for lines from previous days
+  - Displayed in cyan before each line
+- Works in console, GUI, and web interfaces
 - Setting persists across sessions in `~/.mudclient.dat`
 
 ### Confirmation Dialog

@@ -2187,8 +2187,20 @@
             elements.input.focus();
         };
 
-        // Window resize handler to update separator fill
+        // Track whether we're at the bottom (for resize handling)
+        let wasAtBottomBeforeResize = true;
+
+        // Update tracking on scroll
+        elements.outputContainer.addEventListener('scroll', function() {
+            wasAtBottomBeforeResize = isAtBottom();
+        }, { passive: true });
+
+        // Window resize handler to update separator fill and maintain scroll position
         window.addEventListener('resize', function() {
+            // If we were at the bottom before resize, stay at bottom
+            if (wasAtBottomBeforeResize) {
+                scrollToBottom();
+            }
             updateStatusBar();
         });
 
@@ -2199,6 +2211,11 @@
                 // When keyboard appears, visualViewport height shrinks
                 // Keep toolbar at the top of the visual viewport
                 toolbar.style.top = window.visualViewport.offsetTop + 'px';
+                // If we were at bottom before keyboard appeared, stay at bottom
+                if (wasAtBottomBeforeResize) {
+                    scrollToBottom();
+                }
+                updateStatusBar();
             });
             window.visualViewport.addEventListener('scroll', function() {
                 toolbar.style.top = window.visualViewport.offsetTop + 'px';
