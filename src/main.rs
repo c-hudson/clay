@@ -618,6 +618,8 @@ async fn start_http_server(
 enum SettingsField {
     // World-specific fields
     WorldName,
+    WorldType,      // Mud, Slack, or Discord
+    // MUD-specific fields
     Hostname,
     Port,
     User,
@@ -628,6 +630,15 @@ enum SettingsField {
     AutoConnect,
     KeepAlive,
     KeepAliveCmd,
+    // Slack-specific fields
+    SlackToken,
+    SlackChannel,
+    SlackWorkspace,
+    // Discord-specific fields
+    DiscordToken,
+    DiscordGuild,
+    DiscordChannel,
+    // Buttons
     Connect,
     SaveWorld,
     CancelWorld,
@@ -656,6 +667,12 @@ impl SettingsField {
                 | SettingsField::Password
                 | SettingsField::LogFile
                 | SettingsField::KeepAliveCmd
+                | SettingsField::SlackToken
+                | SettingsField::SlackChannel
+                | SettingsField::SlackWorkspace
+                | SettingsField::DiscordToken
+                | SettingsField::DiscordGuild
+                | SettingsField::DiscordChannel
         )
     }
 
@@ -663,61 +680,121 @@ impl SettingsField {
         matches!(self, SettingsField::Connect | SettingsField::SaveWorld | SettingsField::CancelWorld | SettingsField::DeleteWorld | SettingsField::SaveSetup | SettingsField::CancelSetup)
     }
 
-    /// Next field for world settings popup (skip_keep_alive_cmd if keep_alive_type is not Custom)
-    fn next_world(&self, skip_keep_alive_cmd: bool) -> Self {
-        match self {
-            SettingsField::WorldName => SettingsField::Hostname,
-            SettingsField::Hostname => SettingsField::Port,
-            SettingsField::Port => SettingsField::User,
-            SettingsField::User => SettingsField::Password,
-            SettingsField::Password => SettingsField::UseSsl,
-            SettingsField::UseSsl => SettingsField::LogFile,
-            SettingsField::LogFile => SettingsField::Encoding,
-            SettingsField::Encoding => SettingsField::AutoConnect,
-            SettingsField::AutoConnect => SettingsField::KeepAlive,
-            SettingsField::KeepAlive => {
-                if skip_keep_alive_cmd {
-                    SettingsField::SaveWorld
-                } else {
-                    SettingsField::KeepAliveCmd
+    /// Next field for world settings popup
+    /// world_type determines which fields are visible
+    /// skip_keep_alive_cmd is true if keep_alive_type is not Custom
+    fn next_world(&self, world_type: &WorldType, skip_keep_alive_cmd: bool) -> Self {
+        match world_type {
+            WorldType::Mud => match self {
+                SettingsField::WorldName => SettingsField::WorldType,
+                SettingsField::WorldType => SettingsField::Hostname,
+                SettingsField::Hostname => SettingsField::Port,
+                SettingsField::Port => SettingsField::User,
+                SettingsField::User => SettingsField::Password,
+                SettingsField::Password => SettingsField::UseSsl,
+                SettingsField::UseSsl => SettingsField::LogFile,
+                SettingsField::LogFile => SettingsField::Encoding,
+                SettingsField::Encoding => SettingsField::AutoConnect,
+                SettingsField::AutoConnect => SettingsField::KeepAlive,
+                SettingsField::KeepAlive => {
+                    if skip_keep_alive_cmd {
+                        SettingsField::SaveWorld
+                    } else {
+                        SettingsField::KeepAliveCmd
+                    }
                 }
-            }
-            SettingsField::KeepAliveCmd => SettingsField::SaveWorld,
-            SettingsField::SaveWorld => SettingsField::CancelWorld,
-            SettingsField::CancelWorld => SettingsField::DeleteWorld,
-            SettingsField::DeleteWorld => SettingsField::Connect,
-            SettingsField::Connect => SettingsField::WorldName,
-            // Global fields wrap to world fields
-            _ => SettingsField::WorldName,
+                SettingsField::KeepAliveCmd => SettingsField::SaveWorld,
+                SettingsField::SaveWorld => SettingsField::CancelWorld,
+                SettingsField::CancelWorld => SettingsField::DeleteWorld,
+                SettingsField::DeleteWorld => SettingsField::Connect,
+                SettingsField::Connect => SettingsField::WorldName,
+                _ => SettingsField::WorldName,
+            },
+            WorldType::Slack => match self {
+                SettingsField::WorldName => SettingsField::WorldType,
+                SettingsField::WorldType => SettingsField::SlackToken,
+                SettingsField::SlackToken => SettingsField::SlackChannel,
+                SettingsField::SlackChannel => SettingsField::SlackWorkspace,
+                SettingsField::SlackWorkspace => SettingsField::LogFile,
+                SettingsField::LogFile => SettingsField::SaveWorld,
+                SettingsField::SaveWorld => SettingsField::CancelWorld,
+                SettingsField::CancelWorld => SettingsField::DeleteWorld,
+                SettingsField::DeleteWorld => SettingsField::Connect,
+                SettingsField::Connect => SettingsField::WorldName,
+                _ => SettingsField::WorldName,
+            },
+            WorldType::Discord => match self {
+                SettingsField::WorldName => SettingsField::WorldType,
+                SettingsField::WorldType => SettingsField::DiscordToken,
+                SettingsField::DiscordToken => SettingsField::DiscordGuild,
+                SettingsField::DiscordGuild => SettingsField::DiscordChannel,
+                SettingsField::DiscordChannel => SettingsField::LogFile,
+                SettingsField::LogFile => SettingsField::SaveWorld,
+                SettingsField::SaveWorld => SettingsField::CancelWorld,
+                SettingsField::CancelWorld => SettingsField::DeleteWorld,
+                SettingsField::DeleteWorld => SettingsField::Connect,
+                SettingsField::Connect => SettingsField::WorldName,
+                _ => SettingsField::WorldName,
+            },
         }
     }
 
-    /// Previous field for world settings popup (skip_keep_alive_cmd if keep_alive_type is not Custom)
-    fn prev_world(&self, skip_keep_alive_cmd: bool) -> Self {
-        match self {
-            SettingsField::WorldName => SettingsField::Connect,
-            SettingsField::Hostname => SettingsField::WorldName,
-            SettingsField::Port => SettingsField::Hostname,
-            SettingsField::User => SettingsField::Port,
-            SettingsField::Password => SettingsField::User,
-            SettingsField::UseSsl => SettingsField::Password,
-            SettingsField::LogFile => SettingsField::UseSsl,
-            SettingsField::Encoding => SettingsField::LogFile,
-            SettingsField::AutoConnect => SettingsField::Encoding,
-            SettingsField::KeepAlive => SettingsField::AutoConnect,
-            SettingsField::KeepAliveCmd => SettingsField::KeepAlive,
-            SettingsField::SaveWorld => {
-                if skip_keep_alive_cmd {
-                    SettingsField::KeepAlive
-                } else {
-                    SettingsField::KeepAliveCmd
+    /// Previous field for world settings popup
+    /// world_type determines which fields are visible
+    /// skip_keep_alive_cmd is true if keep_alive_type is not Custom
+    fn prev_world(&self, world_type: &WorldType, skip_keep_alive_cmd: bool) -> Self {
+        match world_type {
+            WorldType::Mud => match self {
+                SettingsField::WorldName => SettingsField::Connect,
+                SettingsField::WorldType => SettingsField::WorldName,
+                SettingsField::Hostname => SettingsField::WorldType,
+                SettingsField::Port => SettingsField::Hostname,
+                SettingsField::User => SettingsField::Port,
+                SettingsField::Password => SettingsField::User,
+                SettingsField::UseSsl => SettingsField::Password,
+                SettingsField::LogFile => SettingsField::UseSsl,
+                SettingsField::Encoding => SettingsField::LogFile,
+                SettingsField::AutoConnect => SettingsField::Encoding,
+                SettingsField::KeepAlive => SettingsField::AutoConnect,
+                SettingsField::KeepAliveCmd => SettingsField::KeepAlive,
+                SettingsField::SaveWorld => {
+                    if skip_keep_alive_cmd {
+                        SettingsField::KeepAlive
+                    } else {
+                        SettingsField::KeepAliveCmd
+                    }
                 }
-            }
-            SettingsField::CancelWorld => SettingsField::SaveWorld,
-            SettingsField::DeleteWorld => SettingsField::CancelWorld,
-            SettingsField::Connect => SettingsField::DeleteWorld,
-            // Global fields wrap to world fields
-            _ => SettingsField::Connect,
+                SettingsField::CancelWorld => SettingsField::SaveWorld,
+                SettingsField::DeleteWorld => SettingsField::CancelWorld,
+                SettingsField::Connect => SettingsField::DeleteWorld,
+                _ => SettingsField::Connect,
+            },
+            WorldType::Slack => match self {
+                SettingsField::WorldName => SettingsField::Connect,
+                SettingsField::WorldType => SettingsField::WorldName,
+                SettingsField::SlackToken => SettingsField::WorldType,
+                SettingsField::SlackChannel => SettingsField::SlackToken,
+                SettingsField::SlackWorkspace => SettingsField::SlackChannel,
+                SettingsField::LogFile => SettingsField::SlackWorkspace,
+                SettingsField::SaveWorld => SettingsField::LogFile,
+                SettingsField::CancelWorld => SettingsField::SaveWorld,
+                SettingsField::DeleteWorld => SettingsField::CancelWorld,
+                SettingsField::Connect => SettingsField::DeleteWorld,
+                _ => SettingsField::Connect,
+            },
+            WorldType::Discord => match self {
+                SettingsField::WorldName => SettingsField::Connect,
+                SettingsField::WorldType => SettingsField::WorldName,
+                SettingsField::DiscordToken => SettingsField::WorldType,
+                SettingsField::DiscordGuild => SettingsField::DiscordToken,
+                SettingsField::DiscordChannel => SettingsField::DiscordGuild,
+                SettingsField::LogFile => SettingsField::DiscordChannel,
+                SettingsField::SaveWorld => SettingsField::LogFile,
+                SettingsField::CancelWorld => SettingsField::SaveWorld,
+                SettingsField::DeleteWorld => SettingsField::CancelWorld,
+                SettingsField::Connect => SettingsField::DeleteWorld,
+                _ => SettingsField::Connect,
+            },
         }
     }
 
@@ -769,6 +846,8 @@ struct SettingsPopup {
     editing_world_index: Option<usize>, // Which world is being edited (None for setup mode)
     // Temp values for world-specific fields
     temp_world_name: String,
+    temp_world_type: WorldType,
+    // MUD settings
     temp_hostname: String,
     temp_port: String,
     temp_user: String,
@@ -779,6 +858,14 @@ struct SettingsPopup {
     temp_auto_connect_type: AutoConnectType,
     temp_keep_alive_type: KeepAliveType,
     temp_keep_alive_cmd: String,
+    // Slack settings
+    temp_slack_token: String,
+    temp_slack_channel: String,
+    temp_slack_workspace: String,
+    // Discord settings
+    temp_discord_token: String,
+    temp_discord_guild: String,
+    temp_discord_channel: String,
     // Temp values for global settings
     temp_more_mode: bool,
     temp_spell_check: bool,
@@ -802,6 +889,7 @@ impl SettingsPopup {
             setup_mode: false,
             editing_world_index: None,
             temp_world_name: String::new(),
+            temp_world_type: WorldType::Mud,
             temp_hostname: String::new(),
             temp_port: String::new(),
             temp_user: String::new(),
@@ -812,6 +900,12 @@ impl SettingsPopup {
             temp_auto_connect_type: AutoConnectType::Connect,
             temp_keep_alive_type: KeepAliveType::Nop,
             temp_keep_alive_cmd: String::new(),
+            temp_slack_token: String::new(),
+            temp_slack_channel: String::new(),
+            temp_slack_workspace: String::new(),
+            temp_discord_token: String::new(),
+            temp_discord_guild: String::new(),
+            temp_discord_channel: String::new(),
             temp_more_mode: true,
             temp_spell_check: true,
             temp_world_switch_mode: WorldSwitchMode::UnseenFirst,
@@ -831,6 +925,8 @@ impl SettingsPopup {
         self.editing = false;
         // Load from world settings
         self.temp_world_name = world.name.clone();
+        self.temp_world_type = world.settings.world_type.clone();
+        // MUD settings
         self.temp_hostname = world.settings.hostname.clone();
         self.temp_port = world.settings.port.clone();
         self.temp_user = world.settings.user.clone();
@@ -841,6 +937,14 @@ impl SettingsPopup {
         self.temp_auto_connect_type = world.settings.auto_connect_type;
         self.temp_keep_alive_type = world.settings.keep_alive_type;
         self.temp_keep_alive_cmd = world.settings.keep_alive_cmd.clone();
+        // Slack settings
+        self.temp_slack_token = world.settings.slack_token.clone();
+        self.temp_slack_channel = world.settings.slack_channel.clone();
+        self.temp_slack_workspace = world.settings.slack_workspace.clone();
+        // Discord settings
+        self.temp_discord_token = world.settings.discord_token.clone();
+        self.temp_discord_guild = world.settings.discord_guild.clone();
+        self.temp_discord_channel = world.settings.discord_channel.clone();
         // Load from global settings
         self.temp_more_mode = settings.more_mode_enabled;
         self.temp_spell_check = settings.spell_check_enabled;
@@ -876,7 +980,7 @@ impl SettingsPopup {
             self.selected_field = self.selected_field.next_setup();
         } else {
             let skip_cmd = self.temp_keep_alive_type != KeepAliveType::Custom;
-            self.selected_field = self.selected_field.next_world(skip_cmd);
+            self.selected_field = self.selected_field.next_world(&self.temp_world_type, skip_cmd);
         }
     }
 
@@ -885,7 +989,7 @@ impl SettingsPopup {
             self.selected_field = self.selected_field.prev_setup();
         } else {
             let skip_cmd = self.temp_keep_alive_type != KeepAliveType::Custom;
-            self.selected_field = self.selected_field.prev_world(skip_cmd);
+            self.selected_field = self.selected_field.prev_world(&self.temp_world_type, skip_cmd);
         }
     }
 
@@ -899,6 +1003,12 @@ impl SettingsPopup {
             SettingsField::Password => self.temp_password.clone(),
             SettingsField::LogFile => self.temp_log_file.clone(),
             SettingsField::KeepAliveCmd => self.temp_keep_alive_cmd.clone(),
+            SettingsField::SlackToken => self.temp_slack_token.clone(),
+            SettingsField::SlackChannel => self.temp_slack_channel.clone(),
+            SettingsField::SlackWorkspace => self.temp_slack_workspace.clone(),
+            SettingsField::DiscordToken => self.temp_discord_token.clone(),
+            SettingsField::DiscordGuild => self.temp_discord_guild.clone(),
+            SettingsField::DiscordChannel => self.temp_discord_channel.clone(),
             _ => String::new(),
         };
         self.edit_cursor = self.edit_buffer.len();
@@ -930,6 +1040,12 @@ impl SettingsPopup {
             SettingsField::Password => self.temp_password = self.edit_buffer.clone(),
             SettingsField::LogFile => self.temp_log_file = self.edit_buffer.clone(),
             SettingsField::KeepAliveCmd => self.temp_keep_alive_cmd = self.edit_buffer.clone(),
+            SettingsField::SlackToken => self.temp_slack_token = self.edit_buffer.clone(),
+            SettingsField::SlackChannel => self.temp_slack_channel = self.edit_buffer.clone(),
+            SettingsField::SlackWorkspace => self.temp_slack_workspace = self.edit_buffer.clone(),
+            SettingsField::DiscordToken => self.temp_discord_token = self.edit_buffer.clone(),
+            SettingsField::DiscordGuild => self.temp_discord_guild = self.edit_buffer.clone(),
+            SettingsField::DiscordChannel => self.temp_discord_channel = self.edit_buffer.clone(),
             _ => {}
         }
         self.editing = false;
@@ -941,6 +1057,9 @@ impl SettingsPopup {
 
     fn toggle_or_cycle(&mut self) {
         match self.selected_field {
+            SettingsField::WorldType => {
+                self.temp_world_type = self.temp_world_type.cycle_next();
+            }
             SettingsField::UseSsl => self.temp_use_ssl = !self.temp_use_ssl,
             SettingsField::MoreMode => self.temp_more_mode = !self.temp_more_mode,
             SettingsField::SpellCheck => self.temp_spell_check = !self.temp_spell_check,
@@ -988,6 +1107,8 @@ impl SettingsPopup {
         // Apply world-specific settings (only in world mode)
         if !self.setup_mode {
             world.name = self.temp_world_name.clone();
+            world.settings.world_type = self.temp_world_type.clone();
+            // MUD settings
             world.settings.hostname = self.temp_hostname.clone();
             world.settings.port = self.temp_port.clone();
             world.settings.user = self.temp_user.clone();
@@ -1002,6 +1123,14 @@ impl SettingsPopup {
             world.settings.auto_connect_type = self.temp_auto_connect_type;
             world.settings.keep_alive_type = self.temp_keep_alive_type;
             world.settings.keep_alive_cmd = self.temp_keep_alive_cmd.clone();
+            // Slack settings
+            world.settings.slack_token = self.temp_slack_token.clone();
+            world.settings.slack_channel = self.temp_slack_channel.clone();
+            world.settings.slack_workspace = self.temp_slack_workspace.clone();
+            // Discord settings
+            world.settings.discord_token = self.temp_discord_token.clone();
+            world.settings.discord_guild = self.temp_discord_guild.clone();
+            world.settings.discord_channel = self.temp_discord_channel.clone();
         }
         (self.temp_input_height, self.temp_show_tags)
     }
@@ -2125,8 +2254,45 @@ impl Default for Settings {
     }
 }
 
+/// Type of world connection
+#[derive(Clone, Debug, PartialEq, Default)]
+enum WorldType {
+    #[default]
+    Mud,
+    Slack,
+    Discord,
+}
+
+impl WorldType {
+    fn name(&self) -> &'static str {
+        match self {
+            WorldType::Mud => "mud",
+            WorldType::Slack => "slack",
+            WorldType::Discord => "discord",
+        }
+    }
+
+    fn from_name(name: &str) -> Self {
+        match name.to_lowercase().as_str() {
+            "slack" => WorldType::Slack,
+            "discord" => WorldType::Discord,
+            _ => WorldType::Mud,
+        }
+    }
+
+    fn cycle_next(&self) -> Self {
+        match self {
+            WorldType::Mud => WorldType::Slack,
+            WorldType::Slack => WorldType::Discord,
+            WorldType::Discord => WorldType::Mud,
+        }
+    }
+}
+
 #[derive(Clone)]
 struct WorldSettings {
+    world_type: WorldType,
+    // MUD settings
     hostname: String,
     port: String,
     user: String,
@@ -2137,11 +2303,20 @@ struct WorldSettings {
     auto_connect_type: AutoConnectType,
     keep_alive_type: KeepAliveType,
     keep_alive_cmd: String,
+    // Slack settings
+    slack_token: String,
+    slack_channel: String,
+    slack_workspace: String,
+    // Discord settings
+    discord_token: String,
+    discord_guild: String,
+    discord_channel: String,
 }
 
 impl Default for WorldSettings {
     fn default() -> Self {
         Self {
+            world_type: WorldType::Mud,
             hostname: String::new(),
             port: String::new(),
             user: String::new(),
@@ -2152,6 +2327,12 @@ impl Default for WorldSettings {
             auto_connect_type: AutoConnectType::Connect,
             keep_alive_type: KeepAliveType::Nop,
             keep_alive_cmd: String::new(),
+            slack_token: String::new(),
+            slack_channel: String::new(),
+            slack_workspace: String::new(),
+            discord_token: String::new(),
+            discord_guild: String::new(),
+            discord_channel: String::new(),
         }
     }
 }
@@ -2963,6 +3144,9 @@ struct App {
     /// Cache of which world each WS client is viewing (for activity indicator)
     /// Maps client_id -> current_world_index
     ws_client_worlds: std::collections::HashMap<u64, usize>,
+    /// True if this is the master client (runs WS server or WS disabled).
+    /// Only master should save settings or initiate connections.
+    is_master: bool,
 }
 
 impl App {
@@ -2998,6 +3182,7 @@ impl App {
             https_server: None,
             popup_was_visible: false,
             ws_client_worlds: std::collections::HashMap::new(),
+            is_master: true, // Console app is always master (remote GUI is separate execution path)
         }
         // Note: No initial world created here - it will be created after load_settings()
         // if no worlds are configured
@@ -3571,6 +3756,9 @@ pub enum AppEvent {
     WsClientConnected(u64),                    // client_id
     WsClientDisconnected(u64),                 // client_id
     WsClientMessage(u64, Box<WsMessage>),      // client_id, message
+    // Slack/Discord events
+    SlackMessage(usize, String), // world_index, formatted message
+    DiscordMessage(usize, String), // world_index, formatted message
 }
 
 fn get_settings_path() -> PathBuf {
@@ -3705,6 +3893,10 @@ fn decrypt_password(stored: &str) -> String {
 }
 
 fn save_settings(app: &App) -> io::Result<()> {
+    // Only master client should save settings
+    if !app.is_master {
+        return Ok(());
+    }
     let path = get_settings_path();
     let mut file = std::fs::File::create(&path)?;
 
@@ -3741,6 +3933,8 @@ fn save_settings(app: &App) -> io::Result<()> {
     for world in &app.worlds {
         writeln!(file)?;
         writeln!(file, "[world:{}]", world.name)?;
+        writeln!(file, "world_type={}", world.settings.world_type.name())?;
+        // MUD settings
         writeln!(file, "hostname={}", world.settings.hostname)?;
         writeln!(file, "port={}", world.settings.port)?;
         writeln!(file, "user={}", world.settings.user)?;
@@ -3754,6 +3948,26 @@ fn save_settings(app: &App) -> io::Result<()> {
         }
         if let Some(ref log) = world.settings.log_file {
             writeln!(file, "log_file={}", log)?;
+        }
+        // Slack settings
+        if !world.settings.slack_token.is_empty() {
+            writeln!(file, "slack_token={}", encrypt_password(&world.settings.slack_token))?;
+        }
+        if !world.settings.slack_channel.is_empty() {
+            writeln!(file, "slack_channel={}", world.settings.slack_channel)?;
+        }
+        if !world.settings.slack_workspace.is_empty() {
+            writeln!(file, "slack_workspace={}", world.settings.slack_workspace)?;
+        }
+        // Discord settings
+        if !world.settings.discord_token.is_empty() {
+            writeln!(file, "discord_token={}", encrypt_password(&world.settings.discord_token))?;
+        }
+        if !world.settings.discord_guild.is_empty() {
+            writeln!(file, "discord_guild={}", world.settings.discord_guild)?;
+        }
+        if !world.settings.discord_channel.is_empty() {
+            writeln!(file, "discord_channel={}", world.settings.discord_channel)?;
         }
     }
 
@@ -3968,6 +4182,7 @@ fn load_settings(app: &mut App) -> io::Result<()> {
                 // Find the world and update its settings
                 if let Some(world) = app.worlds.iter_mut().find(|w| &w.name == world_name) {
                     match key {
+                        "world_type" => world.settings.world_type = WorldType::from_name(value),
                         "hostname" => world.settings.hostname = value.to_string(),
                         "port" => world.settings.port = value.to_string(),
                         "user" => world.settings.user = value.to_string(),
@@ -3990,6 +4205,14 @@ fn load_settings(app: &mut App) -> io::Result<()> {
                         "keep_alive_cmd" => {
                             world.settings.keep_alive_cmd = value.to_string();
                         }
+                        // Slack settings
+                        "slack_token" => world.settings.slack_token = decrypt_password(value),
+                        "slack_channel" => world.settings.slack_channel = value.to_string(),
+                        "slack_workspace" => world.settings.slack_workspace = value.to_string(),
+                        // Discord settings
+                        "discord_token" => world.settings.discord_token = decrypt_password(value),
+                        "discord_guild" => world.settings.discord_guild = value.to_string(),
+                        "discord_channel" => world.settings.discord_channel = value.to_string(),
                         _ => {}
                     }
                 }
@@ -4071,6 +4294,7 @@ fn save_reload_state(app: &App) -> io::Result<()> {
         }
 
         // World settings
+        writeln!(file, "world_type={}", world.settings.world_type.name())?;
         writeln!(file, "hostname={}", world.settings.hostname)?;
         writeln!(file, "port={}", world.settings.port)?;
         writeln!(file, "user={}", world.settings.user.replace('=', "\\e"))?;
@@ -4084,6 +4308,26 @@ fn save_reload_state(app: &App) -> io::Result<()> {
         }
         if let Some(ref log) = world.settings.log_file {
             writeln!(file, "log_file={}", log)?;
+        }
+        // Slack settings
+        if !world.settings.slack_token.is_empty() {
+            writeln!(file, "slack_token={}", world.settings.slack_token.replace('=', "\\e"))?;
+        }
+        if !world.settings.slack_channel.is_empty() {
+            writeln!(file, "slack_channel={}", world.settings.slack_channel.replace('=', "\\e"))?;
+        }
+        if !world.settings.slack_workspace.is_empty() {
+            writeln!(file, "slack_workspace={}", world.settings.slack_workspace.replace('=', "\\e"))?;
+        }
+        // Discord settings
+        if !world.settings.discord_token.is_empty() {
+            writeln!(file, "discord_token={}", world.settings.discord_token.replace('=', "\\e"))?;
+        }
+        if !world.settings.discord_guild.is_empty() {
+            writeln!(file, "discord_guild={}", world.settings.discord_guild.replace('=', "\\e"))?;
+        }
+        if !world.settings.discord_channel.is_empty() {
+            writeln!(file, "discord_channel={}", world.settings.discord_channel.replace('=', "\\e"))?;
         }
 
         // Output lines count (we'll save the actual lines separately due to size)
@@ -4417,6 +4661,7 @@ fn load_reload_state(app: &mut App) -> io::Result<bool> {
                             "is_tls" => tw.is_tls = value == "true",
                             "was_connected" => tw.was_connected = value == "true",
                             "socket_fd" => tw.socket_fd = value.parse().ok(),
+                            "world_type" => tw.settings.world_type = WorldType::from_name(value),
                             "hostname" => tw.settings.hostname = value.to_string(),
                             "port" => tw.settings.port = value.to_string(),
                             "user" => tw.settings.user = unescape_string(value),
@@ -4439,6 +4684,14 @@ fn load_reload_state(app: &mut App) -> io::Result<bool> {
                             "keep_alive_cmd" => {
                                 tw.settings.keep_alive_cmd = value.replace("\\e", "=");
                             }
+                            // Slack settings
+                            "slack_token" => tw.settings.slack_token = unescape_string(value),
+                            "slack_channel" => tw.settings.slack_channel = unescape_string(value),
+                            "slack_workspace" => tw.settings.slack_workspace = unescape_string(value),
+                            // Discord settings
+                            "discord_token" => tw.settings.discord_token = unescape_string(value),
+                            "discord_guild" => tw.settings.discord_guild = unescape_string(value),
+                            "discord_channel" => tw.settings.discord_channel = unescape_string(value),
                             _ => {}
                         }
                     }
@@ -9126,6 +9379,26 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                         // Display system message in current world's output
                         app.add_output(&message);
                     }
+                    // Slack/Discord events
+                    AppEvent::SlackMessage(world_idx, message) | AppEvent::DiscordMessage(world_idx, message) => {
+                        if world_idx < app.worlds.len() {
+                            app.worlds[world_idx].last_receive_time = Some(std::time::Instant::now());
+                            let is_current = world_idx == app.current_world_index || app.ws_client_viewing(world_idx);
+                            let settings = app.settings.clone();
+                            let output_height = app.output_height;
+                            let output_width = app.output_width;
+                            // Add newline to message
+                            let data = format!("{}\n", message);
+                            app.worlds[world_idx].add_output(&data, is_current, &settings, output_height, output_width, true);
+                            // Broadcast to WebSocket clients
+                            app.ws_broadcast(WsMessage::ServerData {
+                                world_index: world_idx,
+                                data,
+                                is_viewed: is_current,
+                                ts: current_timestamp_secs(),
+                            });
+                        }
+                    }
                     // WebSocket events
                     AppEvent::WsClientConnected(_client_id) => {
                         // Client connected but not yet authenticated - nothing to do
@@ -9826,6 +10099,24 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                 AppEvent::SystemMessage(message) => {
                     // Display system message in current world's output
                     app.add_output(&message);
+                }
+                // Slack/Discord events
+                AppEvent::SlackMessage(world_idx, message) | AppEvent::DiscordMessage(world_idx, message) => {
+                    if world_idx < app.worlds.len() {
+                        app.worlds[world_idx].last_receive_time = Some(std::time::Instant::now());
+                        let is_current = world_idx == app.current_world_index || app.ws_client_viewing(world_idx);
+                        let settings = app.settings.clone();
+                        let output_height = app.output_height;
+                        let output_width = app.output_width;
+                        let data = format!("{}\n", message);
+                        app.worlds[world_idx].add_output(&data, is_current, &settings, output_height, output_width, true);
+                        app.ws_broadcast(WsMessage::ServerData {
+                            world_index: world_idx,
+                            data,
+                            is_viewed: is_current,
+                            ts: current_timestamp_secs(),
+                        });
+                    }
                 }
                 // WebSocket events (drain loop - complex handlers use primary loop)
                 AppEvent::WsClientConnected(_) => {}
@@ -11470,6 +11761,357 @@ fn handle_key_event(key: KeyEvent, app: &mut App) -> KeyAction {
     }
 }
 
+// ============================================================================
+// Slack Socket Mode Connection
+// ============================================================================
+
+async fn connect_slack(app: &mut App, event_tx: mpsc::Sender<AppEvent>) -> bool {
+    let world_idx = app.current_world_index;
+
+    // Clone settings values first to avoid borrow conflicts
+    let token = app.current_world().settings.slack_token.clone();
+    let channel = app.current_world().settings.slack_channel.clone();
+
+    if token.is_empty() {
+        app.add_output("Error: Slack token is required.");
+        app.add_output("Configure the token in world settings (/world -e)");
+        return false;
+    }
+
+    app.add_output("");
+    app.add_output("Connecting to Slack...");
+    app.add_output("");
+
+    // Get WebSocket URL from Slack API
+    let client = reqwest::Client::new();
+    let response = match client
+        .post("https://slack.com/api/apps.connections.open")
+        .header("Authorization", format!("Bearer {}", token))
+        .header("Content-Type", "application/x-www-form-urlencoded")
+        .send()
+        .await
+    {
+        Ok(r) => r,
+        Err(e) => {
+            app.add_output(&format!("Failed to connect to Slack API: {}", e));
+            return false;
+        }
+    };
+
+    let body: serde_json::Value = match response.json().await {
+        Ok(j) => j,
+        Err(e) => {
+            app.add_output(&format!("Failed to parse Slack response: {}", e));
+            return false;
+        }
+    };
+
+    if body.get("ok").and_then(|v| v.as_bool()) != Some(true) {
+        let error = body.get("error").and_then(|v| v.as_str()).unwrap_or("unknown");
+        app.add_output(&format!("Slack API error: {}", error));
+        return false;
+    }
+
+    let ws_url = match body.get("url").and_then(|v| v.as_str()) {
+        Some(u) => u.to_string(),
+        None => {
+            app.add_output("Slack response missing WebSocket URL");
+            return false;
+        }
+    };
+
+    app.add_output("Got WebSocket URL, connecting...");
+
+    // Connect to Slack WebSocket
+    use tokio_tungstenite::tungstenite::Message as WsMsg;
+    use futures::StreamExt;
+
+    let (ws_stream, _) = match tokio_tungstenite::connect_async(&ws_url).await {
+        Ok(s) => s,
+        Err(e) => {
+            app.add_output(&format!("Failed to connect to Slack WebSocket: {}", e));
+            return false;
+        }
+    };
+
+    app.add_output("Connected to Slack!");
+    app.current_world_mut().connected = true;
+    app.current_world_mut().was_connected = true;
+
+    let (write, mut read) = ws_stream.split();
+    let write = std::sync::Arc::new(tokio::sync::Mutex::new(write));
+
+    // Create command channel for sending messages
+    let (cmd_tx, mut cmd_rx) = mpsc::channel::<WriteCommand>(100);
+    app.current_world_mut().command_tx = Some(cmd_tx);
+
+    // Spawn reader task
+    let event_tx_clone = event_tx.clone();
+    let _token_clone = token.clone(); // Reserved for future use (user lookup, etc.)
+    let channel_clone = channel.clone();
+    let write_clone = write.clone();
+
+    tokio::spawn(async move {
+        use futures::SinkExt;
+
+        while let Some(msg) = read.next().await {
+            match msg {
+                Ok(WsMsg::Text(text)) => {
+                    if let Ok(json) = serde_json::from_str::<serde_json::Value>(&text) {
+                        // Handle envelope acknowledgment
+                        if let Some(envelope_id) = json.get("envelope_id").and_then(|v| v.as_str()) {
+                            let ack = serde_json::json!({ "envelope_id": envelope_id });
+                            let mut w = write_clone.lock().await;
+                            let _ = w.send(WsMsg::Text(ack.to_string().into())).await;
+                        }
+
+                        // Handle events
+                        if let Some(payload) = json.get("payload") {
+                            if let Some(event) = payload.get("event") {
+                                let event_type = event.get("type").and_then(|v| v.as_str()).unwrap_or("");
+
+                                if event_type == "message" {
+                                    // Check if it's the right channel
+                                    let msg_channel = event.get("channel").and_then(|v| v.as_str()).unwrap_or("");
+                                    if channel_clone.is_empty() || msg_channel == channel_clone || msg_channel.contains(&channel_clone) {
+                                        let user = event.get("user").and_then(|v| v.as_str()).unwrap_or("unknown");
+                                        let text = event.get("text").and_then(|v| v.as_str()).unwrap_or("");
+                                        let formatted = format!("[{}] <{}> {}", msg_channel, user, text);
+                                        let _ = event_tx_clone.send(AppEvent::SlackMessage(world_idx, formatted)).await;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                Ok(WsMsg::Close(_)) => {
+                    let _ = event_tx_clone.send(AppEvent::Disconnected(world_idx)).await;
+                    break;
+                }
+                Err(_) => {
+                    let _ = event_tx_clone.send(AppEvent::Disconnected(world_idx)).await;
+                    break;
+                }
+                _ => {}
+            }
+        }
+    });
+
+    // Spawn writer task for sending messages
+    let token_for_writer = token.clone();
+    let channel_for_writer = channel.clone();
+    tokio::spawn(async move {
+        let client = reqwest::Client::new();
+        while let Some(cmd) = cmd_rx.recv().await {
+            let text = match cmd {
+                WriteCommand::Text(t) => t,
+                WriteCommand::Raw(r) => String::from_utf8_lossy(&r).to_string(),
+            };
+            // Send message via chat.postMessage API
+            let _ = client
+                .post("https://slack.com/api/chat.postMessage")
+                .header("Authorization", format!("Bearer {}", token_for_writer))
+                .header("Content-Type", "application/json")
+                .json(&serde_json::json!({
+                    "channel": channel_for_writer,
+                    "text": text
+                }))
+                .send()
+                .await;
+        }
+    });
+
+    false
+}
+
+// ============================================================================
+// Discord Gateway Bot Connection
+// ============================================================================
+
+async fn connect_discord(app: &mut App, event_tx: mpsc::Sender<AppEvent>) -> bool {
+    let world_idx = app.current_world_index;
+
+    // Clone settings values first to avoid borrow conflicts
+    let token = app.current_world().settings.discord_token.clone();
+    let _guild_id = app.current_world().settings.discord_guild.clone();
+    let channel_id = app.current_world().settings.discord_channel.clone();
+
+    if token.is_empty() {
+        app.add_output("Error: Discord token is required.");
+        app.add_output("Configure the token in world settings (/world -e)");
+        return false;
+    }
+
+    app.add_output("");
+    app.add_output("Connecting to Discord...");
+    app.add_output("");
+
+    // Connect to Discord Gateway
+    use tokio_tungstenite::tungstenite::Message as WsMsg;
+    use futures::StreamExt;
+
+    let (ws_stream, _) = match tokio_tungstenite::connect_async("wss://gateway.discord.gg/?v=10&encoding=json").await {
+        Ok(s) => s,
+        Err(e) => {
+            app.add_output(&format!("Failed to connect to Discord Gateway: {}", e));
+            return false;
+        }
+    };
+
+    let (write, mut read) = ws_stream.split();
+    let write = std::sync::Arc::new(tokio::sync::Mutex::new(write));
+
+    // Create command channel for sending messages
+    let (cmd_tx, mut cmd_rx) = mpsc::channel::<WriteCommand>(100);
+    app.current_world_mut().command_tx = Some(cmd_tx);
+
+    // Spawn reader/heartbeat task
+    let event_tx_clone = event_tx.clone();
+    let token_clone = token.clone();
+    let channel_id_clone = channel_id.clone();
+    let write_clone = write.clone();
+
+    tokio::spawn(async move {
+        use futures::SinkExt;
+
+        let mut _heartbeat_interval: Option<u64> = None; // Reserved for dynamic heartbeat
+        let mut last_sequence: Option<u64> = None;
+        let mut _identified = false; // Track READY state
+
+        while let Some(msg) = read.next().await {
+            match msg {
+                Ok(WsMsg::Text(text)) => {
+                    if let Ok(json) = serde_json::from_str::<serde_json::Value>(&text) {
+                        let op = json.get("op").and_then(|v| v.as_u64()).unwrap_or(0);
+
+                        // Update sequence number
+                        if let Some(s) = json.get("s").and_then(|v| v.as_u64()) {
+                            last_sequence = Some(s);
+                        }
+
+                        match op {
+                            10 => {
+                                // Hello - start heartbeat
+                                if let Some(d) = json.get("d") {
+                                    if let Some(interval) = d.get("heartbeat_interval").and_then(|v| v.as_u64()) {
+                                        _heartbeat_interval = Some(interval);
+
+                                        // Send IDENTIFY
+                                        let identify = serde_json::json!({
+                                            "op": 2,
+                                            "d": {
+                                                "token": token_clone,
+                                                "intents": 513, // GUILDS + GUILD_MESSAGES
+                                                "properties": {
+                                                    "os": "linux",
+                                                    "browser": "clay",
+                                                    "device": "clay"
+                                                }
+                                            }
+                                        });
+                                        let mut w = write_clone.lock().await;
+                                        let _ = w.send(WsMsg::Text(identify.to_string().into())).await;
+                                    }
+                                }
+                            }
+                            0 => {
+                                // Dispatch event
+                                let event_type = json.get("t").and_then(|v| v.as_str()).unwrap_or("");
+
+                                if event_type == "READY" {
+                                    _identified = true;
+                                    let _ = event_tx_clone.send(AppEvent::DiscordMessage(world_idx, "Connected to Discord!".to_string())).await;
+                                } else if event_type == "MESSAGE_CREATE" {
+                                    if let Some(d) = json.get("d") {
+                                        let msg_channel = d.get("channel_id").and_then(|v| v.as_str()).unwrap_or("");
+                                        if channel_id_clone.is_empty() || msg_channel == channel_id_clone {
+                                            let author = d.get("author").and_then(|a| a.get("username")).and_then(|v| v.as_str()).unwrap_or("unknown");
+                                            let content = d.get("content").and_then(|v| v.as_str()).unwrap_or("");
+                                            let formatted = format!("[#{}] <{}> {}", msg_channel, author, content);
+                                            let _ = event_tx_clone.send(AppEvent::DiscordMessage(world_idx, formatted)).await;
+                                        }
+                                    }
+                                }
+                            }
+                            11 => {
+                                // Heartbeat ACK - good, keep going
+                            }
+                            1 => {
+                                // Heartbeat request - send heartbeat
+                                let hb = serde_json::json!({
+                                    "op": 1,
+                                    "d": last_sequence
+                                });
+                                let mut w = write_clone.lock().await;
+                                let _ = w.send(WsMsg::Text(hb.to_string().into())).await;
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                Ok(WsMsg::Close(_)) => {
+                    let _ = event_tx_clone.send(AppEvent::Disconnected(world_idx)).await;
+                    break;
+                }
+                Err(_) => {
+                    let _ = event_tx_clone.send(AppEvent::Disconnected(world_idx)).await;
+                    break;
+                }
+                _ => {}
+            }
+        }
+    });
+
+    // Spawn heartbeat task
+    let write_for_heartbeat = write.clone();
+    tokio::spawn(async move {
+        use futures::SinkExt;
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(41)); // ~41s heartbeat
+        loop {
+            interval.tick().await;
+            let hb = serde_json::json!({
+                "op": 1,
+                "d": null
+            });
+            let mut w = write_for_heartbeat.lock().await;
+            if w.send(WsMsg::Text(hb.to_string().into())).await.is_err() {
+                break;
+            }
+        }
+    });
+
+    // Spawn writer task for sending messages via REST API
+    let token_for_writer = token.clone();
+    let channel_for_writer = channel_id.clone();
+    tokio::spawn(async move {
+        let client = reqwest::Client::new();
+        while let Some(cmd) = cmd_rx.recv().await {
+            let text = match cmd {
+                WriteCommand::Text(t) => t,
+                WriteCommand::Raw(r) => String::from_utf8_lossy(&r).to_string(),
+            };
+            if channel_for_writer.is_empty() {
+                continue;
+            }
+            let url = format!("https://discord.com/api/v10/channels/{}/messages", channel_for_writer);
+            let _ = client
+                .post(&url)
+                .header("Authorization", format!("Bot {}", token_for_writer))
+                .header("Content-Type", "application/json")
+                .json(&serde_json::json!({
+                    "content": text
+                }))
+                .send()
+                .await;
+        }
+    });
+
+    app.current_world_mut().connected = true;
+    app.current_world_mut().was_connected = true;
+
+    false
+}
+
 async fn handle_command(cmd: &str, app: &mut App, event_tx: mpsc::Sender<AppEvent>) -> bool {
     let parsed = parse_command(cmd);
 
@@ -11590,12 +12232,31 @@ async fn handle_command(cmd: &str, app: &mut App, event_tx: mpsc::Sender<AppEven
             app.actions_popup.open(&app.settings.actions);
         }
         Command::Connect { host: arg_host, port: arg_port, ssl: arg_ssl } => {
+            // Only master client can initiate connections
+            if !app.is_master {
+                app.add_output("Only the master client can initiate connections.");
+                return false;
+            }
             if app.current_world().connected {
                 app.add_output("Already connected. Use /disconnect first.");
                 return false;
             }
 
-            // Determine host/port/ssl: use args if provided, else use stored settings
+            // Route connection based on world type
+            let world_type = app.current_world().settings.world_type.clone();
+            match world_type {
+                WorldType::Slack => {
+                    return connect_slack(app, event_tx).await;
+                }
+                WorldType::Discord => {
+                    return connect_discord(app, event_tx).await;
+                }
+                WorldType::Mud => {
+                    // Continue with MUD connection below
+                }
+            }
+
+            // MUD connection: Determine host/port/ssl: use args if provided, else use stored settings
             let world_settings = &app.current_world().settings;
             let (host, port, use_ssl) = if let (Some(h), Some(p)) = (arg_host, arg_port) {
                 (h, p, arg_ssl)
@@ -13062,47 +13723,77 @@ fn render_settings_popup(f: &mut Frame, app: &App) {
         let mut lines = vec![
             Line::from(""),
             render_text_field("World:", &popup.temp_world_name, SettingsField::WorldName, w),
-            render_text_field("Hostname:", &popup.temp_hostname, SettingsField::Hostname, w),
-            render_text_field("Port:", &popup.temp_port, SettingsField::Port, w),
-            render_text_field("User:", &popup.temp_user, SettingsField::User, w),
-            render_text_field("Password:", &popup.temp_password, SettingsField::Password, w),
-            render_toggle_field("Use SSL:", popup.temp_use_ssl, SettingsField::UseSsl, w),
-            render_text_field("Log file:", &popup.temp_log_file, SettingsField::LogFile, w),
+            // World type selector
             Line::from(vec![
                 Span::styled(
-                    format!("  {:<w$}", "Encoding:"),
-                    field_style(SettingsField::Encoding),
+                    format!("  {:<w$}", "Type:"),
+                    field_style(SettingsField::WorldType),
                 ),
                 Span::styled(
-                    format!("[{}]", popup.temp_encoding.name()),
-                    field_style(SettingsField::Encoding),
-                ),
-            ]),
-            Line::from(vec![
-                Span::styled(
-                    format!("  {:<w$}", "Auto login:"),
-                    field_style(SettingsField::AutoConnect),
-                ),
-                Span::styled(
-                    format!("[{}]", popup.temp_auto_connect_type.name()),
-                    field_style(SettingsField::AutoConnect),
-                ),
-            ]),
-            Line::from(vec![
-                Span::styled(
-                    format!("  {:<w$}", "Keep-Alive:"),
-                    field_style(SettingsField::KeepAlive),
-                ),
-                Span::styled(
-                    format!("[{}]", popup.temp_keep_alive_type.name()),
-                    field_style(SettingsField::KeepAlive),
+                    format!("[{}]", popup.temp_world_type.name()),
+                    field_style(SettingsField::WorldType),
                 ),
             ]),
         ];
-        // Conditionally add Keep-Alive CMD field only when Custom is selected
-        if popup.temp_keep_alive_type == KeepAliveType::Custom {
-            lines.push(render_text_field("Keep-Alive CMD:", &popup.temp_keep_alive_cmd, SettingsField::KeepAliveCmd, w));
+
+        // Add type-specific fields
+        match popup.temp_world_type {
+            WorldType::Mud => {
+                lines.push(render_text_field("Hostname:", &popup.temp_hostname, SettingsField::Hostname, w));
+                lines.push(render_text_field("Port:", &popup.temp_port, SettingsField::Port, w));
+                lines.push(render_text_field("User:", &popup.temp_user, SettingsField::User, w));
+                lines.push(render_text_field("Password:", &popup.temp_password, SettingsField::Password, w));
+                lines.push(render_toggle_field("Use SSL:", popup.temp_use_ssl, SettingsField::UseSsl, w));
+                lines.push(render_text_field("Log file:", &popup.temp_log_file, SettingsField::LogFile, w));
+                lines.push(Line::from(vec![
+                    Span::styled(
+                        format!("  {:<w$}", "Encoding:"),
+                        field_style(SettingsField::Encoding),
+                    ),
+                    Span::styled(
+                        format!("[{}]", popup.temp_encoding.name()),
+                        field_style(SettingsField::Encoding),
+                    ),
+                ]));
+                lines.push(Line::from(vec![
+                    Span::styled(
+                        format!("  {:<w$}", "Auto login:"),
+                        field_style(SettingsField::AutoConnect),
+                    ),
+                    Span::styled(
+                        format!("[{}]", popup.temp_auto_connect_type.name()),
+                        field_style(SettingsField::AutoConnect),
+                    ),
+                ]));
+                lines.push(Line::from(vec![
+                    Span::styled(
+                        format!("  {:<w$}", "Keep-Alive:"),
+                        field_style(SettingsField::KeepAlive),
+                    ),
+                    Span::styled(
+                        format!("[{}]", popup.temp_keep_alive_type.name()),
+                        field_style(SettingsField::KeepAlive),
+                    ),
+                ]));
+                // Conditionally add Keep-Alive CMD field only when Custom is selected
+                if popup.temp_keep_alive_type == KeepAliveType::Custom {
+                    lines.push(render_text_field("Keep-Alive CMD:", &popup.temp_keep_alive_cmd, SettingsField::KeepAliveCmd, w));
+                }
+            }
+            WorldType::Slack => {
+                lines.push(render_text_field("Token:", &popup.temp_slack_token, SettingsField::SlackToken, w));
+                lines.push(render_text_field("Channel:", &popup.temp_slack_channel, SettingsField::SlackChannel, w));
+                lines.push(render_text_field("Workspace:", &popup.temp_slack_workspace, SettingsField::SlackWorkspace, w));
+                lines.push(render_text_field("Log file:", &popup.temp_log_file, SettingsField::LogFile, w));
+            }
+            WorldType::Discord => {
+                lines.push(render_text_field("Token:", &popup.temp_discord_token, SettingsField::DiscordToken, w));
+                lines.push(render_text_field("Guild:", &popup.temp_discord_guild, SettingsField::DiscordGuild, w));
+                lines.push(render_text_field("Channel:", &popup.temp_discord_channel, SettingsField::DiscordChannel, w));
+                lines.push(render_text_field("Log file:", &popup.temp_log_file, SettingsField::LogFile, w));
+            }
         }
+
         lines.push(Line::from(""));
         lines.push(Line::from(vec![
             render_button("Save", SettingsField::SaveWorld),
