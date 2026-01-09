@@ -157,6 +157,8 @@ pub struct GlobalSettingsMsg {
 pub struct WsClientInfo {
     pub authenticated: bool,
     pub tx: mpsc::UnboundedSender<WsMessage>,
+    /// Which world this client is currently viewing (for activity indicator)
+    pub current_world: Option<usize>,
 }
 
 /// WebSocket server state
@@ -491,6 +493,7 @@ where
         clients_guard.insert(client_id, WsClientInfo {
             authenticated: is_whitelisted,
             tx: tx.clone(),
+            current_world: None,
         });
     }
 

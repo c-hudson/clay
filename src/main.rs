@@ -2908,6 +2908,9 @@ struct App {
     https_server: Option<HttpsServer>,
     // Track if popup was visible last frame (for terminal clear on transition)
     popup_was_visible: bool,
+    /// Cache of which world each WS client is viewing (for activity indicator)
+    /// Maps client_id -> current_world_index
+    ws_client_worlds: std::collections::HashMap<u64, usize>,
 }
 
 impl App {
@@ -2941,6 +2944,7 @@ impl App {
             #[cfg(feature = "rustls-backend")]
             https_server: None,
             popup_was_visible: false,
+            ws_client_worlds: std::collections::HashMap::new(),
         }
         // Note: No initial world created here - it will be created after load_settings()
         // if no worlds are configured
@@ -3195,6 +3199,11 @@ impl App {
                 }
             });
         }
+    }
+
+    /// Check if any WS client is currently viewing a specific world
+    fn ws_client_viewing(&self, world_index: usize) -> bool {
+        self.ws_client_worlds.values().any(|&w| w == world_index)
     }
 
     /// Build initial state message for a newly authenticated client
@@ -8415,7 +8424,8 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                     AppEvent::ServerData(world_idx, bytes) => {
                         if world_idx < app.worlds.len() {
                             app.worlds[world_idx].last_receive_time = Some(std::time::Instant::now());
-                            let is_current = world_idx == app.current_world_index;
+                            // Consider "current" if console OR any web/GUI client is viewing this world
+                            let is_current = world_idx == app.current_world_index || app.ws_client_viewing(world_idx);
                             let data = app.worlds[world_idx].settings.encoding.decode(&bytes);
                             let world_name = app.worlds[world_idx].name.clone();
                             let actions = app.settings.actions.clone();
@@ -8575,8 +8585,9 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                     AppEvent::WsClientConnected(_client_id) => {
                         // Client connected but not yet authenticated - nothing to do
                     }
-                    AppEvent::WsClientDisconnected(_client_id) => {
-                        // Client disconnected - cleanup handled in handle_ws_client
+                    AppEvent::WsClientDisconnected(client_id) => {
+                        // Client disconnected - remove from ws_client_worlds cache
+                        app.ws_client_worlds.remove(&client_id);
                     }
                     AppEvent::WsClientMessage(client_id, msg) => {
                         match *msg {
@@ -8686,8 +8697,21 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                 }
                             }
                             WsMessage::MarkWorldSeen { world_index } => {
-                                // A remote client has viewed this world - clear unseen count
+                                // A remote client has viewed this world - update their current_world
                                 if world_index < app.worlds.len() {
+                                    // Track which world this client is viewing (sync cache)
+                                    app.ws_client_worlds.insert(client_id, world_index);
+                                    // Also update async client info
+                                    if let Some(ref server) = app.ws_server {
+                                        let clients = server.clients.clone();
+                                        let cid = client_id;
+                                        tokio::spawn(async move {
+                                            let mut clients_guard = clients.write().await;
+                                            if let Some(client) = clients_guard.get_mut(&cid) {
+                                                client.current_world = Some(world_index);
+                                            }
+                                        });
+                                    }
                                     app.worlds[world_index].mark_seen();
                                     // Broadcast to all clients so they update their UI
                                     app.ws_broadcast(WsMessage::UnseenCleared { world_index });
@@ -8935,7 +8959,8 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                 AppEvent::ServerData(world_idx, bytes) => {
                     if world_idx < app.worlds.len() {
                         app.worlds[world_idx].last_receive_time = Some(std::time::Instant::now());
-                        let is_current = world_idx == app.current_world_index;
+                        // Consider "current" if console OR any web/GUI client is viewing this world
+                        let is_current = world_idx == app.current_world_index || app.ws_client_viewing(world_idx);
                         let data = app.worlds[world_idx].settings.encoding.decode(&bytes);
                         let world_name = app.worlds[world_idx].name.clone();
                         let actions = app.settings.actions.clone();
@@ -9079,7 +9104,10 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                 }
                 // WebSocket events (drain loop - complex handlers use primary loop)
                 AppEvent::WsClientConnected(_) => {}
-                AppEvent::WsClientDisconnected(_) => {}
+                AppEvent::WsClientDisconnected(client_id) => {
+                    // Client disconnected - remove from ws_client_worlds cache
+                    app.ws_client_worlds.remove(&client_id);
+                }
                 AppEvent::WsClientMessage(client_id, msg) => {
                     // Handle simple messages in drain loop
                     match *msg {
