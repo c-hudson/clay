@@ -6355,6 +6355,32 @@ mod remote_gui {
                                             };
                                             self.open_world_editor(idx);
                                         }
+                                        super::Command::WorldSwitch { ref name } => {
+                                            // /world <name> - switch to world, connect if not connected
+                                            if let Some(idx) = self.worlds.iter().position(|w| w.name.eq_ignore_ascii_case(name)) {
+                                                // Switch locally
+                                                self.current_world = idx;
+                                                // If not connected, send connect command to server
+                                                if !self.worlds[idx].connected {
+                                                    self.connect_world(idx);
+                                                }
+                                            } else {
+                                                // World not found - send to server to create it
+                                                self.send_command(self.current_world, cmd);
+                                            }
+                                        }
+                                        super::Command::WorldConnectNoLogin { ref name } => {
+                                            // /world -l <name> - switch to world, connect without auto-login
+                                            if let Some(idx) = self.worlds.iter().position(|w| w.name.eq_ignore_ascii_case(name)) {
+                                                self.current_world = idx;
+                                                if !self.worlds[idx].connected {
+                                                    // Send the command to server (it handles -l flag)
+                                                    self.send_command(idx, cmd);
+                                                }
+                                            } else {
+                                                self.send_command(self.current_world, cmd);
+                                            }
+                                        }
                                         _ => {
                                             // Check for /font which is GUI-specific
                                             if cmd.trim().eq_ignore_ascii_case("/font") {
