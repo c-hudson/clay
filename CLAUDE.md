@@ -208,7 +208,7 @@ Prompts that are auto-answered are immediately cleared and not displayed in the 
     - **Alphabetical**: Simple alphabetical order by world name
   - "Unseen output" = lines received while viewing another world
   - Disconnected worlds without unseen lines are skipped
-- `Alt+w` (or `Escape` then `w`) - Jump directly to the world with oldest pending output
+- `Alt+w` (or `Escape` then `w`) - Switch to world with activity (priority: oldest pending → unseen output → previous world)
 - `Shift+Up/Down` - Cycle through all worlds that have ever been connected
 
 **Input Area:**
@@ -225,7 +225,7 @@ Prompts that are auto-answered are immediately cleared and not displayed in the 
 - `PageDown` - Scroll forward (unpauses if at bottom)
 - `Tab` - Release one screenful of pending lines (when paused)
 - `Alt+j` (or `Escape` then `j`) - Jump to end, release all pending lines
-- `Alt+w` (or `Escape` then `w`) - Switch to world with oldest pending output
+- `Alt+w` (or `Escape` then `w`) - Switch to world with activity (priority: oldest pending → unseen output → previous world)
 - `F4` - Open filter popup to search output
 
 **General:**
