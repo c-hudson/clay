@@ -638,6 +638,7 @@ enum SettingsField {
     DiscordToken,
     DiscordGuild,
     DiscordChannel,
+    DiscordDmUser,
     // Buttons
     Connect,
     SaveWorld,
@@ -673,6 +674,7 @@ impl SettingsField {
                 | SettingsField::DiscordToken
                 | SettingsField::DiscordGuild
                 | SettingsField::DiscordChannel
+                | SettingsField::DiscordDmUser
         )
     }
 
@@ -728,7 +730,8 @@ impl SettingsField {
                 SettingsField::WorldType => SettingsField::DiscordToken,
                 SettingsField::DiscordToken => SettingsField::DiscordGuild,
                 SettingsField::DiscordGuild => SettingsField::DiscordChannel,
-                SettingsField::DiscordChannel => SettingsField::LogFile,
+                SettingsField::DiscordChannel => SettingsField::DiscordDmUser,
+                SettingsField::DiscordDmUser => SettingsField::LogFile,
                 SettingsField::LogFile => SettingsField::SaveWorld,
                 SettingsField::SaveWorld => SettingsField::CancelWorld,
                 SettingsField::CancelWorld => SettingsField::DeleteWorld,
@@ -788,7 +791,8 @@ impl SettingsField {
                 SettingsField::DiscordToken => SettingsField::WorldType,
                 SettingsField::DiscordGuild => SettingsField::DiscordToken,
                 SettingsField::DiscordChannel => SettingsField::DiscordGuild,
-                SettingsField::LogFile => SettingsField::DiscordChannel,
+                SettingsField::DiscordDmUser => SettingsField::DiscordChannel,
+                SettingsField::LogFile => SettingsField::DiscordDmUser,
                 SettingsField::SaveWorld => SettingsField::LogFile,
                 SettingsField::CancelWorld => SettingsField::SaveWorld,
                 SettingsField::DeleteWorld => SettingsField::CancelWorld,
@@ -866,6 +870,7 @@ struct SettingsPopup {
     temp_discord_token: String,
     temp_discord_guild: String,
     temp_discord_channel: String,
+    temp_discord_dm_user: String,
     // Temp values for global settings
     temp_more_mode: bool,
     temp_spell_check: bool,
@@ -906,6 +911,7 @@ impl SettingsPopup {
             temp_discord_token: String::new(),
             temp_discord_guild: String::new(),
             temp_discord_channel: String::new(),
+            temp_discord_dm_user: String::new(),
             temp_more_mode: true,
             temp_spell_check: true,
             temp_world_switch_mode: WorldSwitchMode::UnseenFirst,
@@ -945,6 +951,7 @@ impl SettingsPopup {
         self.temp_discord_token = world.settings.discord_token.clone();
         self.temp_discord_guild = world.settings.discord_guild.clone();
         self.temp_discord_channel = world.settings.discord_channel.clone();
+        self.temp_discord_dm_user = world.settings.discord_dm_user.clone();
         // Load from global settings
         self.temp_more_mode = settings.more_mode_enabled;
         self.temp_spell_check = settings.spell_check_enabled;
@@ -1009,6 +1016,7 @@ impl SettingsPopup {
             SettingsField::DiscordToken => self.temp_discord_token.clone(),
             SettingsField::DiscordGuild => self.temp_discord_guild.clone(),
             SettingsField::DiscordChannel => self.temp_discord_channel.clone(),
+            SettingsField::DiscordDmUser => self.temp_discord_dm_user.clone(),
             _ => String::new(),
         };
         self.edit_cursor = self.edit_buffer.len();
@@ -1046,6 +1054,7 @@ impl SettingsPopup {
             SettingsField::DiscordToken => self.temp_discord_token = self.edit_buffer.clone(),
             SettingsField::DiscordGuild => self.temp_discord_guild = self.edit_buffer.clone(),
             SettingsField::DiscordChannel => self.temp_discord_channel = self.edit_buffer.clone(),
+            SettingsField::DiscordDmUser => self.temp_discord_dm_user = self.edit_buffer.clone(),
             _ => {}
         }
         self.editing = false;
@@ -1131,6 +1140,7 @@ impl SettingsPopup {
             world.settings.discord_token = self.temp_discord_token.clone();
             world.settings.discord_guild = self.temp_discord_guild.clone();
             world.settings.discord_channel = self.temp_discord_channel.clone();
+            world.settings.discord_dm_user = self.temp_discord_dm_user.clone();
         }
         (self.temp_input_height, self.temp_show_tags)
     }
@@ -2311,6 +2321,7 @@ struct WorldSettings {
     discord_token: String,
     discord_guild: String,
     discord_channel: String,
+    discord_dm_user: String, // User ID for DM (creates DM channel on connect)
 }
 
 impl Default for WorldSettings {
@@ -2333,6 +2344,7 @@ impl Default for WorldSettings {
             discord_token: String::new(),
             discord_guild: String::new(),
             discord_channel: String::new(),
+            discord_dm_user: String::new(),
         }
     }
 }
@@ -3969,6 +3981,9 @@ fn save_settings(app: &App) -> io::Result<()> {
         if !world.settings.discord_channel.is_empty() {
             writeln!(file, "discord_channel={}", world.settings.discord_channel)?;
         }
+        if !world.settings.discord_dm_user.is_empty() {
+            writeln!(file, "discord_dm_user={}", world.settings.discord_dm_user)?;
+        }
     }
 
     // Save actions
@@ -4213,6 +4228,7 @@ fn load_settings(app: &mut App) -> io::Result<()> {
                         "discord_token" => world.settings.discord_token = decrypt_password(value),
                         "discord_guild" => world.settings.discord_guild = value.to_string(),
                         "discord_channel" => world.settings.discord_channel = value.to_string(),
+                        "discord_dm_user" => world.settings.discord_dm_user = value.to_string(),
                         _ => {}
                     }
                 }
@@ -4328,6 +4344,9 @@ fn save_reload_state(app: &App) -> io::Result<()> {
         }
         if !world.settings.discord_channel.is_empty() {
             writeln!(file, "discord_channel={}", world.settings.discord_channel.replace('=', "\\e"))?;
+        }
+        if !world.settings.discord_dm_user.is_empty() {
+            writeln!(file, "discord_dm_user={}", world.settings.discord_dm_user.replace('=', "\\e"))?;
         }
 
         // Output lines count (we'll save the actual lines separately due to size)
@@ -4692,6 +4711,7 @@ fn load_reload_state(app: &mut App) -> io::Result<bool> {
                             "discord_token" => tw.settings.discord_token = unescape_string(value),
                             "discord_guild" => tw.settings.discord_guild = unescape_string(value),
                             "discord_channel" => tw.settings.discord_channel = unescape_string(value),
+                            "discord_dm_user" => tw.settings.discord_dm_user = unescape_string(value),
                             _ => {}
                         }
                     }
@@ -11934,7 +11954,8 @@ async fn connect_discord(app: &mut App, event_tx: mpsc::Sender<AppEvent>) -> boo
     // Clone settings values first to avoid borrow conflicts
     let token = app.current_world().settings.discord_token.clone();
     let _guild_id = app.current_world().settings.discord_guild.clone();
-    let channel_id = app.current_world().settings.discord_channel.clone();
+    let mut channel_id = app.current_world().settings.discord_channel.clone();
+    let dm_user = app.current_world().settings.discord_dm_user.clone();
 
     if token.is_empty() {
         app.add_output("Error: Discord token is required.");
@@ -11944,6 +11965,64 @@ async fn connect_discord(app: &mut App, event_tx: mpsc::Sender<AppEvent>) -> boo
 
     app.add_output("");
     app.add_output("Connecting to Discord...");
+
+    // If DM user is set, create a DM channel first
+    if !dm_user.is_empty() && channel_id.is_empty() {
+        app.add_output(&format!("Creating DM channel with user {}...", dm_user));
+
+        let client = reqwest::Client::new();
+        let response = match client
+            .post("https://discord.com/api/v10/users/@me/channels")
+            .header("Authorization", format!("Bot {}", token))
+            .header("Content-Type", "application/json")
+            .json(&serde_json::json!({
+                "recipient_id": dm_user
+            }))
+            .send()
+            .await
+        {
+            Ok(r) => r,
+            Err(e) => {
+                app.add_output(&format!("Failed to create DM channel: {}", e));
+                return false;
+            }
+        };
+
+        let status = response.status();
+        let body: serde_json::Value = match response.json().await {
+            Ok(j) => j,
+            Err(e) => {
+                app.add_output(&format!("Failed to parse DM response: {} (HTTP {})", e, status));
+                return false;
+            }
+        };
+
+        if status.is_success() {
+            if let Some(id) = body.get("id").and_then(|v| v.as_str()) {
+                channel_id = id.to_string();
+                app.add_output(&format!("DM channel created: {}", channel_id));
+            } else {
+                app.add_output(&format!("Failed to create DM channel: no channel ID in response"));
+                app.add_output(&format!("Response: {}", body));
+                return false;
+            }
+        } else {
+            let error_msg = body.get("message").and_then(|v| v.as_str()).unwrap_or("unknown error");
+            let error_code = body.get("code").and_then(|v| v.as_i64());
+            app.add_output(&format!("Failed to create DM channel (HTTP {}): {}", status.as_u16(), error_msg));
+            if let Some(code) = error_code {
+                app.add_output(&format!("Discord error code: {}", code));
+            }
+            // Show hint for common errors
+            if status.as_u16() == 401 {
+                app.add_output("Hint: Check that your bot token is correct and includes 'Bot ' prefix if needed");
+            } else if status.as_u16() == 403 {
+                app.add_output("Hint: Bot may lack permissions or the user has DMs disabled");
+            }
+            return false;
+        }
+    }
+
     app.add_output("");
 
     // Connect to Discord Gateway
@@ -12774,12 +12853,11 @@ fn render_output_crossterm(app: &App) {
     use std::io::Write;
     use crossterm::{cursor, style::Print, QueueableCommand};
 
-    // Skip if showing splash screen or any popup is visible
+    // Skip if showing splash screen or any popup is visible (except filter popup)
     let any_popup_visible = app.settings_popup.visible
         || app.world_selector.visible
         || app.confirm_dialog.visible
         || app.worlds_popup.visible
-        || app.filter_popup.visible
         || app.help_popup.visible
         || app.actions_popup.visible
         || app.web_popup.visible;
@@ -12865,30 +12943,73 @@ fn render_output_crossterm(app: &App) {
     let mut visual_lines: Vec<String> = Vec::new();
     let mut first_line_idx: usize = 0;
 
-    if !world.output_lines.is_empty() {
-        let end_line = world.scroll_offset.min(world.output_lines.len().saturating_sub(1));
-        let show_tags = app.show_tags;
+    let show_tags = app.show_tags;
 
-        let expand_and_wrap = |line: &OutputLine| -> Vec<String> {
-            // Skip visually empty lines (only ANSI codes/whitespace)
-            if is_visually_empty(&line.text) {
-                return Vec::new();
-            }
-            let processed = if show_tags {
-                // Show timestamp + original text when tags are shown
-                format!("\x1b[36m{}\x1b[0m {}", line.format_timestamp(), line.text)
-            } else {
-                strip_mud_tag(&line.text)
-            };
-            let expanded = processed.replace('\t', "        ");
-            wrap_ansi_line(&expanded, term_width)
+    let expand_and_wrap = |line: &OutputLine, term_width: usize, show_tags: bool| -> Vec<String> {
+        // Skip visually empty lines (only ANSI codes/whitespace)
+        if is_visually_empty(&line.text) {
+            return Vec::new();
+        }
+        let processed = if show_tags {
+            // Show timestamp + original text when tags are shown
+            format!("\x1b[36m{}\x1b[0m {}", line.format_timestamp(), line.text)
+        } else {
+            strip_mud_tag(&line.text)
         };
+        let expanded = processed.replace('\t', "        ");
+        wrap_ansi_line(&expanded, term_width)
+    };
+
+    // Check if filter popup is active with a filter
+    if app.filter_popup.visible && !app.filter_popup.filtered_indices.is_empty() {
+        // Use filtered indices
+        let filtered = &app.filter_popup.filtered_indices;
+        let end_pos = app.filter_popup.scroll_offset.min(filtered.len().saturating_sub(1));
+
+        // Work backwards from scroll_offset to fill the screen
+        for pos in (0..=end_pos).rev() {
+            let line_idx = filtered[pos];
+            if line_idx < world.output_lines.len() {
+                let line = &world.output_lines[line_idx];
+                let wrapped = expand_and_wrap(line, term_width, show_tags);
+
+                for w in wrapped.into_iter().rev() {
+                    visual_lines.insert(0, w);
+                }
+
+                if visual_lines.len() >= visible_height {
+                    break;
+                }
+            }
+        }
+
+        // If we still have room, show lines after scroll_offset
+        if visual_lines.len() < visible_height {
+            for pos in (end_pos + 1)..filtered.len() {
+                let line_idx = filtered[pos];
+                if line_idx < world.output_lines.len() {
+                    let line = &world.output_lines[line_idx];
+                    let wrapped = expand_and_wrap(line, term_width, show_tags);
+
+                    for w in wrapped {
+                        visual_lines.push(w);
+                    }
+
+                    if visual_lines.len() >= visible_height {
+                        break;
+                    }
+                }
+            }
+        }
+    } else if !world.output_lines.is_empty() {
+        // Normal unfiltered rendering
+        let end_line = world.scroll_offset.min(world.output_lines.len().saturating_sub(1));
 
         first_line_idx = end_line;
         for line_idx in (0..=end_line).rev() {
             first_line_idx = line_idx;
             let line = &world.output_lines[line_idx];
-            let wrapped = expand_and_wrap(line);
+            let wrapped = expand_and_wrap(line, term_width, show_tags);
 
             for w in wrapped.into_iter().rev() {
                 visual_lines.insert(0, w);
@@ -12902,7 +13023,7 @@ fn render_output_crossterm(app: &App) {
         if visual_lines.len() < visible_height && first_line_idx == 0 {
             for line_idx in (end_line + 1)..world.output_lines.len() {
                 let line = &world.output_lines[line_idx];
-                let wrapped = expand_and_wrap(line);
+                let wrapped = expand_and_wrap(line, term_width, show_tags);
 
                 for w in wrapped {
                     visual_lines.push(w);
@@ -12939,6 +13060,34 @@ fn render_output_crossterm(app: &App) {
         let _ = stdout.queue(cursor::MoveTo(0, row_idx as u16));
         let spaces = " ".repeat(term_width);
         let _ = stdout.queue(Print(spaces));
+    }
+
+    // Render filter popup if visible (must be after output so it's on top)
+    if app.filter_popup.visible {
+        let popup_width = 40usize.min(term_width);
+        let x = term_width.saturating_sub(popup_width) as u16;
+        let title = " Find [Esc to close] ";
+        let dashes_needed = popup_width.saturating_sub(title.len() + 2); // +2 for corners
+
+        // Draw border top
+        let _ = stdout.queue(cursor::MoveTo(x, 0));
+        let border_top = format!("\x1b[36m┌{}{}{}\x1b[0m", title, "─".repeat(dashes_needed), "┐");
+        let _ = stdout.queue(Print(border_top));
+
+        // Draw content line
+        let _ = stdout.queue(cursor::MoveTo(x, 1));
+        let mut display_text = app.filter_popup.filter_text.clone();
+        display_text.insert(app.filter_popup.cursor, '▏');
+        let label = "Filter: ";
+        let content_width = label.len() + display_text.chars().count();
+        let inner_width = popup_width.saturating_sub(2); // -2 for side borders
+        let padding = inner_width.saturating_sub(content_width);
+        let _ = stdout.queue(Print(format!("\x1b[36m│\x1b[0m{}{}{}\x1b[36m│\x1b[0m", label, display_text, " ".repeat(padding))));
+
+        // Draw border bottom
+        let _ = stdout.queue(cursor::MoveTo(x, 2));
+        let border_bottom = format!("\x1b[36m└{}┘\x1b[0m", "─".repeat(popup_width.saturating_sub(2)));
+        let _ = stdout.queue(Print(border_bottom));
     }
 
     // Restore cursor position for the input area
@@ -13790,6 +13939,7 @@ fn render_settings_popup(f: &mut Frame, app: &App) {
                 lines.push(render_text_field("Token:", &popup.temp_discord_token, SettingsField::DiscordToken, w));
                 lines.push(render_text_field("Guild:", &popup.temp_discord_guild, SettingsField::DiscordGuild, w));
                 lines.push(render_text_field("Channel:", &popup.temp_discord_channel, SettingsField::DiscordChannel, w));
+                lines.push(render_text_field("DM User:", &popup.temp_discord_dm_user, SettingsField::DiscordDmUser, w));
                 lines.push(render_text_field("Log file:", &popup.temp_log_file, SettingsField::LogFile, w));
             }
         }

@@ -47,5 +47,5 @@ egui = { version = "0.30", optional = true }
 [features]
 default = ["native-tls-backend"]
 native-tls-backend = ["tokio-native-tls", "native-tls", "tokio-tungstenite/native-tls"]
-rustls-backend = ["tokio-rustls", "rustls", "rustls-pemfile", "webpki-roots", "rustls-webpki"]
+rustls-backend = ["tokio-rustls", "rustls", "rustls-pemfile", "webpki-roots", "rustls-webpki", "tokio-tungstenite/rustls-tls-webpki-roots"]
 remote-gui = ["eframe", "egui"]
