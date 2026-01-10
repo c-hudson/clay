@@ -6318,6 +6318,7 @@ mod remote_gui {
 
         /// Insert zero-width spaces after break characters in long words (>15 chars)
         /// Break characters: [ ] ( ) , \ / . - and spaces
+        /// Skips ANSI escape sequences to avoid corrupting them
         fn insert_word_breaks(text: &str) -> String {
             const ZWSP: char = '\u{200B}'; // Zero-width space
             const BREAK_CHARS: &[char] = &['[', ']', '(', ')', ',', '\\', '/', '.', '-', ' '];
@@ -6325,9 +6326,26 @@ mod remote_gui {
 
             let mut result = String::with_capacity(text.len() * 2);
             let mut word_len = 0;
+            let mut chars = text.chars().peekable();
 
-            for c in text.chars() {
+            while let Some(c) = chars.next() {
                 result.push(c);
+
+                // Skip ANSI escape sequences entirely
+                if c == '\x1b' && chars.peek() == Some(&'[') {
+                    // Consume the '['
+                    if let Some(bracket) = chars.next() {
+                        result.push(bracket);
+                    }
+                    // Consume until we hit the terminator (alphabetic or ~)
+                    while let Some(&sc) = chars.peek() {
+                        result.push(chars.next().unwrap());
+                        if sc.is_ascii_alphabetic() || sc == '~' {
+                            break;
+                        }
+                    }
+                    continue;
+                }
 
                 if c.is_whitespace() {
                     word_len = 0;
@@ -13126,7 +13144,17 @@ fn render_output_crossterm(app: &App) {
         width
     }
 
-    // Wrap a line with ANSI codes by visible width
+    // Break characters for word wrapping (same as GUI)
+    const BREAK_CHARS: &[char] = &['[', ']', '(', ')', ',', '\\', '/', '.', '-'];
+    const MIN_WORD_LEN: usize = 15;
+
+    // Check if a character is a break character
+    fn is_break_char(c: char) -> bool {
+        c.is_whitespace() || BREAK_CHARS.contains(&c)
+    }
+
+    // Wrap a line with ANSI codes by visible width, preferring to break at
+    // specific characters ([ ] ( ) , \ / . -) for long words (>15 chars)
     fn wrap_ansi_line(line: &str, max_width: usize) -> Vec<String> {
         if max_width == 0 {
             return vec![line.to_string()];
@@ -13138,6 +13166,12 @@ fn render_output_crossterm(app: &App) {
         let mut in_escape = false;
         let mut escape_seq = String::new();
         let mut active_codes: Vec<String> = Vec::new();
+
+        // Track break opportunities for long words
+        let mut word_start_width = 0;  // Width at start of current word
+        let mut last_break_line = String::new();  // Line content at last break point
+        let mut last_break_width = 0;  // Width at last break point
+        let mut last_break_codes: Vec<String> = Vec::new();  // Active codes at last break
 
         for c in line.chars() {
             if c == '\x1b' {
@@ -13159,14 +13193,55 @@ fn render_output_crossterm(app: &App) {
                 }
             } else {
                 let char_width = unicode_width::UnicodeWidthChar::width(c).unwrap_or(0);
+
+                // Check if we need to wrap
                 if current_width + char_width > max_width && current_width > 0 {
-                    current_line.push_str("\x1b[0m");
-                    result.push(current_line);
-                    current_line = active_codes.join("");
-                    current_width = 0;
+                    // Calculate current word length
+                    let word_len = current_width - word_start_width;
+
+                    // If word is long and we have a break point, use it
+                    if word_len > MIN_WORD_LEN && last_break_width > word_start_width {
+                        // Use the break point - emit up to break point
+                        let mut break_line = last_break_line.clone();
+                        break_line.push_str("\x1b[0m");
+                        result.push(break_line);
+
+                        // Start new line with remainder after break point
+                        let remainder_start = last_break_line.len();
+                        let remainder = &current_line[remainder_start..];
+                        current_line = last_break_codes.join("") + remainder;
+                        current_width = current_width - last_break_width;
+                        word_start_width = 0;
+                    } else {
+                        // No good break point, wrap at current position
+                        current_line.push_str("\x1b[0m");
+                        result.push(current_line);
+                        current_line = active_codes.join("");
+                        current_width = 0;
+                        word_start_width = 0;
+                    }
+
+                    // Reset break tracking
+                    last_break_line.clear();
+                    last_break_width = 0;
+                    last_break_codes.clear();
                 }
+
+                // Add the character
                 current_line.push(c);
                 current_width += char_width;
+
+                // Track word boundaries and break opportunities
+                if c.is_whitespace() {
+                    word_start_width = current_width;
+                    last_break_line.clear();
+                    last_break_width = 0;
+                } else if is_break_char(c) {
+                    // Save this as a potential break point (break after this char)
+                    last_break_line = current_line.clone();
+                    last_break_width = current_width;
+                    last_break_codes = active_codes.clone();
+                }
             }
         }
 

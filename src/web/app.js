@@ -956,7 +956,7 @@
             const tsPrefix = showTags && lineTs ? `<span class="timestamp">${formatTimestamp(lineTs)}</span>` : '';
 
             const displayText = showTags ? cleanLine : stripMudTag(cleanLine);
-            const html = tsPrefix + convertDiscordEmojis(linkifyUrls(parseAnsi(displayText)));
+            const html = tsPrefix + convertDiscordEmojis(linkifyUrls(parseAnsi(insertWordBreaks(displayText))));
             htmlParts.push(html);
         }
 
@@ -975,7 +975,7 @@
             worldOutputCache[worldIndex] = [];
         }
         const displayText = showTags ? text : stripMudTag(text);
-        const html = convertDiscordEmojis(linkifyUrls(parseAnsi(displayText)));
+        const html = convertDiscordEmojis(linkifyUrls(parseAnsi(insertWordBreaks(displayText))));
         worldOutputCache[worldIndex][lineIndex] = { html, showTags };
         return html;
     }
@@ -989,7 +989,7 @@
         const tsPrefix = showTags && ts ? `<span class="timestamp">${formatTimestamp(ts)}</span>` : '';
 
         const displayText = showTags ? cleanText : stripMudTag(cleanText);
-        const html = tsPrefix + convertDiscordEmojis(linkifyUrls(parseAnsi(displayText)));
+        const html = tsPrefix + convertDiscordEmojis(linkifyUrls(parseAnsi(insertWordBreaks(displayText))));
 
         // Append to output with a <br> prefix (if not first line)
         if (elements.output.innerHTML.length > 0) {
@@ -1201,6 +1201,52 @@
         const div = document.createElement('div');
         div.textContent = text;
         return div.innerHTML;
+    }
+
+    // Insert zero-width spaces after break characters in long words (>15 chars)
+    // Break characters: [ ] ( ) , \ / . - and spaces
+    // Must be applied BEFORE parseAnsi (on raw text, not HTML)
+    function insertWordBreaks(text) {
+        const ZWSP = '\u200B'; // Zero-width space
+        const BREAK_CHARS = ['[', ']', '(', ')', ',', '\\', '/', '.', '-', ' '];
+        const MIN_WORD_LEN = 15;
+
+        let result = '';
+        let wordLen = 0;
+        let i = 0;
+
+        while (i < text.length) {
+            const c = text[i];
+            result += c;
+            i++;
+
+            // Skip ANSI escape sequences entirely
+            if (c === '\x1b' && text[i] === '[') {
+                result += text[i++]; // consume '['
+                // Consume until terminator (alphabetic or ~)
+                while (i < text.length) {
+                    const sc = text[i];
+                    result += sc;
+                    i++;
+                    if ((sc >= 'A' && sc <= 'Z') || (sc >= 'a' && sc <= 'z') || sc === '~') {
+                        break;
+                    }
+                }
+                continue;
+            }
+
+            if (/\s/.test(c)) {
+                wordLen = 0;
+            } else {
+                wordLen++;
+                // Insert break opportunity after break chars in long words
+                if (wordLen > MIN_WORD_LEN && BREAK_CHARS.includes(c)) {
+                    result += ZWSP;
+                }
+            }
+        }
+
+        return result;
     }
 
     // Strip ANSI escape codes from text
