@@ -12162,6 +12162,7 @@ async fn connect_discord(app: &mut App, event_tx: mpsc::Sender<AppEvent>) -> boo
     // Spawn writer task for sending messages via REST API
     let token_for_writer = token.clone();
     let channel_for_writer = channel_id.clone();
+    let event_tx_for_writer = event_tx.clone();
     tokio::spawn(async move {
         let client = reqwest::Client::new();
         while let Some(cmd) = cmd_rx.recv().await {
@@ -12170,10 +12171,11 @@ async fn connect_discord(app: &mut App, event_tx: mpsc::Sender<AppEvent>) -> boo
                 WriteCommand::Raw(r) => String::from_utf8_lossy(&r).to_string(),
             };
             if channel_for_writer.is_empty() {
+                let _ = event_tx_for_writer.send(AppEvent::DiscordMessage(world_idx, "Error: No channel configured".to_string())).await;
                 continue;
             }
             let url = format!("https://discord.com/api/v10/channels/{}/messages", channel_for_writer);
-            let _ = client
+            match client
                 .post(&url)
                 .header("Authorization", format!("Bot {}", token_for_writer))
                 .header("Content-Type", "application/json")
@@ -12181,7 +12183,22 @@ async fn connect_discord(app: &mut App, event_tx: mpsc::Sender<AppEvent>) -> boo
                     "content": text
                 }))
                 .send()
-                .await;
+                .await
+            {
+                Ok(response) => {
+                    if !response.status().is_success() {
+                        let status = response.status();
+                        let body: serde_json::Value = response.json().await.unwrap_or_default();
+                        let error_msg = body.get("message").and_then(|v| v.as_str()).unwrap_or("unknown error");
+                        let msg = format!("Discord send failed (HTTP {}): {}", status.as_u16(), error_msg);
+                        let _ = event_tx_for_writer.send(AppEvent::DiscordMessage(world_idx, msg)).await;
+                    }
+                }
+                Err(e) => {
+                    let msg = format!("Discord send error: {}", e);
+                    let _ = event_tx_for_writer.send(AppEvent::DiscordMessage(world_idx, msg)).await;
+                }
+            }
         }
     });
 
