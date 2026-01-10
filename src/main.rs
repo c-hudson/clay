@@ -3156,6 +3156,8 @@ struct App {
     /// True if this is the master client (runs WS server or WS disabled).
     /// Only master should save settings or initiate connections.
     is_master: bool,
+    /// True if this session started from a hot reload (suppress server startup messages)
+    is_reload: bool,
 }
 
 impl App {
@@ -3192,6 +3194,7 @@ impl App {
             popup_was_visible: false,
             ws_client_worlds: std::collections::HashMap::new(),
             is_master: true, // Console app is always master (remote GUI is separate execution path)
+            is_reload: false, // Set to true in run_app if started from hot reload
         }
         // Note: No initial world created here - it will be created after load_settings()
         // if no worlds are configured
@@ -8792,6 +8795,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
 
     // Check if we're in reload mode (via --reload command line argument)
     let is_reload = std::env::args().any(|a| a == "--reload");
+    app.is_reload = is_reload; // Suppress server startup messages during reload
     // Check if we're recovering from a crash (via --crash command line argument)
     let is_crash = std::env::args().any(|a| a == "--crash");
 
@@ -9146,8 +9150,10 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                 app.add_output(&format!("Warning: Failed to start WebSocket server: {}", e));
             }
         } else {
-            let protocol = if tls_configured { "wss" } else { "ws" };
-            app.add_output(&format!("WebSocket server started on port {} ({})", app.settings.ws_port, protocol));
+            if !app.is_reload {
+                let protocol = if tls_configured { "wss" } else { "ws" };
+                app.add_output(&format!("WebSocket server started on port {} ({})", app.settings.ws_port, protocol));
+            }
             app.ws_server = Some(server);
         }
     }
@@ -9170,7 +9176,9 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                     true, // HTTPS uses secure WebSocket (wss://)
                 ).await {
                     Ok(()) => {
-                        app.add_output(&format!("HTTPS web interface started on port {} (wss://localhost:{})", app.settings.http_port, app.settings.ws_port));
+                        if !app.is_reload {
+                            app.add_output(&format!("HTTPS web interface started on port {} (wss://localhost:{})", app.settings.http_port, app.settings.ws_port));
+                        }
                         app.https_server = Some(https_server);
                     }
                     Err(e) => {
@@ -9192,7 +9200,9 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                     true, // HTTPS uses secure WebSocket (wss://)
                 ).await {
                     Ok(()) => {
-                        app.add_output(&format!("HTTPS web interface started on port {} (wss://localhost:{})", app.settings.http_port, app.settings.ws_port));
+                        if !app.is_reload {
+                            app.add_output(&format!("HTTPS web interface started on port {} (wss://localhost:{})", app.settings.http_port, app.settings.ws_port));
+                        }
                         app.https_server = Some(https_server);
                     }
                     Err(e) => {
@@ -9212,7 +9222,9 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                 false, // HTTP uses non-secure WebSocket (ws://)
             ).await {
                 Ok(()) => {
-                    app.add_output(&format!("HTTP web interface started on port {} (ws://localhost:{})", app.settings.http_port, app.settings.ws_port));
+                    if !app.is_reload {
+                        app.add_output(&format!("HTTP web interface started on port {} (ws://localhost:{})", app.settings.http_port, app.settings.ws_port));
+                    }
                     app.http_server = Some(http_server);
                 }
                 Err(e) => {
@@ -12984,7 +12996,7 @@ async fn handle_command(cmd: &str, app: &mut App, event_tx: mpsc::Sender<AppEven
                 app.add_output("These connections will need to be re-established after reload.");
             }
 
-            app.add_output(&format!("Performing hot reload from: {}", exe_path.display()));
+            // Binary path is only shown on failure (see error handler below)
 
             // Disable raw mode before exec (the new process will re-enable it)
             let _ = crossterm::terminal::disable_raw_mode();
