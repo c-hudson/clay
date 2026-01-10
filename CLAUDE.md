@@ -93,6 +93,22 @@ On startup, each world displays a colorful ASCII art splash screen with the tagl
 - PageUp/PageDown scroll by visual lines (accounting for line wrapping)
 - Manual line wrapping preserves ANSI color codes across wrapped lines
 
+### Word Wrapping
+
+All interfaces (console, web, GUI) use consistent word wrapping for long words:
+
+- Words longer than 15 characters can break at specific characters: `[ ] ( ) , \ / - & = ?`
+- Period (`.`) is excluded to avoid breaking filenames (e.g., `image.png`) and domain names
+- Console: `wrap_ansi_line` tracks break opportunities and uses them when wrapping long words
+- Web: `insertWordBreaks()` inserts zero-width spaces after break characters
+- GUI: `insert_word_breaks()` inserts zero-width spaces, skipping ANSI escape sequences
+
+This produces cleaner URL wrapping:
+```
+https://example.com/path/to/file.png?key=value&other=data
+```
+Breaks at `/`, `?`, `&`, `=` instead of at periods in filenames.
+
 ### Character Encoding
 
 Encoding is configurable per-world in the world settings popup.
@@ -306,6 +322,12 @@ Works with updated binaries: On Linux, when the binary is rebuilt while running,
 - Apply code changes without losing active MUD sessions
 - Debug fixes can be deployed without reconnecting
 - External scripts can trigger reload via SIGUSR1
+
+**Message suppression:**
+During hot reload, success messages are suppressed to reduce noise:
+- WebSocket/HTTP/HTTPS server startup messages (only shown on failure)
+- Binary path message (only shown on failure)
+- Warnings and errors are always shown
 
 ### Crash Handler
 
