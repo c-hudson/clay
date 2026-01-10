@@ -6325,7 +6325,9 @@ mod remote_gui {
             is_light_theme: bool,
         ) {
             let segments = Self::parse_discord_segments(text);
+            let available_width = ui.available_width();
 
+            // Use a vertical layout to allow text wrapping
             ui.horizontal_wrapped(|ui| {
                 ui.spacing_mut().item_spacing.x = 0.0;
                 for segment in segments {
@@ -6333,6 +6335,10 @@ mod remote_gui {
                         DiscordSegment::Text(txt) => {
                             // Build a LayoutJob for this text segment with ANSI support
                             let mut job = egui::text::LayoutJob::default();
+                            job.wrap = egui::text::TextWrapping {
+                                max_width: available_width,
+                                ..Default::default()
+                            };
                             Self::append_ansi_to_job(&txt, default_color, font_id.clone(), &mut job, is_light_theme);
                             let galley = ui.fonts(|f| f.layout_job(job));
                             ui.label(galley);
