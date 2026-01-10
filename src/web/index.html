@@ -16,6 +16,7 @@
                     <div class="dropdown-item" data-action="worlds">Worlds List</div>
                     <div class="dropdown-item" data-action="world-selector">World Selector</div>
                     <div class="dropdown-item" data-action="actions">Actions</div>
+                    <div class="dropdown-item" data-action="setup">Setup</div>
                     <div class="dropdown-divider"></div>
                     <div class="dropdown-item" data-action="toggle-tags">Toggle Tags</div>
                 </div>
@@ -39,6 +40,7 @@
                     <div class="dropdown-item" data-action="worlds">Worlds List</div>
                     <div class="dropdown-item" data-action="world-selector">World Selector</div>
                     <div class="dropdown-item" data-action="actions">Actions</div>
+                    <div class="dropdown-item" data-action="setup">Setup</div>
                     <div class="dropdown-divider"></div>
                     <div class="dropdown-item" data-action="toggle-tags">Toggle Tags</div>
                 </div>
@@ -64,7 +66,7 @@
         <!-- Input area -->
         <div id="input-container">
             <span id="prompt"></span>
-            <textarea id="input" autocomplete="off" autofocus rows="1"></textarea>
+            <textarea id="input" autocomplete="off" autocapitalize="off" autocorrect="off" spellcheck="false" inputmode="text" autofocus rows="1"></textarea>
             <button id="send-btn">Send</button>
         </div>
 
@@ -177,6 +179,35 @@
                     <button id="world-connect-btn">Connect</button>
                     <button id="world-switch-btn">Switch</button>
                     <button id="world-selector-cancel-btn">Cancel</button>
+                </div>
+            </div>
+        </div>
+
+        <!-- Setup popup (/setup) -->
+        <div id="setup-modal" class="modal">
+            <div class="modal-content setup-modal-content">
+                <h2>Setup</h2>
+                <div class="setup-form">
+                    <div class="setup-field">
+                        <label>More Mode:</label>
+                        <button id="setup-more-mode-btn" class="toggle-btn">on</button>
+                    </div>
+                    <div class="setup-field">
+                        <label>World Switching:</label>
+                        <button id="setup-world-switch-btn" class="toggle-btn">Unseen First</button>
+                    </div>
+                    <div class="setup-field">
+                        <label>Show Tags:</label>
+                        <button id="setup-show-tags-btn" class="toggle-btn">off</button>
+                    </div>
+                    <div class="setup-field">
+                        <label>Input Height:</label>
+                        <input type="number" id="setup-input-height" autocomplete="off" class="setup-input" min="1" max="15">
+                    </div>
+                </div>
+                <div class="modal-buttons">
+                    <button id="setup-save-btn">Save</button>
+                    <button id="setup-cancel-btn">Cancel</button>
                 </div>
             </div>
         </div>

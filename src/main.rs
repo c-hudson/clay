@@ -4931,6 +4931,27 @@ mod remote_gui {
             }
         }
 
+        fn name(&self) -> &'static str {
+            match self {
+                GuiTheme::Dark => "Dark",
+                GuiTheme::Light => "Light",
+            }
+        }
+
+        fn next(&self) -> Self {
+            match self {
+                GuiTheme::Dark => GuiTheme::Light,
+                GuiTheme::Light => GuiTheme::Dark,
+            }
+        }
+
+        fn to_string_value(&self) -> String {
+            match self {
+                GuiTheme::Dark => "dark".to_string(),
+                GuiTheme::Light => "light".to_string(),
+            }
+        }
+
         fn bg(&self) -> Color32 {
             match self {
                 GuiTheme::Dark => Color32::from_rgb(12, 12, 12),  // Very dark gray, subtle lift from pure black
@@ -5804,8 +5825,8 @@ mod remote_gui {
         fn update_global_settings(&mut self) {
             if let Some(ref tx) = self.ws_tx {
                 let _ = tx.send(WsMessage::UpdateGlobalSettings {
-                    console_theme: if self.console_theme == GuiTheme::Dark { "dark".to_string() } else { "light".to_string() },
-                    gui_theme: if self.theme == GuiTheme::Dark { "dark".to_string() } else { "light".to_string() },
+                    console_theme: self.console_theme.to_string_value(),
+                    gui_theme: self.theme.to_string_value(),
                     input_height: self.input_height,
                     font_name: self.font_name.clone(),
                     font_size: self.font_size,
@@ -8168,16 +8189,14 @@ mod remote_gui {
                                     ui.end_row();
 
                                     ui.label("Console Theme:");
-                                    let console_theme_text = if self.console_theme == GuiTheme::Dark { "Dark" } else { "Light" };
-                                    if ui.button(console_theme_text).clicked() {
-                                        self.console_theme = if self.console_theme == GuiTheme::Dark { GuiTheme::Light } else { GuiTheme::Dark };
+                                    if ui.button(self.console_theme.name()).clicked() {
+                                        self.console_theme = self.console_theme.next();
                                     }
                                     ui.end_row();
 
                                     ui.label("GUI Theme:");
-                                    let gui_theme_text = if self.theme == GuiTheme::Dark { "Dark" } else { "Light" };
-                                    if ui.button(gui_theme_text).clicked() {
-                                        self.theme = if self.theme == GuiTheme::Dark { GuiTheme::Light } else { GuiTheme::Dark };
+                                    if ui.button(self.theme.name()).clicked() {
+                                        self.theme = self.theme.next();
                                     }
                                     ui.end_row();
                                 });

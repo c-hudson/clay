@@ -87,7 +87,15 @@
         httpLabel: document.getElementById('http-label'),
         httpPortLabel: document.getElementById('http-port-label'),
         wsLabel: document.getElementById('ws-label'),
-        wsPortLabel: document.getElementById('ws-port-label')
+        wsPortLabel: document.getElementById('ws-port-label'),
+        // Setup popup
+        setupModal: document.getElementById('setup-modal'),
+        setupMoreModeBtn: document.getElementById('setup-more-mode-btn'),
+        setupWorldSwitchBtn: document.getElementById('setup-world-switch-btn'),
+        setupShowTagsBtn: document.getElementById('setup-show-tags-btn'),
+        setupInputHeight: document.getElementById('setup-input-height'),
+        setupSaveBtn: document.getElementById('setup-save-btn'),
+        setupCancelBtn: document.getElementById('setup-cancel-btn')
     };
 
     // State
@@ -139,6 +147,13 @@
     let wsKeyFile = '';
     let selectedWorldIndex = -1;
     let selectedWorldsRowIndex = -1; // For worlds list popup (/worlds)
+
+    // Setup popup state
+    let setupPopupOpen = false;
+    let setupMoreMode = true;
+    let setupWorldSwitchMode = 'Unseen First';
+    let setupShowTags = false;
+    let setupInputHeightValue = 1;
 
     // Menu state
     let menuOpen = false;
@@ -852,6 +867,11 @@
             case CommandType.WEB:
                 elements.input.value = '';
                 openWebPopup();
+                return;
+
+            case CommandType.SETUP:
+                elements.input.value = '';
+                openSetupPopup();
                 return;
 
             case CommandType.WORLDS_LIST:
@@ -1640,6 +1660,72 @@
         }
     }
 
+    // Setup popup functions (/setup)
+    function openSetupPopup() {
+        setupPopupOpen = true;
+        // Load current values
+        setupMoreMode = moreModeEnabled;
+        setupWorldSwitchMode = worldSwitchMode;
+        setupShowTags = showTags;
+        setupInputHeightValue = inputHeight;
+        elements.setupModal.className = 'modal visible';
+        elements.setupModal.style.display = 'flex';
+        updateSetupPopupUI();
+    }
+
+    function closeSetupPopup() {
+        setupPopupOpen = false;
+        elements.setupModal.className = 'modal';
+        elements.setupModal.style.display = 'none';
+        elements.input.focus();
+    }
+
+    function updateSetupPopupUI() {
+        elements.setupMoreModeBtn.textContent = setupMoreMode ? 'on' : 'off';
+        elements.setupWorldSwitchBtn.textContent = setupWorldSwitchMode;
+        elements.setupShowTagsBtn.textContent = setupShowTags ? 'on' : 'off';
+        elements.setupInputHeight.value = setupInputHeightValue;
+    }
+
+    function saveSetupSettings() {
+        // Read values from UI
+        setupInputHeightValue = parseInt(elements.setupInputHeight.value) || 1;
+        if (setupInputHeightValue < 1) setupInputHeightValue = 1;
+        if (setupInputHeightValue > 15) setupInputHeightValue = 15;
+
+        // Apply locally
+        moreModeEnabled = setupMoreMode;
+        worldSwitchMode = setupWorldSwitchMode;
+        showTags = setupShowTags;
+        setInputHeight(setupInputHeightValue);
+
+        // Re-render output with new show_tags setting
+        renderOutput();
+
+        // Send to server
+        send({
+            type: 'UpdateGlobalSettings',
+            more_mode_enabled: moreModeEnabled,
+            world_switch_mode: worldSwitchMode,
+            show_tags: showTags,
+            input_height: setupInputHeightValue,
+            console_theme: 'dark',
+            gui_theme: 'dark',
+            font_name: '',
+            font_size: 14.0,
+            ws_allow_list: wsAllowList,
+            web_secure: webSecure,
+            http_enabled: httpEnabled,
+            http_port: httpPort,
+            ws_enabled: wsEnabled,
+            ws_port: wsPort,
+            ws_cert_file: wsCertFile,
+            ws_key_file: wsKeyFile
+        });
+
+        closeSetupPopup();
+    }
+
     // Web settings popup functions (/web)
     function openWebPopup() {
         webPopupOpen = true;
@@ -1969,11 +2055,26 @@
             const world = worlds[selectedWorldIndex];
             // Switch to the world first
             switchWorldLocal(selectedWorldIndex);
-            // Send connect command to server
-            send({
-                type: 'ConnectWorld',
-                world_index: selectedWorldIndex
-            });
+            // Check if we have settings to connect
+            const hasSettings = world.settings &&
+                world.settings.hostname &&
+                world.settings.hostname.length > 0 &&
+                world.settings.port &&
+                world.settings.port.length > 0;
+            if (hasSettings) {
+                // Has hostname/port - connect
+                send({
+                    type: 'ConnectWorld',
+                    world_index: selectedWorldIndex
+                });
+            } else {
+                // No settings - send to server to open editor
+                send({
+                    type: 'SendCommand',
+                    world_index: currentWorldIndex,
+                    command: '/world ' + world.name
+                });
+            }
             closeWorldSelectorPopup();
         }
     }
@@ -2003,12 +2104,27 @@
             const world = worlds[worldIndex];
             // Switch to the world
             switchWorldLocal(worldIndex);
-            // If not connected, connect
+            // If not connected, check if we have settings to connect
             if (!world.connected) {
-                send({
-                    type: 'ConnectWorld',
-                    world_index: worldIndex
-                });
+                const hasSettings = world.settings &&
+                    world.settings.hostname &&
+                    world.settings.hostname.length > 0 &&
+                    world.settings.port &&
+                    world.settings.port.length > 0;
+                if (hasSettings) {
+                    // Has hostname/port - connect
+                    send({
+                        type: 'ConnectWorld',
+                        world_index: worldIndex
+                    });
+                } else {
+                    // No settings - send to server to open editor
+                    send({
+                        type: 'SendCommand',
+                        world_index: currentWorldIndex,
+                        command: '/world ' + worldName
+                    });
+                }
             }
         } else {
             // World not found - send command to server to create/handle it
@@ -2022,7 +2138,7 @@
 
     // Check if any popup is open
     function isAnyPopupOpen() {
-        return actionsListPopupOpen || actionsEditorPopupOpen || actionsConfirmPopupOpen || worldsPopupOpen || worldSelectorPopupOpen || webPopupOpen;
+        return actionsListPopupOpen || actionsEditorPopupOpen || actionsConfirmPopupOpen || worldsPopupOpen || worldSelectorPopupOpen || webPopupOpen || setupPopupOpen;
     }
 
     // Check if a world should be included in cycling (connected OR has unseen output)
@@ -2108,6 +2224,9 @@
                 break;
             case 'actions':
                 openActionsPopup();
+                break;
+            case 'setup':
+                openSetupPopup();
                 break;
             case 'toggle-tags':
                 showTags = !showTags;
@@ -2305,6 +2424,27 @@
             }
         };
 
+        // On mobile, keep keyboard visible by refocusing input when it loses focus
+        if (deviceMode === 'mobile') {
+            elements.input.addEventListener('blur', function() {
+                // Small delay to allow modal opens and other legitimate blur events
+                setTimeout(function() {
+                    // Don't refocus if a modal is open
+                    if (elements.authModal.classList.contains('visible') ||
+                        elements.actionsListModal.classList.contains('visible') ||
+                        elements.actionsEditorModal.classList.contains('visible') ||
+                        elements.worldsModal.classList.contains('visible') ||
+                        elements.worldSelectorModal.classList.contains('visible') ||
+                        elements.webModal.classList.contains('visible') ||
+                        elements.setupModal.classList.contains('visible')) {
+                        return;
+                    }
+                    // Refocus to keep keyboard visible
+                    elements.input.focus();
+                }, 50);
+            });
+        }
+
         // Scroll event to update status bar (for Hist indicator)
         elements.outputContainer.onscroll = function() {
             updateStatusBar();
@@ -2397,6 +2537,15 @@
                         switchWorldLocal(actualIndex);
                         closeWorldsPopup();
                     }
+                }
+                return;
+            }
+
+            // Handle setup popup
+            if (setupPopupOpen) {
+                if (e.key === 'Escape') {
+                    e.preventDefault();
+                    closeSetupPopup();
                 }
                 return;
             }
@@ -2640,6 +2789,23 @@
             }
             renderWorldSelectorList();
         };
+
+        // Setup popup
+        elements.setupMoreModeBtn.onclick = function() {
+            setupMoreMode = !setupMoreMode;
+            updateSetupPopupUI();
+        };
+        elements.setupWorldSwitchBtn.onclick = function() {
+            // Toggle between 'Unseen First' and 'Alphabetical'
+            setupWorldSwitchMode = setupWorldSwitchMode === 'Unseen First' ? 'Alphabetical' : 'Unseen First';
+            updateSetupPopupUI();
+        };
+        elements.setupShowTagsBtn.onclick = function() {
+            setupShowTags = !setupShowTags;
+            updateSetupPopupUI();
+        };
+        elements.setupSaveBtn.onclick = saveSetupSettings;
+        elements.setupCancelBtn.onclick = closeSetupPopup;
 
         // Web settings popup
         elements.webProtocolBtn.onclick = function() {
