@@ -6397,6 +6397,8 @@ mod remote_gui {
                 bar_outer_margin: 2.0,
                 ..Default::default()
             };
+            // Reduce spacing for tighter text layout (helps with ASCII art)
+            style.spacing.item_spacing.y = 0.0;
             ctx.set_style(style);
 
             // Load custom font if font name changed
@@ -6408,10 +6410,18 @@ mod remote_gui {
                 if !self.font_name.is_empty() {
                     // Try to load the system font
                     if let Some(font_data) = Self::find_system_font(&self.font_name) {
-                        // Add the custom font
+                        // Add the custom font with tweaks for tighter line spacing (ASCII art)
+                        let font_data = egui::FontData::from_owned(font_data).tweak(
+                            egui::FontTweak {
+                                scale: 1.05,              // Slightly larger to fill row height
+                                y_offset_factor: -0.02,   // Move up slightly to reduce gaps
+                                y_offset: 0.0,
+                                baseline_offset_factor: 0.0,
+                            }
+                        );
                         fonts.font_data.insert(
                             "custom_mono".to_owned(),
-                            std::sync::Arc::new(egui::FontData::from_owned(font_data)),
+                            std::sync::Arc::new(font_data),
                         );
 
                         // Make it the first priority for monospace
@@ -7367,6 +7377,8 @@ mod remote_gui {
 
                         let scroll_output = scroll_area.show(ui, |ui| {
                                 ui.set_width(ui.available_width());
+                                // Remove vertical spacing between lines for seamless ASCII art
+                                ui.spacing_mut().item_spacing.y = 0.0;
 
                                 // Use different rendering path for Discord emojis
                                 if has_emojis {

@@ -499,6 +499,23 @@ where
         whitelist_guard.as_ref().map(|h| h == &client_ip).unwrap_or(false)
     };
 
+    // Check allow list - reject if not in allow list and not whitelisted
+    let (allow_list_empty, in_allow_list) = {
+        let allow_list_guard = allow_list.read().unwrap();
+        let empty = allow_list_guard.is_empty();
+        let in_list = is_ip_in_allow_list(&client_ip, &allow_list_guard);
+        (empty, in_list)
+    };
+
+    // Reject connection if:
+    // - Allow list is empty (no connections allowed), OR
+    // - Allow list is non-empty but IP is not in list and not whitelisted
+    if allow_list_empty || (!in_allow_list && !is_whitelisted) {
+        let msg = format!("WS connection rejected from {} (not in allow list)", client_addr);
+        let _ = event_tx.send(AppEvent::SystemMessage(msg)).await;
+        return Ok(());
+    }
+
     let ws_stream = accept_async(stream).await?;
     let (mut ws_sink, mut ws_source) = ws_stream.split();
 
