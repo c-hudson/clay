@@ -1204,11 +1204,12 @@
     }
 
     // Insert zero-width spaces after break characters in long words (>15 chars)
-    // Break characters: [ ] ( ) , \ / . - and spaces
+    // Break characters: [ ] ( ) , \ / - & = ? and spaces
+    // Note: '.' is excluded because it breaks filenames (image.png) and domains awkwardly
     // Must be applied BEFORE parseAnsi (on raw text, not HTML)
     function insertWordBreaks(text) {
         const ZWSP = '\u200B'; // Zero-width space
-        const BREAK_CHARS = ['[', ']', '(', ')', ',', '\\', '/', '.', '-', ' '];
+        const BREAK_CHARS = ['[', ']', '(', ')', ',', '\\', '/', '-', '&', '=', '?', ' '];
         const MIN_WORD_LEN = 15;
 
         let result = '';

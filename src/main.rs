@@ -6317,11 +6317,12 @@ mod remote_gui {
         }
 
         /// Insert zero-width spaces after break characters in long words (>15 chars)
-        /// Break characters: [ ] ( ) , \ / . - and spaces
+        /// Break characters: [ ] ( ) , \ / - & = ? and spaces
+        /// Note: '.' is excluded because it breaks filenames (image.png) and domains awkwardly
         /// Skips ANSI escape sequences to avoid corrupting them
         fn insert_word_breaks(text: &str) -> String {
             const ZWSP: char = '\u{200B}'; // Zero-width space
-            const BREAK_CHARS: &[char] = &['[', ']', '(', ')', ',', '\\', '/', '.', '-', ' '];
+            const BREAK_CHARS: &[char] = &['[', ']', '(', ')', ',', '\\', '/', '-', '&', '=', '?', ' '];
             const MIN_WORD_LEN: usize = 15;
 
             let mut result = String::with_capacity(text.len() * 2);
@@ -13145,7 +13146,8 @@ fn render_output_crossterm(app: &App) {
     }
 
     // Break characters for word wrapping (same as GUI)
-    const BREAK_CHARS: &[char] = &['[', ']', '(', ')', ',', '\\', '/', '.', '-'];
+    // Note: '.' is excluded because it breaks filenames (image.png) and domains awkwardly
+    const BREAK_CHARS: &[char] = &['[', ']', '(', ')', ',', '\\', '/', '-', '&', '=', '?'];
     const MIN_WORD_LEN: usize = 15;
 
     // Check if a character is a break character
@@ -13154,7 +13156,7 @@ fn render_output_crossterm(app: &App) {
     }
 
     // Wrap a line with ANSI codes by visible width, preferring to break at
-    // specific characters ([ ] ( ) , \ / . -) for long words (>15 chars)
+    // specific characters ([ ] ( ) , \ / - & = ?) for long words (>15 chars)
     fn wrap_ansi_line(line: &str, max_width: usize) -> Vec<String> {
         if max_width == 0 {
             return vec![line.to_string()];
