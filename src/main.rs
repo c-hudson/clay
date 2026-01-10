@@ -4930,7 +4930,7 @@ mod remote_gui {
 
         fn bg(&self) -> Color32 {
             match self {
-                GuiTheme::Dark => Color32::BLACK,  // Pure black like a terminal
+                GuiTheme::Dark => Color32::from_rgb(12, 12, 12),  // Very dark gray, subtle lift from pure black
                 GuiTheme::Light => Color32::from_rgb(250, 250, 250),
             }
         }
