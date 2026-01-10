@@ -2903,9 +2903,6 @@ impl World {
         output_width: u16,
         clear_splash: bool,
     ) {
-        // Convert Discord custom emojis to Unicode or :name: fallback
-        let text = convert_discord_emojis(text);
-        let text = text.as_str();
 
         // Clear splash mode when MUD data is received (not for client messages)
         if clear_splash && self.showing_splash {
@@ -5138,6 +5135,13 @@ mod remote_gui {
         action_error: Option<String>,
     }
 
+    /// Discord emoji segment for rendering
+    #[derive(Debug, Clone)]
+    enum DiscordSegment {
+        Text(String),
+        Emoji { name: String, id: String, animated: bool },
+    }
+
     impl RemoteGuiApp {
         pub fn new(ws_url: String, runtime: tokio::runtime::Handle) -> Self {
             Self {
@@ -6270,6 +6274,80 @@ mod remote_gui {
                     .spawn();
             }
         }
+
+        /// Parse text into segments of plain text and Discord emojis
+        fn parse_discord_segments(text: &str) -> Vec<DiscordSegment> {
+            use regex::Regex;
+            use std::sync::OnceLock;
+
+            static RE: OnceLock<Regex> = OnceLock::new();
+            let re = RE.get_or_init(|| {
+                Regex::new(r"<(a?):([^:]+):(\d+)>").unwrap()
+            });
+
+            let mut segments = Vec::new();
+            let mut last_end = 0;
+
+            for cap in re.captures_iter(text) {
+                let m = cap.get(0).unwrap();
+                if m.start() > last_end {
+                    segments.push(DiscordSegment::Text(text[last_end..m.start()].to_string()));
+                }
+                let animated = &cap[1] == "a";
+                let name = cap[2].to_string();
+                let id = cap[3].to_string();
+                segments.push(DiscordSegment::Emoji { name, id, animated });
+                last_end = m.end();
+            }
+
+            if last_end < text.len() {
+                segments.push(DiscordSegment::Text(text[last_end..].to_string()));
+            }
+
+            if segments.is_empty() {
+                segments.push(DiscordSegment::Text(text.to_string()));
+            }
+
+            segments
+        }
+
+        /// Check if text contains Discord custom emojis
+        fn has_discord_emojis(text: &str) -> bool {
+            text.contains("<:") || text.contains("<a:")
+        }
+
+        /// Render a line with inline Discord emoji images
+        fn render_line_with_emojis(
+            ui: &mut egui::Ui,
+            text: &str,
+            default_color: egui::Color32,
+            font_id: &egui::FontId,
+            is_light_theme: bool,
+        ) {
+            let segments = Self::parse_discord_segments(text);
+
+            ui.horizontal_wrapped(|ui| {
+                ui.spacing_mut().item_spacing.x = 0.0;
+                for segment in segments {
+                    match segment {
+                        DiscordSegment::Text(txt) => {
+                            // Build a LayoutJob for this text segment with ANSI support
+                            let mut job = egui::text::LayoutJob::default();
+                            Self::append_ansi_to_job(&txt, default_color, font_id.clone(), &mut job, is_light_theme);
+                            let galley = ui.fonts(|f| f.layout_job(job));
+                            ui.label(galley);
+                        }
+                        DiscordSegment::Emoji { name, id, animated } => {
+                            let ext = if animated { "gif" } else { "png" };
+                            let url = format!("https://cdn.discordapp.com/emojis/{}.{}", id, ext);
+                            let image = egui::Image::from_uri(&url)
+                                .fit_to_exact_size(egui::vec2(font_id.size * 1.2, font_id.size * 1.2));
+                            ui.add(image).on_hover_text(format!(":{}:", name));
+                        }
+                    }
+                }
+            });
+        }
     }
 
     impl eframe::App for RemoteGuiApp {
@@ -7191,27 +7269,34 @@ mod remote_gui {
                             .filter(|line| !Self::strip_ansi_for_copy(&line.text).is_empty())
                             .collect();
 
-                        for (i, line) in non_empty_lines.iter().enumerate() {
-                            // Apply tag stripping if needed (on the ANSI version)
-                            let display_line = if self.show_tags {
-                                // Add timestamp prefix when showing tags
+                        // Check if any line has Discord emojis
+                        let has_any_discord_emojis = non_empty_lines.iter()
+                            .any(|line| Self::has_discord_emojis(&line.text));
+
+                        // Build display lines for both paths
+                        let display_lines: Vec<String> = non_empty_lines.iter().map(|line| {
+                            if self.show_tags {
                                 let ts_prefix = Self::format_timestamp_gui(line.ts);
                                 format!("\x1b[36m{}\x1b[0m {}", ts_prefix, line.text)
                             } else {
                                 Self::strip_mud_tags_ansi(&line.text)
-                            };
+                            }
+                        }).collect();
 
-                            // Parse ANSI and append to combined job
-                            let is_light_theme = matches!(theme, GuiTheme::Light);
-                            Self::append_ansi_to_job(&display_line, default_color, font_id.clone(), &mut combined_job, is_light_theme);
+                        // For non-emoji path, build combined LayoutJob
+                        if !has_any_discord_emojis {
+                            for (i, display_line) in display_lines.iter().enumerate() {
+                                let line_text = convert_discord_emojis(display_line);
+                                let is_light_theme = matches!(theme, GuiTheme::Light);
+                                Self::append_ansi_to_job(&line_text, default_color, font_id.clone(), &mut combined_job, is_light_theme);
 
-                            // Add newline between lines (except after last)
-                            if i < non_empty_lines.len() - 1 {
-                                combined_job.append("\n", 0.0, egui::TextFormat {
-                                    font_id: font_id.clone(),
-                                    color: default_color,
-                                    ..Default::default()
-                                });
+                                if i < display_lines.len() - 1 {
+                                    combined_job.append("\n", 0.0, egui::TextFormat {
+                                        font_id: font_id.clone(),
+                                        color: default_color,
+                                        ..Default::default()
+                                    });
+                                }
                             }
                         }
 
@@ -7267,8 +7352,30 @@ mod remote_gui {
                             }
                         }
 
+                        // Clone values needed in the closure
+                        let has_emojis = has_any_discord_emojis;
+                        let emoji_lines = display_lines.clone();
+                        let emoji_font_id = font_id.clone();
+                        let emoji_default_color = default_color;
+                        let emoji_is_light = matches!(theme, GuiTheme::Light);
+
                         let scroll_output = scroll_area.show(ui, |ui| {
                                 ui.set_width(ui.available_width());
+
+                                // Use different rendering path for Discord emojis
+                                if has_emojis {
+                                    // Render each line with inline emoji images
+                                    for line in &emoji_lines {
+                                        Self::render_line_with_emojis(
+                                            ui,
+                                            line,
+                                            emoji_default_color,
+                                            &emoji_font_id,
+                                            emoji_is_light,
+                                        );
+                                    }
+                                    return; // Skip the TextEdit path
+                                }
 
                                 // Use TextEdit with custom layouter for colored text
                                 let mut text_copy = plain_text.clone();
@@ -8467,7 +8574,9 @@ mod remote_gui {
         eframe::run_native(
             "Clay Mud Client",
             options,
-            Box::new(move |_cc| {
+            Box::new(move |cc| {
+                // Install image loaders for Discord emoji support
+                egui_extras::install_image_loaders(&cc.egui_ctx);
                 Ok(Box::new(RemoteGuiApp::new(addr_string, runtime)) as Box<dyn eframe::App>)
             }),
         ).map_err(|e| io::Error::other(format!("eframe error: {}", e)))
@@ -12967,11 +13076,13 @@ fn render_output_crossterm(app: &App) {
         if is_visually_empty(&line.text) {
             return Vec::new();
         }
+        // Convert Discord custom emojis to :name: for console display
+        let text = convert_discord_emojis(&line.text);
         let processed = if show_tags {
             // Show timestamp + original text when tags are shown
-            format!("\x1b[36m{}\x1b[0m {}", line.format_timestamp(), line.text)
+            format!("\x1b[36m{}\x1b[0m {}", line.format_timestamp(), text)
         } else {
-            strip_mud_tag(&line.text)
+            strip_mud_tag(&text)
         };
         let expanded = processed.replace('\t', "        ");
         wrap_ansi_line(&expanded, term_width)

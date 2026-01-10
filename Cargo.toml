@@ -43,9 +43,11 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "rus
 # GUI client (optional)
 eframe = { version = "0.30", optional = true, default-features = false, features = ["default_fonts", "glow", "x11"] }
 egui = { version = "0.30", optional = true }
+egui_extras = { version = "0.30", optional = true, features = ["image", "http"] }
+image = { version = "0.25", optional = true, default-features = false, features = ["png", "gif"] }
 
 [features]
 default = ["native-tls-backend"]
 native-tls-backend = ["tokio-native-tls", "native-tls", "tokio-tungstenite/native-tls"]
 rustls-backend = ["tokio-rustls", "rustls", "rustls-pemfile", "webpki-roots", "rustls-webpki", "tokio-tungstenite/rustls-tls-webpki-roots"]
-remote-gui = ["eframe", "egui"]
+remote-gui = ["eframe", "egui", "egui_extras", "image"]
