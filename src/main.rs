@@ -6316,13 +6316,14 @@ mod remote_gui {
             text.contains("<:") || text.contains("<a:")
         }
 
-        /// Render a line with inline Discord emoji images
+        /// Render a line with inline Discord emoji images and clickable URLs
         fn render_line_with_emojis(
             ui: &mut egui::Ui,
             text: &str,
             default_color: egui::Color32,
             font_id: &egui::FontId,
             is_light_theme: bool,
+            link_color: egui::Color32,
         ) {
             let segments = Self::parse_discord_segments(text);
             let available_width = ui.available_width();
@@ -6333,15 +6334,63 @@ mod remote_gui {
                 for segment in segments {
                     match segment {
                         DiscordSegment::Text(txt) => {
-                            // Build a LayoutJob for this text segment with ANSI support
-                            let mut job = egui::text::LayoutJob::default();
-                            job.wrap = egui::text::TextWrapping {
-                                max_width: available_width,
-                                ..Default::default()
-                            };
-                            Self::append_ansi_to_job(&txt, default_color, font_id.clone(), &mut job, is_light_theme);
-                            let galley = ui.fonts(|f| f.layout_job(job));
-                            ui.label(galley);
+                            // Check for URLs in this text segment
+                            let urls = Self::find_urls(&txt);
+                            if urls.is_empty() {
+                                // No URLs, render as normal text
+                                let mut job = egui::text::LayoutJob::default();
+                                job.wrap = egui::text::TextWrapping {
+                                    max_width: available_width,
+                                    ..Default::default()
+                                };
+                                Self::append_ansi_to_job(&txt, default_color, font_id.clone(), &mut job, is_light_theme);
+                                let galley = ui.fonts(|f| f.layout_job(job));
+                                ui.label(galley);
+                            } else {
+                                // Has URLs, render text and URLs separately
+                                let mut last_end = 0;
+                                for (start, end, url) in urls {
+                                    // Render text before URL
+                                    if start > last_end {
+                                        let before = &txt[last_end..start];
+                                        let mut job = egui::text::LayoutJob::default();
+                                        job.wrap = egui::text::TextWrapping {
+                                            max_width: available_width,
+                                            ..Default::default()
+                                        };
+                                        Self::append_ansi_to_job(before, default_color, font_id.clone(), &mut job, is_light_theme);
+                                        let galley = ui.fonts(|f| f.layout_job(job));
+                                        ui.label(galley);
+                                    }
+                                    // Render URL as clickable link
+                                    let link = egui::Label::new(
+                                        egui::RichText::new(&url)
+                                            .font(font_id.clone())
+                                            .color(link_color)
+                                            .underline()
+                                    ).sense(egui::Sense::click());
+                                    let response = ui.add(link);
+                                    if response.clicked() {
+                                        Self::open_url(&url);
+                                    }
+                                    if response.hovered() {
+                                        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                                    }
+                                    last_end = end;
+                                }
+                                // Render text after last URL
+                                if last_end < txt.len() {
+                                    let after = &txt[last_end..];
+                                    let mut job = egui::text::LayoutJob::default();
+                                    job.wrap = egui::text::TextWrapping {
+                                        max_width: available_width,
+                                        ..Default::default()
+                                    };
+                                    Self::append_ansi_to_job(after, default_color, font_id.clone(), &mut job, is_light_theme);
+                                    let galley = ui.fonts(|f| f.layout_job(job));
+                                    ui.label(galley);
+                                }
+                            }
                         }
                         DiscordSegment::Emoji { name, id, animated } => {
                             let ext = if animated { "gif" } else { "png" };
@@ -7374,6 +7423,8 @@ mod remote_gui {
                         let emoji_font_id = font_id.clone();
                         let emoji_default_color = default_color;
                         let emoji_is_light = matches!(theme, GuiTheme::Light);
+                        let emoji_link_color = theme.link();
+                        let emoji_plain_text = plain_text.clone();
 
                         let scroll_output = scroll_area.show(ui, |ui| {
                                 ui.set_width(ui.available_width());
@@ -7390,8 +7441,20 @@ mod remote_gui {
                                             emoji_default_color,
                                             &emoji_font_id,
                                             emoji_is_light,
+                                            emoji_link_color,
                                         );
                                     }
+
+                                    // Add context menu for copy functionality
+                                    let text_for_copy = emoji_plain_text.clone();
+                                    ui.interact(ui.min_rect(), egui::Id::new("emoji_output_ctx"), egui::Sense::click())
+                                        .context_menu(|ui| {
+                                            if ui.button("Copy All").clicked() {
+                                                ui.ctx().copy_text(text_for_copy.clone());
+                                                ui.close_menu();
+                                            }
+                                        });
+
                                     return; // Skip the TextEdit path
                                 }
 
