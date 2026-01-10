@@ -94,6 +94,8 @@
         setupWorldSwitchBtn: document.getElementById('setup-world-switch-btn'),
         setupShowTagsBtn: document.getElementById('setup-show-tags-btn'),
         setupInputHeight: document.getElementById('setup-input-height'),
+        setupConsoleThemeBtn: document.getElementById('setup-console-theme-btn'),
+        setupGuiThemeBtn: document.getElementById('setup-gui-theme-btn'),
         setupSaveBtn: document.getElementById('setup-save-btn'),
         setupCancelBtn: document.getElementById('setup-cancel-btn')
     };
@@ -154,6 +156,12 @@
     let setupWorldSwitchMode = 'Unseen First';
     let setupShowTags = false;
     let setupInputHeightValue = 1;
+    let setupConsoleTheme = 'dark';
+    let setupGuiTheme = 'dark';
+
+    // Current theme values (synced from server)
+    let consoleTheme = 'dark';
+    let guiTheme = 'dark';
 
     // Menu state
     let menuOpen = false;
@@ -525,6 +533,12 @@
                     if (msg.settings.world_switch_mode !== undefined) {
                         worldSwitchMode = msg.settings.world_switch_mode;
                     }
+                    if (msg.settings.console_theme !== undefined) {
+                        consoleTheme = msg.settings.console_theme;
+                    }
+                    if (msg.settings.gui_theme !== undefined) {
+                        guiTheme = msg.settings.gui_theme;
+                    }
                 }
                 renderOutput();
                 updateStatusBar();
@@ -647,6 +661,12 @@
                     }
                     if (msg.settings.ws_key_file !== undefined) {
                         wsKeyFile = msg.settings.ws_key_file;
+                    }
+                    if (msg.settings.console_theme !== undefined) {
+                        consoleTheme = msg.settings.console_theme;
+                    }
+                    if (msg.settings.gui_theme !== undefined) {
+                        guiTheme = msg.settings.gui_theme;
                     }
                 }
                 break;
@@ -1668,6 +1688,8 @@
         setupWorldSwitchMode = worldSwitchMode;
         setupShowTags = showTags;
         setupInputHeightValue = inputHeight;
+        setupConsoleTheme = consoleTheme;
+        setupGuiTheme = guiTheme;
         elements.setupModal.className = 'modal visible';
         elements.setupModal.style.display = 'flex';
         updateSetupPopupUI();
@@ -1685,6 +1707,9 @@
         elements.setupWorldSwitchBtn.textContent = setupWorldSwitchMode;
         elements.setupShowTagsBtn.textContent = setupShowTags ? 'on' : 'off';
         elements.setupInputHeight.value = setupInputHeightValue;
+        // Capitalize first letter for display
+        elements.setupConsoleThemeBtn.textContent = setupConsoleTheme.charAt(0).toUpperCase() + setupConsoleTheme.slice(1);
+        elements.setupGuiThemeBtn.textContent = setupGuiTheme.charAt(0).toUpperCase() + setupGuiTheme.slice(1);
     }
 
     function saveSetupSettings() {
@@ -1697,6 +1722,8 @@
         moreModeEnabled = setupMoreMode;
         worldSwitchMode = setupWorldSwitchMode;
         showTags = setupShowTags;
+        consoleTheme = setupConsoleTheme;
+        guiTheme = setupGuiTheme;
         setInputHeight(setupInputHeightValue);
 
         // Re-render output with new show_tags setting
@@ -1709,8 +1736,8 @@
             world_switch_mode: worldSwitchMode,
             show_tags: showTags,
             input_height: setupInputHeightValue,
-            console_theme: 'dark',
-            gui_theme: 'dark',
+            console_theme: consoleTheme,
+            gui_theme: guiTheme,
             font_name: '',
             font_size: 14.0,
             ws_allow_list: wsAllowList,
@@ -2802,6 +2829,16 @@
         };
         elements.setupShowTagsBtn.onclick = function() {
             setupShowTags = !setupShowTags;
+            updateSetupPopupUI();
+        };
+        elements.setupConsoleThemeBtn.onclick = function() {
+            // Toggle between 'dark' and 'light'
+            setupConsoleTheme = setupConsoleTheme === 'dark' ? 'light' : 'dark';
+            updateSetupPopupUI();
+        };
+        elements.setupGuiThemeBtn.onclick = function() {
+            // Toggle between 'dark' and 'light'
+            setupGuiTheme = setupGuiTheme === 'dark' ? 'light' : 'dark';
             updateSetupPopupUI();
         };
         elements.setupSaveBtn.onclick = saveSetupSettings;
