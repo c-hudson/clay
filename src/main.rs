@@ -6316,6 +6316,33 @@ mod remote_gui {
             text.contains("<:") || text.contains("<a:")
         }
 
+        /// Insert zero-width spaces after break characters in long words (>15 chars)
+        /// Break characters: [ ] ( ) , \ / . - and spaces
+        fn insert_word_breaks(text: &str) -> String {
+            const ZWSP: char = '\u{200B}'; // Zero-width space
+            const BREAK_CHARS: &[char] = &['[', ']', '(', ')', ',', '\\', '/', '.', '-', ' '];
+            const MIN_WORD_LEN: usize = 15;
+
+            let mut result = String::with_capacity(text.len() * 2);
+            let mut word_len = 0;
+
+            for c in text.chars() {
+                result.push(c);
+
+                if c.is_whitespace() {
+                    word_len = 0;
+                } else {
+                    word_len += 1;
+                    // Insert break opportunity after break chars in long words
+                    if word_len > MIN_WORD_LEN && BREAK_CHARS.contains(&c) {
+                        result.push(ZWSP);
+                    }
+                }
+            }
+
+            result
+        }
+
         /// Render a line with inline Discord emoji images and clickable URLs
         fn render_line_with_emojis(
             ui: &mut egui::Ui,
@@ -6337,13 +6364,14 @@ mod remote_gui {
                             // Check for URLs in this text segment
                             let urls = Self::find_urls(&txt);
                             if urls.is_empty() {
-                                // No URLs, render as normal text
+                                // No URLs, render as normal text with word breaks
+                                let txt_with_breaks = Self::insert_word_breaks(&txt);
                                 let mut job = egui::text::LayoutJob::default();
                                 job.wrap = egui::text::TextWrapping {
                                     max_width: available_width,
                                     ..Default::default()
                                 };
-                                Self::append_ansi_to_job(&txt, default_color, font_id.clone(), &mut job, is_light_theme);
+                                Self::append_ansi_to_job(&txt_with_breaks, default_color, font_id.clone(), &mut job, is_light_theme);
                                 let galley = ui.fonts(|f| f.layout_job(job));
                                 ui.label(galley);
                             } else {
@@ -6352,23 +6380,24 @@ mod remote_gui {
                                 for (start, end, url) in urls {
                                     // Render text before URL
                                     if start > last_end {
-                                        let before = &txt[last_end..start];
+                                        let before = Self::insert_word_breaks(&txt[last_end..start]);
                                         let mut job = egui::text::LayoutJob::default();
                                         job.wrap = egui::text::TextWrapping {
                                             max_width: available_width,
                                             ..Default::default()
                                         };
-                                        Self::append_ansi_to_job(before, default_color, font_id.clone(), &mut job, is_light_theme);
+                                        Self::append_ansi_to_job(&before, default_color, font_id.clone(), &mut job, is_light_theme);
                                         let galley = ui.fonts(|f| f.layout_job(job));
                                         ui.label(galley);
                                     }
-                                    // Render URL as clickable link
+                                    // Render URL as clickable link with word breaks for long URLs
+                                    let url_with_breaks = Self::insert_word_breaks(&url);
                                     let link = egui::Label::new(
-                                        egui::RichText::new(&url)
+                                        egui::RichText::new(&url_with_breaks)
                                             .font(font_id.clone())
                                             .color(link_color)
                                             .underline()
-                                    ).sense(egui::Sense::click());
+                                    ).sense(egui::Sense::click()).wrap();
                                     let response = ui.add(link);
                                     if response.clicked() {
                                         Self::open_url(&url);
@@ -6380,13 +6409,13 @@ mod remote_gui {
                                 }
                                 // Render text after last URL
                                 if last_end < txt.len() {
-                                    let after = &txt[last_end..];
+                                    let after = Self::insert_word_breaks(&txt[last_end..]);
                                     let mut job = egui::text::LayoutJob::default();
                                     job.wrap = egui::text::TextWrapping {
                                         max_width: available_width,
                                         ..Default::default()
                                     };
-                                    Self::append_ansi_to_job(after, default_color, font_id.clone(), &mut job, is_light_theme);
+                                    Self::append_ansi_to_job(&after, default_color, font_id.clone(), &mut job, is_light_theme);
                                     let galley = ui.fonts(|f| f.layout_job(job));
                                     ui.label(galley);
                                 }
@@ -7352,6 +7381,8 @@ mod remote_gui {
                         if !has_any_discord_emojis {
                             for (i, display_line) in display_lines.iter().enumerate() {
                                 let line_text = convert_discord_emojis(display_line);
+                                // Apply word breaks for long words
+                                let line_text = Self::insert_word_breaks(&line_text);
                                 let is_light_theme = matches!(theme, GuiTheme::Light);
                                 Self::append_ansi_to_job(&line_text, default_color, font_id.clone(), &mut combined_job, is_light_theme);
 
