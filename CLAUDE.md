@@ -448,6 +448,11 @@ Note: HTTP automatically starts the non-secure WebSocket server if not already r
 - `interactive-widget=resizes-content` viewport meta for proper keyboard handling
 - Hamburger icon uses inline SVG for reliable cross-browser rendering
 
+**Mobile Toolbar Layout:**
+- Left side: Menu (hamburger), PgUp, PgDn, Tags (👁)
+- Right side: ▲ (Previous World), ▼ (Next World)
+- PgUp/PgDn on left for easy scrolling access; world switching on right
+
 **Web Interface Controls:**
 - `Up/Down` - Switch between active worlds
 - `PageUp/PageDown` - Scroll output history
