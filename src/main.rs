@@ -3745,14 +3745,13 @@ impl App {
             let end = i;
 
             let word: String = chars[start..end].iter().collect();
-            // Don't check if cursor is in or immediately after the word
-            // Note: end is the first position after the word, so cursor at end means right after word
-            let cursor_in_word = cursor_char_pos >= start && cursor_char_pos <= end;
-            let cursor_right_after = cursor_char_pos == end;
-            // Only check words that are clearly complete
+            // Don't check if cursor is inside the word (actively typing)
+            // Note: end is the first position after the word, so use < not <=
+            let cursor_in_word = cursor_char_pos >= start && cursor_char_pos < end;
+            // Only check words that are clearly complete (followed by separator or at end of input)
             let word_complete = is_word_complete(end);
 
-            if !cursor_in_word && !cursor_right_after && word_complete && !self.spell_checker.is_valid(&word) {
+            if !cursor_in_word && word_complete && !self.spell_checker.is_valid(&word) {
                 misspelled.push((start, end));
             }
         }
@@ -5914,15 +5913,13 @@ mod remote_gui {
                 let end = i;
 
                 let word: String = chars[start..end].iter().collect();
-                // Don't check if cursor is in or immediately after the word
-                // Note: end is the first position after the word, so cursor at end means right after word
-                let cursor_in_word = cursor_char_pos >= start && cursor_char_pos <= end;
-                let cursor_right_after = cursor_char_pos == end;
-                // Only check words that are clearly complete
+                // Don't check if cursor is inside the word (actively typing)
+                // Note: end is the first position after the word, so use < not <=
+                let cursor_in_word = cursor_char_pos >= start && cursor_char_pos < end;
+                // Only check words that are clearly complete (followed by separator or at end of input)
                 let word_complete = is_word_complete(end);
 
-                // Don't mark the word currently being typed
-                if !cursor_in_word && !cursor_right_after && word_complete && !self.spell_checker.is_valid(&word) {
+                if !cursor_in_word && word_complete && !self.spell_checker.is_valid(&word) {
                     misspelled.push((start, end));
                 }
             }
