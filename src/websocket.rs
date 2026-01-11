@@ -51,6 +51,7 @@ pub enum WsMessage {
     CreateWorld { name: String },
     ReleasePending { world_index: usize },
     MarkWorldSeen { world_index: usize },
+    RequestState,  // Request full state resync
 
     // Settings updates (client -> server)
     UpdateWorldSettings {

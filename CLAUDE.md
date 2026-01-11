@@ -213,6 +213,7 @@ Prompts that are auto-answered are immediately cleared and not displayed in the 
 - `src/web/index.html` - Web interface HTML template
 - `src/web/style.css` - Web interface CSS styles
 - `src/web/app.js` - Web interface JavaScript client
+- `websockets.readme` - WebSocket protocol documentation
 - `~/.mudclient.dat` - Settings file (created on first save)
 - `/usr/share/dict/words` - System dictionary for spell checking (fallback: american-english, british-english)
 
@@ -433,10 +434,12 @@ Note: HTTP automatically starts the non-secure WebSocket server if not already r
   - Worlds List - Opens connected worlds list popup
   - World Selector - Opens world selector popup
   - Actions - Opens actions editor popup
+  - Setup - Opens setup popup
   - Toggle Tags - Show/hide MUD tags (same as F2)
   - Toggle Highlight - Highlight lines matching action patterns (same as F8)
+  - Resync - Request full state resync from server
 - Font size buttons (S/M/L) next to hamburger:
-  - **S** (Small, 11px) - Optimized for phone displays
+  - **S** (Small, 8px) - Optimized for phone displays
   - **M** (Medium, 14px) - Default size
   - **L** (Large, 18px) - Optimized for tablet displays
 - "Clay" title displayed after font buttons
@@ -450,6 +453,7 @@ Note: HTTP automatically starts the non-secure WebSocket server if not already r
 - `-webkit-overflow-scrolling: touch` for smooth iOS scrolling
 - `interactive-widget=resizes-content` viewport meta for proper keyboard handling
 - Hamburger icon uses inline SVG for reliable cross-browser rendering
+- Visibility change detection: auto-resync when browser tab becomes visible (handles sleep/wake)
 
 **Mobile Toolbar Layout:**
 - Left side: Menu (hamburger), PgUp, PgDn, Tags (👁)
@@ -510,6 +514,7 @@ cargo build --features remote-gui    # Requires X11 or Wayland
 - MUD tag stripping toggle (F2)
 - Output filtering (F4)
 - World switching is GUI-local (doesn't affect console)
+- Hamburger menu with: Worlds List, World Selector, World Editor, Setup, Font, Toggle Tags, Toggle Highlight, Resync
 
 **Limitations:**
 - The remote-gui feature cannot be built in headless environments
@@ -537,6 +542,7 @@ The remote GUI client supports keyboard shortcuts similar to the console client:
 **Display:**
 - `F2` - Toggle MUD tag display (show/hide `[channel:]` tags and timestamps)
 - `F4` - Open filter popup to search output
+- `F8` - Toggle action pattern highlighting
 - `Esc` or `F4` - Close filter popup
 
 **Menu Shortcuts:**

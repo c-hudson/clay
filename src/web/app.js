@@ -175,10 +175,10 @@
     let menuOpen = false;
     let mobileMenuOpen = false;
 
-    // Font size state: 'small' (11px), 'medium' (14px), 'large' (18px)
+    // Font size state: 'small' (8px), 'medium' (14px), 'large' (18px)
     let currentFontSize = 'medium';
     const fontSizes = {
-        small: 11,   // Phone
+        small: 8,    // Phone
         medium: 14,  // Tablet
         large: 18    // Desktop
     };
@@ -2349,6 +2349,12 @@
                 highlightActions = !highlightActions;
                 renderOutput();
                 break;
+            case 'resync':
+                // Request full state resync from server
+                if (ws && ws.readyState === WebSocket.OPEN) {
+                    ws.send(JSON.stringify({ type: 'RequestState' }));
+                }
+                break;
         }
     }
 
@@ -2988,6 +2994,25 @@
                 send({ type: 'Ping' });
             }
         }, 30000);
+
+        // Handle visibility change (browser sleep/wake)
+        // When page becomes visible, check connection and resync if needed
+        document.addEventListener('visibilitychange', function() {
+            if (document.visibilityState === 'visible') {
+                // Page is now visible - check WebSocket state
+                if (!ws || ws.readyState !== WebSocket.OPEN) {
+                    // WebSocket is closed, reconnect will happen via onclose handler
+                    // but we can trigger it immediately if needed
+                    if (ws && ws.readyState === WebSocket.CLOSED) {
+                        connect();
+                    }
+                } else if (authenticated) {
+                    // WebSocket is open, but we may have missed messages while sleeping
+                    // Request a full state resync to ensure we have all data
+                    ws.send(JSON.stringify({ type: 'RequestState' }));
+                }
+            }
+        });
     }
 
     // Show certificate warning for wss:// self-signed cert issues

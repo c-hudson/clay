@@ -5447,6 +5447,8 @@ mod remote_gui {
         scroll_max_offset: f32,
         /// Show MUD tags
         show_tags: bool,
+        /// Highlight lines matching action patterns
+        highlight_actions: bool,
         /// More mode enabled (pause on overflow)
         more_mode: bool,
         /// Spell check enabled
@@ -5545,6 +5547,7 @@ mod remote_gui {
                 scroll_offset: None,
                 scroll_max_offset: 0.0,
                 show_tags: false,
+                highlight_actions: false,
                 more_mode: true,
                 spell_check_enabled: true,
                 filter_text: String::new(),
@@ -7175,6 +7178,9 @@ mod remote_gui {
                                 // F4 - toggle filter popup
                                 self.filter_active = true;
                                 self.filter_text.clear();
+                            } else if i.consume_key(egui::Modifiers::NONE, egui::Key::F8) {
+                                // F8 - toggle action pattern highlighting
+                                self.highlight_actions = !self.highlight_actions;
                             } else if self.input_buffer.trim().is_empty() {
                                 // Up/Down arrow with empty input - cycle active worlds
                                 // Use shared world switching logic
@@ -7345,6 +7351,15 @@ mod remote_gui {
                                 action = Some("toggle_tags");
                                 ui.close_menu();
                             }
+                            if ui.button("Toggle Highlight").clicked() {
+                                action = Some("toggle_highlight");
+                                ui.close_menu();
+                            }
+                            ui.separator();
+                            if ui.button("Resync").clicked() {
+                                action = Some("resync");
+                                ui.close_menu();
+                            }
                         });
 
                         // S/M/L font size buttons (centered vertically via horizontal_centered)
@@ -7410,6 +7425,13 @@ mod remote_gui {
                     Some("connect") => self.connect_world(self.current_world),
                     Some("disconnect") => self.disconnect_world(self.current_world),
                     Some("toggle_tags") => self.show_tags = !self.show_tags,
+                    Some("toggle_highlight") => self.highlight_actions = !self.highlight_actions,
+                    Some("resync") => {
+                        // Request full state resync from server
+                        if let Some(ref ws_tx) = self.ws_tx {
+                            let _ = ws_tx.send(WsMessage::RequestState);
+                        }
+                    }
                     Some("spell_check") => {
                         if let Some(message) = self.handle_spell_check() {
                             // Add suggestion message to current world's output
@@ -7806,8 +7828,17 @@ mod remote_gui {
                         };
 
                         // Filter out empty lines to match console behavior
+                        // Use same filtering logic as plain_text to keep line counts in sync
                         let non_empty_lines: Vec<_> = colored_lines.iter()
-                            .filter(|line| !Self::strip_ansi_for_copy(&line.text).is_empty())
+                            .filter(|line| {
+                                let stripped = Self::strip_ansi_for_copy(&line.text);
+                                let processed = if self.show_tags {
+                                    stripped // When showing tags, we keep the line
+                                } else {
+                                    Self::strip_mud_tags(&stripped)
+                                };
+                                !processed.is_empty()
+                            })
                             .collect();
 
                         // Check if any line has Discord emojis
@@ -7815,12 +7846,25 @@ mod remote_gui {
                             .any(|line| Self::has_discord_emojis(&line.text));
 
                         // Build display lines for both paths
+                        let world_name = &world.name;
+                        let highlight_actions = self.highlight_actions;
+                        let actions = &self.actions;
                         let display_lines: Vec<String> = non_empty_lines.iter().map(|line| {
-                            if self.show_tags {
+                            let base_line = if self.show_tags {
                                 let ts_prefix = Self::format_timestamp_gui(line.ts);
                                 format!("\x1b[36m{}\x1b[0m {}", ts_prefix, line.text)
                             } else {
                                 Self::strip_mud_tags_ansi(&line.text)
+                            };
+                            // Apply action highlighting if enabled
+                            if highlight_actions && line_matches_action(&line.text, world_name, actions) {
+                                // Dark yellow/brown background (same as console: 48;5;58)
+                                let bg_code = "\x1b[48;5;58m";
+                                // Replace any resets to preserve background
+                                let highlighted = base_line.replace("\x1b[0m", &format!("\x1b[0m{}", bg_code));
+                                format!("{}{}\x1b[0m", bg_code, highlighted)
+                            } else {
+                                base_line
                             }
                         }).collect();
 
@@ -7978,7 +8022,9 @@ mod remote_gui {
                                             let click_pos = cursor_range.primary.ccursor.index;
 
                                             // Check if clicking on a URL
-                                            let urls = Self::find_urls(&plain_text);
+                                            // Use galley text (not plain_text) to match cursor positions
+                                            let galley_text = response.galley.text();
+                                            let urls = Self::find_urls(galley_text);
                                             let mut url_clicked = false;
                                             for (start, end, url) in urls {
                                                 if click_pos >= start && click_pos <= end {
@@ -8044,17 +8090,20 @@ mod remote_gui {
 
                                 // Draw URL underlines and handle hover cursor
                                 {
-                                    let urls = Self::find_urls(&plain_text);
+                                    // Use galley text (not plain_text) to match cursor positions
+                                    let galley = &response.galley;
+                                    let galley_text = galley.text();
+                                    let urls = Self::find_urls(galley_text);
+
                                     if !urls.is_empty() {
-                                        let galley = &response.galley;
                                         let text_pos = response.galley_pos;
                                         let painter = ui.painter();
                                         let link_color = theme.link();
                                         let hover_pos = ui.input(|i| i.pointer.hover_pos());
 
-                                        for (start, end, _url) in urls {
-                                            let start_cursor = galley.from_ccursor(egui::text::CCursor::new(start));
-                                            let end_cursor = galley.from_ccursor(egui::text::CCursor::new(end));
+                                        for (start, end, _url) in &urls {
+                                            let start_cursor = galley.from_ccursor(egui::text::CCursor::new(*start));
+                                            let end_cursor = galley.from_ccursor(egui::text::CCursor::new(*end));
 
                                             // Draw underline for each row the URL spans
                                             for row_idx in start_cursor.rcursor.row..=end_cursor.rcursor.row {
@@ -10561,6 +10610,11 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                 );
                                 app.ws_send_to_client(client_id, WsMessage::CalculatedWorld { index: prev_idx });
                             }
+                            WsMessage::RequestState => {
+                                // Client requested full state resync - send initial state
+                                let initial_state = app.build_initial_state();
+                                app.ws_send_to_client(client_id, initial_state);
+                            }
                             _ => {
                                 // Other message types handled elsewhere or ignored
                             }
@@ -11184,6 +11238,11 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                 app.settings.world_switch_mode,
                             );
                             app.ws_send_to_client(client_id, WsMessage::CalculatedWorld { index: prev_idx });
+                        }
+                        WsMessage::RequestState => {
+                            // Client requested full state resync - send initial state
+                            let initial_state = app.build_initial_state();
+                            app.ws_send_to_client(client_id, initial_state);
                         }
                         _ => {}
                     }

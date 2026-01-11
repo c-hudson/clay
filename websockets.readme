@@ -1,0 +1,333 @@
+# Clay WebSocket Protocol
+
+This document describes the WebSocket protocol used by Clay MUD client for communication between the server (console client) and remote clients (web interface, GUI client).
+
+## Connection
+
+Connect to the WebSocket server on the configured port. The server supports both `ws://` (non-secure) and `wss://` (TLS) connections depending on configuration.
+
+## Message Format
+
+All messages are JSON objects with a `type` field that identifies the message type. Messages use serde's tagged enum format:
+
+```json
+{ "type": "MessageType", "field1": "value1", "field2": "value2" }
+```
+
+## Authentication
+
+### Client -> Server
+
+**AuthRequest** - Authenticate with the server
+```json
+{ "type": "AuthRequest", "password_hash": "<sha256_hex>" }
+```
+The password must be hashed with SHA-256 and sent as a lowercase hex string.
+
+### Server -> Client
+
+**AuthResponse** - Authentication result
+```json
+{ "type": "AuthResponse", "success": true, "error": null }
+{ "type": "AuthResponse", "success": false, "error": "Invalid password" }
+```
+
+On successful authentication, the server immediately sends an `InitialState` message.
+
+## Initial State
+
+**InitialState** - Complete application state sent after authentication or on `RequestState`
+```json
+{
+  "type": "InitialState",
+  "worlds": [...],
+  "settings": {...},
+  "current_world_index": 0,
+  "actions": [...]
+}
+```
+
+### WorldStateMsg Structure
+```json
+{
+  "index": 0,
+  "name": "WorldName",
+  "connected": true,
+  "output_lines": ["line1", "line2"],
+  "pending_lines": [],
+  "scroll_offset": 0,
+  "paused": false,
+  "prompt": "> ",
+  "unseen_lines": 0,
+  "settings": {...},
+  "last_send_secs": 120,
+  "last_recv_secs": 5,
+  "last_nop_secs": null,
+  "keep_alive_type": "nop",
+  "output_lines_ts": [{"text": "line1", "ts": 1704067200}],
+  "pending_lines_ts": []
+}
+```
+
+### WorldSettingsMsg Structure
+```json
+{
+  "hostname": "mud.example.com",
+  "port": "4000",
+  "user": "username",
+  "use_ssl": false,
+  "log_file": "/path/to/log.txt",
+  "encoding": "utf8",
+  "auto_connect_type": "connect",
+  "keep_alive_type": "nop",
+  "keep_alive_cmd": ""
+}
+```
+
+### GlobalSettingsMsg Structure
+```json
+{
+  "more_mode_enabled": true,
+  "spell_check_enabled": true,
+  "world_switch_mode": "unseen_first",
+  "debug_enabled": false,
+  "show_tags": false,
+  "console_theme": "dark",
+  "gui_theme": "dark",
+  "input_height": 3,
+  "font_name": "",
+  "font_size": 14.0,
+  "ws_allow_list": "192.168.1.0/24",
+  "web_secure": true,
+  "http_enabled": true,
+  "http_port": 9000,
+  "ws_enabled": true,
+  "ws_port": 9002,
+  "ws_cert_file": "/path/to/cert.pem",
+  "ws_key_file": "/path/to/key.pem"
+}
+```
+
+## Commands (Client -> Server)
+
+**SendCommand** - Send a command to a world
+```json
+{ "type": "SendCommand", "world_index": 0, "command": "look" }
+```
+
+**SwitchWorld** - Switch the server's current world view
+```json
+{ "type": "SwitchWorld", "world_index": 1 }
+```
+
+**ConnectWorld** - Connect a world to its MUD server
+```json
+{ "type": "ConnectWorld", "world_index": 0 }
+```
+
+**DisconnectWorld** - Disconnect a world from its MUD server
+```json
+{ "type": "DisconnectWorld", "world_index": 0 }
+```
+
+**CreateWorld** - Create a new world
+```json
+{ "type": "CreateWorld", "name": "NewWorld" }
+```
+
+**ReleasePending** - Release pending lines (when paused in more-mode)
+```json
+{ "type": "ReleasePending", "world_index": 0 }
+```
+
+**MarkWorldSeen** - Mark a world as seen (clears unseen line count)
+```json
+{ "type": "MarkWorldSeen", "world_index": 0 }
+```
+
+**RequestState** - Request full state resync
+```json
+{ "type": "RequestState" }
+```
+Server responds with `InitialState`.
+
+## World Switching Calculation
+
+**CalculateNextWorld** - Request next world index based on server's switching logic
+```json
+{ "type": "CalculateNextWorld", "current_index": 0 }
+```
+
+**CalculatePrevWorld** - Request previous world index
+```json
+{ "type": "CalculatePrevWorld", "current_index": 0 }
+```
+
+**CalculatedWorld** - Server response with calculated index
+```json
+{ "type": "CalculatedWorld", "index": 1 }
+{ "type": "CalculatedWorld", "index": null }
+```
+Returns `null` if no valid world to switch to.
+
+## Settings Updates (Client -> Server)
+
+**UpdateWorldSettings** - Update a world's settings
+```json
+{
+  "type": "UpdateWorldSettings",
+  "world_index": 0,
+  "name": "WorldName",
+  "hostname": "mud.example.com",
+  "port": "4000",
+  "user": "username",
+  "password": "secret",
+  "use_ssl": false,
+  "log_file": "",
+  "encoding": "utf8",
+  "auto_login": "connect",
+  "keep_alive_type": "nop",
+  "keep_alive_cmd": ""
+}
+```
+
+**UpdateGlobalSettings** - Update global settings
+```json
+{
+  "type": "UpdateGlobalSettings",
+  "console_theme": "dark",
+  "gui_theme": "dark",
+  "input_height": 3,
+  "font_name": "",
+  "font_size": 14.0,
+  "ws_allow_list": "",
+  "web_secure": true,
+  "http_enabled": true,
+  "http_port": 9000,
+  "ws_enabled": true,
+  "ws_port": 9002,
+  "ws_cert_file": "",
+  "ws_key_file": ""
+}
+```
+
+**UpdateActions** - Update action triggers
+```json
+{
+  "type": "UpdateActions",
+  "actions": [
+    { "name": "greet", "pattern": "", "command": "say Hello!" }
+  ]
+}
+```
+
+## Real-time Updates (Server -> Client)
+
+**ServerData** - MUD output data
+```json
+{
+  "type": "ServerData",
+  "world_index": 0,
+  "data": "You are in a dark room.\n",
+  "is_viewed": true,
+  "ts": 1704067200
+}
+```
+- `is_viewed`: true if any interface is currently viewing this world
+- `ts`: Unix timestamp when the line was received
+
+**WorldConnected** - World connected to MUD
+```json
+{ "type": "WorldConnected", "world_index": 0, "name": "WorldName" }
+```
+
+**WorldDisconnected** - World disconnected from MUD
+```json
+{ "type": "WorldDisconnected", "world_index": 0 }
+```
+
+**WorldAdded** - New world created
+```json
+{ "type": "WorldAdded", "world": {...} }
+```
+
+**WorldRemoved** - World deleted
+```json
+{ "type": "WorldRemoved", "world_index": 0 }
+```
+
+**WorldSwitched** - Server switched current world
+```json
+{ "type": "WorldSwitched", "new_index": 1 }
+```
+
+**PromptUpdate** - World prompt changed
+```json
+{ "type": "PromptUpdate", "world_index": 0, "prompt": "> " }
+```
+
+**PendingLinesUpdate** - Pending line count changed (more-mode)
+```json
+{ "type": "PendingLinesUpdate", "world_index": 0, "count": 42 }
+```
+
+**UnseenCleared** - World's unseen count was cleared
+```json
+{ "type": "UnseenCleared", "world_index": 0 }
+```
+
+**WorldSettingsUpdated** - World settings changed
+```json
+{
+  "type": "WorldSettingsUpdated",
+  "world_index": 0,
+  "settings": {...},
+  "name": "WorldName"
+}
+```
+
+**GlobalSettingsUpdated** - Global settings changed
+```json
+{
+  "type": "GlobalSettingsUpdated",
+  "settings": {...},
+  "input_height": 3
+}
+```
+
+**ActionsUpdated** - Actions changed
+```json
+{ "type": "ActionsUpdated", "actions": [...] }
+```
+
+## Keepalive
+
+**Ping** - Client keepalive (send every 30 seconds)
+```json
+{ "type": "Ping" }
+```
+
+**Pong** - Server keepalive response
+```json
+{ "type": "Pong" }
+```
+
+## Typical Client Flow
+
+1. Connect to WebSocket server
+2. Send `AuthRequest` with hashed password
+3. Receive `AuthResponse` (success/failure)
+4. Receive `InitialState` with full application state
+5. Render worlds and output
+6. Send `Ping` every 30 seconds
+7. Handle real-time updates as they arrive
+8. Send commands via `SendCommand`
+9. On visibility change (browser wake), send `RequestState` to resync
+
+## Encoding Values
+
+- `encoding`: `"utf8"`, `"latin1"`, `"fansi"`
+- `auto_login` / `auto_connect_type`: `"connect"`, `"prompt"`, `"moo_prompt"`
+- `keep_alive_type`: `"none"`, `"nop"`, `"custom"`, `"generic"`
+- `world_switch_mode`: `"unseen_first"`, `"alphabetical"`
+- `console_theme` / `gui_theme`: `"dark"`, `"light"`
