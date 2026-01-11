@@ -494,6 +494,8 @@
                             typeof line === 'string' ? { text: line, ts: currentTs } : line
                         );
                     }
+                    // Set pending_count from pending_lines length for activity indicator
+                    world.pending_count = (world.pending_lines && world.pending_lines.length) || 0;
                 });
                 if (msg.settings) {
                     if (msg.settings.input_height) {
@@ -693,6 +695,14 @@
                 // Another client (console, web, or GUI) has viewed this world
                 if (msg.world_index !== undefined && worlds[msg.world_index]) {
                     worlds[msg.world_index].unseen_lines = 0;
+                    updateStatusBar();
+                }
+                break;
+
+            case 'PendingLinesUpdate':
+                // Update pending count for a world (used for activity indicator)
+                if (msg.world_index !== undefined && worlds[msg.world_index]) {
+                    worlds[msg.world_index].pending_count = msg.count || 0;
                     updateStatusBar();
                 }
                 break;
@@ -1430,14 +1440,14 @@
             elements.worldName.textContent = ' ' + (world.name || '');
         }
 
-        // Activity indicator
-        let unseenCount = 0;
+        // Activity indicator (worlds with unseen lines OR pending output)
+        let activityCount = 0;
         worlds.forEach((w, i) => {
-            if (i !== currentWorldIndex && w.unseen_lines > 0) {
-                unseenCount++;
+            if (i !== currentWorldIndex && (w.unseen_lines > 0 || (w.pending_count && w.pending_count > 0))) {
+                activityCount++;
             }
         });
-        elements.activityIndicator.textContent = unseenCount > 0 ? ` (Activity: ${unseenCount})` : '';
+        elements.activityIndicator.textContent = activityCount > 0 ? ` (Activity: ${activityCount})` : '';
 
         // Fill remaining space with underscores
         // Calculate how many underscores fit based on container width and font size
@@ -2168,14 +2178,21 @@
         return actionsListPopupOpen || actionsEditorPopupOpen || actionsConfirmPopupOpen || worldsPopupOpen || worldSelectorPopupOpen || webPopupOpen || setupPopupOpen;
     }
 
-    // Check if a world should be included in cycling (connected OR has unseen output)
+    // Check if a world should be included in cycling (connected OR has activity)
     function isWorldActive(world) {
-        return world.connected || (world.unseen_lines && world.unseen_lines > 0);
+        return world.connected || worldHasActivity(world);
+    }
+
+    // Check if a world has activity (unseen lines or pending output)
+    function worldHasActivity(world) {
+        return (world.unseen_lines && world.unseen_lines > 0) ||
+               (world.pending_count && world.pending_count > 0);
     }
 
     // Check if a world has unseen output (for pending_first prioritization)
+    // Now includes pending_count for proper activity tracking
     function worldHasPending(world) {
-        return world.unseen_lines && world.unseen_lines > 0;
+        return worldHasActivity(world);
     }
 
     // Get list of active world indices, sorted alphabetically

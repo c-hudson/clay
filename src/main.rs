@@ -2848,6 +2848,10 @@ struct World {
     showing_splash: bool,        // True when showing startup splash (for centering)
     needs_redraw: bool,          // True when terminal needs full redraw (after splash clear)
     pending_since: Option<std::time::Instant>, // When pending output first appeared (for Alt-w)
+    // Debug logging (when debug_enabled and is_master)
+    debug_seq: u64,              // Sequence number for debug logging
+    debug_input_log: Option<std::sync::Arc<std::sync::Mutex<std::fs::File>>>,  // clay.<world>.input.log
+    debug_output_log: Option<std::sync::Arc<std::sync::Mutex<std::fs::File>>>, // clay.<world>.log
 }
 
 impl World {
@@ -2891,6 +2895,9 @@ impl World {
             showing_splash: show_splash,
             needs_redraw: false,
             pending_since: None,
+            debug_seq: 0,
+            debug_input_log: None,
+            debug_output_log: None,
         }
     }
 
@@ -2992,6 +2999,8 @@ impl World {
                     self.pending_since = Some(std::time::Instant::now());
                 }
                 self.pending_lines.push(OutputLine::new(line.to_string()));
+                // Debug log output line with current sequence number
+                debug_log_output(self, self.debug_seq, line);
                 if is_partial {
                     self.partial_line = line.to_string();
                     self.partial_in_pending = true;
@@ -3005,12 +3014,16 @@ impl World {
                     self.pending_since = Some(std::time::Instant::now());
                 }
                 self.pending_lines.push(OutputLine::new(line.to_string()));
+                // Debug log output line with current sequence number
+                debug_log_output(self, self.debug_seq, line);
                 if is_partial {
                     self.partial_line = line.to_string();
                     self.partial_in_pending = true;
                 }
             } else {
                 self.output_lines.push(OutputLine::new(line.to_string()));
+                // Debug log output line with current sequence number
+                debug_log_output(self, self.debug_seq, line);
                 // Count visual lines (accounting for word wrap) instead of logical lines
                 let visual_lines = visual_line_count(line, output_width as usize);
                 self.lines_since_pause += visual_lines;
@@ -3043,6 +3056,11 @@ impl World {
 
     fn mark_seen(&mut self) {
         self.unseen_lines = 0;
+    }
+
+    /// Returns true if this world has activity (unseen lines or pending output)
+    fn has_activity(&self) -> bool {
+        self.unseen_lines > 0 || !self.pending_lines.is_empty()
     }
 
     fn release_pending(&mut self, count: usize) {
@@ -3405,7 +3423,7 @@ impl App {
         self.worlds
             .iter()
             .enumerate()
-            .filter(|(i, w)| *i != self.current_world_index && w.unseen_lines > 0)
+            .filter(|(i, w)| *i != self.current_world_index && w.has_activity())
             .count()
     }
 
@@ -3828,6 +3846,124 @@ fn debug_log_keepalive(debug_enabled: bool, world_name: &str, keepalive_type: &s
     // Log the command and its bytes for debugging
     let bytes: Vec<u8> = data_sent.bytes().collect();
     debug_log(debug_enabled, &format!("KEEPALIVE world='{}' type={} sent='{}' bytes={:?}", world_name, keepalive_type, data_sent, bytes));
+}
+
+/// Get a shortened stack trace (last 10 line numbers in CSV format)
+fn get_short_stack_trace() -> String {
+    let bt = std::backtrace::Backtrace::capture();
+    let bt_str = format!("{}", bt);
+
+    // Parse the backtrace to extract line numbers
+    let mut line_nums: Vec<String> = Vec::new();
+    for line in bt_str.lines() {
+        // Look for lines containing "at" which typically have file:line info
+        if let Some(at_pos) = line.find(" at ") {
+            let after_at = &line[at_pos + 4..];
+            // Extract just the line number part (after the last ':')
+            if let Some(colon_pos) = after_at.rfind(':') {
+                let line_num = after_at[colon_pos + 1..].trim();
+                // Filter out non-numeric parts
+                let num: String = line_num.chars().take_while(|c| c.is_ascii_digit()).collect();
+                if !num.is_empty() {
+                    line_nums.push(num);
+                }
+            }
+        }
+    }
+
+    // Take last 10 line numbers
+    let start = line_nums.len().saturating_sub(10);
+    line_nums[start..].join(",")
+}
+
+/// Get debug log path for a world's input log
+fn get_world_input_log_path(world_name: &str) -> PathBuf {
+    let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
+    let safe_name: String = world_name.chars()
+        .map(|c| if c.is_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
+        .collect();
+    PathBuf::from(home).join(format!("clay.{}.input.log", safe_name))
+}
+
+/// Get debug log path for a world's output log
+fn get_world_output_log_path(world_name: &str) -> PathBuf {
+    let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
+    let safe_name: String = world_name.chars()
+        .map(|c| if c.is_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
+        .collect();
+    PathBuf::from(home).join(format!("clay.{}.log", safe_name))
+}
+
+/// Open debug logs for a world (if debug is enabled and is_master)
+fn open_debug_logs(world: &mut World, debug_enabled: bool, is_master: bool) {
+    // Close existing logs first
+    world.debug_input_log = None;
+    world.debug_output_log = None;
+    world.debug_seq = 0;
+
+    if !debug_enabled || !is_master {
+        return;
+    }
+
+    // Open input log
+    let input_path = get_world_input_log_path(&world.name);
+    if let Ok(file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&input_path)
+    {
+        world.debug_input_log = Some(std::sync::Arc::new(std::sync::Mutex::new(file)));
+    }
+
+    // Open output log
+    let output_path = get_world_output_log_path(&world.name);
+    if let Ok(file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&output_path)
+    {
+        world.debug_output_log = Some(std::sync::Arc::new(std::sync::Mutex::new(file)));
+    }
+}
+
+/// Log input from server (raw data before processing)
+fn debug_log_input(world: &mut World, data: &str) {
+    if let Some(ref handle) = world.debug_input_log {
+        world.debug_seq += 1;
+        let seq = world.debug_seq;
+        let stack = get_short_stack_trace();
+        if let Ok(mut file) = handle.lock() {
+            use std::io::Write;
+            // Escape newlines and carriage returns for single-line log entry
+            let escaped: String = data.chars()
+                .map(|c| match c {
+                    '\n' => '↵',
+                    '\r' => '␍',
+                    _ => c,
+                })
+                .collect();
+            let _ = writeln!(file, "{}|{}|{}", seq, stack, escaped);
+        }
+    }
+}
+
+/// Log output to display (each line going to output area)
+fn debug_log_output(world: &World, seq: u64, line: &str) {
+    if let Some(ref handle) = world.debug_output_log {
+        let stack = get_short_stack_trace();
+        if let Ok(mut file) = handle.lock() {
+            use std::io::Write;
+            // Escape newlines and carriage returns for single-line log entry
+            let escaped: String = line.chars()
+                .map(|c| match c {
+                    '\n' => '↵',
+                    '\r' => '␍',
+                    _ => c,
+                })
+                .collect();
+            let _ = writeln!(file, "{}|{}|{}", seq, stack, escaped);
+        }
+    }
 }
 
 /// Encryption key for password storage (padded to 32 bytes for AES-256)
@@ -7278,10 +7414,10 @@ mod remote_gui {
                                 .map(|w| w.connected)
                                 .unwrap_or(false);
 
-                            // Collect worlds with activity (unseen output)
+                            // Collect worlds with activity (unseen output or pending lines)
                             let worlds_with_activity: Vec<&str> = self.worlds.iter()
                                 .enumerate()
-                                .filter(|(i, w)| *i != self.current_world && w.unseen_lines > 0)
+                                .filter(|(i, w)| *i != self.current_world && (w.unseen_lines > 0 || w.pending_count > 0))
                                 .map(|(_, w)| w.name.as_str())
                                 .collect();
                             let activity_count = worlds_with_activity.len();
@@ -8864,9 +9000,15 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
     // Ensure we have at least one world (creates initial world only if no worlds loaded)
     app.ensure_has_world();
 
-    // After reload, clear unseen_lines on the current world since we're viewing it
+    // After reload, clear unseen_lines and pending_lines on ALL worlds since these
+    // concepts don't carry over between sessions - they're meaningful only within a session
     if should_load_state && !app.worlds.is_empty() {
-        app.worlds[app.current_world_index].unseen_lines = 0;
+        for world in &mut app.worlds {
+            world.unseen_lines = 0;
+            world.pending_lines.clear();
+            world.pending_since = None;
+            world.paused = false;
+        }
     }
 
     // Now display any startup messages
@@ -9058,11 +9200,12 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                 world.output_lines
                     .push(OutputLine::new("Connection was not restored during reload. Use /connect to reconnect.".to_string()));
             }
-            // Clear pending_lines for disconnected worlds - they're only meaningful for active connections
+            // Clear pending_lines and unseen_lines for disconnected worlds - they're only meaningful for active connections
             if !world.connected {
                 world.pending_lines.clear();
                 world.pending_since = None;
                 world.paused = false;
+                world.unseen_lines = 0;
             }
         }
 
@@ -10249,6 +10392,9 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                         // Consider "current" if console OR any web/GUI client is viewing this world
                         let is_current = world_idx == app.current_world_index || app.ws_client_viewing(world_idx);
                         let data = app.worlds[world_idx].settings.encoding.decode(&bytes);
+
+                        // Debug log the raw input (increments sequence number)
+                        debug_log_input(&mut app.worlds[world_idx], &data);
                         let world_name = app.worlds[world_idx].name.clone();
                         let actions = app.settings.actions.clone();
 
@@ -11258,6 +11404,12 @@ fn handle_key_event(key: KeyEvent, app: &mut App) -> KeyAction {
                                 if app.settings.debug_enabled {
                                     debug_log(true, "Debug logging enabled");
                                     app.add_output("Debug logging enabled - writing to ~/clay.debug.log");
+                                }
+                                // Open/close debug logs for all worlds based on new debug setting
+                                let debug_enabled = app.settings.debug_enabled;
+                                let is_master = app.is_master;
+                                for world in &mut app.worlds {
+                                    open_debug_logs(world, debug_enabled, is_master);
                                 }
                                 if let Err(e) = save_settings(app) {
                                     app.add_output(&format!("Warning: Could not save settings: {}", e));
@@ -12770,6 +12922,11 @@ async fn handle_command(cmd: &str, app: &mut App, event_tx: mpsc::Sender<AppEven
                             }
                         }
                     }
+
+                    // Open debug logs if debug is enabled and we're master
+                    let debug_enabled = app.settings.debug_enabled;
+                    let is_master = app.is_master;
+                    open_debug_logs(app.current_world_mut(), debug_enabled, is_master);
 
                     let (cmd_tx, mut cmd_rx) = mpsc::channel::<WriteCommand>(100);
                     app.current_world_mut().command_tx = Some(cmd_tx.clone());
