@@ -3686,7 +3686,19 @@ impl App {
         if self.spell_state.showing_suggestions {
             // Convert byte cursor to character position for comparison
             let cursor_char_pos = self.input.buffer[..self.input.cursor_position].chars().count();
-            if cursor_char_pos < self.spell_state.word_start || cursor_char_pos > self.spell_state.word_end {
+            let chars: Vec<char> = self.input.buffer.chars().collect();
+
+            // Allow cursor to be one position past the word if there's a non-word character there
+            // This handles "thiss |" where user typed a space after the misspelled word
+            let effective_word_end = if self.spell_state.word_end < chars.len()
+                && !chars[self.spell_state.word_end].is_alphabetic()
+            {
+                self.spell_state.word_end + 1
+            } else {
+                self.spell_state.word_end
+            };
+
+            if cursor_char_pos < self.spell_state.word_start || cursor_char_pos > effective_word_end {
                 self.spell_state.reset();
                 self.suggestion_message = None;
             }
@@ -6012,13 +6024,30 @@ mod remote_gui {
             while start > 0 && is_word_char(start - 1) {
                 start -= 1;
             }
-            if !chars[start].is_alphabetic() {
-                return None;
-            }
 
             let mut end = cursor_pos;
-            while end < chars.len() && is_word_char(end) {
-                end += 1;
+
+            // If cursor is on a non-word character (e.g., space after word),
+            // look backwards to find the previous word
+            if !chars[start].is_alphabetic() {
+                // Look back to find the last alphabetic character
+                let mut prev_end = start;
+                while prev_end > 0 && !chars[prev_end - 1].is_alphabetic() {
+                    prev_end -= 1;
+                }
+                if prev_end == 0 && (chars.is_empty() || !chars[0].is_alphabetic()) {
+                    return None;
+                }
+                // Now find the start of this word
+                end = prev_end;
+                start = prev_end;
+                while start > 0 && is_word_char(start - 1) {
+                    start -= 1;
+                }
+            } else {
+                while end < chars.len() && is_word_char(end) {
+                    end += 1;
+                }
             }
 
             let word: String = chars[start..end].iter().collect();
@@ -13485,9 +13514,6 @@ fn render_output_crossterm(app: &App) {
 
     let mut stdout = std::io::stdout();
 
-    // Save cursor position before rendering (ratatui already positioned it correctly)
-    let _ = stdout.queue(cursor::SavePosition);
-
     let world = app.current_world();
     let visible_height = (app.output_height as usize).max(1);
     let term_width = (app.output_width as usize).max(1);
@@ -13772,8 +13798,36 @@ fn render_output_crossterm(app: &App) {
         let _ = stdout.queue(Print(border_bottom));
     }
 
-    // Restore cursor position (back to where ratatui placed it in input area)
-    let _ = stdout.queue(cursor::RestorePosition);
+    // Calculate and set cursor position in input area
+    // This replicates the logic from render_input_area to avoid Save/Restore timing issues
+    let prompt = &app.current_world().prompt;
+    let prompt_len = strip_ansi_codes(prompt).chars().count();
+    let cursor_line = app.input.cursor_line();
+    let viewport_line = cursor_line.saturating_sub(app.input.viewport_start_line);
+
+    // Input area starts after output + separator bar (1 line)
+    let input_area_y = app.output_height + 1;
+    let input_area_width = term_width.max(1);
+
+    if viewport_line < app.input_height as usize {
+        let chars_before_cursor = app.input.buffer[..app.input.cursor_position].chars().count();
+        let effective_chars = if app.input.viewport_start_line == 0 {
+            chars_before_cursor + prompt_len
+        } else {
+            chars_before_cursor
+        };
+        let cursor_col = effective_chars % input_area_width;
+        let cursor_x = cursor_col as u16;
+        let extra_lines = if app.input.viewport_start_line == 0 {
+            (chars_before_cursor + prompt_len) / input_area_width
+        } else {
+            chars_before_cursor / input_area_width
+        };
+        let cursor_y = input_area_y + (viewport_line + extra_lines - cursor_line) as u16;
+        let max_y = input_area_y + app.input_height - 1;
+        let _ = stdout.queue(cursor::MoveTo(cursor_x, cursor_y.min(max_y)));
+    }
+
     let _ = stdout.flush();
 }
 
