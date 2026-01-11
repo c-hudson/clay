@@ -4886,7 +4886,12 @@ fn load_reload_state(app: &mut App) -> io::Result<bool> {
                             "is_tls" => tw.is_tls = value == "true",
                             "was_connected" => tw.was_connected = value == "true",
                             "telnet_mode" => tw.telnet_mode = value == "true",
-                            "prompt" => tw.prompt = unescape_string(value),
+                            "prompt" => {
+                                // Prompts always end with a single trailing space (normalized on receive)
+                                // but trailing spaces are trimmed during file parsing, so add it back
+                                let p = unescape_string(value);
+                                tw.prompt = if p.is_empty() { p } else { format!("{} ", p.trim_end()) };
+                            }
                             "socket_fd" => tw.socket_fd = value.parse().ok(),
                             "world_type" => tw.settings.world_type = WorldType::from_name(value),
                             "hostname" => tw.settings.hostname = value.to_string(),
