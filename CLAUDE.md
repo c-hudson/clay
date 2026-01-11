@@ -669,3 +669,30 @@ Appears when deleting a world:
 - `Esc` - Cancel and close dialog
 - Cannot delete the last remaining world
 - Deletion message includes world name: "World 'name' deleted."
+
+### Spell Checking
+
+Real-time spell checking with misspelled words highlighted in red.
+
+**Dictionary:**
+- Uses system dictionary at `/usr/share/dict/words` (fallback: american-english, british-english)
+- Words are case-insensitive for checking
+
+**Contraction Support:**
+- Contractions like "didn't", "won't", "I'm" are recognized
+- Apostrophes between alphabetic characters are treated as part of the word
+- Special handling for irregular contractions (e.g., "won't" → "will")
+
+**When Words Are Checked:**
+- Words are only checked when "complete" (followed by space, punctuation, or other non-word character)
+- Words at end of input are NOT checked while typing (avoids premature flagging)
+- Once a word is flagged, it stays flagged until completed again
+
+**Cached Misspelling State:**
+- Misspelled word positions are cached between keystrokes
+- When editing a word at end of input, the cached state is used instead of re-checking
+- This prevents flickering: type "thiss " (flagged) → backspace to "thiss" (stays flagged) → backspace to "this" (stays flagged until you type space, then re-checked and unflagged)
+
+**Controls:**
+- `Ctrl+Q` - Cycle through spell suggestions for word at cursor
+- Suggestions use Levenshtein distance (max distance 3, limited to similar-length words)
