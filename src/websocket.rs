@@ -42,6 +42,7 @@ pub enum WsMessage {
     PromptUpdate { world_index: usize, prompt: String },
     PendingLinesUpdate { world_index: usize, count: usize },
     UnseenCleared { world_index: usize },
+    UnseenUpdate { world_index: usize, count: usize },
 
     // Commands (client -> server)
     SendCommand { world_index: usize, command: String },

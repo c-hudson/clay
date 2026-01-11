@@ -271,9 +271,14 @@ Returns `null` if no valid world to switch to.
 { "type": "PendingLinesUpdate", "world_index": 0, "count": 42 }
 ```
 
-**UnseenCleared** - World's unseen count was cleared
+**UnseenCleared** - World's unseen count was cleared (any client viewed the world)
 ```json
 { "type": "UnseenCleared", "world_index": 0 }
+```
+
+**UnseenUpdate** - World's unseen count changed (new lines arrived while no client viewing)
+```json
+{ "type": "UnseenUpdate", "world_index": 0, "count": 5 }
 ```
 
 **WorldSettingsUpdated** - World settings changed

@@ -5821,8 +5821,8 @@ mod remote_gui {
                                     keep_alive_type: w.keep_alive_type.clone(),
                                     keep_alive_cmd: w.settings.keep_alive_cmd.clone(),
                                 },
-                                unseen_lines: 0,  // Start fresh - GUI tracks its own unseen counts
-                                pending_count: w.pending_lines.len(),
+                                unseen_lines: w.unseen_lines,  // Use server's centralized unseen tracking
+                                pending_count: w.pending_lines.len(),  // Show server's pending count
                                 last_send_secs: w.last_send_secs,
                                 last_recv_secs: w.last_recv_secs,
                                 last_nop_secs: w.last_nop_secs,
@@ -5847,26 +5847,9 @@ mod remote_gui {
                             self.show_tags = settings.show_tags;
                             self.actions = actions;
                         }
-                        WsMessage::ServerData { world_index, data, is_viewed, ts } => {
+                        WsMessage::ServerData { world_index, data, is_viewed: _, ts } => {
                             if world_index < self.worlds.len() {
-                                // Debug: log ANSI data to file
-                                if self.worlds[world_index].output_lines.len() < 10 {
-                                    use std::io::Write;
-                                    if let Ok(mut f) = std::fs::OpenOptions::new()
-                                        .create(true).append(true)
-                                        .open("/tmp/clay_gui_debug.log")
-                                    {
-                                        let has_esc = data.contains('\x1b');
-                                        let _ = writeln!(f, "Line {}: has_esc={}, len={}, bytes={:?}",
-                                            self.worlds[world_index].output_lines.len(),
-                                            has_esc,
-                                            data.len(),
-                                            data.chars().take(100).collect::<String>().as_bytes());
-                                    }
-                                }
-
                                 // Parse and add new output lines, filtering out visually empty lines
-                                let mut lines_added = 0;
                                 for line in data.lines() {
                                     // Skip visually empty lines (only ANSI codes/whitespace)
                                     if !is_visually_empty(line) {
@@ -5874,15 +5857,10 @@ mod remote_gui {
                                             text: line.to_string(),
                                             ts,
                                         });
-                                        lines_added += 1;
                                     }
                                 }
-                                // Track unseen lines only if:
-                                // - This is not our current world, AND
-                                // - No other interface (console/web) is viewing this world
-                                if world_index != self.current_world && !is_viewed {
-                                    self.worlds[world_index].unseen_lines += lines_added;
-                                }
+                                // Note: Don't track unseen_lines locally - server handles centralized tracking
+                                // and will broadcast UnseenUpdate/UnseenCleared when counts change
                             }
                         }
                         WsMessage::WorldConnected { world_index, name } => {
@@ -5955,6 +5933,12 @@ mod remote_gui {
                             // Another client (console or web) has viewed this world
                             if world_index < self.worlds.len() {
                                 self.worlds[world_index].unseen_lines = 0;
+                            }
+                        }
+                        WsMessage::UnseenUpdate { world_index, count } => {
+                            // Server's unseen count changed - update our copy
+                            if world_index < self.worlds.len() {
+                                self.worlds[world_index].unseen_lines = count;
                             }
                         }
                         _ => {}
@@ -6649,34 +6633,47 @@ mod remote_gui {
             }
         }
 
-        /// Find URLs in text and return their positions
+        /// Find URLs in text and return their character positions (not byte positions)
+        /// Returns (start_char_idx, end_char_idx, url_string)
         fn find_urls(text: &str) -> Vec<(usize, usize, String)> {
             let mut urls = Vec::new();
-            // Simple URL detection: look for http:// or https://
-            let mut search_start = 0;
-            while search_start < text.len() {
-                let remaining = &text[search_start..];
-                // Find the earliest http:// or https://
+            let chars: Vec<char> = text.chars().collect();
+            let mut i = 0;
+
+            while i < chars.len() {
+                // Look for http:// or https://
+                let remaining: String = chars[i..].iter().collect();
                 let http_pos = remaining.find("http://");
                 let https_pos = remaining.find("https://");
 
-                let rel_pos = match (http_pos, https_pos) {
+                // Find earliest match (in bytes), then convert to char position
+                let byte_pos = match (http_pos, https_pos) {
                     (Some(h), Some(hs)) => Some(h.min(hs)),
                     (Some(h), None) => Some(h),
                     (None, Some(hs)) => Some(hs),
                     (None, None) => None,
                 };
 
-                if let Some(rel_pos) = rel_pos {
-                    let start = search_start + rel_pos;
-                    // Find end of URL (space, newline, or end of string)
-                    let end = text[start..].find(|c: char| c.is_whitespace() || c == '>' || c == '"' || c == '\'' || c == ')' || c == ']')
-                        .map(|e| start + e)
-                        .unwrap_or(text.len());
-                    if end > start {
-                        urls.push((start, end, text[start..end].to_string()));
+                if let Some(byte_offset) = byte_pos {
+                    // Convert byte offset to char offset within remaining
+                    let char_offset = remaining[..byte_offset].chars().count();
+                    let start = i + char_offset;
+
+                    // Find end of URL (whitespace or certain punctuation)
+                    let mut end = start;
+                    while end < chars.len() {
+                        let c = chars[end];
+                        if c.is_whitespace() || c == '>' || c == '"' || c == '\'' || c == ')' || c == ']' {
+                            break;
+                        }
+                        end += 1;
                     }
-                    search_start = end;
+
+                    if end > start {
+                        let url: String = chars[start..end].iter().collect();
+                        urls.push((start, end, url));
+                    }
+                    i = end;
                 } else {
                     break;
                 }
@@ -7704,11 +7701,12 @@ mod remote_gui {
                                 .map(|w| w.connected)
                                 .unwrap_or(false);
 
-                            // Collect worlds with activity (unseen output or pending lines)
-                            let worlds_with_activity: Vec<&str> = self.worlds.iter()
+                            // Collect worlds with activity (unseen output only)
+                            // Note: pending_count is server-side more-mode concept, not meaningful for GUI activity
+                            let worlds_with_activity: Vec<(&str, usize)> = self.worlds.iter()
                                 .enumerate()
-                                .filter(|(i, w)| *i != self.current_world && (w.unseen_lines > 0 || w.pending_count > 0))
-                                .map(|(_, w)| w.name.as_str())
+                                .filter(|(i, w)| *i != self.current_world && w.unseen_lines > 0)
+                                .map(|(_, w)| (w.name.as_str(), w.unseen_lines))
                                 .collect();
                             let activity_count = worlds_with_activity.len();
 
@@ -7737,8 +7735,8 @@ mod remote_gui {
                                 // Show hover popup with list of worlds that have activity
                                 activity_label.on_hover_ui(|ui| {
                                     ui.label(egui::RichText::new("Worlds with unseen output:").strong());
-                                    for world_name in &worlds_with_activity {
-                                        ui.label(*world_name);
+                                    for (world_name, unseen) in &worlds_with_activity {
+                                        ui.label(format!("{}: {} unseen", world_name, unseen));
                                     }
                                 });
                             }
@@ -10051,6 +10049,14 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                     is_viewed: is_current,
                                     ts: current_timestamp_secs(),
                                 });
+                                // Broadcast updated unseen count so all clients stay in sync
+                                let unseen_count = app.worlds[world_idx].unseen_lines;
+                                if unseen_count > 0 {
+                                    app.ws_broadcast(WsMessage::UnseenUpdate {
+                                        world_index: world_idx,
+                                        count: unseen_count,
+                                    });
+                                }
                             }
 
                             // Add gagged lines to output (they'll only show with F2)
@@ -13716,18 +13722,12 @@ fn render_output_crossterm(app: &App) {
         width
     }
 
-    // Break characters for word wrapping (same as GUI)
+    // Break characters for word wrapping within long words
     // Note: '.' is excluded because it breaks filenames (image.png) and domains awkwardly
     const BREAK_CHARS: &[char] = &['[', ']', '(', ')', ',', '\\', '/', '-', '&', '=', '?'];
-    const MIN_WORD_LEN: usize = 15;
 
-    // Check if a character is a break character
-    fn is_break_char(c: char) -> bool {
-        c.is_whitespace() || BREAK_CHARS.contains(&c)
-    }
-
-    // Wrap a line with ANSI codes by visible width, preferring to break at
-    // specific characters ([ ] ( ) , \ / - & = ?) for long words (>15 chars)
+    // Wrap a line with ANSI codes by visible width, preferring to break at word boundaries
+    // Similar to CSS white-space: pre-wrap; word-wrap: break-word
     fn wrap_ansi_line(line: &str, max_width: usize) -> Vec<String> {
         if max_width == 0 {
             return vec![line.to_string()];
@@ -13740,11 +13740,16 @@ fn render_output_crossterm(app: &App) {
         let mut escape_seq = String::new();
         let mut active_codes: Vec<String> = Vec::new();
 
-        // Track break opportunities for long words
-        let mut word_start_width = 0;  // Width at start of current word
-        let mut last_break_line = String::new();  // Line content at last break point
-        let mut last_break_width = 0;  // Width at last break point
-        let mut last_break_codes: Vec<String> = Vec::new();  // Active codes at last break
+        // Track last word boundary (space) for wrapping
+        let mut last_space_line = String::new();
+        let mut last_space_width = 0;
+        let mut last_space_codes: Vec<String> = Vec::new();
+        let mut has_space_on_line = false;
+
+        // Track break opportunities within long words (for BREAK_CHARS)
+        let mut last_break_line = String::new();
+        let mut last_break_width = 0;
+        let mut last_break_codes: Vec<String> = Vec::new();
 
         for c in line.chars() {
             if c == '\x1b' {
@@ -13767,34 +13772,43 @@ fn render_output_crossterm(app: &App) {
             } else {
                 let char_width = unicode_width::UnicodeWidthChar::width(c).unwrap_or(0);
 
-                // Check if we need to wrap
+                // Check if we need to wrap before adding this character
                 if current_width + char_width > max_width && current_width > 0 {
-                    // Calculate current word length
-                    let word_len = current_width - word_start_width;
+                    // Prefer to break at the last space (word boundary)
+                    if has_space_on_line && last_space_width > 0 {
+                        // Break at word boundary - emit up to and including the space
+                        let mut break_line = last_space_line.clone();
+                        break_line.push_str("\x1b[0m");
+                        result.push(break_line);
 
-                    // If word is long and we have a break point, use it
-                    if word_len > MIN_WORD_LEN && last_break_width > word_start_width {
-                        // Use the break point - emit up to break point
+                        // Start new line with content after the space
+                        let remainder_start = last_space_line.len();
+                        let remainder = &current_line[remainder_start..];
+                        current_line = last_space_codes.join("") + remainder;
+                        current_width = current_width - last_space_width;
+                    } else if last_break_width > 0 {
+                        // No space, but we have a break char (for long words) - use it
                         let mut break_line = last_break_line.clone();
                         break_line.push_str("\x1b[0m");
                         result.push(break_line);
 
-                        // Start new line with remainder after break point
                         let remainder_start = last_break_line.len();
                         let remainder = &current_line[remainder_start..];
                         current_line = last_break_codes.join("") + remainder;
                         current_width = current_width - last_break_width;
-                        word_start_width = 0;
                     } else {
-                        // No good break point, wrap at current position
+                        // No break point at all - hard wrap at current position
                         current_line.push_str("\x1b[0m");
                         result.push(current_line);
                         current_line = active_codes.join("");
                         current_width = 0;
-                        word_start_width = 0;
                     }
 
-                    // Reset break tracking
+                    // Reset tracking for new line
+                    has_space_on_line = false;
+                    last_space_line.clear();
+                    last_space_width = 0;
+                    last_space_codes.clear();
                     last_break_line.clear();
                     last_break_width = 0;
                     last_break_codes.clear();
@@ -13804,13 +13818,18 @@ fn render_output_crossterm(app: &App) {
                 current_line.push(c);
                 current_width += char_width;
 
-                // Track word boundaries and break opportunities
+                // Track break opportunities
                 if c.is_whitespace() {
-                    word_start_width = current_width;
+                    // Save position AFTER the space as a word boundary
+                    last_space_line = current_line.clone();
+                    last_space_width = current_width;
+                    last_space_codes = active_codes.clone();
+                    has_space_on_line = true;
+                    // Reset break char tracking since we have a new word
                     last_break_line.clear();
                     last_break_width = 0;
-                } else if is_break_char(c) {
-                    // Save this as a potential break point (break after this char)
+                } else if BREAK_CHARS.contains(&c) {
+                    // Save as potential break point within a word (after this char)
                     last_break_line = current_line.clone();
                     last_break_width = current_width;
                     last_break_codes = active_codes.clone();

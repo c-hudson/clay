@@ -502,10 +502,10 @@
                             typeof line === 'string' ? { text: line, ts: currentTs } : line
                         );
                     }
-                    // Set pending_count from pending_lines length for activity indicator
+                    // Use server's centralized unseen tracking - don't reset to 0
+                    // Note: pending_count is server-side more-mode concept for activity display
+                    // world.unseen_lines comes from server, keep it as-is
                     world.pending_count = (world.pending_lines && world.pending_lines.length) || 0;
-                    // Reset unseen_lines - web client tracks its own unseen counts from this point
-                    world.unseen_lines = 0;
                 });
                 if (msg.settings) {
                     if (msg.settings.input_height) {
@@ -585,10 +585,9 @@
                             world.output_lines.push({ text: line, ts: lineTs });
                             if (msg.world_index === currentWorldIndex) {
                                 handleIncomingLine(line, lineTs, msg.world_index, lineIndex);
-                            } else if (!msg.is_viewed) {
-                                // Only increment unseen if no other interface is viewing this world
-                                world.unseen_lines = (world.unseen_lines || 0) + 1;
                             }
+                            // Note: Don't track unseen_lines locally - server handles centralized tracking
+                            // and sends UnseenUpdate messages to keep all clients in sync
                         });
                         if (msg.world_index !== currentWorldIndex) {
                             updateStatusBar();
@@ -705,6 +704,14 @@
                 // Another client (console, web, or GUI) has viewed this world
                 if (msg.world_index !== undefined && worlds[msg.world_index]) {
                     worlds[msg.world_index].unseen_lines = 0;
+                    updateStatusBar();
+                }
+                break;
+
+            case 'UnseenUpdate':
+                // Server's unseen count changed - update our copy
+                if (msg.world_index !== undefined && worlds[msg.world_index]) {
+                    worlds[msg.world_index].unseen_lines = msg.count || 0;
                     updateStatusBar();
                 }
                 break;
@@ -1511,10 +1518,11 @@
             elements.worldName.textContent = ' ' + (world.name || '');
         }
 
-        // Activity indicator (worlds with unseen lines OR pending output)
+        // Activity indicator (worlds with unseen lines only)
+        // Note: pending_count is server-side more-mode concept, not meaningful for web activity
         let activityCount = 0;
         worlds.forEach((w, i) => {
-            if (i !== currentWorldIndex && (w.unseen_lines > 0 || (w.pending_count && w.pending_count > 0))) {
+            if (i !== currentWorldIndex && w.unseen_lines > 0) {
                 activityCount++;
             }
         });
@@ -2254,14 +2262,13 @@
         return world.connected || worldHasActivity(world);
     }
 
-    // Check if a world has activity (unseen lines or pending output)
+    // Check if a world has activity (unseen lines only)
+    // Note: pending_count is server-side more-mode concept, not meaningful for web activity
     function worldHasActivity(world) {
-        return (world.unseen_lines && world.unseen_lines > 0) ||
-               (world.pending_count && world.pending_count > 0);
+        return world.unseen_lines && world.unseen_lines > 0;
     }
 
     // Check if a world has unseen output (for pending_first prioritization)
-    // Now includes pending_count for proper activity tracking
     function worldHasPending(world) {
         return worldHasActivity(world);
     }
