@@ -13312,6 +13312,10 @@ fn render_output_crossterm(app: &App) {
     }
 
     let mut stdout = std::io::stdout();
+
+    // Save cursor position before rendering (ratatui already positioned it correctly)
+    let _ = stdout.queue(cursor::SavePosition);
+
     let world = app.current_world();
     let visible_height = (app.output_height as usize).max(1);
     let term_width = (app.output_width as usize).max(1);
@@ -13596,7 +13600,8 @@ fn render_output_crossterm(app: &App) {
         let _ = stdout.queue(Print(border_bottom));
     }
 
-    // Flush output - cursor position is handled by ratatui's terminal.draw()
+    // Restore cursor position (back to where ratatui placed it in input area)
+    let _ = stdout.queue(cursor::RestorePosition);
     let _ = stdout.flush();
 }
 
