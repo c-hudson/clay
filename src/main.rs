@@ -3407,7 +3407,7 @@ impl App {
     }
 
     fn find_world(&self, name: &str) -> Option<usize> {
-        self.worlds.iter().position(|w| w.name == name)
+        self.worlds.iter().position(|w| w.name.eq_ignore_ascii_case(name))
     }
 
     fn find_or_create_world(&mut self, name: &str) -> usize {
