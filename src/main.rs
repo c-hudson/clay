@@ -5821,7 +5821,7 @@ mod remote_gui {
                                     keep_alive_type: w.keep_alive_type.clone(),
                                     keep_alive_cmd: w.settings.keep_alive_cmd.clone(),
                                 },
-                                unseen_lines: w.unseen_lines,
+                                unseen_lines: 0,  // Start fresh - GUI tracks its own unseen counts
                                 pending_count: w.pending_lines.len(),
                                 last_send_secs: w.last_send_secs,
                                 last_recv_secs: w.last_recv_secs,

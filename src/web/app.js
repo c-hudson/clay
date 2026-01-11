@@ -504,6 +504,8 @@
                     }
                     // Set pending_count from pending_lines length for activity indicator
                     world.pending_count = (world.pending_lines && world.pending_lines.length) || 0;
+                    // Reset unseen_lines - web client tracks its own unseen counts from this point
+                    world.unseen_lines = 0;
                 });
                 if (msg.settings) {
                     if (msg.settings.input_height) {
