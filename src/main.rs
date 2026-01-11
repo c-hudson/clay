@@ -2804,6 +2804,7 @@ fn current_timestamp_secs() -> u64 {
 struct OutputLine {
     text: String,
     timestamp: SystemTime,
+    from_server: bool,  // true if from MUD server, false if client-generated
 }
 
 impl OutputLine {
@@ -2811,11 +2812,20 @@ impl OutputLine {
         Self {
             text,
             timestamp: SystemTime::now(),
+            from_server: true,  // Default to server output
+        }
+    }
+
+    fn new_client(text: String) -> Self {
+        Self {
+            text,
+            timestamp: SystemTime::now(),
+            from_server: false,
         }
     }
 
     fn new_with_timestamp(text: String, timestamp: SystemTime) -> Self {
-        Self { text, timestamp }
+        Self { text, timestamp, from_server: true }
     }
 
     /// Format timestamp for display based on whether it's from today
@@ -2934,6 +2944,7 @@ impl World {
         output_height: u16,
         output_width: u16,
         clear_splash: bool,
+        from_server: bool,
     ) {
 
         // Clear splash mode when MUD data is received (not for client messages)
@@ -3018,12 +3029,19 @@ impl World {
                 && self.lines_since_pause >= max_lines
                 && self.output_lines.len() >= max_lines;
 
+            // Create OutputLine with appropriate from_server flag
+            let new_line = if from_server {
+                OutputLine::new(line.to_string())
+            } else {
+                OutputLine::new_client(line.to_string())
+            };
+
             if goes_to_pending {
                 // Track when pending output first appeared
                 if self.pending_lines.is_empty() {
                     self.pending_since = Some(std::time::Instant::now());
                 }
-                self.pending_lines.push(OutputLine::new(line.to_string()));
+                self.pending_lines.push(new_line);
                 // Debug log output line with current sequence number
                 debug_log_output(self, self.debug_seq, line);
                 if is_partial {
@@ -3038,7 +3056,7 @@ impl World {
                 if self.pending_lines.is_empty() {
                     self.pending_since = Some(std::time::Instant::now());
                 }
-                self.pending_lines.push(OutputLine::new(line.to_string()));
+                self.pending_lines.push(new_line);
                 // Debug log output line with current sequence number
                 debug_log_output(self, self.debug_seq, line);
                 if is_partial {
@@ -3046,7 +3064,7 @@ impl World {
                     self.partial_in_pending = true;
                 }
             } else {
-                self.output_lines.push(OutputLine::new(line.to_string()));
+                self.output_lines.push(new_line);
                 // Debug log output line with current sequence number
                 debug_log_output(self, self.debug_seq, line);
                 // Count visual lines (accounting for word wrap) instead of logical lines
@@ -3120,6 +3138,16 @@ impl World {
             self.partial_in_pending = false;
         }
         self.scroll_to_bottom();
+    }
+
+    /// Filter output to only keep lines from the MUD server (remove client-generated lines)
+    fn filter_to_server_output(&mut self) {
+        self.output_lines.retain(|line| line.from_server);
+        self.pending_lines.retain(|line| line.from_server);
+        // Adjust scroll offset if it's now past the end
+        if self.scroll_offset > 0 && self.scroll_offset >= self.output_lines.len() {
+            self.scroll_offset = self.output_lines.len().saturating_sub(1);
+        }
     }
 
     fn is_at_bottom(&self) -> bool {
@@ -3484,7 +3512,7 @@ impl App {
             format!("{}\n", text)
         };
         self.current_world_mut()
-            .add_output(&text_with_newline, is_current, &settings, output_height, output_width, false);
+            .add_output(&text_with_newline, is_current, &settings, output_height, output_width, false, false);
     }
 
     /// Broadcast a message to all authenticated WebSocket clients
@@ -9635,6 +9663,8 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                     match handle_key_event(key, &mut app) {
                         KeyAction::Quit => return Ok(()),
                         KeyAction::Redraw => {
+                            // Filter output to only show server data (remove client-generated lines)
+                            app.current_world_mut().filter_to_server_output();
                             terminal.clear()?;
                         }
                         KeyAction::Connect => {
@@ -9899,7 +9929,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                 let settings = app.settings.clone();
                                 let output_height = app.output_height;
                                 let output_width = app.output_width;
-                                app.worlds[world_idx].add_output(&filtered_data, is_current, &settings, output_height, output_width, true);
+                                app.worlds[world_idx].add_output(&filtered_data, is_current, &settings, output_height, output_width, true, true);
                                 // Check if terminal needs full redraw (after splash clear)
                                 if app.worlds[world_idx].needs_redraw {
                                     app.worlds[world_idx].needs_redraw = false;
@@ -10014,7 +10044,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                             let output_width = app.output_width;
                             // Add newline to message
                             let data = format!("{}\n", message);
-                            app.worlds[world_idx].add_output(&data, is_current, &settings, output_height, output_width, true);
+                            app.worlds[world_idx].add_output(&data, is_current, &settings, output_height, output_width, true, true);
                             // Broadcast to WebSocket clients
                             app.ws_broadcast(WsMessage::ServerData {
                                 world_index: world_idx,
@@ -10630,7 +10660,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                             let settings = app.settings.clone();
                             let output_height = app.output_height;
                             let output_width = app.output_width;
-                            app.worlds[world_idx].add_output(&filtered_data, is_current, &settings, output_height, output_width, true);
+                            app.worlds[world_idx].add_output(&filtered_data, is_current, &settings, output_height, output_width, true, true);
                             if app.worlds[world_idx].needs_redraw {
                                 app.worlds[world_idx].needs_redraw = false;
                                 let _ = terminal.clear();
@@ -10737,7 +10767,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                         let output_height = app.output_height;
                         let output_width = app.output_width;
                         let data = format!("{}\n", message);
-                        app.worlds[world_idx].add_output(&data, is_current, &settings, output_height, output_width, true);
+                        app.worlds[world_idx].add_output(&data, is_current, &settings, output_height, output_width, true, true);
                         app.ws_broadcast(WsMessage::ServerData {
                             world_index: world_idx,
                             data,

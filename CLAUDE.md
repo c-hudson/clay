@@ -57,6 +57,7 @@ MudClient is a terminal-based MUD (Multi-User Dungeon) client built with ratatui
 - **FilterPopup**: Modal filter popup for searching/filtering output text (F4)
 - **Encoding**: Character encoding enum (Utf8, Latin1, Fansi) with decode method
 - **StreamReader/StreamWriter**: Wrapper enums supporting both plain TCP and TLS streams
+- **OutputLine**: Output line with timestamp and `from_server` flag (true = MUD server data, false = client-generated)
 
 ### Screen Layout
 
@@ -248,7 +249,7 @@ Prompts that are auto-answered are immediately cleared and not displayed in the 
 - `F1` - Open help popup
 - `F2` - Toggle MUD tag display (show/hide tags like `[channel:]` and timestamps)
 - `Ctrl+C` - Press twice within 15 seconds to quit
-- `Ctrl+L` - Redraw screen
+- `Ctrl+L` - Redraw screen (filters out client-generated output, keeps only MUD server data)
 - `Ctrl+R` - Hot reload (same as /reload)
 - `/quit` - Exit the client
 - `Enter` - Send command (also releases all pending if paused)
