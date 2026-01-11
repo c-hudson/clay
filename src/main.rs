@@ -2840,6 +2840,7 @@ struct OutputLine {
     text: String,
     timestamp: SystemTime,
     from_server: bool,  // true if from MUD server, false if client-generated
+    gagged: bool,       // true if line was gagged by an action (only shown with F2)
 }
 
 impl OutputLine {
@@ -2848,6 +2849,7 @@ impl OutputLine {
             text,
             timestamp: SystemTime::now(),
             from_server: true,  // Default to server output
+            gagged: false,
         }
     }
 
@@ -2856,11 +2858,21 @@ impl OutputLine {
             text,
             timestamp: SystemTime::now(),
             from_server: false,
+            gagged: false,
+        }
+    }
+
+    fn new_gagged(text: String) -> Self {
+        Self {
+            text,
+            timestamp: SystemTime::now(),
+            from_server: true,
+            gagged: true,
         }
     }
 
     fn new_with_timestamp(text: String, timestamp: SystemTime) -> Self {
-        Self { text, timestamp, from_server: true }
+        Self { text, timestamp, from_server: true, gagged: false }
     }
 
     /// Format timestamp for display based on whether it's from today
@@ -9919,7 +9931,8 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                             let actions = app.settings.actions.clone();
 
                             // Process action triggers on complete lines
-                            let mut filtered_lines: Vec<&str> = Vec::new();
+                            // Track lines with gagged flag: (line, is_gagged)
+                            let mut processed_lines: Vec<(&str, bool)> = Vec::new();
                             let mut commands_to_execute: Vec<String> = Vec::new();
                             let ends_with_newline = data.ends_with('\n');
                             let lines: Vec<&str> = data.lines().collect();
@@ -9934,34 +9947,42 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                     continue;
                                 }
 
-                                // Only check triggers on complete lines
+                                // Check triggers on complete lines
+                                let mut is_gagged = false;
                                 if !is_partial {
                                     if let Some(result) = check_action_triggers(line, &world_name, &actions) {
                                         // Collect commands to execute
                                         commands_to_execute.extend(result.commands);
-                                        // If gagged, skip this line
-                                        if result.should_gag {
-                                            continue;
-                                        }
+                                        is_gagged = result.should_gag;
                                     }
                                 }
 
-                                // Add line to filtered data
-                                filtered_lines.push(line);
+                                // Add line with gagged flag
+                                processed_lines.push((line, is_gagged));
                             }
 
-                            // Rebuild the data with proper newlines
-                            let filtered_data = if filtered_lines.is_empty() {
+                            // Separate gagged and non-gagged lines
+                            let non_gagged_lines: Vec<&str> = processed_lines.iter()
+                                .filter(|(_, gagged)| !gagged)
+                                .map(|(line, _)| *line)
+                                .collect();
+                            let gagged_lines: Vec<&str> = processed_lines.iter()
+                                .filter(|(_, gagged)| *gagged)
+                                .map(|(line, _)| *line)
+                                .collect();
+
+                            // Rebuild data for non-gagged lines
+                            let filtered_data = if non_gagged_lines.is_empty() {
                                 String::new()
                             } else {
-                                let mut result = filtered_lines.join("\n");
+                                let mut result = non_gagged_lines.join("\n");
                                 if ends_with_newline {
                                     result.push('\n');
                                 }
                                 result
                             };
 
-                            // Add output to world (if any non-gagged content)
+                            // Add non-gagged output to world
                             if !filtered_data.is_empty() {
                                 let settings = app.settings.clone();
                                 let output_height = app.output_height;
@@ -9981,6 +10002,15 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                     is_viewed: is_current,
                                     ts: current_timestamp_secs(),
                                 });
+                            }
+
+                            // Add gagged lines to output (they'll only show with F2)
+                            for line in gagged_lines {
+                                app.worlds[world_idx].output_lines.push(OutputLine::new_gagged(line.to_string()));
+                            }
+                            // Keep scroll at bottom if we added gagged lines
+                            if !app.worlds[world_idx].paused {
+                                app.worlds[world_idx].scroll_to_bottom();
                             }
 
                             // Execute any triggered commands
@@ -10657,7 +10687,8 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                         let actions = app.settings.actions.clone();
 
                         // Process action triggers on complete lines
-                        let mut filtered_lines: Vec<&str> = Vec::new();
+                        // Track lines with gagged flag: (line, is_gagged)
+                        let mut processed_lines: Vec<(&str, bool)> = Vec::new();
                         let mut commands_to_execute: Vec<String> = Vec::new();
                         let ends_with_newline = data.ends_with('\n');
                         let lines: Vec<&str> = data.lines().collect();
@@ -10672,21 +10703,30 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                 continue;
                             }
 
+                            let mut is_gagged = false;
                             if !is_partial {
                                 if let Some(result) = check_action_triggers(line, &world_name, &actions) {
                                     commands_to_execute.extend(result.commands);
-                                    if result.should_gag {
-                                        continue;
-                                    }
+                                    is_gagged = result.should_gag;
                                 }
                             }
-                            filtered_lines.push(line);
+                            processed_lines.push((line, is_gagged));
                         }
 
-                        let filtered_data = if filtered_lines.is_empty() {
+                        // Separate gagged and non-gagged lines
+                        let non_gagged_lines: Vec<&str> = processed_lines.iter()
+                            .filter(|(_, gagged)| !gagged)
+                            .map(|(line, _)| *line)
+                            .collect();
+                        let gagged_lines: Vec<&str> = processed_lines.iter()
+                            .filter(|(_, gagged)| *gagged)
+                            .map(|(line, _)| *line)
+                            .collect();
+
+                        let filtered_data = if non_gagged_lines.is_empty() {
                             String::new()
                         } else {
-                            let mut result = filtered_lines.join("\n");
+                            let mut result = non_gagged_lines.join("\n");
                             if ends_with_newline {
                                 result.push('\n');
                             }
@@ -10710,6 +10750,14 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                 is_viewed: is_current,
                                 ts: current_timestamp_secs(),
                             });
+                        }
+
+                        // Add gagged lines to output (they'll only show with F2)
+                        for line in gagged_lines {
+                            app.worlds[world_idx].output_lines.push(OutputLine::new_gagged(line.to_string()));
+                        }
+                        if !app.worlds[world_idx].paused {
+                            app.worlds[world_idx].scroll_to_bottom();
                         }
 
                         if let Some(tx) = &app.worlds[world_idx].command_tx {
@@ -13729,6 +13777,10 @@ fn render_output_crossterm(app: &App) {
     let actions = &app.settings.actions;
 
     let expand_and_wrap = |line: &OutputLine, term_width: usize, show_tags: bool, highlight: bool| -> Vec<(String, bool)> {
+        // Skip gagged lines unless show_tags (F2) is enabled
+        if line.gagged && !show_tags {
+            return Vec::new();
+        }
         // Skip visually empty lines (only ANSI codes/whitespace)
         if is_visually_empty(&line.text) {
             return Vec::new();
