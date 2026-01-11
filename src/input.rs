@@ -47,7 +47,7 @@ impl InputArea {
             // Prompt fills entire first line, so all input is on subsequent lines
             // Add 1 for the prompt line, then calculate remaining lines
             1 + chars_before / width
-        } else if chars_before <= first_line_capacity {
+        } else if chars_before < first_line_capacity {
             // Still on first line
             0
         } else {
