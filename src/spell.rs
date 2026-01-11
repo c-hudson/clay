@@ -8,6 +8,20 @@ const SYSTEM_DICT_PATHS: &[&str] = &[
     "/usr/share/dict/british-english",
 ];
 
+// Common contraction suffixes (after apostrophe)
+// If a word ends with 'suffix, check if the base word is valid
+// Note: "n't" must come before "'t" so we match the longer suffix first
+const CONTRACTION_SUFFIXES: &[&str] = &[
+    "n't",   // didn't, wouldn't, couldn't, shouldn't, don't, won't, isn't, aren't, wasn't, weren't, hasn't, haven't, hadn't
+    "'t",    // can't, shan't (base already ends in 'n')
+    "'s",    // he's, she's, it's, that's, what's, who's, there's, here's, let's
+    "'re",   // you're, we're, they're
+    "'ve",   // I've, you've, we've, they've, could've, would've, should've
+    "'ll",   // I'll, you'll, he'll, she'll, it'll, we'll, they'll
+    "'d",    // I'd, you'd, he'd, she'd, we'd, they'd
+    "'m",    // I'm
+];
+
 pub struct SpellChecker {
     words: HashSet<String>,
 }
@@ -36,7 +50,31 @@ impl SpellChecker {
         if word.starts_with('/') || word.chars().all(|c| c.is_ascii_digit()) {
             return true;
         }
-        self.words.contains(&word.to_lowercase())
+        let word_lower = word.to_lowercase();
+
+        // Check if word is in dictionary
+        if self.words.contains(&word_lower) {
+            return true;
+        }
+
+        // Check for contractions: if word contains apostrophe, check base word
+        if word_lower.contains('\'') {
+            // Special case for irregular contractions
+            if word_lower == "won't" {
+                return self.words.contains("will");
+            }
+
+            for suffix in CONTRACTION_SUFFIXES {
+                if word_lower.ends_with(suffix) {
+                    let base = &word_lower[..word_lower.len() - suffix.len()];
+                    if !base.is_empty() && self.words.contains(base) {
+                        return true;
+                    }
+                }
+            }
+        }
+
+        false
     }
 
     pub fn suggestions(&self, word: &str, count: usize) -> Vec<String> {

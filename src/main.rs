@@ -3694,10 +3694,42 @@ impl App {
         let chars: Vec<char> = self.input.buffer.chars().collect();
         let mut i = 0;
 
+        // Helper to check if a character at position is part of a word
+        // (alphabetic, or apostrophe between alphabetic characters)
+        let is_word_char = |pos: usize| -> bool {
+            if pos >= chars.len() {
+                return false;
+            }
+            let c = chars[pos];
+            if c.is_alphabetic() {
+                return true;
+            }
+            // Include apostrophe if between alphabetic characters (contractions)
+            if c == '\'' {
+                let has_alpha_before = pos > 0 && chars[pos - 1].is_alphabetic();
+                let has_alpha_after = pos + 1 < chars.len() && chars[pos + 1].is_alphabetic();
+                return has_alpha_before && has_alpha_after;
+            }
+            false
+        };
+
+        // Helper to check if a word is clearly finished (followed by space or clear punctuation)
+        let is_word_complete = |end_pos: usize| -> bool {
+            if end_pos >= chars.len() {
+                // Word at end of input - only complete if cursor is not right there
+                return true;
+            }
+            let next_char = chars[end_pos];
+            // Word is complete if followed by whitespace or clear punctuation
+            // An apostrophe after a word might be the start of a contraction (e.g., "didn'")
+            next_char.is_whitespace() || matches!(next_char, '.' | ',' | '!' | '?' | ';' | ':' | ')' | ']' | '}' | '"')
+        };
+
         // Convert byte cursor to character position
         let cursor_char_pos = self.input.buffer[..self.input.cursor_position].chars().count();
 
         while i < chars.len() {
+            // Skip non-word characters
             while i < chars.len() && !chars[i].is_alphabetic() {
                 i += 1;
             }
@@ -3706,15 +3738,21 @@ impl App {
             }
 
             let start = i;
-            while i < chars.len() && chars[i].is_alphabetic() {
+            // Continue while we have word characters (including internal apostrophes)
+            while i < chars.len() && is_word_char(i) {
                 i += 1;
             }
             let end = i;
 
             let word: String = chars[start..end].iter().collect();
+            // Don't check if cursor is in or immediately after the word
+            // Note: end is the first position after the word, so cursor at end means right after word
             let cursor_in_word = cursor_char_pos >= start && cursor_char_pos <= end;
+            let cursor_right_after = cursor_char_pos == end;
+            // Only check words that are clearly complete
+            let word_complete = is_word_complete(end);
 
-            if !cursor_in_word && !self.spell_checker.is_valid(&word) {
+            if !cursor_in_word && !cursor_right_after && word_complete && !self.spell_checker.is_valid(&word) {
                 misspelled.push((start, end));
             }
         }
@@ -5826,12 +5864,41 @@ mod remote_gui {
             let chars: Vec<char> = self.input_buffer.chars().collect();
             let mut i = 0;
 
+            // Helper to check if a character at position is part of a word
+            // (alphabetic, or apostrophe between alphabetic characters)
+            let is_word_char = |pos: usize| -> bool {
+                if pos >= chars.len() {
+                    return false;
+                }
+                let c = chars[pos];
+                if c.is_alphabetic() {
+                    return true;
+                }
+                // Include apostrophe if between alphabetic characters (contractions)
+                if c == '\'' {
+                    let has_alpha_before = pos > 0 && chars[pos - 1].is_alphabetic();
+                    let has_alpha_after = pos + 1 < chars.len() && chars[pos + 1].is_alphabetic();
+                    return has_alpha_before && has_alpha_after;
+                }
+                false
+            };
+
+            // Helper to check if a word is clearly finished (followed by space or clear punctuation)
+            let is_word_complete = |end_pos: usize| -> bool {
+                if end_pos >= chars.len() {
+                    return true;
+                }
+                let next_char = chars[end_pos];
+                // Word is complete if followed by whitespace or clear punctuation
+                next_char.is_whitespace() || matches!(next_char, '.' | ',' | '!' | '?' | ';' | ':' | ')' | ']' | '}' | '"')
+            };
+
             // Simple cursor position estimate (egui doesn't expose cursor position easily)
             // We'll just check all words since we can't know where the cursor is during input_mut
             let cursor_char_pos = chars.len(); // Assume cursor at end for now
 
             while i < chars.len() {
-                // Skip non-alphabetic characters
+                // Skip non-word characters
                 while i < chars.len() && !chars[i].is_alphabetic() {
                     i += 1;
                 }
@@ -5840,16 +5907,22 @@ mod remote_gui {
                 }
 
                 let start = i;
-                while i < chars.len() && chars[i].is_alphabetic() {
+                // Continue while we have word characters (including internal apostrophes)
+                while i < chars.len() && is_word_char(i) {
                     i += 1;
                 }
                 let end = i;
 
                 let word: String = chars[start..end].iter().collect();
+                // Don't check if cursor is in or immediately after the word
+                // Note: end is the first position after the word, so cursor at end means right after word
                 let cursor_in_word = cursor_char_pos >= start && cursor_char_pos <= end;
+                let cursor_right_after = cursor_char_pos == end;
+                // Only check words that are clearly complete
+                let word_complete = is_word_complete(end);
 
                 // Don't mark the word currently being typed
-                if !cursor_in_word && !self.spell_checker.is_valid(&word) {
+                if !cursor_in_word && !cursor_right_after && word_complete && !self.spell_checker.is_valid(&word) {
                     misspelled.push((start, end));
                 }
             }
@@ -5864,6 +5937,24 @@ mod remote_gui {
                 return None;
             }
 
+            // Helper to check if a character at position is part of a word
+            let is_word_char = |pos: usize| -> bool {
+                if pos >= chars.len() {
+                    return false;
+                }
+                let c = chars[pos];
+                if c.is_alphabetic() {
+                    return true;
+                }
+                // Include apostrophe if between alphabetic characters
+                if c == '\'' {
+                    let has_alpha_before = pos > 0 && chars[pos - 1].is_alphabetic();
+                    let has_alpha_after = pos + 1 < chars.len() && chars[pos + 1].is_alphabetic();
+                    return has_alpha_before && has_alpha_after;
+                }
+                false
+            };
+
             // Assume cursor is at end of input (egui limitation)
             let cursor_pos = chars.len();
             if cursor_pos == 0 {
@@ -5872,7 +5963,7 @@ mod remote_gui {
 
             // Find word boundaries around cursor
             let mut start = cursor_pos.saturating_sub(1);
-            while start > 0 && chars[start - 1].is_alphabetic() {
+            while start > 0 && is_word_char(start - 1) {
                 start -= 1;
             }
             if !chars[start].is_alphabetic() {
@@ -5880,7 +5971,7 @@ mod remote_gui {
             }
 
             let mut end = cursor_pos;
-            while end < chars.len() && chars[end].is_alphabetic() {
+            while end < chars.len() && is_word_char(end) {
                 end += 1;
             }
 

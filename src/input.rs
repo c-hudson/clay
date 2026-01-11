@@ -210,6 +210,25 @@ impl InputArea {
         self.adjust_viewport();
     }
 
+    /// Check if a character at the given position should be part of a word.
+    /// Includes alphabetic characters and apostrophes between alphabetic characters.
+    fn is_word_char(chars: &[char], pos: usize) -> bool {
+        if pos >= chars.len() {
+            return false;
+        }
+        let c = chars[pos];
+        if c.is_alphabetic() {
+            return true;
+        }
+        // Include apostrophe if it's between alphabetic characters (contractions like "didn't")
+        if c == '\'' {
+            let has_alpha_before = pos > 0 && chars[pos - 1].is_alphabetic();
+            let has_alpha_after = pos + 1 < chars.len() && chars[pos + 1].is_alphabetic();
+            return has_alpha_before && has_alpha_after;
+        }
+        false
+    }
+
     pub fn current_word(&self) -> Option<(usize, usize, String)> {
         if self.buffer.is_empty() {
             return None;
@@ -221,12 +240,12 @@ impl InputArea {
         let pos = char_pos.min(chars.len());
 
         let mut start = pos;
-        while start > 0 && chars[start - 1].is_alphabetic() {
+        while start > 0 && Self::is_word_char(&chars, start - 1) {
             start -= 1;
         }
 
         let mut end = pos;
-        while end < chars.len() && chars[end].is_alphabetic() {
+        while end < chars.len() && Self::is_word_char(&chars, end) {
             end += 1;
         }
 
@@ -241,7 +260,7 @@ impl InputArea {
                 }
                 end = prev_end;
                 start = prev_end;
-                while start > 0 && chars[start - 1].is_alphabetic() {
+                while start > 0 && Self::is_word_char(&chars, start - 1) {
                     start -= 1;
                 }
             } else {
