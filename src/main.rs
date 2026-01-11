@@ -49,7 +49,7 @@ use ratatui::{
     widgets::{Block, Borders, Paragraph},
     Frame, Terminal,
 };
-use regex::{Regex, RegexBuilder};
+use regex::RegexBuilder;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream},
@@ -2653,13 +2653,16 @@ fn check_action_triggers(
             continue;
         }
 
-        // Check if world matches (empty = all worlds)
-        if !action.world.is_empty() && action.world != world_name {
+        // Check if world matches (empty = all worlds, case-insensitive)
+        if !action.world.is_empty() && !action.world.eq_ignore_ascii_case(world_name) {
             continue;
         }
 
-        // Try to compile and match the regex
-        if let Ok(regex) = Regex::new(&action.pattern) {
+        // Try to compile and match the regex (case-insensitive to match line_matches_action)
+        if let Ok(regex) = RegexBuilder::new(&action.pattern)
+            .case_insensitive(true)
+            .build()
+        {
             if regex.is_match(&plain_line) {
                 let commands = split_action_commands(&action.command);
                 let should_gag = commands.iter().any(|cmd|
@@ -5218,6 +5221,7 @@ mod remote_gui {
     }
 
     /// State for a remote world
+    #[derive(Clone)]
     pub struct RemoteWorld {
         pub name: String,
         pub connected: bool,
@@ -7757,22 +7761,35 @@ mod remote_gui {
                         });
                     });
 
-                // Filter popup (F4)
+                // Filter popup (F4) - separate OS window
                 if self.filter_active {
-                    let mut filter_open = true;
-                    egui::Window::new("Filter")
-                        .collapsible(false)
-                        .resizable(false)
-                        .anchor(egui::Align2::RIGHT_TOP, [-10.0, 40.0])
-                        .open(&mut filter_open)
-                        .show(ctx, |ui| {
-                            ui.horizontal(|ui| {
-                                ui.label("Filter:");
-                                let response = ui.text_edit_singleline(&mut self.filter_text);
-                                response.request_focus();
+                    let mut should_close = false;
+                    let mut filter_text = self.filter_text.clone();
+
+                    ctx.show_viewport_immediate(
+                        egui::ViewportId::from_hash_of("filter_window"),
+                        egui::ViewportBuilder::default()
+                            .with_title("Filter - Clay MUD Client")
+                            .with_inner_size([300.0, 60.0]),
+                        |ctx, _class| {
+                            egui::CentralPanel::default().show(ctx, |ui| {
+                                if ui.input(|i| i.key_pressed(egui::Key::Escape)) ||
+                                   ui.input(|i| i.key_pressed(egui::Key::F4)) ||
+                                   ui.input(|i| i.viewport().close_requested()) {
+                                    should_close = true;
+                                }
+
+                                ui.horizontal(|ui| {
+                                    ui.label("Filter:");
+                                    let response = ui.text_edit_singleline(&mut filter_text);
+                                    response.request_focus();
+                                });
                             });
-                        });
-                    if !filter_open {
+                        },
+                    );
+
+                    self.filter_text = filter_text;
+                    if should_close {
                         self.filter_active = false;
                         self.filter_text.clear();
                     }
@@ -8186,66 +8203,70 @@ mod remote_gui {
                 let mut close_popup = false;
                 let mut popup_action: Option<(&str, usize)> = None;
 
-                // World List popup
+                // World List popup - separate OS window
                 if self.popup_state == PopupState::WorldList {
-                    let mut popup_open = true;
-                    let frame = egui::Frame::window(&ctx.style())
-                        .inner_margin(egui::Margin { left: 10.0, right: 10.0, top: 10.0, bottom: 10.0 });
-                    egui::Window::new("World List")
-                        .collapsible(false)
-                        .resizable(true)
-                        .default_size([400.0, 300.0])
-                        .frame(frame)
-                        .open(&mut popup_open)
-                        .show(ctx, |ui| {
-                            // Minimal spacing between items
-                            ui.spacing_mut().item_spacing = egui::vec2(10.0, 0.0);
-                            if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
-                                close_popup = true;
-                            }
-                            // Get available width before ScrollArea so it fills the window
-                            let scroll_width = ui.available_width();
-                            ScrollArea::vertical()
-                                .max_height(200.0)
-                                .min_scrolled_width(scroll_width)
-                                .show(ui, |ui| {
-                                    ui.set_min_width(scroll_width - 16.0); // Account for scrollbar
-                                    for (idx, world) in self.worlds.iter().enumerate() {
-                                        let status = if world.connected { "●" } else { "○" };
-                                        let label = format!("{} {} - {}:{}",
-                                            status, world.name,
-                                            world.settings.hostname, world.settings.port);
-                                        if ui.selectable_label(idx == self.world_list_selected, &label).clicked() {
-                                            self.world_list_selected = idx;
+                    let mut should_close = false;
+                    let mut selected = self.world_list_selected;
+                    // Clone world info for display
+                    let world_info: Vec<(String, bool, String, String)> = self.worlds.iter()
+                        .map(|w| (w.name.clone(), w.connected, w.settings.hostname.clone(), w.settings.port.clone()))
+                        .collect();
+
+                    ctx.show_viewport_immediate(
+                        egui::ViewportId::from_hash_of("world_list_window"),
+                        egui::ViewportBuilder::default()
+                            .with_title("World List")
+                            .with_inner_size([400.0, 300.0]),
+                        |ctx, _class| {
+                            egui::CentralPanel::default().show(ctx, |ui| {
+                                ui.spacing_mut().item_spacing = egui::vec2(10.0, 0.0);
+                                if ui.input(|i| i.key_pressed(egui::Key::Escape)) ||
+                                   ui.input(|i| i.viewport().close_requested()) {
+                                    should_close = true;
+                                }
+                                let scroll_width = ui.available_width();
+                                ScrollArea::vertical()
+                                    .max_height(200.0)
+                                    .min_scrolled_width(scroll_width)
+                                    .show(ui, |ui| {
+                                        ui.set_min_width(scroll_width - 16.0);
+                                        for (idx, (name, connected, hostname, port)) in world_info.iter().enumerate() {
+                                            let status = if *connected { "●" } else { "○" };
+                                            let label = format!("{} {} - {}:{}", status, name, hostname, port);
+                                            if ui.selectable_label(idx == selected, &label).clicked() {
+                                                selected = idx;
+                                            }
                                         }
-                                    }
-                                });
-                            ui.add_space(10.0);
-                            ui.horizontal(|ui| {
-                                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                    if ui.button("Close").clicked() {
-                                        close_popup = true;
-                                    }
-                                    if ui.button("Switch To").clicked() {
-                                        popup_action = Some(("switch", self.world_list_selected));
-                                        close_popup = true;
-                                    }
-                                    if ui.button("Edit").clicked() {
-                                        popup_action = Some(("edit", self.world_list_selected));
-                                    }
-                                    if ui.button("Connect").clicked() {
-                                        popup_action = Some(("connect", self.world_list_selected));
-                                        close_popup = true;
-                                    }
+                                    });
+                                ui.add_space(10.0);
+                                ui.horizontal(|ui| {
+                                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                        if ui.button("Close").clicked() {
+                                            should_close = true;
+                                        }
+                                        if ui.button("Switch To").clicked() {
+                                            popup_action = Some(("switch", selected));
+                                            should_close = true;
+                                        }
+                                        if ui.button("Edit").clicked() {
+                                            popup_action = Some(("edit", selected));
+                                        }
+                                        if ui.button("Connect").clicked() {
+                                            popup_action = Some(("connect", selected));
+                                            should_close = true;
+                                        }
+                                    });
                                 });
                             });
-                        });
-                    if !popup_open {
+                        },
+                    );
+                    self.world_list_selected = selected;
+                    if should_close {
                         close_popup = true;
                     }
                 }
 
-                // Connected Worlds popup (/worlds or /l)
+                // Connected Worlds popup (/worlds or /l) - separate OS window
                 if self.popup_state == PopupState::ConnectedWorlds {
                     // Helper to format elapsed seconds
                     fn format_elapsed_secs(secs: Option<u64>) -> String {
@@ -8282,482 +8303,588 @@ mod remote_gui {
                         }
                     }
 
-                    let mut popup_open = true;
-                    egui::Window::new("Connected Worlds")
-                        .collapsible(false)
-                        .resizable(true)
-                        .default_size([620.0, 250.0])
-                        .open(&mut popup_open)
-                        .show(ctx, |ui| {
-                            if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
-                                close_popup = true;
-                            }
-                            // Table header - matches console columns exactly
-                            egui::Grid::new("worlds_header")
-                                .num_columns(7)
-                                .min_col_width(55.0)
-                                .spacing([10.0, 4.0])
-                                .show(ui, |ui| {
-                                    ui.label(egui::RichText::new("World").strong());
-                                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                        ui.label(egui::RichText::new("Unseen").strong());
-                                    });
-                                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                        ui.label(egui::RichText::new("LastSend").strong());
-                                    });
-                                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                        ui.label(egui::RichText::new("LastRecv").strong());
-                                    });
-                                    ui.label(egui::RichText::new("KeepAlive").strong());
-                                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                        ui.label(egui::RichText::new("LastKA").strong());
-                                    });
-                                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                        ui.label(egui::RichText::new("NextKA").strong());
-                                    });
-                                    ui.end_row();
-                                });
-                            ui.separator();
+                    let mut should_close = false;
+                    let mut selected = self.world_list_selected;
+                    let mut switch_to_world: Option<usize> = None;
+                    let worlds_clone = self.worlds.clone();
+                    let current_world = self.current_world;
 
-                            // Check if any worlds are connected
-                            let has_connected = self.worlds.iter().any(|w| w.connected);
-                            if !has_connected {
-                                ui.label("No worlds connected.");
-                            } else {
-                                ScrollArea::vertical().max_height(150.0).show(ui, |ui| {
-                                    egui::Grid::new("worlds_grid")
-                                        .num_columns(7)
-                                        .min_col_width(55.0)
-                                        .spacing([10.0, 4.0])
-                                        .show(ui, |ui| {
-                                            for (idx, world) in self.worlds.iter().enumerate() {
-                                                // Only show connected worlds
-                                                if !world.connected {
-                                                    continue;
-                                                }
-                                                let is_current = idx == self.current_world;
-                                                let name_text = if is_current {
-                                                    format!("* {}", world.name)
-                                                } else {
-                                                    format!("  {}", world.name)
-                                                };
-                                                let name_label = if is_current {
-                                                    egui::RichText::new(&name_text).strong().color(egui::Color32::WHITE)
-                                                } else {
-                                                    egui::RichText::new(&name_text)
-                                                };
-                                                if ui.selectable_label(idx == self.world_list_selected, name_label).clicked() {
-                                                    self.world_list_selected = idx;
-                                                }
-                                                // Unseen column (right-aligned)
-                                                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                                    if world.unseen_lines > 0 {
-                                                        ui.label(egui::RichText::new(format!("{}", world.unseen_lines))
-                                                            .color(egui::Color32::YELLOW));
-                                                    } else {
-                                                        ui.label("");
-                                                    }
-                                                });
-                                                // Send column (right-aligned)
-                                                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                                    ui.label(format_elapsed_secs(world.last_send_secs));
-                                                });
-                                                // Recv column (right-aligned)
-                                                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                                    ui.label(format_elapsed_secs(world.last_recv_secs));
-                                                });
-                                                // KeepAlive type
-                                                ui.label(&world.settings.keep_alive_type);
-                                                // Last column (right-aligned)
-                                                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                                    ui.label(format_elapsed_secs(world.last_nop_secs));
-                                                });
-                                                // Next column (right-aligned)
-                                                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                                    ui.label(format_next_nop(world.last_send_secs, world.last_recv_secs));
-                                                });
-                                                ui.end_row();
-                                            }
+                    ctx.show_viewport_immediate(
+                        egui::ViewportId::from_hash_of("connected_worlds_window"),
+                        egui::ViewportBuilder::default()
+                            .with_title("Connected Worlds - Clay MUD Client")
+                            .with_inner_size([620.0, 250.0]),
+                        |ctx, _class| {
+                            egui::CentralPanel::default().show(ctx, |ui| {
+                                if ui.input(|i| i.key_pressed(egui::Key::Escape)) ||
+                                   ui.input(|i| i.viewport().close_requested()) {
+                                    should_close = true;
+                                }
+
+                                // Table header - matches console columns exactly
+                                egui::Grid::new("worlds_header")
+                                    .num_columns(7)
+                                    .min_col_width(55.0)
+                                    .spacing([10.0, 4.0])
+                                    .show(ui, |ui| {
+                                        ui.label(egui::RichText::new("World").strong());
+                                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                            ui.label(egui::RichText::new("Unseen").strong());
                                         });
+                                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                            ui.label(egui::RichText::new("LastSend").strong());
+                                        });
+                                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                            ui.label(egui::RichText::new("LastRecv").strong());
+                                        });
+                                        ui.label(egui::RichText::new("KeepAlive").strong());
+                                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                            ui.label(egui::RichText::new("LastKA").strong());
+                                        });
+                                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                            ui.label(egui::RichText::new("NextKA").strong());
+                                        });
+                                        ui.end_row();
+                                    });
+                                ui.separator();
+
+                                // Check if any worlds are connected
+                                let has_connected = worlds_clone.iter().any(|w| w.connected);
+                                if !has_connected {
+                                    ui.label("No worlds connected.");
+                                } else {
+                                    ScrollArea::vertical().max_height(150.0).show(ui, |ui| {
+                                        egui::Grid::new("worlds_grid")
+                                            .num_columns(7)
+                                            .min_col_width(55.0)
+                                            .spacing([10.0, 4.0])
+                                            .show(ui, |ui| {
+                                                for (idx, world) in worlds_clone.iter().enumerate() {
+                                                    // Only show connected worlds
+                                                    if !world.connected {
+                                                        continue;
+                                                    }
+                                                    let is_current = idx == current_world;
+                                                    let name_text = if is_current {
+                                                        format!("* {}", world.name)
+                                                    } else {
+                                                        format!("  {}", world.name)
+                                                    };
+                                                    let name_label = if is_current {
+                                                        egui::RichText::new(&name_text).strong().color(egui::Color32::WHITE)
+                                                    } else {
+                                                        egui::RichText::new(&name_text)
+                                                    };
+                                                    if ui.selectable_label(idx == selected, name_label).clicked() {
+                                                        selected = idx;
+                                                    }
+                                                    // Unseen column (right-aligned)
+                                                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                                        if world.unseen_lines > 0 {
+                                                            ui.label(egui::RichText::new(format!("{}", world.unseen_lines))
+                                                                .color(egui::Color32::YELLOW));
+                                                        } else {
+                                                            ui.label("");
+                                                        }
+                                                    });
+                                                    // Send column (right-aligned)
+                                                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                                        ui.label(format_elapsed_secs(world.last_send_secs));
+                                                    });
+                                                    // Recv column (right-aligned)
+                                                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                                        ui.label(format_elapsed_secs(world.last_recv_secs));
+                                                    });
+                                                    // KeepAlive type
+                                                    ui.label(&world.settings.keep_alive_type);
+                                                    // Last column (right-aligned)
+                                                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                                        ui.label(format_elapsed_secs(world.last_nop_secs));
+                                                    });
+                                                    // Next column (right-aligned)
+                                                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                                        ui.label(format_next_nop(world.last_send_secs, world.last_recv_secs));
+                                                    });
+                                                    ui.end_row();
+                                                }
+                                            });
+                                    });
+                                }
+                                ui.separator();
+                                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                    if ui.button("Close").clicked() {
+                                        should_close = true;
+                                    }
+                                    if ui.button("Switch To").clicked() {
+                                        switch_to_world = Some(selected);
+                                        should_close = true;
+                                    }
                                 });
-                            }
-                            ui.separator();
-                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                if ui.button("Close").clicked() {
-                                    close_popup = true;
-                                }
-                                if ui.button("Switch To").clicked() {
-                                    popup_action = Some(("switch", self.world_list_selected));
-                                    close_popup = true;
-                                }
                             });
-                        });
-                    if !popup_open {
+                        },
+                    );
+
+                    self.world_list_selected = selected;
+                    if let Some(idx) = switch_to_world {
+                        popup_action = Some(("switch", idx));
+                    }
+                    if should_close {
                         close_popup = true;
                     }
                 }
 
-                // World Editor popup
+                // World Editor popup (separate OS window)
                 if let PopupState::WorldEditor(world_idx) = self.popup_state {
-                    let mut popup_open = true;
-                    let frame = egui::Frame::window(&ctx.style())
-                        .inner_margin(egui::Margin { left: 10.0, right: 10.0, top: 10.0, bottom: 10.0 });
-                    egui::Window::new("World Editor")
-                        .collapsible(false)
-                        .resizable(false)
-                        .frame(frame)
-                        .open(&mut popup_open)
-                        .show(ctx, |ui| {
-                            ui.spacing_mut().item_spacing = egui::vec2(10.0, 0.0);
-                            if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
-                                close_popup = true;
-                            }
-                            egui::Grid::new("world_editor_grid")
-                                .num_columns(2)
-                                .spacing([10.0, 8.0])
-                                .show(ui, |ui| {
-                                    ui.label("Name:");
-                                    ui.add(TextEdit::singleline(&mut self.edit_name).desired_width(200.0));
-                                    ui.end_row();
+                    let mut should_close = false;
+                    let mut should_save = false;
+                    let mut should_connect = false;
+                    let mut should_delete = false;
 
-                                    ui.label("Hostname:");
-                                    ui.add(TextEdit::singleline(&mut self.edit_hostname).desired_width(200.0));
-                                    ui.end_row();
+                    // Copy mutable state for viewport
+                    let mut edit_name = self.edit_name.clone();
+                    let mut edit_hostname = self.edit_hostname.clone();
+                    let mut edit_port = self.edit_port.clone();
+                    let mut edit_user = self.edit_user.clone();
+                    let mut edit_password = self.edit_password.clone();
+                    let mut edit_ssl = self.edit_ssl;
+                    let mut edit_log_file = self.edit_log_file.clone();
+                    let mut edit_encoding = self.edit_encoding;
+                    let mut edit_auto_login = self.edit_auto_login;
+                    let mut edit_keep_alive_type = self.edit_keep_alive_type;
+                    let mut edit_keep_alive_cmd = self.edit_keep_alive_cmd.clone();
+                    let can_delete = self.worlds.len() > 1;
 
-                                    ui.label("Port:");
-                                    ui.add(TextEdit::singleline(&mut self.edit_port).desired_width(200.0));
-                                    ui.end_row();
+                    ctx.show_viewport_immediate(
+                        egui::ViewportId::from_hash_of("world_editor_window"),
+                        egui::ViewportBuilder::default()
+                            .with_title("World Editor - Clay MUD Client")
+                            .with_inner_size([350.0, 400.0]),
+                        |ctx, _class| {
+                            egui::CentralPanel::default().show(ctx, |ui| {
+                                ui.spacing_mut().item_spacing = egui::vec2(10.0, 0.0);
+                                if ui.input(|i| i.key_pressed(egui::Key::Escape)) ||
+                                   ui.input(|i| i.viewport().close_requested()) {
+                                    should_close = true;
+                                }
 
-                                    ui.label("User:");
-                                    ui.add(TextEdit::singleline(&mut self.edit_user).desired_width(200.0));
-                                    ui.end_row();
+                                egui::Grid::new("world_editor_grid")
+                                    .num_columns(2)
+                                    .spacing([10.0, 8.0])
+                                    .show(ui, |ui| {
+                                        ui.label("Name:");
+                                        ui.add(TextEdit::singleline(&mut edit_name).desired_width(200.0));
+                                        ui.end_row();
 
-                                    ui.label("Password:");
-                                    ui.add(TextEdit::singleline(&mut self.edit_password)
-                                        .password(true)
-                                        .desired_width(200.0));
-                                    ui.end_row();
+                                        ui.label("Hostname:");
+                                        ui.add(TextEdit::singleline(&mut edit_hostname).desired_width(200.0));
+                                        ui.end_row();
 
-                                    ui.label("Use SSL:");
-                                    ui.checkbox(&mut self.edit_ssl, "");
-                                    ui.end_row();
+                                        ui.label("Port:");
+                                        ui.add(TextEdit::singleline(&mut edit_port).desired_width(200.0));
+                                        ui.end_row();
 
-                                    ui.label("Log file:");
-                                    ui.add(TextEdit::singleline(&mut self.edit_log_file).desired_width(200.0));
-                                    ui.end_row();
+                                        ui.label("User:");
+                                        ui.add(TextEdit::singleline(&mut edit_user).desired_width(200.0));
+                                        ui.end_row();
 
-                                    ui.label("Encoding:");
-                                    if ui.button(self.edit_encoding.name()).clicked() {
-                                        self.edit_encoding = match self.edit_encoding {
-                                            Encoding::Utf8 => Encoding::Latin1,
-                                            Encoding::Latin1 => Encoding::Fansi,
-                                            Encoding::Fansi => Encoding::Utf8,
-                                        };
-                                    }
-                                    ui.end_row();
-
-                                    ui.label("Auto login:");
-                                    if ui.button(self.edit_auto_login.name()).clicked() {
-                                        self.edit_auto_login = self.edit_auto_login.next();
-                                    }
-                                    ui.end_row();
-
-                                    ui.label("Keep-Alive:");
-                                    if ui.button(self.edit_keep_alive_type.name()).clicked() {
-                                        self.edit_keep_alive_type = self.edit_keep_alive_type.next();
-                                    }
-                                    ui.end_row();
-
-                                    // Only show Keep-Alive CMD when Custom is selected
-                                    if self.edit_keep_alive_type == KeepAliveType::Custom {
-                                        ui.label("Keep-Alive CMD:");
-                                        ui.add(TextEdit::singleline(&mut self.edit_keep_alive_cmd)
-                                            .hint_text("use ##rand## for idler tag")
+                                        ui.label("Password:");
+                                        ui.add(TextEdit::singleline(&mut edit_password)
+                                            .password(true)
                                             .desired_width(200.0));
                                         ui.end_row();
-                                    }
-                                });
-                            ui.add_space(10.0);
-                            ui.horizontal(|ui| {
-                                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                    if ui.button("Connect").clicked() {
-                                        popup_action = Some(("connect", world_idx));
-                                        close_popup = true;
-                                    }
-                                    if ui.button("Delete").clicked() {
-                                        // Only allow delete if more than one world exists
-                                        if self.worlds.len() > 1 {
-                                            self.popup_state = PopupState::WorldConfirmDelete(world_idx);
+
+                                        ui.label("Use SSL:");
+                                        ui.checkbox(&mut edit_ssl, "");
+                                        ui.end_row();
+
+                                        ui.label("Log file:");
+                                        ui.add(TextEdit::singleline(&mut edit_log_file).desired_width(200.0));
+                                        ui.end_row();
+
+                                        ui.label("Encoding:");
+                                        if ui.button(edit_encoding.name()).clicked() {
+                                            edit_encoding = match edit_encoding {
+                                                Encoding::Utf8 => Encoding::Latin1,
+                                                Encoding::Latin1 => Encoding::Fansi,
+                                                Encoding::Fansi => Encoding::Utf8,
+                                            };
                                         }
-                                    }
-                                    if ui.button("Cancel").clicked() {
-                                        close_popup = true;
-                                    }
-                                    if ui.button("Save").clicked() {
-                                        // Update local world settings and send to server
-                                        if let Some(world) = self.worlds.get_mut(world_idx) {
-                                            world.name = self.edit_name.clone();
-                                            world.settings.hostname = self.edit_hostname.clone();
-                                            world.settings.port = self.edit_port.clone();
-                                            world.settings.user = self.edit_user.clone();
-                                            world.settings.password = self.edit_password.clone();
-                                            world.settings.use_ssl = self.edit_ssl;
-                                            world.settings.log_file = self.edit_log_file.clone();
-                                            world.settings.encoding = self.edit_encoding.name().to_string();
-                                            world.settings.auto_login = self.edit_auto_login.name().to_string();
-                                            world.settings.keep_alive_type = self.edit_keep_alive_type.name().to_string();
-                                            world.settings.keep_alive_cmd = self.edit_keep_alive_cmd.clone();
+                                        ui.end_row();
+
+                                        ui.label("Auto login:");
+                                        if ui.button(edit_auto_login.name()).clicked() {
+                                            edit_auto_login = edit_auto_login.next();
                                         }
-                                        // Send update to server
-                                        self.update_world_settings(world_idx);
-                                        close_popup = true;
-                                    }
+                                        ui.end_row();
+
+                                        ui.label("Keep-Alive:");
+                                        if ui.button(edit_keep_alive_type.name()).clicked() {
+                                            edit_keep_alive_type = edit_keep_alive_type.next();
+                                        }
+                                        ui.end_row();
+
+                                        // Only show Keep-Alive CMD when Custom is selected
+                                        if edit_keep_alive_type == KeepAliveType::Custom {
+                                            ui.label("Keep-Alive CMD:");
+                                            ui.add(TextEdit::singleline(&mut edit_keep_alive_cmd)
+                                                .hint_text("use ##rand## for idler tag")
+                                                .desired_width(200.0));
+                                            ui.end_row();
+                                        }
+                                    });
+                                ui.add_space(10.0);
+                                ui.horizontal(|ui| {
+                                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                        if ui.button("Connect").clicked() {
+                                            should_save = true;
+                                            should_connect = true;
+                                        }
+                                        if ui.add_enabled(can_delete, egui::Button::new("Delete")).clicked() {
+                                            should_delete = true;
+                                        }
+                                        if ui.button("Cancel").clicked() {
+                                            should_close = true;
+                                        }
+                                        if ui.button("Save").clicked() {
+                                            should_save = true;
+                                        }
+                                    });
                                 });
                             });
-                        });
-                    if !popup_open {
+                        },
+                    );
+
+                    // Apply changes back to self
+                    self.edit_name = edit_name;
+                    self.edit_hostname = edit_hostname;
+                    self.edit_port = edit_port;
+                    self.edit_user = edit_user;
+                    self.edit_password = edit_password;
+                    self.edit_ssl = edit_ssl;
+                    self.edit_log_file = edit_log_file;
+                    self.edit_encoding = edit_encoding;
+                    self.edit_auto_login = edit_auto_login;
+                    self.edit_keep_alive_type = edit_keep_alive_type;
+                    self.edit_keep_alive_cmd = edit_keep_alive_cmd;
+
+                    if should_save {
+                        // Update local world settings and send to server
+                        if let Some(world) = self.worlds.get_mut(world_idx) {
+                            world.name = self.edit_name.clone();
+                            world.settings.hostname = self.edit_hostname.clone();
+                            world.settings.port = self.edit_port.clone();
+                            world.settings.user = self.edit_user.clone();
+                            world.settings.password = self.edit_password.clone();
+                            world.settings.use_ssl = self.edit_ssl;
+                            world.settings.log_file = self.edit_log_file.clone();
+                            world.settings.encoding = self.edit_encoding.name().to_string();
+                            world.settings.auto_login = self.edit_auto_login.name().to_string();
+                            world.settings.keep_alive_type = self.edit_keep_alive_type.name().to_string();
+                            world.settings.keep_alive_cmd = self.edit_keep_alive_cmd.clone();
+                        }
+                        // Send update to server
+                        self.update_world_settings(world_idx);
+                        if should_connect {
+                            popup_action = Some(("connect", world_idx));
+                        }
+                        close_popup = true;
+                    } else if should_delete {
+                        self.popup_state = PopupState::WorldConfirmDelete(world_idx);
+                    } else if should_close {
                         close_popup = true;
                     }
                 }
 
-                // World delete confirmation popup
+                // World delete confirmation popup (separate OS window)
                 if let PopupState::WorldConfirmDelete(world_idx) = self.popup_state {
                     let world_name = self.worlds.get(world_idx)
                         .map(|w| w.name.clone())
                         .unwrap_or_default();
-                    egui::Window::new("Confirm Delete")
-                        .collapsible(false)
-                        .resizable(false)
-                        .show(ctx, |ui| {
-                            ui.label(format!("Delete world '{}'?", world_name));
-                            ui.separator();
-                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                if ui.button("No").clicked() {
-                                    // Go back to world editor
-                                    self.popup_state = PopupState::WorldEditor(world_idx);
+                    let mut should_delete = false;
+                    let mut should_cancel = false;
+
+                    ctx.show_viewport_immediate(
+                        egui::ViewportId::from_hash_of("world_confirm_delete_window"),
+                        egui::ViewportBuilder::default()
+                            .with_title("Confirm Delete - Clay MUD Client")
+                            .with_inner_size([300.0, 100.0]),
+                        |ctx, _class| {
+                            egui::CentralPanel::default().show(ctx, |ui| {
+                                if ui.input(|i| i.key_pressed(egui::Key::Escape)) ||
+                                   ui.input(|i| i.key_pressed(egui::Key::N)) ||
+                                   ui.input(|i| i.viewport().close_requested()) {
+                                    should_cancel = true;
                                 }
-                                if ui.button("Yes").clicked() {
-                                    // Delete the world
-                                    if world_idx < self.worlds.len() && self.worlds.len() > 1 {
-                                        self.worlds.remove(world_idx);
-                                        // Adjust current_world if needed
-                                        if self.current_world >= self.worlds.len() {
-                                            self.current_world = self.worlds.len().saturating_sub(1);
-                                        }
-                                        // Send delete request to server
-                                        if let Some(ref ws_tx) = self.ws_tx {
-                                            let msg = WsMessage::WorldRemoved { world_index: world_idx };
-                                            let _ = ws_tx.send(msg);
-                                        }
+                                if ui.input(|i| i.key_pressed(egui::Key::Y)) {
+                                    should_delete = true;
+                                }
+
+                                ui.label(format!("Delete world '{}'?", world_name));
+                                ui.separator();
+                                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                    if ui.button("No").clicked() {
+                                        should_cancel = true;
                                     }
-                                    close_popup = true;
-                                }
+                                    if ui.button("Yes").clicked() {
+                                        should_delete = true;
+                                    }
+                                });
                             });
-                            if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
-                                self.popup_state = PopupState::WorldEditor(world_idx);
+                        },
+                    );
+
+                    if should_delete {
+                        // Delete the world
+                        if world_idx < self.worlds.len() && self.worlds.len() > 1 {
+                            self.worlds.remove(world_idx);
+                            // Adjust current_world if needed
+                            if self.current_world >= self.worlds.len() {
+                                self.current_world = self.worlds.len().saturating_sub(1);
                             }
-                            if ui.input(|i| i.key_pressed(egui::Key::Y)) {
-                                // Delete the world
-                                if world_idx < self.worlds.len() && self.worlds.len() > 1 {
-                                    self.worlds.remove(world_idx);
-                                    if self.current_world >= self.worlds.len() {
-                                        self.current_world = self.worlds.len().saturating_sub(1);
-                                    }
-                                    if let Some(ref ws_tx) = self.ws_tx {
-                                        let msg = WsMessage::WorldRemoved { world_index: world_idx };
-                                        let _ = ws_tx.send(msg);
-                                    }
-                                }
-                                close_popup = true;
+                            // Send delete request to server
+                            if let Some(ref ws_tx) = self.ws_tx {
+                                let msg = WsMessage::WorldRemoved { world_index: world_idx };
+                                let _ = ws_tx.send(msg);
                             }
-                            if ui.input(|i| i.key_pressed(egui::Key::N)) {
-                                self.popup_state = PopupState::WorldEditor(world_idx);
-                            }
-                        });
+                        }
+                        close_popup = true;
+                    } else if should_cancel {
+                        self.popup_state = PopupState::WorldEditor(world_idx);
+                    }
                 }
 
-                // Setup popup (matches console /setup)
+                // Setup popup - separate OS window
                 if self.popup_state == PopupState::Setup {
-                    let mut popup_open = true;
-                    egui::Window::new("Setup")
-                        .collapsible(false)
-                        .resizable(false)
-                        .open(&mut popup_open)
-                        .show(ctx, |ui| {
-                            if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
-                                close_popup = true;
-                            }
-                            ui.label("Global settings");
-                            ui.separator();
-                            egui::Grid::new("setup_grid")
-                                .num_columns(2)
-                                .spacing([10.0, 8.0])
-                                .show(ui, |ui| {
-                                    ui.label("More mode:");
-                                    let more_text = if self.more_mode { "on" } else { "off" };
-                                    if ui.button(more_text).clicked() {
-                                        self.more_mode = !self.more_mode;
-                                    }
-                                    ui.end_row();
+                    // Copy state for editing in viewport
+                    let mut more_mode = self.more_mode;
+                    let mut spell_check = self.spell_check_enabled;
+                    let mut world_switch = self.world_switch_mode;
+                    let mut debug_enabled = self.debug_enabled;
+                    let mut show_tags = self.show_tags;
+                    let mut input_height = self.input_height;
+                    let mut console_theme = self.console_theme;
+                    let mut gui_theme = self.theme;
+                    let mut should_close = false;
+                    let mut should_save = false;
 
-                                    ui.label("Spell check:");
-                                    let spell_text = if self.spell_check_enabled { "on" } else { "off" };
-                                    if ui.button(spell_text).clicked() {
-                                        self.spell_check_enabled = !self.spell_check_enabled;
-                                    }
-                                    ui.end_row();
-
-                                    ui.label("World Switching:");
-                                    if ui.button(self.world_switch_mode.name()).clicked() {
-                                        self.world_switch_mode = self.world_switch_mode.next();
-                                    }
-                                    ui.end_row();
-
-                                    ui.label("Debug:");
-                                    let debug_text = if self.debug_enabled { "on" } else { "off" };
-                                    if ui.button(debug_text).clicked() {
-                                        self.debug_enabled = !self.debug_enabled;
-                                    }
-                                    ui.end_row();
-
-                                    ui.label("Show tags:");
-                                    let tags_text = if self.show_tags { "on" } else { "off" };
-                                    if ui.button(tags_text).clicked() {
-                                        self.show_tags = !self.show_tags;
-                                    }
-                                    ui.end_row();
-
-                                    ui.label("Input height:");
-                                    ui.horizontal(|ui| {
-                                        if ui.button("-").clicked() && self.input_height > 1 {
-                                            self.input_height -= 1;
+                    ctx.show_viewport_immediate(
+                        egui::ViewportId::from_hash_of("setup_window"),
+                        egui::ViewportBuilder::default()
+                            .with_title("Setup")
+                            .with_inner_size([300.0, 320.0]),
+                        |ctx, _class| {
+                            egui::CentralPanel::default().show(ctx, |ui| {
+                                if ui.input(|i| i.key_pressed(egui::Key::Escape)) ||
+                                   ui.input(|i| i.viewport().close_requested()) {
+                                    should_close = true;
+                                }
+                                ui.label("Global settings");
+                                ui.separator();
+                                egui::Grid::new("setup_grid")
+                                    .num_columns(2)
+                                    .spacing([10.0, 8.0])
+                                    .show(ui, |ui| {
+                                        ui.label("More mode:");
+                                        if ui.button(if more_mode { "on" } else { "off" }).clicked() {
+                                            more_mode = !more_mode;
                                         }
-                                        ui.label(format!("{}", self.input_height));
-                                        if ui.button("+").clicked() && self.input_height < 15 {
-                                            self.input_height += 1;
+                                        ui.end_row();
+
+                                        ui.label("Spell check:");
+                                        if ui.button(if spell_check { "on" } else { "off" }).clicked() {
+                                            spell_check = !spell_check;
                                         }
+                                        ui.end_row();
+
+                                        ui.label("World Switching:");
+                                        if ui.button(world_switch.name()).clicked() {
+                                            world_switch = world_switch.next();
+                                        }
+                                        ui.end_row();
+
+                                        ui.label("Debug:");
+                                        if ui.button(if debug_enabled { "on" } else { "off" }).clicked() {
+                                            debug_enabled = !debug_enabled;
+                                        }
+                                        ui.end_row();
+
+                                        ui.label("Show tags:");
+                                        if ui.button(if show_tags { "on" } else { "off" }).clicked() {
+                                            show_tags = !show_tags;
+                                        }
+                                        ui.end_row();
+
+                                        ui.label("Input height:");
+                                        ui.horizontal(|ui| {
+                                            if ui.button("-").clicked() && input_height > 1 {
+                                                input_height -= 1;
+                                            }
+                                            ui.label(format!("{}", input_height));
+                                            if ui.button("+").clicked() && input_height < 15 {
+                                                input_height += 1;
+                                            }
+                                        });
+                                        ui.end_row();
+
+                                        ui.label("Console Theme:");
+                                        if ui.button(console_theme.name()).clicked() {
+                                            console_theme = console_theme.next();
+                                        }
+                                        ui.end_row();
+
+                                        ui.label("GUI Theme:");
+                                        if ui.button(gui_theme.name()).clicked() {
+                                            gui_theme = gui_theme.next();
+                                        }
+                                        ui.end_row();
                                     });
-                                    ui.end_row();
-
-                                    ui.label("Console Theme:");
-                                    if ui.button(self.console_theme.name()).clicked() {
-                                        self.console_theme = self.console_theme.next();
+                                ui.separator();
+                                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                    if ui.button("Cancel").clicked() {
+                                        should_close = true;
                                     }
-                                    ui.end_row();
-
-                                    ui.label("GUI Theme:");
-                                    if ui.button(self.theme.name()).clicked() {
-                                        self.theme = self.theme.next();
+                                    if ui.button("Save").clicked() {
+                                        should_save = true;
+                                        should_close = true;
                                     }
-                                    ui.end_row();
                                 });
-                            ui.separator();
-                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                if ui.button("Cancel").clicked() {
-                                    close_popup = true;
-                                }
-                                if ui.button("Save").clicked() {
-                                    // Send updated settings to server
-                                    self.update_global_settings();
-                                    close_popup = true;
-                                }
                             });
-                        });
-                    if !popup_open {
+                        },
+                    );
+
+                    // Apply changes back
+                    self.more_mode = more_mode;
+                    self.spell_check_enabled = spell_check;
+                    self.world_switch_mode = world_switch;
+                    self.debug_enabled = debug_enabled;
+                    self.show_tags = show_tags;
+                    self.input_height = input_height;
+                    self.console_theme = console_theme;
+                    self.theme = gui_theme;
+
+                    if should_save {
+                        self.update_global_settings();
+                    }
+                    if should_close {
                         close_popup = true;
                     }
                 }
 
-                // Web popup (matches console /web)
+                // Web popup (matches console /web) - separate OS window
                 if self.popup_state == PopupState::Web {
-                    let mut popup_open = true;
-                    egui::Window::new("Web Settings")
-                        .collapsible(false)
-                        .resizable(false)
-                        .open(&mut popup_open)
-                        .show(ctx, |ui| {
-                            if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
-                                close_popup = true;
-                            }
-                            ui.label("Web server settings");
-                            ui.separator();
-                            egui::Grid::new("web_grid")
-                                .num_columns(2)
-                                .spacing([10.0, 8.0])
-                                .show(ui, |ui| {
-                                    // Protocol selection
-                                    ui.label("Protocol:");
-                                    let proto_text = if self.web_secure { "Secure" } else { "Non-Secure" };
-                                    if ui.button(proto_text).clicked() {
-                                        self.web_secure = !self.web_secure;
-                                    }
-                                    ui.end_row();
+                    let mut should_close = false;
+                    let mut should_save = false;
 
-                                    // HTTP/HTTPS enabled (name changes based on protocol)
-                                    let http_label = if self.web_secure { "HTTPS enabled:" } else { "HTTP enabled:" };
-                                    ui.label(http_label);
-                                    let http_text = if self.http_enabled { "on" } else { "off" };
-                                    if ui.button(http_text).clicked() {
-                                        self.http_enabled = !self.http_enabled;
-                                    }
-                                    ui.end_row();
+                    // Copy mutable state for viewport
+                    let mut web_secure = self.web_secure;
+                    let mut http_enabled = self.http_enabled;
+                    let mut http_port = self.http_port;
+                    let mut ws_enabled = self.ws_enabled;
+                    let mut ws_port = self.ws_port;
+                    let mut ws_allow_list = self.ws_allow_list.clone();
 
-                                    // HTTP/HTTPS port (name changes based on protocol)
-                                    let http_port_label = if self.web_secure { "HTTPS port:" } else { "HTTP port:" };
-                                    ui.label(http_port_label);
-                                    let mut http_port_str = self.http_port.to_string();
-                                    if ui.add(egui::TextEdit::singleline(&mut http_port_str).desired_width(80.0)).changed() {
-                                        if let Ok(port) = http_port_str.parse::<u16>() {
-                                            self.http_port = port;
+                    ctx.show_viewport_immediate(
+                        egui::ViewportId::from_hash_of("web_settings_window"),
+                        egui::ViewportBuilder::default()
+                            .with_title("Web Settings - Clay MUD Client")
+                            .with_inner_size([350.0, 280.0]),
+                        |ctx, _class| {
+                            egui::CentralPanel::default().show(ctx, |ui| {
+                                if ui.input(|i| i.key_pressed(egui::Key::Escape)) ||
+                                   ui.input(|i| i.viewport().close_requested()) {
+                                    should_close = true;
+                                }
+                                ui.label("Web server settings");
+                                ui.separator();
+                                egui::Grid::new("web_grid")
+                                    .num_columns(2)
+                                    .spacing([10.0, 8.0])
+                                    .show(ui, |ui| {
+                                        // Protocol selection
+                                        ui.label("Protocol:");
+                                        let proto_text = if web_secure { "Secure" } else { "Non-Secure" };
+                                        if ui.button(proto_text).clicked() {
+                                            web_secure = !web_secure;
                                         }
-                                    }
-                                    ui.end_row();
+                                        ui.end_row();
 
-                                    // WS/WSS enabled (name changes based on protocol)
-                                    let ws_label = if self.web_secure { "WSS enabled:" } else { "WS enabled:" };
-                                    ui.label(ws_label);
-                                    let ws_text = if self.ws_enabled { "on" } else { "off" };
-                                    if ui.button(ws_text).clicked() {
-                                        self.ws_enabled = !self.ws_enabled;
-                                    }
-                                    ui.end_row();
-
-                                    // WS/WSS port (name changes based on protocol)
-                                    let ws_port_label = if self.web_secure { "WSS port:" } else { "WS port:" };
-                                    ui.label(ws_port_label);
-                                    let mut ws_port_str = self.ws_port.to_string();
-                                    if ui.add(egui::TextEdit::singleline(&mut ws_port_str).desired_width(80.0)).changed() {
-                                        if let Ok(port) = ws_port_str.parse::<u16>() {
-                                            self.ws_port = port;
+                                        // HTTP/HTTPS enabled (name changes based on protocol)
+                                        let http_label = if web_secure { "HTTPS enabled:" } else { "HTTP enabled:" };
+                                        ui.label(http_label);
+                                        let http_text = if http_enabled { "on" } else { "off" };
+                                        if ui.button(http_text).clicked() {
+                                            http_enabled = !http_enabled;
                                         }
-                                    }
-                                    ui.end_row();
+                                        ui.end_row();
 
-                                    // Allow list
-                                    ui.label("Allow List:");
-                                    ui.add(egui::TextEdit::singleline(&mut self.ws_allow_list)
-                                        .hint_text("localhost, 192.168.*")
-                                        .desired_width(200.0));
-                                    ui.end_row();
+                                        // HTTP/HTTPS port (name changes based on protocol)
+                                        let http_port_label = if web_secure { "HTTPS port:" } else { "HTTP port:" };
+                                        ui.label(http_port_label);
+                                        let mut http_port_str = http_port.to_string();
+                                        if ui.add(egui::TextEdit::singleline(&mut http_port_str).desired_width(80.0)).changed() {
+                                            if let Ok(port) = http_port_str.parse::<u16>() {
+                                                http_port = port;
+                                            }
+                                        }
+                                        ui.end_row();
+
+                                        // WS/WSS enabled (name changes based on protocol)
+                                        let ws_label = if web_secure { "WSS enabled:" } else { "WS enabled:" };
+                                        ui.label(ws_label);
+                                        let ws_text = if ws_enabled { "on" } else { "off" };
+                                        if ui.button(ws_text).clicked() {
+                                            ws_enabled = !ws_enabled;
+                                        }
+                                        ui.end_row();
+
+                                        // WS/WSS port (name changes based on protocol)
+                                        let ws_port_label = if web_secure { "WSS port:" } else { "WS port:" };
+                                        ui.label(ws_port_label);
+                                        let mut ws_port_str = ws_port.to_string();
+                                        if ui.add(egui::TextEdit::singleline(&mut ws_port_str).desired_width(80.0)).changed() {
+                                            if let Ok(port) = ws_port_str.parse::<u16>() {
+                                                ws_port = port;
+                                            }
+                                        }
+                                        ui.end_row();
+
+                                        // Allow list
+                                        ui.label("Allow List:");
+                                        ui.add(egui::TextEdit::singleline(&mut ws_allow_list)
+                                            .hint_text("localhost, 192.168.*")
+                                            .desired_width(200.0));
+                                        ui.end_row();
+                                    });
+                                ui.separator();
+                                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                    if ui.button("Cancel").clicked() {
+                                        should_close = true;
+                                    }
+                                    if ui.button("Save").clicked() {
+                                        should_save = true;
+                                    }
                                 });
-                            ui.separator();
-                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                if ui.button("Cancel").clicked() {
-                                    close_popup = true;
-                                }
-                                if ui.button("Save").clicked() {
-                                    // Send updated settings to server
-                                    self.update_global_settings();
-                                    close_popup = true;
-                                }
                             });
-                        });
-                    if !popup_open {
+                        },
+                    );
+
+                    // Apply changes back to self
+                    self.web_secure = web_secure;
+                    self.http_enabled = http_enabled;
+                    self.http_port = http_port;
+                    self.ws_enabled = ws_enabled;
+                    self.ws_port = ws_port;
+                    self.ws_allow_list = ws_allow_list;
+
+                    if should_save {
+                        self.update_global_settings();
+                        close_popup = true;
+                    } else if should_close {
                         close_popup = true;
                     }
                 }
 
-                // Font popup
+                // Font popup - separate OS window
                 if self.popup_state == PopupState::Font {
                     // Common monospace font families
                     const FONT_FAMILIES: &[(&str, &str)] = &[
@@ -8775,373 +8902,455 @@ mod remote_gui {
                         ("Consolas", "Consolas"),
                     ];
 
-                    let mut popup_open = true;
-                    egui::Window::new("Font Settings")
-                        .collapsible(false)
-                        .resizable(false)
-                        .open(&mut popup_open)
-                        .show(ctx, |ui| {
-                            if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
-                                close_popup = true;
-                            }
-                            egui::Grid::new("font_grid")
-                                .num_columns(2)
-                                .spacing([10.0, 8.0])
-                                .show(ui, |ui| {
-                                    ui.label("Font family:");
-                                    let current_label = FONT_FAMILIES.iter()
-                                        .find(|(value, _)| *value == self.edit_font_name)
-                                        .map(|(_, label)| *label)
-                                        .unwrap_or_else(|| {
-                                            if self.edit_font_name.is_empty() { "System Default" } else { &self.edit_font_name }
-                                        });
-                                    egui::ComboBox::from_id_salt("font_family")
-                                        .selected_text(current_label)
-                                        .width(180.0)
-                                        .show_ui(ui, |ui| {
-                                            for (value, label) in FONT_FAMILIES {
-                                                if ui.selectable_value(&mut self.edit_font_name, value.to_string(), *label).clicked() {
-                                                    // Selection handled by selectable_value
-                                                }
-                                            }
-                                        });
-                                    ui.end_row();
+                    let mut should_close = false;
+                    let mut should_save = false;
 
-                                    ui.label("Font size:");
-                                    ui.horizontal(|ui| {
-                                        if ui.button("-").clicked() {
-                                            if let Ok(size) = self.edit_font_size.parse::<f32>() {
-                                                let new_size = (size - 1.0).max(8.0);
-                                                self.edit_font_size = format!("{:.1}", new_size);
-                                            }
-                                        }
-                                        ui.add(egui::TextEdit::singleline(&mut self.edit_font_size)
-                                            .desired_width(50.0));
-                                        if ui.button("+").clicked() {
-                                            if let Ok(size) = self.edit_font_size.parse::<f32>() {
-                                                let new_size = (size + 1.0).min(48.0);
-                                                self.edit_font_size = format!("{:.1}", new_size);
-                                            }
-                                        }
-                                    });
-                                    ui.end_row();
-                                });
-                            ui.separator();
-                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                if ui.button("Cancel").clicked() {
-                                    close_popup = true;
+                    // Copy mutable state for viewport
+                    let mut edit_font_name = self.edit_font_name.clone();
+                    let mut edit_font_size = self.edit_font_size.clone();
+
+                    ctx.show_viewport_immediate(
+                        egui::ViewportId::from_hash_of("font_settings_window"),
+                        egui::ViewportBuilder::default()
+                            .with_title("Font Settings - Clay MUD Client")
+                            .with_inner_size([350.0, 150.0]),
+                        |ctx, _class| {
+                            egui::CentralPanel::default().show(ctx, |ui| {
+                                if ui.input(|i| i.key_pressed(egui::Key::Escape)) ||
+                                   ui.input(|i| i.viewport().close_requested()) {
+                                    should_close = true;
                                 }
-                                if ui.button("OK").clicked() {
-                                    // Parse and apply font settings
-                                    self.font_name = self.edit_font_name.clone();
-                                    if let Ok(size) = self.edit_font_size.parse::<f32>() {
-                                        self.font_size = size.clamp(8.0, 48.0);
-                                    }
-                                    // Send updated settings to server
-                                    self.update_global_settings();
-                                    close_popup = true;
-                                }
-                            });
-                        });
-                    if !popup_open {
-                        close_popup = true;
-                    }
-                }
 
-                // Help popup
-                if self.popup_state == PopupState::Help {
-                    let mut popup_open = true;
-                    egui::Window::new("Help")
-                        .collapsible(false)
-                        .resizable(true)
-                        .default_size([450.0, 400.0])
-                        .open(&mut popup_open)
-                        .show(ctx, |ui| {
-                            // Check for Escape key to close
-                            if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
-                                close_popup = true;
-                            }
-
-                            egui::ScrollArea::vertical()
-                                .max_height(350.0)
-                                .show(ui, |ui| {
-                                    ui.label(egui::RichText::new("Clay - A MUD Client").strong().size(16.0));
-                                    ui.add_space(8.0);
-
-                                    ui.label(egui::RichText::new("World Switching").strong());
-                                    ui.label("  Up/Down      - Cycle through active worlds");
-                                    ui.label("  Shift+Up/Down - Cycle through all worlds");
-                                    ui.add_space(4.0);
-
-                                    ui.label(egui::RichText::new("Output Navigation").strong());
-                                    ui.label("  PageUp/Down  - Scroll through output history");
-                                    ui.label("  Tab          - Release one screenful (when paused)");
-                                    ui.label("  Alt+J        - Jump to end, release all pending");
-                                    ui.add_space(4.0);
-
-                                    ui.label(egui::RichText::new("Input").strong());
-                                    ui.label("  Enter        - Send command");
-                                    ui.label("  Ctrl+P/N     - Previous/Next command history");
-                                    ui.label("  Ctrl+U       - Clear input line");
-                                    ui.label("  Ctrl+W       - Delete word before cursor");
-                                    ui.label("  Ctrl+Q       - Spell check suggestions");
-                                    ui.add_space(4.0);
-
-                                    ui.label(egui::RichText::new("Display").strong());
-                                    ui.label("  F2           - Toggle MUD tag display");
-                                    ui.label("  F4           - Open filter popup");
-                                    ui.add_space(4.0);
-
-                                    ui.label(egui::RichText::new("Options Menu").strong());
-                                    ui.label("  World List   - View and select worlds");
-                                    ui.label("  World Editor - Edit world connection settings");
-                                    ui.label("  Setup        - Global settings");
-                                    ui.label("  Font         - Change font family and size");
-                                    ui.label("  Connect      - Connect to current world");
-                                    ui.label("  Disconnect   - Disconnect from current world");
-                                });
-
-                            ui.separator();
-                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                if ui.button("OK").clicked() {
-                                    close_popup = true;
-                                }
-                            });
-                        });
-                    if !popup_open {
-                        close_popup = true;
-                    }
-                }
-
-                // Actions List popup (first window)
-                if self.popup_state == PopupState::ActionsList {
-                    let mut popup_open = true;
-                    egui::Window::new("Actions")
-                        .collapsible(false)
-                        .resizable(true)
-                        .default_size([450.0, 300.0])
-                        .open(&mut popup_open)
-                        .show(ctx, |ui| {
-                            if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
-                                close_popup = true;
-                            }
-
-                            // Actions list with columns: Name, World, Pattern
-                            ui.label(egui::RichText::new("Saved Actions").strong());
-                            ui.separator();
-
-                            if self.actions.is_empty() {
-                                ui.label("No actions defined.");
-                            } else {
-                                egui::ScrollArea::vertical()
-                                    .max_height(180.0)
+                                egui::Grid::new("font_grid")
+                                    .num_columns(2)
+                                    .spacing([10.0, 8.0])
                                     .show(ui, |ui| {
-                                        egui::Grid::new("actions_list_grid")
-                                            .num_columns(3)
-                                            .min_col_width(80.0)
-                                            .spacing([10.0, 4.0])
-                                            .striped(true)
-                                            .show(ui, |ui| {
-                                                // Header
-                                                ui.label(egui::RichText::new("Name").strong());
-                                                ui.label(egui::RichText::new("World").strong());
-                                                ui.label(egui::RichText::new("Pattern").strong());
-                                                ui.end_row();
-
-                                                // Actions
-                                                for (idx, action) in self.actions.iter().enumerate() {
-                                                    let is_selected = idx == self.actions_selected;
-                                                    let name_text = if is_selected {
-                                                        egui::RichText::new(&action.name).strong().color(egui::Color32::WHITE)
-                                                    } else {
-                                                        egui::RichText::new(&action.name)
-                                                    };
-                                                    if ui.selectable_label(is_selected, name_text).clicked() {
-                                                        self.actions_selected = idx;
+                                        ui.label("Font family:");
+                                        let current_label = FONT_FAMILIES.iter()
+                                            .find(|(value, _)| *value == edit_font_name)
+                                            .map(|(_, label)| *label)
+                                            .unwrap_or_else(|| {
+                                                if edit_font_name.is_empty() { "System Default" } else { &edit_font_name }
+                                            });
+                                        egui::ComboBox::from_id_salt("font_family")
+                                            .selected_text(current_label)
+                                            .width(180.0)
+                                            .show_ui(ui, |ui| {
+                                                for (value, label) in FONT_FAMILIES {
+                                                    if ui.selectable_value(&mut edit_font_name, value.to_string(), *label).clicked() {
+                                                        // Selection handled by selectable_value
                                                     }
-                                                    let world_display = if action.world.is_empty() { "(all)" } else { &action.world };
-                                                    ui.label(world_display);
-                                                    let pattern_display = if action.pattern.is_empty() { "(manual)" } else { &action.pattern };
-                                                    ui.label(pattern_display);
-                                                    ui.end_row();
                                                 }
                                             });
+                                        ui.end_row();
+
+                                        ui.label("Font size:");
+                                        ui.horizontal(|ui| {
+                                            if ui.button("-").clicked() {
+                                                if let Ok(size) = edit_font_size.parse::<f32>() {
+                                                    let new_size = (size - 1.0).max(8.0);
+                                                    edit_font_size = format!("{:.1}", new_size);
+                                                }
+                                            }
+                                            ui.add(egui::TextEdit::singleline(&mut edit_font_size)
+                                                .desired_width(50.0));
+                                            if ui.button("+").clicked() {
+                                                if let Ok(size) = edit_font_size.parse::<f32>() {
+                                                    let new_size = (size + 1.0).min(48.0);
+                                                    edit_font_size = format!("{:.1}", new_size);
+                                                }
+                                            }
+                                        });
+                                        ui.end_row();
                                     });
-                            }
-
-                            ui.separator();
-
-                            // Buttons: Add, Edit, Delete, Cancel
-                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                if ui.button("Cancel").clicked() {
-                                    close_popup = true;
-                                }
-                                if ui.button("Delete").clicked() && !self.actions.is_empty() {
-                                    self.popup_state = PopupState::ActionConfirmDelete;
-                                }
-                                if ui.button("Edit").clicked() && !self.actions.is_empty() {
-                                    // Load selected action into editor
-                                    if let Some(action) = self.actions.get(self.actions_selected) {
-                                        self.edit_action_name = action.name.clone();
-                                        self.edit_action_world = action.world.clone();
-                                        self.edit_action_pattern = action.pattern.clone();
-                                        self.edit_action_command = action.command.clone();
-                                        self.action_error = None;
-                                        self.popup_state = PopupState::ActionEditor(self.actions_selected);
+                                ui.separator();
+                                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                    if ui.button("Cancel").clicked() {
+                                        should_close = true;
                                     }
-                                }
-                                if ui.button("Add").clicked() {
-                                    // Create new action and open editor
-                                    self.edit_action_name = String::new();
-                                    self.edit_action_world = String::new();
-                                    self.edit_action_pattern = String::new();
-                                    self.edit_action_command = String::new();
-                                    self.action_error = None;
-                                    self.popup_state = PopupState::ActionEditor(usize::MAX); // MAX = new action
-                                }
+                                    if ui.button("OK").clicked() {
+                                        should_save = true;
+                                    }
+                                });
                             });
-                        });
-                    if !popup_open {
+                        },
+                    );
+
+                    // Apply changes back to self
+                    self.edit_font_name = edit_font_name;
+                    self.edit_font_size = edit_font_size;
+
+                    if should_save {
+                        // Parse and apply font settings
+                        self.font_name = self.edit_font_name.clone();
+                        if let Ok(size) = self.edit_font_size.parse::<f32>() {
+                            self.font_size = size.clamp(8.0, 48.0);
+                        }
+                        // Send updated settings to server
+                        self.update_global_settings();
+                        close_popup = true;
+                    } else if should_close {
                         close_popup = true;
                     }
                 }
 
-                // Actions Editor popup (second window)
-                if let PopupState::ActionEditor(edit_idx) = self.popup_state.clone() {
-                    let mut popup_open = true;
-                    let title = if edit_idx == usize::MAX { "New Action" } else { "Edit Action" };
-                    egui::Window::new(title)
-                        .collapsible(false)
-                        .resizable(true)
-                        .default_size([400.0, 350.0])
-                        .open(&mut popup_open)
-                        .show(ctx, |ui| {
-                            if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
-                                // Return to actions list
-                                self.popup_state = PopupState::ActionsList;
-                            }
-
-                            egui::Grid::new("action_editor_grid")
-                                .num_columns(2)
-                                .spacing([10.0, 8.0])
-                                .show(ui, |ui| {
-                                    ui.label("Name:");
-                                    ui.add(egui::TextEdit::singleline(&mut self.edit_action_name)
-                                        .desired_width(250.0));
-                                    ui.end_row();
-
-                                    ui.label("World:");
-                                    ui.add(egui::TextEdit::singleline(&mut self.edit_action_world)
-                                        .hint_text("(empty = all worlds)")
-                                        .desired_width(250.0));
-                                    ui.end_row();
-
-                                    ui.label("Pattern:");
-                                    ui.add(egui::TextEdit::singleline(&mut self.edit_action_pattern)
-                                        .hint_text("(regex, empty = manual only)")
-                                        .desired_width(250.0));
-                                    ui.end_row();
-
-                                    ui.label("Command:");
-                                    ui.end_row();
-                                });
-
-                            // Larger command area
-                            ui.add(egui::TextEdit::multiline(&mut self.edit_action_command)
-                                .hint_text("Commands (semicolon-separated)")
-                                .desired_width(f32::INFINITY)
-                                .desired_rows(5));
-
-                            // Error message
-                            if let Some(ref err) = self.action_error {
-                                ui.colored_label(egui::Color32::RED, err);
-                            }
-
-                            ui.separator();
-
-                            // Buttons: Save, Cancel
-                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                if ui.button("Cancel").clicked() {
-                                    self.popup_state = PopupState::ActionsList;
+                // Help popup - separate OS window
+                if self.popup_state == PopupState::Help {
+                    let mut should_close = false;
+                    ctx.show_viewport_immediate(
+                        egui::ViewportId::from_hash_of("help_window"),
+                        egui::ViewportBuilder::default()
+                            .with_title("Help - Clay MUD Client")
+                            .with_inner_size([450.0, 400.0]),
+                        |ctx, _class| {
+                            egui::CentralPanel::default().show(ctx, |ui| {
+                                // Check for Escape key or window close
+                                if ui.input(|i| i.key_pressed(egui::Key::Escape)) ||
+                                   ui.input(|i| i.viewport().close_requested()) {
+                                    should_close = true;
                                 }
-                                if ui.button("Save").clicked() {
-                                    // Validate
-                                    let name = self.edit_action_name.trim();
-                                    if name.is_empty() {
-                                        self.action_error = Some("Name is required".to_string());
-                                    } else {
-                                        // Check for duplicates (excluding current if editing)
-                                        let mut duplicate = false;
-                                        for (i, a) in self.actions.iter().enumerate() {
-                                            if (edit_idx == usize::MAX || i != edit_idx) &&
-                                               a.name.eq_ignore_ascii_case(name) {
-                                                self.action_error = Some(format!("Action '{}' already exists", name));
-                                                duplicate = true;
-                                                break;
+
+                                egui::ScrollArea::vertical()
+                                    .max_height(330.0)
+                                    .show(ui, |ui| {
+                                        ui.label(egui::RichText::new("Clay - A MUD Client").strong().size(16.0));
+                                        ui.add_space(8.0);
+
+                                        ui.label(egui::RichText::new("World Switching").strong());
+                                        ui.label("  Up/Down      - Cycle through active worlds");
+                                        ui.label("  Shift+Up/Down - Cycle through all worlds");
+                                        ui.add_space(4.0);
+
+                                        ui.label(egui::RichText::new("Output Navigation").strong());
+                                        ui.label("  PageUp/Down  - Scroll through output history");
+                                        ui.label("  Tab          - Release one screenful (when paused)");
+                                        ui.label("  Alt+J        - Jump to end, release all pending");
+                                        ui.add_space(4.0);
+
+                                        ui.label(egui::RichText::new("Input").strong());
+                                        ui.label("  Enter        - Send command");
+                                        ui.label("  Ctrl+P/N     - Previous/Next command history");
+                                        ui.label("  Ctrl+U       - Clear input line");
+                                        ui.label("  Ctrl+W       - Delete word before cursor");
+                                        ui.label("  Ctrl+Q       - Spell check suggestions");
+                                        ui.add_space(4.0);
+
+                                        ui.label(egui::RichText::new("Display").strong());
+                                        ui.label("  F2           - Toggle MUD tag display");
+                                        ui.label("  F4           - Open filter popup");
+                                        ui.add_space(4.0);
+
+                                        ui.label(egui::RichText::new("Options Menu").strong());
+                                        ui.label("  World List   - View and select worlds");
+                                        ui.label("  World Editor - Edit world connection settings");
+                                        ui.label("  Setup        - Global settings");
+                                        ui.label("  Font         - Change font family and size");
+                                        ui.label("  Connect      - Connect to current world");
+                                        ui.label("  Disconnect   - Disconnect from current world");
+                                    });
+
+                                ui.separator();
+                                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                    if ui.button("OK").clicked() {
+                                        should_close = true;
+                                    }
+                                });
+                            });
+                        },
+                    );
+                    if should_close {
+                        close_popup = true;
+                    }
+                }
+
+                // Actions List popup (separate OS window)
+                if self.popup_state == PopupState::ActionsList {
+                    let mut should_close = false;
+                    let mut new_popup_state: Option<PopupState> = None;
+                    let mut actions_selected = self.actions_selected;
+                    let actions_clone = self.actions.clone();
+
+                    // State for opening editor
+                    let mut open_editor_idx: Option<usize> = None;
+                    let mut add_new_action = false;
+
+                    ctx.show_viewport_immediate(
+                        egui::ViewportId::from_hash_of("actions_list_window"),
+                        egui::ViewportBuilder::default()
+                            .with_title("Actions - Clay MUD Client")
+                            .with_inner_size([450.0, 300.0]),
+                        |ctx, _class| {
+                            egui::CentralPanel::default().show(ctx, |ui| {
+                                if ui.input(|i| i.key_pressed(egui::Key::Escape)) ||
+                                   ui.input(|i| i.viewport().close_requested()) {
+                                    should_close = true;
+                                }
+
+                                // Actions list with columns: Name, World, Pattern
+                                ui.label(egui::RichText::new("Saved Actions").strong());
+                                ui.separator();
+
+                                if actions_clone.is_empty() {
+                                    ui.label("No actions defined.");
+                                } else {
+                                    egui::ScrollArea::vertical()
+                                        .max_height(180.0)
+                                        .show(ui, |ui| {
+                                            egui::Grid::new("actions_list_grid")
+                                                .num_columns(3)
+                                                .min_col_width(80.0)
+                                                .spacing([10.0, 4.0])
+                                                .striped(true)
+                                                .show(ui, |ui| {
+                                                    // Header
+                                                    ui.label(egui::RichText::new("Name").strong());
+                                                    ui.label(egui::RichText::new("World").strong());
+                                                    ui.label(egui::RichText::new("Pattern").strong());
+                                                    ui.end_row();
+
+                                                    // Actions
+                                                    for (idx, action) in actions_clone.iter().enumerate() {
+                                                        let is_selected = idx == actions_selected;
+                                                        let name_text = if is_selected {
+                                                            egui::RichText::new(&action.name).strong().color(egui::Color32::WHITE)
+                                                        } else {
+                                                            egui::RichText::new(&action.name)
+                                                        };
+                                                        if ui.selectable_label(is_selected, name_text).clicked() {
+                                                            actions_selected = idx;
+                                                        }
+                                                        let world_display = if action.world.is_empty() { "(all)" } else { &action.world };
+                                                        ui.label(world_display);
+                                                        let pattern_display = if action.pattern.is_empty() { "(manual)" } else { &action.pattern };
+                                                        ui.label(pattern_display);
+                                                        ui.end_row();
+                                                    }
+                                                });
+                                        });
+                                }
+
+                                ui.separator();
+
+                                // Buttons: Add, Edit, Delete, Cancel
+                                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                    if ui.button("Cancel").clicked() {
+                                        should_close = true;
+                                    }
+                                    if ui.button("Delete").clicked() && !actions_clone.is_empty() {
+                                        new_popup_state = Some(PopupState::ActionConfirmDelete);
+                                    }
+                                    if ui.button("Edit").clicked() && !actions_clone.is_empty() {
+                                        open_editor_idx = Some(actions_selected);
+                                    }
+                                    if ui.button("Add").clicked() {
+                                        add_new_action = true;
+                                    }
+                                });
+                            });
+                        },
+                    );
+
+                    // Apply changes back to self
+                    self.actions_selected = actions_selected;
+
+                    if let Some(state) = new_popup_state {
+                        self.popup_state = state;
+                    } else if let Some(idx) = open_editor_idx {
+                        // Load selected action into editor
+                        if let Some(action) = self.actions.get(idx) {
+                            self.edit_action_name = action.name.clone();
+                            self.edit_action_world = action.world.clone();
+                            self.edit_action_pattern = action.pattern.clone();
+                            self.edit_action_command = action.command.clone();
+                            self.action_error = None;
+                            self.popup_state = PopupState::ActionEditor(idx);
+                        }
+                    } else if add_new_action {
+                        // Create new action and open editor
+                        self.edit_action_name = String::new();
+                        self.edit_action_world = String::new();
+                        self.edit_action_pattern = String::new();
+                        self.edit_action_command = String::new();
+                        self.action_error = None;
+                        self.popup_state = PopupState::ActionEditor(usize::MAX); // MAX = new action
+                    } else if should_close {
+                        close_popup = true;
+                    }
+                }
+
+                // Actions Editor popup (separate OS window)
+                if let PopupState::ActionEditor(edit_idx) = self.popup_state.clone() {
+                    let title = if edit_idx == usize::MAX { "New Action - Clay MUD Client" } else { "Edit Action - Clay MUD Client" };
+                    let mut should_close = false;
+                    let mut should_save = false;
+
+                    // Copy mutable state for viewport
+                    let mut edit_action_name = self.edit_action_name.clone();
+                    let mut edit_action_world = self.edit_action_world.clone();
+                    let mut edit_action_pattern = self.edit_action_pattern.clone();
+                    let mut edit_action_command = self.edit_action_command.clone();
+                    let mut action_error = self.action_error.clone();
+                    let actions_clone = self.actions.clone();
+
+                    ctx.show_viewport_immediate(
+                        egui::ViewportId::from_hash_of("actions_editor_window"),
+                        egui::ViewportBuilder::default()
+                            .with_title(title)
+                            .with_inner_size([400.0, 350.0]),
+                        |ctx, _class| {
+                            egui::CentralPanel::default().show(ctx, |ui| {
+                                if ui.input(|i| i.key_pressed(egui::Key::Escape)) ||
+                                   ui.input(|i| i.viewport().close_requested()) {
+                                    should_close = true;
+                                }
+
+                                egui::Grid::new("action_editor_grid")
+                                    .num_columns(2)
+                                    .spacing([10.0, 8.0])
+                                    .show(ui, |ui| {
+                                        ui.label("Name:");
+                                        ui.add(egui::TextEdit::singleline(&mut edit_action_name)
+                                            .desired_width(250.0));
+                                        ui.end_row();
+
+                                        ui.label("World:");
+                                        ui.add(egui::TextEdit::singleline(&mut edit_action_world)
+                                            .hint_text("(empty = all worlds)")
+                                            .desired_width(250.0));
+                                        ui.end_row();
+
+                                        ui.label("Pattern:");
+                                        ui.add(egui::TextEdit::singleline(&mut edit_action_pattern)
+                                            .hint_text("(regex, empty = manual only)")
+                                            .desired_width(250.0));
+                                        ui.end_row();
+
+                                        ui.label("Command:");
+                                        ui.end_row();
+                                    });
+
+                                // Larger command area
+                                ui.add(egui::TextEdit::multiline(&mut edit_action_command)
+                                    .hint_text("Commands (semicolon-separated)")
+                                    .desired_width(f32::INFINITY)
+                                    .desired_rows(5));
+
+                                // Error message
+                                if let Some(ref err) = action_error {
+                                    ui.colored_label(egui::Color32::RED, err);
+                                }
+
+                                ui.separator();
+
+                                // Buttons: Save, Cancel
+                                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                    if ui.button("Cancel").clicked() {
+                                        should_close = true;
+                                    }
+                                    if ui.button("Save").clicked() {
+                                        // Validate
+                                        let name = edit_action_name.trim();
+                                        if name.is_empty() {
+                                            action_error = Some("Name is required".to_string());
+                                        } else {
+                                            // Check for duplicates (excluding current if editing)
+                                            let mut duplicate = false;
+                                            for (i, a) in actions_clone.iter().enumerate() {
+                                                if (edit_idx == usize::MAX || i != edit_idx) &&
+                                                   a.name.eq_ignore_ascii_case(name) {
+                                                    action_error = Some(format!("Action '{}' already exists", name));
+                                                    duplicate = true;
+                                                    break;
+                                                }
                                             }
-                                        }
-                                        if !duplicate {
-                                            let new_action = Action {
-                                                name: name.to_string(),
-                                                world: self.edit_action_world.trim().to_string(),
-                                                pattern: self.edit_action_pattern.clone(),
-                                                command: self.edit_action_command.clone(),
-                                            };
-                                            if edit_idx == usize::MAX {
-                                                // New action
-                                                self.actions.push(new_action);
-                                                self.actions_selected = self.actions.len() - 1;
-                                            } else {
-                                                // Update existing
-                                                self.actions[edit_idx] = new_action;
+                                            if !duplicate {
+                                                should_save = true;
                                             }
-                                            // Send updated actions to server
-                                            self.update_actions();
-                                            self.popup_state = PopupState::ActionsList;
                                         }
                                     }
-                                }
+                                });
                             });
-                        });
-                    if !popup_open {
+                        },
+                    );
+
+                    // Apply changes back to self
+                    self.edit_action_name = edit_action_name;
+                    self.edit_action_world = edit_action_world;
+                    self.edit_action_pattern = edit_action_pattern;
+                    self.edit_action_command = edit_action_command;
+                    self.action_error = action_error;
+
+                    if should_save {
+                        let new_action = Action {
+                            name: self.edit_action_name.trim().to_string(),
+                            world: self.edit_action_world.trim().to_string(),
+                            pattern: self.edit_action_pattern.clone(),
+                            command: self.edit_action_command.clone(),
+                        };
+                        if edit_idx == usize::MAX {
+                            // New action
+                            self.actions.push(new_action);
+                            self.actions_selected = self.actions.len() - 1;
+                        } else {
+                            // Update existing
+                            self.actions[edit_idx] = new_action;
+                        }
+                        // Send updated actions to server
+                        self.update_actions();
+                        self.popup_state = PopupState::ActionsList;
+                    } else if should_close {
                         self.popup_state = PopupState::ActionsList;
                     }
                 }
 
-                // Action delete confirmation popup
+                // Action delete confirmation popup (separate OS window)
                 if self.popup_state == PopupState::ActionConfirmDelete {
-                    egui::Window::new("Confirm Delete")
-                        .collapsible(false)
-                        .resizable(false)
-                        .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
-                        .show(ctx, |ui| {
-                            if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
-                                self.popup_state = PopupState::ActionsList;
-                            }
+                    let mut should_close = false;
+                    let mut should_delete = false;
+                    let action_name = self.actions.get(self.actions_selected)
+                        .map(|a| a.name.clone())
+                        .unwrap_or_else(|| "(unknown)".to_string());
 
-                            let action_name = self.actions.get(self.actions_selected)
-                                .map(|a| a.name.as_str())
-                                .unwrap_or("(unknown)");
-                            ui.label(format!("Delete action '{}'?", action_name));
-                            ui.add_space(8.0);
-
-                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                if ui.button("No").clicked() {
-                                    self.popup_state = PopupState::ActionsList;
+                    ctx.show_viewport_immediate(
+                        egui::ViewportId::from_hash_of("action_confirm_delete_window"),
+                        egui::ViewportBuilder::default()
+                            .with_title("Confirm Delete - Clay MUD Client")
+                            .with_inner_size([300.0, 100.0]),
+                        |ctx, _class| {
+                            egui::CentralPanel::default().show(ctx, |ui| {
+                                if ui.input(|i| i.key_pressed(egui::Key::Escape)) ||
+                                   ui.input(|i| i.viewport().close_requested()) {
+                                    should_close = true;
                                 }
-                                if ui.button("Yes").clicked() {
-                                    if self.actions_selected < self.actions.len() {
-                                        self.actions.remove(self.actions_selected);
-                                        if self.actions_selected >= self.actions.len() && !self.actions.is_empty() {
-                                            self.actions_selected = self.actions.len() - 1;
-                                        }
-                                        // Send updated actions to server
-                                        self.update_actions();
+
+                                ui.label(format!("Delete action '{}'?", action_name));
+                                ui.add_space(8.0);
+
+                                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                    if ui.button("No").clicked() {
+                                        should_close = true;
                                     }
-                                    self.popup_state = PopupState::ActionsList;
-                                }
+                                    if ui.button("Yes").clicked() {
+                                        should_delete = true;
+                                    }
+                                });
                             });
-                        });
+                        },
+                    );
+
+                    if should_delete {
+                        if self.actions_selected < self.actions.len() {
+                            self.actions.remove(self.actions_selected);
+                            if self.actions_selected >= self.actions.len() && !self.actions.is_empty() {
+                                self.actions_selected = self.actions.len() - 1;
+                            }
+                            // Send updated actions to server
+                            self.update_actions();
+                        }
+                        self.popup_state = PopupState::ActionsList;
+                    } else if should_close {
+                        self.popup_state = PopupState::ActionsList;
+                    }
                 }
 
                 // Handle popup actions
