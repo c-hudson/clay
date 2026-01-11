@@ -1932,6 +1932,7 @@ struct ActionsPopup {
     edit_pattern: String,
     edit_command: String,
     cursor_pos: usize,              // Cursor position in current text field
+    edit_scroll_offset: usize,      // Horizontal scroll offset for long text fields
     error_message: Option<String>,  // Validation error message
     command_expanded: bool,         // Whether command field is expanded to show all lines
 }
@@ -1953,6 +1954,7 @@ impl ActionsPopup {
             edit_pattern: String::new(),
             edit_command: String::new(),
             cursor_pos: 0,
+            edit_scroll_offset: 0,
             error_message: None,
             command_expanded: false,
         }
@@ -1982,6 +1984,7 @@ impl ActionsPopup {
         self.editor_field = ActionEditorField::Name;
         self.error_message = None;
         self.cursor_pos = 0;
+        self.edit_scroll_offset = 0;
         self.command_expanded = false;
 
         if let Some(idx) = index {
@@ -2144,6 +2147,26 @@ impl ActionsPopup {
         self.cursor_pos = self.current_field_text().len();
     }
 
+    /// Adjust scroll offset to keep cursor visible within given visible width
+    fn adjust_scroll(&mut self, visible_width: usize) {
+        if visible_width == 0 {
+            return;
+        }
+        // Convert cursor byte position to character position
+        let text = self.current_field_text();
+        let cursor_char_pos = text[..self.cursor_pos.min(text.len())].chars().count();
+
+        // Keep cursor visible with some margin
+        let margin = 2.min(visible_width / 4);
+        if cursor_char_pos < self.edit_scroll_offset + margin {
+            // Cursor is before visible area, scroll left
+            self.edit_scroll_offset = cursor_char_pos.saturating_sub(margin);
+        } else if cursor_char_pos >= self.edit_scroll_offset + visible_width - margin {
+            // Cursor is after visible area, scroll right
+            self.edit_scroll_offset = cursor_char_pos.saturating_sub(visible_width - margin - 1);
+        }
+    }
+
     // List view field navigation
     fn next_list_field(&mut self) {
         self.list_field = match self.list_field {
@@ -2176,6 +2199,7 @@ impl ActionsPopup {
             ActionEditorField::CancelButton => ActionEditorField::Name,
         };
         self.cursor_pos = self.current_field_text().len();
+        self.edit_scroll_offset = 0; // Reset scroll when switching fields
     }
 
     fn prev_editor_field(&mut self) {
@@ -2188,6 +2212,7 @@ impl ActionsPopup {
             ActionEditorField::CancelButton => ActionEditorField::SaveButton,
         };
         self.cursor_pos = self.current_field_text().len();
+        self.edit_scroll_offset = 0; // Reset scroll when switching fields
     }
 
     fn select_prev_action(&mut self) {
@@ -11066,6 +11091,7 @@ fn handle_key_event(key: KeyEvent, app: &mut App) -> KeyAction {
                             ActionEditorField::Name | ActionEditorField::World |
                             ActionEditorField::Pattern | ActionEditorField::Command => {
                                 app.actions_popup.move_cursor_left();
+                                app.actions_popup.adjust_scroll(44); // field_width for 60-char popup
                             }
                             ActionEditorField::CancelButton => {
                                 app.actions_popup.editor_field = ActionEditorField::SaveButton;
@@ -11078,6 +11104,7 @@ fn handle_key_event(key: KeyEvent, app: &mut App) -> KeyAction {
                             ActionEditorField::Name | ActionEditorField::World |
                             ActionEditorField::Pattern | ActionEditorField::Command => {
                                 app.actions_popup.move_cursor_right();
+                                app.actions_popup.adjust_scroll(44); // field_width for 60-char popup
                             }
                             ActionEditorField::SaveButton => {
                                 app.actions_popup.editor_field = ActionEditorField::CancelButton;
@@ -11087,12 +11114,15 @@ fn handle_key_event(key: KeyEvent, app: &mut App) -> KeyAction {
                     }
                     KeyCode::Home => {
                         app.actions_popup.move_cursor_home();
+                        app.actions_popup.adjust_scroll(44);
                     }
                     KeyCode::End => {
                         app.actions_popup.move_cursor_end();
+                        app.actions_popup.adjust_scroll(44);
                     }
                     KeyCode::Backspace => {
                         app.actions_popup.delete_char();
+                        app.actions_popup.adjust_scroll(44);
                     }
                     KeyCode::Enter => {
                         match app.actions_popup.editor_field {
@@ -11119,6 +11149,7 @@ fn handle_key_event(key: KeyEvent, app: &mut App) -> KeyAction {
                             ActionEditorField::Name | ActionEditorField::World |
                             ActionEditorField::Pattern | ActionEditorField::Command => {
                                 app.actions_popup.insert_char(c);
+                                app.actions_popup.adjust_scroll(44); // field_width for 60-char popup
                             }
                             _ => {}
                         }
@@ -15223,54 +15254,94 @@ fn render_actions_popup(f: &mut Frame, app: &App) {
             let inner_width = popup_width.saturating_sub(4) as usize;
             let field_width = inner_width.saturating_sub(12);
 
-            fn format_field_with_cursor(value: &str, cursor: usize, is_current: bool, max_len: usize) -> String {
+            // Format field with cursor and horizontal scrolling
+            let format_field_scrolled = |value: &str, cursor_byte: usize, is_current: bool, max_len: usize, scroll: usize| -> String {
                 if is_current {
-                    let before = &value[..cursor.min(value.len())];
-                    let after = &value[cursor.min(value.len())..];
-                    let cursor_char = if cursor < value.len() { "" } else { "_" };
-                    let display = format!("{}{}{}", before, cursor_char, after);
-                    truncate_str(&display, max_len).to_string()
+                    let chars: Vec<char> = value.chars().collect();
+                    let cursor_char_pos = value[..cursor_byte.min(value.len())].chars().count();
+                    let chars_len = chars.len();
+
+                    // Calculate visible portion (leave room for scroll indicators)
+                    let visible_width = max_len.saturating_sub(2);
+                    let start = scroll.min(chars_len);
+                    let end = (scroll + visible_width).min(chars_len);
+
+                    let mut display = String::new();
+
+                    // Left scroll indicator
+                    if scroll > 0 {
+                        display.push('<');
+                    } else {
+                        display.push(' ');
+                    }
+
+                    // Visible text with cursor
+                    for (i, &c) in chars.iter().enumerate() {
+                        if i == cursor_char_pos && i >= start && i < end {
+                            display.push('|');
+                        }
+                        if i >= start && i < end {
+                            display.push(c);
+                        }
+                    }
+                    // Cursor at end
+                    if cursor_char_pos >= chars_len && cursor_char_pos >= start {
+                        display.push('|');
+                    }
+
+                    // Right scroll indicator
+                    if end < chars_len {
+                        display.push('>');
+                    }
+
+                    display
                 } else {
+                    // Not current field - just truncate
                     truncate_str(value, max_len).to_string()
                 }
-            }
+            };
 
-            let name_style = if popup.editor_field == ActionEditorField::Name { selected_style } else { value_style };
-            let world_style = if popup.editor_field == ActionEditorField::World { selected_style } else { value_style };
-            let pattern_style = if popup.editor_field == ActionEditorField::Pattern { selected_style } else { value_style };
-            let command_style = if popup.editor_field == ActionEditorField::Command { selected_style } else { value_style };
+            // Use selected_style for label when field is active, value_style for content
+            let name_label_style = if popup.editor_field == ActionEditorField::Name { selected_style } else { label_style };
+            let world_label_style = if popup.editor_field == ActionEditorField::World { selected_style } else { label_style };
+            let pattern_label_style = if popup.editor_field == ActionEditorField::Pattern { selected_style } else { label_style };
+            let command_label_style = if popup.editor_field == ActionEditorField::Command { selected_style } else { label_style };
+
+            // Get scroll offset only for the current field
+            let scroll = popup.edit_scroll_offset;
 
             lines.push(Line::from(""));
 
             lines.push(Line::from(vec![
-                Span::styled("Name:    ", label_style),
+                Span::styled("Name:    ", name_label_style),
                 Span::styled(
-                    format_field_with_cursor(&popup.edit_name, popup.cursor_pos, popup.editor_field == ActionEditorField::Name, field_width),
-                    name_style,
+                    format!("[{}]", format_field_scrolled(&popup.edit_name, popup.cursor_pos, popup.editor_field == ActionEditorField::Name, field_width.saturating_sub(2), if popup.editor_field == ActionEditorField::Name { scroll } else { 0 })),
+                    value_style,
                 ),
             ]));
 
             lines.push(Line::from(vec![
-                Span::styled("World:   ", label_style),
+                Span::styled("World:   ", world_label_style),
                 Span::styled(
-                    format_field_with_cursor(&popup.edit_world, popup.cursor_pos, popup.editor_field == ActionEditorField::World, field_width),
-                    world_style,
+                    format!("[{}]", format_field_scrolled(&popup.edit_world, popup.cursor_pos, popup.editor_field == ActionEditorField::World, field_width.saturating_sub(2), if popup.editor_field == ActionEditorField::World { scroll } else { 0 })),
+                    value_style,
                 ),
             ]));
 
             lines.push(Line::from(vec![
-                Span::styled("Pattern: ", label_style),
+                Span::styled("Pattern: ", pattern_label_style),
                 Span::styled(
-                    format_field_with_cursor(&popup.edit_pattern, popup.cursor_pos, popup.editor_field == ActionEditorField::Pattern, field_width),
-                    pattern_style,
+                    format!("[{}]", format_field_scrolled(&popup.edit_pattern, popup.cursor_pos, popup.editor_field == ActionEditorField::Pattern, field_width.saturating_sub(2), if popup.editor_field == ActionEditorField::Pattern { scroll } else { 0 })),
+                    value_style,
                 ),
             ]));
 
-            lines.push(Line::from(Span::styled("Command:", label_style)));
-            let cmd_display = format_field_with_cursor(&popup.edit_command, popup.cursor_pos, popup.editor_field == ActionEditorField::Command, inner_width.saturating_sub(2));
+            lines.push(Line::from(Span::styled("Command:", command_label_style)));
+            let cmd_display = format_field_scrolled(&popup.edit_command, popup.cursor_pos, popup.editor_field == ActionEditorField::Command, inner_width.saturating_sub(4), if popup.editor_field == ActionEditorField::Command { scroll } else { 0 });
             lines.push(Line::from(vec![
-                Span::styled("  ", label_style),
-                Span::styled(cmd_display, command_style),
+                Span::styled("  [", label_style),
+                Span::styled(cmd_display, value_style),
+                Span::styled("]", label_style),
             ]));
 
             // Show additional command lines if expanded
