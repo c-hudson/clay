@@ -49,7 +49,7 @@ use ratatui::{
     widgets::{Block, Borders, Paragraph},
     Frame, Terminal,
 };
-use regex::Regex;
+use regex::{Regex, RegexBuilder};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream},
@@ -2703,8 +2703,11 @@ fn line_matches_action(
             continue;
         }
 
-        // Try to compile and match the regex
-        if let Ok(regex) = Regex::new(&action.pattern) {
+        // Try to compile and match the regex (case-insensitive)
+        if let Ok(regex) = RegexBuilder::new(&action.pattern)
+            .case_insensitive(true)
+            .build()
+        {
             if regex.is_match(&plain_line) {
                 return true;
             }
@@ -13843,10 +13846,15 @@ fn render_output_crossterm(app: &App) {
         // Apply highlight background if this line matches an action
         if *highlight {
             // Dark yellow/brown background for action-matched lines
-            let _ = stdout.queue(Print("\x1b[48;5;58m"));
+            // Replace any resets in the line to preserve background color
+            let bg_code = "\x1b[48;5;58m";
+            let _ = stdout.queue(Print(bg_code));
+            // Replace \x1b[0m with \x1b[0m\x1b[48;5;58m to preserve background
+            let highlighted = wrapped.replace("\x1b[0m", &format!("\x1b[0m{}", bg_code));
+            let _ = stdout.queue(Print(&highlighted));
+        } else {
+            let _ = stdout.queue(Print(wrapped));
         }
-
-        let _ = stdout.queue(Print(wrapped));
 
         let line_visible_width = visible_width(wrapped);
         if line_visible_width < term_width {
