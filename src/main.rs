@@ -2682,6 +2682,38 @@ fn check_action_triggers(
     None
 }
 
+/// Check if a line matches any action pattern for the given world (for highlighting)
+/// Returns true if the line matches any action's pattern
+fn line_matches_action(
+    line: &str,
+    world_name: &str,
+    actions: &[Action],
+) -> bool {
+    // Strip ANSI codes for pattern matching
+    let plain_line = strip_ansi_codes(line);
+
+    for action in actions {
+        // Skip actions without patterns (those are manual /name only)
+        if action.pattern.is_empty() {
+            continue;
+        }
+
+        // Check if world matches (empty = all worlds)
+        if !action.world.is_empty() && !action.world.eq_ignore_ascii_case(world_name) {
+            continue;
+        }
+
+        // Try to compile and match the regex
+        if let Ok(regex) = Regex::new(&action.pattern) {
+            if regex.is_match(&plain_line) {
+                return true;
+            }
+        }
+    }
+
+    false
+}
+
 const RELOAD_FDS_ENV: &str = "CLAY_RELOAD_FDS";
 const CRASH_COUNT_ENV: &str = "CLAY_CRASH_COUNT";
 const MAX_CRASH_RESTARTS: u32 = 2;
@@ -3212,6 +3244,7 @@ struct App {
     last_ctrl_c: Option<std::time::Instant>,
     last_escape: Option<std::time::Instant>, // For Escape+key sequences (Alt emulation)
     show_tags: bool, // F2 toggles - false = hide tags (default), true = show tags
+    highlight_actions: bool, // F3 toggles - highlight lines matching action patterns
     // WebSocket server (ws:// or wss:// depending on web_secure setting)
     ws_server: Option<WebSocketServer>,
     // HTTP web interface server (no TLS)
@@ -3260,6 +3293,7 @@ impl App {
             last_ctrl_c: None,
             last_escape: None,
             show_tags: false, // Default: hide tags
+            highlight_actions: false, // Default: don't highlight action matches
             ws_server: None,
             http_server: None,
             #[cfg(feature = "native-tls-backend")]
@@ -12288,6 +12322,12 @@ fn handle_key_event(key: KeyEvent, app: &mut App) -> KeyAction {
             KeyAction::Redraw // Force full screen redraw to apply change
         }
 
+        // F3 to toggle action pattern highlighting
+        (_, KeyCode::F(3)) => {
+            app.highlight_actions = !app.highlight_actions;
+            KeyAction::Redraw // Force full screen redraw to apply change
+        }
+
         // F4 to open filter popup
         (_, KeyCode::F(4)) => {
             app.filter_popup.open();
@@ -13676,12 +13716,16 @@ fn render_output_crossterm(app: &App) {
     }
 
     // Collect wrapped lines centered around scroll_offset to fill the screen
-    let mut visual_lines: Vec<String> = Vec::new();
+    // Each entry is (line_text, should_highlight)
+    let mut visual_lines: Vec<(String, bool)> = Vec::new();
     let mut first_line_idx: usize = 0;
 
     let show_tags = app.show_tags;
+    let highlight_actions = app.highlight_actions;
+    let world_name = &world.name;
+    let actions = &app.settings.actions;
 
-    let expand_and_wrap = |line: &OutputLine, term_width: usize, show_tags: bool| -> Vec<String> {
+    let expand_and_wrap = |line: &OutputLine, term_width: usize, show_tags: bool, highlight: bool| -> Vec<(String, bool)> {
         // Skip visually empty lines (only ANSI codes/whitespace)
         if is_visually_empty(&line.text) {
             return Vec::new();
@@ -13696,6 +13740,14 @@ fn render_output_crossterm(app: &App) {
         };
         let expanded = processed.replace('\t', "        ");
         wrap_ansi_line(&expanded, term_width)
+            .into_iter()
+            .map(|s| (s, highlight))
+            .collect()
+    };
+
+    // Helper to check if a line should be highlighted
+    let should_highlight = |line: &OutputLine| -> bool {
+        highlight_actions && line_matches_action(&line.text, world_name, actions)
     };
 
     // Check if filter popup is active with a filter
@@ -13709,7 +13761,8 @@ fn render_output_crossterm(app: &App) {
             let line_idx = filtered[pos];
             if line_idx < world.output_lines.len() {
                 let line = &world.output_lines[line_idx];
-                let wrapped = expand_and_wrap(line, term_width, show_tags);
+                let highlight = should_highlight(line);
+                let wrapped = expand_and_wrap(line, term_width, show_tags, highlight);
 
                 for w in wrapped.into_iter().rev() {
                     visual_lines.insert(0, w);
@@ -13727,7 +13780,8 @@ fn render_output_crossterm(app: &App) {
                 let line_idx = filtered[pos];
                 if line_idx < world.output_lines.len() {
                     let line = &world.output_lines[line_idx];
-                    let wrapped = expand_and_wrap(line, term_width, show_tags);
+                    let highlight = should_highlight(line);
+                    let wrapped = expand_and_wrap(line, term_width, show_tags, highlight);
 
                     for w in wrapped {
                         visual_lines.push(w);
@@ -13747,7 +13801,8 @@ fn render_output_crossterm(app: &App) {
         for line_idx in (0..=end_line).rev() {
             first_line_idx = line_idx;
             let line = &world.output_lines[line_idx];
-            let wrapped = expand_and_wrap(line, term_width, show_tags);
+            let highlight = should_highlight(line);
+            let wrapped = expand_and_wrap(line, term_width, show_tags, highlight);
 
             for w in wrapped.into_iter().rev() {
                 visual_lines.insert(0, w);
@@ -13761,7 +13816,8 @@ fn render_output_crossterm(app: &App) {
         if visual_lines.len() < visible_height && first_line_idx == 0 {
             for line_idx in (end_line + 1)..world.output_lines.len() {
                 let line = &world.output_lines[line_idx];
-                let wrapped = expand_and_wrap(line, term_width, show_tags);
+                let highlight = should_highlight(line);
+                let wrapped = expand_and_wrap(line, term_width, show_tags, highlight);
 
                 for w in wrapped {
                     visual_lines.push(w);
@@ -13774,15 +13830,22 @@ fn render_output_crossterm(app: &App) {
         }
     }
 
-    let lines_to_show: &[String] = if first_line_idx == 0 && visual_lines.len() <= visible_height {
+    let lines_to_show: &[(String, bool)] = if first_line_idx == 0 && visual_lines.len() <= visible_height {
         &visual_lines[..visual_lines.len().min(visible_height)]
     } else {
         let display_start = visual_lines.len().saturating_sub(visible_height);
         &visual_lines[display_start..]
     };
 
-    for (row_idx, wrapped) in lines_to_show.iter().enumerate() {
+    for (row_idx, (wrapped, highlight)) in lines_to_show.iter().enumerate() {
         let _ = stdout.queue(cursor::MoveTo(0, row_idx as u16));
+
+        // Apply highlight background if this line matches an action
+        if *highlight {
+            // Dark yellow/brown background for action-matched lines
+            let _ = stdout.queue(Print("\x1b[48;5;58m"));
+        }
+
         let _ = stdout.queue(Print(wrapped));
 
         let line_visible_width = visible_width(wrapped);

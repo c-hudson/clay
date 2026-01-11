@@ -248,6 +248,7 @@ Prompts that are auto-answered are immediately cleared and not displayed in the 
 **General:**
 - `F1` - Open help popup
 - `F2` - Toggle MUD tag display (show/hide tags like `[channel:]` and timestamps)
+- `F3` - Toggle action pattern highlighting (highlight lines matching action patterns without running commands)
 - `Ctrl+C` - Press twice within 15 seconds to quit
 - `Ctrl+L` - Redraw screen (filters out client-generated output, keeps only MUD server data)
 - `Ctrl+R` - Hot reload (same as /reload)
