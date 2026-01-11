@@ -4501,6 +4501,10 @@ fn save_reload_state(app: &App) -> io::Result<()> {
         writeln!(file, "lines_since_pause={}", world.lines_since_pause)?;
         writeln!(file, "is_tls={}", world.is_tls)?;
         writeln!(file, "was_connected={}", world.was_connected)?;
+        writeln!(file, "telnet_mode={}", world.telnet_mode)?;
+        if !world.prompt.is_empty() {
+            writeln!(file, "prompt={}", world.prompt.replace('=', "\\e"))?;
+        }
 
         // Socket fd if connected (will be passed via env var separately)
         if let Some(fd) = world.socket_fd {
@@ -4639,6 +4643,8 @@ fn load_reload_state(app: &mut App) -> io::Result<bool> {
         lines_since_pause: usize,
         is_tls: bool,
         was_connected: bool,
+        telnet_mode: bool,
+        prompt: String,
         settings: WorldSettings,
     }
 
@@ -4684,6 +4690,8 @@ fn load_reload_state(app: &mut App) -> io::Result<bool> {
                         lines_since_pause: 0,
                         is_tls: false,
                         was_connected: false,
+                        telnet_mode: false,
+                        prompt: String::new(),
                         settings: WorldSettings::default(),
                     });
                 }
@@ -4877,6 +4885,8 @@ fn load_reload_state(app: &mut App) -> io::Result<bool> {
                             "lines_since_pause" => tw.lines_since_pause = value.parse().unwrap_or(0),
                             "is_tls" => tw.is_tls = value == "true",
                             "was_connected" => tw.was_connected = value == "true",
+                            "telnet_mode" => tw.telnet_mode = value == "true",
+                            "prompt" => tw.prompt = unescape_string(value),
                             "socket_fd" => tw.socket_fd = value.parse().ok(),
                             "world_type" => tw.settings.world_type = WorldType::from_name(value),
                             "hostname" => tw.settings.hostname = value.to_string(),
@@ -4946,6 +4956,8 @@ fn load_reload_state(app: &mut App) -> io::Result<bool> {
         world.lines_since_pause = tw.lines_since_pause;
         world.is_tls = tw.is_tls;
         world.was_connected = tw.was_connected;
+        world.telnet_mode = tw.telnet_mode;
+        world.prompt = tw.prompt;
         world.socket_fd = tw.socket_fd;
         world.settings = tw.settings;
         // Leave timing fields as None for connected worlds after reload
