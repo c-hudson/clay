@@ -3259,7 +3259,7 @@ struct App {
     last_ctrl_c: Option<std::time::Instant>,
     last_escape: Option<std::time::Instant>, // For Escape+key sequences (Alt emulation)
     show_tags: bool, // F2 toggles - false = hide tags (default), true = show tags
-    highlight_actions: bool, // F3 toggles - highlight lines matching action patterns
+    highlight_actions: bool, // F8 toggles - highlight lines matching action patterns
     // WebSocket server (ws:// or wss:// depending on web_secure setting)
     ws_server: Option<WebSocketServer>,
     // HTTP web interface server (no TLS)
@@ -12373,8 +12373,8 @@ fn handle_key_event(key: KeyEvent, app: &mut App) -> KeyAction {
             KeyAction::Redraw // Force full screen redraw to apply change
         }
 
-        // F3 to toggle action pattern highlighting
-        (_, KeyCode::F(3)) => {
+        // F8 to toggle action pattern highlighting
+        (_, KeyCode::F(8)) => {
             app.highlight_actions = !app.highlight_actions;
             KeyAction::Redraw // Force full screen redraw to apply change
         }
@@ -13805,45 +13805,49 @@ fn render_output_crossterm(app: &App) {
         highlight_actions && line_matches_action(&line.text, world_name, actions)
     };
 
-    // Check if filter popup is active with a filter
-    if app.filter_popup.visible && !app.filter_popup.filtered_indices.is_empty() {
-        // Use filtered indices
-        let filtered = &app.filter_popup.filtered_indices;
-        let end_pos = app.filter_popup.scroll_offset.min(filtered.len().saturating_sub(1));
+    // Check if filter popup is active with a non-empty filter
+    // If filter is active but no matches, show nothing (don't fall through to normal rendering)
+    if app.filter_popup.visible && !app.filter_popup.filter_text.is_empty() {
+        // If no matches, visual_lines stays empty - that's correct behavior
+        if !app.filter_popup.filtered_indices.is_empty() {
+            // Use filtered indices
+            let filtered = &app.filter_popup.filtered_indices;
+            let end_pos = app.filter_popup.scroll_offset.min(filtered.len().saturating_sub(1));
 
-        // Work backwards from scroll_offset to fill the screen
-        for pos in (0..=end_pos).rev() {
-            let line_idx = filtered[pos];
-            if line_idx < world.output_lines.len() {
-                let line = &world.output_lines[line_idx];
-                let highlight = should_highlight(line);
-                let wrapped = expand_and_wrap(line, term_width, show_tags, highlight);
-
-                for w in wrapped.into_iter().rev() {
-                    visual_lines.insert(0, w);
-                }
-
-                if visual_lines.len() >= visible_height {
-                    break;
-                }
-            }
-        }
-
-        // If we still have room, show lines after scroll_offset
-        if visual_lines.len() < visible_height {
-            for pos in (end_pos + 1)..filtered.len() {
+            // Work backwards from scroll_offset to fill the screen
+            for pos in (0..=end_pos).rev() {
                 let line_idx = filtered[pos];
                 if line_idx < world.output_lines.len() {
                     let line = &world.output_lines[line_idx];
                     let highlight = should_highlight(line);
                     let wrapped = expand_and_wrap(line, term_width, show_tags, highlight);
 
-                    for w in wrapped {
-                        visual_lines.push(w);
+                    for w in wrapped.into_iter().rev() {
+                        visual_lines.insert(0, w);
                     }
 
                     if visual_lines.len() >= visible_height {
                         break;
+                    }
+                }
+            }
+
+            // If we still have room, show lines after scroll_offset
+            if visual_lines.len() < visible_height {
+                for pos in (end_pos + 1)..filtered.len() {
+                    let line_idx = filtered[pos];
+                    if line_idx < world.output_lines.len() {
+                        let line = &world.output_lines[line_idx];
+                        let highlight = should_highlight(line);
+                        let wrapped = expand_and_wrap(line, term_width, show_tags, highlight);
+
+                        for w in wrapped {
+                            visual_lines.push(w);
+                        }
+
+                        if visual_lines.len() >= visible_height {
+                            break;
+                        }
                     }
                 }
             }
