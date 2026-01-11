@@ -13596,27 +13596,7 @@ fn render_output_crossterm(app: &App) {
         let _ = stdout.queue(Print(border_bottom));
     }
 
-    // Restore cursor position for the input area
-    let separator_height = 1u16;
-    let input_area_y = app.output_height + separator_height;
-    let prompt = &app.current_world().prompt;
-    let prompt_visible_len = visible_width(prompt);
-    // Use max(1) to prevent division by zero
-    let input_width = (app.output_width as usize).max(1);
-    let chars_before_cursor = app.input.buffer[..app.input.cursor_position].chars().count();
-
-    let effective_chars = if app.input.viewport_start_line == 0 {
-        chars_before_cursor + prompt_visible_len
-    } else {
-        chars_before_cursor
-    };
-
-    let cursor_line = effective_chars / input_width;
-    let cursor_col = effective_chars % input_width;
-    let cursor_y = input_area_y + (cursor_line as u16).saturating_sub(app.input.viewport_start_line as u16);
-    let cursor_x = cursor_col as u16;
-
-    let _ = stdout.queue(cursor::MoveTo(cursor_x, cursor_y));
+    // Flush output - cursor position is handled by ratatui's terminal.draw()
     let _ = stdout.flush();
 }
 
