@@ -4,6 +4,7 @@ pub struct InputArea {
     pub viewport_start_line: usize,
     pub visible_height: u16,
     pub width: u16,
+    pub prompt_len: usize, // Length of prompt (reduces first line capacity)
     pub history: Vec<String>,
     pub history_index: Option<usize>,
     pub temp_input: String,
@@ -17,6 +18,7 @@ impl InputArea {
             viewport_start_line: 0,
             visible_height,
             width: 80,
+            prompt_len: 0,
             history: Vec::new(),
             history_index: None,
             temp_input: String::new(),
@@ -35,7 +37,24 @@ impl InputArea {
         }
         // Count characters before cursor, not bytes
         let chars_before = self.buffer[..self.cursor_position].chars().count();
-        chars_before / self.width as usize
+        let width = self.width as usize;
+
+        // Account for prompt taking up space on the first line
+        // First line capacity is reduced by prompt_len
+        let first_line_capacity = width.saturating_sub(self.prompt_len);
+
+        if first_line_capacity == 0 {
+            // Prompt fills entire first line, so all input is on subsequent lines
+            // Add 1 for the prompt line, then calculate remaining lines
+            1 + chars_before / width
+        } else if chars_before <= first_line_capacity {
+            // Still on first line
+            0
+        } else {
+            // Past first line: subtract first line chars, then divide by width
+            let remaining_chars = chars_before - first_line_capacity;
+            1 + remaining_chars / width
+        }
     }
 
     pub fn adjust_viewport(&mut self) {

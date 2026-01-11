@@ -13112,8 +13112,9 @@ fn ui(f: &mut Frame, app: &mut App) {
     let separator_area = chunks[1];
     let input_area = chunks[2];
 
-    // Update input dimensions
+    // Update input dimensions and prompt length for viewport calculation
     app.input.set_dimensions(input_area.width, app.input_height);
+    app.input.prompt_len = strip_ansi_codes(&app.current_world().prompt).chars().count();
 
     // Render output area
     render_output_area(f, app, output_area);
