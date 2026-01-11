@@ -19,6 +19,7 @@
                     <div class="dropdown-item" data-action="setup">Setup</div>
                     <div class="dropdown-divider"></div>
                     <div class="dropdown-item" data-action="toggle-tags">Toggle Tags</div>
+                    <div class="dropdown-item" data-action="toggle-highlight">Toggle Highlight</div>
                 </div>
                 <button id="font-small" class="font-btn" title="Small font (phone)">S</button>
                 <button id="font-medium" class="font-btn active" title="Medium font (default)">M</button>
@@ -43,6 +44,7 @@
                     <div class="dropdown-item" data-action="setup">Setup</div>
                     <div class="dropdown-divider"></div>
                     <div class="dropdown-item" data-action="toggle-tags">Toggle Tags</div>
+                    <div class="dropdown-item" data-action="toggle-highlight">Toggle Highlight</div>
                 </div>
                 <button id="mobile-pgup-btn" class="mobile-btn" title="Page Up">PgUp</button>
                 <button id="mobile-pgdn-btn" class="mobile-btn" title="Page Down">PgDn</button>
@@ -86,6 +88,15 @@
             <div class="overlay-content">
                 <div class="spinner"></div>
                 <p>Connecting...</p>
+            </div>
+        </div>
+
+        <!-- Filter popup (F4) -->
+        <div id="filter-popup" class="filter-popup" style="display: none;">
+            <div class="filter-popup-header">Find [Esc to close]</div>
+            <div class="filter-popup-content">
+                <span>Filter: </span>
+                <input type="text" id="filter-input" autocomplete="off">
             </div>
         </div>
 

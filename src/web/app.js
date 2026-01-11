@@ -97,7 +97,10 @@
         setupConsoleThemeBtn: document.getElementById('setup-console-theme-btn'),
         setupGuiThemeBtn: document.getElementById('setup-gui-theme-btn'),
         setupSaveBtn: document.getElementById('setup-save-btn'),
-        setupCancelBtn: document.getElementById('setup-cancel-btn')
+        setupCancelBtn: document.getElementById('setup-cancel-btn'),
+        // Filter popup (F4)
+        filterPopup: document.getElementById('filter-popup'),
+        filterInput: document.getElementById('filter-input')
     };
 
     // State
@@ -132,6 +135,7 @@
 
     // Tag display state
     let showTags = false;
+    let highlightActions = false;
 
     // World popup state
     let worldsPopupOpen = false;
@@ -158,6 +162,10 @@
     let setupInputHeightValue = 1;
     let setupConsoleTheme = 'dark';
     let setupGuiTheme = 'dark';
+
+    // Filter popup state (F4)
+    let filterPopupOpen = false;
+    let filterText = '';
 
     // Current theme values (synced from server)
     let consoleTheme = 'dark';
@@ -981,6 +989,53 @@
     }
 
     // Render output - render all lines as text with line breaks
+    // Filter popup functions
+    function openFilterPopup() {
+        filterPopupOpen = true;
+        filterText = '';
+        elements.filterPopup.style.display = 'block';
+        elements.filterInput.value = '';
+        elements.filterInput.focus();
+    }
+
+    function closeFilterPopup() {
+        filterPopupOpen = false;
+        filterText = '';
+        elements.filterPopup.style.display = 'none';
+        elements.input.focus();
+        renderOutput();
+    }
+
+    function updateFilter() {
+        filterText = elements.filterInput.value;
+        renderOutput();
+    }
+
+    // Strip ANSI codes for filter matching
+    function stripAnsiForFilter(text) {
+        return text.replace(/\x1b\[[0-9;]*[a-zA-Z]/g, '');
+    }
+
+    // Check if a line matches any action pattern (for F8 highlighting)
+    function lineMatchesAction(line, worldName) {
+        const plainLine = stripAnsiForFilter(line).toLowerCase();
+        for (const action of actions) {
+            // Skip actions without patterns
+            if (!action.pattern || action.pattern.trim() === '') continue;
+            // Check world match (empty = all worlds)
+            if (action.world && action.world.trim() !== '' &&
+                action.world.toLowerCase() !== worldName.toLowerCase()) continue;
+            // Try regex match (case-insensitive)
+            try {
+                const regex = new RegExp(action.pattern, 'i');
+                if (regex.test(plainLine)) return true;
+            } catch (e) {
+                // Invalid regex, skip
+            }
+        }
+        return false;
+    }
+
     function renderOutput() {
         elements.output.innerHTML = '';
 
@@ -1002,11 +1057,25 @@
             // Strip newlines/carriage returns
             const cleanLine = String(rawLine).replace(/[\r\n]+/g, '');
 
+            // Filter: skip lines that don't match (case-insensitive)
+            if (filterPopupOpen && filterText.length > 0) {
+                const plainLine = stripAnsiForFilter(cleanLine).toLowerCase();
+                if (!plainLine.includes(filterText.toLowerCase())) {
+                    continue;
+                }
+            }
+
             // Format timestamp prefix if showTags is enabled
             const tsPrefix = showTags && lineTs ? `<span class="timestamp">${formatTimestamp(lineTs)}</span>` : '';
 
             const displayText = showTags ? cleanLine : stripMudTag(cleanLine);
-            const html = tsPrefix + convertDiscordEmojis(linkifyUrls(parseAnsi(insertWordBreaks(displayText))));
+            let html = tsPrefix + convertDiscordEmojis(linkifyUrls(parseAnsi(insertWordBreaks(displayText))));
+
+            // Apply action highlighting if enabled
+            if (highlightActions && lineMatchesAction(cleanLine, world.name || '')) {
+                html = `<span class="action-highlight">${html}</span>`;
+            }
+
             htmlParts.push(html);
         }
 
@@ -2276,6 +2345,10 @@
                 showTags = !showTags;
                 renderOutput();
                 break;
+            case 'toggle-highlight':
+                highlightActions = !highlightActions;
+                renderOutput();
+                break;
         }
     }
 
@@ -2505,10 +2578,47 @@
             }
         };
 
+        // Filter input handler
+        elements.filterInput.addEventListener('input', updateFilter);
+        elements.filterInput.addEventListener('keydown', function(e) {
+            if (e.key === 'Escape') {
+                e.preventDefault();
+                closeFilterPopup();
+            } else if (e.key === 'F4') {
+                e.preventDefault();
+                closeFilterPopup();
+            }
+        });
+
         // Document-level keyboard handler for navigation keys
         document.onkeydown = function(e) {
             // Skip if auth modal is visible
             if (elements.authModal.classList.contains('visible')) return;
+
+            // Handle F-keys and shortcuts globally (before popup checks which have early returns)
+            if (e.key === 'F2') {
+                // F2: Toggle MUD tag display
+                e.preventDefault();
+                showTags = !showTags;
+                renderOutput();
+                return;
+            } else if (e.key === 'F8') {
+                // F8: Toggle action highlighting
+                e.preventDefault();
+                e.stopPropagation();
+                highlightActions = !highlightActions;
+                renderOutput();
+                return;
+            } else if (e.key === 'F4') {
+                // F4: Toggle filter popup
+                e.preventDefault();
+                if (filterPopupOpen) {
+                    closeFilterPopup();
+                } else {
+                    openFilterPopup();
+                }
+                return;
+            }
 
             // Handle actions confirm popup
             if (actionsConfirmPopupOpen) {
@@ -2672,11 +2782,10 @@
                 e.preventDefault();
                 requestNextWorld();
                 elements.input.focus();
-            } else if (e.key === 'F2') {
-                // F2: Toggle MUD tag display
+            } else if (e.key === 'Escape' && filterPopupOpen) {
+                // Escape: Close filter popup if open
                 e.preventDefault();
-                showTags = !showTags;
-                renderOutput();
+                closeFilterPopup();
             }
         };
 
@@ -2783,12 +2892,8 @@
                     linesSincePause = 0;
                     updateStatusBar();
                 }
-            } else if (e.key === 'F2') {
-                // F2: Toggle MUD tag display
-                e.preventDefault();
-                showTags = !showTags;
-                renderOutput();
             }
+            // Note: F2, F3, F4 are handled at document level (before this handler)
         });
 
         // Auth submit

@@ -248,7 +248,7 @@ Prompts that are auto-answered are immediately cleared and not displayed in the 
 **General:**
 - `F1` - Open help popup
 - `F2` - Toggle MUD tag display (show/hide tags like `[channel:]` and timestamps)
-- `F3` - Toggle action pattern highlighting (highlight lines matching action patterns without running commands)
+- `F8` - Toggle action pattern highlighting (highlight lines matching action patterns without running commands)
 - `Ctrl+C` - Press twice within 15 seconds to quit
 - `Ctrl+L` - Redraw screen (filters out client-generated output, keeps only MUD server data)
 - `Ctrl+R` - Hot reload (same as /reload)
@@ -434,6 +434,7 @@ Note: HTTP automatically starts the non-secure WebSocket server if not already r
   - World Selector - Opens world selector popup
   - Actions - Opens actions editor popup
   - Toggle Tags - Show/hide MUD tags (same as F2)
+  - Toggle Highlight - Highlight lines matching action patterns (same as F8)
 - Font size buttons (S/M/L) next to hamburger:
   - **S** (Small, 11px) - Optimized for phone displays
   - **M** (Medium, 14px) - Default size
@@ -466,6 +467,8 @@ Note: HTTP automatically starts the non-secure WebSocket server if not already r
 - `Ctrl+A` - Move cursor to beginning of line
 - `Ctrl+Up/Down` - Resize input area
 - `F2` - Toggle MUD tag display (show/hide tags and timestamps)
+- `F4` - Open filter popup to search output
+- `F8` - Toggle action pattern highlighting
 - `Enter` - Send command
 
 **Web Popup Controls:**
@@ -682,8 +685,8 @@ Actions are automated triggers that match incoming MUD output against regex patt
 - Gagged lines are stored with a flag and only shown when F2 (show_tags) is enabled
 - This allows filtering spam while preserving the ability to review filtered content
 
-**F3 Highlighting:**
-- Press F3 to toggle highlighting of lines that match any action pattern
+**F8 Highlighting:**
+- Press F8 to toggle highlighting of lines that match any action pattern
 - Matched lines get a dark background color
 - Useful for debugging action patterns without running commands
 
