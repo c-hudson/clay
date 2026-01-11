@@ -3713,20 +3713,20 @@ impl App {
             false
         };
 
+        // Convert byte cursor to character position
+        let cursor_char_pos = self.input.buffer[..self.input.cursor_position].chars().count();
+
         // Helper to check if a word is clearly finished (followed by space or clear punctuation)
         let is_word_complete = |end_pos: usize| -> bool {
             if end_pos >= chars.len() {
-                // Word at end of input - only complete if cursor is not right there
-                return true;
+                // Word at end of input - NOT complete if cursor is right at the end (still typing)
+                return cursor_char_pos != end_pos;
             }
             let next_char = chars[end_pos];
             // Word is complete if followed by whitespace or clear punctuation
             // An apostrophe after a word might be the start of a contraction (e.g., "didn'")
             next_char.is_whitespace() || matches!(next_char, '.' | ',' | '!' | '?' | ';' | ':' | ')' | ']' | '}' | '"')
         };
-
-        // Convert byte cursor to character position
-        let cursor_char_pos = self.input.buffer[..self.input.cursor_position].chars().count();
 
         while i < chars.len() {
             // Skip non-word characters
@@ -5899,19 +5899,20 @@ mod remote_gui {
                 false
             };
 
+            // Simple cursor position estimate (egui doesn't expose cursor position easily)
+            // We'll just check all words since we can't know where the cursor is during input_mut
+            let cursor_char_pos = chars.len(); // Assume cursor at end for now
+
             // Helper to check if a word is clearly finished (followed by space or clear punctuation)
             let is_word_complete = |end_pos: usize| -> bool {
                 if end_pos >= chars.len() {
-                    return true;
+                    // Word at end of input - NOT complete if cursor is right at the end (still typing)
+                    return cursor_char_pos != end_pos;
                 }
                 let next_char = chars[end_pos];
                 // Word is complete if followed by whitespace or clear punctuation
                 next_char.is_whitespace() || matches!(next_char, '.' | ',' | '!' | '?' | ';' | ':' | ')' | ']' | '}' | '"')
             };
-
-            // Simple cursor position estimate (egui doesn't expose cursor position easily)
-            // We'll just check all words since we can't know where the cursor is during input_mut
-            let cursor_char_pos = chars.len(); // Assume cursor at end for now
 
             while i < chars.len() {
                 // Skip non-word characters
