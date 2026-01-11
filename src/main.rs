@@ -3169,6 +3169,7 @@ struct App {
     output_width: u16,
     spell_checker: SpellChecker,
     spell_state: SpellState,
+    last_input_was_delete: bool, // Track if last input action was backspace/delete (for spell check)
     suggestion_message: Option<String>,
     settings: Settings,
     settings_popup: SettingsPopup,
@@ -3215,6 +3216,7 @@ impl App {
             output_width: 80,  // Will be updated by ui()
             spell_checker: SpellChecker::new(),
             spell_state: SpellState::new(),
+            last_input_was_delete: false,
             suggestion_message: None,
             settings: Settings::default(),
             settings_popup: SettingsPopup::new(),
@@ -3715,12 +3717,20 @@ impl App {
 
         // Convert byte cursor to character position
         let cursor_char_pos = self.input.buffer[..self.input.cursor_position].chars().count();
+        let last_was_delete = self.last_input_was_delete;
 
         // Helper to check if a word is clearly finished (followed by space or clear punctuation)
         let is_word_complete = |end_pos: usize| -> bool {
             if end_pos >= chars.len() {
-                // Word at end of input - NOT complete if cursor is right at the end (still typing)
-                return cursor_char_pos != end_pos;
+                // Word at end of input
+                if cursor_char_pos != end_pos {
+                    // Cursor moved away from end - word is complete
+                    return true;
+                }
+                // Cursor is at end of word at end of input
+                // If last action was delete (backspace), treat as complete to keep flagging
+                // If last action was typing, treat as incomplete to avoid premature flagging
+                return last_was_delete;
             }
             let next_char = chars[end_pos];
             // Word is complete if followed by whitespace or clear punctuation
@@ -12249,6 +12259,7 @@ fn handle_key_event(key: KeyEvent, app: &mut App) -> KeyAction {
             app.input.delete_word_before_cursor();
             app.spell_state.reset();
             app.suggestion_message = None;
+            app.last_input_was_delete = true;
             KeyAction::None
         }
 
@@ -12293,10 +12304,12 @@ fn handle_key_event(key: KeyEvent, app: &mut App) -> KeyAction {
         // Editing
         (_, KeyCode::Backspace) => {
             app.input.delete_char();
+            app.last_input_was_delete = true;
             KeyAction::None
         }
         (_, KeyCode::Delete) => {
             app.input.delete_char_forward();
+            app.last_input_was_delete = true;
             KeyAction::None
         }
 
@@ -12334,6 +12347,7 @@ fn handle_key_event(key: KeyEvent, app: &mut App) -> KeyAction {
                 app.spell_state.reset();
             }
             app.input.insert_char(c);
+            app.last_input_was_delete = false;
             KeyAction::None
         }
 
