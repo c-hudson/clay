@@ -3719,7 +3719,6 @@ impl App {
 
         // Convert byte cursor to character position
         let cursor_char_pos = self.input.buffer[..self.input.cursor_position].chars().count();
-        let last_was_delete = self.last_input_was_delete;
         let cached = &self.cached_misspelled;
 
         // Helper to check if a word overlaps with any cached misspelled range
@@ -3766,13 +3765,12 @@ impl App {
 
             if at_end_of_input && cursor_at_word_end {
                 // Word at end of input with cursor right at the end
-                if last_was_delete {
-                    // Backspacing - use cached state, don't re-check
-                    if is_cached_misspelled(start, end) {
-                        misspelled.push((start, end));
-                    }
+                // Use cached state - if word overlaps with cached misspelled, keep it flagged
+                // This keeps words flagged while typing/backspacing until completed again
+                if is_cached_misspelled(start, end) {
+                    misspelled.push((start, end));
                 }
-                // If typing (not delete), don't flag - word is incomplete
+                // If not in cache, don't flag - user is typing a fresh word
             } else if at_end_of_input {
                 // Word at end of input but cursor moved away - check spelling
                 if !self.spell_checker.is_valid(&word) {
