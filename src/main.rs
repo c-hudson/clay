@@ -3170,6 +3170,7 @@ struct App {
     spell_checker: SpellChecker,
     spell_state: SpellState,
     last_input_was_delete: bool, // Track if last input action was backspace/delete (for spell check)
+    cached_misspelled: Vec<(usize, usize)>, // Cached misspelled word ranges (char positions)
     suggestion_message: Option<String>,
     settings: Settings,
     settings_popup: SettingsPopup,
@@ -3217,6 +3218,7 @@ impl App {
             spell_checker: SpellChecker::new(),
             spell_state: SpellState::new(),
             last_input_was_delete: false,
+            cached_misspelled: Vec::new(),
             suggestion_message: None,
             settings: Settings::default(),
             settings_popup: SettingsPopup::new(),
@@ -3691,7 +3693,7 @@ impl App {
         }
     }
 
-    fn find_misspelled_words(&self) -> Vec<(usize, usize)> {
+    fn find_misspelled_words(&mut self) -> Vec<(usize, usize)> {
         let mut misspelled = Vec::new();
         let chars: Vec<char> = self.input.buffer.chars().collect();
         let mut i = 0;
@@ -3718,24 +3720,20 @@ impl App {
         // Convert byte cursor to character position
         let cursor_char_pos = self.input.buffer[..self.input.cursor_position].chars().count();
         let last_was_delete = self.last_input_was_delete;
+        let cached = &self.cached_misspelled;
 
-        // Helper to check if a word is clearly finished (followed by space or clear punctuation)
-        let is_word_complete = |end_pos: usize| -> bool {
+        // Helper to check if a word overlaps with any cached misspelled range
+        let is_cached_misspelled = |start: usize, end: usize| -> bool {
+            cached.iter().any(|(cs, ce)| start < *ce && end > *cs)
+        };
+
+        // Helper to check if followed by separator
+        let has_separator = |end_pos: usize| -> bool {
             if end_pos >= chars.len() {
-                // Word at end of input
-                if cursor_char_pos != end_pos {
-                    // Cursor moved away from end - word is complete
-                    return true;
-                }
-                // Cursor is at end of word at end of input
-                // If last action was delete (backspace), treat as complete to keep flagging
-                // If last action was typing, treat as incomplete to avoid premature flagging
-                return last_was_delete;
+                return false;
             }
             let next_char = chars[end_pos];
-            // Word is complete if followed by whitespace or clear punctuation
-            // An apostrophe after a word might be the start of a contraction (e.g., "didn'")
-            next_char.is_whitespace() || matches!(next_char, '.' | ',' | '!' | '?' | ';' | ':' | ')' | ']' | '}' | '"')
+            next_char.is_whitespace() || matches!(next_char, '.' | ',' | '!' | '?' | ';' | ':' | ')' | ']' | '}' | '"' | '%' | '@' | '#' | '$' | '^' | '&' | '*' | '(' | '[' | '{')
         };
 
         while i < chars.len() {
@@ -3756,16 +3754,41 @@ impl App {
 
             let word: String = chars[start..end].iter().collect();
             // Don't check if cursor is inside the word (actively typing)
-            // Note: end is the first position after the word, so use < not <=
             let cursor_in_word = cursor_char_pos >= start && cursor_char_pos < end;
-            // Only check words that are clearly complete (followed by separator or at end of input)
-            let word_complete = is_word_complete(end);
 
-            if !cursor_in_word && word_complete && !self.spell_checker.is_valid(&word) {
-                misspelled.push((start, end));
+            if cursor_in_word {
+                // Cursor inside word - don't flag
+                continue;
             }
+
+            let at_end_of_input = end >= chars.len();
+            let cursor_at_word_end = cursor_char_pos == end;
+
+            if at_end_of_input && cursor_at_word_end {
+                // Word at end of input with cursor right at the end
+                if last_was_delete {
+                    // Backspacing - use cached state, don't re-check
+                    if is_cached_misspelled(start, end) {
+                        misspelled.push((start, end));
+                    }
+                }
+                // If typing (not delete), don't flag - word is incomplete
+            } else if at_end_of_input {
+                // Word at end of input but cursor moved away - check spelling
+                if !self.spell_checker.is_valid(&word) {
+                    misspelled.push((start, end));
+                }
+            } else if has_separator(end) {
+                // Word followed by separator - check spelling
+                if !self.spell_checker.is_valid(&word) {
+                    misspelled.push((start, end));
+                }
+            }
+            // else: word not followed by separator and not at end - don't check
         }
 
+        // Update cache with current result
+        self.cached_misspelled = misspelled.clone();
         misspelled
     }
 
@@ -14033,13 +14056,13 @@ fn render_separator_bar(f: &mut Frame, app: &App, area: Rect) {
     f.render_widget(paragraph, area);
 }
 
-fn render_input_area(f: &mut Frame, app: &App, area: Rect) {
-    // Get prompt for current world only
-    let prompt = &app.current_world().prompt;
+fn render_input_area(f: &mut Frame, app: &mut App, area: Rect) {
+    // Get prompt for current world only (clone to avoid borrow conflict)
+    let prompt = app.current_world().prompt.clone();
     // Use visible length (without ANSI codes) for cursor positioning
-    let prompt_len = strip_ansi_codes(prompt).chars().count();
+    let prompt_len = strip_ansi_codes(&prompt).chars().count();
 
-    let input_text = render_input(app, area.width as usize, prompt);
+    let input_text = render_input(app, area.width as usize, &prompt);
 
     let input_paragraph = Paragraph::new(input_text);
     f.render_widget(input_paragraph, area);
@@ -14071,7 +14094,7 @@ fn render_input_area(f: &mut Frame, app: &App, area: Rect) {
     }
 }
 
-fn render_input(app: &App, width: usize, prompt: &str) -> Text<'static> {
+fn render_input(app: &mut App, width: usize, prompt: &str) -> Text<'static> {
     let misspelled = app.find_misspelled_words();
     let chars: Vec<char> = app.input.buffer.chars().collect();
 
