@@ -242,7 +242,7 @@ Prompts that are auto-answered are immediately cleared and not displayed in the 
 **Output Scrollback:**
 - `PageUp` - Scroll back in history (enables more-pause)
 - `PageDown` - Scroll forward (unpauses if at bottom)
-- `Tab` - Release one screenful of pending lines (when paused)
+- `Tab` - Release one screenful of pending lines (when paused); scroll down like PgDn (when viewing history)
 - `Alt+j` (or `Escape` then `j`) - Jump to end, release all pending lines
 - `Alt+w` (or `Escape` then `w`) - Switch to world with activity (priority: oldest pending → unseen output → previous world)
 - `F4` - Open filter popup to search output

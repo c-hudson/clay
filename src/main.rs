@@ -8845,7 +8845,9 @@ mod remote_gui {
                                             let mut url_clicked = false;
                                             for (start, end, url) in urls {
                                                 if click_pos >= start && click_pos <= end {
-                                                    Self::open_url(&url);
+                                                    // Strip zero-width spaces that were inserted for word breaking
+                                                    let clean_url = url.replace('\u{200B}', "");
+                                                    Self::open_url(&clean_url);
                                                     url_clicked = true;
                                                     break;
                                                 }
@@ -9037,30 +9039,18 @@ mod remote_gui {
                         egui::ViewportId::from_hash_of("world_list_window"),
                         egui::ViewportBuilder::default()
                             .with_title("World List")
-                            .with_inner_size([400.0, 300.0]),
+                            .with_inner_size([400.0, 280.0]),
                         |ctx, _class| {
-                            egui::CentralPanel::default().show(ctx, |ui| {
-                                ui.spacing_mut().item_spacing = egui::vec2(10.0, 0.0);
-                                if ui.input(|i| i.key_pressed(egui::Key::Escape)) ||
-                                   ui.input(|i| i.viewport().close_requested()) {
-                                    should_close = true;
-                                }
-                                let scroll_width = ui.available_width();
-                                ScrollArea::vertical()
-                                    .max_height(200.0)
-                                    .min_scrolled_width(scroll_width)
-                                    .show(ui, |ui| {
-                                        ui.set_min_width(scroll_width - 16.0);
-                                        for (idx, (name, connected, hostname, port)) in world_info.iter().enumerate() {
-                                            let status = if *connected { "●" } else { "○" };
-                                            let label = format!("{} {} - {}:{}", status, name, hostname, port);
-                                            if ui.selectable_label(idx == selected, &label).clicked() {
-                                                selected = idx;
-                                            }
-                                        }
-                                    });
-                                ui.add_space(10.0);
-                                ui.horizontal(|ui| {
+                            if ctx.input(|i| i.key_pressed(egui::Key::Escape)) ||
+                               ctx.input(|i| i.viewport().close_requested()) {
+                                should_close = true;
+                            }
+
+                            // Bottom panel for buttons
+                            egui::TopBottomPanel::bottom("world_list_buttons")
+                                .exact_height(35.0)
+                                .show(ctx, |ui| {
+                                    ui.add_space(5.0);
                                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                                         if ui.button("Close").clicked() {
                                             should_close = true;
@@ -9081,6 +9071,23 @@ mod remote_gui {
                                         }
                                     });
                                 });
+
+                            egui::CentralPanel::default().show(ctx, |ui| {
+                                ui.spacing_mut().item_spacing = egui::vec2(10.0, 0.0);
+                                let scroll_width = ui.available_width();
+                                ScrollArea::vertical()
+                                    .auto_shrink([false; 2])
+                                    .min_scrolled_width(scroll_width)
+                                    .show(ui, |ui| {
+                                        ui.set_min_width(scroll_width - 16.0);
+                                        for (idx, (name, connected, hostname, port)) in world_info.iter().enumerate() {
+                                            let status = if *connected { "●" } else { "○" };
+                                            let label = format!("{} {} - {}:{}", status, name, hostname, port);
+                                            if ui.selectable_label(idx == selected, &label).clicked() {
+                                                selected = idx;
+                                            }
+                                        }
+                                    });
                             });
                         },
                     );
@@ -9137,14 +9144,30 @@ mod remote_gui {
                         egui::ViewportId::from_hash_of("connected_worlds_window"),
                         egui::ViewportBuilder::default()
                             .with_title("Connected Worlds - Clay MUD Client")
-                            .with_inner_size([620.0, 250.0]),
+                            .with_inner_size([620.0, 230.0]),
                         |ctx, _class| {
-                            egui::CentralPanel::default().show(ctx, |ui| {
-                                if ui.input(|i| i.key_pressed(egui::Key::Escape)) ||
-                                   ui.input(|i| i.viewport().close_requested()) {
-                                    should_close = true;
-                                }
+                            if ctx.input(|i| i.key_pressed(egui::Key::Escape)) ||
+                               ctx.input(|i| i.viewport().close_requested()) {
+                                should_close = true;
+                            }
 
+                            // Bottom panel for buttons
+                            egui::TopBottomPanel::bottom("connected_worlds_buttons")
+                                .exact_height(35.0)
+                                .show(ctx, |ui| {
+                                    ui.add_space(5.0);
+                                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                        if ui.button("Close").clicked() {
+                                            should_close = true;
+                                        }
+                                        if ui.button("Switch To").clicked() {
+                                            switch_to_world = Some(selected);
+                                            should_close = true;
+                                        }
+                                    });
+                                });
+
+                            egui::CentralPanel::default().show(ctx, |ui| {
                                 // Table header - matches console columns exactly
                                 egui::Grid::new("worlds_header")
                                     .num_columns(7)
@@ -9177,7 +9200,7 @@ mod remote_gui {
                                 if !has_connected {
                                     ui.label("No worlds connected.");
                                 } else {
-                                    ScrollArea::vertical().max_height(150.0).show(ui, |ui| {
+                                    ScrollArea::vertical().auto_shrink([false; 2]).show(ui, |ui| {
                                         egui::Grid::new("worlds_grid")
                                             .num_columns(7)
                                             .min_col_width(55.0)
@@ -9234,16 +9257,6 @@ mod remote_gui {
                                             });
                                     });
                                 }
-                                ui.separator();
-                                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                    if ui.button("Close").clicked() {
-                                        should_close = true;
-                                    }
-                                    if ui.button("Switch To").clicked() {
-                                        switch_to_world = Some(selected);
-                                        should_close = true;
-                                    }
-                                });
                             });
                         },
                     );
@@ -9282,14 +9295,37 @@ mod remote_gui {
                         egui::ViewportId::from_hash_of("world_editor_window"),
                         egui::ViewportBuilder::default()
                             .with_title("World Editor - Clay MUD Client")
-                            .with_inner_size([350.0, 400.0]),
+                            .with_inner_size([350.0, 340.0]),
                         |ctx, _class| {
+                            if ctx.input(|i| i.key_pressed(egui::Key::Escape)) ||
+                               ctx.input(|i| i.viewport().close_requested()) {
+                                should_close = true;
+                            }
+
+                            // Bottom panel for buttons
+                            egui::TopBottomPanel::bottom("world_editor_buttons")
+                                .exact_height(35.0)
+                                .show(ctx, |ui| {
+                                    ui.add_space(5.0);
+                                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                        if ui.button("Connect").clicked() {
+                                            should_save = true;
+                                            should_connect = true;
+                                        }
+                                        if ui.add_enabled(can_delete, egui::Button::new("Delete")).clicked() {
+                                            should_delete = true;
+                                        }
+                                        if ui.button("Cancel").clicked() {
+                                            should_close = true;
+                                        }
+                                        if ui.button("Save").clicked() {
+                                            should_save = true;
+                                        }
+                                    });
+                                });
+
                             egui::CentralPanel::default().show(ctx, |ui| {
                                 ui.spacing_mut().item_spacing = egui::vec2(10.0, 0.0);
-                                if ui.input(|i| i.key_pressed(egui::Key::Escape)) ||
-                                   ui.input(|i| i.viewport().close_requested()) {
-                                    should_close = true;
-                                }
 
                                 egui::Grid::new("world_editor_grid")
                                     .num_columns(2)
@@ -9356,24 +9392,6 @@ mod remote_gui {
                                             ui.end_row();
                                         }
                                     });
-                                ui.add_space(10.0);
-                                ui.horizontal(|ui| {
-                                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                        if ui.button("Connect").clicked() {
-                                            should_save = true;
-                                            should_connect = true;
-                                        }
-                                        if ui.add_enabled(can_delete, egui::Button::new("Delete")).clicked() {
-                                            should_delete = true;
-                                        }
-                                        if ui.button("Cancel").clicked() {
-                                            should_close = true;
-                                        }
-                                        if ui.button("Save").clicked() {
-                                            should_save = true;
-                                        }
-                                    });
-                                });
                             });
                         },
                     );
@@ -9490,13 +9508,30 @@ mod remote_gui {
                         egui::ViewportId::from_hash_of("setup_window"),
                         egui::ViewportBuilder::default()
                             .with_title("Setup")
-                            .with_inner_size([300.0, 320.0]),
+                            .with_inner_size([300.0, 290.0]),
                         |ctx, _class| {
+                            if ctx.input(|i| i.key_pressed(egui::Key::Escape)) ||
+                               ctx.input(|i| i.viewport().close_requested()) {
+                                should_close = true;
+                            }
+
+                            // Bottom panel for buttons
+                            egui::TopBottomPanel::bottom("setup_buttons")
+                                .exact_height(35.0)
+                                .show(ctx, |ui| {
+                                    ui.add_space(5.0);
+                                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                        if ui.button("Cancel").clicked() {
+                                            should_close = true;
+                                        }
+                                        if ui.button("Save").clicked() {
+                                            should_save = true;
+                                            should_close = true;
+                                        }
+                                    });
+                                });
+
                             egui::CentralPanel::default().show(ctx, |ui| {
-                                if ui.input(|i| i.key_pressed(egui::Key::Escape)) ||
-                                   ui.input(|i| i.viewport().close_requested()) {
-                                    should_close = true;
-                                }
                                 ui.label("Global settings");
                                 ui.separator();
                                 egui::Grid::new("setup_grid")
@@ -9557,16 +9592,6 @@ mod remote_gui {
                                         }
                                         ui.end_row();
                                     });
-                                ui.separator();
-                                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                    if ui.button("Cancel").clicked() {
-                                        should_close = true;
-                                    }
-                                    if ui.button("Save").clicked() {
-                                        should_save = true;
-                                        should_close = true;
-                                    }
-                                });
                             });
                         },
                     );
@@ -9606,13 +9631,29 @@ mod remote_gui {
                         egui::ViewportId::from_hash_of("web_settings_window"),
                         egui::ViewportBuilder::default()
                             .with_title("Web Settings - Clay MUD Client")
-                            .with_inner_size([350.0, 280.0]),
+                            .with_inner_size([350.0, 250.0]),
                         |ctx, _class| {
+                            if ctx.input(|i| i.key_pressed(egui::Key::Escape)) ||
+                               ctx.input(|i| i.viewport().close_requested()) {
+                                should_close = true;
+                            }
+
+                            // Bottom panel for buttons
+                            egui::TopBottomPanel::bottom("web_settings_buttons")
+                                .exact_height(35.0)
+                                .show(ctx, |ui| {
+                                    ui.add_space(5.0);
+                                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                        if ui.button("Cancel").clicked() {
+                                            should_close = true;
+                                        }
+                                        if ui.button("Save").clicked() {
+                                            should_save = true;
+                                        }
+                                    });
+                                });
+
                             egui::CentralPanel::default().show(ctx, |ui| {
-                                if ui.input(|i| i.key_pressed(egui::Key::Escape)) ||
-                                   ui.input(|i| i.viewport().close_requested()) {
-                                    should_close = true;
-                                }
                                 ui.label("Web server settings");
                                 ui.separator();
                                 egui::Grid::new("web_grid")
@@ -9674,15 +9715,6 @@ mod remote_gui {
                                             .desired_width(200.0));
                                         ui.end_row();
                                     });
-                                ui.separator();
-                                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                    if ui.button("Cancel").clicked() {
-                                        should_close = true;
-                                    }
-                                    if ui.button("Save").clicked() {
-                                        should_save = true;
-                                    }
-                                });
                             });
                         },
                     );
@@ -9732,14 +9764,29 @@ mod remote_gui {
                         egui::ViewportId::from_hash_of("font_settings_window"),
                         egui::ViewportBuilder::default()
                             .with_title("Font Settings - Clay MUD Client")
-                            .with_inner_size([350.0, 150.0]),
+                            .with_inner_size([350.0, 120.0]),
                         |ctx, _class| {
-                            egui::CentralPanel::default().show(ctx, |ui| {
-                                if ui.input(|i| i.key_pressed(egui::Key::Escape)) ||
-                                   ui.input(|i| i.viewport().close_requested()) {
-                                    should_close = true;
-                                }
+                            if ctx.input(|i| i.key_pressed(egui::Key::Escape)) ||
+                               ctx.input(|i| i.viewport().close_requested()) {
+                                should_close = true;
+                            }
 
+                            // Bottom panel for buttons
+                            egui::TopBottomPanel::bottom("font_settings_buttons")
+                                .exact_height(35.0)
+                                .show(ctx, |ui| {
+                                    ui.add_space(5.0);
+                                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                        if ui.button("Cancel").clicked() {
+                                            should_close = true;
+                                        }
+                                        if ui.button("OK").clicked() {
+                                            should_save = true;
+                                        }
+                                    });
+                                });
+
+                            egui::CentralPanel::default().show(ctx, |ui| {
                                 egui::Grid::new("font_grid")
                                     .num_columns(2)
                                     .spacing([10.0, 8.0])
@@ -9782,15 +9829,6 @@ mod remote_gui {
                                         });
                                         ui.end_row();
                                     });
-                                ui.separator();
-                                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                    if ui.button("Cancel").clicked() {
-                                        should_close = true;
-                                    }
-                                    if ui.button("OK").clicked() {
-                                        should_save = true;
-                                    }
-                                });
                             });
                         },
                     );
@@ -9959,14 +9997,35 @@ mod remote_gui {
                         egui::ViewportId::from_hash_of("actions_list_window"),
                         egui::ViewportBuilder::default()
                             .with_title("Actions - Clay MUD Client")
-                            .with_inner_size([450.0, 300.0]),
+                            .with_inner_size([450.0, 280.0]),
                         |ctx, _class| {
-                            egui::CentralPanel::default().show(ctx, |ui| {
-                                if ui.input(|i| i.key_pressed(egui::Key::Escape)) ||
-                                   ui.input(|i| i.viewport().close_requested()) {
-                                    should_close = true;
-                                }
+                            if ctx.input(|i| i.key_pressed(egui::Key::Escape)) ||
+                               ctx.input(|i| i.viewport().close_requested()) {
+                                should_close = true;
+                            }
 
+                            // Bottom panel for buttons
+                            egui::TopBottomPanel::bottom("actions_buttons")
+                                .exact_height(35.0)
+                                .show(ctx, |ui| {
+                                    ui.add_space(5.0);
+                                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                        if ui.button("Ok").clicked() {
+                                            should_close = true;
+                                        }
+                                        if ui.button("Delete").clicked() && !actions_clone.is_empty() {
+                                            new_popup_state = Some(PopupState::ActionConfirmDelete);
+                                        }
+                                        if ui.button("Edit").clicked() && !actions_clone.is_empty() {
+                                            open_editor_idx = Some(actions_selected);
+                                        }
+                                        if ui.button("Add").clicked() {
+                                            add_new_action = true;
+                                        }
+                                    });
+                                });
+
+                            egui::CentralPanel::default().show(ctx, |ui| {
                                 // Actions list with columns: Name, World, Pattern
                                 ui.label(egui::RichText::new("Saved Actions").strong());
                                 ui.separator();
@@ -9975,7 +10034,7 @@ mod remote_gui {
                                     ui.label("No actions defined.");
                                 } else {
                                     egui::ScrollArea::vertical()
-                                        .max_height(180.0)
+                                        .auto_shrink([false; 2])
                                         .show(ui, |ui| {
                                             egui::Grid::new("actions_list_grid")
                                                 .num_columns(3)
@@ -10009,24 +10068,6 @@ mod remote_gui {
                                                 });
                                         });
                                 }
-
-                                ui.separator();
-
-                                // Buttons: Add, Edit, Delete, Ok
-                                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                    if ui.button("Ok").clicked() {
-                                        should_close = true;
-                                    }
-                                    if ui.button("Delete").clicked() && !actions_clone.is_empty() {
-                                        new_popup_state = Some(PopupState::ActionConfirmDelete);
-                                    }
-                                    if ui.button("Edit").clicked() && !actions_clone.is_empty() {
-                                        open_editor_idx = Some(actions_selected);
-                                    }
-                                    if ui.button("Add").clicked() {
-                                        add_new_action = true;
-                                    }
-                                });
                             });
                         },
                     );
@@ -10080,14 +10121,47 @@ mod remote_gui {
                         egui::ViewportId::from_hash_of("actions_editor_window"),
                         egui::ViewportBuilder::default()
                             .with_title(title)
-                            .with_inner_size([400.0, 350.0]),
+                            .with_inner_size([400.0, 280.0]),
                         |ctx, _class| {
-                            egui::CentralPanel::default().show(ctx, |ui| {
-                                if ui.input(|i| i.key_pressed(egui::Key::Escape)) ||
-                                   ui.input(|i| i.viewport().close_requested()) {
-                                    should_close = true;
-                                }
+                            if ctx.input(|i| i.key_pressed(egui::Key::Escape)) ||
+                               ctx.input(|i| i.viewport().close_requested()) {
+                                should_close = true;
+                            }
 
+                            // Bottom panel for buttons
+                            egui::TopBottomPanel::bottom("action_editor_buttons")
+                                .exact_height(35.0)
+                                .show(ctx, |ui| {
+                                    ui.add_space(5.0);
+                                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                        if ui.button("Cancel").clicked() {
+                                            should_close = true;
+                                        }
+                                        if ui.button("Save").clicked() {
+                                            // Validate
+                                            let name = edit_action_name.trim();
+                                            if name.is_empty() {
+                                                action_error = Some("Name is required".to_string());
+                                            } else {
+                                                // Check for duplicates (excluding current if editing)
+                                                let mut duplicate = false;
+                                                for (i, a) in actions_clone.iter().enumerate() {
+                                                    if (edit_idx == usize::MAX || i != edit_idx) &&
+                                                       a.name.eq_ignore_ascii_case(name) {
+                                                        action_error = Some(format!("Action '{}' already exists", name));
+                                                        duplicate = true;
+                                                        break;
+                                                    }
+                                                }
+                                                if !duplicate {
+                                                    should_save = true;
+                                                }
+                                            }
+                                        }
+                                    });
+                                });
+
+                            egui::CentralPanel::default().show(ctx, |ui| {
                                 egui::Grid::new("action_editor_grid")
                                     .num_columns(2)
                                     .spacing([10.0, 8.0])
@@ -10137,36 +10211,6 @@ mod remote_gui {
                                 if let Some(ref err) = action_error {
                                     ui.colored_label(egui::Color32::RED, err);
                                 }
-
-                                ui.separator();
-
-                                // Buttons: Save, Cancel
-                                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                    if ui.button("Cancel").clicked() {
-                                        should_close = true;
-                                    }
-                                    if ui.button("Save").clicked() {
-                                        // Validate
-                                        let name = edit_action_name.trim();
-                                        if name.is_empty() {
-                                            action_error = Some("Name is required".to_string());
-                                        } else {
-                                            // Check for duplicates (excluding current if editing)
-                                            let mut duplicate = false;
-                                            for (i, a) in actions_clone.iter().enumerate() {
-                                                if (edit_idx == usize::MAX || i != edit_idx) &&
-                                                   a.name.eq_ignore_ascii_case(name) {
-                                                    action_error = Some(format!("Action '{}' already exists", name));
-                                                    duplicate = true;
-                                                    break;
-                                                }
-                                            }
-                                            if !duplicate {
-                                                should_save = true;
-                                            }
-                                        }
-                                    }
-                                });
                             });
                         },
                     );
