@@ -4049,17 +4049,33 @@ impl App {
             let clean_pending: Vec<String> = world.pending_lines.iter()
                 .map(|s| s.text.replace('\r', ""))
                 .collect();
-            // Create timestamped versions
+            // Create timestamped versions (add %% prefix and red color for client-generated messages)
             let output_lines_ts: Vec<TimestampedLine> = world.output_lines.iter()
-                .map(|s| TimestampedLine {
-                    text: s.text.replace('\r', ""),
-                    ts: s.timestamp.duration_since(UNIX_EPOCH).unwrap_or_default().as_secs(),
+                .map(|s| {
+                    let text = s.text.replace('\r', "");
+                    let text = if !s.from_server {
+                        format!("\x1b[31m%% {}\x1b[0m", text)
+                    } else {
+                        text
+                    };
+                    TimestampedLine {
+                        text,
+                        ts: s.timestamp.duration_since(UNIX_EPOCH).unwrap_or_default().as_secs(),
+                    }
                 })
                 .collect();
             let pending_lines_ts: Vec<TimestampedLine> = world.pending_lines.iter()
-                .map(|s| TimestampedLine {
-                    text: s.text.replace('\r', ""),
-                    ts: s.timestamp.duration_since(UNIX_EPOCH).unwrap_or_default().as_secs(),
+                .map(|s| {
+                    let text = s.text.replace('\r', "");
+                    let text = if !s.from_server {
+                        format!("\x1b[31m%% {}\x1b[0m", text)
+                    } else {
+                        text
+                    };
+                    TimestampedLine {
+                        text,
+                        ts: s.timestamp.duration_since(UNIX_EPOCH).unwrap_or_default().as_secs(),
+                    }
                 })
                 .collect();
             WorldStateMsg {
@@ -8356,11 +8372,11 @@ mod remote_gui {
                                                     self.connect_world(idx);
                                                 }
                                             } else {
-                                                // World not found - show error locally
+                                                // World not found - show error locally (red with %% prefix)
                                                 let ts = current_timestamp_secs();
                                                 if self.current_world < self.worlds.len() {
                                                     self.worlds[self.current_world].output_lines.push(
-                                                        TimestampedLine { text: format!("World '{}' not found.", name), ts }
+                                                        TimestampedLine { text: format!("\x1b[31m%% World '{}' not found.\x1b[0m", name), ts }
                                                     );
                                                 }
                                             }
@@ -8374,11 +8390,11 @@ mod remote_gui {
                                                     self.send_command(idx, cmd);
                                                 }
                                             } else {
-                                                // World not found - show error locally
+                                                // World not found - show error locally (red with %% prefix)
                                                 let ts = current_timestamp_secs();
                                                 if self.current_world < self.worlds.len() {
                                                     self.worlds[self.current_world].output_lines.push(
-                                                        TimestampedLine { text: format!("World '{}' not found.", name), ts }
+                                                        TimestampedLine { text: format!("\x1b[31m%% World '{}' not found.\x1b[0m", name), ts }
                                                     );
                                                 }
                                             }
@@ -15405,6 +15421,12 @@ fn render_output_crossterm(app: &App) {
         }
         // Convert Discord custom emojis to :name: for console display
         let text = convert_discord_emojis(&line.text);
+        // Add "%% " prefix and red color for client-generated messages
+        let text = if !line.from_server {
+            format!("\x1b[31m%% {}\x1b[0m", text)
+        } else {
+            text
+        };
         let processed = if show_tags {
             // Show timestamp + original text when tags are shown
             format!("\x1b[36m{}\x1b[0m {}", line.format_timestamp(), text)
@@ -17247,8 +17269,36 @@ fn render_actions_popup(f: &mut Frame, app: &App) {
                 scroll.min(filtered_indices.len().saturating_sub(list_height))
             };
 
+            // Calculate scrollbar position
+            let total_items = filtered_indices.len();
+            let scrollbar_chars: Vec<char> = if total_items <= list_height {
+                // No scrolling needed - show empty track
+                vec!['│'; list_height]
+            } else {
+                // Calculate thumb size and position
+                let thumb_size = ((list_height as f64 / total_items as f64) * list_height as f64).max(1.0) as usize;
+                let thumb_size = thumb_size.max(1).min(list_height);
+                let scroll_range = total_items.saturating_sub(list_height);
+                let thumb_pos = if scroll_range > 0 {
+                    ((scroll_offset as f64 / scroll_range as f64) * (list_height - thumb_size) as f64) as usize
+                } else {
+                    0
+                };
+                let thumb_pos = thumb_pos.min(list_height - thumb_size);
+
+                (0..list_height).map(|i| {
+                    if i >= thumb_pos && i < thumb_pos + thumb_size {
+                        '█' // Thumb
+                    } else {
+                        '│' // Track
+                    }
+                }).collect()
+            };
+
             for i in 0..list_height {
                 let filtered_pos = scroll_offset + i;
+                let scrollbar_char = scrollbar_chars.get(i).copied().unwrap_or('│');
+
                 if filtered_pos < filtered_indices.len() {
                     let action_idx = filtered_indices[filtered_pos];
                     let action = &popup.actions[action_idx];
@@ -17274,12 +17324,23 @@ fn render_actions_popup(f: &mut Frame, app: &App) {
                         format!("{} {} ({}) [{}]", marker, action.name, action.world, truncate_str(&action.pattern, 15))
                     };
 
-                    lines.push(Line::from(Span::styled(
-                        truncate_str(&display, inner_width),
-                        style,
-                    )));
+                    // Truncate to leave room for scrollbar
+                    let display_width = inner_width.saturating_sub(2);
+                    let truncated = truncate_str(&display, display_width);
+                    let padding = display_width.saturating_sub(truncated.chars().count());
+
+                    lines.push(Line::from(vec![
+                        Span::styled(truncated, style),
+                        Span::raw(" ".repeat(padding)),
+                        Span::styled(format!(" {}", scrollbar_char), Style::default().fg(theme.fg_dim())),
+                    ]));
                 } else {
-                    lines.push(Line::from(""));
+                    // Empty line with scrollbar
+                    let padding = inner_width.saturating_sub(2);
+                    lines.push(Line::from(vec![
+                        Span::raw(" ".repeat(padding)),
+                        Span::styled(format!(" {}", scrollbar_char), Style::default().fg(theme.fg_dim())),
+                    ]));
                 }
             }
 

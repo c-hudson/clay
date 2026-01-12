@@ -1270,6 +1270,19 @@
         return html;
     }
 
+    // Append a client-generated message (with %% prefix and red color)
+    function appendLine(text, worldIndex) {
+        const ts = Math.floor(Date.now() / 1000);
+        const clientText = `\x1b[31m%% ${text}\x1b[0m`;
+        if (worldIndex >= 0 && worldIndex < worlds.length) {
+            const lineIndex = worlds[worldIndex].output_lines.length;
+            worlds[worldIndex].output_lines.push({ text: clientText, ts: ts });
+            if (worldIndex === currentWorldIndex) {
+                appendNewLine(clientText, ts, worldIndex, lineIndex);
+            }
+        }
+    }
+
     // Append a new line to current world's output (already visible)
     function appendNewLine(text, ts, worldIndex, lineIndex) {
         // Strip newlines/carriage returns
