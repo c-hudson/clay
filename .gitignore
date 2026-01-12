@@ -22,3 +22,6 @@ certs/
 
 # Local scripts
 copy.sh
+
+# Reference files
+dog-paw-svgrepo-com.svg
