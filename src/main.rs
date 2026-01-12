@@ -9484,9 +9484,11 @@ mod remote_gui {
                             }
                             // Local removal will happen when server sends WorldRemoved
                         }
-                        close_popup = true;
+                        // Return to World List popup
+                        self.popup_state = PopupState::WorldList;
                     } else if should_cancel {
-                        close_popup = true;
+                        // Return to World List popup
+                        self.popup_state = PopupState::WorldList;
                     }
                 }
 
