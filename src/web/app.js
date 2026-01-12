@@ -48,6 +48,7 @@
         actionEditorTitle: document.getElementById('action-editor-title'),
         actionName: document.getElementById('action-name'),
         actionWorld: document.getElementById('action-world'),
+        actionMatchType: document.getElementById('action-match-type'),
         actionPattern: document.getElementById('action-pattern'),
         actionCommand: document.getElementById('action-command'),
         actionError: document.getElementById('action-error'),
@@ -1677,6 +1678,11 @@
             const action = actions[editIndex];
             elements.actionName.value = action.name || '';
             elements.actionWorld.value = action.world || '';
+            const matchType = action.match_type === 'Wildcard' ? 'Wildcard' : 'Regexp';
+            elements.actionMatchType.textContent = matchType;
+            elements.actionPattern.placeholder = matchType === 'Wildcard'
+                ? '(wildcard: * and ?, empty = manual only)'
+                : '(regex, empty = manual only)';
             elements.actionPattern.value = action.pattern || '';
             elements.actionCommand.value = action.command || '';
         } else {
@@ -1684,6 +1690,8 @@
             elements.actionEditorTitle.textContent = 'New Action';
             elements.actionName.value = '';
             elements.actionWorld.value = '';
+            elements.actionMatchType.textContent = 'Regexp';  // Default to Regexp
+            elements.actionPattern.placeholder = '(regex, empty = manual only)';
             elements.actionPattern.value = '';
             elements.actionCommand.value = '';
         }
@@ -1762,6 +1770,7 @@
         const actionData = {
             name: name,
             world: elements.actionWorld.value.trim(),
+            match_type: elements.actionMatchType.textContent,
             pattern: elements.actionPattern.value,
             command: elements.actionCommand.value
         };
@@ -3010,6 +3019,16 @@
         // Actions Editor popup
         elements.actionSaveBtn.onclick = saveAction;
         elements.actionEditorCancelBtn.onclick = closeActionsEditorPopup;
+        elements.actionMatchType.onclick = function() {
+            // Toggle between Regexp and Wildcard
+            if (elements.actionMatchType.textContent === 'Regexp') {
+                elements.actionMatchType.textContent = 'Wildcard';
+                elements.actionPattern.placeholder = '(wildcard: * and ?, empty = manual only)';
+            } else {
+                elements.actionMatchType.textContent = 'Regexp';
+                elements.actionPattern.placeholder = '(regex, empty = manual only)';
+            }
+        };
 
         // Actions Confirm Delete popup
         elements.actionConfirmYesBtn.onclick = confirmDeleteAction;
