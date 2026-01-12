@@ -799,8 +799,8 @@ body {
 /* World selector popup */
 .world-selector-modal-content {
     min-width: 350px;
-    max-width: 500px;
-    width: 90%;
+    max-width: 90%;
+    width: fit-content;
     padding: 12px;
 }
 
