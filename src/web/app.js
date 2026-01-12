@@ -226,8 +226,8 @@
 
     // Internal commands that are handled by the server (not action names)
     const INTERNAL_COMMANDS = [
-        'help', 'quit', 'reload', 'setup', 'web', 'actions', 'world', 'worlds',
-        'l', 'connect', 'disconnect', 'dc', 'send', 'keepalive', 'gag'
+        'help', 'quit', 'reload', 'setup', 'web', 'actions', 'worlds', 'connections',
+        'l', 'disconnect', 'dc', 'send', 'keepalive', 'gag'
     ];
 
     function isInternalCommand(name) {

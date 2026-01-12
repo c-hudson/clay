@@ -1895,7 +1895,6 @@ impl HelpPopup {
             lines: vec![
                 "Commands:",
                 "  /help                      Show this help",
-                "  /connect [host port [ssl]] Connect to server",
                 "  /disconnect (or /dc)       Disconnect from server",
                 "  /send [-W] [-w<world>] [-n] <text>",
                 "                             Send text to world(s)",
@@ -2600,7 +2599,7 @@ impl Action {
 
 /// List of internal commands that cannot be overridden by actions
 const INTERNAL_COMMANDS: &[&str] = &[
-    "help", "connect", "disconnect", "dc", "setup", "world", "worlds", "l",
+    "help", "disconnect", "dc", "setup", "worlds", "connections", "l",
     "keepalive", "reload", "quit", "actions", "gag", "web", "send",
 ];
 
@@ -2688,7 +2687,7 @@ fn parse_command(input: &str) -> Command {
         }
         "/connections" | "/l" => Command::WorldsList,
         "/worlds" => parse_world_command(args),
-        "/connect" => parse_connect_command(args),
+        "/connect" => parse_connect_command(args),  // Internal use only (Connect buttons)
         "/disconnect" | "/dc" => Command::Disconnect,
         "/send" => parse_send_command(args, trimmed),
         "/keepalive" => Command::Keepalive,
@@ -10035,9 +10034,9 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
 
         // Disconnect TLS worlds
         let tls_msg = if is_crash {
-            "TLS connection was closed during crash recovery. Use /connect to reconnect."
+            "TLS connection was closed during crash recovery. Use /worlds to reconnect."
         } else {
-            "TLS connection was closed during reload. Use /connect to reconnect."
+            "TLS connection was closed during reload. Use /worlds to reconnect."
         };
         for world_idx in tls_disconnect_worlds {
             app.worlds[world_idx].connected = false;
@@ -10206,7 +10205,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                 world.connected = false;
                 world.socket_fd = None;
                 world.output_lines
-                    .push(OutputLine::new("Connection was not restored during reload. Use /connect to reconnect.".to_string()));
+                    .push(OutputLine::new("Connection was not restored during reload. Use /worlds to reconnect.".to_string()));
             }
             // Clear pending_lines and unseen_lines for disconnected worlds - they're only meaningful for active connections
             if !world.connected {
@@ -10495,7 +10494,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                     }
                                 }
                             } else {
-                                app.add_output("Not connected. Use /connect <host> <port>");
+                                app.add_output("Not connected. Use /worlds to connect.");
                             }
                         }
                         KeyAction::UpdateWebSocket => {
@@ -13334,7 +13333,7 @@ fn handle_key_event(key: KeyEvent, app: &mut App) -> KeyAction {
         if !input.contains(' ') || app.input.cursor_position <= input.find(' ').unwrap_or(input.len()) {
             // Build list of completions: internal commands + manual actions
             let internal_commands = vec![
-                "/help", "/connect", "/disconnect", "/dc", "/send", "/worlds", "/connections",
+                "/help", "/disconnect", "/dc", "/send", "/worlds", "/connections",
                 "/setup", "/web", "/actions", "/keepalive", "/reload", "/quit", "/gag",
             ];
 
@@ -14200,8 +14199,7 @@ async fn handle_command(cmd: &str, app: &mut App, event_tx: mpsc::Sender<AppEven
                     world_settings.use_ssl,
                 )
             } else {
-                app.add_output("Usage: /connect [<host> <port> [ssl]]");
-                app.add_output("Or configure host/port in world settings (/worlds)");
+                app.add_output("Configure host/port in world settings (/worlds)");
                 return false;
             };
 
@@ -14538,7 +14536,7 @@ async fn handle_command(cmd: &str, app: &mut App, event_tx: mpsc::Sender<AppEven
                 // Send to current world
                 let world = app.current_world_mut();
                 if !world.connected {
-                    app.add_output("Not connected. Use /connect first.");
+                    app.add_output("Not connected. Use /worlds to connect.");
                 } else if let Some(tx) = &world.command_tx {
                     let result = if no_newline {
                         tx.try_send(WriteCommand::Raw(text.as_bytes().to_vec()))

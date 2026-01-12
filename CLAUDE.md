@@ -142,7 +142,7 @@ Encoding is configurable per-world in the world settings popup.
 ### SSL/TLS Support
 
 - Uses `tokio-native-tls` for TLS connections
-- Enable via "Use SSL" toggle in world settings, or `/connect host port ssl`
+- Enable via "Use SSL" toggle in world settings
 - `StreamReader`/`StreamWriter` enums wrap both plain TCP and TLS streams
 - Implements `AsyncRead`/`AsyncWrite` traits for unified handling
 
@@ -272,7 +272,6 @@ Prompts that are auto-answered are immediately cleared and not displayed in the 
 ### Commands
 
 - `/help` - Show help popup with commands and controls (scrollable with arrow keys)
-- `/connect [<host> <port> [ssl]]` - Connect to MUD server (uses stored settings if no args); shows "Connecting to host:port..." message
 - `/disconnect` (or `/dc`) - Disconnect current world and close log file
 - `/send [-W] [-w<world>] [-n] <text>` - Send text to world(s)
   - `-w<world>` - Send to specified world (by name)
@@ -767,7 +766,7 @@ Tab completion for commands when input starts with `/`:
 
 **Behavior:**
 - Press `Tab` when input starts with `/` to cycle through matching commands
-- Matches internal commands: `/help`, `/connect`, `/disconnect`, `/dc`, `/send`, `/worlds`, `/connections`, `/setup`, `/web`, `/actions`, `/keepalive`, `/reload`, `/quit`, `/gag`
+- Matches internal commands: `/help`, `/disconnect`, `/dc`, `/send`, `/worlds`, `/connections`, `/setup`, `/web`, `/actions`, `/keepalive`, `/reload`, `/quit`, `/gag`
 - Also matches manual actions (actions with empty patterns)
 - Completion is case-insensitive
 - Pressing `Tab` multiple times cycles through all matches alphabetically
