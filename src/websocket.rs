@@ -41,6 +41,8 @@ pub enum WsMessage {
     WorldSwitched { new_index: usize },
     PromptUpdate { world_index: usize, prompt: String },
     PendingLinesUpdate { world_index: usize, count: usize },
+    /// Broadcast when pending lines are released (by any interface)
+    PendingReleased { world_index: usize, count: usize },
     UnseenCleared { world_index: usize },
     UnseenUpdate { world_index: usize, count: usize },
 
@@ -51,7 +53,8 @@ pub enum WsMessage {
     DisconnectWorld { world_index: usize },
     DeleteWorld { world_index: usize },
     CreateWorld { name: String },
-    ReleasePending { world_index: usize },
+    /// Request to release pending lines (count = number to release, 0 = all)
+    ReleasePending { world_index: usize, count: usize },
     MarkWorldSeen { world_index: usize },
     RequestState,  // Request full state resync
 

@@ -147,6 +147,10 @@
     let showTags = false;
     let highlightActions = false;
 
+    // Command completion state
+    let lastCompletionPrefix = '';
+    let lastCompletionIndex = -1;
+
     // World popup state
     let worldsPopupOpen = false;
     let worldSelectorPopupOpen = false;
@@ -232,6 +236,66 @@
 
     function isInternalCommand(name) {
         return INTERNAL_COMMANDS.includes(name.toLowerCase());
+    }
+
+    // Command completion - returns completed command or null if no match
+    function completeCommand(input) {
+        if (!input.startsWith('/')) return null;
+
+        // Get the partial command (everything up to first space)
+        const spacePos = input.indexOf(' ');
+        const partial = spacePos >= 0 ? input.substring(0, spacePos) : input;
+        const args = spacePos >= 0 ? input.substring(spacePos) : '';
+
+        // Only complete if cursor is in the command part
+        if (spacePos >= 0 && elements.input.selectionStart > spacePos) {
+            return null;
+        }
+
+        // Build list of completions: internal commands + manual actions
+        let completions = INTERNAL_COMMANDS.map(cmd => '/' + cmd);
+
+        // Add manual actions (empty pattern)
+        const manualActions = actions
+            .filter(a => !a.pattern || a.pattern.trim() === '')
+            .map(a => '/' + a.name);
+        completions = completions.concat(manualActions);
+
+        // Find all matches
+        const partialLower = partial.toLowerCase();
+        let matches = completions.filter(cmd => cmd.toLowerCase().startsWith(partialLower));
+
+        if (matches.length === 0) return null;
+
+        // Sort and dedupe
+        matches.sort();
+        matches = [...new Set(matches)];
+
+        // Check if this is a continuation of previous completion
+        let nextIndex = 0;
+        if (partial.toLowerCase() === lastCompletionPrefix.toLowerCase()) {
+            // Cycle to next match
+            nextIndex = (lastCompletionIndex + 1) % matches.length;
+        } else {
+            // Find current match if we're already on a completed command
+            const currentIdx = matches.findIndex(m => m.toLowerCase() === partial.toLowerCase());
+            if (currentIdx >= 0) {
+                nextIndex = (currentIdx + 1) % matches.length;
+            }
+        }
+
+        // Update completion state
+        lastCompletionPrefix = partial;
+        lastCompletionIndex = nextIndex;
+
+        // Return the completion with preserved arguments
+        return matches[nextIndex] + args;
+    }
+
+    // Reset completion state (call when input changes by typing)
+    function resetCompletion() {
+        lastCompletionPrefix = '';
+        lastCompletionIndex = -1;
     }
 
     // Parse a command string and return command object
@@ -758,6 +822,13 @@
                 }
                 break;
 
+            case 'PendingReleased':
+                // Server/another client released pending lines - sync our state
+                if (msg.world_index === currentWorld && msg.count > 0) {
+                    doReleasePending(msg.count);
+                }
+                break;
+
             default:
                 console.log('Unknown message type:', msg.type);
         }
@@ -793,9 +864,27 @@
         if (!paused || pendingLines.length === 0) return;
 
         const count = Math.max(1, getVisibleLineCount() - 2);
-        const toRelease = pendingLines.splice(0, count);
+        // Send release request to server instead of local release
+        // Server will broadcast PendingReleased which triggers actual release
+        send({ type: 'ReleasePending', world_index: currentWorld, count: count });
+    }
 
-        toRelease.forEach(item => {
+    // Release all pending lines
+    function releaseAll() {
+        if (!paused) return;
+
+        // Send release request to server (count: 0 = all)
+        send({ type: 'ReleasePending', world_index: currentWorld, count: 0 });
+    }
+
+    // Actually release pending lines (called when server broadcasts PendingReleased)
+    function doReleasePending(count) {
+        if (pendingLines.length === 0) return;
+
+        const toRelease = count === 0 ? pendingLines.length : Math.min(count, pendingLines.length);
+        const released = pendingLines.splice(0, toRelease);
+
+        released.forEach(item => {
             appendNewLine(item.text, item.ts, item.worldIndex, item.lineIndex);
         });
 
@@ -803,20 +892,6 @@
             paused = false;
             linesSincePause = 0;
         }
-
-        updateStatusBar();
-    }
-
-    // Release all pending lines
-    function releaseAll() {
-        if (!paused) return;
-
-        pendingLines.forEach(item => {
-            appendNewLine(item.text, item.ts, item.worldIndex, item.lineIndex);
-        });
-        pendingLines = [];
-        paused = false;
-        linesSincePause = 0;
 
         updateStatusBar();
     }
@@ -2986,8 +3061,21 @@
                 e.stopPropagation();  // Prevent document-level handler from catching this
                 sendCommand();
             } else if (e.key === 'Tab' && !e.shiftKey && !e.ctrlKey) {
-                // Tab: Release one screenful of pending lines, or scroll down
                 e.preventDefault(); // Always prevent default tab behavior
+                // Try command completion first if input starts with /
+                const inputValue = elements.input.value;
+                if (inputValue.startsWith('/')) {
+                    const completed = completeCommand(inputValue);
+                    if (completed !== null) {
+                        elements.input.value = completed;
+                        // Move cursor to end of command part
+                        const spacePos = completed.indexOf(' ');
+                        const cursorPos = spacePos >= 0 ? spacePos : completed.length;
+                        elements.input.setSelectionRange(cursorPos, cursorPos);
+                        return;
+                    }
+                }
+                // Tab: Release one screenful of pending lines, or scroll down
                 if (paused && pendingLines.length > 0) {
                     releaseScreenful();
                 } else {
@@ -3083,6 +3171,11 @@
                 }
             }
             // Note: F2, F3, F4 are handled at document level (before this handler)
+        });
+
+        // Reset command completion state when input changes (typing, not Tab)
+        elements.input.addEventListener('input', function() {
+            resetCompletion();
         });
 
         // Auth submit

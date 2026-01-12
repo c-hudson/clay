@@ -5683,6 +5683,10 @@ mod remote_gui {
         current_world: usize,
         /// Input buffer for commands
         input_buffer: String,
+        /// Command completion state - last partial command that was completed
+        completion_prefix: String,
+        /// Command completion state - index of last match used
+        completion_index: usize,
         /// Channel for sending messages to WebSocket
         ws_tx: Option<mpsc::UnboundedSender<WsMessage>>,
         /// Channel for receiving messages from WebSocket
@@ -5809,6 +5813,8 @@ mod remote_gui {
                 worlds: Vec::new(),
                 current_world: 0,
                 input_buffer: String::new(),
+                completion_prefix: String::new(),
+                completion_index: 0,
                 ws_tx: None,
                 ws_rx: None,
                 runtime,
@@ -6263,6 +6269,12 @@ mod remote_gui {
                             if world_index < self.worlds.len() {
                                 self.worlds[world_index].pending_count = count;
                             }
+                        }
+                        WsMessage::PendingReleased { world_index, count: _ } => {
+                            // Server/another client released pending lines
+                            // GUI shows all data immediately, so just log for debugging
+                            // pending_count update comes via PendingLinesUpdate
+                            let _ = world_index; // suppress unused warning
                         }
                         WsMessage::ActionsUpdated { actions } => {
                             // Update local actions from server
@@ -7447,6 +7459,7 @@ mod remote_gui {
                     let mut clear_input = false;
                     let mut delete_word = false;
                     let mut resize_input: i32 = 0;
+                    let mut tab_complete = false;
 
                     // Use input_mut to consume events before widgets get them
                     ctx.input_mut(|i| {
@@ -7520,6 +7533,23 @@ mod remote_gui {
                             } else if i.consume_key(egui::Modifiers::NONE, egui::Key::F8) {
                                 // F8 - toggle action pattern highlighting
                                 self.highlight_actions = !self.highlight_actions;
+                            } else if i.consume_key(egui::Modifiers::NONE, egui::Key::Tab) {
+                                // Tab - command completion if input starts with /
+                                // Otherwise release pending lines if any
+                                if self.input_buffer.starts_with('/') {
+                                    tab_complete = true;
+                                } else if self.current_world < self.worlds.len()
+                                    && self.worlds[self.current_world].pending_count > 0
+                                {
+                                    // Send ReleasePending to server to release one screenful
+                                    // Use 20 as a reasonable default batch size
+                                    if let Some(ref tx) = self.ws_tx {
+                                        let _ = tx.send(WsMessage::ReleasePending {
+                                            world_index: self.current_world,
+                                            count: 20,
+                                        });
+                                    }
+                                }
                             } else if self.input_buffer.trim().is_empty() {
                                 // Up/Down arrow with empty input - cycle active worlds
                                 // Use shared world switching logic
@@ -7570,6 +7600,63 @@ mod remote_gui {
                             && !self.input_buffer.ends_with(|c: char| c.is_whitespace())
                         {
                             self.input_buffer.pop();
+                        }
+                    }
+
+                    // Apply tab completion
+                    if tab_complete && self.input_buffer.starts_with('/') {
+                        // Get the partial command (everything up to first space)
+                        let input = self.input_buffer.clone();
+                        let (partial, args) = if let Some(space_pos) = input.find(' ') {
+                            (&input[..space_pos], &input[space_pos..])
+                        } else {
+                            (input.as_str(), "")
+                        };
+
+                        // Build list of completions: internal commands + manual actions
+                        let internal_commands = vec![
+                            "/help", "/disconnect", "/dc", "/send", "/worlds", "/connections",
+                            "/setup", "/web", "/actions", "/keepalive", "/reload", "/quit", "/gag",
+                        ];
+
+                        // Get manual actions (empty pattern)
+                        let manual_actions: Vec<String> = self.actions.iter()
+                            .filter(|a| a.pattern.is_empty())
+                            .map(|a| format!("/{}", a.name))
+                            .collect();
+
+                        // Find all matches
+                        let partial_lower = partial.to_lowercase();
+                        let mut matches: Vec<String> = internal_commands.iter()
+                            .filter(|cmd| cmd.to_lowercase().starts_with(&partial_lower))
+                            .map(|s| s.to_string())
+                            .collect();
+                        matches.extend(manual_actions.iter()
+                            .filter(|cmd| cmd.to_lowercase().starts_with(&partial_lower))
+                            .cloned());
+
+                        if !matches.is_empty() {
+                            matches.sort();
+                            matches.dedup();
+
+                            // Find next match index
+                            let next_idx = if partial.to_lowercase() == self.completion_prefix.to_lowercase() {
+                                // Cycle to next match
+                                (self.completion_index + 1) % matches.len()
+                            } else {
+                                // Find current match if we're already on a completed command
+                                matches.iter()
+                                    .position(|m| m.eq_ignore_ascii_case(partial))
+                                    .map(|idx| (idx + 1) % matches.len())
+                                    .unwrap_or(0)
+                            };
+
+                            // Update completion state
+                            self.completion_prefix = partial.to_string();
+                            self.completion_index = next_idx;
+
+                            // Replace input with completion
+                            self.input_buffer = format!("{}{}", matches[next_idx], args);
                         }
                     }
 
@@ -11250,6 +11337,23 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                     app.ws_broadcast(WsMessage::UnseenCleared { world_index });
                                 }
                             }
+                            WsMessage::ReleasePending { world_index, count } => {
+                                // A remote client is releasing pending lines - sync across all interfaces
+                                if world_index < app.worlds.len() {
+                                    let pending_count = app.worlds[world_index].pending_lines.len();
+                                    if pending_count > 0 {
+                                        // Determine how many lines to release
+                                        let to_release = if count == 0 { pending_count } else { count.min(pending_count) };
+                                        // Release the lines on the server
+                                        app.worlds[world_index].release_pending(to_release);
+                                        // Broadcast to all clients so they release the same number
+                                        app.ws_broadcast(WsMessage::PendingReleased { world_index, count: to_release });
+                                        // Also update pending count
+                                        let new_count = app.worlds[world_index].pending_lines.len();
+                                        app.ws_broadcast(WsMessage::PendingLinesUpdate { world_index, count: new_count });
+                                    }
+                                }
+                            }
                             WsMessage::UpdateWorldSettings { world_index, name, hostname, port, user, password, use_ssl, log_file, encoding, auto_login, keep_alive_type, keep_alive_cmd } => {
                                 // Update world settings from remote client
                                 if world_index < app.worlds.len() {
@@ -13416,8 +13520,12 @@ fn handle_key_event(key: KeyEvent, app: &mut App) -> KeyAction {
     if app.current_world().paused && key.code == KeyCode::Tab && key.modifiers.is_empty() {
         let batch_size = (app.output_height as usize).saturating_sub(2);
         let world_idx = app.current_world_index;
+        let pending_before = app.worlds[world_idx].pending_lines.len();
         app.current_world_mut().release_pending(batch_size);
-        // Broadcast updated pending count to GUI clients
+        let released = pending_before - app.worlds[world_idx].pending_lines.len();
+        // Broadcast release event so other clients sync
+        app.ws_broadcast(WsMessage::PendingReleased { world_index: world_idx, count: released });
+        // Also broadcast updated pending count
         let pending_count = app.worlds[world_idx].pending_lines.len();
         app.ws_broadcast(WsMessage::PendingLinesUpdate { world_index: world_idx, count: pending_count });
         return KeyAction::None;
@@ -13439,8 +13547,11 @@ fn handle_key_event(key: KeyEvent, app: &mut App) -> KeyAction {
         app.last_escape = None; // Clear escape state
         if app.current_world().paused {
             let world_idx = app.current_world_index;
+            let released = app.worlds[world_idx].pending_lines.len();
             app.current_world_mut().release_all_pending();
-            // Broadcast updated pending count to GUI clients
+            // Broadcast release event so other clients sync
+            app.ws_broadcast(WsMessage::PendingReleased { world_index: world_idx, count: released });
+            // Also broadcast updated pending count
             app.ws_broadcast(WsMessage::PendingLinesUpdate { world_index: world_idx, count: 0 });
         }
         return KeyAction::None;
