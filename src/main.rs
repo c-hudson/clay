@@ -14429,6 +14429,83 @@ async fn connect_discord(app: &mut App, event_tx: mpsc::Sender<AppEvent>) -> boo
         }
     }
 
+    // Resolve channel name to ID if needed
+    let guild_id = app.current_world().settings.discord_guild.clone();
+    if !channel_id.is_empty() && !channel_id.chars().all(|c| c.is_ascii_digit()) {
+        // Channel is a name, not an ID - need to resolve it
+        if guild_id.is_empty() {
+            app.add_output("Error: Guild ID is required when using a channel name.");
+            app.add_output("Either use a numeric channel ID or configure the Guild ID.");
+            return false;
+        }
+
+        app.add_output(&format!("Resolving channel name '{}'...", channel_id));
+
+        let client = reqwest::Client::new();
+        let url = format!("https://discord.com/api/v10/guilds/{}/channels", guild_id);
+        let response = match client
+            .get(&url)
+            .header("Authorization", format!("Bot {}", token))
+            .send()
+            .await
+        {
+            Ok(r) => r,
+            Err(e) => {
+                app.add_output(&format!("Failed to fetch guild channels: {}", e));
+                return false;
+            }
+        };
+
+        let status = response.status();
+        if !status.is_success() {
+            let body: serde_json::Value = response.json().await.unwrap_or_default();
+            let error_msg = body.get("message").and_then(|v| v.as_str()).unwrap_or("unknown error");
+            app.add_output(&format!("Failed to fetch guild channels (HTTP {}): {}", status.as_u16(), error_msg));
+            return false;
+        }
+
+        let channels: Vec<serde_json::Value> = match response.json().await {
+            Ok(c) => c,
+            Err(e) => {
+                app.add_output(&format!("Failed to parse channels response: {}", e));
+                return false;
+            }
+        };
+
+        // Find channel by name (case-insensitive)
+        let channel_name_lower = channel_id.to_lowercase();
+        let found_channel = channels.iter().find(|ch| {
+            ch.get("name")
+                .and_then(|n| n.as_str())
+                .map(|n| n.to_lowercase() == channel_name_lower)
+                .unwrap_or(false)
+        });
+
+        match found_channel {
+            Some(ch) => {
+                if let Some(id) = ch.get("id").and_then(|v| v.as_str()) {
+                    app.add_output(&format!("Resolved '{}' to channel ID {}", channel_id, id));
+                    channel_id = id.to_string();
+                } else {
+                    app.add_output(&format!("Channel '{}' found but has no ID", channel_id));
+                    return false;
+                }
+            }
+            None => {
+                app.add_output(&format!("Channel '{}' not found in guild", channel_id));
+                // List available channels as a hint
+                let available: Vec<&str> = channels.iter()
+                    .filter_map(|ch| ch.get("name").and_then(|n| n.as_str()))
+                    .take(10)
+                    .collect();
+                if !available.is_empty() {
+                    app.add_output(&format!("Available channels: {}", available.join(", ")));
+                }
+                return false;
+            }
+        }
+    }
+
     app.add_output("");
 
     // Connect to Discord Gateway
@@ -14489,7 +14566,7 @@ async fn connect_discord(app: &mut App, event_tx: mpsc::Sender<AppEvent>) -> boo
                                             "op": 2,
                                             "d": {
                                                 "token": token_clone,
-                                                "intents": 513, // GUILDS + GUILD_MESSAGES
+                                                "intents": 2099200, // GUILDS + GUILD_MESSAGES + MESSAGE_CONTENT
                                                 "properties": {
                                                     "os": "linux",
                                                     "browser": "clay",
