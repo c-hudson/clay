@@ -45,6 +45,8 @@ pub enum WsMessage {
     PendingReleased { world_index: usize, count: usize },
     UnseenCleared { world_index: usize },
     UnseenUpdate { world_index: usize, count: usize },
+    /// Tell client to execute a command locally (for action commands like /worlds)
+    ExecuteLocalCommand { command: String },
 
     // Commands (client -> server)
     SendCommand { world_index: usize, command: String },

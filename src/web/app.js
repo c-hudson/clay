@@ -829,6 +829,13 @@
                 }
                 break;
 
+            case 'ExecuteLocalCommand':
+                // Server wants us to execute a command locally (from action)
+                if (msg.command) {
+                    executeLocalCommand(msg.command);
+                }
+                break;
+
             default:
                 console.log('Unknown message type:', msg.type);
         }
@@ -1082,6 +1089,52 @@
         historyIndex = -1;
         elements.input.value = '';
         elements.prompt.textContent = '';
+    }
+
+    // Execute a command locally (called from server via ExecuteLocalCommand message)
+    // Used when action commands contain /commands that should open popups
+    function executeLocalCommand(cmd) {
+        const parsed = parseCommand(cmd);
+
+        switch (parsed.type) {
+            case CommandType.ACTIONS:
+                openActionsListPopup(parsed.world);
+                break;
+
+            case CommandType.WEB:
+                openWebPopup();
+                break;
+
+            case CommandType.SETUP:
+                openSetupPopup();
+                break;
+
+            case CommandType.WORLDS_LIST:
+                openWorldsPopup();
+                break;
+
+            case CommandType.WORLD_SELECTOR:
+                openWorldSelectorPopup();
+                break;
+
+            case CommandType.WORLD_SWITCH:
+                handleWorldCommand(parsed.name);
+                break;
+
+            case CommandType.HELP:
+                // Help popup not implemented in web, just ignore
+                break;
+
+            default:
+                // For commands not handled locally, send to server
+                // (e.g., /send, /disconnect)
+                send({
+                    type: 'SendCommand',
+                    world_index: currentWorldIndex,
+                    command: cmd
+                });
+                break;
+        }
     }
 
     // Switch world locally (does not affect console)

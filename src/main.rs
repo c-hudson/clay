@@ -2841,6 +2841,46 @@ fn split_action_commands(command: &str) -> Vec<String> {
     result
 }
 
+/// Substitute action arguments ($1-$9, $*) in a command string
+/// args_str is the space-separated arguments passed to the action
+fn substitute_action_args(command: &str, args_str: &str) -> String {
+    // Split args into words
+    let args: Vec<&str> = args_str.split_whitespace().collect();
+
+    let mut result = String::with_capacity(command.len() + args_str.len());
+    let mut chars = command.chars().peekable();
+
+    while let Some(c) = chars.next() {
+        if c == '$' {
+            if let Some(&next) = chars.peek() {
+                if next == '*' {
+                    // $* - all arguments
+                    chars.next();
+                    result.push_str(args_str);
+                } else if next.is_ascii_digit() && next != '0' {
+                    // $1-$9
+                    chars.next();
+                    let idx = (next as usize) - ('1' as usize);
+                    if idx < args.len() {
+                        result.push_str(args[idx]);
+                    }
+                    // If arg doesn't exist, substitute with nothing
+                } else {
+                    // Not a substitution pattern, keep the $
+                    result.push(c);
+                }
+            } else {
+                // $ at end of string
+                result.push(c);
+            }
+        } else {
+            result.push(c);
+        }
+    }
+
+    result
+}
+
 /// Result of checking action triggers on a line
 struct ActionTriggerResult {
     should_gag: bool,           // If true, suppress the line from output
@@ -6290,6 +6330,39 @@ mod remote_gui {
                             // Server's unseen count changed - update our copy
                             if world_index < self.worlds.len() {
                                 self.worlds[world_index].unseen_lines = count;
+                            }
+                        }
+                        WsMessage::ExecuteLocalCommand { command } => {
+                            // Server wants us to execute a command locally (from action)
+                            let parsed = parse_command(&command);
+                            match parsed {
+                                Command::WorldSelector => {
+                                    self.popup_state = PopupState::WorldList;
+                                    self.world_list_selected = self.current_world;
+                                }
+                                Command::WorldsList => {
+                                    self.popup_state = PopupState::ConnectedWorlds;
+                                    self.world_list_selected = self.current_world;
+                                }
+                                Command::Help => {
+                                    self.popup_state = PopupState::Help;
+                                }
+                                Command::Setup => {
+                                    self.popup_state = PopupState::Setup;
+                                }
+                                Command::Actions { .. } => {
+                                    self.popup_state = PopupState::ActionsList;
+                                    self.actions_selected = 0;
+                                }
+                                _ => {
+                                    // For other commands, send to server
+                                    if let Some(ref tx) = self.ws_tx {
+                                        let _ = tx.send(WsMessage::SendCommand {
+                                            world_index: self.current_world,
+                                            command,
+                                        });
+                                    }
+                                }
                             }
                         }
                         _ => {}
@@ -10121,11 +10194,11 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
     // Ensure we have at least one world (creates initial world only if no worlds loaded)
     app.ensure_has_world();
 
-    // After reload, clear unseen_lines and pending_lines on ALL worlds since these
-    // concepts don't carry over between sessions - they're meaningful only within a session
+    // After reload, clear pending_lines and pause state on ALL worlds since these
+    // are display state that doesn't carry over between sessions
+    // Note: unseen_lines IS preserved to maintain activity notifications
     if should_load_state && !app.worlds.is_empty() {
         for world in &mut app.worlds {
-            world.unseen_lines = 0;
             world.pending_lines.clear();
             world.pending_since = None;
             world.paused = false;
@@ -11035,20 +11108,31 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
 
                                 match parsed {
                                     // Commands handled locally on server
-                                    Command::ActionCommand { name, args: _ } => {
+                                    Command::ActionCommand { name, args } => {
                                         // Execute action if it exists
                                         if let Some(action) = app.settings.actions.iter().find(|a| a.name.eq_ignore_ascii_case(&name)) {
                                             let commands = split_action_commands(&action.command);
-                                            if world_index < app.worlds.len() {
-                                                if let Some(tx) = &app.worlds[world_index].command_tx {
-                                                    for cmd in commands {
-                                                        if cmd.eq_ignore_ascii_case("/gag") || cmd.to_lowercase().starts_with("/gag ") {
-                                                            continue;
-                                                        }
-                                                        let _ = tx.try_send(WriteCommand::Text(cmd));
-                                                    }
-                                                    app.worlds[world_index].last_send_time = Some(std::time::Instant::now());
+                                            let mut sent_to_server = false;
+                                            for cmd in commands {
+                                                // Substitute $1-$9 and $* with arguments
+                                                let cmd = substitute_action_args(&cmd, &args);
+
+                                                if cmd.eq_ignore_ascii_case("/gag") || cmd.to_lowercase().starts_with("/gag ") {
+                                                    continue;
                                                 }
+                                                // If command starts with /, send back to client for local execution
+                                                if cmd.starts_with('/') {
+                                                    app.ws_send_to_client(client_id, WsMessage::ExecuteLocalCommand { command: cmd });
+                                                } else if world_index < app.worlds.len() {
+                                                    // Plain text - send to MUD server
+                                                    if let Some(tx) = &app.worlds[world_index].command_tx {
+                                                        let _ = tx.try_send(WriteCommand::Text(cmd));
+                                                        sent_to_server = true;
+                                                    }
+                                                }
+                                            }
+                                            if sent_to_server {
+                                                app.worlds[world_index].last_send_time = Some(std::time::Instant::now());
                                             }
                                         } else {
                                             app.ws_broadcast(WsMessage::ServerData {
@@ -11843,20 +11927,31 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
 
                             match parsed {
                                 // Commands handled locally on server
-                                Command::ActionCommand { name, args: _ } => {
+                                Command::ActionCommand { name, args } => {
                                     // Execute action if it exists
                                     if let Some(action) = app.settings.actions.iter().find(|a| a.name.eq_ignore_ascii_case(&name)) {
                                         let commands = split_action_commands(&action.command);
-                                        if world_index < app.worlds.len() {
-                                            if let Some(tx) = &app.worlds[world_index].command_tx {
-                                                for cmd in commands {
-                                                    if cmd.eq_ignore_ascii_case("/gag") || cmd.to_lowercase().starts_with("/gag ") {
-                                                        continue;
-                                                    }
-                                                    let _ = tx.try_send(WriteCommand::Text(cmd));
-                                                }
-                                                app.worlds[world_index].last_send_time = Some(std::time::Instant::now());
+                                        let mut sent_to_server = false;
+                                        for cmd in commands {
+                                            // Substitute $1-$9 and $* with arguments
+                                            let cmd = substitute_action_args(&cmd, &args);
+
+                                            if cmd.eq_ignore_ascii_case("/gag") || cmd.to_lowercase().starts_with("/gag ") {
+                                                continue;
                                             }
+                                            // If command starts with /, send back to client for local execution
+                                            if cmd.starts_with('/') {
+                                                app.ws_send_to_client(client_id, WsMessage::ExecuteLocalCommand { command: cmd });
+                                            } else if world_index < app.worlds.len() {
+                                                // Plain text - send to MUD server
+                                                if let Some(tx) = &app.worlds[world_index].command_tx {
+                                                    let _ = tx.try_send(WriteCommand::Text(cmd));
+                                                    sent_to_server = true;
+                                                }
+                                            }
+                                        }
+                                        if sent_to_server {
+                                            app.worlds[world_index].last_send_time = Some(std::time::Instant::now());
                                         }
                                     } else {
                                         app.ws_broadcast(WsMessage::ServerData {
@@ -14757,7 +14852,7 @@ async fn handle_command(cmd: &str, app: &mut App, event_tx: mpsc::Sender<AppEven
             // TODO: Implement gag patterns
             app.add_output(&format!("Gag pattern set: {}", pattern));
         }
-        Command::ActionCommand { name, args: _ } => {
+        Command::ActionCommand { name, args } => {
             // Check if this is an action command (/name)
             let action_found = app.settings.actions.iter()
                 .find(|a| a.name.eq_ignore_ascii_case(&name))
@@ -14768,6 +14863,9 @@ async fn handle_command(cmd: &str, app: &mut App, event_tx: mpsc::Sender<AppEven
                 let commands = split_action_commands(&action.command);
                 let mut sent_to_server = false;
                 for cmd_str in commands {
+                    // Substitute $1-$9 and $* with arguments
+                    let cmd_str = substitute_action_args(&cmd_str, &args);
+
                     // Skip /gag commands when invoked manually
                     if cmd_str.eq_ignore_ascii_case("/gag") || cmd_str.to_lowercase().starts_with("/gag ") {
                         continue;
