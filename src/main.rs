@@ -2015,6 +2015,7 @@ struct ActionsPopup {
     edit_scroll_offset: usize,      // Horizontal scroll offset for long text fields
     error_message: Option<String>,  // Validation error message
     command_expanded: bool,         // Whether command field is expanded to show all lines
+    command_scroll_row: usize,      // Vertical scroll offset for command mini-editor (first visible row)
 }
 
 impl ActionsPopup {
@@ -2042,6 +2043,7 @@ impl ActionsPopup {
             edit_scroll_offset: 0,
             error_message: None,
             command_expanded: false,
+            command_scroll_row: 0,
         }
     }
 
@@ -2126,6 +2128,7 @@ impl ActionsPopup {
         self.cursor_pos = 0;
         self.edit_scroll_offset = 0;
         self.command_expanded = false;
+        self.command_scroll_row = 0;
 
         if let Some(idx) = index {
             if let Some(action) = self.actions.get(idx) {
@@ -2403,6 +2406,152 @@ impl ActionsPopup {
                 self.scroll_offset = pos - visible_items + 1;
             }
         }
+    }
+
+    /// Wrap command text into lines of given width
+    fn wrap_command_lines(&self, width: usize) -> Vec<String> {
+        if width == 0 {
+            return vec![self.edit_command.clone()];
+        }
+        let mut lines = Vec::new();
+        let mut current_line = String::new();
+        let mut char_count = 0;
+
+        for c in self.edit_command.chars() {
+            if c == '\n' {
+                lines.push(current_line);
+                current_line = String::new();
+                char_count = 0;
+            } else {
+                current_line.push(c);
+                char_count += 1;
+                if char_count >= width {
+                    lines.push(current_line);
+                    current_line = String::new();
+                    char_count = 0;
+                }
+            }
+        }
+        lines.push(current_line);
+        lines
+    }
+
+    /// Get row and column from cursor position in wrapped command text
+    fn get_command_cursor_row_col(&self, width: usize) -> (usize, usize) {
+        if width == 0 {
+            return (0, self.cursor_pos);
+        }
+        let mut row = 0;
+        let mut col = 0;
+        let mut byte_pos = 0;
+
+        for c in self.edit_command.chars() {
+            if byte_pos >= self.cursor_pos {
+                break;
+            }
+            if c == '\n' {
+                row += 1;
+                col = 0;
+            } else {
+                col += 1;
+                if col >= width {
+                    row += 1;
+                    col = 0;
+                }
+            }
+            byte_pos += c.len_utf8();
+        }
+        (row, col)
+    }
+
+    /// Adjust command scroll to keep cursor visible (5 visible rows)
+    fn adjust_command_scroll(&mut self, width: usize) {
+        let (row, _col) = self.get_command_cursor_row_col(width);
+        let visible_rows = 5;
+
+        if row < self.command_scroll_row {
+            self.command_scroll_row = row;
+        } else if row >= self.command_scroll_row + visible_rows {
+            self.command_scroll_row = row - visible_rows + 1;
+        }
+    }
+
+    /// Move cursor up one row in wrapped command text
+    fn move_command_cursor_up(&mut self, width: usize) {
+        if width == 0 {
+            return;
+        }
+        let (row, col) = self.get_command_cursor_row_col(width);
+        if row == 0 {
+            return; // Already at top
+        }
+
+        // Find position at same column in previous row
+        let lines = self.wrap_command_lines(width);
+        let target_row = row - 1;
+        let target_col = col.min(lines.get(target_row).map(|l| l.chars().count()).unwrap_or(0));
+
+        // Calculate byte position
+        let mut byte_pos = 0;
+        let mut current_row = 0;
+        let mut current_col = 0;
+
+        for c in self.edit_command.chars() {
+            if current_row == target_row && current_col == target_col {
+                break;
+            }
+            if c == '\n' {
+                current_row += 1;
+                current_col = 0;
+            } else {
+                current_col += 1;
+                if current_col >= width {
+                    current_row += 1;
+                    current_col = 0;
+                }
+            }
+            byte_pos += c.len_utf8();
+        }
+        self.cursor_pos = byte_pos;
+    }
+
+    /// Move cursor down one row in wrapped command text
+    fn move_command_cursor_down(&mut self, width: usize) {
+        if width == 0 {
+            return;
+        }
+        let (row, col) = self.get_command_cursor_row_col(width);
+        let lines = self.wrap_command_lines(width);
+        if row >= lines.len() - 1 {
+            return; // Already at bottom
+        }
+
+        // Find position at same column in next row
+        let target_row = row + 1;
+        let target_col = col.min(lines.get(target_row).map(|l| l.chars().count()).unwrap_or(0));
+
+        // Calculate byte position
+        let mut byte_pos = 0;
+        let mut current_row = 0;
+        let mut current_col = 0;
+
+        for c in self.edit_command.chars() {
+            if current_row == target_row && current_col == target_col {
+                break;
+            }
+            if c == '\n' {
+                current_row += 1;
+                current_col = 0;
+            } else {
+                current_col += 1;
+                if current_col >= width {
+                    current_row += 1;
+                    current_col = 0;
+                }
+            }
+            byte_pos += c.len_utf8();
+        }
+        self.cursor_pos = byte_pos.min(self.edit_command.len());
     }
 }
 
@@ -7657,7 +7806,7 @@ mod remote_gui {
                                 self.highlight_actions = !self.highlight_actions;
                             } else if i.consume_key(egui::Modifiers::NONE, egui::Key::Tab) {
                                 // Tab - command completion if input starts with /
-                                // Otherwise release pending lines if any
+                                // Otherwise release pending lines or scroll down if viewing history
                                 if self.input_buffer.starts_with('/') {
                                     tab_complete = true;
                                 } else if self.current_world < self.worlds.len()
@@ -7670,6 +7819,16 @@ mod remote_gui {
                                             world_index: self.current_world,
                                             count: 20,
                                         });
+                                    }
+                                } else if self.scroll_offset.is_some() {
+                                    // Viewing history - scroll down like PgDn
+                                    if let Some(offset) = self.scroll_offset {
+                                        let new_offset = offset + 300.0;
+                                        if new_offset >= self.scroll_max_offset - 10.0 {
+                                            self.scroll_offset = None; // Snap to bottom
+                                        } else {
+                                            self.scroll_offset = Some(new_offset);
+                                        }
                                     }
                                 }
                             } else if self.input_buffer.trim().is_empty() {
@@ -8197,8 +8356,13 @@ mod remote_gui {
                                                     self.connect_world(idx);
                                                 }
                                             } else {
-                                                // World not found - send to server to create it
-                                                self.send_command(self.current_world, cmd);
+                                                // World not found - show error locally
+                                                let ts = current_timestamp_secs();
+                                                if self.current_world < self.worlds.len() {
+                                                    self.worlds[self.current_world].output_lines.push(
+                                                        TimestampedLine { text: format!("World '{}' not found.", name), ts }
+                                                    );
+                                                }
                                             }
                                         }
                                         super::Command::WorldConnectNoLogin { ref name } => {
@@ -8210,7 +8374,13 @@ mod remote_gui {
                                                     self.send_command(idx, cmd);
                                                 }
                                             } else {
-                                                self.send_command(self.current_world, cmd);
+                                                // World not found - show error locally
+                                                let ts = current_timestamp_secs();
+                                                if self.current_world < self.worlds.len() {
+                                                    self.worlds[self.current_world].output_lines.push(
+                                                        TimestampedLine { text: format!("World '{}' not found.", name), ts }
+                                                    );
+                                                }
                                             }
                                         }
                                         _ => {
@@ -10446,12 +10616,12 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                 world.output_lines
                     .push(OutputLine::new("Connection was not restored during reload. Use /worlds to reconnect.".to_string()));
             }
-            // Clear pending_lines and unseen_lines for disconnected worlds - they're only meaningful for active connections
+            // Clear pending_lines for disconnected worlds - they're only meaningful for active connections
+            // Note: unseen_lines is preserved so user still sees activity indicator for unread output
             if !world.connected {
                 world.pending_lines.clear();
                 world.pending_since = None;
                 world.paused = false;
-                world.unseen_lines = 0;
             }
         }
 
@@ -12474,17 +12644,44 @@ fn handle_key_event(key: KeyEvent, app: &mut App) -> KeyAction {
                         }
                     }
                     KeyCode::Up => {
-                        app.actions_popup.prev_editor_field();
+                        if app.actions_popup.editor_field == ActionEditorField::Command {
+                            // In command field: move cursor up if not on first row
+                            let (row, _) = app.actions_popup.get_command_cursor_row_col(44);
+                            if row > 0 {
+                                app.actions_popup.move_command_cursor_up(44);
+                                app.actions_popup.adjust_command_scroll(44);
+                            } else {
+                                app.actions_popup.prev_editor_field();
+                            }
+                        } else {
+                            app.actions_popup.prev_editor_field();
+                        }
                     }
                     KeyCode::Down => {
-                        app.actions_popup.next_editor_field();
+                        if app.actions_popup.editor_field == ActionEditorField::Command {
+                            // In command field: move cursor down if not on last row
+                            let lines = app.actions_popup.wrap_command_lines(44);
+                            let (row, _) = app.actions_popup.get_command_cursor_row_col(44);
+                            if row < lines.len().saturating_sub(1) {
+                                app.actions_popup.move_command_cursor_down(44);
+                                app.actions_popup.adjust_command_scroll(44);
+                            } else {
+                                app.actions_popup.next_editor_field();
+                            }
+                        } else {
+                            app.actions_popup.next_editor_field();
+                        }
                     }
                     KeyCode::Left => {
                         match app.actions_popup.editor_field {
                             ActionEditorField::Name | ActionEditorField::World |
-                            ActionEditorField::Pattern | ActionEditorField::Command => {
+                            ActionEditorField::Pattern => {
                                 app.actions_popup.move_cursor_left();
                                 app.actions_popup.adjust_scroll(44); // field_width for 60-char popup
+                            }
+                            ActionEditorField::Command => {
+                                app.actions_popup.move_cursor_left();
+                                app.actions_popup.adjust_command_scroll(44);
                             }
                             ActionEditorField::MatchType => {
                                 // Left/Right toggle match type
@@ -12499,9 +12696,13 @@ fn handle_key_event(key: KeyEvent, app: &mut App) -> KeyAction {
                     KeyCode::Right => {
                         match app.actions_popup.editor_field {
                             ActionEditorField::Name | ActionEditorField::World |
-                            ActionEditorField::Pattern | ActionEditorField::Command => {
+                            ActionEditorField::Pattern => {
                                 app.actions_popup.move_cursor_right();
                                 app.actions_popup.adjust_scroll(44); // field_width for 60-char popup
+                            }
+                            ActionEditorField::Command => {
+                                app.actions_popup.move_cursor_right();
+                                app.actions_popup.adjust_command_scroll(44);
                             }
                             ActionEditorField::MatchType => {
                                 // Left/Right toggle match type
@@ -12515,15 +12716,27 @@ fn handle_key_event(key: KeyEvent, app: &mut App) -> KeyAction {
                     }
                     KeyCode::Home => {
                         app.actions_popup.move_cursor_home();
-                        app.actions_popup.adjust_scroll(44);
+                        if app.actions_popup.editor_field == ActionEditorField::Command {
+                            app.actions_popup.adjust_command_scroll(44);
+                        } else {
+                            app.actions_popup.adjust_scroll(44);
+                        }
                     }
                     KeyCode::End => {
                         app.actions_popup.move_cursor_end();
-                        app.actions_popup.adjust_scroll(44);
+                        if app.actions_popup.editor_field == ActionEditorField::Command {
+                            app.actions_popup.adjust_command_scroll(44);
+                        } else {
+                            app.actions_popup.adjust_scroll(44);
+                        }
                     }
                     KeyCode::Backspace => {
                         app.actions_popup.delete_char();
-                        app.actions_popup.adjust_scroll(44);
+                        if app.actions_popup.editor_field == ActionEditorField::Command {
+                            app.actions_popup.adjust_command_scroll(44);
+                        } else {
+                            app.actions_popup.adjust_scroll(44);
+                        }
                     }
                     KeyCode::Enter => {
                         match app.actions_popup.editor_field {
@@ -12552,9 +12765,13 @@ fn handle_key_event(key: KeyEvent, app: &mut App) -> KeyAction {
                     KeyCode::Char(c) => {
                         match app.actions_popup.editor_field {
                             ActionEditorField::Name | ActionEditorField::World |
-                            ActionEditorField::Pattern | ActionEditorField::Command => {
+                            ActionEditorField::Pattern => {
                                 app.actions_popup.insert_char(c);
                                 app.actions_popup.adjust_scroll(44); // field_width for 60-char popup
+                            }
+                            ActionEditorField::Command => {
+                                app.actions_popup.insert_char(c);
+                                app.actions_popup.adjust_command_scroll(44);
                             }
                             ActionEditorField::MatchType => {
                                 // Space toggles match type
@@ -13660,19 +13877,26 @@ fn handle_key_event(key: KeyEvent, app: &mut App) -> KeyAction {
         }
     }
 
-    // Handle Tab when paused - release one screenful of lines
-    if app.current_world().paused && key.code == KeyCode::Tab && key.modifiers.is_empty() {
-        let batch_size = (app.output_height as usize).saturating_sub(2);
-        let world_idx = app.current_world_index;
-        let pending_before = app.worlds[world_idx].pending_lines.len();
-        app.current_world_mut().release_pending(batch_size);
-        let released = pending_before - app.worlds[world_idx].pending_lines.len();
-        // Broadcast release event so other clients sync
-        app.ws_broadcast(WsMessage::PendingReleased { world_index: world_idx, count: released });
-        // Also broadcast updated pending count
-        let pending_count = app.worlds[world_idx].pending_lines.len();
-        app.ws_broadcast(WsMessage::PendingLinesUpdate { world_index: world_idx, count: pending_count });
-        return KeyAction::None;
+    // Handle Tab - release pending lines when paused, or scroll down when viewing history
+    if key.code == KeyCode::Tab && key.modifiers.is_empty() {
+        if app.current_world().paused {
+            // Paused with pending lines - release one screenful
+            let batch_size = (app.output_height as usize).saturating_sub(2);
+            let world_idx = app.current_world_index;
+            let pending_before = app.worlds[world_idx].pending_lines.len();
+            app.current_world_mut().release_pending(batch_size);
+            let released = pending_before - app.worlds[world_idx].pending_lines.len();
+            // Broadcast release event so other clients sync
+            app.ws_broadcast(WsMessage::PendingReleased { world_index: world_idx, count: released });
+            // Also broadcast updated pending count
+            let pending_count = app.worlds[world_idx].pending_lines.len();
+            app.ws_broadcast(WsMessage::PendingLinesUpdate { world_index: world_idx, count: pending_count });
+            return KeyAction::None;
+        } else if !app.current_world().is_at_bottom() {
+            // Not paused but scrolled back (Hist indicator showing) - scroll down like PgDn
+            app.scroll_output_down();
+            return KeyAction::None;
+        }
     }
 
     // Helper to check if escape was pressed recently (for Escape+key sequences)
@@ -14380,29 +14604,21 @@ async fn handle_command(cmd: &str, app: &mut App, event_tx: mpsc::Sender<AppEven
             }
         }
         Command::WorldSwitch { name } => {
-            // /worlds <name> - connect to world if exists, else show editor for new world
+            // /worlds <name> - switch to world and connect if not already connected
             if let Some(idx) = app.find_world(&name) {
-                // World exists - switch to it and connect if has settings
+                // World exists - switch to it
                 app.switch_world(idx);
+                // Connect if not already connected and has settings
                 if !app.current_world().connected {
                     let has_settings = !app.current_world().settings.hostname.is_empty()
                         && !app.current_world().settings.port.is_empty();
                     if has_settings {
                         return Box::pin(handle_command("/connect", app, event_tx)).await;
-                    } else {
-                        // No settings configured - open editor
-                        let input_height = app.input_height;
-                        let show_tags = app.show_tags;
-                        app.settings_popup.open(&app.settings, &app.worlds[idx], idx, input_height, show_tags);
                     }
                 }
             } else {
-                // World doesn't exist - create it and show editor
-                let idx = app.find_or_create_world(&name);
-                app.switch_world(idx);
-                let input_height = app.input_height;
-                let show_tags = app.show_tags;
-                app.settings_popup.open(&app.settings, &app.worlds[idx], idx, input_height, show_tags);
+                // World doesn't exist - show error message (goes through more-mode flow)
+                app.add_output(&format!("World '{}' not found.", name));
             }
         }
         Command::WorldsList => {
@@ -17098,7 +17314,7 @@ fn render_actions_popup(f: &mut Frame, app: &App) {
         ActionsView::Editor => {
             // Editor view - show name/world/match_type/pattern/command with Save/Cancel
             let popup_width = 60u16.min(area.width.saturating_sub(4));
-            let popup_height = 15u16.min(area.height.saturating_sub(2));
+            let popup_height = 20u16.min(area.height.saturating_sub(2));
 
             let x = area.width.saturating_sub(popup_width) / 2;
             let y = area.height.saturating_sub(popup_height) / 2;
@@ -17200,25 +17416,74 @@ fn render_actions_popup(f: &mut Frame, app: &App) {
                 ),
             ]));
 
+            // Command field: 5-line mini-editor with viewport scrolling
             lines.push(Line::from(Span::styled("Command:", command_label_style)));
-            let cmd_display = format_field_scrolled(&popup.edit_command, popup.cursor_pos, popup.editor_field == ActionEditorField::Command, inner_width.saturating_sub(4), if popup.editor_field == ActionEditorField::Command { scroll } else { 0 });
-            lines.push(Line::from(vec![
-                Span::styled("  [", label_style),
-                Span::styled(cmd_display, value_style),
-                Span::styled("]", label_style),
-            ]));
 
-            // Show additional command lines if expanded
-            if popup.command_expanded || popup.edit_command.contains(';') {
-                let commands: Vec<&str> = popup.edit_command.split(';').collect();
-                if commands.len() > 1 {
-                    for cmd in commands.iter().skip(1).take(3) {
-                        lines.push(Line::from(vec![
-                            Span::styled("  ", label_style),
-                            Span::styled(format!(";{}", truncate_str(cmd.trim(), inner_width.saturating_sub(3))), value_style),
-                        ]));
+            let cmd_width = inner_width.saturating_sub(6); // Leave room for "  [" and "]"
+            let wrapped_lines = popup.wrap_command_lines(cmd_width);
+            let (cursor_row, cursor_col) = popup.get_command_cursor_row_col(cmd_width);
+            let visible_rows = 5;
+            let scroll_row = popup.command_scroll_row;
+            let total_rows = wrapped_lines.len();
+            let is_command_active = popup.editor_field == ActionEditorField::Command;
+
+            // Show up indicator if scrolled down
+            if scroll_row > 0 {
+                lines.push(Line::from(vec![
+                    Span::styled("  ", label_style),
+                    Span::styled("▲ more above", Style::default().fg(Color::DarkGray)),
+                ]));
+            }
+
+            // Render visible rows (3 rows)
+            for row_idx in 0..visible_rows {
+                let actual_row = scroll_row + row_idx;
+                let line_text = wrapped_lines.get(actual_row).cloned().unwrap_or_default();
+
+                // Build display string with cursor if this is the active field
+                let display = if is_command_active && actual_row == cursor_row {
+                    let chars: Vec<char> = line_text.chars().collect();
+                    let mut s = String::new();
+                    for (i, &c) in chars.iter().enumerate() {
+                        if i == cursor_col {
+                            s.push('|');
+                        }
+                        s.push(c);
                     }
-                }
+                    if cursor_col >= chars.len() {
+                        s.push('|');
+                    }
+                    // Pad to fill the width
+                    while s.chars().count() < cmd_width + 1 {
+                        s.push(' ');
+                    }
+                    s
+                } else {
+                    // Not active or not cursor row - just pad the text
+                    let mut s = line_text.clone();
+                    while s.chars().count() < cmd_width {
+                        s.push(' ');
+                    }
+                    s
+                };
+
+                let bracket_left = if row_idx == 0 { "[" } else { " " };
+                let bracket_right = if row_idx == visible_rows - 1 { "]" } else { " " };
+
+                lines.push(Line::from(vec![
+                    Span::styled("  ", label_style),
+                    Span::styled(bracket_left, label_style),
+                    Span::styled(display, value_style),
+                    Span::styled(bracket_right, label_style),
+                ]));
+            }
+
+            // Show down indicator if more rows below
+            if scroll_row + visible_rows < total_rows {
+                lines.push(Line::from(vec![
+                    Span::styled("  ", label_style),
+                    Span::styled("▼ more below", Style::default().fg(Color::DarkGray)),
+                ]));
             }
 
             lines.push(Line::from(""));

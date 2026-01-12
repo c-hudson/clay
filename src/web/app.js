@@ -2491,22 +2491,11 @@
                         type: 'ConnectWorld',
                         world_index: worldIndex
                     });
-                } else {
-                    // No settings - send to server to open editor
-                    send({
-                        type: 'SendCommand',
-                        world_index: currentWorldIndex,
-                        command: '/worlds ' + worldName
-                    });
                 }
             }
         } else {
-            // World not found - send command to server to create/handle it
-            send({
-                type: 'SendCommand',
-                world_index: currentWorldIndex,
-                command: '/worlds ' + worldName
-            });
+            // World not found - show error message locally
+            appendLine(`World '${worldName}' not found.`, currentWorldIndex);
         }
     }
 
