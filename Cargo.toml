@@ -47,7 +47,7 @@ egui_extras = { version = "0.30", optional = true, features = ["image", "http", 
 image = { version = "0.25", optional = true, default-features = false, features = ["png", "gif"] }
 
 [features]
-default = ["native-tls-backend", "remote-gui"]
+default = ["rustls-backend"]
 native-tls-backend = ["tokio-native-tls", "native-tls", "tokio-tungstenite/native-tls"]
 rustls-backend = ["tokio-rustls", "rustls", "rustls-pemfile", "webpki-roots", "rustls-webpki", "tokio-tungstenite/rustls-tls-webpki-roots"]
 remote-gui = ["eframe", "egui", "egui_extras", "image"]
