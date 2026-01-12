@@ -685,14 +685,15 @@ Actions are automated triggers that match incoming MUD output against regex patt
 
 **Action Processing:**
 - Incoming lines are checked against all action patterns as they arrive
+- Works with all world types: MUD, Slack, and Discord
 - Pattern matching is case-insensitive
 - ANSI color codes are stripped before pattern matching
 - World-specific actions only match for their configured world (empty = all worlds)
-- When a pattern matches, the action's commands are executed (sent to the MUD)
+- When a pattern matches, the action's commands are executed (sent to the server)
 
 **Commands:**
 - Multiple commands can be separated by semicolons
-- Commands are sent to the MUD server, not processed as local commands
+- Commands are sent to the server (MUD/Slack/Discord), not processed as local commands
 - Special command `/gag` hides the matched line from display (but stores it for F2 viewing)
 
 **Gagging:**
