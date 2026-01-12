@@ -2692,6 +2692,17 @@ impl Default for WorldSettings {
     }
 }
 
+impl WorldSettings {
+    /// Check if this world has enough settings to attempt a connection
+    fn has_connection_settings(&self) -> bool {
+        match self.world_type {
+            WorldType::Mud => !self.hostname.is_empty() && !self.port.is_empty(),
+            WorldType::Slack => !self.slack_token.is_empty(),
+            WorldType::Discord => !self.discord_token.is_empty(),
+        }
+    }
+}
+
 /// Match type for action patterns
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize, Default)]
 pub enum MatchType {
@@ -11575,9 +11586,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                         // Remote clients should use ConnectWorld message instead
                                         // But we can try to handle it here too
                                         if world_index < app.worlds.len() && !app.worlds[world_index].connected {
-                                            let has_settings = !app.worlds[world_index].settings.hostname.is_empty()
-                                                && !app.worlds[world_index].settings.port.is_empty();
-                                            if has_settings {
+                                            if app.worlds[world_index].settings.has_connection_settings() {
                                                 // Save current index, connect target, restore
                                                 let prev_index = app.current_world_index;
                                                 app.current_world_index = world_index;
@@ -11586,7 +11595,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                             } else {
                                                 app.ws_broadcast(WsMessage::ServerData {
                                                     world_index,
-                                                    data: "No hostname/port configured for this world.".to_string(),
+                                                    data: "No connection settings configured for this world.".to_string(),
                                                     is_viewed: false,
                                                     ts: current_timestamp_secs(),
                                                 });
@@ -11601,9 +11610,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                             app.ws_broadcast(WsMessage::WorldSwitched { new_index: idx });
                                             // Connect if not connected and has settings
                                             if !app.worlds[idx].connected {
-                                                let has_settings = !app.worlds[idx].settings.hostname.is_empty()
-                                                    && !app.worlds[idx].settings.port.is_empty();
-                                                if has_settings {
+                                                if app.worlds[idx].settings.has_connection_settings() {
                                                     // For WorldConnectNoLogin, set skip flag
                                                     if matches!(parsed, Command::WorldConnectNoLogin { .. }) {
                                                         app.worlds[idx].skip_auto_login = true;
@@ -13679,9 +13686,7 @@ fn handle_key_event(key: KeyEvent, app: &mut App) -> KeyAction {
                     app.world_selector.close();
                     app.switch_world(idx);
                     if !app.current_world().connected {
-                        let has_settings = !app.current_world().settings.hostname.is_empty()
-                            && !app.current_world().settings.port.is_empty();
-                        if has_settings {
+                        if app.current_world().settings.has_connection_settings() {
                             return KeyAction::Connect;
                         }
                     }
@@ -13764,9 +13769,7 @@ fn handle_key_event(key: KeyEvent, app: &mut App) -> KeyAction {
                             app.world_selector.close();
                             app.switch_world(idx);
                             if !app.current_world().connected {
-                                let has_settings = !app.current_world().settings.hostname.is_empty()
-                                    && !app.current_world().settings.port.is_empty();
-                                if has_settings {
+                                if app.current_world().settings.has_connection_settings() {
                                     return KeyAction::Connect;
                                 }
                             }
@@ -14654,9 +14657,7 @@ async fn handle_command(cmd: &str, app: &mut App, event_tx: mpsc::Sender<AppEven
             if let Some(idx) = app.find_world(&name) {
                 app.switch_world(idx);
                 if !app.current_world().connected {
-                    let has_settings = !app.current_world().settings.hostname.is_empty()
-                        && !app.current_world().settings.port.is_empty();
-                    if has_settings {
+                    if app.current_world().settings.has_connection_settings() {
                         // Set flag to skip auto-login
                         app.current_world_mut().skip_auto_login = true;
                         return Box::pin(handle_command("/connect", app, event_tx)).await;
@@ -14675,9 +14676,7 @@ async fn handle_command(cmd: &str, app: &mut App, event_tx: mpsc::Sender<AppEven
                 app.switch_world(idx);
                 // Connect if not already connected and has settings
                 if !app.current_world().connected {
-                    let has_settings = !app.current_world().settings.hostname.is_empty()
-                        && !app.current_world().settings.port.is_empty();
-                    if has_settings {
+                    if app.current_world().settings.has_connection_settings() {
                         return Box::pin(handle_command("/connect", app, event_tx)).await;
                     }
                 }
