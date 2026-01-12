@@ -49,6 +49,7 @@ pub enum WsMessage {
     SwitchWorld { world_index: usize },
     ConnectWorld { world_index: usize },
     DisconnectWorld { world_index: usize },
+    DeleteWorld { world_index: usize },
     CreateWorld { name: String },
     ReleasePending { world_index: usize },
     MarkWorldSeen { world_index: usize },

@@ -67,9 +67,15 @@
         worldFilter: document.getElementById('world-filter'),
         worldSelectorList: document.getElementById('world-selector-list'),
         worldEditBtn: document.getElementById('world-edit-btn'),
+        worldDeleteBtn: document.getElementById('world-delete-btn'),
         worldConnectBtn: document.getElementById('world-connect-btn'),
         worldSwitchBtn: document.getElementById('world-switch-btn'),
         worldSelectorCancelBtn: document.getElementById('world-selector-cancel-btn'),
+        // World delete confirm popup
+        worldConfirmModal: document.getElementById('world-confirm-modal'),
+        worldConfirmText: document.getElementById('world-confirm-text'),
+        worldConfirmYesBtn: document.getElementById('world-confirm-yes-btn'),
+        worldConfirmNoBtn: document.getElementById('world-confirm-no-btn'),
         // Web settings popup
         webModal: document.getElementById('web-modal'),
         webProtocolBtn: document.getElementById('web-protocol-btn'),
@@ -140,6 +146,7 @@
     // World popup state
     let worldsPopupOpen = false;
     let worldSelectorPopupOpen = false;
+    let worldConfirmPopupOpen = false;
 
     // Web settings popup state
     let webPopupOpen = false;
@@ -607,6 +614,29 @@
                 if (msg.world_index !== undefined && worlds[msg.world_index]) {
                     worlds[msg.world_index].connected = false;
                     updateStatusBar();
+                }
+                break;
+
+            case 'WorldRemoved':
+                if (msg.world_index !== undefined && msg.world_index < worlds.length) {
+                    worlds.splice(msg.world_index, 1);
+                    // Adjust currentWorldIndex if needed
+                    if (currentWorldIndex >= worlds.length) {
+                        currentWorldIndex = Math.max(0, worlds.length - 1);
+                    } else if (currentWorldIndex > msg.world_index) {
+                        currentWorldIndex--;
+                    }
+                    // Adjust selectedWorldIndex if needed
+                    if (selectedWorldIndex >= worlds.length) {
+                        selectedWorldIndex = Math.max(0, worlds.length - 1);
+                    } else if (selectedWorldIndex > msg.world_index) {
+                        selectedWorldIndex--;
+                    }
+                    updateStatusBar();
+                    renderOutput();
+                    if (worldSelectorPopupOpen) {
+                        renderWorldSelectorList();
+                    }
                 }
                 break;
 
@@ -2208,6 +2238,42 @@
         }
     }
 
+    // Open world delete confirmation popup
+    function openWorldConfirmPopup() {
+        if (worlds.length <= 1) {
+            // Can't delete the last world
+            return;
+        }
+        if (selectedWorldIndex >= 0 && selectedWorldIndex < worlds.length) {
+            const world = worlds[selectedWorldIndex];
+            worldConfirmPopupOpen = true;
+            elements.worldConfirmText.textContent = `Delete world '${world.name}'?`;
+            elements.worldConfirmModal.className = 'modal visible';
+            elements.worldConfirmModal.style.display = 'flex';
+        }
+    }
+
+    // Close world delete confirmation popup
+    function closeWorldConfirmPopup() {
+        worldConfirmPopupOpen = false;
+        elements.worldConfirmModal.className = 'modal';
+        elements.worldConfirmModal.style.display = 'none';
+    }
+
+    // Confirm delete world
+    function confirmDeleteWorld() {
+        if (selectedWorldIndex >= 0 && selectedWorldIndex < worlds.length && worlds.length > 1) {
+            const world = worlds[selectedWorldIndex];
+            // Send delete command to server
+            send({
+                type: 'DeleteWorld',
+                world_index: selectedWorldIndex
+            });
+            closeWorldConfirmPopup();
+            closeWorldSelectorPopup();
+        }
+    }
+
     // Handle /world <name> command
     function handleWorldCommand(worldName) {
         // Find world by name (case-insensitive)
@@ -2254,7 +2320,7 @@
 
     // Check if any popup is open
     function isAnyPopupOpen() {
-        return actionsListPopupOpen || actionsEditorPopupOpen || actionsConfirmPopupOpen || worldsPopupOpen || worldSelectorPopupOpen || webPopupOpen || setupPopupOpen;
+        return actionsListPopupOpen || actionsEditorPopupOpen || actionsConfirmPopupOpen || worldsPopupOpen || worldSelectorPopupOpen || worldConfirmPopupOpen || webPopupOpen || setupPopupOpen;
     }
 
     // Check if a world should be included in cycling (connected OR has activity)
@@ -2728,6 +2794,18 @@
                 return;
             }
 
+            // Handle world delete confirm popup
+            if (worldConfirmPopupOpen) {
+                if (e.key === 'Escape' || e.key === 'n' || e.key === 'N') {
+                    e.preventDefault();
+                    closeWorldConfirmPopup();
+                } else if (e.key === 'y' || e.key === 'Y' || e.key === 'Enter') {
+                    e.preventDefault();
+                    confirmDeleteWorld();
+                }
+                return;
+            }
+
             // Handle world selector popup
             if (worldSelectorPopupOpen) {
                 if (e.key === 'Escape') {
@@ -2942,9 +3020,14 @@
 
         // World selector popup
         elements.worldEditBtn.onclick = editSelectedWorld;
+        elements.worldDeleteBtn.onclick = openWorldConfirmPopup;
         elements.worldConnectBtn.onclick = connectSelectedWorld;
         elements.worldSwitchBtn.onclick = switchToSelectedWorld;
         elements.worldSelectorCancelBtn.onclick = closeWorldSelectorPopup;
+
+        // World delete confirm popup
+        elements.worldConfirmYesBtn.onclick = confirmDeleteWorld;
+        elements.worldConfirmNoBtn.onclick = closeWorldConfirmPopup;
         elements.worldFilter.oninput = function() {
             // Update selection if current selection is filtered out
             const visibleIndices = getFilteredWorldIndices();

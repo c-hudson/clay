@@ -1382,6 +1382,7 @@ enum WorldSelectorFocus {
     List,
     AddButton,
     EditButton,
+    DeleteButton,
     ConnectButton,
     CancelButton,
 }
@@ -1393,6 +1394,8 @@ struct WorldSelectorPopup {
     filter_cursor: usize,
     editing_filter: bool,
     focus: WorldSelectorFocus,
+    confirm_delete: bool,           // True when showing delete confirmation
+    confirm_delete_selected: bool,  // True = Yes, False = No
 }
 
 impl WorldSelectorPopup {
@@ -1404,6 +1407,8 @@ impl WorldSelectorPopup {
             filter_cursor: 0,
             editing_filter: false,
             focus: WorldSelectorFocus::List,
+            confirm_delete: false,
+            confirm_delete_selected: false,
         }
     }
 
@@ -1414,18 +1419,22 @@ impl WorldSelectorPopup {
         self.filter_cursor = 0;
         self.editing_filter = false;
         self.focus = WorldSelectorFocus::List;
+        self.confirm_delete = false;
+        self.confirm_delete_selected = false;
     }
 
     fn close(&mut self) {
         self.visible = false;
         self.editing_filter = false;
+        self.confirm_delete = false;
     }
 
     fn next_focus(&mut self) {
         self.focus = match self.focus {
             WorldSelectorFocus::List => WorldSelectorFocus::AddButton,
             WorldSelectorFocus::AddButton => WorldSelectorFocus::EditButton,
-            WorldSelectorFocus::EditButton => WorldSelectorFocus::ConnectButton,
+            WorldSelectorFocus::EditButton => WorldSelectorFocus::DeleteButton,
+            WorldSelectorFocus::DeleteButton => WorldSelectorFocus::ConnectButton,
             WorldSelectorFocus::ConnectButton => WorldSelectorFocus::CancelButton,
             WorldSelectorFocus::CancelButton => WorldSelectorFocus::List,
         };
@@ -1436,7 +1445,8 @@ impl WorldSelectorPopup {
             WorldSelectorFocus::List => WorldSelectorFocus::CancelButton,
             WorldSelectorFocus::AddButton => WorldSelectorFocus::List,
             WorldSelectorFocus::EditButton => WorldSelectorFocus::AddButton,
-            WorldSelectorFocus::ConnectButton => WorldSelectorFocus::EditButton,
+            WorldSelectorFocus::DeleteButton => WorldSelectorFocus::EditButton,
+            WorldSelectorFocus::ConnectButton => WorldSelectorFocus::DeleteButton,
             WorldSelectorFocus::CancelButton => WorldSelectorFocus::ConnectButton,
         };
     }
@@ -1909,6 +1919,7 @@ enum ActionListField {
 enum ActionEditorField {
     Name,
     World,
+    MatchType,
     Pattern,
     Command,
     SaveButton,
@@ -1929,6 +1940,7 @@ struct ActionsPopup {
     // Editing state for current action
     edit_name: String,
     edit_world: String,
+    edit_match_type: MatchType,     // Pattern match type (Regexp or Wildcard)
     edit_pattern: String,
     edit_command: String,
     cursor_pos: usize,              // Cursor position in current text field
@@ -1951,6 +1963,7 @@ impl ActionsPopup {
             scroll_offset: 0,
             edit_name: String::new(),
             edit_world: String::new(),
+            edit_match_type: MatchType::Regexp,
             edit_pattern: String::new(),
             edit_command: String::new(),
             cursor_pos: 0,
@@ -1991,6 +2004,7 @@ impl ActionsPopup {
             if let Some(action) = self.actions.get(idx) {
                 self.edit_name = action.name.clone();
                 self.edit_world = action.world.clone();
+                self.edit_match_type = action.match_type;
                 self.edit_pattern = action.pattern.clone();
                 self.edit_command = action.command.clone();
             }
@@ -1998,6 +2012,7 @@ impl ActionsPopup {
             // New action
             self.edit_name.clear();
             self.edit_world.clear();
+            self.edit_match_type = MatchType::Regexp;
             self.edit_pattern.clear();
             self.edit_command.clear();
         }
@@ -2043,6 +2058,7 @@ impl ActionsPopup {
         let action = Action {
             name: name.to_string(),
             world: self.edit_world.trim().to_string(),
+            match_type: self.edit_match_type,
             pattern: self.edit_pattern.clone(),
             command: self.edit_command.clone(),
         };
@@ -2192,7 +2208,8 @@ impl ActionsPopup {
     fn next_editor_field(&mut self) {
         self.editor_field = match self.editor_field {
             ActionEditorField::Name => ActionEditorField::World,
-            ActionEditorField::World => ActionEditorField::Pattern,
+            ActionEditorField::World => ActionEditorField::MatchType,
+            ActionEditorField::MatchType => ActionEditorField::Pattern,
             ActionEditorField::Pattern => ActionEditorField::Command,
             ActionEditorField::Command => ActionEditorField::SaveButton,
             ActionEditorField::SaveButton => ActionEditorField::CancelButton,
@@ -2206,7 +2223,8 @@ impl ActionsPopup {
         self.editor_field = match self.editor_field {
             ActionEditorField::Name => ActionEditorField::CancelButton,
             ActionEditorField::World => ActionEditorField::Name,
-            ActionEditorField::Pattern => ActionEditorField::World,
+            ActionEditorField::MatchType => ActionEditorField::World,
+            ActionEditorField::Pattern => ActionEditorField::MatchType,
             ActionEditorField::Command => ActionEditorField::Pattern,
             ActionEditorField::SaveButton => ActionEditorField::Command,
             ActionEditorField::CancelButton => ActionEditorField::SaveButton,
@@ -2374,12 +2392,45 @@ impl Default for WorldSettings {
     }
 }
 
+/// Match type for action patterns
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize, Default)]
+pub enum MatchType {
+    #[default]
+    Regexp,     // Regular expression matching
+    Wildcard,   // Glob/wildcard matching (* and ?)
+}
+
+impl MatchType {
+    fn next(self) -> Self {
+        match self {
+            MatchType::Regexp => MatchType::Wildcard,
+            MatchType::Wildcard => MatchType::Regexp,
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            MatchType::Regexp => "Regexp",
+            MatchType::Wildcard => "Wildcard",
+        }
+    }
+
+    fn from_str(s: &str) -> Self {
+        match s.to_lowercase().as_str() {
+            "wildcard" => MatchType::Wildcard,
+            _ => MatchType::Regexp,
+        }
+    }
+}
+
 /// User-defined action/trigger
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Action {
     pub name: String,           // Unique name (also used as /name command if no pattern)
     pub world: String,          // World name to match (empty = all worlds)
-    pub pattern: String,        // Regex pattern to match output (empty = manual /name only)
+    #[serde(default)]
+    pub match_type: MatchType,  // How to interpret pattern (regexp or wildcard)
+    pub pattern: String,        // Pattern to match output (empty = manual /name only)
     pub command: String,        // Command(s) to execute, semicolon-separated
 }
 
@@ -2388,6 +2439,7 @@ impl Action {
         Self {
             name: String::new(),
             world: String::new(),
+            match_type: MatchType::Regexp,
             pattern: String::new(),
             command: String::new(),
         }
@@ -2637,6 +2689,24 @@ struct ActionTriggerResult {
     commands: Vec<String>,      // Commands to execute
 }
 
+/// Convert a wildcard pattern (* and ?) to a regex pattern
+fn wildcard_to_regex(pattern: &str) -> String {
+    let mut regex = String::with_capacity(pattern.len() * 2);
+    for c in pattern.chars() {
+        match c {
+            '*' => regex.push_str(".*"),
+            '?' => regex.push('.'),
+            // Escape regex special characters
+            '.' | '+' | '^' | '$' | '|' | '\\' | '(' | ')' | '[' | ']' | '{' | '}' => {
+                regex.push('\\');
+                regex.push(c);
+            }
+            _ => regex.push(c),
+        }
+    }
+    regex
+}
+
 /// Check if a line matches any action triggers
 /// Returns None if no match, Some(result) if matched
 fn check_action_triggers(
@@ -2658,8 +2728,14 @@ fn check_action_triggers(
             continue;
         }
 
+        // Convert pattern based on match type
+        let regex_pattern = match action.match_type {
+            MatchType::Wildcard => wildcard_to_regex(&action.pattern),
+            MatchType::Regexp => action.pattern.clone(),
+        };
+
         // Try to compile and match the regex (case-insensitive to match line_matches_action)
-        if let Ok(regex) = RegexBuilder::new(&action.pattern)
+        if let Ok(regex) = RegexBuilder::new(&regex_pattern)
             .case_insensitive(true)
             .build()
         {
@@ -2706,8 +2782,14 @@ fn line_matches_action(
             continue;
         }
 
+        // Convert pattern based on match type
+        let regex_pattern = match action.match_type {
+            MatchType::Wildcard => wildcard_to_regex(&action.pattern),
+            MatchType::Regexp => action.pattern.clone(),
+        };
+
         // Try to compile and match the regex (case-insensitive)
-        if let Ok(regex) = RegexBuilder::new(&action.pattern)
+        if let Ok(regex) = RegexBuilder::new(&regex_pattern)
             .case_insensitive(true)
             .build()
         {
@@ -4315,6 +4397,10 @@ fn save_settings(app: &App) -> io::Result<()> {
         if !action.world.is_empty() {
             writeln!(file, "world={}", action.world)?;
         }
+        // Only save match_type if not the default (regexp)
+        if action.match_type != MatchType::Regexp {
+            writeln!(file, "match_type={}", action.match_type.as_str().to_lowercase())?;
+        }
         if !action.pattern.is_empty() {
             // Escape newlines and equals signs in pattern
             writeln!(file, "pattern={}", action.pattern.replace('\\', "\\\\").replace('=', "\\e").replace('\n', "\\n"))?;
@@ -4386,6 +4472,7 @@ fn load_settings(app: &mut App) -> io::Result<()> {
                     match key {
                         "name" => action.name = value.to_string(),
                         "world" => action.world = value.to_string(),
+                        "match_type" => action.match_type = MatchType::from_str(value),
                         "pattern" => action.pattern = unescape_action_value(value),
                         "command" => action.command = unescape_action_value(value),
                         _ => {}
@@ -4704,6 +4791,10 @@ fn save_reload_state(app: &App) -> io::Result<()> {
         writeln!(file, "name={}", action.name)?;
         if !action.world.is_empty() {
             writeln!(file, "world={}", action.world)?;
+        }
+        // Only save match_type if not the default (regexp)
+        if action.match_type != MatchType::Regexp {
+            writeln!(file, "match_type={}", action.match_type.as_str().to_lowercase())?;
         }
         if !action.pattern.is_empty() {
             writeln!(file, "pattern={}", action.pattern.replace('\\', "\\\\").replace('=', "\\e").replace('\n', "\\n"))?;
@@ -5062,6 +5153,7 @@ fn load_reload_state(app: &mut App) -> io::Result<bool> {
                     match key {
                         "name" => action.name = value.to_string(),
                         "world" => action.world = value.to_string(),
+                        "match_type" => action.match_type = MatchType::from_str(value),
                         "pattern" => action.pattern = unescape_action_value(value),
                         "command" => action.command = unescape_action_value(value),
                         _ => {}
@@ -5234,6 +5326,8 @@ mod remote_gui {
         pub last_send_secs: Option<u64>,
         pub last_recv_secs: Option<u64>,
         pub last_nop_secs: Option<u64>,
+        // Partial line handling (for lines split across multiple WebSocket messages)
+        pub partial_line: String,
     }
 
     /// Which popup is currently open
@@ -5834,6 +5928,7 @@ mod remote_gui {
                                 last_send_secs: w.last_send_secs,
                                 last_recv_secs: w.last_recv_secs,
                                 last_nop_secs: w.last_nop_secs,
+                                partial_line: String::new(),
                             }).collect();
                             self.current_world = current_world_index;
                             self.console_theme = GuiTheme::from_name(&settings.console_theme);
@@ -5857,14 +5952,38 @@ mod remote_gui {
                         }
                         WsMessage::ServerData { world_index, data, is_viewed: _, ts } => {
                             if world_index < self.worlds.len() {
-                                // Parse and add new output lines, filtering out visually empty lines
-                                for line in data.lines() {
-                                    // Skip visually empty lines (only ANSI codes/whitespace)
-                                    if !is_visually_empty(line) {
-                                        self.worlds[world_index].output_lines.push(TimestampedLine {
-                                            text: line.to_string(),
-                                            ts,
-                                        });
+                                let world = &mut self.worlds[world_index];
+
+                                // Combine with any partial line from previous message
+                                let combined = if world.partial_line.is_empty() {
+                                    data.clone()
+                                } else {
+                                    let mut s = std::mem::take(&mut world.partial_line);
+                                    s.push_str(&data);
+                                    s
+                                };
+
+                                // Check if data ends with newline (complete line) or not (partial)
+                                let ends_with_newline = combined.ends_with('\n');
+
+                                // Split into lines
+                                let lines: Vec<&str> = combined.lines().collect();
+                                let line_count = lines.len();
+
+                                for (i, line) in lines.into_iter().enumerate() {
+                                    let is_last = i == line_count - 1;
+
+                                    if is_last && !ends_with_newline {
+                                        // Last line without trailing newline - it's a partial
+                                        world.partial_line = line.to_string();
+                                    } else {
+                                        // Complete line - add to output
+                                        if !is_visually_empty(line) {
+                                            world.output_lines.push(TimestampedLine {
+                                                text: line.to_string(),
+                                                ts,
+                                            });
+                                        }
                                     }
                                 }
                                 // Note: Don't track unseen_lines locally - server handles centralized tracking
@@ -5880,6 +5999,23 @@ mod remote_gui {
                         WsMessage::WorldDisconnected { world_index } => {
                             if world_index < self.worlds.len() {
                                 self.worlds[world_index].connected = false;
+                            }
+                        }
+                        WsMessage::WorldRemoved { world_index } => {
+                            if world_index < self.worlds.len() {
+                                self.worlds.remove(world_index);
+                                // Adjust current_world if needed
+                                if self.current_world >= self.worlds.len() {
+                                    self.current_world = self.worlds.len().saturating_sub(1);
+                                } else if self.current_world > world_index {
+                                    self.current_world -= 1;
+                                }
+                                // Adjust world_list_selected if needed
+                                if self.world_list_selected >= self.worlds.len() {
+                                    self.world_list_selected = self.worlds.len().saturating_sub(1);
+                                } else if self.world_list_selected > world_index {
+                                    self.world_list_selected -= 1;
+                                }
                             }
                         }
                         WsMessage::WorldSwitched { new_index } => {
@@ -8340,6 +8476,9 @@ mod remote_gui {
                                             popup_action = Some(("switch", selected));
                                             should_close = true;
                                         }
+                                        if ui.button("Delete").clicked() && world_info.len() > 1 {
+                                            popup_action = Some(("delete", selected));
+                                        }
                                         if ui.button("Edit").clicked() {
                                             popup_action = Some(("edit", selected));
                                         }
@@ -8726,22 +8865,17 @@ mod remote_gui {
                     );
 
                     if should_delete {
-                        // Delete the world
+                        // Delete the world - send request to server
                         if world_idx < self.worlds.len() && self.worlds.len() > 1 {
-                            self.worlds.remove(world_idx);
-                            // Adjust current_world if needed
-                            if self.current_world >= self.worlds.len() {
-                                self.current_world = self.worlds.len().saturating_sub(1);
-                            }
-                            // Send delete request to server
                             if let Some(ref ws_tx) = self.ws_tx {
-                                let msg = WsMessage::WorldRemoved { world_index: world_idx };
+                                let msg = WsMessage::DeleteWorld { world_index: world_idx };
                                 let _ = ws_tx.send(msg);
                             }
+                            // Local removal will happen when server sends WorldRemoved
                         }
                         close_popup = true;
                     } else if should_cancel {
-                        self.popup_state = PopupState::WorldEditor(world_idx);
+                        close_popup = true;
                     }
                 }
 
@@ -9285,9 +9419,9 @@ mod remote_gui {
 
                                 ui.separator();
 
-                                // Buttons: Add, Edit, Delete, Cancel
+                                // Buttons: Add, Edit, Delete, Ok
                                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                    if ui.button("Cancel").clicked() {
+                                    if ui.button("Ok").clicked() {
                                         should_close = true;
                                     }
                                     if ui.button("Delete").clicked() && !actions_clone.is_empty() {
@@ -9438,6 +9572,7 @@ mod remote_gui {
                         let new_action = Action {
                             name: self.edit_action_name.trim().to_string(),
                             world: self.edit_action_world.trim().to_string(),
+                            match_type: MatchType::Regexp, // GUI uses default match type for now
                             pattern: self.edit_action_pattern.clone(),
                             command: self.edit_action_command.clone(),
                         };
@@ -9515,6 +9650,11 @@ mod remote_gui {
                         "switch" => {
                             self.current_world = idx;
                             self.switch_world(idx);
+                        }
+                        "delete" => {
+                            if self.worlds.len() > 1 && idx < self.worlds.len() {
+                                self.popup_state = PopupState::WorldConfirmDelete(idx);
+                            }
                         }
                         _ => {}
                     }
@@ -10851,6 +10991,23 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                     // WorldDisconnected broadcast happens via AppEvent::Disconnected
                                 }
                             }
+                            WsMessage::DeleteWorld { world_index } => {
+                                // Delete specified world (if not the last one)
+                                if app.worlds.len() > 1 && world_index < app.worlds.len() {
+                                    let deleted_name = app.worlds[world_index].name.clone();
+                                    app.worlds.remove(world_index);
+                                    // Adjust current_world_index if needed
+                                    if app.current_world_index >= app.worlds.len() {
+                                        app.current_world_index = app.worlds.len().saturating_sub(1);
+                                    } else if app.current_world_index > world_index {
+                                        app.current_world_index -= 1;
+                                    }
+                                    app.add_output(&format!("World '{}' deleted.\n", deleted_name));
+                                    // Broadcast WorldRemoved to all clients
+                                    app.ws_broadcast(WsMessage::WorldRemoved { world_index });
+                                    let _ = save_settings(&mut app);
+                                }
+                            }
                             WsMessage::MarkWorldSeen { world_index } => {
                                 // A remote client has viewed this world - update their current_world
                                 if world_index < app.worlds.len() {
@@ -11858,6 +12015,10 @@ fn handle_key_event(key: KeyEvent, app: &mut App) -> KeyAction {
                                 app.actions_popup.move_cursor_left();
                                 app.actions_popup.adjust_scroll(44); // field_width for 60-char popup
                             }
+                            ActionEditorField::MatchType => {
+                                // Left/Right toggle match type
+                                app.actions_popup.edit_match_type = app.actions_popup.edit_match_type.next();
+                            }
                             ActionEditorField::CancelButton => {
                                 app.actions_popup.editor_field = ActionEditorField::SaveButton;
                             }
@@ -11870,6 +12031,10 @@ fn handle_key_event(key: KeyEvent, app: &mut App) -> KeyAction {
                             ActionEditorField::Pattern | ActionEditorField::Command => {
                                 app.actions_popup.move_cursor_right();
                                 app.actions_popup.adjust_scroll(44); // field_width for 60-char popup
+                            }
+                            ActionEditorField::MatchType => {
+                                // Left/Right toggle match type
+                                app.actions_popup.edit_match_type = app.actions_popup.edit_match_type.next();
                             }
                             ActionEditorField::SaveButton => {
                                 app.actions_popup.editor_field = ActionEditorField::CancelButton;
@@ -11904,6 +12069,10 @@ fn handle_key_event(key: KeyEvent, app: &mut App) -> KeyAction {
                             ActionEditorField::CancelButton => {
                                 app.actions_popup.close_editor();
                             }
+                            ActionEditorField::MatchType => {
+                                // Toggle match type
+                                app.actions_popup.edit_match_type = app.actions_popup.edit_match_type.next();
+                            }
                             _ => {
                                 app.actions_popup.next_editor_field();
                             }
@@ -11915,6 +12084,12 @@ fn handle_key_event(key: KeyEvent, app: &mut App) -> KeyAction {
                             ActionEditorField::Pattern | ActionEditorField::Command => {
                                 app.actions_popup.insert_char(c);
                                 app.actions_popup.adjust_scroll(44); // field_width for 60-char popup
+                            }
+                            ActionEditorField::MatchType => {
+                                // Space toggles match type
+                                if c == ' ' {
+                                    app.actions_popup.edit_match_type = app.actions_popup.edit_match_type.next();
+                                }
                             }
                             _ => {}
                         }
@@ -12236,10 +12411,11 @@ fn handle_key_event(key: KeyEvent, app: &mut App) -> KeyAction {
                                 app.settings_popup.close();
                             }
                             SettingsField::DeleteWorld => {
-                                // Show confirmation dialog
-                                let world_name = app.current_world().name.clone();
-                                let world_index = app.current_world_index;
-                                app.confirm_dialog.show_delete_world(&world_name, world_index);
+                                // Show confirmation dialog for the world being edited, not the current world
+                                if let Some(world_index) = app.settings_popup.editing_world_index {
+                                    let world_name = app.worlds[world_index].name.clone();
+                                    app.confirm_dialog.show_delete_world(&world_name, world_index);
+                                }
                             }
                             _ => {}
                         }
@@ -12579,6 +12755,70 @@ fn handle_key_event(key: KeyEvent, app: &mut App) -> KeyAction {
 
     // Handle world selector popup input
     if app.world_selector.visible {
+        // Handle delete confirmation dialog first
+        if app.world_selector.confirm_delete {
+            match key.code {
+                KeyCode::Esc => {
+                    // Cancel delete
+                    app.world_selector.confirm_delete = false;
+                }
+                KeyCode::Char('y') | KeyCode::Char('Y') => {
+                    // Confirm delete
+                    app.world_selector.confirm_delete_selected = true;
+                    // Delete the selected world
+                    let idx = app.world_selector.selected_index;
+                    if app.worlds.len() > 1 && idx < app.worlds.len() {
+                        let deleted_name = app.worlds[idx].name.clone();
+                        app.worlds.remove(idx);
+                        // Adjust current_world_index if needed
+                        if app.current_world_index >= app.worlds.len() {
+                            app.current_world_index = app.worlds.len().saturating_sub(1);
+                        } else if app.current_world_index > idx {
+                            app.current_world_index -= 1;
+                        }
+                        // Adjust selected_index
+                        if app.world_selector.selected_index >= app.worlds.len() {
+                            app.world_selector.selected_index = app.worlds.len().saturating_sub(1);
+                        }
+                        app.add_output(&format!("World '{}' deleted.\n", deleted_name));
+                        let _ = save_settings(app);
+                    }
+                    app.world_selector.confirm_delete = false;
+                }
+                KeyCode::Char('n') | KeyCode::Char('N') => {
+                    // Cancel delete
+                    app.world_selector.confirm_delete = false;
+                }
+                KeyCode::Enter => {
+                    if app.world_selector.confirm_delete_selected {
+                        // Yes selected - delete
+                        let idx = app.world_selector.selected_index;
+                        if app.worlds.len() > 1 && idx < app.worlds.len() {
+                            let deleted_name = app.worlds[idx].name.clone();
+                            app.worlds.remove(idx);
+                            if app.current_world_index >= app.worlds.len() {
+                                app.current_world_index = app.worlds.len().saturating_sub(1);
+                            } else if app.current_world_index > idx {
+                                app.current_world_index -= 1;
+                            }
+                            if app.world_selector.selected_index >= app.worlds.len() {
+                                app.world_selector.selected_index = app.worlds.len().saturating_sub(1);
+                            }
+                            app.add_output(&format!("World '{}' deleted.\n", deleted_name));
+                            let _ = save_settings(app);
+                        }
+                    }
+                    app.world_selector.confirm_delete = false;
+                }
+                KeyCode::Left | KeyCode::Right | KeyCode::Up | KeyCode::Down | KeyCode::Tab | KeyCode::BackTab => {
+                    // Toggle between Yes and No
+                    app.world_selector.confirm_delete_selected = !app.world_selector.confirm_delete_selected;
+                }
+                _ => {}
+            }
+            return KeyAction::None;
+        }
+
         if app.world_selector.editing_filter {
             // Filter text editing mode
             match key.code {
@@ -12703,6 +12943,15 @@ fn handle_key_event(key: KeyEvent, app: &mut App) -> KeyAction {
                             let input_height = app.input_height;
                             let show_tags = app.show_tags;
                             app.settings_popup.open(&app.settings, &app.worlds[idx], idx, input_height, show_tags);
+                        }
+                        WorldSelectorFocus::DeleteButton => {
+                            // Show delete confirmation
+                            if app.worlds.len() > 1 {
+                                app.world_selector.confirm_delete = true;
+                                app.world_selector.confirm_delete_selected = false; // Default to No
+                            } else {
+                                app.add_output("Cannot delete the last world.\n");
+                            }
                         }
                         WorldSelectorFocus::CancelButton => {
                             // Close without action
@@ -15770,7 +16019,7 @@ fn render_world_selector_popup(f: &mut Frame, app: &App) {
 
     // Calculate total content width: marker(2) + columns + spacing(6) + some padding(4)
     let content_width = 2 + name_width + host_width + port_width + user_width + 6 + 4;
-    let buttons_width = 47; // "[ Add ]  [ Edit ]  [ Connect ]  [ Cancel ] "
+    let buttons_width = 60; // "[ Add ]  [ Edit ]  [ Delete ]  [ Connect ]  [ Cancel ] "
     let min_content_width = content_width.max(buttons_width);
 
     // Add borders (2) and apply screen limits
@@ -15933,6 +16182,11 @@ fn render_world_selector_popup(f: &mut Frame, app: &App) {
     } else {
         Style::default().fg(theme.fg())
     };
+    let delete_style = if selector.focus == WorldSelectorFocus::DeleteButton {
+        Style::default().fg(theme.button_selected_fg()).bg(theme.button_selected_bg()).add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(theme.fg())
+    };
     let connect_style = if selector.focus == WorldSelectorFocus::ConnectButton {
         Style::default().fg(theme.button_selected_fg()).bg(theme.button_selected_bg()).add_modifier(Modifier::BOLD)
     } else {
@@ -15950,6 +16204,8 @@ fn render_world_selector_popup(f: &mut Frame, app: &App) {
         Span::raw("  "),
         Span::styled("[ Edit ]", edit_style),
         Span::raw("  "),
+        Span::styled("[ Delete ]", delete_style),
+        Span::raw("  "),
         Span::styled("[ Connect ]", connect_style),
         Span::raw("  "),
         Span::styled("[ Cancel ]", cancel_style),
@@ -15965,6 +16221,56 @@ fn render_world_selector_popup(f: &mut Frame, app: &App) {
     let popup_text = Paragraph::new(lines).block(popup_block);
 
     f.render_widget(popup_text, popup_area);
+
+    // Render delete confirmation dialog if active
+    if selector.confirm_delete {
+        let world_name = if selector.selected_index < app.worlds.len() {
+            app.worlds[selector.selected_index].name.clone()
+        } else {
+            "Unknown".to_string()
+        };
+
+        let confirm_width: u16 = 40;
+        let confirm_height: u16 = 5;
+        let confirm_x = area.width.saturating_sub(confirm_width) / 2;
+        let confirm_y = area.height.saturating_sub(confirm_height) / 2;
+        let confirm_area = Rect::new(confirm_x, confirm_y, confirm_width, confirm_height);
+
+        f.render_widget(ratatui::widgets::Clear, confirm_area);
+
+        let yes_style = if selector.confirm_delete_selected {
+            Style::default().fg(theme.button_selected_fg()).bg(theme.button_selected_bg()).add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(theme.fg())
+        };
+        let no_style = if !selector.confirm_delete_selected {
+            Style::default().fg(theme.button_selected_fg()).bg(theme.button_selected_bg()).add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(theme.fg())
+        };
+
+        let confirm_lines = vec![
+            Line::from(format!("Delete world '{}'?", world_name)),
+            Line::from(""),
+            Line::from(vec![
+                Span::styled("[ Yes ]", yes_style),
+                Span::raw("    "),
+                Span::styled("[ No ]", no_style),
+            ]),
+        ];
+
+        let confirm_block = Block::default()
+            .title(" Confirm Delete ")
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(theme.popup_border()))
+            .style(Style::default().bg(theme.popup_bg()));
+
+        let confirm_text = Paragraph::new(confirm_lines)
+            .block(confirm_block)
+            .alignment(Alignment::Center);
+
+        f.render_widget(confirm_text, confirm_area);
+    }
 }
 
 fn render_actions_popup(f: &mut Frame, app: &App) {
@@ -16075,7 +16381,7 @@ fn render_actions_popup(f: &mut Frame, app: &App) {
                 Span::raw("  "),
                 Span::styled("[ Delete ]", del_style),
                 Span::raw("  "),
-                Span::styled("[ Cancel ]", cancel_style),
+                Span::styled("[ Ok ]", cancel_style),
             ]));
 
             let popup_block = Block::default()
@@ -16089,9 +16395,9 @@ fn render_actions_popup(f: &mut Frame, app: &App) {
         }
 
         ActionsView::Editor => {
-            // Editor view - show name/world/pattern/command with Save/Cancel
+            // Editor view - show name/world/match_type/pattern/command with Save/Cancel
             let popup_width = 60u16.min(area.width.saturating_sub(4));
-            let popup_height = 14u16.min(area.height.saturating_sub(2));
+            let popup_height = 15u16.min(area.height.saturating_sub(2));
 
             let x = area.width.saturating_sub(popup_width) / 2;
             let y = area.height.saturating_sub(popup_height) / 2;
@@ -16153,6 +16459,7 @@ fn render_actions_popup(f: &mut Frame, app: &App) {
             // Use selected_style for label when field is active, value_style for content
             let name_label_style = if popup.editor_field == ActionEditorField::Name { selected_style } else { label_style };
             let world_label_style = if popup.editor_field == ActionEditorField::World { selected_style } else { label_style };
+            let match_type_label_style = if popup.editor_field == ActionEditorField::MatchType { selected_style } else { label_style };
             let pattern_label_style = if popup.editor_field == ActionEditorField::Pattern { selected_style } else { label_style };
             let command_label_style = if popup.editor_field == ActionEditorField::Command { selected_style } else { label_style };
 
@@ -16162,7 +16469,7 @@ fn render_actions_popup(f: &mut Frame, app: &App) {
             lines.push(Line::from(""));
 
             lines.push(Line::from(vec![
-                Span::styled("Name:    ", name_label_style),
+                Span::styled("Name:      ", name_label_style),
                 Span::styled(
                     format!("[{}]", format_field_scrolled(&popup.edit_name, popup.cursor_pos, popup.editor_field == ActionEditorField::Name, field_width.saturating_sub(2), if popup.editor_field == ActionEditorField::Name { scroll } else { 0 })),
                     value_style,
@@ -16170,15 +16477,22 @@ fn render_actions_popup(f: &mut Frame, app: &App) {
             ]));
 
             lines.push(Line::from(vec![
-                Span::styled("World:   ", world_label_style),
+                Span::styled("World:     ", world_label_style),
                 Span::styled(
                     format!("[{}]", format_field_scrolled(&popup.edit_world, popup.cursor_pos, popup.editor_field == ActionEditorField::World, field_width.saturating_sub(2), if popup.editor_field == ActionEditorField::World { scroll } else { 0 })),
                     value_style,
                 ),
             ]));
 
+            // Match Type toggle field
+            let match_type_value = format!("< {} >", popup.edit_match_type.as_str());
             lines.push(Line::from(vec![
-                Span::styled("Pattern: ", pattern_label_style),
+                Span::styled("Match Type:", match_type_label_style),
+                Span::styled(match_type_value, if popup.editor_field == ActionEditorField::MatchType { selected_style } else { value_style }),
+            ]));
+
+            lines.push(Line::from(vec![
+                Span::styled("Pattern:   ", pattern_label_style),
                 Span::styled(
                     format!("[{}]", format_field_scrolled(&popup.edit_pattern, popup.cursor_pos, popup.editor_field == ActionEditorField::Pattern, field_width.saturating_sub(2), if popup.editor_field == ActionEditorField::Pattern { scroll } else { 0 })),
                     value_style,
