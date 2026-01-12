@@ -14562,19 +14562,30 @@ async fn handle_command(cmd: &str, app: &mut App, event_tx: mpsc::Sender<AppEven
                 .cloned();
 
             if let Some(action) = action_found {
-                // Execute the action's commands
+                // Execute the action's commands - process each individually
                 let commands = split_action_commands(&action.command);
-                if let Some(tx) = &app.current_world().command_tx {
-                    for cmd_str in commands {
-                        // Skip /gag commands when invoked manually
-                        if cmd_str.eq_ignore_ascii_case("/gag") || cmd_str.to_lowercase().starts_with("/gag ") {
-                            continue;
-                        }
-                        let _ = tx.try_send(WriteCommand::Text(cmd_str));
+                let mut sent_to_server = false;
+                for cmd_str in commands {
+                    // Skip /gag commands when invoked manually
+                    if cmd_str.eq_ignore_ascii_case("/gag") || cmd_str.to_lowercase().starts_with("/gag ") {
+                        continue;
                     }
+
+                    // If command starts with /, process it as a client command
+                    if cmd_str.starts_with('/') {
+                        Box::pin(handle_command(&cmd_str, app, event_tx.clone())).await;
+                    } else {
+                        // Plain text - send to server if connected
+                        if let Some(tx) = &app.current_world().command_tx {
+                            let _ = tx.try_send(WriteCommand::Text(cmd_str.clone()));
+                            sent_to_server = true;
+                        } else {
+                            app.add_output(&format!("Not connected. Cannot send: {}", cmd_str));
+                        }
+                    }
+                }
+                if sent_to_server {
                     app.current_world_mut().last_send_time = Some(std::time::Instant::now());
-                } else {
-                    app.add_output("Not connected. Cannot execute action.");
                 }
             } else {
                 app.add_output(&format!("Unknown action: /{}", name));
