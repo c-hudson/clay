@@ -6505,7 +6505,11 @@ mod remote_gui {
                             } else {
                                 egui::Color32::from_rgb(205, 205, 0)  // Yellow
                             },
-                            34 => current_color = egui::Color32::from_rgb(0, 0, 205),     // Blue
+                            34 => current_color = if is_light_theme {
+                                egui::Color32::from_rgb(0, 0, 205)       // Blue (standard for light theme)
+                            } else {
+                                egui::Color32::from_rgb(26, 26, 230)     // Blue (10% lighter for dark theme)
+                            },
                             35 => current_color = egui::Color32::from_rgb(205, 0, 205),   // Magenta
                             36 => current_color = egui::Color32::from_rgb(0, 205, 205),   // Cyan
                             37 => current_color = if is_light_theme {
@@ -10520,19 +10524,46 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                         if world_idx < app.worlds.len() {
                             app.worlds[world_idx].last_receive_time = Some(std::time::Instant::now());
                             let is_current = world_idx == app.current_world_index || app.ws_client_viewing(world_idx);
-                            let settings = app.settings.clone();
-                            let output_height = app.output_height;
-                            let output_width = app.output_width;
-                            // Add newline to message
+                            let world_name = app.worlds[world_idx].name.clone();
+                            let actions = app.settings.actions.clone();
+
+                            // Check action triggers on the message
+                            let mut is_gagged = false;
+                            let mut commands_to_execute: Vec<String> = Vec::new();
+                            if let Some(result) = check_action_triggers(&message, &world_name, &actions) {
+                                commands_to_execute = result.commands;
+                                is_gagged = result.should_gag;
+                            }
+
                             let data = format!("{}\n", message);
-                            app.worlds[world_idx].add_output(&data, is_current, &settings, output_height, output_width, true, true);
-                            // Broadcast to WebSocket clients
-                            app.ws_broadcast(WsMessage::ServerData {
-                                world_index: world_idx,
-                                data,
-                                is_viewed: is_current,
-                                ts: current_timestamp_secs(),
-                            });
+
+                            if is_gagged {
+                                // Add as gagged line (only visible with F2)
+                                app.worlds[world_idx].output_lines.push(OutputLine::new_gagged(message.clone()));
+                                if !app.worlds[world_idx].paused {
+                                    app.worlds[world_idx].scroll_to_bottom();
+                                }
+                            } else {
+                                // Add non-gagged output normally
+                                let settings = app.settings.clone();
+                                let output_height = app.output_height;
+                                let output_width = app.output_width;
+                                app.worlds[world_idx].add_output(&data, is_current, &settings, output_height, output_width, true, true);
+                                // Broadcast to WebSocket clients (only non-gagged)
+                                app.ws_broadcast(WsMessage::ServerData {
+                                    world_index: world_idx,
+                                    data,
+                                    is_viewed: is_current,
+                                    ts: current_timestamp_secs(),
+                                });
+                            }
+
+                            // Execute any triggered commands
+                            if let Some(tx) = &app.worlds[world_idx].command_tx {
+                                for cmd in commands_to_execute {
+                                    let _ = tx.try_send(WriteCommand::Text(cmd));
+                                }
+                            }
                         }
                     }
                     // WebSocket events
@@ -11267,17 +11298,46 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                     if world_idx < app.worlds.len() {
                         app.worlds[world_idx].last_receive_time = Some(std::time::Instant::now());
                         let is_current = world_idx == app.current_world_index || app.ws_client_viewing(world_idx);
-                        let settings = app.settings.clone();
-                        let output_height = app.output_height;
-                        let output_width = app.output_width;
+                        let world_name = app.worlds[world_idx].name.clone();
+                        let actions = app.settings.actions.clone();
+
+                        // Check action triggers on the message
+                        let mut is_gagged = false;
+                        let mut commands_to_execute: Vec<String> = Vec::new();
+                        if let Some(result) = check_action_triggers(&message, &world_name, &actions) {
+                            commands_to_execute = result.commands;
+                            is_gagged = result.should_gag;
+                        }
+
                         let data = format!("{}\n", message);
-                        app.worlds[world_idx].add_output(&data, is_current, &settings, output_height, output_width, true, true);
-                        app.ws_broadcast(WsMessage::ServerData {
-                            world_index: world_idx,
-                            data,
-                            is_viewed: is_current,
-                            ts: current_timestamp_secs(),
-                        });
+
+                        if is_gagged {
+                            // Add as gagged line (only visible with F2)
+                            app.worlds[world_idx].output_lines.push(OutputLine::new_gagged(message.clone()));
+                            if !app.worlds[world_idx].paused {
+                                app.worlds[world_idx].scroll_to_bottom();
+                            }
+                        } else {
+                            // Add non-gagged output normally
+                            let settings = app.settings.clone();
+                            let output_height = app.output_height;
+                            let output_width = app.output_width;
+                            app.worlds[world_idx].add_output(&data, is_current, &settings, output_height, output_width, true, true);
+                            // Broadcast to WebSocket clients (only non-gagged)
+                            app.ws_broadcast(WsMessage::ServerData {
+                                world_index: world_idx,
+                                data,
+                                is_viewed: is_current,
+                                ts: current_timestamp_secs(),
+                            });
+                        }
+
+                        // Execute any triggered commands
+                        if let Some(tx) = &app.worlds[world_idx].command_tx {
+                            for cmd in commands_to_execute {
+                                let _ = tx.try_send(WriteCommand::Text(cmd));
+                            }
+                        }
                     }
                 }
                 // WebSocket events (drain loop - complex handlers use primary loop)
