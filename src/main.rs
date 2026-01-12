@@ -6127,6 +6127,10 @@ mod remote_gui {
         }
 
         fn process_messages(&mut self) {
+            // Collect deferred actions to avoid borrow issues
+            let mut deferred_switch: Option<usize> = None;
+            let mut deferred_connect: Option<usize> = None;
+
             if let Some(ref mut rx) = self.ws_rx {
                 while let Ok(msg) = rx.try_recv() {
                     match msg {
@@ -6344,6 +6348,28 @@ mod remote_gui {
                                     self.popup_state = PopupState::ConnectedWorlds;
                                     self.world_list_selected = self.current_world;
                                 }
+                                Command::WorldSwitch { ref name } | Command::WorldConnectNoLogin { ref name } => {
+                                    // Switch to world locally, connect if needed
+                                    if let Some(idx) = self.worlds.iter().position(|w| w.name.eq_ignore_ascii_case(name)) {
+                                        self.current_world = idx;
+                                        deferred_switch = Some(idx);
+                                        if !self.worlds[idx].connected {
+                                            deferred_connect = Some(idx);
+                                        }
+                                    }
+                                    // If world not found, ignore (don't send to server to avoid console switch)
+                                }
+                                Command::WorldEdit { ref name } => {
+                                    // Open editor for world
+                                    if let Some(ref name) = name {
+                                        if let Some(idx) = self.worlds.iter().position(|w| w.name.eq_ignore_ascii_case(name)) {
+                                            self.popup_state = PopupState::WorldEditor(idx);
+                                        }
+                                    } else {
+                                        // Edit current world
+                                        self.popup_state = PopupState::WorldEditor(self.current_world);
+                                    }
+                                }
                                 Command::Help => {
                                     self.popup_state = PopupState::Help;
                                 }
@@ -6354,8 +6380,20 @@ mod remote_gui {
                                     self.popup_state = PopupState::ActionsList;
                                     self.actions_selected = 0;
                                 }
+                                Command::Disconnect => {
+                                    // Send disconnect to server (this is safe, won't affect console's world)
+                                    if let Some(ref tx) = self.ws_tx {
+                                        let _ = tx.send(WsMessage::DisconnectWorld { world_index: self.current_world });
+                                    }
+                                }
+                                Command::Connect { .. } => {
+                                    // Connect current world
+                                    deferred_connect = Some(self.current_world);
+                                }
                                 _ => {
-                                    // For other commands, send to server
+                                    // For other commands (like /send), send to server
+                                    // Be careful: some commands like WorldSwitch would switch console
+                                    // so we handle those explicitly above
                                     if let Some(ref tx) = self.ws_tx {
                                         let _ = tx.send(WsMessage::SendCommand {
                                             world_index: self.current_world,
@@ -6368,6 +6406,14 @@ mod remote_gui {
                         _ => {}
                     }
                 }
+            }
+
+            // Execute deferred actions after the borrow is released
+            if let Some(idx) = deferred_switch {
+                self.switch_world(idx);
+            }
+            if let Some(idx) = deferred_connect {
+                self.connect_world(idx);
             }
         }
 
@@ -6388,8 +6434,11 @@ mod remote_gui {
         }
 
         fn switch_world(&mut self, world_index: usize) {
+            // Only send MarkWorldSeen to clear unseen count on server
+            // Don't send SwitchWorld - that would switch the console too
+            // GUI switching is local only (same as web interface)
             if let Some(ref tx) = self.ws_tx {
-                let _ = tx.send(WsMessage::SwitchWorld { world_index });
+                let _ = tx.send(WsMessage::MarkWorldSeen { world_index });
             }
         }
 
