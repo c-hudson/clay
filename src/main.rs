@@ -158,6 +158,10 @@ const WEB_STYLE_CSS: &str = include_str!("web/style.css");
 #[cfg(feature = "native-tls-backend")]
 const WEB_APP_JS: &str = include_str!("web/app.js");
 
+/// Embedded clay.png for the web interface menu icon
+#[cfg(feature = "native-tls-backend")]
+const WEB_CLAY_PNG: &[u8] = include_bytes!("../clay.png");
+
 /// Parse an HTTP request line and return the method and path
 #[cfg(feature = "native-tls-backend")]
 fn parse_http_request(request: &str) -> Option<(&str, &str)> {
@@ -180,6 +184,22 @@ fn build_http_response(status: u16, status_text: &str, content_type: &str, body:
          {}",
         status, status_text, content_type, body.len(), body
     ).into_bytes()
+}
+
+/// Build an HTTP response with binary body (for images)
+#[cfg(feature = "native-tls-backend")]
+fn build_http_response_binary(status: u16, status_text: &str, content_type: &str, body: &[u8]) -> Vec<u8> {
+    let header = format!(
+        "HTTP/1.1 {} {}\r\n\
+         Content-Type: {}\r\n\
+         Content-Length: {}\r\n\
+         Connection: close\r\n\
+         \r\n",
+        status, status_text, content_type, body.len()
+    );
+    let mut response = header.into_bytes();
+    response.extend_from_slice(body);
+    response
 }
 
 /// Handle an HTTPS connection
@@ -219,6 +239,9 @@ async fn handle_https_client(
             }
             "/app.js" => {
                 build_http_response(200, "OK", "application/javascript", WEB_APP_JS)
+            }
+            "/clay.png" => {
+                build_http_response_binary(200, "OK", "image/png", WEB_CLAY_PNG)
             }
             _ => {
                 build_http_response(404, "Not Found", "text/plain", "Not Found")
@@ -327,6 +350,10 @@ const WEB_STYLE_CSS: &str = include_str!("web/style.css");
 #[cfg(feature = "rustls-backend")]
 const WEB_APP_JS: &str = include_str!("web/app.js");
 
+/// Embedded clay.png for the web interface menu icon (rustls version)
+#[cfg(feature = "rustls-backend")]
+const WEB_CLAY_PNG: &[u8] = include_bytes!("../clay.png");
+
 /// Parse an HTTP request line and return the method and path (rustls version)
 #[cfg(feature = "rustls-backend")]
 fn parse_http_request(request: &str) -> Option<(&str, &str)> {
@@ -349,6 +376,22 @@ fn build_http_response(status: u16, status_text: &str, content_type: &str, body:
          {}",
         status, status_text, content_type, body.len(), body
     ).into_bytes()
+}
+
+/// Build an HTTP response with binary body (for images) (rustls version)
+#[cfg(feature = "rustls-backend")]
+fn build_http_response_binary(status: u16, status_text: &str, content_type: &str, body: &[u8]) -> Vec<u8> {
+    let header = format!(
+        "HTTP/1.1 {} {}\r\n\
+         Content-Type: {}\r\n\
+         Content-Length: {}\r\n\
+         Connection: close\r\n\
+         \r\n",
+        status, status_text, content_type, body.len()
+    );
+    let mut response = header.into_bytes();
+    response.extend_from_slice(body);
+    response
 }
 
 /// Handle an HTTPS connection (rustls version)
@@ -388,6 +431,9 @@ async fn handle_https_client(
             }
             "/app.js" => {
                 build_http_response(200, "OK", "application/javascript", WEB_APP_JS)
+            }
+            "/clay.png" => {
+                build_http_response_binary(200, "OK", "image/png", WEB_CLAY_PNG)
             }
             _ => {
                 build_http_response(404, "Not Found", "text/plain", "Not Found")
@@ -536,6 +582,20 @@ async fn handle_http_client(
         ).into_bytes()
     }
 
+    fn build_response_binary(status: u16, status_text: &str, content_type: &str, body: &[u8]) -> Vec<u8> {
+        let header = format!(
+            "HTTP/1.1 {} {}\r\n\
+             Content-Type: {}\r\n\
+             Content-Length: {}\r\n\
+             Connection: close\r\n\
+             \r\n",
+            status, status_text, content_type, body.len()
+        );
+        let mut response = header.into_bytes();
+        response.extend_from_slice(body);
+        response
+    }
+
     if let Some((method, path)) = parse_request(&request) {
         if method != "GET" {
             let response = build_response(405, "Method Not Allowed", "text/plain", "Method Not Allowed");
@@ -547,6 +607,7 @@ async fn handle_http_client(
         const HTTP_INDEX_HTML: &str = include_str!("web/index.html");
         const HTTP_STYLE_CSS: &str = include_str!("web/style.css");
         const HTTP_APP_JS: &str = include_str!("web/app.js");
+        const HTTP_CLAY_PNG: &[u8] = include_bytes!("../clay.png");
 
         let response = match path {
             "/" | "/index.html" => {
@@ -561,6 +622,9 @@ async fn handle_http_client(
             }
             "/app.js" => {
                 build_response(200, "OK", "application/javascript", HTTP_APP_JS)
+            }
+            "/clay.png" => {
+                build_response_binary(200, "OK", "image/png", HTTP_CLAY_PNG)
             }
             _ => {
                 build_response(404, "Not Found", "text/plain", "Not Found")
@@ -3542,6 +3606,11 @@ impl App {
         &mut self.worlds[idx]
     }
 
+    /// Find world index by name (case-insensitive)
+    fn find_world_index(&self, name: &str) -> Option<usize> {
+        self.worlds.iter().position(|w| w.name.eq_ignore_ascii_case(name))
+    }
+
     fn switch_world(&mut self, index: usize) {
         if index < self.worlds.len() && index != self.current_world_index {
             // Track previous world for Alt+w fallback
@@ -4139,18 +4208,18 @@ impl App {
 }
 
 pub enum AppEvent {
-    ServerData(usize, Vec<u8>),  // world_index, raw bytes
-    Disconnected(usize),         // world_index
-    TelnetDetected(usize),       // world_index - telnet negotiation detected
-    Prompt(usize, Vec<u8>),      // world_index, prompt bytes (from telnet GA)
+    ServerData(String, Vec<u8>),  // world_name, raw bytes
+    Disconnected(String),         // world_name
+    TelnetDetected(String),       // world_name - telnet negotiation detected
+    Prompt(String, Vec<u8>),      // world_name, prompt bytes (from telnet GA)
     SystemMessage(String),       // message to display in current world's output
     // WebSocket events
     WsClientConnected(u64),                    // client_id
     WsClientDisconnected(u64),                 // client_id
     WsClientMessage(u64, Box<WsMessage>),      // client_id, message
     // Slack/Discord events
-    SlackMessage(usize, String), // world_index, formatted message
-    DiscordMessage(usize, String), // world_index, formatted message
+    SlackMessage(String, String), // world_name, formatted message
+    DiscordMessage(String, String), // world_name, formatted message
 }
 
 fn get_settings_path() -> PathBuf {
@@ -10012,6 +10081,9 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                 // Clone tx for use in reader (for telnet responses)
                 let telnet_tx = cmd_tx;
 
+                // Capture world name for the reader task (stable across world deletions)
+                let world_name = app.worlds[world_idx].name.clone();
+
                 // Spawn reader task
                 let event_tx_read = event_tx.clone();
                 tokio::spawn(async move {
@@ -10029,24 +10101,24 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                         let _ = telnet_tx.send(WriteCommand::Raw(responses)).await;
                                     }
                                     if detected {
-                                        let _ = event_tx_read.send(AppEvent::TelnetDetected(world_idx)).await;
+                                        let _ = event_tx_read.send(AppEvent::TelnetDetected(world_name.clone())).await;
                                     }
                                     // Send prompt FIRST for immediate auto-login response
                                     if let Some(prompt_bytes) = prompt {
-                                        let _ = event_tx_read.send(AppEvent::Prompt(world_idx, prompt_bytes)).await;
+                                        let _ = event_tx_read.send(AppEvent::Prompt(world_name.clone(), prompt_bytes)).await;
                                     }
                                     // Send remaining data
                                     if !cleaned.is_empty() {
-                                        let _ = event_tx_read.send(AppEvent::ServerData(world_idx, cleaned)).await;
+                                        let _ = event_tx_read.send(AppEvent::ServerData(world_name.clone(), cleaned)).await;
                                     }
                                 }
                                 let _ = event_tx_read
                                     .send(AppEvent::ServerData(
-                                        world_idx,
+                                        world_name.clone(),
                                         "Connection closed by server.".as_bytes().to_vec(),
                                     ))
                                     .await;
-                                let _ = event_tx_read.send(AppEvent::Disconnected(world_idx)).await;
+                                let _ = event_tx_read.send(AppEvent::Disconnected(world_name.clone())).await;
                                 break;
                             }
                             Ok(n) => {
@@ -10078,21 +10150,21 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                     // Notify if telnet detected
                                     if detected {
                                         let _ = event_tx_read
-                                            .send(AppEvent::TelnetDetected(world_idx))
+                                            .send(AppEvent::TelnetDetected(world_name.clone()))
                                             .await;
                                     }
 
                                     // Send prompt FIRST if detected via telnet GA
                                     if let Some(prompt_bytes) = prompt {
                                         let _ = event_tx_read
-                                            .send(AppEvent::Prompt(world_idx, prompt_bytes))
+                                            .send(AppEvent::Prompt(world_name.clone(), prompt_bytes))
                                             .await;
                                     }
 
                                     // Send cleaned data to main loop
                                     if !cleaned.is_empty()
                                         && event_tx_read
-                                            .send(AppEvent::ServerData(world_idx, cleaned))
+                                            .send(AppEvent::ServerData(world_name.clone(), cleaned))
                                             .await
                                             .is_err()
                                     {
@@ -10103,9 +10175,9 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                             Err(e) => {
                                 let msg = format!("Read error: {}", e);
                                 let _ = event_tx_read
-                                    .send(AppEvent::ServerData(world_idx, msg.into_bytes()))
+                                    .send(AppEvent::ServerData(world_name.clone(), msg.into_bytes()))
                                     .await;
-                                let _ = event_tx_read.send(AppEvent::Disconnected(world_idx)).await;
+                                let _ = event_tx_read.send(AppEvent::Disconnected(world_name.clone())).await;
                                 break;
                             }
                         }
@@ -10589,13 +10661,13 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
             // Server events (data from MUD connections)
             Some(event) = event_rx.recv() => {
                 match event {
-                    AppEvent::ServerData(world_idx, bytes) => {
-                        if world_idx < app.worlds.len() {
+                    AppEvent::ServerData(ref world_name, bytes) => {
+                        if let Some(world_idx) = app.find_world_index(world_name) {
                             app.worlds[world_idx].last_receive_time = Some(std::time::Instant::now());
                             // Consider "current" if console OR any web/GUI client is viewing this world
                             let is_current = world_idx == app.current_world_index || app.ws_client_viewing(world_idx);
                             let data = app.worlds[world_idx].settings.encoding.decode(&bytes);
-                            let world_name = app.worlds[world_idx].name.clone();
+                            let world_name_for_triggers = world_name.clone();
                             let actions = app.settings.actions.clone();
 
                             // Process action triggers on complete lines
@@ -10618,7 +10690,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                 // Check triggers on complete lines
                                 let mut is_gagged = false;
                                 if !is_partial {
-                                    if let Some(result) = check_action_triggers(line, &world_name, &actions) {
+                                    if let Some(result) = check_action_triggers(line, &world_name_for_triggers, &actions) {
                                         // Collect commands to execute
                                         commands_to_execute.extend(result.commands);
                                         is_gagged = result.should_gag;
@@ -10698,8 +10770,8 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                             }
                         }
                     }
-                    AppEvent::Disconnected(world_idx) => {
-                        if world_idx < app.worlds.len() {
+                    AppEvent::Disconnected(ref world_name) => {
+                        if let Some(world_idx) = app.find_world_index(world_name) {
                             app.worlds[world_idx].connected = false;
                             app.worlds[world_idx].command_tx = None;
                             app.worlds[world_idx].telnet_mode = false;
@@ -10709,13 +10781,15 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                             app.ws_broadcast(WsMessage::WorldDisconnected { world_index: world_idx });
                         }
                     }
-                    AppEvent::TelnetDetected(world_idx) => {
-                        if world_idx < app.worlds.len() && !app.worlds[world_idx].telnet_mode {
-                            app.worlds[world_idx].telnet_mode = true;
+                    AppEvent::TelnetDetected(ref world_name) => {
+                        if let Some(world_idx) = app.find_world_index(world_name) {
+                            if !app.worlds[world_idx].telnet_mode {
+                                app.worlds[world_idx].telnet_mode = true;
+                            }
                         }
                     }
-                    AppEvent::Prompt(world_idx, prompt_bytes) => {
-                        if world_idx < app.worlds.len() {
+                    AppEvent::Prompt(ref world_name, prompt_bytes) => {
+                        if let Some(world_idx) = app.find_world_index(world_name) {
                             app.worlds[world_idx].last_receive_time = Some(std::time::Instant::now());
                             let encoding = app.worlds[world_idx].settings.encoding;
                             let prompt_text = encoding.decode(&prompt_bytes);
@@ -10778,17 +10852,17 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                         app.add_output(&message);
                     }
                     // Slack/Discord events
-                    AppEvent::SlackMessage(world_idx, message) | AppEvent::DiscordMessage(world_idx, message) => {
-                        if world_idx < app.worlds.len() {
+                    AppEvent::SlackMessage(ref world_name, message) | AppEvent::DiscordMessage(ref world_name, message) => {
+                        if let Some(world_idx) = app.find_world_index(world_name) {
                             app.worlds[world_idx].last_receive_time = Some(std::time::Instant::now());
                             let is_current = world_idx == app.current_world_index || app.ws_client_viewing(world_idx);
-                            let world_name = app.worlds[world_idx].name.clone();
+                            let world_name_for_triggers = world_name.clone();
                             let actions = app.settings.actions.clone();
 
                             // Check action triggers on the message
                             let mut is_gagged = false;
                             let mut commands_to_execute: Vec<String> = Vec::new();
-                            if let Some(result) = check_action_triggers(&message, &world_name, &actions) {
+                            if let Some(result) = check_action_triggers(&message, &world_name_for_triggers, &actions) {
                                 commands_to_execute = result.commands;
                                 is_gagged = result.should_gag;
                             }
@@ -11399,8 +11473,8 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
         while let Ok(event) = event_rx.try_recv() {
             processed_events = true;
             match event {
-                AppEvent::ServerData(world_idx, bytes) => {
-                    if world_idx < app.worlds.len() {
+                AppEvent::ServerData(ref world_name, bytes) => {
+                    if let Some(world_idx) = app.find_world_index(world_name) {
                         app.worlds[world_idx].last_receive_time = Some(std::time::Instant::now());
                         // Consider "current" if console OR any web/GUI client is viewing this world
                         let is_current = world_idx == app.current_world_index || app.ws_client_viewing(world_idx);
@@ -11408,7 +11482,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
 
                         // Debug log the raw input (increments sequence number)
                         debug_log_input(&mut app.worlds[world_idx], &data);
-                        let world_name = app.worlds[world_idx].name.clone();
+                        let world_name_for_triggers = world_name.clone();
                         let actions = app.settings.actions.clone();
 
                         // Process action triggers on complete lines
@@ -11430,7 +11504,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
 
                             let mut is_gagged = false;
                             if !is_partial {
-                                if let Some(result) = check_action_triggers(line, &world_name, &actions) {
+                                if let Some(result) = check_action_triggers(line, &world_name_for_triggers, &actions) {
                                     commands_to_execute.extend(result.commands);
                                     is_gagged = result.should_gag;
                                 }
@@ -11492,8 +11566,8 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                         }
                     }
                 }
-                AppEvent::Disconnected(world_idx) => {
-                    if world_idx < app.worlds.len() {
+                AppEvent::Disconnected(ref world_name) => {
+                    if let Some(world_idx) = app.find_world_index(world_name) {
                         app.worlds[world_idx].connected = false;
                         app.worlds[world_idx].command_tx = None;
                         app.worlds[world_idx].telnet_mode = false;
@@ -11502,13 +11576,15 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                         app.ws_broadcast(WsMessage::WorldDisconnected { world_index: world_idx });
                     }
                 }
-                AppEvent::TelnetDetected(world_idx) => {
-                    if world_idx < app.worlds.len() && !app.worlds[world_idx].telnet_mode {
-                        app.worlds[world_idx].telnet_mode = true;
+                AppEvent::TelnetDetected(ref world_name) => {
+                    if let Some(world_idx) = app.find_world_index(world_name) {
+                        if !app.worlds[world_idx].telnet_mode {
+                            app.worlds[world_idx].telnet_mode = true;
+                        }
                     }
                 }
-                AppEvent::Prompt(world_idx, prompt_bytes) => {
-                    if world_idx < app.worlds.len() {
+                AppEvent::Prompt(ref world_name, prompt_bytes) => {
+                    if let Some(world_idx) = app.find_world_index(world_name) {
                         app.worlds[world_idx].last_receive_time = Some(std::time::Instant::now());
                         let encoding = app.worlds[world_idx].settings.encoding;
                         let prompt_text = encoding.decode(&prompt_bytes);
@@ -11569,17 +11645,17 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                     app.add_output(&message);
                 }
                 // Slack/Discord events
-                AppEvent::SlackMessage(world_idx, message) | AppEvent::DiscordMessage(world_idx, message) => {
-                    if world_idx < app.worlds.len() {
+                AppEvent::SlackMessage(ref world_name, message) | AppEvent::DiscordMessage(ref world_name, message) => {
+                    if let Some(world_idx) = app.find_world_index(world_name) {
                         app.worlds[world_idx].last_receive_time = Some(std::time::Instant::now());
                         let is_current = world_idx == app.current_world_index || app.ws_client_viewing(world_idx);
-                        let world_name = app.worlds[world_idx].name.clone();
+                        let world_name_for_triggers = world_name.clone();
                         let actions = app.settings.actions.clone();
 
                         // Check action triggers on the message
                         let mut is_gagged = false;
                         let mut commands_to_execute: Vec<String> = Vec::new();
-                        if let Some(result) = check_action_triggers(&message, &world_name, &actions) {
+                        if let Some(result) = check_action_triggers(&message, &world_name_for_triggers, &actions) {
                             commands_to_execute = result.commands;
                             is_gagged = result.should_gag;
                         }
@@ -13475,7 +13551,8 @@ fn handle_key_event(key: KeyEvent, app: &mut App) -> KeyAction {
 // ============================================================================
 
 async fn connect_slack(app: &mut App, event_tx: mpsc::Sender<AppEvent>) -> bool {
-    let world_idx = app.current_world_index;
+    // Capture world name for the reader task (stable across world deletions)
+    let world_name = app.current_world().name.clone();
 
     // Clone settings values first to avoid borrow conflicts
     let token = app.current_world().settings.slack_token.clone();
@@ -13586,7 +13663,7 @@ async fn connect_slack(app: &mut App, event_tx: mpsc::Sender<AppEvent>) -> bool 
                                         let user = event.get("user").and_then(|v| v.as_str()).unwrap_or("unknown");
                                         let text = event.get("text").and_then(|v| v.as_str()).unwrap_or("");
                                         let formatted = format!("[{}] <{}> {}", msg_channel, user, text);
-                                        let _ = event_tx_clone.send(AppEvent::SlackMessage(world_idx, formatted)).await;
+                                        let _ = event_tx_clone.send(AppEvent::SlackMessage(world_name.clone(), formatted)).await;
                                     }
                                 }
                             }
@@ -13594,11 +13671,11 @@ async fn connect_slack(app: &mut App, event_tx: mpsc::Sender<AppEvent>) -> bool 
                     }
                 }
                 Ok(WsMsg::Close(_)) => {
-                    let _ = event_tx_clone.send(AppEvent::Disconnected(world_idx)).await;
+                    let _ = event_tx_clone.send(AppEvent::Disconnected(world_name.clone())).await;
                     break;
                 }
                 Err(_) => {
-                    let _ = event_tx_clone.send(AppEvent::Disconnected(world_idx)).await;
+                    let _ = event_tx_clone.send(AppEvent::Disconnected(world_name.clone())).await;
                     break;
                 }
                 _ => {}
@@ -13638,7 +13715,8 @@ async fn connect_slack(app: &mut App, event_tx: mpsc::Sender<AppEvent>) -> bool 
 // ============================================================================
 
 async fn connect_discord(app: &mut App, event_tx: mpsc::Sender<AppEvent>) -> bool {
-    let world_idx = app.current_world_index;
+    // Capture world name for the reader task (stable across world deletions)
+    let world_name = app.current_world().name.clone();
 
     // Clone settings values first to avoid borrow conflicts
     let token = app.current_world().settings.discord_token.clone();
@@ -13733,6 +13811,9 @@ async fn connect_discord(app: &mut App, event_tx: mpsc::Sender<AppEvent>) -> boo
     let (cmd_tx, mut cmd_rx) = mpsc::channel::<WriteCommand>(100);
     app.current_world_mut().command_tx = Some(cmd_tx);
 
+    // Clone world_name for both spawns before moving into first one
+    let world_name_for_writer = world_name.clone();
+
     // Spawn reader/heartbeat task
     let event_tx_clone = event_tx.clone();
     let token_clone = token.clone();
@@ -13788,7 +13869,7 @@ async fn connect_discord(app: &mut App, event_tx: mpsc::Sender<AppEvent>) -> boo
 
                                 if event_type == "READY" {
                                     _identified = true;
-                                    let _ = event_tx_clone.send(AppEvent::DiscordMessage(world_idx, "Connected to Discord!".to_string())).await;
+                                    let _ = event_tx_clone.send(AppEvent::DiscordMessage(world_name.clone(), "Connected to Discord!".to_string())).await;
                                 } else if event_type == "MESSAGE_CREATE" {
                                     if let Some(d) = json.get("d") {
                                         let msg_channel = d.get("channel_id").and_then(|v| v.as_str()).unwrap_or("");
@@ -13796,7 +13877,7 @@ async fn connect_discord(app: &mut App, event_tx: mpsc::Sender<AppEvent>) -> boo
                                             let author = d.get("author").and_then(|a| a.get("username")).and_then(|v| v.as_str()).unwrap_or("unknown");
                                             let content = d.get("content").and_then(|v| v.as_str()).unwrap_or("");
                                             let formatted = format!("[#{}] <{}> {}", msg_channel, author, content);
-                                            let _ = event_tx_clone.send(AppEvent::DiscordMessage(world_idx, formatted)).await;
+                                            let _ = event_tx_clone.send(AppEvent::DiscordMessage(world_name.clone(), formatted)).await;
                                         }
                                     }
                                 }
@@ -13818,11 +13899,11 @@ async fn connect_discord(app: &mut App, event_tx: mpsc::Sender<AppEvent>) -> boo
                     }
                 }
                 Ok(WsMsg::Close(_)) => {
-                    let _ = event_tx_clone.send(AppEvent::Disconnected(world_idx)).await;
+                    let _ = event_tx_clone.send(AppEvent::Disconnected(world_name.clone())).await;
                     break;
                 }
                 Err(_) => {
-                    let _ = event_tx_clone.send(AppEvent::Disconnected(world_idx)).await;
+                    let _ = event_tx_clone.send(AppEvent::Disconnected(world_name.clone())).await;
                     break;
                 }
                 _ => {}
@@ -13860,7 +13941,7 @@ async fn connect_discord(app: &mut App, event_tx: mpsc::Sender<AppEvent>) -> boo
                 WriteCommand::Raw(r) => String::from_utf8_lossy(&r).to_string(),
             };
             if channel_for_writer.is_empty() {
-                let _ = event_tx_for_writer.send(AppEvent::DiscordMessage(world_idx, "Error: No channel configured".to_string())).await;
+                let _ = event_tx_for_writer.send(AppEvent::DiscordMessage(world_name_for_writer.clone(), "Error: No channel configured".to_string())).await;
                 continue;
             }
             let url = format!("https://discord.com/api/v10/channels/{}/messages", channel_for_writer);
@@ -13880,12 +13961,12 @@ async fn connect_discord(app: &mut App, event_tx: mpsc::Sender<AppEvent>) -> boo
                         let body: serde_json::Value = response.json().await.unwrap_or_default();
                         let error_msg = body.get("message").and_then(|v| v.as_str()).unwrap_or("unknown error");
                         let msg = format!("Discord send failed (HTTP {}): {}", status.as_u16(), error_msg);
-                        let _ = event_tx_for_writer.send(AppEvent::DiscordMessage(world_idx, msg)).await;
+                        let _ = event_tx_for_writer.send(AppEvent::DiscordMessage(world_name_for_writer.clone(), msg)).await;
                     }
                 }
                 Err(e) => {
                     let msg = format!("Discord send error: {}", e);
-                    let _ = event_tx_for_writer.send(AppEvent::DiscordMessage(world_idx, msg)).await;
+                    let _ = event_tx_for_writer.send(AppEvent::DiscordMessage(world_name_for_writer.clone(), msg)).await;
                 }
             }
         }
@@ -14171,8 +14252,8 @@ async fn handle_command(cmd: &str, app: &mut App, event_tx: mpsc::Sender<AppEven
                     // Discard any unused initial world now that we have a real connection
                     app.discard_initial_world();
 
-                    // Re-capture world_idx after potential discard (indices may have shifted)
-                    let world_idx = app.current_world_index;
+                    // Capture world name for the reader task (stable across world deletions)
+                    let world_name = app.current_world().name.clone();
 
                     // Open log file if configured
                     let log_path = app.current_world().settings.log_file.clone();
@@ -14236,25 +14317,25 @@ async fn handle_command(cmd: &str, app: &mut App, event_tx: mpsc::Sender<AppEven
                                             let _ = telnet_tx.send(WriteCommand::Raw(responses)).await;
                                         }
                                         if detected {
-                                            let _ = event_tx_read.send(AppEvent::TelnetDetected(world_idx)).await;
+                                            let _ = event_tx_read.send(AppEvent::TelnetDetected(world_name.clone())).await;
                                         }
                                         // Send prompt FIRST for immediate auto-login response
                                         if let Some(prompt_bytes) = prompt {
-                                            let _ = event_tx_read.send(AppEvent::Prompt(world_idx, prompt_bytes)).await;
+                                            let _ = event_tx_read.send(AppEvent::Prompt(world_name.clone(), prompt_bytes)).await;
                                         }
                                         // Send remaining data
                                         if !cleaned.is_empty() {
-                                            let _ = event_tx_read.send(AppEvent::ServerData(world_idx, cleaned)).await;
+                                            let _ = event_tx_read.send(AppEvent::ServerData(world_name.clone(), cleaned)).await;
                                         }
                                     }
                                     let _ = event_tx_read
                                         .send(AppEvent::ServerData(
-                                            world_idx,
+                                            world_name.clone(),
                                             "Connection closed by server.".as_bytes().to_vec(),
                                         ))
                                         .await;
                                     let _ =
-                                        event_tx_read.send(AppEvent::Disconnected(world_idx)).await;
+                                        event_tx_read.send(AppEvent::Disconnected(world_name.clone())).await;
                                     break;
                                 }
                                 Ok(n) => {
@@ -14286,21 +14367,21 @@ async fn handle_command(cmd: &str, app: &mut App, event_tx: mpsc::Sender<AppEven
                                         // Notify if telnet detected
                                         if detected {
                                             let _ = event_tx_read
-                                                .send(AppEvent::TelnetDetected(world_idx))
+                                                .send(AppEvent::TelnetDetected(world_name.clone()))
                                                 .await;
                                         }
 
                                         // Send prompt FIRST if detected via telnet GA
                                         if let Some(prompt_bytes) = prompt {
                                             let _ = event_tx_read
-                                                .send(AppEvent::Prompt(world_idx, prompt_bytes))
+                                                .send(AppEvent::Prompt(world_name.clone(), prompt_bytes))
                                                 .await;
                                         }
 
                                         // Send cleaned data to main loop
                                         if !cleaned.is_empty()
                                             && event_tx_read
-                                                .send(AppEvent::ServerData(world_idx, cleaned))
+                                                .send(AppEvent::ServerData(world_name.clone(), cleaned))
                                                 .await
                                                 .is_err()
                                         {
@@ -14311,10 +14392,10 @@ async fn handle_command(cmd: &str, app: &mut App, event_tx: mpsc::Sender<AppEven
                                 Err(e) => {
                                     let msg = format!("Read error: {}", e);
                                     let _ = event_tx_read
-                                        .send(AppEvent::ServerData(world_idx, msg.into_bytes()))
+                                        .send(AppEvent::ServerData(world_name.clone(), msg.into_bytes()))
                                         .await;
                                     let _ =
-                                        event_tx_read.send(AppEvent::Disconnected(world_idx)).await;
+                                        event_tx_read.send(AppEvent::Disconnected(world_name.clone())).await;
                                     break;
                                 }
                             }
