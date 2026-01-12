@@ -546,6 +546,35 @@ body {
     margin-bottom: 8px;
 }
 
+.actions-filter {
+    margin-bottom: 8px;
+}
+
+.actions-filter input {
+    width: 100%;
+    padding: 6px;
+    background-color: #000;
+    border: 1px solid var(--separator-color);
+    color: var(--text-color);
+    font-family: inherit;
+    font-size: inherit;
+}
+
+.actions-filter input:focus {
+    outline: none;
+    border-color: var(--accent-color);
+}
+
+.action-world-filter-indicator {
+    color: var(--accent-color);
+    font-size: 0.9em;
+    margin-top: 4px;
+}
+
+.action-world-filter-indicator:empty {
+    display: none;
+}
+
 .actions-list {
     border: 1px solid var(--separator-color);
     background-color: #000;

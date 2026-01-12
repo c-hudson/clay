@@ -1937,6 +1937,11 @@ struct ActionsPopup {
     editor_field: ActionEditorField, // Current field in editor view
     confirm_selected: bool,         // Yes (true) or No (false) in confirm dialog
     scroll_offset: usize,           // Scroll offset for action list
+    // Filter state
+    filter: String,                 // Filter text for action list
+    filter_cursor: usize,           // Cursor position in filter
+    filter_editing: bool,           // True when actively editing filter
+    world_filter: String,           // Pre-set world filter from /actions <world>
     // Editing state for current action
     edit_name: String,
     edit_world: String,
@@ -1961,6 +1966,10 @@ impl ActionsPopup {
             editor_field: ActionEditorField::Name,
             confirm_selected: false,
             scroll_offset: 0,
+            filter: String::new(),
+            filter_cursor: 0,
+            filter_editing: false,
+            world_filter: String::new(),
             edit_name: String::new(),
             edit_world: String::new(),
             edit_match_type: MatchType::Regexp,
@@ -1977,18 +1986,73 @@ impl ActionsPopup {
         self.visible = true;
         self.view = ActionsView::List;
         self.actions = actions.to_vec();
-        self.selected_index = if actions.is_empty() { 0 } else { 0 };
+        self.selected_index = 0;
         self.editing_index = None;
         self.list_field = ActionListField::List;
         self.scroll_offset = 0;
+        self.filter.clear();
+        self.filter_cursor = 0;
+        self.filter_editing = false;
+        self.world_filter.clear();
         self.error_message = None;
         self.command_expanded = false;
+    }
+
+    fn open_with_world_filter(&mut self, actions: &[Action], world: &str) {
+        self.open(actions);
+        self.world_filter = world.to_string();
+        // Select first matching action
+        let indices = self.filtered_indices();
+        if !indices.is_empty() {
+            self.selected_index = indices[0];
+        }
     }
 
     fn close(&mut self) {
         self.visible = false;
         self.view = ActionsView::List;
+        self.filter.clear();
+        self.filter_cursor = 0;
+        self.filter_editing = false;
+        self.world_filter.clear();
         self.error_message = None;
+    }
+
+    /// Get indices of actions matching the filter
+    fn filtered_indices(&self) -> Vec<usize> {
+        let filter_lower = self.filter.to_lowercase();
+        let world_filter_lower = self.world_filter.to_lowercase();
+
+        self.actions.iter().enumerate()
+            .filter(|(_, action)| {
+                // World filter (from /actions <world>)
+                if !world_filter_lower.is_empty()
+                    && !action.world.to_lowercase().contains(&world_filter_lower)
+                {
+                    return false;
+                }
+                // Text filter (from filter input)
+                if !filter_lower.is_empty() {
+                    let name_match = action.name.to_lowercase().contains(&filter_lower);
+                    let world_match = action.world.to_lowercase().contains(&filter_lower);
+                    let pattern_match = action.pattern.to_lowercase().contains(&filter_lower);
+                    if !name_match && !world_match && !pattern_match {
+                        return false;
+                    }
+                }
+                true
+            })
+            .map(|(i, _)| i)
+            .collect()
+    }
+
+    fn start_filter_edit(&mut self) {
+        self.filter_editing = true;
+        self.list_field = ActionListField::List;
+    }
+
+    fn stop_filter_edit(&mut self) {
+        self.filter_editing = false;
     }
 
     fn open_editor(&mut self, index: Option<usize>) {
@@ -2234,23 +2298,47 @@ impl ActionsPopup {
     }
 
     fn select_prev_action(&mut self) {
-        if self.selected_index > 0 {
-            self.selected_index -= 1;
+        let indices = self.filtered_indices();
+        if indices.is_empty() {
+            return;
+        }
+        // Find current position in filtered list
+        if let Some(pos) = indices.iter().position(|&i| i == self.selected_index) {
+            if pos > 0 {
+                self.selected_index = indices[pos - 1];
+            }
+        } else if !indices.is_empty() {
+            // Not in filtered list, select last item
+            self.selected_index = indices[indices.len() - 1];
         }
         // Update scroll offset to keep selection visible
-        if self.selected_index < self.scroll_offset {
-            self.scroll_offset = self.selected_index;
+        if let Some(pos) = indices.iter().position(|&i| i == self.selected_index) {
+            if pos < self.scroll_offset {
+                self.scroll_offset = pos;
+            }
         }
     }
 
     fn select_next_action(&mut self) {
-        if self.selected_index + 1 < self.actions.len() {
-            self.selected_index += 1;
+        let indices = self.filtered_indices();
+        if indices.is_empty() {
+            return;
+        }
+        // Find current position in filtered list
+        if let Some(pos) = indices.iter().position(|&i| i == self.selected_index) {
+            if pos + 1 < indices.len() {
+                self.selected_index = indices[pos + 1];
+            }
+        } else if !indices.is_empty() {
+            // Not in filtered list, select first item
+            self.selected_index = indices[0];
         }
         // Update scroll offset to keep selection visible (assuming 5 visible items)
         let visible_items = 5;
-        if self.selected_index >= self.scroll_offset + visible_items {
-            self.scroll_offset = self.selected_index - visible_items + 1;
+        if let Some(pos) = indices.iter().position(|&i| i == self.selected_index) {
+            if pos >= self.scroll_offset + visible_items {
+                self.scroll_offset = pos - visible_items + 1;
+            }
         }
     }
 }
@@ -2473,8 +2561,8 @@ enum Command {
     Setup,
     /// /web - show web settings popup
     Web,
-    /// /actions - show actions popup
-    Actions,
+    /// /actions [world] - show actions popup, optionally filtered by world
+    Actions { world: Option<String> },
     /// /worlds or /l - show connected worlds list
     WorldsList,
     /// /world (no args) - show world selector
@@ -2526,7 +2614,14 @@ fn parse_command(input: &str) -> Command {
         "/reload" => Command::Reload,
         "/setup" => Command::Setup,
         "/web" => Command::Web,
-        "/actions" => Command::Actions,
+        "/actions" => {
+            let world = if args.is_empty() {
+                None
+            } else {
+                Some(args.join(" "))
+            };
+            Command::Actions { world }
+        }
         "/worlds" | "/l" => Command::WorldsList,
         "/world" => parse_world_command(args),
         "/connect" => parse_connect_command(args),
@@ -7137,10 +7232,7 @@ mod remote_gui {
                     ui.vertical_centered(|ui| {
                         ui.add_space(30.0);
 
-                        // Dog ASCII art and Clay title - matching console splash colors
-                        // ANSI 256-color to RGB: 180=#d7af87, 209=#ff875f, 208=#ff8700, 215=#ffaf5f
-                        // 216=#ffaf87, 217=#ffafaf, 218=#ffafd7, 213=#ff87ff, 244=#808080
-                        let dog_color = egui::Color32::from_rgb(0xd7, 0xaf, 0x87);  // tan/gold (180)
+                        // Clay logo image with CLAY block letters to the right
                         let clay_colors = [
                             egui::Color32::from_rgb(0xff, 0x87, 0x5f),  // 209
                             egui::Color32::from_rgb(0xff, 0x87, 0x00),  // 208
@@ -7149,39 +7241,41 @@ mod remote_gui {
                             egui::Color32::from_rgb(0xff, 0xaf, 0xaf),  // 217
                             egui::Color32::from_rgb(0xff, 0xaf, 0xd7),  // 218
                         ];
-                        let tagline_color = egui::Color32::from_rgb(0xff, 0x87, 0xff);  // 213
-                        let help_color = egui::Color32::from_rgb(0x80, 0x80, 0x80);  // 244
-
-                        // Splash art: dog on left, CLAY block letters on right
-                        let dog_lines = [
-                            "          (\\/\\__o     ",
-                            "  __      `-/ `_/     ",
-                            " `--\\______/  |       ",
-                            "    /        /        ",
-                            " -`/_------'\\_.       ",
-                            "                       ",
-                        ];
                         let clay_lines = [
                             " ██████╗██╗      █████╗ ██╗   ██╗",
                             "██╔════╝██║     ██╔══██╗╚██╗ ██╔╝",
                             "██║     ██║     ███████║ ╚████╔╝ ",
                             "██║     ██║     ██╔══██║  ╚██╔╝  ",
                             "╚██████╗███████╗██║  ██║   ██║   ",
-                            "╚═════╝╚══════╝╚═╝  ╚═╝   ╚═╝   ",
+                            " ╚═════╝╚══════╝╚═╝  ╚═╝   ╚═╝   ",
                         ];
 
-                        ui.vertical(|ui| {
-                            for (i, (dog, clay)) in dog_lines.iter().zip(clay_lines.iter()).enumerate() {
-                                ui.horizontal(|ui| {
-                                    ui.add_space(ui.available_width() / 2.0 - 250.0);
-                                    ui.label(egui::RichText::new(*dog).color(dog_color).monospace());
-                                    ui.label(egui::RichText::new(*clay).color(clay_colors[i]).monospace());
-                                });
-                            }
+                        ui.horizontal(|ui| {
+                            // Center the horizontal group
+                            ui.add_space((ui.available_width() - 400.0) / 2.0);
+
+                            // Image on left (30% smaller: 179x125)
+                            let splash_image = egui::Image::from_bytes(
+                                "bytes://clay_splash",
+                                include_bytes!("../clay.png"),
+                            ).fit_to_exact_size(egui::vec2(179.0, 125.0));
+                            ui.add(splash_image);
+
+                            ui.add_space(10.0);
+
+                            // CLAY text on right, moved down one line
+                            ui.vertical(|ui| {
+                                ui.label("");  // One line of spacing
+                                for (i, line) in clay_lines.iter().enumerate() {
+                                    ui.label(egui::RichText::new(*line).color(clay_colors[i]).monospace());
+                                }
+                            });
                         });
 
+                        let tagline_color = egui::Color32::from_rgb(0xff, 0x87, 0xff);  // 213
+                        let help_color = egui::Color32::from_rgb(0x80, 0x80, 0x80);  // 244
                         ui.add_space(10.0);
-                        ui.label(egui::RichText::new("✨ A 90dies mud client written today ✨").color(tagline_color).italics());
+                        ui.label(egui::RichText::new("A 90dies mud client written today").color(tagline_color).italics());
                         ui.add_space(5.0);
                         ui.label(egui::RichText::new("/help for how to use clay").color(help_color));
                         ui.add_space(15.0);
@@ -7772,7 +7866,7 @@ mod remote_gui {
                                         super::Command::Help => {
                                             self.popup_state = PopupState::Help;
                                         }
-                                        super::Command::Actions => {
+                                        super::Command::Actions { .. } => {
                                             self.actions_selected = 0;
                                             self.popup_state = PopupState::ActionsList;
                                         }
@@ -10913,7 +11007,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                         });
                                     }
                                     // UI popup commands - handled client-side, no-op on server
-                                    Command::Help | Command::Setup | Command::Web | Command::Actions |
+                                    Command::Help | Command::Setup | Command::Web | Command::Actions { .. } |
                                     Command::WorldsList | Command::WorldSelector | Command::WorldEdit { .. } => {
                                         // These are handled by the GUI/web interface locally
                                         // No server action needed
@@ -11702,7 +11796,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                     });
                                 }
                                 // UI popup commands - handled client-side, no-op on server
-                                Command::Help | Command::Setup | Command::Web | Command::Actions |
+                                Command::Help | Command::Setup | Command::Web | Command::Actions { .. } |
                                 Command::WorldsList | Command::WorldSelector | Command::WorldEdit { .. } => {
                                     // These are handled by the GUI/web interface locally
                                     // No server action needed
@@ -12122,87 +12216,180 @@ fn handle_key_event(key: KeyEvent, app: &mut App) -> KeyAction {
                 }
             }
             ActionsView::List => {
-                // List view
-                match key.code {
-                    KeyCode::Esc => {
-                        app.actions_popup.close();
-                    }
-                    KeyCode::Tab => {
-                        if key.modifiers.contains(KeyModifiers::SHIFT) {
-                            app.actions_popup.prev_list_field();
-                        } else {
-                            app.actions_popup.next_list_field();
+                // Check if we're in filter editing mode
+                if app.actions_popup.filter_editing {
+                    match key.code {
+                        KeyCode::Esc => {
+                            // Exit filter mode, clear filter
+                            app.actions_popup.filter.clear();
+                            app.actions_popup.filter_cursor = 0;
+                            app.actions_popup.stop_filter_edit();
                         }
-                    }
-                    KeyCode::Up => {
-                        if app.actions_popup.list_field == ActionListField::List {
+                        KeyCode::Enter => {
+                            // Exit filter mode, keep filter
+                            app.actions_popup.stop_filter_edit();
+                        }
+                        KeyCode::Backspace => {
+                            if app.actions_popup.filter_cursor > 0 {
+                                app.actions_popup.filter_cursor -= 1;
+                                app.actions_popup.filter.remove(app.actions_popup.filter_cursor);
+                                // Reset selection to first filtered item
+                                let indices = app.actions_popup.filtered_indices();
+                                if !indices.is_empty() {
+                                    app.actions_popup.selected_index = indices[0];
+                                    app.actions_popup.scroll_offset = 0;
+                                }
+                            }
+                        }
+                        KeyCode::Delete => {
+                            if app.actions_popup.filter_cursor < app.actions_popup.filter.len() {
+                                app.actions_popup.filter.remove(app.actions_popup.filter_cursor);
+                                let indices = app.actions_popup.filtered_indices();
+                                if !indices.is_empty() {
+                                    app.actions_popup.selected_index = indices[0];
+                                    app.actions_popup.scroll_offset = 0;
+                                }
+                            }
+                        }
+                        KeyCode::Left => {
+                            if app.actions_popup.filter_cursor > 0 {
+                                app.actions_popup.filter_cursor -= 1;
+                            }
+                        }
+                        KeyCode::Right => {
+                            if app.actions_popup.filter_cursor < app.actions_popup.filter.len() {
+                                app.actions_popup.filter_cursor += 1;
+                            }
+                        }
+                        KeyCode::Home => {
+                            app.actions_popup.filter_cursor = 0;
+                        }
+                        KeyCode::End => {
+                            app.actions_popup.filter_cursor = app.actions_popup.filter.len();
+                        }
+                        KeyCode::Up => {
                             app.actions_popup.select_prev_action();
-                        } else {
-                            app.actions_popup.list_field = ActionListField::List;
                         }
-                    }
-                    KeyCode::Down => {
-                        if app.actions_popup.list_field == ActionListField::List {
+                        KeyCode::Down => {
                             app.actions_popup.select_next_action();
-                        } else {
-                            app.actions_popup.list_field = ActionListField::List;
                         }
-                    }
-                    KeyCode::Left => {
-                        match app.actions_popup.list_field {
-                            ActionListField::EditButton => {
-                                app.actions_popup.list_field = ActionListField::AddButton;
+                        KeyCode::Char(c) => {
+                            app.actions_popup.filter.insert(app.actions_popup.filter_cursor, c);
+                            app.actions_popup.filter_cursor += 1;
+                            // Reset selection to first filtered item
+                            let indices = app.actions_popup.filtered_indices();
+                            if !indices.is_empty() {
+                                app.actions_popup.selected_index = indices[0];
+                                app.actions_popup.scroll_offset = 0;
                             }
-                            ActionListField::DeleteButton => {
-                                app.actions_popup.list_field = ActionListField::EditButton;
-                            }
-                            ActionListField::CancelButton => {
-                                app.actions_popup.list_field = ActionListField::DeleteButton;
-                            }
-                            _ => {}
                         }
+                        _ => {}
                     }
-                    KeyCode::Right => {
-                        match app.actions_popup.list_field {
-                            ActionListField::AddButton => {
-                                app.actions_popup.list_field = ActionListField::EditButton;
-                            }
-                            ActionListField::EditButton => {
-                                app.actions_popup.list_field = ActionListField::DeleteButton;
-                            }
-                            ActionListField::DeleteButton => {
-                                app.actions_popup.list_field = ActionListField::CancelButton;
-                            }
-                            _ => {}
+                } else {
+                    // Normal list navigation
+                    match key.code {
+                        KeyCode::Esc => {
+                            app.actions_popup.close();
                         }
-                    }
-                    KeyCode::Enter => {
-                        match app.actions_popup.list_field {
-                            ActionListField::List => {
-                                // Edit selected action
-                                if !app.actions_popup.actions.is_empty() {
-                                    let idx = app.actions_popup.selected_index;
-                                    app.actions_popup.open_editor(Some(idx));
+                        KeyCode::Tab => {
+                            if key.modifiers.contains(KeyModifiers::SHIFT) {
+                                app.actions_popup.prev_list_field();
+                            } else {
+                                app.actions_popup.next_list_field();
+                            }
+                        }
+                        KeyCode::Up => {
+                            if app.actions_popup.list_field == ActionListField::List {
+                                app.actions_popup.select_prev_action();
+                            } else {
+                                app.actions_popup.list_field = ActionListField::List;
+                            }
+                        }
+                        KeyCode::Down => {
+                            if app.actions_popup.list_field == ActionListField::List {
+                                app.actions_popup.select_next_action();
+                            } else {
+                                app.actions_popup.list_field = ActionListField::List;
+                            }
+                        }
+                        KeyCode::Left => {
+                            match app.actions_popup.list_field {
+                                ActionListField::EditButton => {
+                                    app.actions_popup.list_field = ActionListField::AddButton;
+                                }
+                                ActionListField::DeleteButton => {
+                                    app.actions_popup.list_field = ActionListField::EditButton;
+                                }
+                                ActionListField::CancelButton => {
+                                    app.actions_popup.list_field = ActionListField::DeleteButton;
+                                }
+                                _ => {}
+                            }
+                        }
+                        KeyCode::Right => {
+                            match app.actions_popup.list_field {
+                                ActionListField::AddButton => {
+                                    app.actions_popup.list_field = ActionListField::EditButton;
+                                }
+                                ActionListField::EditButton => {
+                                    app.actions_popup.list_field = ActionListField::DeleteButton;
+                                }
+                                ActionListField::DeleteButton => {
+                                    app.actions_popup.list_field = ActionListField::CancelButton;
+                                }
+                                _ => {}
+                            }
+                        }
+                        KeyCode::Enter => {
+                            match app.actions_popup.list_field {
+                                ActionListField::List => {
+                                    // Edit selected action
+                                    let indices = app.actions_popup.filtered_indices();
+                                    if !indices.is_empty() {
+                                        let idx = app.actions_popup.selected_index;
+                                        app.actions_popup.open_editor(Some(idx));
+                                    }
+                                }
+                                ActionListField::AddButton => {
+                                    app.actions_popup.open_editor(None);
+                                }
+                                ActionListField::EditButton => {
+                                    let indices = app.actions_popup.filtered_indices();
+                                    if !indices.is_empty() {
+                                        let idx = app.actions_popup.selected_index;
+                                        app.actions_popup.open_editor(Some(idx));
+                                    }
+                                }
+                                ActionListField::DeleteButton => {
+                                    app.actions_popup.open_confirm_delete();
+                                }
+                                ActionListField::CancelButton => {
+                                    app.actions_popup.close();
                                 }
                             }
-                            ActionListField::AddButton => {
-                                app.actions_popup.open_editor(None);
-                            }
-                            ActionListField::EditButton => {
-                                if !app.actions_popup.actions.is_empty() {
-                                    let idx = app.actions_popup.selected_index;
-                                    app.actions_popup.open_editor(Some(idx));
-                                }
-                            }
-                            ActionListField::DeleteButton => {
-                                app.actions_popup.open_confirm_delete();
-                            }
-                            ActionListField::CancelButton => {
-                                app.actions_popup.close();
+                        }
+                        KeyCode::Char('/') => {
+                            // Start filter editing
+                            if app.actions_popup.list_field == ActionListField::List {
+                                app.actions_popup.start_filter_edit();
                             }
                         }
+                        KeyCode::Char(c) => {
+                            // Start filtering when typing in list
+                            if app.actions_popup.list_field == ActionListField::List {
+                                app.actions_popup.start_filter_edit();
+                                app.actions_popup.filter.push(c);
+                                app.actions_popup.filter_cursor = app.actions_popup.filter.len();
+                                // Reset selection to first filtered item
+                                let indices = app.actions_popup.filtered_indices();
+                                if !indices.is_empty() {
+                                    app.actions_popup.selected_index = indices[0];
+                                    app.actions_popup.scroll_offset = 0;
+                                }
+                            }
+                        }
+                        _ => {}
                     }
-                    _ => {}
                 }
             }
         }
@@ -13826,8 +14013,12 @@ async fn handle_command(cmd: &str, app: &mut App, event_tx: mpsc::Sender<AppEven
             app.add_output("─".repeat(70).as_str());
             app.add_output("(*=current, ✓=connected)");
         }
-        Command::Actions => {
-            app.actions_popup.open(&app.settings.actions);
+        Command::Actions { world } => {
+            if let Some(world_name) = world {
+                app.actions_popup.open_with_world_filter(&app.settings.actions, &world_name);
+            } else {
+                app.actions_popup.open(&app.settings.actions);
+            }
         }
         Command::Connect { host: arg_host, port: arg_port, ssl: arg_ssl } => {
             // Only master client can initiate connections
@@ -16320,6 +16511,9 @@ fn render_actions_popup(f: &mut Frame, app: &App) {
     match popup.view {
         ActionsView::List => {
             // List view - show actions with Add/Edit/Delete/Cancel buttons
+            // Get filtered indices
+            let filtered_indices = popup.filtered_indices();
+
             let max_action_display = popup.actions.iter().map(|a| {
                 let display_len = if a.pattern.is_empty() {
                     if a.world.is_empty() {
@@ -16339,7 +16533,9 @@ fn render_actions_popup(f: &mut Frame, app: &App) {
             let content_width = max_action_display.max(buttons_width).max(40);
             let popup_width = ((content_width + 4) as u16).min(area.width.saturating_sub(4));
             let list_height = 8usize;
-            let popup_height = ((list_height + 5) as u16).min(area.height.saturating_sub(2));
+            // Extra height for filter line (1) + world filter indicator if present (1)
+            let extra_lines = if popup.world_filter.is_empty() { 1 } else { 2 };
+            let popup_height = ((list_height + 5 + extra_lines) as u16).min(area.height.saturating_sub(2));
 
             let x = area.width.saturating_sub(popup_width) / 2;
             let y = area.height.saturating_sub(popup_height) / 2;
@@ -16350,14 +16546,54 @@ fn render_actions_popup(f: &mut Frame, app: &App) {
             let mut lines: Vec<Line<'static>> = Vec::new();
             let inner_width = popup_width.saturating_sub(4) as usize;
 
+            // Filter line at top
+            let filter_label = "Filter: ";
+            let filter_display = if popup.filter_editing {
+                let mut buf = popup.filter.clone();
+                buf.insert(popup.filter_cursor, '|');
+                buf
+            } else if popup.filter.is_empty() {
+                "(type to filter)".to_string()
+            } else {
+                popup.filter.clone()
+            };
+            let filter_style = if popup.filter_editing {
+                Style::default().fg(theme.fg_success())
+            } else {
+                Style::default().fg(theme.fg_dim())
+            };
+            lines.push(Line::from(vec![
+                Span::styled(filter_label, Style::default().fg(theme.fg_accent())),
+                Span::styled(filter_display, filter_style),
+            ]));
+
+            // World filter indicator if set
+            if !popup.world_filter.is_empty() {
+                lines.push(Line::from(Span::styled(
+                    format!("World: {}", popup.world_filter),
+                    Style::default().fg(theme.fg_accent()),
+                )));
+            }
+
             lines.push(Line::from(""));
 
-            let actions_len = popup.actions.len();
             let scroll = popup.scroll_offset;
 
+            // Calculate scroll offset to keep selection visible
+            let selected_pos = filtered_indices
+                .iter()
+                .position(|&i| i == popup.selected_index)
+                .unwrap_or(0);
+            let scroll_offset = if selected_pos >= list_height {
+                selected_pos - list_height + 1
+            } else {
+                scroll.min(filtered_indices.len().saturating_sub(list_height))
+            };
+
             for i in 0..list_height {
-                let action_idx = scroll + i;
-                if action_idx < actions_len {
+                let filtered_pos = scroll_offset + i;
+                if filtered_pos < filtered_indices.len() {
+                    let action_idx = filtered_indices[filtered_pos];
                     let action = &popup.actions[action_idx];
                     let is_selected = action_idx == popup.selected_index;
                     let marker = if is_selected { ">" } else { " " };

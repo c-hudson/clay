@@ -38,6 +38,8 @@
         mobilePgDnBtn: document.getElementById('mobile-pgdn-btn'),
         // Actions List popup
         actionsListModal: document.getElementById('actions-list-modal'),
+        actionFilter: document.getElementById('action-filter'),
+        actionWorldFilterIndicator: document.getElementById('action-world-filter'),
         actionsList: document.getElementById('actions-list'),
         actionAddBtn: document.getElementById('action-add-btn'),
         actionEditBtn: document.getElementById('action-edit-btn'),
@@ -139,6 +141,7 @@
     let actionsConfirmPopupOpen = false;
     let selectedActionIndex = -1;
     let editingActionIndex = -1;  // -1 = new action, >=0 = editing existing
+    let actionsWorldFilter = '';  // Filter by world from /actions <world>
 
     // Tag display state
     let showTags = false;
@@ -260,7 +263,7 @@
             case '/web':
                 return { type: CommandType.WEB };
             case '/actions':
-                return { type: CommandType.ACTIONS };
+                return { type: CommandType.ACTIONS, world: args.join(' ') || null };
             case '/worlds':
             case '/l':
                 return { type: CommandType.WORLDS_LIST };
@@ -939,7 +942,7 @@
         switch (parsed.type) {
             case CommandType.ACTIONS:
                 elements.input.value = '';
-                openActionsPopup();
+                openActionsListPopup(parsed.world);
                 return;
 
             case CommandType.WEB:
@@ -1609,23 +1612,64 @@
     // Actions popup functions (split into List and Editor)
 
     // Open Actions List popup
-    function openActionsListPopup() {
+    function openActionsListPopup(worldFilter = null) {
         actionsListPopupOpen = true;
-        selectedActionIndex = actions.length > 0 ? 0 : -1;
+        actionsWorldFilter = worldFilter || '';
+        elements.actionFilter.value = '';
+        elements.actionWorldFilterIndicator.textContent = worldFilter ? `World: ${worldFilter}` : '';
+        selectedActionIndex = -1;
         elements.actionsListModal.className = 'modal visible';
         renderActionsList();
+        // Select first visible action
+        const firstVisible = getFilteredActionIndices()[0];
+        if (firstVisible !== undefined) {
+            selectedActionIndex = firstVisible;
+            renderActionsList();
+        }
+        elements.actionFilter.focus();
     }
 
     // Close Actions List popup
     function closeActionsListPopup() {
         actionsListPopupOpen = false;
+        actionsWorldFilter = '';
+        elements.actionFilter.value = '';
+        elements.actionWorldFilterIndicator.textContent = '';
         elements.actionsListModal.className = 'modal';
         elements.input.focus();
+    }
+
+    // Get indices of actions matching current filters
+    function getFilteredActionIndices() {
+        const filterText = elements.actionFilter.value.toLowerCase();
+        const worldFilterLower = actionsWorldFilter.toLowerCase();
+
+        return actions
+            .map((action, index) => ({ action, index }))
+            .filter(({ action }) => {
+                // World filter (from /actions <world>)
+                if (worldFilterLower && !action.world.toLowerCase().includes(worldFilterLower)) {
+                    return false;
+                }
+                // Text filter (from filter input)
+                if (filterText) {
+                    const nameMatch = action.name.toLowerCase().includes(filterText);
+                    const worldMatch = action.world.toLowerCase().includes(filterText);
+                    const patternMatch = action.pattern.toLowerCase().includes(filterText);
+                    if (!nameMatch && !worldMatch && !patternMatch) {
+                        return false;
+                    }
+                }
+                return true;
+            })
+            .map(({ index }) => index);
     }
 
     // Render actions list with Name, World, Pattern columns
     function renderActionsList() {
         elements.actionsList.innerHTML = '';
+        const filteredIndices = getFilteredActionIndices();
+
         if (actions.length === 0) {
             const div = document.createElement('div');
             div.style.padding = '8px';
@@ -1634,7 +1678,18 @@
             elements.actionsList.appendChild(div);
             return;
         }
-        actions.forEach((action, index) => {
+
+        if (filteredIndices.length === 0) {
+            const div = document.createElement('div');
+            div.style.padding = '8px';
+            div.style.color = '#888';
+            div.textContent = 'No matching actions.';
+            elements.actionsList.appendChild(div);
+            return;
+        }
+
+        filteredIndices.forEach((index) => {
+            const action = actions[index];
             const div = document.createElement('div');
             div.className = 'actions-list-item' + (index === selectedActionIndex ? ' selected' : '');
 
@@ -2730,9 +2785,41 @@
 
             // Handle actions list popup
             if (actionsListPopupOpen) {
+                const filteredIndices = getFilteredActionIndices();
+
                 if (e.key === 'Escape') {
                     e.preventDefault();
                     closeActionsListPopup();
+                } else if (e.key === 'ArrowUp') {
+                    e.preventDefault();
+                    e.stopPropagation();
+                    if (filteredIndices.length > 0) {
+                        const currentPos = filteredIndices.indexOf(selectedActionIndex);
+                        if (currentPos > 0) {
+                            selectedActionIndex = filteredIndices[currentPos - 1];
+                        } else {
+                            selectedActionIndex = filteredIndices[filteredIndices.length - 1]; // Wrap to bottom
+                        }
+                        renderActionsList();
+                    }
+                } else if (e.key === 'ArrowDown') {
+                    e.preventDefault();
+                    e.stopPropagation();
+                    if (filteredIndices.length > 0) {
+                        const currentPos = filteredIndices.indexOf(selectedActionIndex);
+                        if (currentPos < filteredIndices.length - 1) {
+                            selectedActionIndex = filteredIndices[currentPos + 1];
+                        } else {
+                            selectedActionIndex = filteredIndices[0]; // Wrap to top
+                        }
+                        renderActionsList();
+                    }
+                } else if (e.key === 'Enter' && document.activeElement === elements.actionFilter) {
+                    // Enter in filter field opens editor for selected action
+                    e.preventDefault();
+                    if (selectedActionIndex >= 0 && selectedActionIndex < actions.length) {
+                        openActionsEditorPopup(selectedActionIndex);
+                    }
                 }
                 return;
             }
@@ -3015,6 +3102,14 @@
         };
         elements.actionDeleteBtn.onclick = openActionsConfirmPopup;
         elements.actionCancelBtn.onclick = closeActionsListPopup;
+        elements.actionFilter.oninput = function() {
+            // Update selection if current selection is filtered out
+            const visibleIndices = getFilteredActionIndices();
+            if (!visibleIndices.includes(selectedActionIndex)) {
+                selectedActionIndex = visibleIndices.length > 0 ? visibleIndices[0] : -1;
+            }
+            renderActionsList();
+        };
 
         // Actions Editor popup
         elements.actionSaveBtn.onclick = saveAction;
