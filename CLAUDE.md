@@ -681,7 +681,7 @@ Toggle with `F2`:
 
 ### Actions
 
-Actions are automated triggers that match incoming MUD output against regex patterns and execute commands.
+Actions are automated triggers that match incoming MUD output against patterns and execute commands.
 
 **Action Processing:**
 - Incoming lines are checked against all action patterns as they arrive
@@ -690,6 +690,13 @@ Actions are automated triggers that match incoming MUD output against regex patt
 - ANSI color codes are stripped before pattern matching
 - World-specific actions only match for their configured world (empty = all worlds)
 - When a pattern matches, the action's commands are executed (sent to the server)
+
+**Match Types:**
+- Each action has a configurable match type: **Regexp** (default) or **Wildcard**
+- **Regexp**: Pattern is interpreted as a regular expression (e.g., `^You say` matches lines starting with "You say")
+- **Wildcard**: Pattern uses glob-style matching where `*` matches any sequence of characters and `?` matches any single character (e.g., `*tells you*` matches any line containing "tells you")
+- Wildcard patterns automatically escape regex special characters, making them safer for simple text matching
+- Toggle match type in the action editor (console: Space/Enter/arrows, web/GUI: click button)
 
 **Commands:**
 - Multiple commands can be separated by semicolons
