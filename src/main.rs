@@ -5589,6 +5589,7 @@ mod remote_gui {
         /// Action editor temp fields
         edit_action_name: String,
         edit_action_world: String,
+        edit_action_match_type: MatchType,
         edit_action_pattern: String,
         edit_action_command: String,
         /// Action error message
@@ -5670,6 +5671,7 @@ mod remote_gui {
                 actions_selected: 0,
                 edit_action_name: String::new(),
                 edit_action_world: String::new(),
+                edit_action_match_type: MatchType::Regexp,
                 edit_action_pattern: String::new(),
                 edit_action_command: String::new(),
                 action_error: None,
@@ -7487,11 +7489,15 @@ mod remote_gui {
                                 action = Some("actions");
                                 ui.close_menu();
                             }
-                            ui.separator();
+                            if ui.button("Setup").clicked() {
+                                action = Some("setup");
+                                ui.close_menu();
+                            }
                             if ui.button("Font").clicked() {
                                 action = Some("font");
                                 ui.close_menu();
                             }
+                            ui.separator();
                             if ui.button("Toggle Tags").clicked() {
                                 action = Some("toggle_tags");
                                 ui.close_menu();
@@ -9448,6 +9454,7 @@ mod remote_gui {
                         if let Some(action) = self.actions.get(idx) {
                             self.edit_action_name = action.name.clone();
                             self.edit_action_world = action.world.clone();
+                            self.edit_action_match_type = action.match_type;
                             self.edit_action_pattern = action.pattern.clone();
                             self.edit_action_command = action.command.clone();
                             self.action_error = None;
@@ -9457,6 +9464,7 @@ mod remote_gui {
                         // Create new action and open editor
                         self.edit_action_name = String::new();
                         self.edit_action_world = String::new();
+                        self.edit_action_match_type = MatchType::Regexp;
                         self.edit_action_pattern = String::new();
                         self.edit_action_command = String::new();
                         self.action_error = None;
@@ -9475,6 +9483,7 @@ mod remote_gui {
                     // Copy mutable state for viewport
                     let mut edit_action_name = self.edit_action_name.clone();
                     let mut edit_action_world = self.edit_action_world.clone();
+                    let mut edit_action_match_type = self.edit_action_match_type;
                     let mut edit_action_pattern = self.edit_action_pattern.clone();
                     let mut edit_action_command = self.edit_action_command.clone();
                     let mut action_error = self.action_error.clone();
@@ -9507,9 +9516,23 @@ mod remote_gui {
                                             .desired_width(250.0));
                                         ui.end_row();
 
+                                        ui.label("Match Type:");
+                                        let match_type_text = match edit_action_match_type {
+                                            MatchType::Regexp => "Regexp",
+                                            MatchType::Wildcard => "Wildcard",
+                                        };
+                                        if ui.button(match_type_text).clicked() {
+                                            edit_action_match_type = edit_action_match_type.next();
+                                        }
+                                        ui.end_row();
+
                                         ui.label("Pattern:");
+                                        let pattern_hint = match edit_action_match_type {
+                                            MatchType::Regexp => "(regex, empty = manual only)",
+                                            MatchType::Wildcard => "(wildcard: * and ?, empty = manual only)",
+                                        };
                                         ui.add(egui::TextEdit::singleline(&mut edit_action_pattern)
-                                            .hint_text("(regex, empty = manual only)")
+                                            .hint_text(pattern_hint)
                                             .desired_width(250.0));
                                         ui.end_row();
 
@@ -9564,6 +9587,7 @@ mod remote_gui {
                     // Apply changes back to self
                     self.edit_action_name = edit_action_name;
                     self.edit_action_world = edit_action_world;
+                    self.edit_action_match_type = edit_action_match_type;
                     self.edit_action_pattern = edit_action_pattern;
                     self.edit_action_command = edit_action_command;
                     self.action_error = action_error;
@@ -9572,7 +9596,7 @@ mod remote_gui {
                         let new_action = Action {
                             name: self.edit_action_name.trim().to_string(),
                             world: self.edit_action_world.trim().to_string(),
-                            match_type: MatchType::Regexp, // GUI uses default match type for now
+                            match_type: self.edit_action_match_type,
                             pattern: self.edit_action_pattern.clone(),
                             command: self.edit_action_command.clone(),
                         };
