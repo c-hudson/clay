@@ -4930,20 +4930,27 @@ fn save_reload_state(app: &App) -> io::Result<()> {
     }
 
     // Save output lines in a separate section (can be large)
-    // Format: timestamp_secs|escaped_text
+    // Format: timestamp_secs|flags|escaped_text
+    // Flags: s = from_server (omit if false), g = gagged (omit if false)
     for (idx, world) in app.worlds.iter().enumerate() {
         writeln!(file)?;
         writeln!(file, "[output:{}]", idx)?;
         for line in &world.output_lines {
             let ts_secs = line.timestamp.duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
+            let mut flags = String::new();
+            if line.from_server { flags.push('s'); }
+            if line.gagged { flags.push('g'); }
             let escaped = line.text.replace('\\', "\\\\").replace('\n', "\\n");
-            writeln!(file, "{}|{}", ts_secs, escaped)?;
+            writeln!(file, "{}|{}|{}", ts_secs, flags, escaped)?;
         }
         writeln!(file, "[pending:{}]", idx)?;
         for line in &world.pending_lines {
             let ts_secs = line.timestamp.duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
+            let mut flags = String::new();
+            if line.from_server { flags.push('s'); }
+            if line.gagged { flags.push('g'); }
             let escaped = line.text.replace('\\', "\\\\").replace('\n', "\\n");
-            writeln!(file, "{}|{}", ts_secs, escaped)?;
+            writeln!(file, "{}|{}|{}", ts_secs, flags, escaped)?;
         }
     }
 
@@ -5025,14 +5032,37 @@ fn load_reload_state(app: &mut App) -> io::Result<bool> {
         settings: WorldSettings,
     }
 
-    // Parse a saved output/pending line with timestamp (format: timestamp_secs|text)
+    // Parse a saved output/pending line with timestamp
+    // New format: timestamp_secs|flags|text (flags: s=from_server, g=gagged)
+    // Old format: timestamp_secs|text (for backward compatibility)
     fn parse_timestamped_line(line: &str) -> OutputLine {
-        if let Some(pipe_pos) = line.find('|') {
-            let ts_str = &line[..pipe_pos];
-            let text = &line[pipe_pos + 1..];
-            if let Ok(ts_secs) = ts_str.parse::<u64>() {
+        let parts: Vec<&str> = line.splitn(3, '|').collect();
+
+        if parts.len() >= 2 {
+            if let Ok(ts_secs) = parts[0].parse::<u64>() {
                 let timestamp = UNIX_EPOCH + Duration::from_secs(ts_secs);
-                return OutputLine::new_with_timestamp(unescape_string(text), timestamp);
+
+                if parts.len() == 3 {
+                    // New format: timestamp|flags|text
+                    let flags = parts[1];
+                    let text = unescape_string(parts[2]);
+                    let from_server = flags.contains('s');
+                    let gagged = flags.contains('g');
+                    return OutputLine {
+                        text,
+                        timestamp,
+                        from_server,
+                        gagged,
+                    };
+                } else {
+                    // Old format: timestamp|text (assume from_server=true for compatibility)
+                    return OutputLine {
+                        text: unescape_string(parts[1]),
+                        timestamp,
+                        from_server: true,
+                        gagged: false,
+                    };
+                }
             }
         }
         // Fallback: no timestamp in old format, use current time
