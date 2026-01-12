@@ -5251,6 +5251,7 @@ mod remote_gui {
         ActionsList,           // Actions list (first window)
         ActionEditor(usize),   // Action editor (second window) - index of action being edited
         ActionConfirmDelete,   // Delete confirmation dialog
+        DebugText,             // Debug popup showing raw ANSI codes
     }
 
     /// Remote GUI client application state
@@ -5498,6 +5499,8 @@ mod remote_gui {
         edit_action_command: String,
         /// Action error message
         action_error: Option<String>,
+        /// Debug text for showing raw ANSI codes
+        debug_text: String,
     }
 
     /// Discord emoji segment for rendering
@@ -5576,6 +5579,7 @@ mod remote_gui {
                 edit_action_pattern: String::new(),
                 edit_action_command: String::new(),
                 action_error: None,
+                debug_text: String::new(),
             }
         }
 
@@ -8014,19 +8018,84 @@ mod remote_gui {
                                 // This ensures we have it captured before any click clears it
                                 let selection_id = egui::Id::new("output_selection");
                                 let selection_range_id = egui::Id::new("output_selection_range");
+                                let selection_raw_id = egui::Id::new("output_selection_raw");
                                 if let Some(cursor_range) = response.cursor_range {
                                     if cursor_range.primary != cursor_range.secondary {
                                         let start_char = cursor_range.primary.ccursor.index.min(cursor_range.secondary.ccursor.index);
                                         let end_char = cursor_range.primary.ccursor.index.max(cursor_range.secondary.ccursor.index);
                                         // Convert character indices to byte indices for proper UTF-8 slicing
-                                        let text = response.galley.text();
-                                        let start_byte = text.char_indices().nth(start_char).map(|(i, _)| i).unwrap_or(text.len());
-                                        let end_byte = text.char_indices().nth(end_char).map(|(i, _)| i).unwrap_or(text.len());
-                                        let selected = text[start_byte..end_byte].to_string();
-                                        // Always store selection text and range when we have one
+                                        let galley_text = response.galley.text();
+                                        let start_byte = galley_text.char_indices().nth(start_char).map(|(i, _)| i).unwrap_or(galley_text.len());
+                                        let end_byte = galley_text.char_indices().nth(end_char).map(|(i, _)| i).unwrap_or(galley_text.len());
+                                        let selected = galley_text[start_byte..end_byte].to_string();
+
+                                        // Extract the selected portion from raw lines, preserving ANSI codes
+                                        // Helper to extract visible char range from raw text with ANSI
+                                        fn extract_raw_selection(raw: &str, vis_start: usize, vis_end: usize) -> String {
+                                            let mut result = String::new();
+                                            let mut vis_pos = 0;
+                                            let mut chars = raw.chars().peekable();
+
+                                            while let Some(c) = chars.next() {
+                                                if c == '\x1b' {
+                                                    // Start of ANSI sequence - include it if we're in selection
+                                                    let mut seq = String::from(c);
+                                                    while let Some(&next) = chars.peek() {
+                                                        seq.push(chars.next().unwrap());
+                                                        if next.is_ascii_alphabetic() {
+                                                            break;
+                                                        }
+                                                    }
+                                                    if vis_pos >= vis_start && vis_pos < vis_end {
+                                                        result.push_str(&seq);
+                                                    }
+                                                } else {
+                                                    // Visible character
+                                                    if vis_pos >= vis_start && vis_pos < vis_end {
+                                                        result.push(c);
+                                                    }
+                                                    vis_pos += 1;
+                                                    if vis_pos >= vis_end {
+                                                        break;
+                                                    }
+                                                }
+                                            }
+                                            result
+                                        }
+
+                                        // Build selection from raw lines
+                                        let mut raw_selected_parts = Vec::new();
+                                        let mut char_pos = 0;
+                                        for (i, galley_line) in galley_text.lines().enumerate() {
+                                            let line_start = char_pos;
+                                            let line_end = char_pos + galley_line.chars().count();
+
+                                            // Check if this line overlaps with selection
+                                            if line_end > start_char && line_start < end_char {
+                                                if let Some(ts_line) = non_empty_lines.get(i) {
+                                                    // Calculate visible char range within this line
+                                                    let sel_start_in_line = start_char.saturating_sub(line_start);
+                                                    let sel_end_in_line = (end_char - line_start).min(galley_line.chars().count());
+
+                                                    let raw_part = extract_raw_selection(
+                                                        &ts_line.text,
+                                                        sel_start_in_line,
+                                                        sel_end_in_line
+                                                    );
+                                                    if !raw_part.is_empty() {
+                                                        raw_selected_parts.push(raw_part);
+                                                    }
+                                                }
+                                            }
+                                            char_pos = line_end + 1; // +1 for newline
+                                        }
+                                        let raw_text = raw_selected_parts.join("\n").replace('\x1b', "<esc>");
+
+                                        // Always store selection text, range, and raw lines when we have one
                                         ui.ctx().data_mut(|d| {
                                             d.insert_temp(selection_id, selected);
                                             d.insert_temp(selection_range_id, (start_char, end_char));
+                                            d.insert_temp(selection_raw_id, raw_text);
                                         });
                                     }
                                 }
@@ -8054,6 +8123,7 @@ mod remote_gui {
                                                 ui.ctx().data_mut(|d| {
                                                     d.remove::<String>(selection_id);
                                                     d.remove::<(usize, usize)>(selection_range_id);
+                                                    d.remove::<String>(selection_raw_id);
                                                 });
                                             }
                                         }
@@ -8061,6 +8131,7 @@ mod remote_gui {
                                         ui.ctx().data_mut(|d| {
                                             d.remove::<String>(selection_id);
                                             d.remove::<(usize, usize)>(selection_range_id);
+                                            d.remove::<String>(selection_raw_id);
                                         });
                                     }
                                 }
@@ -8161,14 +8232,16 @@ mod remote_gui {
 
                                 // Right-click context menu
                                 let plain_text_for_menu = plain_text.clone();
+                                let debug_request_id = egui::Id::new("debug_text_request");
                                 response.response.context_menu(|ui| {
                                     // Get stored selection from egui memory
                                     let stored_selection: Option<String> = ui.ctx().data(|d| d.get_temp(selection_id));
+                                    let stored_raw: Option<String> = ui.ctx().data(|d| d.get_temp(selection_raw_id));
 
                                     // Show Copy button if there's stored selected text
-                                    if let Some(selected) = stored_selection {
+                                    if let Some(ref selected) = stored_selection {
                                         if ui.button("Copy").clicked() {
-                                            ui.ctx().copy_text(selected);
+                                            ui.ctx().copy_text(selected.clone());
                                             ui.close_menu();
                                         }
                                     }
@@ -8176,7 +8249,22 @@ mod remote_gui {
                                         ui.ctx().copy_text(plain_text_for_menu.clone());
                                         ui.close_menu();
                                     }
+                                    ui.separator();
+                                    // Debug option - show raw ANSI codes
+                                    if let Some(raw_text) = stored_raw {
+                                        if ui.button("Debug Selection").clicked() {
+                                            // Store in egui memory for retrieval outside closure
+                                            ui.ctx().data_mut(|d| d.insert_temp(debug_request_id, raw_text));
+                                            ui.close_menu();
+                                        }
+                                    }
                                 });
+                                // Check if debug was requested
+                                let debug_request: Option<String> = ui.ctx().data_mut(|d| d.remove_temp(debug_request_id));
+                                if let Some(debug_text) = debug_request {
+                                    self.debug_text = debug_text;
+                                    self.popup_state = PopupState::DebugText;
+                                }
                             });
 
                         // Track actual scroll position from scroll area state
@@ -9056,6 +9144,68 @@ mod remote_gui {
                                     }
                                 });
                             });
+                        },
+                    );
+                    if should_close {
+                        close_popup = true;
+                    }
+                }
+
+                // Debug Text popup - separate OS window
+                if self.popup_state == PopupState::DebugText {
+                    let mut should_close = false;
+                    let debug_text_clone = self.debug_text.clone();
+
+                    ctx.show_viewport_immediate(
+                        egui::ViewportId::from_hash_of("debug_text_window"),
+                        egui::ViewportBuilder::default()
+                            .with_title("Debug - Raw ANSI Codes")
+                            .with_inner_size([600.0, 200.0]),
+                        |ctx, _class| {
+                            if ctx.input(|i| i.key_pressed(egui::Key::Escape)) ||
+                               ctx.input(|i| i.viewport().close_requested()) {
+                                should_close = true;
+                            }
+
+                            // Bottom panel for buttons
+                            egui::TopBottomPanel::bottom("debug_buttons")
+                                .exact_height(32.0)
+                                .frame(egui::Frame::none().inner_margin(egui::Margin { left: 8.0, right: 8.0, top: 0.0, bottom: 6.0 }))
+                                .show(ctx, |ui| {
+                                    ui.add_space(6.0);
+                                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                        if ui.button("Close").clicked() {
+                                            should_close = true;
+                                        }
+                                        if ui.button("Copy").clicked() {
+                                            ui.ctx().copy_text(debug_text_clone.clone());
+                                        }
+                                    });
+                                });
+
+                            // Central panel for content
+                            egui::CentralPanel::default()
+                                .frame(egui::Frame::none().inner_margin(egui::Margin { left: 8.0, right: 8.0, top: 8.0, bottom: 8.0 }))
+                                .show(ctx, |ui| {
+                                    ui.spacing_mut().item_spacing = egui::vec2(6.0, 6.0);
+
+                                    ui.label(egui::RichText::new("Raw ANSI codes (ESC = <esc>)").strong());
+
+                                    let display_text = if debug_text_clone.is_empty() {
+                                        "(No text captured)".to_string()
+                                    } else {
+                                        debug_text_clone.clone()
+                                    };
+                                    egui::ScrollArea::both().show(ui, |ui| {
+                                        ui.add(
+                                            egui::Label::new(
+                                                egui::RichText::new(&display_text)
+                                                    .monospace()
+                                                    .color(egui::Color32::LIGHT_GRAY)
+                                            ).wrap()
+                                        );
+                                    });
+                                });
                         },
                     );
                     if should_close {
