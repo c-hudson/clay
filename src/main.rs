@@ -910,7 +910,7 @@ struct SettingsPopup {
     edit_buffer: String,
     edit_cursor: usize,
     edit_scroll_offset: usize, // Horizontal scroll offset for long text fields
-    setup_mode: bool, // True for /setup (global only), false for /world (all settings)
+    setup_mode: bool, // True for /setup (global only), false for /worlds (all settings)
     editing_world_index: Option<usize>, // Which world is being edited (None for setup mode)
     // Temp values for world-specific fields
     temp_world_name: String,
@@ -1640,7 +1640,7 @@ impl ConfirmDialog {
     }
 }
 
-/// Popup to display connected worlds status (from /worlds command)
+/// Popup to display connected worlds status (from /connections command)
 struct WorldsPopup {
     visible: bool,
     lines: Vec<String>,
@@ -1899,11 +1899,11 @@ impl HelpPopup {
                 "  /disconnect (or /dc)       Disconnect from server",
                 "  /send [-W] [-w<world>] [-n] <text>",
                 "                             Send text to world(s)",
-                "  /world                     Open world selector",
-                "  /world <name>              Connect to or create world",
-                "  /world -e [name]           Edit world settings",
-                "  /world -l <name>           Connect without auto-login",
-                "  /worlds (or /l)            List connected worlds",
+                "  /worlds                    Open world selector",
+                "  /worlds <name>             Connect to or create world",
+                "  /worlds -e [name]          Edit world settings",
+                "  /worlds -l <name>          Connect without auto-login",
+                "  /connections (or /l)       List connected worlds",
                 "  /keepalive                 Show keepalive settings for all worlds",
                 "  /actions                   Open actions/triggers editor",
                 "  /setup                     Open global settings",
@@ -2627,15 +2627,15 @@ enum Command {
     Web,
     /// /actions [world] - show actions popup, optionally filtered by world
     Actions { world: Option<String> },
-    /// /worlds or /l - show connected worlds list
+    /// /connections or /l - show connected worlds list
     WorldsList,
-    /// /world (no args) - show world selector
+    /// /worlds (no args) - show world selector
     WorldSelector,
-    /// /world -e [name] - edit world settings
+    /// /worlds -e [name] - edit world settings
     WorldEdit { name: Option<String> },
-    /// /world -l <name> - connect without auto-login
+    /// /worlds -l <name> - connect without auto-login
     WorldConnectNoLogin { name: String },
-    /// /world <name> - switch to or connect to named world
+    /// /worlds <name> - switch to or connect to named world
     WorldSwitch { name: String },
     /// /connect [host port [ssl]] - connect to server
     Connect { host: Option<String>, port: Option<String>, ssl: bool },
@@ -2686,8 +2686,8 @@ fn parse_command(input: &str) -> Command {
             };
             Command::Actions { world }
         }
-        "/worlds" | "/l" => Command::WorldsList,
-        "/world" => parse_world_command(args),
+        "/connections" | "/l" => Command::WorldsList,
+        "/worlds" => parse_world_command(args),
         "/connect" => parse_connect_command(args),
         "/disconnect" | "/dc" => Command::Disconnect,
         "/send" => parse_send_command(args, trimmed),
@@ -2714,7 +2714,7 @@ fn parse_command(input: &str) -> Command {
     }
 }
 
-/// Parse /world command with its various forms
+/// Parse /worlds command with its various forms
 fn parse_world_command(args: &[&str]) -> Command {
     if args.is_empty() {
         return Command::WorldSelector;
@@ -2722,7 +2722,7 @@ fn parse_world_command(args: &[&str]) -> Command {
 
     match args[0] {
         "-e" => {
-            // /world -e [name] - edit world
+            // /worlds -e [name] - edit world
             let name = if args.len() > 1 {
                 Some(args[1..].join(" "))
             } else {
@@ -2731,15 +2731,15 @@ fn parse_world_command(args: &[&str]) -> Command {
             Command::WorldEdit { name }
         }
         "-l" => {
-            // /world -l <name> - connect without auto-login
+            // /worlds -l <name> - connect without auto-login
             if args.len() > 1 {
                 Command::WorldConnectNoLogin { name: args[1..].join(" ") }
             } else {
-                Command::Unknown { cmd: "/world -l".to_string() }
+                Command::Unknown { cmd: "/worlds -l".to_string() }
             }
         }
         _ => {
-            // /world <name> - switch to or connect to named world
+            // /worlds <name> - switch to or connect to named world
             Command::WorldSwitch { name: args.join(" ") }
         }
     }
@@ -3170,7 +3170,7 @@ struct World {
     partial_in_pending: bool,    // True if partial_line is in pending_lines (vs output_lines)
     is_initial_world: bool,      // True for the auto-created world before first connection
     was_connected: bool,         // True if world has ever been connected (for world cycling)
-    skip_auto_login: bool,       // True to skip auto-login on next connect (for /world -l)
+    skip_auto_login: bool,       // True to skip auto-login on next connect (for /worlds -l)
     showing_splash: bool,        // True when showing startup splash (for centering)
     needs_redraw: bool,          // True when terminal needs full redraw (after splash clear)
     pending_since: Option<std::time::Instant>, // When pending output first appeared (for Alt-w)
@@ -5499,7 +5499,7 @@ mod remote_gui {
     enum PopupState {
         None,
         WorldList,
-        ConnectedWorlds,  // /worlds or /l - shows connected worlds with stats
+        ConnectedWorlds,  // /connections or /l - shows connected worlds with stats
         WorldEditor(usize),  // world index being edited
         WorldConfirmDelete(usize),  // world index to delete
         Setup,
@@ -7950,7 +7950,7 @@ mod remote_gui {
                                             self.open_world_editor(idx);
                                         }
                                         super::Command::WorldSwitch { ref name } => {
-                                            // /world <name> - switch to world, connect if not connected
+                                            // /worlds <name> - switch to world, connect if not connected
                                             if let Some(idx) = self.worlds.iter().position(|w| w.name.eq_ignore_ascii_case(name)) {
                                                 // Switch locally
                                                 self.current_world = idx;
@@ -7964,7 +7964,7 @@ mod remote_gui {
                                             }
                                         }
                                         super::Command::WorldConnectNoLogin { ref name } => {
-                                            // /world -l <name> - switch to world, connect without auto-login
+                                            // /worlds -l <name> - switch to world, connect without auto-login
                                             if let Some(idx) = self.worlds.iter().position(|w| w.name.eq_ignore_ascii_case(name)) {
                                                 self.current_world = idx;
                                                 if !self.worlds[idx].connected {
@@ -8666,7 +8666,7 @@ mod remote_gui {
                     }
                 }
 
-                // Connected Worlds popup (/worlds or /l) - separate OS window
+                // Connected Worlds popup (/connections or /l) - separate OS window
                 if self.popup_state == PopupState::ConnectedWorlds {
                     // Helper to format elapsed seconds
                     fn format_elapsed_secs(secs: Option<u64>) -> String {
@@ -10806,7 +10806,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                             let world = &mut app.worlds[world_idx];
                             world.prompt_count += 1;
 
-                            // Skip auto-login if flag is set (from /world -l)
+                            // Skip auto-login if flag is set (from /worlds -l)
                             if world.skip_auto_login {
                                 continue;
                             }
@@ -11599,7 +11599,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                         let world = &mut app.worlds[world_idx];
                         world.prompt_count += 1;
 
-                        // Skip auto-login if flag is set (from /world -l)
+                        // Skip auto-login if flag is set (from /worlds -l)
                         if world.skip_auto_login {
                             continue;
                         }
@@ -13320,6 +13320,69 @@ fn handle_key_event(key: KeyEvent, app: &mut App) -> KeyAction {
         return KeyAction::None;
     }
 
+    // Handle Tab for command completion when input starts with /
+    if key.code == KeyCode::Tab && key.modifiers.is_empty() && app.input.buffer.starts_with('/') {
+        // Get the current partial command (everything up to first space, or whole buffer)
+        let input = app.input.buffer.clone();
+        let partial = if let Some(space_pos) = input.find(' ') {
+            &input[..space_pos]
+        } else {
+            input.as_str()
+        };
+
+        // Only complete if we're still in the command part (no space yet or cursor before space)
+        if !input.contains(' ') || app.input.cursor_position <= input.find(' ').unwrap_or(input.len()) {
+            // Build list of completions: internal commands + manual actions
+            let internal_commands = vec![
+                "/help", "/connect", "/disconnect", "/dc", "/send", "/worlds", "/connections",
+                "/setup", "/web", "/actions", "/keepalive", "/reload", "/quit", "/gag",
+            ];
+
+            // Get manual actions (empty pattern)
+            let manual_actions: Vec<String> = app.settings.actions.iter()
+                .filter(|a| a.pattern.is_empty())
+                .map(|a| format!("/{}", a.name))
+                .collect();
+
+            // Find all matches
+            let partial_lower = partial.to_lowercase();
+            let mut matches: Vec<String> = internal_commands.iter()
+                .filter(|cmd| cmd.to_lowercase().starts_with(&partial_lower))
+                .map(|s| s.to_string())
+                .collect();
+            matches.extend(manual_actions.iter()
+                .filter(|cmd| cmd.to_lowercase().starts_with(&partial_lower))
+                .cloned());
+
+            if !matches.is_empty() {
+                // Sort matches alphabetically
+                matches.sort();
+                matches.dedup();
+
+                // Find current match index if we're already on a completed command
+                let current_idx = matches.iter().position(|m| m.eq_ignore_ascii_case(partial));
+
+                // Get next match (cycle through)
+                let next_idx = match current_idx {
+                    Some(idx) => (idx + 1) % matches.len(),
+                    None => 0,
+                };
+
+                // Replace the command part with the completion
+                let completion = &matches[next_idx];
+                if input.contains(' ') {
+                    // Preserve arguments after the command
+                    let args_start = input.find(' ').unwrap();
+                    app.input.buffer = format!("{}{}", completion, &input[args_start..]);
+                } else {
+                    app.input.buffer = completion.clone();
+                }
+                app.input.cursor_position = completion.len();
+                return KeyAction::None;
+            }
+        }
+    }
+
     // Handle Tab when paused - release one screenful of lines
     if app.current_world().paused && key.code == KeyCode::Tab && key.modifiers.is_empty() {
         let batch_size = (app.output_height as usize).saturating_sub(2);
@@ -13560,7 +13623,7 @@ async fn connect_slack(app: &mut App, event_tx: mpsc::Sender<AppEvent>) -> bool 
 
     if token.is_empty() {
         app.add_output("Error: Slack token is required.");
-        app.add_output("Configure the token in world settings (/world -e)");
+        app.add_output("Configure the token in world settings (/worlds -e)");
         return false;
     }
 
@@ -13726,7 +13789,7 @@ async fn connect_discord(app: &mut App, event_tx: mpsc::Sender<AppEvent>) -> boo
 
     if token.is_empty() {
         app.add_output("Error: Discord token is required.");
-        app.add_output("Configure the token in world settings (/world -e)");
+        app.add_output("Configure the token in world settings (/worlds -e)");
         return false;
     }
 
@@ -13997,16 +14060,16 @@ async fn handle_command(cmd: &str, app: &mut App, event_tx: mpsc::Sender<AppEven
             app.web_popup.open(&app.settings);
         }
         Command::WorldSelector => {
-            // /world (no args) - show world selector popup
+            // /worlds (no args) - show world selector popup
             app.world_selector.open(app.current_world_index);
         }
         Command::WorldEdit { name } => {
-            // /world -e or /world -e <name>
+            // /worlds -e or /worlds -e <name>
             let idx = if let Some(ref world_name) = name {
-                // /world -e <name> - find or create the world, then edit
+                // /worlds -e <name> - find or create the world, then edit
                 app.find_or_create_world(world_name)
             } else {
-                // /world -e - edit current world
+                // /worlds -e - edit current world
                 app.current_world_index
             };
             let input_height = app.input_height;
@@ -14014,7 +14077,7 @@ async fn handle_command(cmd: &str, app: &mut App, event_tx: mpsc::Sender<AppEven
             app.settings_popup.open(&app.settings, &app.worlds[idx], idx, input_height, show_tags);
         }
         Command::WorldConnectNoLogin { name } => {
-            // /world -l <name> - connect without auto-login
+            // /worlds -l <name> - connect without auto-login
             if let Some(idx) = app.find_world(&name) {
                 app.switch_world(idx);
                 if !app.current_world().connected {
@@ -14033,7 +14096,7 @@ async fn handle_command(cmd: &str, app: &mut App, event_tx: mpsc::Sender<AppEven
             }
         }
         Command::WorldSwitch { name } => {
-            // /world <name> - connect to world if exists, else show editor for new world
+            // /worlds <name> - connect to world if exists, else show editor for new world
             if let Some(idx) = app.find_world(&name) {
                 // World exists - switch to it and connect if has settings
                 app.switch_world(idx);
@@ -14138,7 +14201,7 @@ async fn handle_command(cmd: &str, app: &mut App, event_tx: mpsc::Sender<AppEven
                 )
             } else {
                 app.add_output("Usage: /connect [<host> <port> [ssl]]");
-                app.add_output("Or configure host/port in world settings (/world)");
+                app.add_output("Or configure host/port in world settings (/worlds)");
                 return false;
             };
 
@@ -14283,7 +14346,7 @@ async fn handle_command(cmd: &str, app: &mut App, event_tx: mpsc::Sender<AppEven
                     app.current_world_mut().command_tx = Some(cmd_tx.clone());
 
                     // Send "connect <user> <password>" if configured and auto_connect_type is Connect
-                    // Skip if skip_auto_login flag is set (from /world -l)
+                    // Skip if skip_auto_login flag is set (from /worlds -l)
                     let skip_login = app.current_world().skip_auto_login;
                     // Reset flag so future reconnects will try auto-login again
                     app.current_world_mut().skip_auto_login = false;

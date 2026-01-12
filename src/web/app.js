@@ -163,7 +163,7 @@
     let wsCertFile = '';
     let wsKeyFile = '';
     let selectedWorldIndex = -1;
-    let selectedWorldsRowIndex = -1; // For worlds list popup (/worlds)
+    let selectedWorldsRowIndex = -1; // For worlds list popup (/connections)
 
     // Setup popup state
     let setupPopupOpen = false;
@@ -264,10 +264,10 @@
                 return { type: CommandType.WEB };
             case '/actions':
                 return { type: CommandType.ACTIONS, world: args.join(' ') || null };
-            case '/worlds':
+            case '/connections':
             case '/l':
                 return { type: CommandType.WORLDS_LIST };
-            case '/world':
+            case '/worlds':
                 return parseWorldCommand(args);
             case '/connect':
                 return parseConnectCommand(args);
@@ -293,27 +293,27 @@
         }
     }
 
-    // Parse /world command variants
+    // Parse /worlds command variants
     function parseWorldCommand(args) {
         if (args.length === 0) {
             return { type: CommandType.WORLD_SELECTOR };
         }
 
         if (args[0] === '-e') {
-            // /world -e [name]
+            // /worlds -e [name]
             const name = args.length > 1 ? args.slice(1).join(' ') : null;
             return { type: CommandType.WORLD_EDIT, name: name };
         }
 
         if (args[0] === '-l') {
-            // /world -l <name>
+            // /worlds -l <name>
             if (args.length > 1) {
                 return { type: CommandType.WORLD_CONNECT_NO_LOGIN, name: args.slice(1).join(' ') };
             }
-            return { type: CommandType.UNKNOWN, cmd: '/world -l' };
+            return { type: CommandType.UNKNOWN, cmd: '/worlds -l' };
         }
 
-        // /world <name>
+        // /worlds <name>
         return { type: CommandType.WORLD_SWITCH, name: args.join(' ') };
     }
 
@@ -2006,7 +2006,7 @@
         closeWebPopup();
     }
 
-    // Worlds list popup functions (/worlds, /l)
+    // Worlds list popup functions (/connections, /l)
     function openWorldsPopup() {
         worldsPopupOpen = true;
         selectedWorldsRowIndex = currentWorldIndex;
@@ -2143,7 +2143,7 @@
         });
     }
 
-    // World selector popup functions (/world)
+    // World selector popup functions (/worlds)
     function openWorldSelectorPopup() {
         worldSelectorPopupOpen = true;
         selectedWorldIndex = currentWorldIndex;
@@ -2282,7 +2282,7 @@
                 send({
                     type: 'SendCommand',
                     world_index: currentWorldIndex,
-                    command: '/world ' + world.name
+                    command: '/worlds ' + world.name
                 });
             }
             closeWorldSelectorPopup();
@@ -2295,7 +2295,7 @@
             // Send command to open world editor on server
             send({
                 type: 'SendCommand',
-                command: '/world -e ' + world.name,
+                command: '/worlds -e ' + world.name,
                 world_index: currentWorldIndex
             });
             closeWorldSelectorPopup();
@@ -2338,7 +2338,7 @@
         }
     }
 
-    // Handle /world <name> command
+    // Handle /worlds <name> command
     function handleWorldCommand(worldName) {
         // Find world by name (case-insensitive)
         const lowerName = worldName.toLowerCase();
@@ -2368,7 +2368,7 @@
                     send({
                         type: 'SendCommand',
                         world_index: currentWorldIndex,
-                        command: '/world ' + worldName
+                        command: '/worlds ' + worldName
                     });
                 }
             }
@@ -2377,7 +2377,7 @@
             send({
                 type: 'SendCommand',
                 world_index: currentWorldIndex,
-                command: '/world ' + worldName
+                command: '/worlds ' + worldName
             });
         }
     }

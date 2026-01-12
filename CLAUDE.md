@@ -237,6 +237,7 @@ Prompts that are auto-answered are immediately cleared and not displayed in the 
 - `Ctrl+P/N` - Previous/Next command history
 - `Ctrl+Q` - Spell suggestions / cycle and replace
 - `Ctrl+A` or `Home/End` - Jump to start/end (Ctrl+A = start only)
+- `Tab` - Command completion (when input starts with `/`)
 
 **Output Scrollback:**
 - `PageUp` - Scroll back in history (enables more-pause)
@@ -280,11 +281,11 @@ Prompts that are auto-answered are immediately cleared and not displayed in the 
   - No flags: Send to current world
 - `/setup` - Open Global Settings popup (more mode, spell check, pending first, show tags, input height)
 - `/web` - Open Web Settings popup (HTTP/HTTPS servers, WebSocket settings, TLS configuration)
-- `/world` - Open World Selector popup (list all worlds, filter, connect or edit)
-- `/world <name>` - Connect to world if exists (opens editor if no hostname/port configured), otherwise create and open editor
-- `/world -e [name]` - Open World Settings editor for current world or specified world (creates if needed)
-- `/world -l <name>` - Connect to world without sending auto-login credentials
-- `/worlds` (or `/l`) - List connected worlds in table format with columns:
+- `/worlds` - Open World Selector popup (list all worlds, filter, connect or edit)
+- `/worlds <name>` - Connect to world if exists (opens editor if no hostname/port configured), otherwise create and open editor
+- `/worlds -e [name]` - Open World Settings editor for current world or specified world (creates if needed)
+- `/worlds -l <name>` - Connect to world without sending auto-login credentials
+- `/connections` (or `/l`) - List connected worlds in table format with columns:
   - **World**: World name (`*` = current)
   - **Unseen**: Count of unseen lines (empty if 0)
   - **LastSend**: Time since last user command sent
@@ -419,8 +420,8 @@ Note: HTTP automatically starts the non-secure WebSocket server if not already r
 - More-mode pausing with Tab/Alt+j
 - Command history (Ctrl+P/N)
 - Multiple world support with world switching
-- World selector popup (`/world` command)
-- Connected worlds list (`/worlds` or `/l` command) with arrow key navigation
+- World selector popup (`/worlds` command)
+- Connected worlds list (`/connections` or `/l` command) with arrow key navigation
 - Actions popup (`/actions` command)
 - MUD tag stripping toggle (F2)
 - Keep-alive/idler message filtering (same as console)
@@ -476,8 +477,8 @@ Note: HTTP automatically starts the non-secure WebSocket server if not already r
 - `Enter` - Send command
 
 **Web Popup Controls:**
-- `/world` - World selector with filter, arrow keys to navigate, Enter to switch
-- `/worlds` or `/l` - Connected worlds list with arrow keys to navigate, Enter to switch
+- `/worlds` - World selector with filter, arrow keys to navigate, Enter to switch
+- `/connections` or `/l` - Connected worlds list with arrow keys to navigate, Enter to switch
 - `/actions` - Actions editor
 - `Escape` - Close any popup
 
@@ -567,7 +568,7 @@ The remote GUI client supports keyboard shortcuts similar to the console client:
 
 ### World Selector Popup
 
-Opened with `/world` command (no arguments):
+Opened with `/worlds` command (no arguments):
 
 - Shows list of all worlds with columns: World name, Hostname, Port, User
 - Filter box at top - type to filter worlds by name, hostname, or user
@@ -592,7 +593,7 @@ Opened with `/world` command (no arguments):
 
 ### World Settings Popup Fields
 
-Opened with `/world -e` command:
+Opened with `/worlds -e` command:
 
 **Per-World Settings:**
 - World name - Display name for this world
@@ -707,7 +708,7 @@ Actions are automated triggers that match incoming MUD output against patterns a
 - Actions with empty patterns are manual-only (never trigger automatically)
 - Manual invocation works even when disconnected
 - Each command is processed individually:
-  - Commands starting with `/` are processed as client commands (e.g., `/connect`, `/world`)
+  - Commands starting with `/` are processed as client commands (e.g., `/connect`, `/worlds`)
   - Plain text is sent to the server (shows error per command if not connected)
 - `/gag` commands are skipped when invoking actions manually
 
@@ -759,3 +760,15 @@ Real-time spell checking with misspelled words highlighted in red.
 **Controls:**
 - `Ctrl+Q` - Cycle through spell suggestions for word at cursor
 - Suggestions use Levenshtein distance (max distance 3, limited to similar-length words)
+
+### Command Completion
+
+Tab completion for commands when input starts with `/`:
+
+**Behavior:**
+- Press `Tab` when input starts with `/` to cycle through matching commands
+- Matches internal commands: `/help`, `/connect`, `/disconnect`, `/dc`, `/send`, `/worlds`, `/connections`, `/setup`, `/web`, `/actions`, `/keepalive`, `/reload`, `/quit`, `/gag`
+- Also matches manual actions (actions with empty patterns)
+- Completion is case-insensitive
+- Pressing `Tab` multiple times cycles through all matches alphabetically
+- Arguments after the command are preserved when cycling
