@@ -515,6 +515,7 @@ cargo build --features remote-gui    # Requires X11 or Wayland
 - Output filtering (F4)
 - World switching is GUI-local (doesn't affect console)
 - Hamburger menu with: Worlds List, World Selector, World Editor, Setup, Font, Toggle Tags, Toggle Highlight, Resync
+- Debug Selection: Right-click highlighted text to see raw ANSI codes (ESC shown as `<esc>`)
 
 **Limitations:**
 - The remote-gui feature cannot be built in headless environments
@@ -555,6 +556,14 @@ The remote GUI client supports keyboard shortcuts similar to the console client:
 **Filter Popup (F4):**
 - Type text to filter output (case-insensitive)
 - `Esc` or `F4` - Close and clear filter
+
+**Debug Selection (Right-click menu):**
+- Highlight text in output area, then right-click
+- Select "Debug Selection" from context menu
+- Opens popup showing raw text with ANSI escape codes visible
+- Escape character (0x1B) displayed as `<esc>` for readability
+- Useful for debugging color code issues or unexpected formatting
+- Copy button to copy the raw text to clipboard
 
 ### World Selector Popup
 
