@@ -700,8 +700,16 @@ Actions are automated triggers that match incoming MUD output against patterns a
 
 **Commands:**
 - Multiple commands can be separated by semicolons
-- Commands are sent to the server (MUD/Slack/Discord), not processed as local commands
 - Special command `/gag` hides the matched line from display (but stores it for F2 viewing)
+
+**Manual Invocation:**
+- Actions can be invoked manually by typing `/actionname` in the input
+- Actions with empty patterns are manual-only (never trigger automatically)
+- Manual invocation works even when disconnected
+- Each command is processed individually:
+  - Commands starting with `/` are processed as client commands (e.g., `/connect`, `/world`)
+  - Plain text is sent to the server (shows error per command if not connected)
+- `/gag` commands are skipped when invoking actions manually
 
 **Gagging:**
 - If an action's command list includes `/gag`, the matched line is hidden
