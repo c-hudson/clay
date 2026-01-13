@@ -8197,9 +8197,9 @@ mod remote_gui {
                                 .position(|&s| (s - self.font_size).abs() < 0.5)
                                 .unwrap_or(2) as i32;
 
-                            // Small "A" label on the right (added first in RTL layout)
+                            // Large "A" label on the right (added first in RTL layout)
                             let label_color = egui::Color32::from_gray(128);
-                            ui.label(egui::RichText::new("A").color(label_color).size(8.0));
+                            ui.label(egui::RichText::new("A").color(label_color).size(14.0));
 
                             // Slider dimensions
                             let slider_width = 80.0;
@@ -8261,8 +8261,8 @@ mod remote_gui {
                                 }
                             }
 
-                            // Large "A" label on the left (added last in RTL layout)
-                            ui.label(egui::RichText::new("A").color(label_color).size(14.0));
+                            // Small "A" label on the left (added last in RTL layout)
+                            ui.label(egui::RichText::new("A").color(label_color).size(8.0));
                         });
                     });
                 });

@@ -304,11 +304,11 @@ body {
 #output {
     white-space: pre-wrap;
     word-wrap: break-word;
-    line-height: 1.2;
+    line-height: 1.1;
 }
 
 #output .line {
-    line-height: 1.2;
+    line-height: 1.1;
     margin: 0;
     padding: 0;
 }
