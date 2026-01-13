@@ -5788,6 +5788,10 @@ mod remote_gui {
             }
         }
 
+        fn is_dark(&self) -> bool {
+            matches!(self, GuiTheme::Dark)
+        }
+
         fn to_string_value(&self) -> String {
             match self {
                 GuiTheme::Dark => "dark".to_string(),
@@ -6016,6 +6020,7 @@ mod remote_gui {
     enum DiscordSegment {
         Text(String),
         Emoji { name: String, id: String, animated: bool },
+        ColoredSquare(egui::Color32),
     }
 
     impl RemoteGuiApp {
@@ -7356,7 +7361,28 @@ mod remote_gui {
             }
         }
 
-        /// Parse text into segments of plain text and Discord emojis
+        /// Get color for a colored square emoji, if it is one
+        fn colored_square_color(c: char) -> Option<egui::Color32> {
+            match c {
+                '🟥' => Some(egui::Color32::from_rgb(0xDD, 0x2E, 0x44)), // Red
+                '🟧' => Some(egui::Color32::from_rgb(0xF4, 0x90, 0x0C)), // Orange
+                '🟨' => Some(egui::Color32::from_rgb(0xFD, 0xCB, 0x58)), // Yellow
+                '🟩' => Some(egui::Color32::from_rgb(0x78, 0xB1, 0x59)), // Green
+                '🟦' => Some(egui::Color32::from_rgb(0x55, 0xAC, 0xEE)), // Blue
+                '🟪' => Some(egui::Color32::from_rgb(0xAA, 0x8E, 0xD6)), // Purple
+                '🟫' => Some(egui::Color32::from_rgb(0xA0, 0x6A, 0x42)), // Brown
+                '⬛' => Some(egui::Color32::from_rgb(0x31, 0x37, 0x3D)), // Black
+                '⬜' => Some(egui::Color32::from_rgb(0xE6, 0xE7, 0xE8)), // White
+                _ => None,
+            }
+        }
+
+        /// Check if text contains colored square emoji
+        fn has_colored_squares(text: &str) -> bool {
+            text.chars().any(|c| Self::colored_square_color(c).is_some())
+        }
+
+        /// Parse text into segments of plain text, Discord emojis, and colored squares
         fn parse_discord_segments(text: &str) -> Vec<DiscordSegment> {
             use regex::Regex;
             use std::sync::OnceLock;
@@ -7366,35 +7392,66 @@ mod remote_gui {
                 Regex::new(r"<(a?):([^:]+):(\d+)>").unwrap()
             });
 
-            let mut segments = Vec::new();
+            // First pass: handle Discord custom emoji
+            let mut temp_segments: Vec<DiscordSegment> = Vec::new();
             let mut last_end = 0;
 
             for cap in re.captures_iter(text) {
                 let m = cap.get(0).unwrap();
                 if m.start() > last_end {
-                    segments.push(DiscordSegment::Text(text[last_end..m.start()].to_string()));
+                    temp_segments.push(DiscordSegment::Text(text[last_end..m.start()].to_string()));
                 }
                 let animated = &cap[1] == "a";
                 let name = cap[2].to_string();
                 let id = cap[3].to_string();
-                segments.push(DiscordSegment::Emoji { name, id, animated });
+                temp_segments.push(DiscordSegment::Emoji { name, id, animated });
                 last_end = m.end();
             }
 
             if last_end < text.len() {
-                segments.push(DiscordSegment::Text(text[last_end..].to_string()));
+                temp_segments.push(DiscordSegment::Text(text[last_end..].to_string()));
+            }
+
+            if temp_segments.is_empty() {
+                temp_segments.push(DiscordSegment::Text(text.to_string()));
+            }
+
+            // Second pass: split Text segments to extract colored square emoji
+            let mut segments: Vec<DiscordSegment> = Vec::new();
+            for seg in temp_segments {
+                match seg {
+                    DiscordSegment::Text(txt) => {
+                        // Split text at colored square emoji
+                        let mut current_text = String::new();
+                        for c in txt.chars() {
+                            if let Some(color) = Self::colored_square_color(c) {
+                                if !current_text.is_empty() {
+                                    segments.push(DiscordSegment::Text(current_text.clone()));
+                                    current_text.clear();
+                                }
+                                segments.push(DiscordSegment::ColoredSquare(color));
+                            } else {
+                                current_text.push(c);
+                            }
+                        }
+                        if !current_text.is_empty() {
+                            segments.push(DiscordSegment::Text(current_text));
+                        }
+                    }
+                    other => segments.push(other),
+                }
             }
 
             if segments.is_empty() {
-                segments.push(DiscordSegment::Text(text.to_string()));
+                segments.push(DiscordSegment::Text(String::new()));
             }
 
             segments
         }
 
-        /// Check if text contains Discord custom emojis
+        /// Check if text contains Discord custom emojis or colored squares
         fn has_discord_emojis(text: &str) -> bool {
-            text.contains("<:") || text.contains("<a:")
+            text.contains("<:") || text.contains("<a:") || Self::has_colored_squares(text)
         }
 
         /// Insert zero-width spaces after break characters in long words (>15 chars)
@@ -7528,6 +7585,17 @@ mod remote_gui {
                                 .fit_to_exact_size(egui::vec2(font_id.size * 1.2, font_id.size * 1.2));
                             ui.add(image).on_hover_text(format!(":{}:", name));
                         }
+                        DiscordSegment::ColoredSquare(color) => {
+                            // Draw a colored rectangle for square emoji
+                            let size = font_id.size * 1.1;
+                            let (rect, _response) = ui.allocate_exact_size(
+                                egui::vec2(size, size),
+                                egui::Sense::hover()
+                            );
+                            if ui.is_rect_visible(rect) {
+                                ui.painter().rect_filled(rect, 2.0, color);
+                            }
+                        }
                     }
                 }
             });
@@ -7615,7 +7683,29 @@ mod remote_gui {
                             .insert(0, "custom_mono".to_owned());
                     }
                 }
-                // If font_name is empty or font not found, use defaults (already in fonts)
+                // Load symbol fonts for Unicode/emoji coverage
+                // NotoSansSymbols2 has geometric shapes including colored square emoji
+                let symbol_fonts: &[(&str, &str)] = &[
+                    ("symbols2", "/usr/share/fonts/truetype/noto/NotoSansSymbols2-Regular.ttf"),
+                    ("symbols", "/usr/share/fonts/truetype/noto/NotoSansSymbols-Regular.ttf"),
+                    ("symbola", "/usr/share/fonts/truetype/ancient-scripts/Symbola_hint.ttf"),
+                ];
+                for (name, path) in symbol_fonts {
+                    if let Ok(font_data) = std::fs::read(path) {
+                        fonts.font_data.insert(
+                            (*name).to_owned(),
+                            std::sync::Arc::new(egui::FontData::from_owned(font_data)),
+                        );
+                        fonts.families
+                            .entry(egui::FontFamily::Monospace)
+                            .or_default()
+                            .push((*name).to_owned());
+                        fonts.families
+                            .entry(egui::FontFamily::Proportional)
+                            .or_default()
+                            .push((*name).to_owned());
+                    }
+                }
 
                 ctx.set_fonts(fonts);
             }
@@ -8103,37 +8193,91 @@ mod remote_gui {
                             }
                         });
 
-                        // S/M/L font size buttons (centered vertically via horizontal_centered)
-                        let btn_size = 16.0;
-                        let small_text = if self.font_size <= 12.0 {
-                            egui::RichText::new("S").size(btn_size).strong()
-                        } else {
-                            egui::RichText::new("S").size(btn_size)
-                        };
-                        if ui.button(small_text).on_hover_text("Small font").clicked() {
-                            self.font_size = 12.0;
-                            action = Some("font_changed");
-                        }
+                        // Font size slider on the right side of menu bar
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            // Define the 4 font size positions
+                            const FONT_SIZES: [f32; 4] = [10.0, 12.0, 14.0, 18.0];
 
-                        let medium_text = if self.font_size > 12.0 && self.font_size <= 16.0 {
-                            egui::RichText::new("M").size(btn_size).strong()
-                        } else {
-                            egui::RichText::new("M").size(btn_size)
-                        };
-                        if ui.button(medium_text).on_hover_text("Medium font").clicked() {
-                            self.font_size = 14.0;
-                            action = Some("font_changed");
-                        }
+                            // Find current position (0-3)
+                            let current_pos = FONT_SIZES.iter()
+                                .position(|&s| (s - self.font_size).abs() < 0.5)
+                                .unwrap_or(1) as i32;
 
-                        let large_text = if self.font_size > 16.0 {
-                            egui::RichText::new("L").size(btn_size).strong()
-                        } else {
-                            egui::RichText::new("L").size(btn_size)
-                        };
-                        if ui.button(large_text).on_hover_text("Large font").clicked() {
-                            self.font_size = 18.0;
-                            action = Some("font_changed");
-                        }
+                            // Slider dimensions
+                            let slider_width = 80.0;
+                            let slider_height = 20.0;
+
+                            // Allocate space for the slider
+                            let (rect, response) = ui.allocate_exact_size(
+                                egui::vec2(slider_width, slider_height),
+                                egui::Sense::click_and_drag()
+                            );
+
+                            if ui.is_rect_visible(rect) {
+                                let painter = ui.painter();
+
+                                // Draw triangle background (grows from left to right)
+                                let triangle_color = if theme.is_dark() {
+                                    egui::Color32::from_gray(60)
+                                } else {
+                                    egui::Color32::from_gray(180)
+                                };
+
+                                let triangle_points = vec![
+                                    egui::pos2(rect.left() + 2.0, rect.bottom() - 2.0),  // Bottom left
+                                    egui::pos2(rect.right() - 2.0, rect.bottom() - 2.0), // Bottom right
+                                    egui::pos2(rect.right() - 2.0, rect.top() + 2.0),    // Top right
+                                ];
+                                painter.add(egui::Shape::convex_polygon(
+                                    triangle_points,
+                                    triangle_color,
+                                    egui::Stroke::NONE,
+                                ));
+
+                                // Draw tick marks for the 4 positions
+                                let tick_color = if theme.is_dark() {
+                                    egui::Color32::from_gray(100)
+                                } else {
+                                    egui::Color32::from_gray(140)
+                                };
+
+                                for i in 0..4 {
+                                    let x = rect.left() + 6.0 + (i as f32) * ((slider_width - 12.0) / 3.0);
+                                    painter.line_segment(
+                                        [egui::pos2(x, rect.bottom() - 4.0), egui::pos2(x, rect.bottom() - 8.0)],
+                                        egui::Stroke::new(1.0, tick_color)
+                                    );
+                                }
+
+                                // Draw slider handle
+                                let handle_x = rect.left() + 6.0 + (current_pos as f32) * ((slider_width - 12.0) / 3.0);
+                                let handle_color = if theme.is_dark() {
+                                    egui::Color32::from_rgb(100, 180, 255)
+                                } else {
+                                    egui::Color32::from_rgb(50, 120, 200)
+                                };
+
+                                painter.circle_filled(
+                                    egui::pos2(handle_x, rect.center().y),
+                                    6.0,
+                                    handle_color
+                                );
+                            }
+
+                            // Handle clicks and drags
+                            if response.clicked() || response.dragged() {
+                                if let Some(pos) = response.interact_pointer_pos() {
+                                    let rel_x = pos.x - rect.left() - 6.0;
+                                    let step_width = (slider_width - 12.0) / 3.0;
+                                    let new_pos = ((rel_x / step_width).round() as i32).clamp(0, 3);
+                                    let new_size = FONT_SIZES[new_pos as usize];
+                                    if (new_size - self.font_size).abs() > 0.5 {
+                                        self.font_size = new_size;
+                                        action = Some("font_changed");
+                                    }
+                                }
+                            }
+                        });
                     });
                 });
 
