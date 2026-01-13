@@ -202,17 +202,38 @@
         <!-- World selector popup (/worlds) -->
         <div id="world-selector-modal" class="modal">
             <div class="modal-content world-selector-modal-content">
-                <h2>World Selector</h2>
+                <h2>Worlds</h2>
                 <div class="world-selector-filter">
                     <input type="text" id="world-filter" placeholder="Filter worlds..." autocomplete="off">
                 </div>
-                <div id="world-selector-list" class="world-selector-list"></div>
-                <div class="modal-buttons">
-                    <button id="world-edit-btn">Edit</button>
-                    <button id="world-delete-btn">Delete</button>
-                    <button id="world-connect-btn">Connect</button>
-                    <button id="world-switch-btn">Switch</button>
-                    <button id="world-selector-cancel-btn">Ok</button>
+                <div id="world-selector-table-container">
+                    <table id="world-selector-table">
+                        <thead>
+                            <tr>
+                                <th></th>
+                                <th>World</th>
+                                <th>Hostname</th>
+                                <th>Port</th>
+                                <th>User</th>
+                            </tr>
+                        </thead>
+                        <tbody id="world-selector-table-body"></tbody>
+                    </table>
+                </div>
+                <div class="modal-footer-split">
+                    <div class="modal-footer-left">
+                        <span class="toggle-label">Only Connected</span>
+                        <label class="toggle-switch">
+                            <input type="checkbox" id="world-selector-only-connected">
+                            <span class="toggle-slider"></span>
+                        </label>
+                    </div>
+                    <div class="modal-buttons">
+                        <button id="world-add-btn">Add</button>
+                        <button id="world-edit-btn">Edit</button>
+                        <button id="world-selector-cancel-btn">Close</button>
+                        <button id="world-connect-btn">Connect</button>
+                    </div>
                 </div>
             </div>
         </div>

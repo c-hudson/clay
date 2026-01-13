@@ -6618,9 +6618,29 @@ mod remote_gui {
                                     self.only_connected_worlds = false;
                                 }
                                 Command::WorldsList => {
-                                    self.popup_state = PopupState::ConnectedWorlds;
-                                    self.world_list_selected = self.current_world;
-                                    self.only_connected_worlds = true;
+                                    // Output connected worlds list as text
+                                    let worlds_info: Vec<super::util::WorldListInfo> = self.worlds.iter().enumerate().map(|(idx, world)| {
+                                        super::util::WorldListInfo {
+                                            name: world.name.clone(),
+                                            connected: world.connected,
+                                            is_current: idx == self.current_world,
+                                            unseen_lines: world.unseen_lines,
+                                            last_send_secs: world.last_send_secs,
+                                            last_recv_secs: world.last_recv_secs,
+                                            last_nop_secs: world.last_nop_secs,
+                                            next_nop_secs: None,
+                                        }
+                                    }).collect();
+                                    let output = super::util::format_worlds_list(&worlds_info);
+                                    let ts = super::current_timestamp_secs();
+                                    if self.current_world < self.worlds.len() {
+                                        for line in output.lines() {
+                                            self.worlds[self.current_world].output_lines.push(TimestampedLine {
+                                                text: line.to_string(),
+                                                ts,
+                                            });
+                                        }
+                                    }
                                 }
                                 Command::WorldSwitch { ref name } | Command::WorldConnectNoLogin { ref name } => {
                                     // Switch to world locally, connect if needed
@@ -8739,9 +8759,29 @@ mod remote_gui {
                                         self.only_connected_worlds = false;
                                     }
                                     super::Command::WorldsList => {
-                                        self.popup_state = PopupState::ConnectedWorlds;
-                                        self.world_list_selected = self.current_world;
-                                        self.only_connected_worlds = true;
+                                        // Output connected worlds list as text
+                                        let worlds_info: Vec<super::util::WorldListInfo> = self.worlds.iter().enumerate().map(|(idx, world)| {
+                                            super::util::WorldListInfo {
+                                                name: world.name.clone(),
+                                                connected: world.connected,
+                                                is_current: idx == self.current_world,
+                                                unseen_lines: world.unseen_lines,
+                                                last_send_secs: world.last_send_secs,
+                                                last_recv_secs: world.last_recv_secs,
+                                                last_nop_secs: world.last_nop_secs,
+                                                next_nop_secs: None,
+                                            }
+                                        }).collect();
+                                        let output = super::util::format_worlds_list(&worlds_info);
+                                        let ts = super::current_timestamp_secs();
+                                        if self.current_world < self.worlds.len() {
+                                            for line in output.lines() {
+                                                self.worlds[self.current_world].output_lines.push(TimestampedLine {
+                                                    text: line.to_string(),
+                                                    ts,
+                                                });
+                                            }
+                                        }
                                     }
                                     super::Command::Help => {
                                         self.popup_state = PopupState::Help;
@@ -16817,9 +16857,23 @@ async fn handle_command(cmd: &str, app: &mut App, event_tx: mpsc::Sender<AppEven
             }
         }
         Command::WorldsList => {
+            // Output connected worlds list as text
             let current_idx = app.current_world_index;
-            let screen_width = app.output_width;
-            app.worlds_popup.show(&app.worlds, current_idx, screen_width);
+            let worlds_info: Vec<util::WorldListInfo> = app.worlds.iter().enumerate().map(|(idx, world)| {
+                let now = std::time::Instant::now();
+                util::WorldListInfo {
+                    name: world.name.clone(),
+                    connected: world.connected,
+                    is_current: idx == current_idx,
+                    unseen_lines: world.unseen_lines,
+                    last_send_secs: world.last_user_command_time.map(|t| now.duration_since(t).as_secs()),
+                    last_recv_secs: world.last_receive_time.map(|t| now.duration_since(t).as_secs()),
+                    last_nop_secs: world.last_nop_time.map(|t| now.duration_since(t).as_secs()),
+                    next_nop_secs: None, // Calculated in format function
+                }
+            }).collect();
+            let output = util::format_worlds_list(&worlds_info);
+            app.add_output(&output);
         }
         Command::Keepalive => {
             // Show keepalive settings for all worlds

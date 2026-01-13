@@ -836,10 +836,19 @@ body {
 }
 
 /* World selector popup */
+#world-selector-modal {
+    background-color: transparent;
+    pointer-events: none;
+}
+
+#world-selector-modal .modal-content {
+    pointer-events: auto;
+}
+
 .world-selector-modal-content {
-    min-width: 350px;
-    max-width: 90%;
-    width: fit-content;
+    min-width: 500px;
+    max-width: 700px;
+    width: 90%;
     padding: 12px;
 }
 
@@ -866,77 +875,147 @@ body {
     border-color: var(--accent-color);
 }
 
-.world-selector-list {
-    border: 1px solid var(--separator-color);
-    background-color: #000;
-    min-height: 150px;
-    max-height: 250px;
+#world-selector-table-container {
+    max-height: 300px;
     overflow-y: auto;
     margin-bottom: 8px;
 }
 
-.world-selector-item {
-    padding: 6px 8px;
-    cursor: pointer;
-    border-bottom: 1px solid #222;
-    display: flex;
-    justify-content: space-between;
-    align-items: center;
+#world-selector-table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 13px;
 }
 
-.world-selector-item:hover {
+#world-selector-table th,
+#world-selector-table td {
+    padding: 4px 8px;
+    text-align: left;
+    border-bottom: 1px solid var(--separator-color);
+}
+
+#world-selector-table th {
+    color: var(--accent-color);
+    font-weight: normal;
+}
+
+#world-selector-table th:first-child {
+    width: 24px;
+}
+
+#world-selector-table tr.current-world {
     background-color: #222;
 }
 
-.world-selector-item.selected {
+#world-selector-table tr.current-world td:nth-child(2)::before {
+    content: "* ";
+    color: var(--warning-color);
+}
+
+#world-selector-table tr.selected-row {
     background-color: var(--accent-color);
     color: #000;
 }
 
-.world-selector-item.current {
-    font-weight: bold;
+#world-selector-table tr.selected-row.current-world {
+    background-color: var(--accent-color);
 }
 
-.world-selector-item .world-info {
-    display: flex;
-    flex-direction: column;
-    align-items: flex-start;
-    text-align: left;
-}
-
-.world-selector-item .world-name {
-    font-weight: bold;
-    text-align: left;
-    white-space: normal;
-}
-
-.world-selector-item .world-host {
-    font-size: 11px;
-    color: #888;
-}
-
-.world-selector-item.selected .world-host {
-    color: #444;
-}
-
-.world-selector-item .world-status {
-    font-size: 12px;
-}
-
-.world-selector-item .world-status.connected {
-    color: var(--success-color);
-}
-
-.world-selector-item .world-status.disconnected {
-    color: #666;
-}
-
-.world-selector-item.selected .world-status.connected {
+#world-selector-table tr.selected-row .status-connected {
     color: #006600;
 }
 
-.world-selector-item.selected .world-status.disconnected {
+#world-selector-table tr.selected-row .status-disconnected {
     color: #444;
+}
+
+#world-selector-table tr:hover {
+    background-color: #333;
+    cursor: pointer;
+}
+
+#world-selector-table tr.selected-row:hover {
+    background-color: var(--accent-color);
+}
+
+#world-selector-table .status-connected {
+    color: var(--success-color);
+}
+
+#world-selector-table .status-disconnected {
+    color: #666;
+}
+
+/* Modal footer with toggle on left and buttons on right */
+.modal-footer-split {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    margin-top: 8px;
+}
+
+.modal-footer-left {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+}
+
+.toggle-label {
+    font-size: 12px;
+    color: var(--text-color);
+}
+
+/* Toggle switch */
+.toggle-switch {
+    position: relative;
+    display: inline-block;
+    width: 36px;
+    height: 20px;
+}
+
+.toggle-switch input {
+    opacity: 0;
+    width: 0;
+    height: 0;
+}
+
+.toggle-slider {
+    position: absolute;
+    cursor: pointer;
+    top: 0;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    background-color: #444;
+    transition: 0.2s;
+    border-radius: 20px;
+}
+
+.toggle-slider:before {
+    position: absolute;
+    content: "";
+    height: 14px;
+    width: 14px;
+    left: 3px;
+    bottom: 3px;
+    background-color: #ccc;
+    transition: 0.2s;
+    border-radius: 50%;
+}
+
+.toggle-switch input:checked + .toggle-slider {
+    background-color: var(--accent-color);
+}
+
+/* Smaller buttons for world selector */
+.world-selector-modal-content .modal-buttons button {
+    padding: 4px 10px;
+    font-size: 12px;
+}
+
+.toggle-switch input:checked + .toggle-slider:before {
+    transform: translateX(16px);
+    background-color: #fff;
 }
 
 /* Setup popup (/setup) */

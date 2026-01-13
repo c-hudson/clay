@@ -68,11 +68,11 @@
         // World selector popup
         worldSelectorModal: document.getElementById('world-selector-modal'),
         worldFilter: document.getElementById('world-filter'),
-        worldSelectorList: document.getElementById('world-selector-list'),
+        worldSelectorTableBody: document.getElementById('world-selector-table-body'),
+        worldSelectorOnlyConnected: document.getElementById('world-selector-only-connected'),
+        worldAddBtn: document.getElementById('world-add-btn'),
         worldEditBtn: document.getElementById('world-edit-btn'),
-        worldDeleteBtn: document.getElementById('world-delete-btn'),
         worldConnectBtn: document.getElementById('world-connect-btn'),
-        worldSwitchBtn: document.getElementById('world-switch-btn'),
         worldSelectorCancelBtn: document.getElementById('world-selector-cancel-btn'),
         // World delete confirm popup
         worldConfirmModal: document.getElementById('world-confirm-modal'),
@@ -157,6 +157,7 @@
     let worldsPopupOpen = false;
     let worldSelectorPopupOpen = false;
     let worldConfirmPopupOpen = false;
+    let worldSelectorOnlyConnected = false;
 
     // Web settings popup state
     let webPopupOpen = false;
@@ -1054,7 +1055,7 @@
 
             case CommandType.WORLDS_LIST:
                 elements.input.value = '';
-                openWorldsPopup();
+                outputWorldsList();
                 return;
 
             case CommandType.WORLD_SELECTOR:
@@ -1125,7 +1126,7 @@
                 break;
 
             case CommandType.WORLDS_LIST:
-                openWorldsPopup();
+                outputWorldsList();
                 break;
 
             case CommandType.WORLD_SELECTOR:
@@ -2207,6 +2208,118 @@
         return Math.floor(secs / 86400) + 'd';
     }
 
+    // Format duration for /l command output
+    // Under 60 minutes: Xm, 1-24 hours: X.Xh, Over 24 hours: X.Xd
+    function formatDurationShort(secs) {
+        if (secs === null || secs === undefined) return '—';
+        const minutes = Math.floor(secs / 60);
+        const hours = secs / 3600;
+        const days = secs / 86400;
+
+        if (minutes < 60) {
+            return minutes + 'm';
+        } else if (hours < 24) {
+            return hours.toFixed(1) + 'h';
+        } else {
+            return days.toFixed(1) + 'd';
+        }
+    }
+
+    // Format worlds list for /l command (text output)
+    // Only shows connected worlds
+    function formatWorldsList() {
+        const KEEPALIVE_SECS = 5 * 60;
+        const GRAY = '\x1b[90m';
+        const YELLOW = '\x1b[33m';
+        const CYAN = '\x1b[36m';
+        const RESET = '\x1b[0m';
+
+        // Filter to connected worlds only
+        const connectedWorlds = worlds
+            .map((world, idx) => ({ world, idx }))
+            .filter(({ world }) => world.connected);
+
+        if (connectedWorlds.length === 0) {
+            return ['No worlds connected.'];
+        }
+
+        const lines = [];
+
+        // Header line
+        lines.push(padRight('World', 20) + padLeft('Unseen', 6) + '  ' +
+            padLeft('LastSend', 8) + '  ' + padLeft('LastRecv', 8) + '  ' +
+            padLeft('LastNOP', 8) + '  ' + padLeft('NextNOP', 8));
+
+        connectedWorlds.forEach(({ world, idx }) => {
+            // Current marker
+            const currentMarker = idx === currentWorldIndex ?
+                CYAN + '*' + RESET :
+                ' ';
+
+            // Unseen count
+            const unseen = world.unseen_lines || 0;
+            const unseenStr = unseen > 0 ?
+                YELLOW + padLeft(unseen.toString(), 6) + RESET :
+                GRAY + padLeft('—', 6) + RESET;
+
+            // Time columns
+            const lastSend = formatDurationShort(world.last_send_secs);
+            const lastRecv = formatDurationShort(world.last_recv_secs);
+            const lastNop = formatDurationShort(world.last_nop_secs);
+
+            // NextNOP calculation
+            const lastSendVal = world.last_send_secs !== null && world.last_send_secs !== undefined ? world.last_send_secs : KEEPALIVE_SECS;
+            const lastRecvVal = world.last_recv_secs !== null && world.last_recv_secs !== undefined ? world.last_recv_secs : KEEPALIVE_SECS;
+            const lastActivity = Math.min(lastSendVal, lastRecvVal);
+            const remaining = Math.max(0, KEEPALIVE_SECS - lastActivity);
+            const nextNop = formatDurationShort(remaining);
+
+            // Truncate world name
+            const name = world.name || '';
+            const nameDisplay = name.length > 18 ? name.substring(0, 15) + '...' : name;
+
+            lines.push(currentMarker + ' ' + padRight(nameDisplay, 18) + ' ' + unseenStr + '  ' +
+                padLeft(lastSend, 8) + '  ' + padLeft(lastRecv, 8) + '  ' +
+                padLeft(lastNop, 8) + '  ' + padLeft(nextNop, 8));
+        });
+
+        return lines;
+    }
+
+    // Helper: pad string to the right
+    function padRight(str, len) {
+        str = String(str);
+        while (str.length < len) str += ' ';
+        return str;
+    }
+
+    // Helper: pad string to the left
+    function padLeft(str, len) {
+        str = String(str);
+        while (str.length < len) str = ' ' + str;
+        return str;
+    }
+
+    // Add raw output lines (without %% prefix)
+    function addRawOutputLines(lines, worldIndex) {
+        const ts = Math.floor(Date.now() / 1000);
+        if (worldIndex >= 0 && worldIndex < worlds.length) {
+            lines.forEach(line => {
+                const lineIndex = worlds[worldIndex].output_lines.length;
+                worlds[worldIndex].output_lines.push({ text: line, ts: ts });
+                if (worldIndex === currentWorldIndex) {
+                    appendNewLine(line, ts, worldIndex, lineIndex);
+                }
+            });
+        }
+    }
+
+    // Output worlds list as text (/l command)
+    function outputWorldsList() {
+        const lines = formatWorldsList();
+        addRawOutputLines(lines, currentWorldIndex);
+    }
+
     // Calculate next keepalive time
     function formatNextKA(lastSendSecs, lastRecvSecs) {
         const KEEPALIVE_SECS = 5 * 60; // 5 minutes
@@ -2316,9 +2429,14 @@
 
     function renderWorldSelectorList() {
         const filter = elements.worldFilter.value.toLowerCase();
-        elements.worldSelectorList.innerHTML = '';
+        elements.worldSelectorTableBody.innerHTML = '';
 
         worlds.forEach((world, index) => {
+            // Filter by "Only Connected" toggle
+            if (worldSelectorOnlyConnected && !world.connected) {
+                return;
+            }
+
             // Filter by name, hostname, or user
             const name = (world.name || '').toLowerCase();
             const hostname = (world.settings?.hostname || '').toLowerCase();
@@ -2328,42 +2446,53 @@
                 return; // Skip non-matching worlds
             }
 
-            const div = document.createElement('div');
-            div.className = 'world-selector-item';
-            if (index === selectedWorldIndex) div.className += ' selected';
-            if (index === currentWorldIndex) div.className += ' current';
-
-            // World info (name + host)
-            const infoDiv = document.createElement('div');
-            infoDiv.className = 'world-info';
-
-            const nameSpan = document.createElement('span');
-            nameSpan.className = 'world-name';
-            nameSpan.textContent = stripAnsi(world.name || '(unnamed)').trim();
-            infoDiv.appendChild(nameSpan);
-
-            if (world.settings?.hostname) {
-                const hostSpan = document.createElement('span');
-                hostSpan.className = 'world-host';
-                hostSpan.textContent = world.settings.hostname + (world.settings.port ? ':' + world.settings.port : '');
-                infoDiv.appendChild(hostSpan);
+            const tr = document.createElement('tr');
+            let classes = [];
+            if (index === currentWorldIndex) {
+                classes.push('current-world');
+            }
+            if (index === selectedWorldIndex) {
+                classes.push('selected-row');
+            }
+            if (classes.length > 0) {
+                tr.className = classes.join(' ');
             }
 
-            div.appendChild(infoDiv);
-
-            // Status indicator
+            // Status indicator column
+            const tdStatus = document.createElement('td');
             const statusSpan = document.createElement('span');
-            statusSpan.className = 'world-status ' + (world.connected ? 'connected' : 'disconnected');
+            statusSpan.className = world.connected ? 'status-connected' : 'status-disconnected';
             statusSpan.textContent = world.connected ? '●' : '○';
-            div.appendChild(statusSpan);
+            tdStatus.appendChild(statusSpan);
+            tr.appendChild(tdStatus);
 
-            div.onclick = () => selectWorld(index);
-            div.ondblclick = () => {
+            // World name column
+            const tdName = document.createElement('td');
+            tdName.textContent = stripAnsi(world.name || '(unnamed)').trim();
+            tr.appendChild(tdName);
+
+            // Hostname column
+            const tdHost = document.createElement('td');
+            tdHost.textContent = world.settings?.hostname || '';
+            tr.appendChild(tdHost);
+
+            // Port column
+            const tdPort = document.createElement('td');
+            tdPort.textContent = world.settings?.port || '';
+            tr.appendChild(tdPort);
+
+            // User column
+            const tdUser = document.createElement('td');
+            tdUser.textContent = world.settings?.user || '';
+            tr.appendChild(tdUser);
+
+            tr.onclick = () => selectWorld(index);
+            tr.ondblclick = () => {
                 selectWorld(index);
-                switchToSelectedWorld();
+                connectSelectedWorld();
             };
 
-            elements.worldSelectorList.appendChild(div);
+            elements.worldSelectorTableBody.appendChild(tr);
         });
     }
 
@@ -2373,11 +2502,11 @@
         scrollSelectedWorldIntoView();
     }
 
-    // Scroll the selected world into view in world selector list
+    // Scroll the selected world into view in world selector table
     function scrollSelectedWorldIntoView() {
         requestAnimationFrame(() => {
-            const container = elements.worldSelectorList;
-            const selectedItem = container?.querySelector('.world-selector-item.selected');
+            const container = document.getElementById('world-selector-table-container');
+            const selectedItem = elements.worldSelectorTableBody?.querySelector('.selected-row');
             if (selectedItem && container) {
                 const containerRect = container.getBoundingClientRect();
                 const itemRect = selectedItem.getBoundingClientRect();
@@ -2391,11 +2520,15 @@
         });
     }
 
-    // Get indices of worlds that match the current filter
+    // Get indices of worlds that match the current filter and "Only Connected" toggle
     function getFilteredWorldIndices() {
         const filter = elements.worldFilter.value.toLowerCase();
         const indices = [];
         worlds.forEach((world, index) => {
+            // Filter by "Only Connected" toggle
+            if (worldSelectorOnlyConnected && !world.connected) {
+                return;
+            }
             const name = (world.name || '').toLowerCase();
             const hostname = (world.settings?.hostname || '').toLowerCase();
             const user = (world.settings?.user || '').toLowerCase();
@@ -2440,6 +2573,24 @@
             }
             closeWorldSelectorPopup();
         }
+    }
+
+    function addNewWorld() {
+        // Generate a unique world name
+        let baseName = 'New World';
+        let name = baseName;
+        let counter = 1;
+        while (worlds.some(w => w.name.toLowerCase() === name.toLowerCase())) {
+            counter++;
+            name = baseName + ' ' + counter;
+        }
+        // Send command to create and edit new world
+        send({
+            type: 'SendCommand',
+            command: '/worlds ' + name,
+            world_index: currentWorldIndex
+        });
+        closeWorldSelectorPopup();
     }
 
     function editSelectedWorld() {
@@ -2611,7 +2762,7 @@
         closeMobileMenu();
         switch (action) {
             case 'worlds':
-                openWorldsPopup();
+                outputWorldsList();
                 break;
             case 'world-selector':
                 openWorldSelectorPopup();
@@ -3400,11 +3551,19 @@
         elements.worldsCloseBtn.onclick = closeWorldsPopup;
 
         // World selector popup
+        elements.worldAddBtn.onclick = addNewWorld;
         elements.worldEditBtn.onclick = editSelectedWorld;
-        elements.worldDeleteBtn.onclick = openWorldConfirmPopup;
         elements.worldConnectBtn.onclick = connectSelectedWorld;
-        elements.worldSwitchBtn.onclick = switchToSelectedWorld;
         elements.worldSelectorCancelBtn.onclick = closeWorldSelectorPopup;
+        elements.worldSelectorOnlyConnected.onchange = function() {
+            worldSelectorOnlyConnected = this.checked;
+            // Update selection if current selection is filtered out
+            if (worldSelectorOnlyConnected && selectedWorldIndex >= 0 && worlds[selectedWorldIndex] && !worlds[selectedWorldIndex].connected) {
+                const connectedIdx = worlds.findIndex(w => w.connected);
+                selectedWorldIndex = connectedIdx >= 0 ? connectedIdx : -1;
+            }
+            renderWorldSelectorList();
+        };
 
         // World delete confirm popup
         elements.worldConfirmYesBtn.onclick = confirmDeleteWorld;

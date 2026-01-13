@@ -288,3 +288,123 @@ pub fn calculate_prev_world(
         }
     }
 }
+
+// ============================================================================
+// Connected Worlds List Formatting (/l command)
+// ============================================================================
+
+/// Format a duration as a human-readable string
+/// - Under 60 minutes: Xm (e.g., 12m, 45m)
+/// - 1-24 hours: X.Xh (e.g., 2.5h, 12.3h)
+/// - Over 24 hours: X.Xd (e.g., 1.2d, 3.5d)
+pub fn format_duration_short(secs: u64) -> String {
+    let minutes = secs / 60;
+    let hours = secs as f64 / 3600.0;
+    let days = secs as f64 / 86400.0;
+
+    if minutes < 60 {
+        format!("{}m", minutes)
+    } else if hours < 24.0 {
+        format!("{:.1}h", hours)
+    } else {
+        format!("{:.1}d", days)
+    }
+}
+
+/// Information about a world needed for the /l command output
+pub struct WorldListInfo {
+    pub name: String,
+    pub connected: bool,
+    pub is_current: bool,
+    pub unseen_lines: usize,
+    pub last_send_secs: Option<u64>,
+    pub last_recv_secs: Option<u64>,
+    pub last_nop_secs: Option<u64>,
+    pub next_nop_secs: Option<u64>,
+}
+
+/// Format the connected worlds list for /l command output
+/// Returns a string with ANSI color codes for terminal display
+/// Only shows connected worlds
+pub fn format_worlds_list(worlds: &[WorldListInfo]) -> String {
+    const KEEPALIVE_SECS: u64 = 5 * 60;
+
+    // ANSI color codes
+    const GRAY: &str = "\x1b[90m";
+    const YELLOW: &str = "\x1b[33m";
+    const CYAN: &str = "\x1b[36m";
+    const RESET: &str = "\x1b[0m";
+
+    // Filter to connected worlds only
+    let connected_worlds: Vec<&WorldListInfo> = worlds.iter()
+        .filter(|w| w.connected)
+        .collect();
+
+    if connected_worlds.is_empty() {
+        return "No worlds connected.".to_string();
+    }
+
+    let mut lines = Vec::new();
+
+    // Header line
+    lines.push(format!(
+        "{:20} {:>6}  {:>8}  {:>8}  {:>8}  {:>8}",
+        "World", "Unseen", "LastSend", "LastRecv", "LastNOP", "NextNOP"
+    ));
+
+    for world in connected_worlds {
+        // Current world marker
+        let current_marker = if world.is_current {
+            format!("{}*{}", CYAN, RESET)
+        } else {
+            " ".to_string()
+        };
+
+        // Unseen count: yellow if > 0, gray dash otherwise
+        let unseen = if world.unseen_lines > 0 {
+            format!("{}{:>6}{}", YELLOW, world.unseen_lines, RESET)
+        } else {
+            format!("{}{:>6}{}", GRAY, "—", RESET)
+        };
+
+        // Time columns
+        let last_send = world.last_send_secs
+            .map(format_duration_short)
+            .unwrap_or_else(|| "—".to_string());
+        let last_recv = world.last_recv_secs
+            .map(format_duration_short)
+            .unwrap_or_else(|| "—".to_string());
+        let last_nop = world.last_nop_secs
+            .map(format_duration_short)
+            .unwrap_or_else(|| "—".to_string());
+
+        // NextNOP: calculate based on last activity
+        let last_activity = match (world.last_send_secs, world.last_recv_secs) {
+            (Some(s), Some(r)) => Some(s.min(r)),
+            (Some(s), None) => Some(s),
+            (None, Some(r)) => Some(r),
+            (None, None) => None,
+        };
+        let next_nop = match last_activity {
+            Some(elapsed) => {
+                let remaining = KEEPALIVE_SECS.saturating_sub(elapsed);
+                format_duration_short(remaining)
+            }
+            None => "—".to_string(),
+        };
+
+        // Truncate world name to 18 chars to fit with marker
+        let name_display = if world.name.len() > 18 {
+            format!("{}...", &world.name[..15])
+        } else {
+            world.name.clone()
+        };
+
+        lines.push(format!(
+            "{} {:18} {}  {:>8}  {:>8}  {:>8}  {:>8}",
+            current_marker, name_display, unseen, last_send, last_recv, last_nop, next_nop
+        ));
+    }
+
+    lines.join("\n")
+}
