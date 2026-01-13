@@ -5858,7 +5858,7 @@ mod remote_gui {
 
         fn panel_bg(&self) -> Color32 {
             match self {
-                GuiTheme::Dark => Color32::from_rgb(16, 16, 16),  // Very dark gray for panels
+                GuiTheme::Dark => Color32::from_rgb(32, 32, 32),  // Dark gray for panels
                 GuiTheme::Light => Color32::from_rgb(235, 235, 235),
             }
         }
