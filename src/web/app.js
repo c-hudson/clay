@@ -2760,11 +2760,11 @@
         let downBtnPressStart = 0;
 
         // Up button - short press: prev world, long press (3s+): prev history
-        elements.mobileUpBtn.onmousedown = elements.mobileUpBtn.ontouchstart = function(e) {
+        function upBtnStart(e) {
             e.preventDefault();
             upBtnPressStart = Date.now();
-        };
-        elements.mobileUpBtn.onmouseup = elements.mobileUpBtn.ontouchend = function(e) {
+        }
+        function upBtnEnd(e) {
             e.preventDefault();
             e.stopPropagation();
             const pressDuration = Date.now() - upBtnPressStart;
@@ -2783,14 +2783,18 @@
                 requestPrevWorld();
             }
             elements.input.focus();
-        };
+        }
+        elements.mobileUpBtn.addEventListener('mousedown', upBtnStart);
+        elements.mobileUpBtn.addEventListener('mouseup', upBtnEnd);
+        elements.mobileUpBtn.addEventListener('touchstart', upBtnStart, { passive: false });
+        elements.mobileUpBtn.addEventListener('touchend', upBtnEnd, { passive: false });
 
         // Down button - short press: next world, long press (3s+): next history
-        elements.mobileDownBtn.onmousedown = elements.mobileDownBtn.ontouchstart = function(e) {
+        function downBtnStart(e) {
             e.preventDefault();
             downBtnPressStart = Date.now();
-        };
-        elements.mobileDownBtn.onmouseup = elements.mobileDownBtn.ontouchend = function(e) {
+        }
+        function downBtnEnd(e) {
             e.preventDefault();
             e.stopPropagation();
             const pressDuration = Date.now() - downBtnPressStart;
@@ -2810,7 +2814,11 @@
                 requestNextWorld();
             }
             elements.input.focus();
-        };
+        }
+        elements.mobileDownBtn.addEventListener('mousedown', downBtnStart);
+        elements.mobileDownBtn.addEventListener('mouseup', downBtnEnd);
+        elements.mobileDownBtn.addEventListener('touchstart', downBtnStart, { passive: false });
+        elements.mobileDownBtn.addEventListener('touchend', downBtnEnd, { passive: false });
 
         elements.mobilePgUpBtn.onclick = function(e) {
             e.preventDefault();
