@@ -8197,24 +8197,31 @@ mod remote_gui {
                                 .position(|&s| (s - self.font_size).abs() < 0.5)
                                 .unwrap_or(2) as i32;
 
-                            // Large "A" label on the right (added first in RTL layout)
                             let label_color = egui::Color32::from_gray(128);
-                            ui.vertical(|ui| {
-                                ui.add_space(5.0);
-                                ui.label(egui::RichText::new("A").color(label_color).size(14.0));
-                            });
 
                             // Slider dimensions
                             let slider_width = 80.0;
                             let slider_height = 20.0;
+                            let label_spacing = 4.0;
 
-                            // Allocate space for the slider
-                            let (rect, response) = ui.allocate_exact_size(
-                                egui::vec2(slider_width, slider_height),
+                            // Allocate space for: large A + slider + small A
+                            let total_width = 14.0 + label_spacing + slider_width + label_spacing + 8.0;
+                            let (total_rect, response) = ui.allocate_exact_size(
+                                egui::vec2(total_width, slider_height),
                                 egui::Sense::click_and_drag()
                             );
 
-                            if ui.is_rect_visible(rect) {
+                            // Calculate positions (RTL: large A on right, small A on left)
+                            let small_a_x = total_rect.left() + 4.0;
+                            let slider_left = total_rect.left() + 8.0 + label_spacing;
+                            let slider_right = slider_left + slider_width;
+                            let large_a_x = slider_right + label_spacing;
+                            let rect = egui::Rect::from_min_max(
+                                egui::pos2(slider_left, total_rect.top()),
+                                egui::pos2(slider_right, total_rect.bottom())
+                            );
+
+                            if ui.is_rect_visible(total_rect) {
                                 let painter = ui.painter();
 
                                 // Draw triangle background (point on left, tall on right)
@@ -8248,27 +8255,44 @@ mod remote_gui {
                                     6.0,
                                     handle_color
                                 );
+
+                                // Draw A labels aligned with bottom of slider
+                                let label_y = rect.bottom() - 2.0;
+
+                                // Small A on left
+                                painter.text(
+                                    egui::pos2(small_a_x, label_y),
+                                    egui::Align2::LEFT_BOTTOM,
+                                    "A",
+                                    egui::FontId::proportional(8.0),
+                                    label_color,
+                                );
+
+                                // Large A on right
+                                painter.text(
+                                    egui::pos2(large_a_x, label_y),
+                                    egui::Align2::LEFT_BOTTOM,
+                                    "A",
+                                    egui::FontId::proportional(14.0),
+                                    label_color,
+                                );
                             }
 
-                            // Handle clicks and drags
+                            // Handle clicks and drags on the slider area
                             if response.clicked() || response.dragged() {
                                 if let Some(pos) = response.interact_pointer_pos() {
-                                    let rel_x = pos.x - rect.left() - 6.0;
-                                    let step_width = (slider_width - 12.0) / 3.0;
-                                    let new_pos = ((rel_x / step_width).round() as i32).clamp(0, 3);
-                                    let new_size = FONT_SIZES[new_pos as usize];
-                                    if (new_size - self.font_size).abs() > 0.5 {
-                                        self.font_size = new_size;
-                                        action = Some("font_changed");
+                                    if pos.x >= rect.left() && pos.x <= rect.right() {
+                                        let rel_x = pos.x - rect.left() - 6.0;
+                                        let step_width = (slider_width - 12.0) / 3.0;
+                                        let new_pos = ((rel_x / step_width).round() as i32).clamp(0, 3);
+                                        let new_size = FONT_SIZES[new_pos as usize];
+                                        if (new_size - self.font_size).abs() > 0.5 {
+                                            self.font_size = new_size;
+                                            action = Some("font_changed");
+                                        }
                                     }
                                 }
                             }
-
-                            // Small "A" label on the left (added last in RTL layout)
-                            ui.vertical(|ui| {
-                                ui.add_space(5.0);
-                                ui.label(egui::RichText::new("A").color(label_color).size(8.0));
-                            });
                         });
                     });
                 });
@@ -8634,15 +8658,18 @@ mod remote_gui {
 
                             // Spacer with underscore-style fill
                             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                // Current time (HH:MM)
-                                let now = std::time::SystemTime::now();
-                                let datetime = now.duration_since(std::time::UNIX_EPOCH).unwrap_or_default();
-                                let secs = datetime.as_secs();
-                                let hours = (secs / 3600) % 24;
-                                let mins = (secs / 60) % 60;
-                                // Adjust for local timezone (rough estimate)
-                                let local_hours = (hours + 24 - 5) % 24; // UTC-5 estimate
-                                ui.label(egui::RichText::new(format!("{}:{:02}", local_hours, mins))
+                                // Current time (HH:MM) in local timezone
+                                let (hours, mins) = unsafe {
+                                    let mut now: libc::time_t = 0;
+                                    libc::time(&mut now);
+                                    let tm = libc::localtime(&now);
+                                    if tm.is_null() {
+                                        (0, 0)
+                                    } else {
+                                        ((*tm).tm_hour as u32, (*tm).tm_min as u32)
+                                    }
+                                };
+                                ui.label(egui::RichText::new(format!("{}:{:02}", hours, mins))
                                     .monospace().color(theme.accent()));
                             });
                         });
