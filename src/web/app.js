@@ -539,6 +539,7 @@
                     authenticated = true;
                     showAuthModal(false);
                     elements.authError.textContent = '';
+                    elements.input.focus();
                 } else {
                     elements.authError.textContent = msg.error || 'Authentication failed';
                     elements.authPassword.value = '';
@@ -2914,6 +2915,16 @@
         document.onkeydown = function(e) {
             // Skip if auth modal is visible
             if (elements.authModal.classList.contains('visible')) return;
+
+            // Prevent browser's quick find (/) and focus input instead
+            if (e.key === '/' && document.activeElement !== elements.input &&
+                document.activeElement !== elements.filterInput &&
+                document.activeElement !== elements.actionFilter &&
+                document.activeElement !== elements.worldFilter) {
+                e.preventDefault();
+                elements.input.focus();
+                return;
+            }
 
             // Handle F-keys and shortcuts globally (before popup checks which have early returns)
             if (e.key === 'F2') {

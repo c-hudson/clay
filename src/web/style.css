@@ -186,6 +186,8 @@ body {
     font-family: serif;
     line-height: 1;
     user-select: none;
+    align-self: flex-end;
+    margin-bottom: -3px;
 }
 
 .font-slider-label.small {
