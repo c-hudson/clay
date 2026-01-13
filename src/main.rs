@@ -8090,33 +8090,33 @@ mod remote_gui {
                                         }
                                     }
                                 }
-                            } else if self.input_buffer.trim().is_empty() {
-                                // Up/Down arrow with empty input - cycle active worlds
-                                // Use shared world switching logic
-                                let world_info: Vec<crate::util::WorldSwitchInfo> = self.worlds.iter()
-                                    .map(|w| crate::util::WorldSwitchInfo {
-                                        name: w.name.clone(),
-                                        connected: w.connected,
-                                        unseen_lines: w.unseen_lines,
-                                    })
-                                    .collect();
+                            }
 
-                                if i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowUp) {
-                                    if let Some(prev_idx) = crate::util::calculate_prev_world(
-                                        &world_info,
-                                        self.current_world,
-                                        self.world_switch_mode,
-                                    ) {
-                                        switch_world = Some(prev_idx);
-                                    }
-                                } else if i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowDown) {
-                                    if let Some(next_idx) = crate::util::calculate_next_world(
-                                        &world_info,
-                                        self.current_world,
-                                        self.world_switch_mode,
-                                    ) {
-                                        switch_world = Some(next_idx);
-                                    }
+                            // Up/Down arrow - always cycle active worlds
+                            // Use shared world switching logic
+                            let world_info: Vec<crate::util::WorldSwitchInfo> = self.worlds.iter()
+                                .map(|w| crate::util::WorldSwitchInfo {
+                                    name: w.name.clone(),
+                                    connected: w.connected,
+                                    unseen_lines: w.unseen_lines,
+                                })
+                                .collect();
+
+                            if i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowUp) {
+                                if let Some(prev_idx) = crate::util::calculate_prev_world(
+                                    &world_info,
+                                    self.current_world,
+                                    self.world_switch_mode,
+                                ) {
+                                    switch_world = Some(prev_idx);
+                                }
+                            } else if i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowDown) {
+                                if let Some(next_idx) = crate::util::calculate_next_world(
+                                    &world_info,
+                                    self.current_world,
+                                    self.world_switch_mode,
+                                ) {
+                                    switch_world = Some(next_idx);
                                 }
                             }
                         }
