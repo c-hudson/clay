@@ -4101,6 +4101,7 @@ impl App {
                     hostname: world.settings.hostname.clone(),
                     port: world.settings.port.clone(),
                     user: world.settings.user.clone(),
+                    password: encrypt_password(&world.settings.password),
                     use_ssl: world.settings.use_ssl,
                     log_file: world.settings.log_file.clone(),
                     encoding: world.settings.encoding.name().to_string(),
@@ -5751,8 +5752,7 @@ mod remote_gui {
     #[derive(PartialEq, Clone)]
     enum PopupState {
         None,
-        WorldList,
-        ConnectedWorlds,  // /connections or /l - shows connected worlds with stats
+        ConnectedWorlds,  // Combined world selector and connected worlds list
         WorldEditor(usize),  // world index being edited
         WorldConfirmDelete(usize),  // world index to delete
         Setup,
@@ -5807,89 +5807,152 @@ mod remote_gui {
             }
         }
 
+        // Background hierarchy (deep -> base -> surface -> elevated -> hover)
+        fn bg_deep(&self) -> Color32 {
+            match self {
+                GuiTheme::Dark => Color32::from_rgb(8, 8, 10),
+                GuiTheme::Light => Color32::from_rgb(255, 255, 255),
+            }
+        }
+
         fn bg(&self) -> Color32 {
             match self {
-                GuiTheme::Dark => Color32::from_rgb(12, 12, 12),  // Very dark gray, subtle lift from pure black
+                GuiTheme::Dark => Color32::from_rgb(13, 17, 28),
                 GuiTheme::Light => Color32::from_rgb(250, 250, 250),
             }
         }
 
+        fn bg_surface(&self) -> Color32 {
+            match self {
+                GuiTheme::Dark => Color32::from_rgb(20, 20, 24),
+                GuiTheme::Light => Color32::from_rgb(245, 245, 245),
+            }
+        }
+
+        fn bg_elevated(&self) -> Color32 {
+            match self {
+                GuiTheme::Dark => Color32::from_rgb(26, 26, 31),
+                GuiTheme::Light => Color32::from_rgb(240, 240, 240),
+            }
+        }
+
+        fn bg_hover(&self) -> Color32 {
+            match self {
+                GuiTheme::Dark => Color32::from_rgb(34, 34, 40),
+                GuiTheme::Light => Color32::from_rgb(230, 230, 230),
+            }
+        }
+
+        // Text hierarchy (primary -> secondary -> muted -> dim)
         fn fg(&self) -> Color32 {
             match self {
-                GuiTheme::Dark => Color32::from_rgb(192, 192, 192),  // Light gray like terminal default
+                GuiTheme::Dark => Color32::from_rgb(228, 228, 231),
                 GuiTheme::Light => Color32::BLACK,
+            }
+        }
+
+        fn fg_secondary(&self) -> Color32 {
+            match self {
+                GuiTheme::Dark => Color32::from_rgb(161, 161, 170),
+                GuiTheme::Light => Color32::from_rgb(80, 80, 80),
+            }
+        }
+
+        fn fg_muted(&self) -> Color32 {
+            match self {
+                GuiTheme::Dark => Color32::from_rgb(113, 113, 122),
+                GuiTheme::Light => Color32::from_rgb(120, 120, 120),
             }
         }
 
         fn fg_dim(&self) -> Color32 {
             match self {
-                GuiTheme::Dark => Color32::from_rgb(128, 128, 128),  // Medium gray
+                GuiTheme::Dark => Color32::from_rgb(82, 82, 91),
                 GuiTheme::Light => Color32::DARK_GRAY,
             }
         }
 
+        // Accent colors
         fn accent(&self) -> Color32 {
             match self {
-                GuiTheme::Dark => Color32::from_rgb(0, 255, 255),  // Cyan like terminal
+                GuiTheme::Dark => Color32::from_rgb(34, 211, 238),  // Softer cyan
                 GuiTheme::Light => Color32::from_rgb(0, 100, 180),
+            }
+        }
+
+        fn accent_dim(&self) -> Color32 {
+            match self {
+                GuiTheme::Dark => Color32::from_rgb(8, 145, 178),
+                GuiTheme::Light => Color32::from_rgb(0, 80, 140),
             }
         }
 
         fn highlight(&self) -> Color32 {
             match self {
-                GuiTheme::Dark => Color32::YELLOW,
+                GuiTheme::Dark => Color32::from_rgb(251, 191, 36),  // Amber
                 GuiTheme::Light => Color32::from_rgb(180, 100, 0),
             }
         }
 
         fn success(&self) -> Color32 {
             match self {
-                GuiTheme::Dark => Color32::from_rgb(0, 255, 0),  // Bright green like terminal
+                GuiTheme::Dark => Color32::from_rgb(74, 222, 128),  // Softer green
                 GuiTheme::Light => Color32::from_rgb(0, 128, 0),
             }
         }
 
         fn error(&self) -> Color32 {
             match self {
-                GuiTheme::Dark => Color32::from_rgb(255, 0, 0),  // Bright red like terminal
+                GuiTheme::Dark => Color32::from_rgb(248, 113, 113),  // Softer red
                 GuiTheme::Light => Color32::from_rgb(180, 0, 0),
             }
         }
 
-        fn panel_bg(&self) -> Color32 {
+        fn error_dim(&self) -> Color32 {
             match self {
-                GuiTheme::Dark => Color32::from_rgb(32, 32, 32),  // Dark gray for panels
-                GuiTheme::Light => Color32::from_rgb(235, 235, 235),
+                GuiTheme::Dark => Color32::from_rgb(239, 68, 68),
+                GuiTheme::Light => Color32::from_rgb(200, 0, 0),
             }
         }
 
-        fn button_bg(&self) -> Color32 {
+        // Borders
+        fn border_subtle(&self) -> Color32 {
             match self {
-                GuiTheme::Dark => Color32::from_rgb(32, 32, 32),  // Dark gray for buttons
-                GuiTheme::Light => Color32::from_rgb(220, 220, 220),
+                GuiTheme::Dark => Color32::from_rgba_unmultiplied(255, 255, 255, 15),
+                GuiTheme::Light => Color32::from_rgba_unmultiplied(0, 0, 0, 15),
             }
+        }
+
+        fn border_medium(&self) -> Color32 {
+            match self {
+                GuiTheme::Dark => Color32::from_rgba_unmultiplied(255, 255, 255, 26),
+                GuiTheme::Light => Color32::from_rgba_unmultiplied(0, 0, 0, 26),
+            }
+        }
+
+        fn panel_bg(&self) -> Color32 {
+            self.bg_surface()
+        }
+
+        fn button_bg(&self) -> Color32 {
+            self.bg_hover()
         }
 
         fn selection_bg(&self) -> Color32 {
             match self {
-                GuiTheme::Dark => Color32::from_rgb(0, 64, 128),  // Dark blue selection
+                GuiTheme::Dark => Color32::from_rgb(0, 64, 128),
                 GuiTheme::Light => Color32::from_rgb(180, 200, 230),
             }
         }
 
         fn prompt(&self) -> Color32 {
-            // Cyan color for prompts (matches TUI style)
-            match self {
-                GuiTheme::Dark => Color32::from_rgb(0, 255, 255),
-                GuiTheme::Light => Color32::from_rgb(0, 139, 139),
-            }
+            self.accent()
         }
 
         fn link(&self) -> Color32 {
-            // Blue color for clickable links
             match self {
-                GuiTheme::Dark => Color32::from_rgb(100, 149, 237), // Cornflower blue
-                GuiTheme::Light => Color32::from_rgb(0, 0, 238),    // Standard link blue
+                GuiTheme::Dark => Color32::from_rgb(100, 149, 237),
+                GuiTheme::Light => Color32::from_rgb(0, 0, 238),
             }
         }
     }
@@ -5931,6 +5994,10 @@ mod remote_gui {
         popup_state: PopupState,
         /// Selected world in world list popup
         world_list_selected: usize,
+        /// Filter text for worlds popup
+        connected_worlds_filter: String,
+        /// Only show connected worlds toggle
+        only_connected_worlds: bool,
         /// Temp fields for world editor
         edit_name: String,
         edit_hostname: String,
@@ -6011,6 +6078,8 @@ mod remote_gui {
         actions: Vec<Action>,
         /// Selected action index in actions list
         actions_selected: usize,
+        /// Filter text for actions list
+        actions_list_filter: String,
         /// Action editor temp fields
         edit_action_name: String,
         edit_action_world: String,
@@ -6023,6 +6092,8 @@ mod remote_gui {
         debug_text: String,
         /// Window transparency (0.0 = fully transparent, 1.0 = fully opaque)
         transparency: f32,
+        /// Original transparency when setup popup opened (for cancel/revert)
+        original_transparency: Option<f32>,
     }
 
     /// Discord emoji segment for rendering
@@ -6054,6 +6125,8 @@ mod remote_gui {
                 connect_time: None,
                 popup_state: PopupState::None,
                 world_list_selected: 0,
+                connected_worlds_filter: String::new(),
+                only_connected_worlds: false,
                 edit_name: String::new(),
                 edit_hostname: String::new(),
                 edit_port: String::new(),
@@ -6099,6 +6172,7 @@ mod remote_gui {
                 suggestion_message: None,
                 actions: Vec::new(),
                 actions_selected: 0,
+                actions_list_filter: String::new(),
                 edit_action_name: String::new(),
                 edit_action_world: String::new(),
                 edit_action_match_type: MatchType::Regexp,
@@ -6107,6 +6181,7 @@ mod remote_gui {
                 action_error: None,
                 debug_text: String::new(),
                 transparency: 1.0,
+                original_transparency: None,
             }
         }
 
@@ -6322,6 +6397,7 @@ mod remote_gui {
             // Collect deferred actions to avoid borrow issues
             let mut deferred_switch: Option<usize> = None;
             let mut deferred_connect: Option<usize> = None;
+            let mut deferred_edit: Option<usize> = None;
 
             if let Some(ref mut rx) = self.ws_rx {
                 while let Ok(msg) = rx.try_recv() {
@@ -6352,7 +6428,7 @@ mod remote_gui {
                                     hostname: w.settings.hostname,
                                     port: w.settings.port,
                                     user: w.settings.user,
-                                    password: String::new(),  // Password not sent from server for security
+                                    password: decrypt_password(&w.settings.password),
                                     use_ssl: w.settings.use_ssl,
                                     log_file: w.settings.log_file.unwrap_or_default(),
                                     encoding: w.settings.encoding,
@@ -6535,12 +6611,14 @@ mod remote_gui {
                             let parsed = parse_command(&command);
                             match parsed {
                                 Command::WorldSelector => {
-                                    self.popup_state = PopupState::WorldList;
+                                    self.popup_state = PopupState::ConnectedWorlds;
                                     self.world_list_selected = self.current_world;
+                                    self.only_connected_worlds = false;
                                 }
                                 Command::WorldsList => {
                                     self.popup_state = PopupState::ConnectedWorlds;
                                     self.world_list_selected = self.current_world;
+                                    self.only_connected_worlds = true;
                                 }
                                 Command::WorldSwitch { ref name } | Command::WorldConnectNoLogin { ref name } => {
                                     // Switch to world locally, connect if needed
@@ -6554,14 +6632,14 @@ mod remote_gui {
                                     // If world not found, ignore (don't send to server to avoid console switch)
                                 }
                                 Command::WorldEdit { ref name } => {
-                                    // Open editor for world
+                                    // Open editor for world (deferred to avoid borrow issues)
                                     if let Some(ref name) = name {
                                         if let Some(idx) = self.worlds.iter().position(|w| w.name.eq_ignore_ascii_case(name)) {
-                                            self.popup_state = PopupState::WorldEditor(idx);
+                                            deferred_edit = Some(idx);
                                         }
                                     } else {
                                         // Edit current world
-                                        self.popup_state = PopupState::WorldEditor(self.current_world);
+                                        deferred_edit = Some(self.current_world);
                                     }
                                 }
                                 Command::Help => {
@@ -6608,6 +6686,9 @@ mod remote_gui {
             }
             if let Some(idx) = deferred_connect {
                 self.connect_world(idx);
+            }
+            if let Some(idx) = deferred_edit {
+                self.open_world_editor(idx);
             }
         }
 
@@ -7743,7 +7824,9 @@ mod remote_gui {
 
             if !self.connected || !self.authenticated {
                 // Show login dialog with dog and Clay branding
-                egui::CentralPanel::default().show(ctx, |ui| {
+                egui::CentralPanel::default()
+                    .frame(egui::Frame::none().fill(theme.bg_deep()))
+                    .show(ctx, |ui| {
                     ui.vertical_centered(|ui| {
                         ui.add_space(30.0);
 
@@ -7788,67 +7871,109 @@ mod remote_gui {
                         });
 
                         let tagline_color = egui::Color32::from_rgb(0xff, 0x87, 0xff);  // 213
-                        let help_color = egui::Color32::from_rgb(0x80, 0x80, 0x80);  // 244
                         ui.add_space(10.0);
                         ui.label(egui::RichText::new("A 90dies mud client written today").color(tagline_color).italics());
                         ui.add_space(5.0);
-                        ui.label(egui::RichText::new("/help for how to use clay").color(help_color));
-                        ui.add_space(15.0);
+                        ui.label(egui::RichText::new("/help for how to use clay").color(theme.fg_muted()));
+                        ui.add_space(20.0);
 
-                        ui.label(format!("Server: {}", self.ws_url));
-                        ui.add_space(10.0);
+                        // Login card
+                        egui::Frame::none()
+                            .fill(theme.bg_surface())
+                            .stroke(egui::Stroke::new(1.0, theme.border_subtle()))
+                            .rounding(egui::Rounding::same(8.0))
+                            .inner_margin(egui::Margin::same(20.0))
+                            .show(ui, |ui| {
+                                ui.set_min_width(280.0);
+                                ui.set_max_width(280.0);
 
-                        // Auto-connect on first frame to check if allow list grants access
-                        if !self.auto_connect_attempted && !self.connected {
-                            self.auto_connect_attempted = true;
-                            self.connect_websocket();
-                        }
+                                // Server address
+                                ui.label(egui::RichText::new(format!("Connecting to {}", self.ws_url))
+                                    .color(theme.fg_muted())
+                                    .size(11.0));
+                                ui.add_space(16.0);
 
-                        // Check if we're still waiting for allow list response (500ms timeout)
-                        let allow_list_timeout = std::time::Duration::from_millis(500);
-                        let still_checking_allow_list = self.connected
-                            && !self.authenticated
-                            && !self.password_submitted
-                            && self.connect_time.map_or(false, |t| t.elapsed() < allow_list_timeout);
+                                // Auto-connect on first frame to check if allow list grants access
+                                if !self.auto_connect_attempted && !self.connected {
+                                    self.auto_connect_attempted = true;
+                                    self.connect_websocket();
+                                }
 
-                        // Show connection status or password prompt
-                        if still_checking_allow_list {
-                            ui.label("Checking allow list...");
-                            ui.add_space(10.0);
-                            // Request repaint to update when timeout expires
-                            ctx.request_repaint();
-                        }
+                                // Check if we're still waiting for allow list response (500ms timeout)
+                                let allow_list_timeout = std::time::Duration::from_millis(500);
+                                let still_checking_allow_list = self.connected
+                                    && !self.authenticated
+                                    && !self.password_submitted
+                                    && self.connect_time.map_or(false, |t| t.elapsed() < allow_list_timeout);
 
-                        ui.label("Password:");
-                        let password_edit = TextEdit::singleline(&mut self.password)
-                            .password(true)
-                            .desired_width(200.0);
-                        let response = ui.add(password_edit);
+                                // Show connection status or password prompt
+                                if still_checking_allow_list {
+                                    ui.label(egui::RichText::new("Checking allow list...")
+                                        .color(theme.fg_secondary()));
+                                    ui.add_space(10.0);
+                                    // Request repaint to update when timeout expires
+                                    ctx.request_repaint();
+                                }
 
-                        if response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
-                            self.password_submitted = true;
-                            // If already connected, just send auth; otherwise reconnect
-                            if self.connected {
-                                self.send_auth();
-                            } else {
-                                self.connect_websocket();
-                            }
-                        }
+                                // Password label
+                                ui.label(egui::RichText::new("PASSWORD")
+                                    .color(theme.fg_muted())
+                                    .size(10.0));
+                                ui.add_space(4.0);
 
-                        ui.add_space(10.0);
-                        if ui.button("Connect").clicked() {
-                            self.password_submitted = true;
-                            if self.connected {
-                                self.send_auth();
-                            } else {
-                                self.connect_websocket();
-                            }
-                        }
+                                // Password input with custom styling
+                                let password_edit = TextEdit::singleline(&mut self.password)
+                                    .password(true)
+                                    .desired_width(f32::INFINITY)
+                                    .margin(egui::Margin::symmetric(12.0, 8.0));
+                                let response = ui.add(password_edit);
 
-                        if let Some(ref err) = self.error_message {
-                            ui.add_space(10.0);
-                            ui.colored_label(theme.error(), err);
-                        }
+                                if response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                                    self.password_submitted = true;
+                                    if self.connected {
+                                        self.send_auth();
+                                    } else {
+                                        self.connect_websocket();
+                                    }
+                                }
+
+                                ui.add_space(12.0);
+
+                                // Connect button - styled as primary
+                                let button = egui::Button::new(
+                                    egui::RichText::new("CONNECT")
+                                        .color(theme.bg_deep())
+                                        .strong()
+                                        .size(11.0)
+                                )
+                                .fill(theme.accent_dim())
+                                .stroke(egui::Stroke::NONE)
+                                .rounding(egui::Rounding::same(4.0))
+                                .min_size(egui::vec2(f32::INFINITY, 32.0));
+
+                                if ui.add(button).clicked() {
+                                    self.password_submitted = true;
+                                    if self.connected {
+                                        self.send_auth();
+                                    } else {
+                                        self.connect_websocket();
+                                    }
+                                }
+
+                                // Error message
+                                if let Some(ref err) = self.error_message {
+                                    ui.add_space(12.0);
+                                    egui::Frame::none()
+                                        .fill(Color32::from_rgba_unmultiplied(248, 113, 113, 25))
+                                        .rounding(egui::Rounding::same(4.0))
+                                        .inner_margin(egui::Margin::same(8.0))
+                                        .show(ui, |ui| {
+                                            ui.label(egui::RichText::new(err)
+                                                .color(theme.error())
+                                                .size(11.0));
+                                        });
+                                }
+                            });
                     });
                 });
             } else {
@@ -8161,9 +8286,12 @@ mod remote_gui {
                     });
                 }
 
+                let alpha = (self.transparency * 255.0) as u8;
+                let menu_bg = theme.panel_bg();
+                let menu_bg_transparent = egui::Color32::from_rgba_unmultiplied(menu_bg.r(), menu_bg.g(), menu_bg.b(), alpha);
                 egui::TopBottomPanel::top("menu_bar")
                     .frame(egui::Frame::none()
-                        .fill(theme.panel_bg())  // Slightly grey instead of pure black
+                        .fill(menu_bg_transparent)
                         .inner_margin(egui::Margin::symmetric(4.0, 5.0))  // 3px extra padding top/bottom
                         .stroke(egui::Stroke::NONE))
                     .show(ctx, |ui| {
@@ -8174,36 +8302,35 @@ mod remote_gui {
                         let paw_image = egui::Image::from_bytes("bytes://paw_icon.svg", PAW_SVG)
                             .fit_to_exact_size(egui::vec2(paw_size, paw_size));
                         ui.menu_image_button(paw_image, |ui| {
-                            if ui.button("Worlds List").clicked() {
-                                action = Some("connected_worlds");
-                                ui.close_menu();
-                            }
-                            if ui.button("World Selector").clicked() {
-                                action = Some("world_list");
-                                ui.close_menu();
-                            }
+                            // First segment - alphabetical
                             if ui.button("Actions").clicked() {
                                 action = Some("actions");
-                                ui.close_menu();
-                            }
-                            if ui.button("Setup").clicked() {
-                                action = Some("setup");
                                 ui.close_menu();
                             }
                             if ui.button("Font").clicked() {
                                 action = Some("font");
                                 ui.close_menu();
                             }
-                            ui.separator();
-                            if ui.button("Toggle Tags").clicked() {
-                                action = Some("toggle_tags");
+                            if ui.button("Setup").clicked() {
+                                action = Some("setup");
                                 ui.close_menu();
                             }
+                            if ui.button("Worlds").clicked() {
+                                action = Some("connected_worlds");
+                                ui.close_menu();
+                            }
+                            ui.separator();
+                            // Second segment - alphabetical
                             if ui.button("Toggle Highlight").clicked() {
                                 action = Some("toggle_highlight");
                                 ui.close_menu();
                             }
+                            if ui.button("Toggle Tags").clicked() {
+                                action = Some("toggle_tags");
+                                ui.close_menu();
+                            }
                             ui.separator();
+                            // Third segment
                             if ui.button("Resync").clicked() {
                                 action = Some("resync");
                                 ui.close_menu();
@@ -8323,12 +8450,14 @@ mod remote_gui {
                 // Handle menu actions
                 match action {
                     Some("world_list") => {
-                        self.popup_state = PopupState::WorldList;
+                        self.popup_state = PopupState::ConnectedWorlds;
                         self.world_list_selected = self.current_world;
+                        self.only_connected_worlds = false;
                     }
                     Some("connected_worlds") => {
                         self.popup_state = PopupState::ConnectedWorlds;
                         self.world_list_selected = self.current_world;
+                        self.only_connected_worlds = true;
                     }
                     Some("actions") => {
                         self.popup_state = PopupState::ActionsList;
@@ -8377,44 +8506,52 @@ mod remote_gui {
                     .map(|w| Self::strip_ansi_for_copy(&w.prompt))
                     .unwrap_or_default();
 
+                let input_bg = theme.bg();
+                let input_bg_transparent = egui::Color32::from_rgba_unmultiplied(input_bg.r(), input_bg.g(), input_bg.b(), alpha);
                 egui::TopBottomPanel::bottom("input_panel")
                     .exact_height(input_height)
                     .frame(egui::Frame::none()
-                        .fill(theme.bg())
+                        .fill(input_bg_transparent)
                         .inner_margin(egui::Margin::same(2.0))
                         .stroke(egui::Stroke::NONE))
                     .show(ctx, |ui| {
                         ui.spacing_mut().item_spacing.x = 0.0; // Remove horizontal spacing
-                        ui.horizontal(|ui| {
-                            // Show prompt if present (cyan colored like TUI)
-                            if !prompt_text.is_empty() {
-                                ui.label(egui::RichText::new(&prompt_text)
-                                    .monospace()
-                                    .color(theme.prompt()));
-                            }
 
-                            // Text input takes remaining width (no border)
-                            // Build layout job with spell check coloring (misspelled words in red)
-                            let input_id = egui::Id::new("main_input");
-                            let misspelled = self.find_misspelled_words();
-                            let font_id = egui::FontId::monospace(self.font_size);
-                            let default_color = theme.fg();
+                        // Use ScrollArea to allow input content to scroll when it exceeds panel height
+                        egui::ScrollArea::vertical()
+                            .auto_shrink([false, false])
+                            .stick_to_bottom(true)
+                            .show(ui, |ui| {
+                            ui.horizontal(|ui| {
+                                // Show prompt if present (cyan colored like TUI)
+                                if !prompt_text.is_empty() {
+                                    ui.label(egui::RichText::new(&prompt_text)
+                                        .monospace()
+                                        .color(theme.prompt()));
+                                }
 
-                            // Build layouter using actual text parameter (not pre-computed job)
-                            // This ensures cursor positioning works correctly when text changes
-                            let misspelled_ranges = misspelled;
-                            let layouter_font_id = font_id.clone();
-                            let layouter_default_color = default_color;
+                                // Text input takes remaining width (no border)
+                                // Build layout job with spell check coloring (misspelled words in red)
+                                let input_id = egui::Id::new("main_input");
+                                let misspelled = self.find_misspelled_words();
+                                let font_id = egui::FontId::monospace(self.font_size);
+                                let default_color = theme.fg();
 
-                            let response = ui.add_sized(
-                                ui.available_size(),
-                                TextEdit::multiline(&mut self.input_buffer)
-                                    .font(egui::TextStyle::Monospace)
-                                    .desired_rows(self.input_height as usize)
-                                    .margin(egui::Margin::ZERO)
-                                    .frame(false)
-                                    .id(input_id)
-                                    .layouter(&mut |_ui, text, wrap_width| {
+                                // Build layouter using actual text parameter (not pre-computed job)
+                                // This ensures cursor positioning works correctly when text changes
+                                let misspelled_ranges = misspelled;
+                                let layouter_font_id = font_id.clone();
+                                let layouter_default_color = default_color;
+
+                                let response = ui.add_sized(
+                                    ui.available_size(),
+                                    TextEdit::multiline(&mut self.input_buffer)
+                                        .font(egui::TextStyle::Monospace)
+                                        .desired_rows(self.input_height as usize)
+                                        .margin(egui::Margin::ZERO)
+                                        .frame(false)
+                                        .id(input_id)
+                                        .layouter(&mut |_ui, text, wrap_width| {
                                         // Build layout job from actual text parameter
                                         let mut job = egui::text::LayoutJob::default();
                                         let chars: Vec<char> = text.chars().collect();
@@ -8535,12 +8672,14 @@ mod remote_gui {
                                             self.popup_state = PopupState::Web;
                                         }
                                         super::Command::WorldSelector => {
-                                            self.popup_state = PopupState::WorldList;
+                                            self.popup_state = PopupState::ConnectedWorlds;
                                             self.world_list_selected = self.current_world;
+                                            self.only_connected_worlds = false;
                                         }
                                         super::Command::WorldsList => {
                                             self.popup_state = PopupState::ConnectedWorlds;
                                             self.world_list_selected = self.current_world;
+                                            self.only_connected_worlds = true;
                                         }
                                         super::Command::Help => {
                                             self.popup_state = PopupState::Help;
@@ -8611,10 +8750,11 @@ mod remote_gui {
                                 }
                             }
 
-                            // Show suggestion message if present
-                            if let Some(ref msg) = self.suggestion_message {
-                                ui.label(egui::RichText::new(msg).color(theme.prompt()).monospace());
-                            }
+                                // Show suggestion message if present
+                                if let Some(ref msg) = self.suggestion_message {
+                                    ui.label(egui::RichText::new(msg).color(theme.prompt()).monospace());
+                                }
+                            });
                         });
                     });
 
@@ -8623,10 +8763,11 @@ mod remote_gui {
                     GuiTheme::Dark => egui::Color32::from_rgb(40, 40, 40),
                     GuiTheme::Light => egui::Color32::from_rgb(200, 200, 200),  // Darker for light theme
                 };
+                let separator_bg_transparent = egui::Color32::from_rgba_unmultiplied(separator_bg.r(), separator_bg.g(), separator_bg.b(), alpha);
                 egui::TopBottomPanel::bottom("separator_bar")
                     .exact_height(20.0)
                     .frame(egui::Frame::none()
-                        .fill(separator_bg)
+                        .fill(separator_bg_transparent)
                         .inner_margin(egui::Margin::same(0.0))
                         .stroke(egui::Stroke::NONE))
                     .show(ctx, |ui| {
@@ -9229,126 +9370,71 @@ mod remote_gui {
                 let mut close_popup = false;
                 let mut popup_action: Option<(&str, usize)> = None;
 
-                // World List popup - separate OS window
-                if self.popup_state == PopupState::WorldList {
-                    let mut should_close = false;
-                    let mut selected = self.world_list_selected;
-                    // Clone world info for display
-                    let world_info: Vec<(String, bool, String, String)> = self.worlds.iter()
-                        .map(|w| (w.name.clone(), w.connected, w.settings.hostname.clone(), w.settings.port.clone()))
-                        .collect();
-
-                    ctx.show_viewport_immediate(
-                        egui::ViewportId::from_hash_of("world_list_window"),
-                        egui::ViewportBuilder::default()
-                            .with_title("World List")
-                            .with_inner_size([400.0, 280.0]),
-                        |ctx, _class| {
-                            if ctx.input(|i| i.key_pressed(egui::Key::Escape)) ||
-                               ctx.input(|i| i.viewport().close_requested()) {
-                                should_close = true;
-                            }
-
-                            // Bottom panel for buttons
-                            egui::TopBottomPanel::bottom("world_list_buttons")
-                                .exact_height(35.0)
-                                .show(ctx, |ui| {
-                                    ui.add_space(5.0);
-                                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                        if ui.button("Close").clicked() {
-                                            should_close = true;
-                                        }
-                                        if ui.button("Switch To").clicked() {
-                                            popup_action = Some(("switch", selected));
-                                            should_close = true;
-                                        }
-                                        if ui.button("Delete").clicked() && world_info.len() > 1 {
-                                            popup_action = Some(("delete", selected));
-                                        }
-                                        if ui.button("Edit").clicked() {
-                                            popup_action = Some(("edit", selected));
-                                        }
-                                        if ui.button("Connect").clicked() {
-                                            popup_action = Some(("connect", selected));
-                                            should_close = true;
-                                        }
-                                    });
-                                });
-
-                            egui::CentralPanel::default().show(ctx, |ui| {
-                                ui.spacing_mut().item_spacing = egui::vec2(10.0, 0.0);
-                                let scroll_width = ui.available_width();
-                                ScrollArea::vertical()
-                                    .auto_shrink([false; 2])
-                                    .min_scrolled_width(scroll_width)
-                                    .show(ui, |ui| {
-                                        ui.set_min_width(scroll_width - 16.0);
-                                        for (idx, (name, connected, hostname, port)) in world_info.iter().enumerate() {
-                                            let status = if *connected { "●" } else { "○" };
-                                            let label = format!("{} {} - {}:{}", status, name, hostname, port);
-                                            if ui.selectable_label(idx == selected, &label).clicked() {
-                                                selected = idx;
-                                            }
-                                        }
-                                    });
-                            });
-                        },
-                    );
-                    self.world_list_selected = selected;
-                    if should_close {
-                        close_popup = true;
-                    }
-                }
-
-                // Connected Worlds popup (/connections or /l) - separate OS window
+                // Worlds popup (combined world selector and connected worlds list) - separate OS window
                 if self.popup_state == PopupState::ConnectedWorlds {
-                    // Helper to format elapsed seconds
-                    fn format_elapsed_secs(secs: Option<u64>) -> String {
-                        match secs {
-                            None => "-".to_string(),
-                            Some(s) => {
-                                if s < 60 {
-                                    format!("{}s", s)
-                                } else if s < 3600 {
-                                    format!("{}m", s / 60)
-                                } else if s < 86400 {
-                                    format!("{}h", s / 3600)
-                                } else {
-                                    format!("{}d", s / 86400)
-                                }
-                            }
-                        }
-                    }
-
-                    // Helper to calculate time until next NOP (based on 5 min keepalive)
-                    fn format_next_nop(last_send: Option<u64>, last_recv: Option<u64>) -> String {
-                        const KEEPALIVE_SECS: u64 = 5 * 60;
-                        let elapsed = match (last_send, last_recv) {
-                            (Some(s), Some(r)) => s.min(r),  // Use more recent (smaller elapsed)
-                            (Some(s), None) => s,
-                            (None, Some(r)) => r,
-                            (None, None) => KEEPALIVE_SECS,
-                        };
-                        let remaining = KEEPALIVE_SECS.saturating_sub(elapsed);
-                        if remaining < 60 {
-                            format!("{}s", remaining)
-                        } else {
-                            format!("{}m", remaining / 60)
-                        }
-                    }
-
                     let mut should_close = false;
                     let mut selected = self.world_list_selected;
-                    let mut switch_to_world: Option<usize> = None;
+                    let mut connect_world: Option<usize> = None;
+                    let mut edit_world: Option<usize> = None;
+                    let mut add_world = false;
+                    let mut toggle_only_connected = false;
                     let worlds_clone = self.worlds.clone();
                     let current_world = self.current_world;
+
+                    let only_connected = self.only_connected_worlds;
+                    let window_title = if only_connected { "Worlds List" } else { "World Selector" };
 
                     ctx.show_viewport_immediate(
                         egui::ViewportId::from_hash_of("connected_worlds_window"),
                         egui::ViewportBuilder::default()
-                            .with_title("Connected Worlds - Clay MUD Client")
-                            .with_inner_size([620.0, 230.0]),
+                            .with_title(window_title)
+                            .with_inner_size([640.0, 352.0]),
                         |ctx, _class| {
+                            // Apply popup styling
+                            ctx.style_mut(|style| {
+                                style.visuals.window_fill = theme.bg_elevated();
+                                style.visuals.panel_fill = theme.bg_elevated();
+                                style.visuals.window_stroke = egui::Stroke::NONE;
+                                style.visuals.window_shadow = egui::epaint::Shadow::NONE;
+
+                                let widget_bg = theme.bg_deep();
+                                let widget_rounding = egui::Rounding::same(4.0);
+
+                                style.visuals.widgets.noninteractive.bg_fill = widget_bg;
+                                style.visuals.widgets.noninteractive.bg_stroke = egui::Stroke::NONE;
+                                style.visuals.widgets.noninteractive.fg_stroke = egui::Stroke::NONE;
+                                style.visuals.widgets.noninteractive.rounding = widget_rounding;
+                                style.visuals.widgets.noninteractive.weak_bg_fill = widget_bg;
+
+                                style.visuals.widgets.inactive.bg_fill = theme.bg_hover();
+                                style.visuals.widgets.inactive.bg_stroke = egui::Stroke::NONE;
+                                style.visuals.widgets.inactive.fg_stroke = egui::Stroke::NONE;
+                                style.visuals.widgets.inactive.rounding = widget_rounding;
+                                style.visuals.widgets.inactive.weak_bg_fill = theme.bg_hover();
+
+                                style.visuals.widgets.hovered.bg_fill = theme.bg_hover();
+                                style.visuals.widgets.hovered.bg_stroke = egui::Stroke::NONE;
+                                style.visuals.widgets.hovered.fg_stroke = egui::Stroke::NONE;
+                                style.visuals.widgets.hovered.rounding = widget_rounding;
+                                style.visuals.widgets.hovered.weak_bg_fill = theme.bg_hover();
+
+                                style.visuals.widgets.active.bg_fill = theme.accent_dim();
+                                style.visuals.widgets.active.bg_stroke = egui::Stroke::NONE;
+                                style.visuals.widgets.active.fg_stroke = egui::Stroke::NONE;
+                                style.visuals.widgets.active.rounding = widget_rounding;
+                                style.visuals.widgets.active.weak_bg_fill = theme.accent_dim();
+
+                                style.visuals.widgets.open.bg_fill = theme.bg_hover();
+                                style.visuals.widgets.open.bg_stroke = egui::Stroke::NONE;
+                                style.visuals.widgets.open.fg_stroke = egui::Stroke::NONE;
+                                style.visuals.widgets.open.rounding = widget_rounding;
+                                style.visuals.widgets.open.weak_bg_fill = theme.bg_hover();
+
+                                style.visuals.selection.bg_fill = Color32::from_rgba_unmultiplied(34, 211, 238, 38);
+                                style.visuals.selection.stroke = egui::Stroke::NONE;
+                                style.visuals.extreme_bg_color = widget_bg;
+                            });
+
                             if ctx.input(|i| i.key_pressed(egui::Key::Escape)) ||
                                ctx.input(|i| i.viewport().close_requested()) {
                                 should_close = true;
@@ -9356,117 +9442,265 @@ mod remote_gui {
 
                             // Bottom panel for buttons
                             egui::TopBottomPanel::bottom("connected_worlds_buttons")
-                                .exact_height(35.0)
+                                .exact_height(44.0)
+                                .frame(egui::Frame::none()
+                                    .fill(theme.bg_surface())
+                                    .stroke(egui::Stroke::NONE)
+                                    .inner_margin(egui::Margin { left: 16.0, right: 17.0, top: 8.0, bottom: 8.0 }))
                                 .show(ctx, |ui| {
-                                    ui.add_space(5.0);
-                                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                        if ui.button("Close").clicked() {
-                                            should_close = true;
+                                    ui.horizontal(|ui| {
+                                        ui.spacing_mut().item_spacing = egui::vec2(8.0, 0.0);
+
+                                        // Left side: Only Connected toggle
+                                        ui.label(egui::RichText::new("Only Connected")
+                                            .size(11.0)
+                                            .color(theme.fg_secondary())
+                                            .family(egui::FontFamily::Monospace));
+
+                                        // Toggle switch (like SSL toggle in world editor)
+                                        let toggle_width = 36.0;
+                                        let toggle_height = 18.0;
+                                        let toggle_rect = ui.allocate_space(egui::vec2(toggle_width, toggle_height)).1;
+                                        let toggle_response = ui.interact(toggle_rect, ui.id().with("only_connected_toggle"), egui::Sense::click());
+
+                                        // Draw toggle background
+                                        let toggle_bg = if only_connected { theme.accent_dim() } else { theme.bg_deep() };
+                                        ui.painter().rect_filled(toggle_rect, egui::Rounding::same(toggle_height / 2.0), toggle_bg);
+
+                                        // Draw toggle knob
+                                        let knob_radius = (toggle_height - 4.0) / 2.0;
+                                        let knob_x = if only_connected {
+                                            toggle_rect.right() - knob_radius - 2.0
+                                        } else {
+                                            toggle_rect.left() + knob_radius + 2.0
+                                        };
+                                        let knob_color = if only_connected { theme.bg_deep() } else { theme.fg_muted() };
+                                        ui.painter().circle_filled(egui::pos2(knob_x, toggle_rect.center().y), knob_radius, knob_color);
+
+                                        if toggle_response.clicked() {
+                                            toggle_only_connected = true;
                                         }
-                                        if ui.button("Switch To").clicked() {
-                                            switch_to_world = Some(selected);
-                                            should_close = true;
-                                        }
+
+                                        // Spacer to push buttons to right
+                                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                            ui.spacing_mut().item_spacing = egui::vec2(8.0, 0.0);
+
+                                            // Close button
+                                            if ui.add(egui::Button::new(
+                                                egui::RichText::new("CLOSE").size(11.0).color(theme.fg_secondary()).family(egui::FontFamily::Monospace))
+                                                .fill(theme.bg_hover())
+                                                .stroke(egui::Stroke::new(1.0, theme.border_medium()))
+                                                .rounding(egui::Rounding::same(4.0))
+                                                .min_size(egui::vec2(70.0, 28.0))
+                                            ).clicked() {
+                                                should_close = true;
+                                            }
+
+                                            // Connect button (primary)
+                                            if ui.add(egui::Button::new(
+                                                egui::RichText::new("CONNECT").size(11.0).color(theme.bg_deep()).strong().family(egui::FontFamily::Monospace))
+                                                .fill(theme.accent_dim())
+                                                .stroke(egui::Stroke::NONE)
+                                                .rounding(egui::Rounding::same(4.0))
+                                                .min_size(egui::vec2(80.0, 28.0))
+                                            ).clicked() {
+                                                connect_world = Some(selected);
+                                                should_close = true;
+                                            }
+
+                                            // Edit button
+                                            if ui.add(egui::Button::new(
+                                                egui::RichText::new("EDIT").size(11.0).color(theme.fg_secondary()).family(egui::FontFamily::Monospace))
+                                                .fill(theme.bg_hover())
+                                                .stroke(egui::Stroke::new(1.0, theme.border_medium()))
+                                                .rounding(egui::Rounding::same(4.0))
+                                                .min_size(egui::vec2(60.0, 28.0))
+                                            ).clicked() {
+                                                edit_world = Some(selected);
+                                            }
+
+                                            // Add button
+                                            if ui.add(egui::Button::new(
+                                                egui::RichText::new("ADD").size(11.0).color(theme.fg_secondary()).family(egui::FontFamily::Monospace))
+                                                .fill(theme.bg_hover())
+                                                .stroke(egui::Stroke::new(1.0, theme.border_medium()))
+                                                .rounding(egui::Rounding::same(4.0))
+                                                .min_size(egui::vec2(60.0, 28.0))
+                                            ).clicked() {
+                                                add_world = true;
+                                            }
+                                        });
                                     });
                                 });
 
-                            egui::CentralPanel::default().show(ctx, |ui| {
-                                // Table header - matches console columns exactly
-                                egui::Grid::new("worlds_header")
-                                    .num_columns(7)
-                                    .min_col_width(55.0)
-                                    .spacing([10.0, 4.0])
-                                    .show(ui, |ui| {
-                                        ui.label(egui::RichText::new("World").strong());
-                                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                            ui.label(egui::RichText::new("Unseen").strong());
-                                        });
-                                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                            ui.label(egui::RichText::new("LastSend").strong());
-                                        });
-                                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                            ui.label(egui::RichText::new("LastRecv").strong());
-                                        });
-                                        ui.label(egui::RichText::new("KeepAlive").strong());
-                                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                            ui.label(egui::RichText::new("LastKA").strong());
-                                        });
-                                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                            ui.label(egui::RichText::new("NextKA").strong());
-                                        });
-                                        ui.end_row();
-                                    });
-                                ui.separator();
+                            egui::CentralPanel::default()
+                                .frame(egui::Frame::none()
+                                    .fill(theme.bg_elevated())
+                                    .inner_margin(egui::Margin::same(16.0)))
+                                .show(ctx, |ui| {
+                                    // Filter input
+                                    let filter_rect = ui.allocate_space(egui::vec2(ui.available_width(), 28.0)).1;
+                                    ui.painter().rect_filled(filter_rect, egui::Rounding::same(4.0), theme.bg_deep());
+                                    let filter_inner = filter_rect.shrink2(egui::vec2(8.0, 4.0));
+                                    let mut filter_ui = ui.new_child(egui::UiBuilder::new()
+                                        .max_rect(filter_inner)
+                                        .layout(egui::Layout::left_to_right(egui::Align::Center)));
+                                    let filter_edit = TextEdit::singleline(&mut self.connected_worlds_filter)
+                                        .frame(false)
+                                        .hint_text(egui::RichText::new("Filter worlds...").color(theme.fg_dim()))
+                                        .desired_width(filter_inner.width())
+                                        .text_color(theme.fg())
+                                        .font(egui::FontId::monospace(12.0));
+                                    filter_ui.add(filter_edit);
+                                    ui.add_space(12.0);
 
-                                // Check if any worlds are connected
-                                let has_connected = worlds_clone.iter().any(|w| w.connected);
-                                if !has_connected {
-                                    ui.label("No worlds connected.");
-                                } else {
-                                    ScrollArea::vertical().auto_shrink([false; 2]).show(ui, |ui| {
-                                        egui::Grid::new("worlds_grid")
-                                            .num_columns(7)
-                                            .min_col_width(55.0)
-                                            .spacing([10.0, 4.0])
-                                            .show(ui, |ui| {
-                                                for (idx, world) in worlds_clone.iter().enumerate() {
-                                                    // Only show connected worlds
-                                                    if !world.connected {
-                                                        continue;
-                                                    }
-                                                    let is_current = idx == current_world;
-                                                    let name_text = if is_current {
-                                                        format!("* {}", world.name)
-                                                    } else {
-                                                        format!("  {}", world.name)
-                                                    };
-                                                    let name_label = if is_current {
-                                                        egui::RichText::new(&name_text).strong().color(egui::Color32::WHITE)
-                                                    } else {
-                                                        egui::RichText::new(&name_text)
-                                                    };
-                                                    if ui.selectable_label(idx == selected, name_label).clicked() {
-                                                        selected = idx;
-                                                    }
-                                                    // Unseen column (right-aligned)
-                                                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                                        if world.unseen_lines > 0 {
-                                                            ui.label(egui::RichText::new(format!("{}", world.unseen_lines))
-                                                                .color(egui::Color32::YELLOW));
-                                                        } else {
-                                                            ui.label("");
-                                                        }
-                                                    });
-                                                    // Send column (right-aligned)
-                                                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                                        ui.label(format_elapsed_secs(world.last_send_secs));
-                                                    });
-                                                    // Recv column (right-aligned)
-                                                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                                        ui.label(format_elapsed_secs(world.last_recv_secs));
-                                                    });
-                                                    // KeepAlive type
-                                                    ui.label(&world.settings.keep_alive_type);
-                                                    // Last column (right-aligned)
-                                                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                                        ui.label(format_elapsed_secs(world.last_nop_secs));
-                                                    });
-                                                    // Next column (right-aligned)
-                                                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                                        ui.label(format_next_nop(world.last_send_secs, world.last_recv_secs));
-                                                    });
-                                                    ui.end_row();
+                                    // Table header row
+                                    let row_height = 24.0;
+                                    let col_widths = [180.0, 180.0, 60.0, 80.0]; // World, Hostname, Port, User
+                                    let header_rect = ui.allocate_space(egui::vec2(ui.available_width(), row_height)).1;
+                                    let header_y = header_rect.center().y;
+                                    // World header aligned with text after status dot (4 + 14 = 18)
+                                    ui.painter().text(
+                                        egui::pos2(header_rect.left() + 18.0, header_y),
+                                        egui::Align2::LEFT_CENTER,
+                                        "World",
+                                        egui::FontId::monospace(11.0),
+                                        theme.fg_muted());
+                                    ui.painter().text(
+                                        egui::pos2(header_rect.left() + col_widths[0], header_y),
+                                        egui::Align2::LEFT_CENTER,
+                                        "Hostname",
+                                        egui::FontId::monospace(11.0),
+                                        theme.fg_muted());
+                                    ui.painter().text(
+                                        egui::pos2(header_rect.left() + col_widths[0] + col_widths[1], header_y),
+                                        egui::Align2::LEFT_CENTER,
+                                        "Port",
+                                        egui::FontId::monospace(11.0),
+                                        theme.fg_muted());
+                                    ui.painter().text(
+                                        egui::pos2(header_rect.left() + col_widths[0] + col_widths[1] + col_widths[2], header_y),
+                                        egui::Align2::LEFT_CENTER,
+                                        "User",
+                                        egui::FontId::monospace(11.0),
+                                        theme.fg_muted());
+
+                                    ui.add_space(4.0);
+                                    ui.add(egui::Separator::default().spacing(0.0));
+                                    ui.add_space(4.0);
+
+                                    // Build filtered list of worlds
+                                    let filter_lower = self.connected_worlds_filter.to_lowercase();
+                                    let filtered_worlds: Vec<(usize, &RemoteWorld)> = worlds_clone.iter()
+                                        .enumerate()
+                                        .filter(|(_, w)| !only_connected || w.connected)
+                                        .filter(|(_, w)| {
+                                            if filter_lower.is_empty() {
+                                                true
+                                            } else {
+                                                w.name.to_lowercase().contains(&filter_lower) ||
+                                                w.settings.hostname.to_lowercase().contains(&filter_lower) ||
+                                                w.settings.user.to_lowercase().contains(&filter_lower)
+                                            }
+                                        })
+                                        .collect();
+
+                                    let empty_message = if only_connected { "No worlds connected." } else { "No worlds found." };
+                                    if filtered_worlds.is_empty() {
+                                        ui.add_space(8.0);
+                                        ui.label(egui::RichText::new(empty_message)
+                                            .size(12.0)
+                                            .color(theme.fg_muted())
+                                            .family(egui::FontFamily::Monospace));
+                                    } else {
+                                        ScrollArea::vertical().auto_shrink([false; 2]).show(ui, |ui| {
+                                            for (idx, world) in filtered_worlds.iter() {
+                                                let is_current = *idx == current_world;
+                                                let is_selected = *idx == selected;
+
+                                                // Full row as a clickable area
+                                                let row_rect = ui.allocate_space(egui::vec2(ui.available_width(), row_height)).1;
+                                                let response = ui.interact(row_rect, ui.id().with(idx), egui::Sense::click());
+
+                                                // Draw selection/hover background for full row
+                                                if is_selected {
+                                                    ui.painter().rect_filled(row_rect, egui::Rounding::same(2.0),
+                                                        Color32::from_rgba_unmultiplied(34, 211, 238, 38));
+                                                } else if response.hovered() {
+                                                    ui.painter().rect_filled(row_rect, egui::Rounding::same(2.0), theme.bg_hover());
                                                 }
-                                            });
-                                    });
-                                }
-                            });
+
+                                                if response.clicked() {
+                                                    selected = *idx;
+                                                }
+
+                                                // Draw row content
+                                                let mut col_x = row_rect.left() + 4.0;
+                                                let text_y = row_rect.center().y;
+
+                                                // World column with status dot and current marker
+                                                let status_color = if world.connected { theme.success() } else { theme.fg_dim() };
+                                                let dot_rect = egui::Rect::from_center_size(
+                                                    egui::pos2(col_x + 4.0, text_y),
+                                                    egui::vec2(6.0, 6.0));
+                                                ui.painter().circle_filled(dot_rect.center(), 3.0, status_color);
+                                                col_x += 14.0;
+
+                                                let current_marker = if is_current { "* " } else { "" };
+                                                let name_color = if is_current { theme.accent() } else if is_selected { theme.fg() } else { theme.fg_secondary() };
+                                                ui.painter().text(
+                                                    egui::pos2(col_x, text_y),
+                                                    egui::Align2::LEFT_CENTER,
+                                                    format!("{}{}", current_marker, world.name),
+                                                    egui::FontId::monospace(12.0),
+                                                    name_color);
+                                                col_x = row_rect.left() + col_widths[0];
+
+                                                // Hostname column
+                                                ui.painter().text(
+                                                    egui::pos2(col_x, text_y),
+                                                    egui::Align2::LEFT_CENTER,
+                                                    &world.settings.hostname,
+                                                    egui::FontId::monospace(12.0),
+                                                    theme.fg_secondary());
+                                                col_x += col_widths[1];
+
+                                                // Port column
+                                                ui.painter().text(
+                                                    egui::pos2(col_x, text_y),
+                                                    egui::Align2::LEFT_CENTER,
+                                                    &world.settings.port,
+                                                    egui::FontId::monospace(12.0),
+                                                    theme.fg_secondary());
+                                                col_x += col_widths[2];
+
+                                                // User column
+                                                let user_text = if world.settings.user.is_empty() { "—" } else { &world.settings.user };
+                                                ui.painter().text(
+                                                    egui::pos2(col_x, text_y),
+                                                    egui::Align2::LEFT_CENTER,
+                                                    user_text,
+                                                    egui::FontId::monospace(12.0),
+                                                    theme.fg_secondary());
+                                            }
+                                        });
+                                    }
+                                });
                         },
                     );
 
                     self.world_list_selected = selected;
-                    if let Some(idx) = switch_to_world {
-                        popup_action = Some(("switch", idx));
+                    if toggle_only_connected {
+                        self.only_connected_worlds = !self.only_connected_worlds;
+                    }
+                    if let Some(idx) = connect_world {
+                        popup_action = Some(("connect", idx));
+                    }
+                    if let Some(idx) = edit_world {
+                        popup_action = Some(("edit", idx));
+                    }
+                    if add_world {
+                        popup_action = Some(("add", 0));
                     }
                     if should_close {
                         close_popup = true;
@@ -9494,107 +9728,444 @@ mod remote_gui {
                     let mut edit_keep_alive_cmd = self.edit_keep_alive_cmd.clone();
                     let can_delete = self.worlds.len() > 1;
 
+                    // Dynamic height based on whether keep-alive cmd is shown
+                    let popup_height = if edit_keep_alive_type == KeepAliveType::Custom { 480.0 } else { 440.0 };
+
                     ctx.show_viewport_immediate(
                         egui::ViewportId::from_hash_of("world_editor_window"),
                         egui::ViewportBuilder::default()
-                            .with_title("World Editor - Clay MUD Client")
-                            .with_inner_size([350.0, 340.0]),
+                            .with_title("World Editor")
+                            .with_inner_size([440.0, popup_height]),
                         |ctx, _class| {
+                            // Apply popup styling - remove ALL strokes everywhere
+                            ctx.style_mut(|style| {
+                                style.visuals.window_fill = theme.bg_elevated();
+                                style.visuals.panel_fill = theme.bg_elevated();
+                                style.visuals.window_stroke = egui::Stroke::NONE;
+                                style.visuals.window_shadow = egui::epaint::Shadow::NONE;
+
+                                let widget_bg = theme.bg_deep();
+                                let widget_rounding = egui::Rounding::same(4.0);
+
+                                // All widget states: NO stroke anywhere
+                                style.visuals.widgets.noninteractive.bg_fill = widget_bg;
+                                style.visuals.widgets.noninteractive.bg_stroke = egui::Stroke::NONE;
+                                style.visuals.widgets.noninteractive.fg_stroke = egui::Stroke::NONE;
+                                style.visuals.widgets.noninteractive.rounding = widget_rounding;
+                                style.visuals.widgets.noninteractive.weak_bg_fill = widget_bg;
+
+                                style.visuals.widgets.inactive.bg_fill = widget_bg;
+                                style.visuals.widgets.inactive.bg_stroke = egui::Stroke::NONE;
+                                style.visuals.widgets.inactive.fg_stroke = egui::Stroke::NONE;
+                                style.visuals.widgets.inactive.rounding = widget_rounding;
+                                style.visuals.widgets.inactive.expansion = 0.0;
+                                style.visuals.widgets.inactive.weak_bg_fill = widget_bg;
+
+                                style.visuals.widgets.hovered.bg_fill = widget_bg;
+                                style.visuals.widgets.hovered.bg_stroke = egui::Stroke::NONE;
+                                style.visuals.widgets.hovered.fg_stroke = egui::Stroke::NONE;
+                                style.visuals.widgets.hovered.rounding = widget_rounding;
+                                style.visuals.widgets.hovered.expansion = 0.0;
+                                style.visuals.widgets.hovered.weak_bg_fill = widget_bg;
+
+                                style.visuals.widgets.active.bg_fill = widget_bg;
+                                style.visuals.widgets.active.bg_stroke = egui::Stroke::NONE;
+                                style.visuals.widgets.active.fg_stroke = egui::Stroke::NONE;
+                                style.visuals.widgets.active.rounding = widget_rounding;
+                                style.visuals.widgets.active.expansion = 0.0;
+                                style.visuals.widgets.active.weak_bg_fill = widget_bg;
+
+                                style.visuals.widgets.open.bg_fill = widget_bg;
+                                style.visuals.widgets.open.bg_stroke = egui::Stroke::NONE;
+                                style.visuals.widgets.open.fg_stroke = egui::Stroke::NONE;
+                                style.visuals.widgets.open.rounding = widget_rounding;
+                                style.visuals.widgets.open.expansion = 0.0;
+                                style.visuals.widgets.open.weak_bg_fill = widget_bg;
+
+                                // Selection highlight - no stroke
+                                style.visuals.selection.bg_fill = Color32::from_rgba_unmultiplied(34, 211, 238, 38);
+                                style.visuals.selection.stroke = egui::Stroke::NONE;
+
+                                // Text edit - no cursor stroke
+                                style.visuals.extreme_bg_color = widget_bg;
+                                style.visuals.text_cursor.stroke = egui::Stroke::new(1.0, theme.fg());
+                            });
+
                             if ctx.input(|i| i.key_pressed(egui::Key::Escape)) ||
                                ctx.input(|i| i.viewport().close_requested()) {
                                 should_close = true;
                             }
 
-                            // Bottom panel for buttons
+                            // Bottom panel for buttons (right margin reduced to move buttons right)
                             egui::TopBottomPanel::bottom("world_editor_buttons")
-                                .exact_height(35.0)
+                                .exact_height(48.0)
+                                .frame(egui::Frame::none()
+                                    .fill(theme.bg_surface())
+                                    .stroke(egui::Stroke::new(1.0, theme.border_subtle()))
+                                    .inner_margin(egui::Margin { left: 16.0, right: 1.0, top: 10.0, bottom: 10.0 }))
                                 .show(ctx, |ui| {
-                                    ui.add_space(5.0);
-                                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                        if ui.button("Connect").clicked() {
+                                    ui.horizontal(|ui| {
+                                        ui.spacing_mut().item_spacing = egui::vec2(8.0, 0.0);
+
+                                        // Delete button (danger, left side)
+                                        if can_delete {
+                                            if ui.add(egui::Button::new(
+                                                egui::RichText::new("Delete").size(11.0).color(theme.error()))
+                                                .fill(Color32::TRANSPARENT)
+                                                .stroke(egui::Stroke::new(1.0, theme.error_dim()))
+                                                .rounding(egui::Rounding::same(4.0))
+                                                .min_size(egui::vec2(70.0, 28.0))
+                                            ).clicked() {
+                                                should_delete = true;
+                                            }
+                                        }
+
+                                        // Spacer to push remaining buttons to the right
+                                        let remaining = ui.available_width() - 240.0; // 3 buttons * 70 + spacing
+                                        if remaining > 0.0 {
+                                            ui.add_space(remaining);
+                                        }
+
+                                        // Cancel button
+                                        if ui.add(egui::Button::new(
+                                            egui::RichText::new("Cancel").size(11.0).color(theme.fg_secondary()))
+                                            .fill(theme.bg_hover())
+                                            .stroke(egui::Stroke::new(1.0, theme.border_medium()))
+                                            .rounding(egui::Rounding::same(4.0))
+                                            .min_size(egui::vec2(70.0, 28.0))
+                                        ).clicked() {
+                                            should_close = true;
+                                        }
+
+                                        // Connect button
+                                        if ui.add(egui::Button::new(
+                                            egui::RichText::new("Connect").size(11.0).color(theme.fg_secondary()))
+                                            .fill(theme.bg_hover())
+                                            .stroke(egui::Stroke::new(1.0, theme.border_medium()))
+                                            .rounding(egui::Rounding::same(4.0))
+                                            .min_size(egui::vec2(70.0, 28.0))
+                                        ).clicked() {
                                             should_save = true;
                                             should_connect = true;
                                         }
-                                        if ui.add_enabled(can_delete, egui::Button::new("Delete")).clicked() {
-                                            should_delete = true;
-                                        }
-                                        if ui.button("Cancel").clicked() {
-                                            should_close = true;
-                                        }
-                                        if ui.button("Save").clicked() {
+
+                                        // Save button (primary)
+                                        if ui.add(egui::Button::new(
+                                            egui::RichText::new("Save").size(11.0).color(theme.bg_deep()).strong())
+                                            .fill(theme.accent_dim())
+                                            .stroke(egui::Stroke::NONE)
+                                            .rounding(egui::Rounding::same(4.0))
+                                            .min_size(egui::vec2(70.0, 28.0))
+                                        ).clicked() {
                                             should_save = true;
                                         }
                                     });
                                 });
 
-                            egui::CentralPanel::default().show(ctx, |ui| {
-                                ui.spacing_mut().item_spacing = egui::vec2(10.0, 0.0);
+                            egui::CentralPanel::default()
+                                .frame(egui::Frame::none()
+                                    .fill(theme.bg_elevated())
+                                    .inner_margin(egui::Margin { left: 20.0, right: 16.0, top: 20.0, bottom: 20.0 }))
+                                .show(ctx, |ui| {
+                                    // Header
+                                    ui.label(egui::RichText::new("WORLD EDITOR")
+                                        .size(10.0)
+                                        .color(theme.fg_muted())
+                                        .strong());
+                                    ui.add_space(16.0);
 
-                                egui::Grid::new("world_editor_grid")
-                                    .num_columns(2)
-                                    .spacing([10.0, 8.0])
-                                    .show(ui, |ui| {
-                                        ui.label("Name:");
-                                        ui.add(TextEdit::singleline(&mut edit_name).desired_width(200.0));
-                                        ui.end_row();
+                                    // Layout dimensions
+                                    let label_width = 100.0;
+                                    let label_spacing = 12.0;
+                                    let row_height = 28.0;
+                                    // input_width will be calculated dynamically using available_width()
 
-                                        ui.label("Hostname:");
-                                        ui.add(TextEdit::singleline(&mut edit_hostname).desired_width(200.0));
-                                        ui.end_row();
+                                    // Helper to draw chevron (down arrow) like mockup SVG
+                                    let draw_chevron = |painter: &egui::Painter, center: egui::Pos2, color: Color32| {
+                                        // Chevron: two lines from top corners to bottom center
+                                        // Similar to SVG path "M6 9l6 6 6-6" scaled to fit
+                                        let half_width = 5.0;
+                                        let half_height = 3.0;
+                                        let stroke = egui::Stroke::new(1.5, color);
+                                        // Left line: top-left to bottom-center
+                                        painter.line_segment(
+                                            [egui::pos2(center.x - half_width, center.y - half_height),
+                                             egui::pos2(center.x, center.y + half_height)],
+                                            stroke
+                                        );
+                                        // Right line: top-right to bottom-center
+                                        painter.line_segment(
+                                            [egui::pos2(center.x + half_width, center.y - half_height),
+                                             egui::pos2(center.x, center.y + half_height)],
+                                            stroke
+                                        );
+                                    };
 
-                                        ui.label("Port:");
-                                        ui.add(TextEdit::singleline(&mut edit_port).desired_width(200.0));
-                                        ui.end_row();
+                                    // Helper macro-like closure for form rows
+                                    let form_row = |ui: &mut egui::Ui, label: &str, add_widget: &mut dyn FnMut(&mut egui::Ui)| {
+                                        ui.horizontal(|ui| {
+                                            ui.spacing_mut().item_spacing = egui::vec2(0.0, 0.0);
+                                            ui.set_height(row_height);
+                                            // Right-aligned label
+                                            ui.allocate_ui_with_layout(
+                                                egui::vec2(label_width, row_height),
+                                                egui::Layout::right_to_left(egui::Align::Center),
+                                                |ui| {
+                                                    ui.label(egui::RichText::new(label.to_uppercase())
+                                                        .size(10.0)
+                                                        .color(theme.fg_muted()));
+                                                }
+                                            );
+                                            ui.add_space(label_spacing);
+                                            add_widget(ui);
+                                        });
+                                        ui.add_space(6.0);
+                                    };
 
-                                        ui.label("User:");
-                                        ui.add(TextEdit::singleline(&mut edit_user).desired_width(200.0));
-                                        ui.end_row();
+                                    // Helper to create styled text input - uses available width or fixed
+                                    // NO BORDERS - just background fill
+                                    let styled_text_input = |ui: &mut egui::Ui, text: &mut String, fixed_width: Option<f32>, id_salt: &str| {
+                                        let width = fixed_width.unwrap_or_else(|| ui.available_width());
+                                        let field_id = ui.id().with(id_salt);
+                                        let field_rect = ui.allocate_space(egui::vec2(width, row_height)).1;
+                                        let _response = ui.interact(field_rect, field_id, egui::Sense::click());
 
-                                        ui.label("Password:");
-                                        ui.add(TextEdit::singleline(&mut edit_password)
-                                            .password(true)
-                                            .desired_width(200.0));
-                                        ui.end_row();
+                                        // Draw background only - NO border
+                                        ui.painter().rect_filled(field_rect, egui::Rounding::same(4.0), theme.bg_deep());
 
-                                        ui.label("Use SSL:");
-                                        ui.checkbox(&mut edit_ssl, "");
-                                        ui.end_row();
+                                        // Inner text edit area (no frame, no background)
+                                        let inner_rect = field_rect.shrink2(egui::vec2(8.0, 4.0));
+                                        let mut child_ui = ui.new_child(egui::UiBuilder::new()
+                                            .max_rect(inner_rect)
+                                            .layout(egui::Layout::left_to_right(egui::Align::Center)));
+                                        let text_edit = TextEdit::singleline(text)
+                                            .frame(false)
+                                            .desired_width(inner_rect.width())
+                                            .text_color(theme.fg())
+                                            .font(egui::FontId::monospace(11.0));
+                                        child_ui.add(text_edit);
+                                    };
 
-                                        ui.label("Log file:");
-                                        ui.add(TextEdit::singleline(&mut edit_log_file).desired_width(200.0));
-                                        ui.end_row();
-
-                                        ui.label("Encoding:");
-                                        if ui.button(edit_encoding.name()).clicked() {
-                                            edit_encoding = match edit_encoding {
-                                                Encoding::Utf8 => Encoding::Latin1,
-                                                Encoding::Latin1 => Encoding::Fansi,
-                                                Encoding::Fansi => Encoding::Utf8,
-                                            };
-                                        }
-                                        ui.end_row();
-
-                                        ui.label("Auto login:");
-                                        if ui.button(edit_auto_login.name()).clicked() {
-                                            edit_auto_login = edit_auto_login.next();
-                                        }
-                                        ui.end_row();
-
-                                        ui.label("Keep-Alive:");
-                                        if ui.button(edit_keep_alive_type.name()).clicked() {
-                                            edit_keep_alive_type = edit_keep_alive_type.next();
-                                        }
-                                        ui.end_row();
-
-                                        // Only show Keep-Alive CMD when Custom is selected
-                                        if edit_keep_alive_type == KeepAliveType::Custom {
-                                            ui.label("Keep-Alive CMD:");
-                                            ui.add(TextEdit::singleline(&mut edit_keep_alive_cmd)
-                                                .hint_text("use ##rand## for idler tag")
-                                                .desired_width(200.0));
-                                            ui.end_row();
-                                        }
+                                    // Name (full width)
+                                    form_row(ui, "Name", &mut |ui| {
+                                        styled_text_input(ui, &mut edit_name, None, "name_input");
                                     });
+
+                                    // Hostname (full width)
+                                    form_row(ui, "Hostname", &mut |ui| {
+                                        styled_text_input(ui, &mut edit_hostname, None, "hostname_input");
+                                    });
+
+                                    // Port (fixed width)
+                                    form_row(ui, "Port", &mut |ui| {
+                                        styled_text_input(ui, &mut edit_port, Some(80.0), "port_input");
+                                    });
+
+                                    // User (full width)
+                                    form_row(ui, "User", &mut |ui| {
+                                        styled_text_input(ui, &mut edit_user, None, "user_input");
+                                    });
+
+                                    // Password (full width, not masked)
+                                    form_row(ui, "Password", &mut |ui| {
+                                        styled_text_input(ui, &mut edit_password, None, "password_input");
+                                    });
+
+                                    // Use SSL (toggle)
+                                    form_row(ui, "Use SSL", &mut |ui| {
+                                        // Toggle switch style
+                                        let (toggle_bg, toggle_border, knob_pos) = if edit_ssl {
+                                            (theme.accent_dim(), theme.accent_dim(), 18.0)
+                                        } else {
+                                            (theme.bg_deep(), theme.border_medium(), 3.0)
+                                        };
+
+                                        let toggle_rect = ui.allocate_space(egui::vec2(36.0, 20.0));
+                                        let response = ui.interact(toggle_rect.1, ui.id().with("ssl_toggle"), egui::Sense::click());
+
+                                        if response.clicked() {
+                                            edit_ssl = !edit_ssl;
+                                        }
+
+                                        // Draw toggle background
+                                        ui.painter().rect_filled(
+                                            toggle_rect.1,
+                                            egui::Rounding::same(10.0),
+                                            toggle_bg
+                                        );
+                                        ui.painter().rect_stroke(
+                                            toggle_rect.1,
+                                            egui::Rounding::same(10.0),
+                                            egui::Stroke::new(1.0, toggle_border)
+                                        );
+
+                                        // Draw knob
+                                        let knob_color = if edit_ssl { theme.bg_deep() } else { theme.fg_muted() };
+                                        let knob_center = egui::pos2(
+                                            toggle_rect.1.min.x + knob_pos + 7.0,
+                                            toggle_rect.1.center().y
+                                        );
+                                        ui.painter().circle_filled(knob_center, 7.0, knob_color);
+                                    });
+
+                                    // Log File (full width)
+                                    form_row(ui, "Log File", &mut |ui| {
+                                        styled_text_input(ui, &mut edit_log_file, None, "log_file_input");
+                                    });
+
+                                    // Encoding (custom styled dropdown, full width, NO border)
+                                    form_row(ui, "Encoding", &mut |ui| {
+                                        let dropdown_id = ui.id().with("encoding_dropdown");
+                                        let _is_open = ui.memory(|mem| mem.is_popup_open(dropdown_id));
+                                        let dropdown_width = ui.available_width();
+
+                                        let button_rect = ui.allocate_space(egui::vec2(dropdown_width, row_height)).1;
+                                        let response = ui.interact(button_rect, dropdown_id.with("button"), egui::Sense::click());
+
+                                        // Background only - NO border
+                                        ui.painter().rect_filled(button_rect, egui::Rounding::same(4.0), theme.bg_deep());
+
+                                        ui.painter().text(
+                                            egui::pos2(button_rect.min.x + 12.0, button_rect.center().y),
+                                            egui::Align2::LEFT_CENTER,
+                                            edit_encoding.name(),
+                                            egui::FontId::monospace(11.0),
+                                            theme.fg()
+                                        );
+
+                                        draw_chevron(ui.painter(), egui::pos2(button_rect.max.x - 16.0, button_rect.center().y), theme.fg_muted());
+
+                                        if response.clicked() {
+                                            ui.memory_mut(|mem| mem.toggle_popup(dropdown_id));
+                                        }
+
+                                        egui::popup_below_widget(ui, dropdown_id, &response, egui::PopupCloseBehavior::CloseOnClickOutside, |ui| {
+                                            ui.set_min_width(dropdown_width);
+                                            ui.style_mut().visuals.widgets.inactive.fg_stroke = egui::Stroke::new(1.0, theme.fg());
+                                            ui.style_mut().visuals.widgets.hovered.fg_stroke = egui::Stroke::new(1.0, theme.fg());
+                                            ui.style_mut().visuals.widgets.active.fg_stroke = egui::Stroke::new(1.0, theme.fg());
+                                            if ui.selectable_label(edit_encoding == Encoding::Utf8,
+                                                egui::RichText::new("UTF-8").size(11.0).color(theme.fg()).family(egui::FontFamily::Monospace)).clicked() {
+                                                edit_encoding = Encoding::Utf8;
+                                                ui.memory_mut(|mem| mem.close_popup());
+                                            }
+                                            if ui.selectable_label(edit_encoding == Encoding::Latin1,
+                                                egui::RichText::new("Latin-1").size(11.0).color(theme.fg()).family(egui::FontFamily::Monospace)).clicked() {
+                                                edit_encoding = Encoding::Latin1;
+                                                ui.memory_mut(|mem| mem.close_popup());
+                                            }
+                                            if ui.selectable_label(edit_encoding == Encoding::Fansi,
+                                                egui::RichText::new("FANSI").size(11.0).color(theme.fg()).family(egui::FontFamily::Monospace)).clicked() {
+                                                edit_encoding = Encoding::Fansi;
+                                                ui.memory_mut(|mem| mem.close_popup());
+                                            }
+                                        });
+                                    });
+
+                                    // Auto Login (custom styled dropdown, full width, NO border)
+                                    form_row(ui, "Auto Login", &mut |ui| {
+                                        let dropdown_id = ui.id().with("auto_login_dropdown");
+                                        let _is_open = ui.memory(|mem| mem.is_popup_open(dropdown_id));
+                                        let dropdown_width = ui.available_width();
+
+                                        let button_rect = ui.allocate_space(egui::vec2(dropdown_width, row_height)).1;
+                                        let response = ui.interact(button_rect, dropdown_id.with("button"), egui::Sense::click());
+
+                                        // Background only - NO border
+                                        ui.painter().rect_filled(button_rect, egui::Rounding::same(4.0), theme.bg_deep());
+
+                                        ui.painter().text(
+                                            egui::pos2(button_rect.min.x + 12.0, button_rect.center().y),
+                                            egui::Align2::LEFT_CENTER,
+                                            edit_auto_login.name(),
+                                            egui::FontId::monospace(11.0),
+                                            theme.fg()
+                                        );
+
+                                        draw_chevron(ui.painter(), egui::pos2(button_rect.max.x - 16.0, button_rect.center().y), theme.fg_muted());
+
+                                        if response.clicked() {
+                                            ui.memory_mut(|mem| mem.toggle_popup(dropdown_id));
+                                        }
+
+                                        egui::popup_below_widget(ui, dropdown_id, &response, egui::PopupCloseBehavior::CloseOnClickOutside, |ui| {
+                                            ui.set_min_width(dropdown_width);
+                                            ui.style_mut().visuals.widgets.inactive.fg_stroke = egui::Stroke::new(1.0, theme.fg());
+                                            ui.style_mut().visuals.widgets.hovered.fg_stroke = egui::Stroke::new(1.0, theme.fg());
+                                            ui.style_mut().visuals.widgets.active.fg_stroke = egui::Stroke::new(1.0, theme.fg());
+                                            if ui.selectable_label(edit_auto_login == AutoConnectType::Connect,
+                                                egui::RichText::new("Connect").size(11.0).color(theme.fg()).family(egui::FontFamily::Monospace)).clicked() {
+                                                edit_auto_login = AutoConnectType::Connect;
+                                                ui.memory_mut(|mem| mem.close_popup());
+                                            }
+                                            if ui.selectable_label(edit_auto_login == AutoConnectType::Prompt,
+                                                egui::RichText::new("Prompt").size(11.0).color(theme.fg()).family(egui::FontFamily::Monospace)).clicked() {
+                                                edit_auto_login = AutoConnectType::Prompt;
+                                                ui.memory_mut(|mem| mem.close_popup());
+                                            }
+                                            if ui.selectable_label(edit_auto_login == AutoConnectType::MooPrompt,
+                                                egui::RichText::new("MOO Prompt").size(11.0).color(theme.fg()).family(egui::FontFamily::Monospace)).clicked() {
+                                                edit_auto_login = AutoConnectType::MooPrompt;
+                                                ui.memory_mut(|mem| mem.close_popup());
+                                            }
+                                        });
+                                    });
+
+                                    // Keep Alive (custom styled dropdown, full width, NO border)
+                                    form_row(ui, "Keep Alive", &mut |ui| {
+                                        let dropdown_id = ui.id().with("keep_alive_dropdown");
+                                        let _is_open = ui.memory(|mem| mem.is_popup_open(dropdown_id));
+                                        let dropdown_width = ui.available_width();
+
+                                        let button_rect = ui.allocate_space(egui::vec2(dropdown_width, row_height)).1;
+                                        let response = ui.interact(button_rect, dropdown_id.with("button"), egui::Sense::click());
+
+                                        // Background only - NO border
+                                        ui.painter().rect_filled(button_rect, egui::Rounding::same(4.0), theme.bg_deep());
+
+                                        ui.painter().text(
+                                            egui::pos2(button_rect.min.x + 12.0, button_rect.center().y),
+                                            egui::Align2::LEFT_CENTER,
+                                            edit_keep_alive_type.name(),
+                                            egui::FontId::monospace(11.0),
+                                            theme.fg()
+                                        );
+
+                                        draw_chevron(ui.painter(), egui::pos2(button_rect.max.x - 16.0, button_rect.center().y), theme.fg_muted());
+
+                                        if response.clicked() {
+                                            ui.memory_mut(|mem| mem.toggle_popup(dropdown_id));
+                                        }
+
+                                        egui::popup_below_widget(ui, dropdown_id, &response, egui::PopupCloseBehavior::CloseOnClickOutside, |ui| {
+                                            ui.set_min_width(dropdown_width);
+                                            ui.style_mut().visuals.widgets.inactive.fg_stroke = egui::Stroke::new(1.0, theme.fg());
+                                            ui.style_mut().visuals.widgets.hovered.fg_stroke = egui::Stroke::new(1.0, theme.fg());
+                                            ui.style_mut().visuals.widgets.active.fg_stroke = egui::Stroke::new(1.0, theme.fg());
+                                            if ui.selectable_label(edit_keep_alive_type == KeepAliveType::Nop,
+                                                egui::RichText::new("NOP").size(11.0).color(theme.fg()).family(egui::FontFamily::Monospace)).clicked() {
+                                                edit_keep_alive_type = KeepAliveType::Nop;
+                                                ui.memory_mut(|mem| mem.close_popup());
+                                            }
+                                            if ui.selectable_label(edit_keep_alive_type == KeepAliveType::Custom,
+                                                egui::RichText::new("Custom").size(11.0).color(theme.fg()).family(egui::FontFamily::Monospace)).clicked() {
+                                                edit_keep_alive_type = KeepAliveType::Custom;
+                                                ui.memory_mut(|mem| mem.close_popup());
+                                            }
+                                            if ui.selectable_label(edit_keep_alive_type == KeepAliveType::Generic,
+                                                egui::RichText::new("Generic").size(11.0).color(theme.fg()).family(egui::FontFamily::Monospace)).clicked() {
+                                                edit_keep_alive_type = KeepAliveType::Generic;
+                                                ui.memory_mut(|mem| mem.close_popup());
+                                            }
+                                        });
+                                    });
+
+                                    // Only show Keep-Alive CMD when Custom is selected (full width)
+                                    if edit_keep_alive_type == KeepAliveType::Custom {
+                                        form_row(ui, "Keep Alive CMD", &mut |ui| {
+                                            styled_text_input(ui, &mut edit_keep_alive_cmd, None, "keep_alive_cmd_input");
+                                        });
+                                    }
                             });
                         },
                     );
@@ -9651,10 +10222,59 @@ mod remote_gui {
                     ctx.show_viewport_immediate(
                         egui::ViewportId::from_hash_of("world_confirm_delete_window"),
                         egui::ViewportBuilder::default()
-                            .with_title("Confirm Delete - Clay MUD Client")
-                            .with_inner_size([300.0, 100.0]),
+                            .with_title("Confirm Delete")
+                            .with_inner_size([320.0, 140.0]),
                         |ctx, _class| {
-                            egui::CentralPanel::default().show(ctx, |ui| {
+                            // Apply popup styling
+                            ctx.style_mut(|style| {
+                                style.visuals.window_fill = theme.bg_elevated();
+                                style.visuals.panel_fill = theme.bg_elevated();
+                                style.visuals.window_stroke = egui::Stroke::NONE;
+                                style.visuals.window_shadow = egui::epaint::Shadow::NONE;
+
+                                let widget_bg = theme.bg_deep();
+                                let widget_rounding = egui::Rounding::same(4.0);
+
+                                style.visuals.widgets.noninteractive.bg_fill = widget_bg;
+                                style.visuals.widgets.noninteractive.bg_stroke = egui::Stroke::NONE;
+                                style.visuals.widgets.noninteractive.fg_stroke = egui::Stroke::NONE;
+                                style.visuals.widgets.noninteractive.rounding = widget_rounding;
+                                style.visuals.widgets.noninteractive.weak_bg_fill = widget_bg;
+
+                                style.visuals.widgets.inactive.bg_fill = theme.bg_hover();
+                                style.visuals.widgets.inactive.bg_stroke = egui::Stroke::NONE;
+                                style.visuals.widgets.inactive.fg_stroke = egui::Stroke::NONE;
+                                style.visuals.widgets.inactive.rounding = widget_rounding;
+                                style.visuals.widgets.inactive.weak_bg_fill = theme.bg_hover();
+
+                                style.visuals.widgets.hovered.bg_fill = theme.bg_hover();
+                                style.visuals.widgets.hovered.bg_stroke = egui::Stroke::NONE;
+                                style.visuals.widgets.hovered.fg_stroke = egui::Stroke::NONE;
+                                style.visuals.widgets.hovered.rounding = widget_rounding;
+                                style.visuals.widgets.hovered.weak_bg_fill = theme.bg_hover();
+
+                                style.visuals.widgets.active.bg_fill = theme.accent_dim();
+                                style.visuals.widgets.active.bg_stroke = egui::Stroke::NONE;
+                                style.visuals.widgets.active.fg_stroke = egui::Stroke::NONE;
+                                style.visuals.widgets.active.rounding = widget_rounding;
+                                style.visuals.widgets.active.weak_bg_fill = theme.accent_dim();
+
+                                style.visuals.widgets.open.bg_fill = theme.bg_hover();
+                                style.visuals.widgets.open.bg_stroke = egui::Stroke::NONE;
+                                style.visuals.widgets.open.fg_stroke = egui::Stroke::NONE;
+                                style.visuals.widgets.open.rounding = widget_rounding;
+                                style.visuals.widgets.open.weak_bg_fill = theme.bg_hover();
+
+                                style.visuals.selection.bg_fill = Color32::from_rgba_unmultiplied(34, 211, 238, 38);
+                                style.visuals.selection.stroke = egui::Stroke::NONE;
+                                style.visuals.extreme_bg_color = widget_bg;
+                            });
+
+                            egui::CentralPanel::default()
+                                .frame(egui::Frame::none()
+                                    .fill(theme.bg_elevated())
+                                    .inner_margin(egui::Margin::same(20.0)))
+                                .show(ctx, |ui| {
                                 if ui.input(|i| i.key_pressed(egui::Key::Escape)) ||
                                    ui.input(|i| i.key_pressed(egui::Key::N)) ||
                                    ui.input(|i| i.viewport().close_requested()) {
@@ -9664,15 +10284,43 @@ mod remote_gui {
                                     should_delete = true;
                                 }
 
-                                ui.label(format!("Delete world '{}'?", world_name));
-                                ui.separator();
-                                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                    if ui.button("No").clicked() {
-                                        should_cancel = true;
-                                    }
-                                    if ui.button("Yes").clicked() {
-                                        should_delete = true;
-                                    }
+                                // Header
+                                ui.label(egui::RichText::new("CONFIRM DELETE")
+                                    .size(11.0)
+                                    .color(theme.fg_muted())
+                                    .strong());
+                                ui.add_space(16.0);
+
+                                ui.label(egui::RichText::new(format!("Delete world '{}'?", world_name))
+                                    .color(theme.fg_secondary()));
+                                ui.add_space(20.0);
+
+                                ui.horizontal(|ui| {
+                                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                        ui.spacing_mut().item_spacing = egui::vec2(8.0, 0.0);
+
+                                        // No button
+                                        if ui.add(egui::Button::new(
+                                            egui::RichText::new("No").size(11.0).color(theme.fg_secondary()))
+                                            .fill(theme.bg_hover())
+                                            .stroke(egui::Stroke::new(1.0, theme.border_medium()))
+                                            .rounding(egui::Rounding::same(4.0))
+                                            .min_size(egui::vec2(70.0, 28.0))
+                                        ).clicked() {
+                                            should_cancel = true;
+                                        }
+
+                                        // Yes button (danger)
+                                        if ui.add(egui::Button::new(
+                                            egui::RichText::new("Yes").size(11.0).color(theme.error()))
+                                            .fill(Color32::TRANSPARENT)
+                                            .stroke(egui::Stroke::new(1.0, theme.error_dim()))
+                                            .rounding(egui::Rounding::same(4.0))
+                                            .min_size(egui::vec2(70.0, 28.0))
+                                        ).clicked() {
+                                            should_delete = true;
+                                        }
+                                    });
                                 });
                             });
                         },
@@ -9687,121 +10335,388 @@ mod remote_gui {
                             }
                             // Local removal will happen when server sends WorldRemoved
                         }
-                        // Return to World List popup
-                        self.popup_state = PopupState::WorldList;
+                        // Return to Worlds popup
+                        self.popup_state = PopupState::ConnectedWorlds;
                     } else if should_cancel {
-                        // Return to World List popup
-                        self.popup_state = PopupState::WorldList;
+                        // Return to Worlds popup
+                        self.popup_state = PopupState::ConnectedWorlds;
                     }
                 }
 
                 // Setup popup - separate OS window
                 if self.popup_state == PopupState::Setup {
+                    // Save original transparency when popup first opens
+                    if self.original_transparency.is_none() {
+                        self.original_transparency = Some(self.transparency);
+                    }
+
                     // Copy state for editing in viewport
                     let mut more_mode = self.more_mode;
                     let mut spell_check = self.spell_check_enabled;
                     let mut world_switch = self.world_switch_mode;
-                    let mut debug_enabled = self.debug_enabled;
+                    let debug_enabled = self.debug_enabled;
                     let mut show_tags = self.show_tags;
                     let mut input_height = self.input_height;
                     let mut gui_theme = self.theme;
                     let mut transparency = self.transparency;
                     let mut should_close = false;
                     let mut should_save = false;
+                    let mut should_cancel = false;
 
                     ctx.show_viewport_immediate(
                         egui::ViewportId::from_hash_of("setup_window"),
                         egui::ViewportBuilder::default()
-                            .with_title("Setup")
-                            .with_inner_size([300.0, 290.0]),
+                            .with_title("Settings")
+                            .with_inner_size([420.0, 340.0]),
                         |ctx, _class| {
+                            // Apply popup styling - remove all default strokes
+                            ctx.style_mut(|style| {
+                                style.visuals.window_fill = theme.bg_elevated();
+                                style.visuals.panel_fill = theme.bg_elevated();
+                                style.visuals.window_stroke = egui::Stroke::NONE;
+                                style.visuals.window_shadow = egui::epaint::Shadow::NONE;
+
+                                let widget_bg = theme.bg_deep();
+                                let widget_rounding = egui::Rounding::same(4.0);
+
+                                style.visuals.widgets.noninteractive.bg_fill = widget_bg;
+                                style.visuals.widgets.noninteractive.bg_stroke = egui::Stroke::NONE;
+                                style.visuals.widgets.noninteractive.fg_stroke = egui::Stroke::NONE;
+                                style.visuals.widgets.noninteractive.rounding = widget_rounding;
+                                style.visuals.widgets.noninteractive.weak_bg_fill = widget_bg;
+
+                                style.visuals.widgets.inactive.bg_fill = theme.bg_hover();
+                                style.visuals.widgets.inactive.bg_stroke = egui::Stroke::NONE;
+                                style.visuals.widgets.inactive.fg_stroke = egui::Stroke::NONE;
+                                style.visuals.widgets.inactive.rounding = widget_rounding;
+                                style.visuals.widgets.inactive.weak_bg_fill = widget_bg;
+
+                                style.visuals.widgets.hovered.bg_fill = theme.bg_hover();
+                                style.visuals.widgets.hovered.bg_stroke = egui::Stroke::NONE;
+                                style.visuals.widgets.hovered.fg_stroke = egui::Stroke::NONE;
+                                style.visuals.widgets.hovered.rounding = widget_rounding;
+                                style.visuals.widgets.hovered.weak_bg_fill = widget_bg;
+
+                                style.visuals.widgets.active.bg_fill = theme.accent_dim();
+                                style.visuals.widgets.active.bg_stroke = egui::Stroke::NONE;
+                                style.visuals.widgets.active.fg_stroke = egui::Stroke::NONE;
+                                style.visuals.widgets.active.rounding = widget_rounding;
+                                style.visuals.widgets.active.weak_bg_fill = widget_bg;
+
+                                style.visuals.widgets.open.bg_fill = widget_bg;
+                                style.visuals.widgets.open.bg_stroke = egui::Stroke::NONE;
+                                style.visuals.widgets.open.fg_stroke = egui::Stroke::NONE;
+                                style.visuals.widgets.open.rounding = widget_rounding;
+                                style.visuals.widgets.open.weak_bg_fill = widget_bg;
+
+                                style.visuals.selection.bg_fill = Color32::from_rgba_unmultiplied(34, 211, 238, 38);
+                                style.visuals.selection.stroke = egui::Stroke::NONE;
+                                style.visuals.extreme_bg_color = widget_bg;
+                            });
+
                             if ctx.input(|i| i.key_pressed(egui::Key::Escape)) ||
                                ctx.input(|i| i.viewport().close_requested()) {
+                                should_cancel = true;
                                 should_close = true;
                             }
 
                             // Bottom panel for buttons
                             egui::TopBottomPanel::bottom("setup_buttons")
-                                .exact_height(35.0)
+                                .exact_height(44.0)
+                                .frame(egui::Frame::none()
+                                    .fill(theme.bg_surface())
+                                    .stroke(egui::Stroke::NONE)
+                                    .inner_margin(egui::Margin { left: 16.0, right: 17.0, top: 8.0, bottom: 8.0 }))
                                 .show(ctx, |ui| {
-                                    ui.add_space(5.0);
                                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                        if ui.button("Cancel").clicked() {
+                                        ui.spacing_mut().item_spacing = egui::vec2(8.0, 0.0);
+
+                                        // Cancel button
+                                        if ui.add(egui::Button::new(
+                                            egui::RichText::new("CANCEL").size(11.0).color(theme.fg_secondary()).family(egui::FontFamily::Monospace))
+                                            .fill(theme.bg_hover())
+                                            .stroke(egui::Stroke::new(1.0, theme.border_medium()))
+                                            .rounding(egui::Rounding::same(4.0))
+                                            .min_size(egui::vec2(70.0, 28.0))
+                                        ).clicked() {
+                                            should_cancel = true;
                                             should_close = true;
                                         }
-                                        if ui.button("Save").clicked() {
+
+                                        // Save button (primary)
+                                        if ui.add(egui::Button::new(
+                                            egui::RichText::new("SAVE").size(11.0).color(theme.bg_deep()).strong().family(egui::FontFamily::Monospace))
+                                            .fill(theme.accent_dim())
+                                            .stroke(egui::Stroke::NONE)
+                                            .rounding(egui::Rounding::same(4.0))
+                                            .min_size(egui::vec2(70.0, 28.0))
+                                        ).clicked() {
                                             should_save = true;
                                             should_close = true;
                                         }
                                     });
                                 });
 
-                            egui::CentralPanel::default().show(ctx, |ui| {
-                                ui.label("Global settings");
-                                ui.separator();
-                                egui::Grid::new("setup_grid")
-                                    .num_columns(2)
-                                    .spacing([10.0, 8.0])
-                                    .show(ui, |ui| {
-                                        ui.label("More mode:");
-                                        if ui.button(if more_mode { "on" } else { "off" }).clicked() {
-                                            more_mode = !more_mode;
-                                        }
-                                        ui.end_row();
+                            egui::CentralPanel::default()
+                                .frame(egui::Frame::none()
+                                    .fill(theme.bg_elevated())
+                                    .inner_margin(egui::Margin { left: 20.0, right: 16.0, top: 20.0, bottom: 16.0 }))
+                                .show(ctx, |ui| {
+                                    // Layout dimensions (matching World Editor)
+                                    let label_width = 110.0;
+                                    let label_spacing = 12.0;
+                                    let row_height = 28.0;
 
-                                        ui.label("Spell check:");
-                                        if ui.button(if spell_check { "on" } else { "off" }).clicked() {
-                                            spell_check = !spell_check;
-                                        }
-                                        ui.end_row();
+                                    // Helper to draw chevron
+                                    let draw_chevron = |painter: &egui::Painter, center: egui::Pos2, color: Color32| {
+                                        let half_width = 5.0;
+                                        let half_height = 3.0;
+                                        let stroke = egui::Stroke::new(1.5, color);
+                                        painter.line_segment(
+                                            [egui::pos2(center.x - half_width, center.y - half_height),
+                                             egui::pos2(center.x, center.y + half_height)],
+                                            stroke
+                                        );
+                                        painter.line_segment(
+                                            [egui::pos2(center.x + half_width, center.y - half_height),
+                                             egui::pos2(center.x, center.y + half_height)],
+                                            stroke
+                                        );
+                                    };
 
-                                        ui.label("World Switching:");
-                                        if ui.button(world_switch.name()).clicked() {
-                                            world_switch = world_switch.next();
-                                        }
-                                        ui.end_row();
-
-                                        ui.label("Debug:");
-                                        if ui.button(if debug_enabled { "on" } else { "off" }).clicked() {
-                                            debug_enabled = !debug_enabled;
-                                        }
-                                        ui.end_row();
-
-                                        ui.label("Show tags:");
-                                        if ui.button(if show_tags { "on" } else { "off" }).clicked() {
-                                            show_tags = !show_tags;
-                                        }
-                                        ui.end_row();
-
-                                        ui.label("Input height:");
+                                    // Helper for form rows
+                                    let form_row = |ui: &mut egui::Ui, label: &str, add_widget: &mut dyn FnMut(&mut egui::Ui)| {
                                         ui.horizontal(|ui| {
-                                            if ui.button("-").clicked() && input_height > 1 {
-                                                input_height -= 1;
+                                            ui.spacing_mut().item_spacing = egui::vec2(0.0, 0.0);
+                                            ui.set_height(row_height);
+                                            ui.allocate_ui_with_layout(
+                                                egui::vec2(label_width, row_height),
+                                                egui::Layout::right_to_left(egui::Align::Center),
+                                                |ui| {
+                                                    ui.label(egui::RichText::new(label.to_uppercase())
+                                                        .size(10.0)
+                                                        .color(theme.fg_muted()));
+                                                }
+                                            );
+                                            ui.add_space(label_spacing);
+                                            add_widget(ui);
+                                        });
+                                        ui.add_space(6.0);
+                                    };
+
+                                    // World Switching (dropdown)
+                                    form_row(ui, "World Switching", &mut |ui| {
+                                        let dropdown_id = ui.id().with("world_switch_dropdown");
+                                        let _is_open = ui.memory(|mem| mem.is_popup_open(dropdown_id));
+                                        let dropdown_width = ui.available_width();
+
+                                        let button_rect = ui.allocate_space(egui::vec2(dropdown_width, row_height)).1;
+                                        let response = ui.interact(button_rect, dropdown_id.with("button"), egui::Sense::click());
+
+                                        ui.painter().rect_filled(button_rect, egui::Rounding::same(4.0), theme.bg_deep());
+
+                                        ui.painter().text(
+                                            egui::pos2(button_rect.min.x + 12.0, button_rect.center().y),
+                                            egui::Align2::LEFT_CENTER,
+                                            world_switch.name(),
+                                            egui::FontId::monospace(11.0),
+                                            theme.fg()
+                                        );
+
+                                        draw_chevron(ui.painter(), egui::pos2(button_rect.max.x - 16.0, button_rect.center().y), theme.fg_muted());
+
+                                        if response.clicked() {
+                                            ui.memory_mut(|mem| mem.toggle_popup(dropdown_id));
+                                        }
+
+                                        egui::popup_below_widget(ui, dropdown_id, &response, egui::PopupCloseBehavior::CloseOnClickOutside, |ui| {
+                                            ui.set_min_width(dropdown_width);
+                                            ui.style_mut().visuals.widgets.inactive.fg_stroke = egui::Stroke::new(1.0, theme.fg());
+                                            ui.style_mut().visuals.widgets.hovered.fg_stroke = egui::Stroke::new(1.0, theme.fg());
+                                            ui.style_mut().visuals.widgets.active.fg_stroke = egui::Stroke::new(1.0, theme.fg());
+                                            if ui.selectable_label(world_switch == WorldSwitchMode::UnseenFirst,
+                                                egui::RichText::new("Unseen First").size(11.0).color(theme.fg()).family(egui::FontFamily::Monospace)).clicked() {
+                                                world_switch = WorldSwitchMode::UnseenFirst;
+                                                ui.memory_mut(|mem| mem.close_popup());
                                             }
-                                            ui.label(format!("{}", input_height));
-                                            if ui.button("+").clicked() && input_height < 15 {
-                                                input_height += 1;
+                                            if ui.selectable_label(world_switch == WorldSwitchMode::Alphabetical,
+                                                egui::RichText::new("Alphabetical").size(11.0).color(theme.fg()).family(egui::FontFamily::Monospace)).clicked() {
+                                                world_switch = WorldSwitchMode::Alphabetical;
+                                                ui.memory_mut(|mem| mem.close_popup());
                                             }
                                         });
-                                        ui.end_row();
+                                    });
 
-                                        ui.label("GUI Theme:");
-                                        if ui.button(gui_theme.name()).clicked() {
-                                            gui_theme = gui_theme.next();
+                                    // Theme (dropdown)
+                                    form_row(ui, "Theme", &mut |ui| {
+                                        let dropdown_id = ui.id().with("theme_dropdown");
+                                        let _is_open = ui.memory(|mem| mem.is_popup_open(dropdown_id));
+                                        let dropdown_width = ui.available_width();
+
+                                        let button_rect = ui.allocate_space(egui::vec2(dropdown_width, row_height)).1;
+                                        let response = ui.interact(button_rect, dropdown_id.with("button"), egui::Sense::click());
+
+                                        ui.painter().rect_filled(button_rect, egui::Rounding::same(4.0), theme.bg_deep());
+
+                                        let theme_name = match gui_theme {
+                                            GuiTheme::Dark => "Dark",
+                                            GuiTheme::Light => "Light",
+                                        };
+                                        ui.painter().text(
+                                            egui::pos2(button_rect.min.x + 12.0, button_rect.center().y),
+                                            egui::Align2::LEFT_CENTER,
+                                            theme_name,
+                                            egui::FontId::monospace(11.0),
+                                            theme.fg()
+                                        );
+
+                                        draw_chevron(ui.painter(), egui::pos2(button_rect.max.x - 16.0, button_rect.center().y), theme.fg_muted());
+
+                                        if response.clicked() {
+                                            ui.memory_mut(|mem| mem.toggle_popup(dropdown_id));
                                         }
-                                        ui.end_row();
 
-                                        ui.label("Transparency:");
-                                        ui.add(egui::Slider::new(&mut transparency, 0.3..=1.0)
-                                            .show_value(false)
-                                            .clamping(egui::SliderClamping::Always));
-                                        ui.end_row();
+                                        egui::popup_below_widget(ui, dropdown_id, &response, egui::PopupCloseBehavior::CloseOnClickOutside, |ui| {
+                                            ui.set_min_width(dropdown_width);
+                                            ui.style_mut().visuals.widgets.inactive.fg_stroke = egui::Stroke::new(1.0, theme.fg());
+                                            ui.style_mut().visuals.widgets.hovered.fg_stroke = egui::Stroke::new(1.0, theme.fg());
+                                            ui.style_mut().visuals.widgets.active.fg_stroke = egui::Stroke::new(1.0, theme.fg());
+                                            if ui.selectable_label(gui_theme == GuiTheme::Dark,
+                                                egui::RichText::new("Dark").size(11.0).color(theme.fg()).family(egui::FontFamily::Monospace)).clicked() {
+                                                gui_theme = GuiTheme::Dark;
+                                                ui.memory_mut(|mem| mem.close_popup());
+                                            }
+                                            if ui.selectable_label(gui_theme == GuiTheme::Light,
+                                                egui::RichText::new("Light").size(11.0).color(theme.fg()).family(egui::FontFamily::Monospace)).clicked() {
+                                                gui_theme = GuiTheme::Light;
+                                                ui.memory_mut(|mem| mem.close_popup());
+                                            }
+                                        });
+                                    });
+
+                                    ui.add_space(8.0);
+
+                                    // Input Height
+                                    form_row(ui, "Input Height", &mut |ui| {
+                                        ui.spacing_mut().item_spacing = egui::vec2(4.0, 0.0);
+                                        if ui.add(egui::Button::new(
+                                            egui::RichText::new("-").size(11.0).color(theme.fg_secondary()).family(egui::FontFamily::Monospace))
+                                            .fill(theme.bg_deep())
+                                            .stroke(egui::Stroke::NONE)
+                                            .rounding(egui::Rounding::same(4.0))
+                                            .min_size(egui::vec2(28.0, 24.0))
+                                        ).clicked() && input_height > 1 {
+                                            input_height -= 1;
+                                        }
+                                        ui.add_space(4.0);
+                                        // Number display in a styled box
+                                        let num_rect = ui.allocate_space(egui::vec2(40.0, row_height)).1;
+                                        ui.painter().rect_filled(num_rect, egui::Rounding::same(4.0), theme.bg_deep());
+                                        ui.painter().text(
+                                            num_rect.center(),
+                                            egui::Align2::CENTER_CENTER,
+                                            format!("{}", input_height),
+                                            egui::FontId::monospace(11.0),
+                                            theme.fg()
+                                        );
+                                        ui.add_space(4.0);
+                                        if ui.add(egui::Button::new(
+                                            egui::RichText::new("+").size(11.0).color(theme.fg_secondary()).family(egui::FontFamily::Monospace))
+                                            .fill(theme.bg_deep())
+                                            .stroke(egui::Stroke::NONE)
+                                            .rounding(egui::Rounding::same(4.0))
+                                            .min_size(egui::vec2(28.0, 24.0))
+                                        ).clicked() && input_height < 15 {
+                                            input_height += 1;
+                                        }
+                                    });
+
+                                    // Transparency
+                                    form_row(ui, "Transparency", &mut |ui| {
+                                        let slider_width = ui.available_width();
+                                        let slider_height = row_height;
+                                        let slider_rect = ui.allocate_space(egui::vec2(slider_width, slider_height)).1;
+
+                                        // Draw track background
+                                        let track_rect = egui::Rect::from_center_size(
+                                            slider_rect.center(),
+                                            egui::vec2(slider_width - 20.0, 4.0)
+                                        );
+                                        ui.painter().rect_filled(track_rect, egui::Rounding::same(2.0), theme.bg_deep());
+
+                                        // Calculate knob position
+                                        let knob_x = track_rect.left() + (transparency - 0.3) / 0.7 * track_rect.width();
+                                        let knob_center = egui::pos2(knob_x, slider_rect.center().y);
+
+                                        // Draw filled portion
+                                        let filled_rect = egui::Rect::from_min_max(
+                                            track_rect.min,
+                                            egui::pos2(knob_x, track_rect.max.y)
+                                        );
+                                        ui.painter().rect_filled(filled_rect, egui::Rounding::same(2.0), theme.accent_dim());
+
+                                        // Draw knob
+                                        ui.painter().circle_filled(knob_center, 8.0, theme.accent());
+
+                                        // Handle interaction
+                                        let response = ui.interact(slider_rect, ui.id().with("transparency_slider"), egui::Sense::click_and_drag());
+                                        if response.dragged() || response.clicked() {
+                                            if let Some(pos) = response.interact_pointer_pos() {
+                                                let new_value = ((pos.x - track_rect.left()) / track_rect.width() * 0.7 + 0.3)
+                                                    .clamp(0.3, 1.0);
+                                                transparency = new_value;
+                                            }
+                                        }
+                                    });
+
+                                    ui.add_space(8.0);
+
+                                    // More Mode
+                                    form_row(ui, "More Mode", &mut |ui| {
+                                        let switch_width = 44.0;
+                                        let switch_height = 22.0;
+                                        let switch_rect = ui.allocate_space(egui::vec2(switch_width, switch_height)).1;
+                                        let response = ui.interact(switch_rect, ui.id().with("more_mode_toggle"), egui::Sense::click());
+                                        let track_color = if more_mode { theme.accent_dim() } else { theme.bg_deep() };
+                                        ui.painter().rect_filled(switch_rect, egui::Rounding::same(11.0), track_color);
+                                        let knob_x = if more_mode { switch_rect.right() - 11.0 } else { switch_rect.left() + 11.0 };
+                                        let knob_color = if more_mode { theme.accent() } else { theme.fg_muted() };
+                                        ui.painter().circle_filled(egui::pos2(knob_x, switch_rect.center().y), 7.0, knob_color);
+                                        if response.clicked() { more_mode = !more_mode; }
+                                    });
+
+                                    // Spell Check
+                                    form_row(ui, "Spell Check", &mut |ui| {
+                                        let switch_width = 44.0;
+                                        let switch_height = 22.0;
+                                        let switch_rect = ui.allocate_space(egui::vec2(switch_width, switch_height)).1;
+                                        let response = ui.interact(switch_rect, ui.id().with("spell_check_toggle"), egui::Sense::click());
+                                        let track_color = if spell_check { theme.accent_dim() } else { theme.bg_deep() };
+                                        ui.painter().rect_filled(switch_rect, egui::Rounding::same(11.0), track_color);
+                                        let knob_x = if spell_check { switch_rect.right() - 11.0 } else { switch_rect.left() + 11.0 };
+                                        let knob_color = if spell_check { theme.accent() } else { theme.fg_muted() };
+                                        ui.painter().circle_filled(egui::pos2(knob_x, switch_rect.center().y), 7.0, knob_color);
+                                        if response.clicked() { spell_check = !spell_check; }
+                                    });
+
+                                    // Show Tags
+                                    form_row(ui, "Show Tags", &mut |ui| {
+                                        let switch_width = 44.0;
+                                        let switch_height = 22.0;
+                                        let switch_rect = ui.allocate_space(egui::vec2(switch_width, switch_height)).1;
+                                        let response = ui.interact(switch_rect, ui.id().with("show_tags_toggle"), egui::Sense::click());
+                                        let track_color = if show_tags { theme.accent_dim() } else { theme.bg_deep() };
+                                        ui.painter().rect_filled(switch_rect, egui::Rounding::same(11.0), track_color);
+                                        let knob_x = if show_tags { switch_rect.right() - 11.0 } else { switch_rect.left() + 11.0 };
+                                        let knob_color = if show_tags { theme.accent() } else { theme.fg_muted() };
+                                        ui.painter().circle_filled(egui::pos2(knob_x, switch_rect.center().y), 7.0, knob_color);
+                                        if response.clicked() { show_tags = !show_tags; }
                                     });
                             });
                         },
                     );
 
-                    // Apply changes back
+                    // Apply changes back (live preview for transparency)
                     self.more_mode = more_mode;
                     self.spell_check_enabled = spell_check;
                     self.world_switch_mode = world_switch;
@@ -9813,8 +10728,16 @@ mod remote_gui {
 
                     if should_save {
                         self.update_global_settings();
+                        self.original_transparency = None;
+                    }
+                    if should_cancel {
+                        // Revert transparency to original value
+                        if let Some(orig) = self.original_transparency.take() {
+                            self.transparency = orig;
+                        }
                     }
                     if should_close {
+                        self.original_transparency = None;
                         close_popup = true;
                     }
                 }
@@ -9835,9 +10758,54 @@ mod remote_gui {
                     ctx.show_viewport_immediate(
                         egui::ViewportId::from_hash_of("web_settings_window"),
                         egui::ViewportBuilder::default()
-                            .with_title("Web Settings - Clay MUD Client")
-                            .with_inner_size([350.0, 250.0]),
+                            .with_title("Web Settings")
+                            .with_inner_size([380.0, 300.0]),
                         |ctx, _class| {
+                            // Apply popup styling - remove all default strokes
+                            ctx.style_mut(|style| {
+                                style.visuals.window_fill = theme.bg_elevated();
+                                style.visuals.panel_fill = theme.bg_elevated();
+                                style.visuals.window_stroke = egui::Stroke::NONE;
+                                style.visuals.window_shadow = egui::epaint::Shadow::NONE;
+
+                                let widget_bg = theme.bg_deep();
+                                let widget_rounding = egui::Rounding::same(4.0);
+
+                                style.visuals.widgets.noninteractive.bg_fill = widget_bg;
+                                style.visuals.widgets.noninteractive.bg_stroke = egui::Stroke::NONE;
+                                style.visuals.widgets.noninteractive.fg_stroke = egui::Stroke::NONE;
+                                style.visuals.widgets.noninteractive.rounding = widget_rounding;
+                                style.visuals.widgets.noninteractive.weak_bg_fill = widget_bg;
+
+                                style.visuals.widgets.inactive.bg_fill = theme.bg_hover();
+                                style.visuals.widgets.inactive.bg_stroke = egui::Stroke::NONE;
+                                style.visuals.widgets.inactive.fg_stroke = egui::Stroke::NONE;
+                                style.visuals.widgets.inactive.rounding = widget_rounding;
+                                style.visuals.widgets.inactive.weak_bg_fill = widget_bg;
+
+                                style.visuals.widgets.hovered.bg_fill = theme.bg_hover();
+                                style.visuals.widgets.hovered.bg_stroke = egui::Stroke::NONE;
+                                style.visuals.widgets.hovered.fg_stroke = egui::Stroke::NONE;
+                                style.visuals.widgets.hovered.rounding = widget_rounding;
+                                style.visuals.widgets.hovered.weak_bg_fill = widget_bg;
+
+                                style.visuals.widgets.active.bg_fill = theme.accent_dim();
+                                style.visuals.widgets.active.bg_stroke = egui::Stroke::NONE;
+                                style.visuals.widgets.active.fg_stroke = egui::Stroke::NONE;
+                                style.visuals.widgets.active.rounding = widget_rounding;
+                                style.visuals.widgets.active.weak_bg_fill = widget_bg;
+
+                                style.visuals.widgets.open.bg_fill = widget_bg;
+                                style.visuals.widgets.open.bg_stroke = egui::Stroke::NONE;
+                                style.visuals.widgets.open.fg_stroke = egui::Stroke::NONE;
+                                style.visuals.widgets.open.rounding = widget_rounding;
+                                style.visuals.widgets.open.weak_bg_fill = widget_bg;
+
+                                style.visuals.selection.bg_fill = Color32::from_rgba_unmultiplied(34, 211, 238, 38);
+                                style.visuals.selection.stroke = egui::Stroke::NONE;
+                                style.visuals.extreme_bg_color = widget_bg;
+                            });
+
                             if ctx.input(|i| i.key_pressed(egui::Key::Escape)) ||
                                ctx.input(|i| i.viewport().close_requested()) {
                                 should_close = true;
@@ -9845,81 +10813,148 @@ mod remote_gui {
 
                             // Bottom panel for buttons
                             egui::TopBottomPanel::bottom("web_settings_buttons")
-                                .exact_height(35.0)
+                                .exact_height(44.0)
+                                .frame(egui::Frame::none()
+                                    .fill(theme.bg_surface())
+                                    .stroke(egui::Stroke::new(1.0, theme.border_subtle()))
+                                    .inner_margin(egui::Margin { left: 16.0, right: 1.0, top: 8.0, bottom: 8.0 }))
                                 .show(ctx, |ui| {
-                                    ui.add_space(5.0);
                                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                        if ui.button("Cancel").clicked() {
+                                        ui.spacing_mut().item_spacing = egui::vec2(8.0, 0.0);
+
+                                        // Cancel button
+                                        if ui.add(egui::Button::new(
+                                            egui::RichText::new("Cancel").size(11.0).color(theme.fg_secondary()))
+                                            .fill(theme.bg_hover())
+                                            .stroke(egui::Stroke::new(1.0, theme.border_medium()))
+                                            .rounding(egui::Rounding::same(4.0))
+                                            .min_size(egui::vec2(70.0, 28.0))
+                                        ).clicked() {
                                             should_close = true;
                                         }
-                                        if ui.button("Save").clicked() {
+
+                                        // Save button (primary)
+                                        if ui.add(egui::Button::new(
+                                            egui::RichText::new("Save").size(11.0).color(theme.bg_deep()).strong())
+                                            .fill(theme.accent_dim())
+                                            .stroke(egui::Stroke::NONE)
+                                            .rounding(egui::Rounding::same(4.0))
+                                            .min_size(egui::vec2(70.0, 28.0))
+                                        ).clicked() {
                                             should_save = true;
                                         }
                                     });
                                 });
 
-                            egui::CentralPanel::default().show(ctx, |ui| {
-                                ui.label("Web server settings");
-                                ui.separator();
-                                egui::Grid::new("web_grid")
-                                    .num_columns(2)
-                                    .spacing([10.0, 8.0])
-                                    .show(ui, |ui| {
-                                        // Protocol selection
-                                        ui.label("Protocol:");
-                                        let proto_text = if web_secure { "Secure" } else { "Non-Secure" };
-                                        if ui.button(proto_text).clicked() {
-                                            web_secure = !web_secure;
-                                        }
-                                        ui.end_row();
+                            egui::CentralPanel::default()
+                                .frame(egui::Frame::none()
+                                    .fill(theme.bg_elevated())
+                                    .inner_margin(egui::Margin::same(16.0)))
+                                .show(ctx, |ui| {
+                                    // Header
+                                    ui.label(egui::RichText::new("WEB SETTINGS")
+                                        .size(11.0)
+                                        .color(theme.fg_muted())
+                                        .strong());
+                                    ui.add_space(16.0);
 
-                                        // HTTP/HTTPS enabled (name changes based on protocol)
-                                        let http_label = if web_secure { "HTTPS enabled:" } else { "HTTP enabled:" };
-                                        ui.label(http_label);
-                                        let http_text = if http_enabled { "on" } else { "off" };
-                                        if ui.button(http_text).clicked() {
-                                            http_enabled = !http_enabled;
-                                        }
-                                        ui.end_row();
+                                    egui::Grid::new("web_grid")
+                                        .num_columns(2)
+                                        .spacing([16.0, 10.0])
+                                        .show(ui, |ui| {
+                                            // Protocol selection
+                                            ui.label(egui::RichText::new("Protocol").size(12.0).color(theme.fg_secondary()));
+                                            ui.horizontal(|ui| {
+                                                ui.spacing_mut().item_spacing = egui::vec2(2.0, 0.0);
+                                                if ui.add(egui::Button::new(
+                                                    egui::RichText::new("Secure").size(11.0)
+                                                        .color(if web_secure { theme.bg_deep() } else { theme.fg_muted() }))
+                                                    .fill(if web_secure { theme.accent_dim() } else { theme.bg_hover() })
+                                                    .stroke(egui::Stroke::NONE)
+                                                    .rounding(egui::Rounding::same(4.0))
+                                                    .min_size(egui::vec2(70.0, 24.0))
+                                                ).clicked() {
+                                                    web_secure = true;
+                                                }
+                                                if ui.add(egui::Button::new(
+                                                    egui::RichText::new("Non-Secure").size(11.0)
+                                                        .color(if !web_secure { theme.bg_deep() } else { theme.fg_muted() }))
+                                                    .fill(if !web_secure { theme.accent_dim() } else { theme.bg_hover() })
+                                                    .stroke(egui::Stroke::NONE)
+                                                    .rounding(egui::Rounding::same(4.0))
+                                                    .min_size(egui::vec2(80.0, 24.0))
+                                                ).clicked() {
+                                                    web_secure = false;
+                                                }
+                                            });
+                                            ui.end_row();
 
-                                        // HTTP/HTTPS port (name changes based on protocol)
-                                        let http_port_label = if web_secure { "HTTPS port:" } else { "HTTP port:" };
-                                        ui.label(http_port_label);
-                                        let mut http_port_str = http_port.to_string();
-                                        if ui.add(egui::TextEdit::singleline(&mut http_port_str).desired_width(80.0)).changed() {
-                                            if let Ok(port) = http_port_str.parse::<u16>() {
-                                                http_port = port;
+                                            // HTTP/HTTPS enabled
+                                            let http_label = if web_secure { "HTTPS enabled" } else { "HTTP enabled" };
+                                            ui.label(egui::RichText::new(http_label).size(12.0).color(theme.fg_secondary()));
+                                            let http_text = if http_enabled { "ON" } else { "OFF" };
+                                            let http_color = if http_enabled { theme.accent() } else { theme.fg_muted() };
+                                            if ui.add(egui::Button::new(
+                                                egui::RichText::new(http_text).size(11.0).color(http_color))
+                                                .fill(if http_enabled { theme.accent_dim() } else { theme.bg_hover() })
+                                                .stroke(egui::Stroke::new(1.0, if http_enabled { theme.accent_dim() } else { theme.border_medium() }))
+                                                .rounding(egui::Rounding::same(4.0))
+                                                .min_size(egui::vec2(50.0, 24.0))
+                                            ).clicked() {
+                                                http_enabled = !http_enabled;
                                             }
-                                        }
-                                        ui.end_row();
+                                            ui.end_row();
 
-                                        // WS/WSS enabled (name changes based on protocol)
-                                        let ws_label = if web_secure { "WSS enabled:" } else { "WS enabled:" };
-                                        ui.label(ws_label);
-                                        let ws_text = if ws_enabled { "on" } else { "off" };
-                                        if ui.button(ws_text).clicked() {
-                                            ws_enabled = !ws_enabled;
-                                        }
-                                        ui.end_row();
-
-                                        // WS/WSS port (name changes based on protocol)
-                                        let ws_port_label = if web_secure { "WSS port:" } else { "WS port:" };
-                                        ui.label(ws_port_label);
-                                        let mut ws_port_str = ws_port.to_string();
-                                        if ui.add(egui::TextEdit::singleline(&mut ws_port_str).desired_width(80.0)).changed() {
-                                            if let Ok(port) = ws_port_str.parse::<u16>() {
-                                                ws_port = port;
+                                            // HTTP/HTTPS port
+                                            let http_port_label = if web_secure { "HTTPS port" } else { "HTTP port" };
+                                            ui.label(egui::RichText::new(http_port_label).size(12.0).color(theme.fg_secondary()));
+                                            let mut http_port_str = http_port.to_string();
+                                            if ui.add(egui::TextEdit::singleline(&mut http_port_str)
+                                                .desired_width(80.0)
+                                                .margin(egui::Margin::symmetric(8.0, 6.0))).changed() {
+                                                if let Ok(port) = http_port_str.parse::<u16>() {
+                                                    http_port = port;
+                                                }
                                             }
-                                        }
-                                        ui.end_row();
+                                            ui.end_row();
 
-                                        // Allow list
-                                        ui.label("Allow List:");
-                                        ui.add(egui::TextEdit::singleline(&mut ws_allow_list)
-                                            .hint_text("localhost, 192.168.*")
-                                            .desired_width(200.0));
-                                        ui.end_row();
-                                    });
+                                            // WS/WSS enabled
+                                            let ws_label = if web_secure { "WSS enabled" } else { "WS enabled" };
+                                            ui.label(egui::RichText::new(ws_label).size(12.0).color(theme.fg_secondary()));
+                                            let ws_text = if ws_enabled { "ON" } else { "OFF" };
+                                            let ws_color = if ws_enabled { theme.accent() } else { theme.fg_muted() };
+                                            if ui.add(egui::Button::new(
+                                                egui::RichText::new(ws_text).size(11.0).color(ws_color))
+                                                .fill(if ws_enabled { theme.accent_dim() } else { theme.bg_hover() })
+                                                .stroke(egui::Stroke::new(1.0, if ws_enabled { theme.accent_dim() } else { theme.border_medium() }))
+                                                .rounding(egui::Rounding::same(4.0))
+                                                .min_size(egui::vec2(50.0, 24.0))
+                                            ).clicked() {
+                                                ws_enabled = !ws_enabled;
+                                            }
+                                            ui.end_row();
+
+                                            // WS/WSS port
+                                            let ws_port_label = if web_secure { "WSS port" } else { "WS port" };
+                                            ui.label(egui::RichText::new(ws_port_label).size(12.0).color(theme.fg_secondary()));
+                                            let mut ws_port_str = ws_port.to_string();
+                                            if ui.add(egui::TextEdit::singleline(&mut ws_port_str)
+                                                .desired_width(80.0)
+                                                .margin(egui::Margin::symmetric(8.0, 6.0))).changed() {
+                                                if let Ok(port) = ws_port_str.parse::<u16>() {
+                                                    ws_port = port;
+                                                }
+                                            }
+                                            ui.end_row();
+
+                                            // Allow list
+                                            ui.label(egui::RichText::new("Allow List").size(12.0).color(theme.fg_secondary()));
+                                            ui.add(egui::TextEdit::singleline(&mut ws_allow_list)
+                                                .hint_text("localhost, 192.168.*")
+                                                .desired_width(180.0)
+                                                .margin(egui::Margin::symmetric(8.0, 6.0)));
+                                            ui.end_row();
+                                        });
                             });
                         },
                     );
@@ -9968,9 +11003,54 @@ mod remote_gui {
                     ctx.show_viewport_immediate(
                         egui::ViewportId::from_hash_of("font_settings_window"),
                         egui::ViewportBuilder::default()
-                            .with_title("Font Settings - Clay MUD Client")
-                            .with_inner_size([350.0, 120.0]),
+                            .with_title("Font Settings")
+                            .with_inner_size([380.0, 180.0]),
                         |ctx, _class| {
+                            // Apply popup styling - remove all default strokes
+                            ctx.style_mut(|style| {
+                                style.visuals.window_fill = theme.bg_elevated();
+                                style.visuals.panel_fill = theme.bg_elevated();
+                                style.visuals.window_stroke = egui::Stroke::NONE;
+                                style.visuals.window_shadow = egui::epaint::Shadow::NONE;
+
+                                let widget_bg = theme.bg_deep();
+                                let widget_rounding = egui::Rounding::same(4.0);
+
+                                style.visuals.widgets.noninteractive.bg_fill = widget_bg;
+                                style.visuals.widgets.noninteractive.bg_stroke = egui::Stroke::NONE;
+                                style.visuals.widgets.noninteractive.fg_stroke = egui::Stroke::NONE;
+                                style.visuals.widgets.noninteractive.rounding = widget_rounding;
+                                style.visuals.widgets.noninteractive.weak_bg_fill = widget_bg;
+
+                                style.visuals.widgets.inactive.bg_fill = theme.bg_hover();
+                                style.visuals.widgets.inactive.bg_stroke = egui::Stroke::NONE;
+                                style.visuals.widgets.inactive.fg_stroke = egui::Stroke::NONE;
+                                style.visuals.widgets.inactive.rounding = widget_rounding;
+                                style.visuals.widgets.inactive.weak_bg_fill = widget_bg;
+
+                                style.visuals.widgets.hovered.bg_fill = theme.bg_hover();
+                                style.visuals.widgets.hovered.bg_stroke = egui::Stroke::NONE;
+                                style.visuals.widgets.hovered.fg_stroke = egui::Stroke::NONE;
+                                style.visuals.widgets.hovered.rounding = widget_rounding;
+                                style.visuals.widgets.hovered.weak_bg_fill = widget_bg;
+
+                                style.visuals.widgets.active.bg_fill = theme.accent_dim();
+                                style.visuals.widgets.active.bg_stroke = egui::Stroke::NONE;
+                                style.visuals.widgets.active.fg_stroke = egui::Stroke::NONE;
+                                style.visuals.widgets.active.rounding = widget_rounding;
+                                style.visuals.widgets.active.weak_bg_fill = widget_bg;
+
+                                style.visuals.widgets.open.bg_fill = widget_bg;
+                                style.visuals.widgets.open.bg_stroke = egui::Stroke::NONE;
+                                style.visuals.widgets.open.fg_stroke = egui::Stroke::NONE;
+                                style.visuals.widgets.open.rounding = widget_rounding;
+                                style.visuals.widgets.open.weak_bg_fill = widget_bg;
+
+                                style.visuals.selection.bg_fill = Color32::from_rgba_unmultiplied(34, 211, 238, 38);
+                                style.visuals.selection.stroke = egui::Stroke::NONE;
+                                style.visuals.extreme_bg_color = widget_bg;
+                            });
+
                             if ctx.input(|i| i.key_pressed(egui::Key::Escape)) ||
                                ctx.input(|i| i.viewport().close_requested()) {
                                 should_close = true;
@@ -9978,62 +11058,107 @@ mod remote_gui {
 
                             // Bottom panel for buttons
                             egui::TopBottomPanel::bottom("font_settings_buttons")
-                                .exact_height(35.0)
+                                .exact_height(44.0)
+                                .frame(egui::Frame::none()
+                                    .fill(theme.bg_surface())
+                                    .stroke(egui::Stroke::new(1.0, theme.border_subtle()))
+                                    .inner_margin(egui::Margin { left: 16.0, right: 1.0, top: 8.0, bottom: 8.0 }))
                                 .show(ctx, |ui| {
-                                    ui.add_space(5.0);
                                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                        if ui.button("Cancel").clicked() {
+                                        ui.spacing_mut().item_spacing = egui::vec2(8.0, 0.0);
+
+                                        // Cancel button
+                                        if ui.add(egui::Button::new(
+                                            egui::RichText::new("Cancel").size(11.0).color(theme.fg_secondary()))
+                                            .fill(theme.bg_hover())
+                                            .stroke(egui::Stroke::new(1.0, theme.border_medium()))
+                                            .rounding(egui::Rounding::same(4.0))
+                                            .min_size(egui::vec2(70.0, 28.0))
+                                        ).clicked() {
                                             should_close = true;
                                         }
-                                        if ui.button("OK").clicked() {
+
+                                        // OK button (primary)
+                                        if ui.add(egui::Button::new(
+                                            egui::RichText::new("OK").size(11.0).color(theme.bg_deep()).strong())
+                                            .fill(theme.accent_dim())
+                                            .stroke(egui::Stroke::NONE)
+                                            .rounding(egui::Rounding::same(4.0))
+                                            .min_size(egui::vec2(70.0, 28.0))
+                                        ).clicked() {
                                             should_save = true;
                                         }
                                     });
                                 });
 
-                            egui::CentralPanel::default().show(ctx, |ui| {
-                                egui::Grid::new("font_grid")
-                                    .num_columns(2)
-                                    .spacing([10.0, 8.0])
-                                    .show(ui, |ui| {
-                                        ui.label("Font family:");
-                                        let current_label = FONT_FAMILIES.iter()
-                                            .find(|(value, _)| *value == edit_font_name)
-                                            .map(|(_, label)| *label)
-                                            .unwrap_or_else(|| {
-                                                if edit_font_name.is_empty() { "System Default" } else { &edit_font_name }
-                                            });
-                                        egui::ComboBox::from_id_salt("font_family")
-                                            .selected_text(current_label)
-                                            .width(180.0)
-                                            .show_ui(ui, |ui| {
-                                                for (value, label) in FONT_FAMILIES {
-                                                    if ui.selectable_value(&mut edit_font_name, value.to_string(), *label).clicked() {
-                                                        // Selection handled by selectable_value
+                            egui::CentralPanel::default()
+                                .frame(egui::Frame::none()
+                                    .fill(theme.bg_elevated())
+                                    .inner_margin(egui::Margin::same(16.0)))
+                                .show(ctx, |ui| {
+                                    // Header
+                                    ui.label(egui::RichText::new("FONT SETTINGS")
+                                        .size(11.0)
+                                        .color(theme.fg_muted())
+                                        .strong());
+                                    ui.add_space(16.0);
+
+                                    egui::Grid::new("font_grid")
+                                        .num_columns(2)
+                                        .spacing([16.0, 12.0])
+                                        .show(ui, |ui| {
+                                            ui.label(egui::RichText::new("Font family").size(12.0).color(theme.fg_secondary()));
+                                            let current_label = FONT_FAMILIES.iter()
+                                                .find(|(value, _)| *value == edit_font_name)
+                                                .map(|(_, label)| *label)
+                                                .unwrap_or_else(|| {
+                                                    if edit_font_name.is_empty() { "System Default" } else { &edit_font_name }
+                                                });
+                                            egui::ComboBox::from_id_salt("font_family")
+                                                .selected_text(current_label)
+                                                .width(180.0)
+                                                .show_ui(ui, |ui| {
+                                                    for (value, label) in FONT_FAMILIES {
+                                                        if ui.selectable_value(&mut edit_font_name, value.to_string(), *label).clicked() {
+                                                            // Selection handled by selectable_value
+                                                        }
+                                                    }
+                                                });
+                                            ui.end_row();
+
+                                            ui.label(egui::RichText::new("Font size").size(12.0).color(theme.fg_secondary()));
+                                            ui.horizontal(|ui| {
+                                                ui.spacing_mut().item_spacing = egui::vec2(4.0, 0.0);
+                                                if ui.add(egui::Button::new(
+                                                    egui::RichText::new("-").size(11.0).color(theme.fg_secondary()))
+                                                    .fill(theme.bg_hover())
+                                                    .stroke(egui::Stroke::new(1.0, theme.border_medium()))
+                                                    .rounding(egui::Rounding::same(4.0))
+                                                    .min_size(egui::vec2(28.0, 24.0))
+                                                ).clicked() {
+                                                    if let Ok(size) = edit_font_size.parse::<f32>() {
+                                                        let new_size = (size - 1.0).max(8.0);
+                                                        edit_font_size = format!("{:.1}", new_size);
+                                                    }
+                                                }
+                                                ui.add(egui::TextEdit::singleline(&mut edit_font_size)
+                                                    .desired_width(50.0)
+                                                    .margin(egui::Margin::symmetric(8.0, 6.0)));
+                                                if ui.add(egui::Button::new(
+                                                    egui::RichText::new("+").size(11.0).color(theme.fg_secondary()))
+                                                    .fill(theme.bg_hover())
+                                                    .stroke(egui::Stroke::new(1.0, theme.border_medium()))
+                                                    .rounding(egui::Rounding::same(4.0))
+                                                    .min_size(egui::vec2(28.0, 24.0))
+                                                ).clicked() {
+                                                    if let Ok(size) = edit_font_size.parse::<f32>() {
+                                                        let new_size = (size + 1.0).min(48.0);
+                                                        edit_font_size = format!("{:.1}", new_size);
                                                     }
                                                 }
                                             });
-                                        ui.end_row();
-
-                                        ui.label("Font size:");
-                                        ui.horizontal(|ui| {
-                                            if ui.button("-").clicked() {
-                                                if let Ok(size) = edit_font_size.parse::<f32>() {
-                                                    let new_size = (size - 1.0).max(8.0);
-                                                    edit_font_size = format!("{:.1}", new_size);
-                                                }
-                                            }
-                                            ui.add(egui::TextEdit::singleline(&mut edit_font_size)
-                                                .desired_width(50.0));
-                                            if ui.button("+").clicked() {
-                                                if let Ok(size) = edit_font_size.parse::<f32>() {
-                                                    let new_size = (size + 1.0).min(48.0);
-                                                    edit_font_size = format!("{:.1}", new_size);
-                                                }
-                                            }
+                                            ui.end_row();
                                         });
-                                        ui.end_row();
-                                    });
                             });
                         },
                     );
@@ -10065,59 +11190,169 @@ mod remote_gui {
                             .with_title("Help - Clay MUD Client")
                             .with_inner_size([450.0, 400.0]),
                         |ctx, _class| {
-                            egui::CentralPanel::default().show(ctx, |ui| {
-                                // Check for Escape key or window close
-                                if ui.input(|i| i.key_pressed(egui::Key::Escape)) ||
-                                   ui.input(|i| i.viewport().close_requested()) {
-                                    should_close = true;
-                                }
+                            // Apply popup styling
+                            ctx.style_mut(|style| {
+                                style.visuals.window_fill = theme.bg_elevated();
+                                style.visuals.panel_fill = theme.bg_elevated();
+                                style.visuals.window_stroke = egui::Stroke::NONE;
+                                style.visuals.window_shadow = egui::epaint::Shadow::NONE;
 
-                                egui::ScrollArea::vertical()
-                                    .max_height(330.0)
-                                    .show(ui, |ui| {
-                                        ui.label(egui::RichText::new("Clay - A MUD Client").strong().size(16.0));
-                                        ui.add_space(8.0);
+                                let widget_bg = theme.bg_deep();
+                                let widget_rounding = egui::Rounding::same(4.0);
 
-                                        ui.label(egui::RichText::new("World Switching").strong());
-                                        ui.label("  Up/Down      - Cycle through active worlds");
-                                        ui.label("  Shift+Up/Down - Cycle through all worlds");
-                                        ui.add_space(4.0);
+                                style.visuals.widgets.noninteractive.bg_fill = widget_bg;
+                                style.visuals.widgets.noninteractive.bg_stroke = egui::Stroke::NONE;
+                                style.visuals.widgets.noninteractive.fg_stroke = egui::Stroke::NONE;
+                                style.visuals.widgets.noninteractive.rounding = widget_rounding;
+                                style.visuals.widgets.noninteractive.weak_bg_fill = widget_bg;
 
-                                        ui.label(egui::RichText::new("Output Navigation").strong());
-                                        ui.label("  PageUp/Down  - Scroll through output history");
-                                        ui.label("  Tab          - Release one screenful (when paused)");
-                                        ui.label("  Alt+J        - Jump to end, release all pending");
-                                        ui.add_space(4.0);
+                                style.visuals.widgets.inactive.bg_fill = theme.bg_hover();
+                                style.visuals.widgets.inactive.bg_stroke = egui::Stroke::NONE;
+                                style.visuals.widgets.inactive.fg_stroke = egui::Stroke::NONE;
+                                style.visuals.widgets.inactive.rounding = widget_rounding;
+                                style.visuals.widgets.inactive.weak_bg_fill = theme.bg_hover();
 
-                                        ui.label(egui::RichText::new("Input").strong());
-                                        ui.label("  Enter        - Send command");
-                                        ui.label("  Ctrl+P/N     - Previous/Next command history");
-                                        ui.label("  Ctrl+U       - Clear input line");
-                                        ui.label("  Ctrl+W       - Delete word before cursor");
-                                        ui.label("  Ctrl+Q       - Spell check suggestions");
-                                        ui.add_space(4.0);
+                                style.visuals.widgets.hovered.bg_fill = theme.bg_hover();
+                                style.visuals.widgets.hovered.bg_stroke = egui::Stroke::NONE;
+                                style.visuals.widgets.hovered.fg_stroke = egui::Stroke::NONE;
+                                style.visuals.widgets.hovered.rounding = widget_rounding;
+                                style.visuals.widgets.hovered.weak_bg_fill = theme.bg_hover();
 
-                                        ui.label(egui::RichText::new("Display").strong());
-                                        ui.label("  F2           - Toggle MUD tag display");
-                                        ui.label("  F4           - Open filter popup");
-                                        ui.add_space(4.0);
+                                style.visuals.widgets.active.bg_fill = theme.accent_dim();
+                                style.visuals.widgets.active.bg_stroke = egui::Stroke::NONE;
+                                style.visuals.widgets.active.fg_stroke = egui::Stroke::NONE;
+                                style.visuals.widgets.active.rounding = widget_rounding;
+                                style.visuals.widgets.active.weak_bg_fill = theme.accent_dim();
 
-                                        ui.label(egui::RichText::new("Options Menu").strong());
-                                        ui.label("  World List   - View and select worlds");
-                                        ui.label("  World Editor - Edit world connection settings");
-                                        ui.label("  Setup        - Global settings");
-                                        ui.label("  Font         - Change font family and size");
-                                        ui.label("  Connect      - Connect to current world");
-                                        ui.label("  Disconnect   - Disconnect from current world");
-                                    });
+                                style.visuals.widgets.open.bg_fill = theme.bg_hover();
+                                style.visuals.widgets.open.bg_stroke = egui::Stroke::NONE;
+                                style.visuals.widgets.open.fg_stroke = egui::Stroke::NONE;
+                                style.visuals.widgets.open.rounding = widget_rounding;
+                                style.visuals.widgets.open.weak_bg_fill = theme.bg_hover();
 
-                                ui.separator();
-                                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                    if ui.button("OK").clicked() {
-                                        should_close = true;
-                                    }
-                                });
+                                style.visuals.selection.bg_fill = Color32::from_rgba_unmultiplied(34, 211, 238, 38);
+                                style.visuals.selection.stroke = egui::Stroke::NONE;
+                                style.visuals.extreme_bg_color = widget_bg;
                             });
+
+                            // Check for Escape key or window close
+                            if ctx.input(|i| i.key_pressed(egui::Key::Escape)) ||
+                               ctx.input(|i| i.viewport().close_requested()) {
+                                should_close = true;
+                            }
+
+                            // Bottom panel for button
+                            egui::TopBottomPanel::bottom("help_buttons")
+                                .exact_height(44.0)
+                                .frame(egui::Frame::none()
+                                    .fill(theme.bg_surface())
+                                    .stroke(egui::Stroke::NONE)
+                                    .inner_margin(egui::Margin { left: 16.0, right: 1.0, top: 8.0, bottom: 8.0 }))
+                                .show(ctx, |ui| {
+                                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                        if ui.add(egui::Button::new(
+                                            egui::RichText::new("OK").size(11.0).color(theme.bg_deep()).strong())
+                                            .fill(theme.accent_dim())
+                                            .stroke(egui::Stroke::NONE)
+                                            .rounding(egui::Rounding::same(4.0))
+                                            .min_size(egui::vec2(70.0, 28.0))
+                                        ).clicked() {
+                                            should_close = true;
+                                        }
+                                    });
+                                });
+
+                            egui::CentralPanel::default()
+                                .frame(egui::Frame::none()
+                                    .fill(theme.bg_elevated())
+                                    .inner_margin(egui::Margin::same(16.0)))
+                                .show(ctx, |ui| {
+                                    // Title
+                                    ui.label(egui::RichText::new("CLAY MUD CLIENT")
+                                        .size(11.0)
+                                        .color(theme.fg_muted())
+                                        .strong());
+                                    ui.add_space(12.0);
+
+                                    egui::ScrollArea::vertical()
+                                        .auto_shrink([false; 2])
+                                        .show(ui, |ui| {
+                                            // World Switching section
+                                            ui.label(egui::RichText::new("World Switching")
+                                                .size(12.0)
+                                                .color(theme.accent())
+                                                .strong());
+                                            ui.add_space(4.0);
+                                            ui.label(egui::RichText::new("  Up/Down         Cycle through active worlds")
+                                                .size(11.0).color(theme.fg_secondary()));
+                                            ui.label(egui::RichText::new("  Shift+Up/Down   Cycle through all worlds")
+                                                .size(11.0).color(theme.fg_secondary()));
+                                            ui.add_space(12.0);
+
+                                            // Output Navigation section
+                                            ui.label(egui::RichText::new("Output Navigation")
+                                                .size(12.0)
+                                                .color(theme.accent())
+                                                .strong());
+                                            ui.add_space(4.0);
+                                            ui.label(egui::RichText::new("  PageUp/Down     Scroll through output history")
+                                                .size(11.0).color(theme.fg_secondary()));
+                                            ui.label(egui::RichText::new("  Tab             Release one screenful (when paused)")
+                                                .size(11.0).color(theme.fg_secondary()));
+                                            ui.label(egui::RichText::new("  Alt+J           Jump to end, release all pending")
+                                                .size(11.0).color(theme.fg_secondary()));
+                                            ui.add_space(12.0);
+
+                                            // Input section
+                                            ui.label(egui::RichText::new("Input")
+                                                .size(12.0)
+                                                .color(theme.accent())
+                                                .strong());
+                                            ui.add_space(4.0);
+                                            ui.label(egui::RichText::new("  Enter           Send command")
+                                                .size(11.0).color(theme.fg_secondary()));
+                                            ui.label(egui::RichText::new("  Ctrl+P/N        Previous/Next command history")
+                                                .size(11.0).color(theme.fg_secondary()));
+                                            ui.label(egui::RichText::new("  Ctrl+U          Clear input line")
+                                                .size(11.0).color(theme.fg_secondary()));
+                                            ui.label(egui::RichText::new("  Ctrl+W          Delete word before cursor")
+                                                .size(11.0).color(theme.fg_secondary()));
+                                            ui.label(egui::RichText::new("  Ctrl+Q          Spell check suggestions")
+                                                .size(11.0).color(theme.fg_secondary()));
+                                            ui.add_space(12.0);
+
+                                            // Display section
+                                            ui.label(egui::RichText::new("Display")
+                                                .size(12.0)
+                                                .color(theme.accent())
+                                                .strong());
+                                            ui.add_space(4.0);
+                                            ui.label(egui::RichText::new("  F2              Toggle MUD tag display")
+                                                .size(11.0).color(theme.fg_secondary()));
+                                            ui.label(egui::RichText::new("  F4              Open filter popup")
+                                                .size(11.0).color(theme.fg_secondary()));
+                                            ui.add_space(12.0);
+
+                                            // Options Menu section
+                                            ui.label(egui::RichText::new("Options Menu")
+                                                .size(12.0)
+                                                .color(theme.accent())
+                                                .strong());
+                                            ui.add_space(4.0);
+                                            ui.label(egui::RichText::new("  World List      View and select worlds")
+                                                .size(11.0).color(theme.fg_secondary()));
+                                            ui.label(egui::RichText::new("  World Editor    Edit world connection settings")
+                                                .size(11.0).color(theme.fg_secondary()));
+                                            ui.label(egui::RichText::new("  Setup           Global settings")
+                                                .size(11.0).color(theme.fg_secondary()));
+                                            ui.label(egui::RichText::new("  Font            Change font family and size")
+                                                .size(11.0).color(theme.fg_secondary()));
+                                            ui.label(egui::RichText::new("  Connect         Connect to current world")
+                                                .size(11.0).color(theme.fg_secondary()));
+                                            ui.label(egui::RichText::new("  Disconnect      Disconnect from current world")
+                                                .size(11.0).color(theme.fg_secondary()));
+                                        });
+                                });
                         },
                     );
                     if should_close {
@@ -10134,8 +11369,53 @@ mod remote_gui {
                         egui::ViewportId::from_hash_of("debug_text_window"),
                         egui::ViewportBuilder::default()
                             .with_title("Debug - Raw ANSI Codes")
-                            .with_inner_size([600.0, 200.0]),
+                            .with_inner_size([600.0, 250.0]),
                         |ctx, _class| {
+                            // Apply popup styling
+                            ctx.style_mut(|style| {
+                                style.visuals.window_fill = theme.bg_elevated();
+                                style.visuals.panel_fill = theme.bg_elevated();
+                                style.visuals.window_stroke = egui::Stroke::NONE;
+                                style.visuals.window_shadow = egui::epaint::Shadow::NONE;
+
+                                let widget_bg = theme.bg_deep();
+                                let widget_rounding = egui::Rounding::same(4.0);
+
+                                style.visuals.widgets.noninteractive.bg_fill = widget_bg;
+                                style.visuals.widgets.noninteractive.bg_stroke = egui::Stroke::NONE;
+                                style.visuals.widgets.noninteractive.fg_stroke = egui::Stroke::NONE;
+                                style.visuals.widgets.noninteractive.rounding = widget_rounding;
+                                style.visuals.widgets.noninteractive.weak_bg_fill = widget_bg;
+
+                                style.visuals.widgets.inactive.bg_fill = theme.bg_hover();
+                                style.visuals.widgets.inactive.bg_stroke = egui::Stroke::NONE;
+                                style.visuals.widgets.inactive.fg_stroke = egui::Stroke::NONE;
+                                style.visuals.widgets.inactive.rounding = widget_rounding;
+                                style.visuals.widgets.inactive.weak_bg_fill = theme.bg_hover();
+
+                                style.visuals.widgets.hovered.bg_fill = theme.bg_hover();
+                                style.visuals.widgets.hovered.bg_stroke = egui::Stroke::NONE;
+                                style.visuals.widgets.hovered.fg_stroke = egui::Stroke::NONE;
+                                style.visuals.widgets.hovered.rounding = widget_rounding;
+                                style.visuals.widgets.hovered.weak_bg_fill = theme.bg_hover();
+
+                                style.visuals.widgets.active.bg_fill = theme.accent_dim();
+                                style.visuals.widgets.active.bg_stroke = egui::Stroke::NONE;
+                                style.visuals.widgets.active.fg_stroke = egui::Stroke::NONE;
+                                style.visuals.widgets.active.rounding = widget_rounding;
+                                style.visuals.widgets.active.weak_bg_fill = theme.accent_dim();
+
+                                style.visuals.widgets.open.bg_fill = theme.bg_hover();
+                                style.visuals.widgets.open.bg_stroke = egui::Stroke::NONE;
+                                style.visuals.widgets.open.fg_stroke = egui::Stroke::NONE;
+                                style.visuals.widgets.open.rounding = widget_rounding;
+                                style.visuals.widgets.open.weak_bg_fill = theme.bg_hover();
+
+                                style.visuals.selection.bg_fill = Color32::from_rgba_unmultiplied(34, 211, 238, 38);
+                                style.visuals.selection.stroke = egui::Stroke::NONE;
+                                style.visuals.extreme_bg_color = widget_bg;
+                            });
+
                             if ctx.input(|i| i.key_pressed(egui::Key::Escape)) ||
                                ctx.input(|i| i.viewport().close_requested()) {
                                 should_close = true;
@@ -10143,15 +11423,34 @@ mod remote_gui {
 
                             // Bottom panel for buttons
                             egui::TopBottomPanel::bottom("debug_buttons")
-                                .exact_height(32.0)
-                                .frame(egui::Frame::none().inner_margin(egui::Margin { left: 8.0, right: 8.0, top: 0.0, bottom: 6.0 }))
+                                .exact_height(44.0)
+                                .frame(egui::Frame::none()
+                                    .fill(theme.bg_surface())
+                                    .stroke(egui::Stroke::NONE)
+                                    .inner_margin(egui::Margin { left: 16.0, right: 1.0, top: 8.0, bottom: 8.0 }))
                                 .show(ctx, |ui| {
-                                    ui.add_space(6.0);
                                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                        if ui.button("Close").clicked() {
+                                        ui.spacing_mut().item_spacing = egui::vec2(8.0, 0.0);
+
+                                        // Close button (primary)
+                                        if ui.add(egui::Button::new(
+                                            egui::RichText::new("Close").size(11.0).color(theme.bg_deep()).strong())
+                                            .fill(theme.accent_dim())
+                                            .stroke(egui::Stroke::NONE)
+                                            .rounding(egui::Rounding::same(4.0))
+                                            .min_size(egui::vec2(70.0, 28.0))
+                                        ).clicked() {
                                             should_close = true;
                                         }
-                                        if ui.button("Copy").clicked() {
+
+                                        // Copy button (secondary)
+                                        if ui.add(egui::Button::new(
+                                            egui::RichText::new("Copy").size(11.0).color(theme.fg_secondary()))
+                                            .fill(theme.bg_hover())
+                                            .stroke(egui::Stroke::new(1.0, theme.border_medium()))
+                                            .rounding(egui::Rounding::same(4.0))
+                                            .min_size(egui::vec2(70.0, 28.0))
+                                        ).clicked() {
                                             ui.ctx().copy_text(debug_text_clone.clone());
                                         }
                                     });
@@ -10159,26 +11458,46 @@ mod remote_gui {
 
                             // Central panel for content
                             egui::CentralPanel::default()
-                                .frame(egui::Frame::none().inner_margin(egui::Margin { left: 8.0, right: 8.0, top: 8.0, bottom: 8.0 }))
+                                .frame(egui::Frame::none()
+                                    .fill(theme.bg_elevated())
+                                    .inner_margin(egui::Margin::same(16.0)))
                                 .show(ctx, |ui| {
-                                    ui.spacing_mut().item_spacing = egui::vec2(6.0, 6.0);
+                                    // Header
+                                    ui.label(egui::RichText::new("RAW ANSI CODES")
+                                        .size(11.0)
+                                        .color(theme.fg_muted())
+                                        .strong());
+                                    ui.add_space(4.0);
+                                    ui.label(egui::RichText::new("ESC character shown as <esc>")
+                                        .size(10.0)
+                                        .color(theme.fg_muted()));
+                                    ui.add_space(12.0);
 
-                                    ui.label(egui::RichText::new("Raw ANSI codes (ESC = <esc>)").strong());
-
+                                    // Content area with background
                                     let display_text = if debug_text_clone.is_empty() {
                                         "(No text captured)".to_string()
                                     } else {
                                         debug_text_clone.clone()
                                     };
-                                    egui::ScrollArea::both().show(ui, |ui| {
-                                        ui.add(
-                                            egui::Label::new(
-                                                egui::RichText::new(&display_text)
-                                                    .monospace()
-                                                    .color(egui::Color32::LIGHT_GRAY)
-                                            ).wrap()
-                                        );
-                                    });
+
+                                    egui::Frame::none()
+                                        .fill(theme.bg_deep())
+                                        .rounding(egui::Rounding::same(4.0))
+                                        .inner_margin(egui::Margin::same(12.0))
+                                        .show(ui, |ui| {
+                                            egui::ScrollArea::both()
+                                                .auto_shrink([false; 2])
+                                                .show(ui, |ui| {
+                                                    ui.add(
+                                                        egui::Label::new(
+                                                            egui::RichText::new(&display_text)
+                                                                .monospace()
+                                                                .size(11.0)
+                                                                .color(theme.fg_secondary())
+                                                        ).wrap()
+                                                    );
+                                                });
+                                        });
                                 });
                         },
                     );
@@ -10192,6 +11511,7 @@ mod remote_gui {
                     let mut should_close = false;
                     let mut new_popup_state: Option<PopupState> = None;
                     let mut actions_selected = self.actions_selected;
+                    let mut actions_list_filter = self.actions_list_filter.clone();
                     let actions_clone = self.actions.clone();
 
                     // State for opening editor
@@ -10202,8 +11522,53 @@ mod remote_gui {
                         egui::ViewportId::from_hash_of("actions_list_window"),
                         egui::ViewportBuilder::default()
                             .with_title("Actions - Clay MUD Client")
-                            .with_inner_size([450.0, 280.0]),
+                            .with_inner_size([500.0, 344.0]),
                         |ctx, _class| {
+                            // Apply popup styling
+                            ctx.style_mut(|style| {
+                                style.visuals.window_fill = theme.bg_elevated();
+                                style.visuals.panel_fill = theme.bg_elevated();
+                                style.visuals.window_stroke = egui::Stroke::NONE;
+                                style.visuals.window_shadow = egui::epaint::Shadow::NONE;
+
+                                let widget_bg = theme.bg_deep();
+                                let widget_rounding = egui::Rounding::same(4.0);
+
+                                style.visuals.widgets.noninteractive.bg_fill = widget_bg;
+                                style.visuals.widgets.noninteractive.bg_stroke = egui::Stroke::NONE;
+                                style.visuals.widgets.noninteractive.fg_stroke = egui::Stroke::NONE;
+                                style.visuals.widgets.noninteractive.rounding = widget_rounding;
+                                style.visuals.widgets.noninteractive.weak_bg_fill = widget_bg;
+
+                                style.visuals.widgets.inactive.bg_fill = theme.bg_hover();
+                                style.visuals.widgets.inactive.bg_stroke = egui::Stroke::NONE;
+                                style.visuals.widgets.inactive.fg_stroke = egui::Stroke::NONE;
+                                style.visuals.widgets.inactive.rounding = widget_rounding;
+                                style.visuals.widgets.inactive.weak_bg_fill = theme.bg_hover();
+
+                                style.visuals.widgets.hovered.bg_fill = theme.bg_hover();
+                                style.visuals.widgets.hovered.bg_stroke = egui::Stroke::NONE;
+                                style.visuals.widgets.hovered.fg_stroke = egui::Stroke::NONE;
+                                style.visuals.widgets.hovered.rounding = widget_rounding;
+                                style.visuals.widgets.hovered.weak_bg_fill = theme.bg_hover();
+
+                                style.visuals.widgets.active.bg_fill = theme.accent_dim();
+                                style.visuals.widgets.active.bg_stroke = egui::Stroke::NONE;
+                                style.visuals.widgets.active.fg_stroke = egui::Stroke::NONE;
+                                style.visuals.widgets.active.rounding = widget_rounding;
+                                style.visuals.widgets.active.weak_bg_fill = theme.accent_dim();
+
+                                style.visuals.widgets.open.bg_fill = theme.bg_hover();
+                                style.visuals.widgets.open.bg_stroke = egui::Stroke::NONE;
+                                style.visuals.widgets.open.fg_stroke = egui::Stroke::NONE;
+                                style.visuals.widgets.open.rounding = widget_rounding;
+                                style.visuals.widgets.open.weak_bg_fill = theme.bg_hover();
+
+                                style.visuals.selection.bg_fill = Color32::from_rgba_unmultiplied(34, 211, 238, 38);
+                                style.visuals.selection.stroke = egui::Stroke::NONE;
+                                style.visuals.extreme_bg_color = widget_bg;
+                            });
+
                             if ctx.input(|i| i.key_pressed(egui::Key::Escape)) ||
                                ctx.input(|i| i.viewport().close_requested()) {
                                 should_close = true;
@@ -10211,74 +11576,198 @@ mod remote_gui {
 
                             // Bottom panel for buttons
                             egui::TopBottomPanel::bottom("actions_buttons")
-                                .exact_height(35.0)
+                                .exact_height(44.0)
+                                .frame(egui::Frame::none()
+                                    .fill(theme.bg_surface())
+                                    .stroke(egui::Stroke::NONE)
+                                    .inner_margin(egui::Margin { left: 16.0, right: 17.0, top: 8.0, bottom: 8.0 }))
                                 .show(ctx, |ui| {
-                                    ui.add_space(5.0);
-                                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                        if ui.button("Ok").clicked() {
-                                            should_close = true;
-                                        }
-                                        if ui.button("Delete").clicked() && !actions_clone.is_empty() {
+                                    ui.horizontal(|ui| {
+                                        ui.spacing_mut().item_spacing = egui::vec2(8.0, 0.0);
+
+                                        // Delete button (danger) - left aligned
+                                        if ui.add(egui::Button::new(
+                                            egui::RichText::new("DELETE").size(11.0).color(theme.error()).family(egui::FontFamily::Monospace))
+                                            .fill(Color32::TRANSPARENT)
+                                            .stroke(egui::Stroke::new(1.0, theme.error_dim()))
+                                            .rounding(egui::Rounding::same(4.0))
+                                            .min_size(egui::vec2(70.0, 28.0))
+                                        ).clicked() && !actions_clone.is_empty() {
                                             new_popup_state = Some(PopupState::ActionConfirmDelete);
                                         }
-                                        if ui.button("Edit").clicked() && !actions_clone.is_empty() {
-                                            open_editor_idx = Some(actions_selected);
-                                        }
-                                        if ui.button("Add").clicked() {
-                                            add_new_action = true;
-                                        }
+
+                                        // Spacer to push remaining buttons to the right
+                                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                            ui.spacing_mut().item_spacing = egui::vec2(8.0, 0.0);
+
+                                            // OK button (primary)
+                                            if ui.add(egui::Button::new(
+                                                egui::RichText::new("OK").size(11.0).color(theme.bg_deep()).strong().family(egui::FontFamily::Monospace))
+                                                .fill(theme.accent_dim())
+                                                .stroke(egui::Stroke::NONE)
+                                                .rounding(egui::Rounding::same(4.0))
+                                                .min_size(egui::vec2(70.0, 28.0))
+                                            ).clicked() {
+                                                should_close = true;
+                                            }
+
+                                            // Edit button (secondary)
+                                            if ui.add(egui::Button::new(
+                                                egui::RichText::new("EDIT").size(11.0).color(theme.fg_secondary()).family(egui::FontFamily::Monospace))
+                                                .fill(theme.bg_hover())
+                                                .stroke(egui::Stroke::new(1.0, theme.border_medium()))
+                                                .rounding(egui::Rounding::same(4.0))
+                                                .min_size(egui::vec2(70.0, 28.0))
+                                            ).clicked() && !actions_clone.is_empty() {
+                                                open_editor_idx = Some(actions_selected);
+                                            }
+
+                                            // Add button (secondary)
+                                            if ui.add(egui::Button::new(
+                                                egui::RichText::new("ADD").size(11.0).color(theme.fg_secondary()).family(egui::FontFamily::Monospace))
+                                                .fill(theme.bg_hover())
+                                                .stroke(egui::Stroke::new(1.0, theme.border_medium()))
+                                                .rounding(egui::Rounding::same(4.0))
+                                                .min_size(egui::vec2(70.0, 28.0))
+                                            ).clicked() {
+                                                add_new_action = true;
+                                            }
+                                        });
                                     });
                                 });
 
-                            egui::CentralPanel::default().show(ctx, |ui| {
-                                // Actions list with columns: Name, World, Pattern
-                                ui.label(egui::RichText::new("Saved Actions").strong());
-                                ui.separator();
+                            egui::CentralPanel::default()
+                                .frame(egui::Frame::none()
+                                    .fill(theme.bg_elevated())
+                                    .inner_margin(egui::Margin::same(16.0)))
+                                .show(ctx, |ui| {
+                                    // Filter input
+                                    let filter_rect = ui.allocate_space(egui::vec2(ui.available_width(), 28.0)).1;
+                                    ui.painter().rect_filled(filter_rect, egui::Rounding::same(4.0), theme.bg_deep());
+                                    let filter_inner = filter_rect.shrink2(egui::vec2(8.0, 4.0));
+                                    let mut filter_ui = ui.new_child(egui::UiBuilder::new()
+                                        .max_rect(filter_inner)
+                                        .layout(egui::Layout::left_to_right(egui::Align::Center)));
+                                    let filter_edit = TextEdit::singleline(&mut actions_list_filter)
+                                        .frame(false)
+                                        .hint_text(egui::RichText::new("Filter actions...").color(theme.fg_dim()))
+                                        .desired_width(filter_inner.width())
+                                        .text_color(theme.fg())
+                                        .font(egui::FontId::monospace(12.0));
+                                    filter_ui.add(filter_edit);
+                                    ui.add_space(12.0);
 
-                                if actions_clone.is_empty() {
-                                    ui.label("No actions defined.");
-                                } else {
-                                    egui::ScrollArea::vertical()
-                                        .auto_shrink([false; 2])
-                                        .show(ui, |ui| {
-                                            egui::Grid::new("actions_list_grid")
-                                                .num_columns(3)
-                                                .min_col_width(80.0)
-                                                .spacing([10.0, 4.0])
-                                                .striped(true)
-                                                .show(ui, |ui| {
-                                                    // Header
-                                                    ui.label(egui::RichText::new("Name").strong());
-                                                    ui.label(egui::RichText::new("World").strong());
-                                                    ui.label(egui::RichText::new("Pattern").strong());
-                                                    ui.end_row();
+                                    // Table header row
+                                    let row_height = 24.0;
+                                    let col_widths = [140.0, 100.0, 220.0]; // Name, World, Pattern
+                                    let header_rect = ui.allocate_space(egui::vec2(ui.available_width(), row_height)).1;
+                                    let header_y = header_rect.center().y;
+                                    ui.painter().text(
+                                        egui::pos2(header_rect.left() + 4.0, header_y),
+                                        egui::Align2::LEFT_CENTER,
+                                        "Name",
+                                        egui::FontId::monospace(11.0),
+                                        theme.fg_muted());
+                                    ui.painter().text(
+                                        egui::pos2(header_rect.left() + col_widths[0], header_y),
+                                        egui::Align2::LEFT_CENTER,
+                                        "World",
+                                        egui::FontId::monospace(11.0),
+                                        theme.fg_muted());
+                                    ui.painter().text(
+                                        egui::pos2(header_rect.left() + col_widths[0] + col_widths[1], header_y),
+                                        egui::Align2::LEFT_CENTER,
+                                        "Pattern",
+                                        egui::FontId::monospace(11.0),
+                                        theme.fg_muted());
 
-                                                    // Actions
-                                                    for (idx, action) in actions_clone.iter().enumerate() {
-                                                        let is_selected = idx == actions_selected;
-                                                        let name_text = if is_selected {
-                                                            egui::RichText::new(&action.name).strong().color(egui::Color32::WHITE)
-                                                        } else {
-                                                            egui::RichText::new(&action.name)
-                                                        };
-                                                        if ui.selectable_label(is_selected, name_text).clicked() {
-                                                            actions_selected = idx;
-                                                        }
-                                                        let world_display = if action.world.is_empty() { "(all)" } else { &action.world };
-                                                        ui.label(world_display);
-                                                        let pattern_display = if action.pattern.is_empty() { "(manual)" } else { &action.pattern };
-                                                        ui.label(pattern_display);
-                                                        ui.end_row();
-                                                    }
-                                                });
+                                    ui.add_space(4.0);
+                                    ui.add(egui::Separator::default().spacing(0.0));
+                                    ui.add_space(4.0);
+
+                                    // Build filtered list of actions
+                                    let filter_lower = actions_list_filter.to_lowercase();
+                                    let filtered_actions: Vec<(usize, &Action)> = actions_clone.iter()
+                                        .enumerate()
+                                        .filter(|(_, a)| {
+                                            if filter_lower.is_empty() {
+                                                true
+                                            } else {
+                                                a.name.to_lowercase().contains(&filter_lower) ||
+                                                a.world.to_lowercase().contains(&filter_lower) ||
+                                                a.pattern.to_lowercase().contains(&filter_lower)
+                                            }
+                                        })
+                                        .collect();
+
+                                    if filtered_actions.is_empty() {
+                                        ui.add_space(8.0);
+                                        let msg = if actions_clone.is_empty() { "No actions defined." } else { "No actions found." };
+                                        ui.label(egui::RichText::new(msg)
+                                            .size(12.0)
+                                            .color(theme.fg_muted())
+                                            .family(egui::FontFamily::Monospace));
+                                    } else {
+                                        ScrollArea::vertical().auto_shrink([false; 2]).show(ui, |ui| {
+                                            for (idx, action) in filtered_actions.iter() {
+                                                let is_selected = *idx == actions_selected;
+
+                                                // Full row as a clickable area
+                                                let row_rect = ui.allocate_space(egui::vec2(ui.available_width(), row_height)).1;
+                                                let response = ui.interact(row_rect, ui.id().with(idx), egui::Sense::click());
+
+                                                // Draw selection/hover background for full row
+                                                if is_selected {
+                                                    ui.painter().rect_filled(row_rect, egui::Rounding::same(2.0),
+                                                        Color32::from_rgba_unmultiplied(34, 211, 238, 38));
+                                                } else if response.hovered() {
+                                                    ui.painter().rect_filled(row_rect, egui::Rounding::same(2.0), theme.bg_hover());
+                                                }
+
+                                                if response.clicked() {
+                                                    actions_selected = *idx;
+                                                }
+
+                                                // Draw row content
+                                                let col_x = row_rect.left() + 4.0;
+                                                let text_y = row_rect.center().y;
+
+                                                // Name column
+                                                let name_color = if is_selected { theme.fg() } else { theme.fg_secondary() };
+                                                ui.painter().text(
+                                                    egui::pos2(col_x, text_y),
+                                                    egui::Align2::LEFT_CENTER,
+                                                    &action.name,
+                                                    egui::FontId::monospace(12.0),
+                                                    name_color);
+
+                                                // World column
+                                                let world_display = if action.world.is_empty() { "(all)" } else { &action.world };
+                                                ui.painter().text(
+                                                    egui::pos2(row_rect.left() + col_widths[0], text_y),
+                                                    egui::Align2::LEFT_CENTER,
+                                                    world_display,
+                                                    egui::FontId::monospace(12.0),
+                                                    theme.fg_muted());
+
+                                                // Pattern column
+                                                let pattern_display = if action.pattern.is_empty() { "(manual)" } else { &action.pattern };
+                                                ui.painter().text(
+                                                    egui::pos2(row_rect.left() + col_widths[0] + col_widths[1], text_y),
+                                                    egui::Align2::LEFT_CENTER,
+                                                    pattern_display,
+                                                    egui::FontId::monospace(12.0),
+                                                    theme.fg_muted());
+                                            }
                                         });
-                                }
-                            });
+                                    }
+                                });
                         },
                     );
 
                     // Apply changes back to self
                     self.actions_selected = actions_selected;
+                    self.actions_list_filter = actions_list_filter;
 
                     if let Some(state) = new_popup_state {
                         self.popup_state = state;
@@ -10326,8 +11815,53 @@ mod remote_gui {
                         egui::ViewportId::from_hash_of("actions_editor_window"),
                         egui::ViewportBuilder::default()
                             .with_title(title)
-                            .with_inner_size([400.0, 280.0]),
+                            .with_inner_size([450.0, 340.0]),
                         |ctx, _class| {
+                            // Apply popup styling
+                            ctx.style_mut(|style| {
+                                style.visuals.window_fill = theme.bg_elevated();
+                                style.visuals.panel_fill = theme.bg_elevated();
+                                style.visuals.window_stroke = egui::Stroke::NONE;
+                                style.visuals.window_shadow = egui::epaint::Shadow::NONE;
+
+                                let widget_bg = theme.bg_deep();
+                                let widget_rounding = egui::Rounding::same(4.0);
+
+                                style.visuals.widgets.noninteractive.bg_fill = widget_bg;
+                                style.visuals.widgets.noninteractive.bg_stroke = egui::Stroke::NONE;
+                                style.visuals.widgets.noninteractive.fg_stroke = egui::Stroke::NONE;
+                                style.visuals.widgets.noninteractive.rounding = widget_rounding;
+                                style.visuals.widgets.noninteractive.weak_bg_fill = widget_bg;
+
+                                style.visuals.widgets.inactive.bg_fill = theme.bg_hover();
+                                style.visuals.widgets.inactive.bg_stroke = egui::Stroke::NONE;
+                                style.visuals.widgets.inactive.fg_stroke = egui::Stroke::NONE;
+                                style.visuals.widgets.inactive.rounding = widget_rounding;
+                                style.visuals.widgets.inactive.weak_bg_fill = theme.bg_hover();
+
+                                style.visuals.widgets.hovered.bg_fill = theme.bg_hover();
+                                style.visuals.widgets.hovered.bg_stroke = egui::Stroke::NONE;
+                                style.visuals.widgets.hovered.fg_stroke = egui::Stroke::NONE;
+                                style.visuals.widgets.hovered.rounding = widget_rounding;
+                                style.visuals.widgets.hovered.weak_bg_fill = theme.bg_hover();
+
+                                style.visuals.widgets.active.bg_fill = theme.accent_dim();
+                                style.visuals.widgets.active.bg_stroke = egui::Stroke::NONE;
+                                style.visuals.widgets.active.fg_stroke = egui::Stroke::NONE;
+                                style.visuals.widgets.active.rounding = widget_rounding;
+                                style.visuals.widgets.active.weak_bg_fill = theme.accent_dim();
+
+                                style.visuals.widgets.open.bg_fill = theme.bg_hover();
+                                style.visuals.widgets.open.bg_stroke = egui::Stroke::NONE;
+                                style.visuals.widgets.open.fg_stroke = egui::Stroke::NONE;
+                                style.visuals.widgets.open.rounding = widget_rounding;
+                                style.visuals.widgets.open.weak_bg_fill = theme.bg_hover();
+
+                                style.visuals.selection.bg_fill = Color32::from_rgba_unmultiplied(34, 211, 238, 38);
+                                style.visuals.selection.stroke = egui::Stroke::NONE;
+                                style.visuals.extreme_bg_color = widget_bg;
+                            });
+
                             if ctx.input(|i| i.key_pressed(egui::Key::Escape)) ||
                                ctx.input(|i| i.viewport().close_requested()) {
                                 should_close = true;
@@ -10335,14 +11869,34 @@ mod remote_gui {
 
                             // Bottom panel for buttons
                             egui::TopBottomPanel::bottom("action_editor_buttons")
-                                .exact_height(35.0)
+                                .exact_height(44.0)
+                                .frame(egui::Frame::none()
+                                    .fill(theme.bg_surface())
+                                    .stroke(egui::Stroke::NONE)
+                                    .inner_margin(egui::Margin { left: 16.0, right: 17.0, top: 8.0, bottom: 8.0 }))
                                 .show(ctx, |ui| {
-                                    ui.add_space(5.0);
                                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                        if ui.button("Cancel").clicked() {
+                                        ui.spacing_mut().item_spacing = egui::vec2(8.0, 0.0);
+
+                                        // Cancel button (secondary)
+                                        if ui.add(egui::Button::new(
+                                            egui::RichText::new("CANCEL").size(11.0).color(theme.fg_secondary()).family(egui::FontFamily::Monospace))
+                                            .fill(theme.bg_hover())
+                                            .stroke(egui::Stroke::new(1.0, theme.border_medium()))
+                                            .rounding(egui::Rounding::same(4.0))
+                                            .min_size(egui::vec2(70.0, 28.0))
+                                        ).clicked() {
                                             should_close = true;
                                         }
-                                        if ui.button("Save").clicked() {
+
+                                        // Save button (primary)
+                                        if ui.add(egui::Button::new(
+                                            egui::RichText::new("SAVE").size(11.0).color(theme.bg_deep()).strong().family(egui::FontFamily::Monospace))
+                                            .fill(theme.accent_dim())
+                                            .stroke(egui::Stroke::NONE)
+                                            .rounding(egui::Rounding::same(4.0))
+                                            .min_size(egui::vec2(70.0, 28.0))
+                                        ).clicked() {
                                             // Validate
                                             let name = edit_action_name.trim();
                                             if name.is_empty() {
@@ -10366,57 +11920,183 @@ mod remote_gui {
                                     });
                                 });
 
-                            egui::CentralPanel::default().show(ctx, |ui| {
-                                egui::Grid::new("action_editor_grid")
-                                    .num_columns(2)
-                                    .spacing([10.0, 8.0])
-                                    .show(ui, |ui| {
-                                        ui.label("Name:");
-                                        ui.add(egui::TextEdit::singleline(&mut edit_action_name)
-                                            .desired_width(250.0));
-                                        ui.end_row();
+                            egui::CentralPanel::default()
+                                .frame(egui::Frame::none()
+                                    .fill(theme.bg_elevated())
+                                    .inner_margin(egui::Margin { left: 20.0, right: 16.0, top: 20.0, bottom: 16.0 }))
+                                .show(ctx, |ui| {
+                                    // Layout dimensions (matching World Editor)
+                                    let label_width = 90.0;
+                                    let label_spacing = 12.0;
+                                    let row_height = 28.0;
 
-                                        ui.label("World:");
-                                        ui.add(egui::TextEdit::singleline(&mut edit_action_world)
-                                            .hint_text("(empty = all worlds)")
-                                            .desired_width(250.0));
-                                        ui.end_row();
+                                    // Helper to draw chevron (down arrow) like World Editor
+                                    let draw_chevron = |painter: &egui::Painter, center: egui::Pos2, color: Color32| {
+                                        let half_width = 5.0;
+                                        let half_height = 3.0;
+                                        let stroke = egui::Stroke::new(1.5, color);
+                                        painter.line_segment(
+                                            [egui::pos2(center.x - half_width, center.y - half_height),
+                                             egui::pos2(center.x, center.y + half_height)],
+                                            stroke
+                                        );
+                                        painter.line_segment(
+                                            [egui::pos2(center.x + half_width, center.y - half_height),
+                                             egui::pos2(center.x, center.y + half_height)],
+                                            stroke
+                                        );
+                                    };
 
-                                        ui.label("Match Type:");
+                                    // Helper for form rows with right-aligned uppercase labels
+                                    let form_row = |ui: &mut egui::Ui, label: &str, add_widget: &mut dyn FnMut(&mut egui::Ui)| {
+                                        ui.horizontal(|ui| {
+                                            ui.spacing_mut().item_spacing = egui::vec2(0.0, 0.0);
+                                            ui.set_height(row_height);
+                                            // Right-aligned label
+                                            ui.allocate_ui_with_layout(
+                                                egui::vec2(label_width, row_height),
+                                                egui::Layout::right_to_left(egui::Align::Center),
+                                                |ui| {
+                                                    ui.label(egui::RichText::new(label.to_uppercase())
+                                                        .size(10.0)
+                                                        .color(theme.fg_muted()));
+                                                }
+                                            );
+                                            ui.add_space(label_spacing);
+                                            add_widget(ui);
+                                        });
+                                        ui.add_space(6.0);
+                                    };
+
+                                    // Helper for styled text input (no border, just background)
+                                    let styled_text_input = |ui: &mut egui::Ui, text: &mut String, hint: Option<&str>, id_salt: &str| {
+                                        let width = ui.available_width();
+                                        let field_rect = ui.allocate_space(egui::vec2(width, row_height)).1;
+                                        ui.painter().rect_filled(field_rect, egui::Rounding::same(4.0), theme.bg_deep());
+                                        let inner_rect = field_rect.shrink2(egui::vec2(8.0, 4.0));
+                                        let mut child_ui = ui.new_child(egui::UiBuilder::new()
+                                            .max_rect(inner_rect)
+                                            .layout(egui::Layout::left_to_right(egui::Align::Center)));
+                                        let mut text_edit = TextEdit::singleline(text)
+                                            .frame(false)
+                                            .desired_width(inner_rect.width())
+                                            .text_color(theme.fg())
+                                            .font(egui::FontId::monospace(11.0));
+                                        if let Some(h) = hint {
+                                            text_edit = text_edit.hint_text(egui::RichText::new(h).color(theme.fg_dim()));
+                                        }
+                                        child_ui.add(text_edit);
+                                        let _ = id_salt; // Used for uniqueness if needed
+                                    };
+
+                                    // Name
+                                    form_row(ui, "Name", &mut |ui| {
+                                        styled_text_input(ui, &mut edit_action_name, None, "action_name");
+                                    });
+
+                                    // World
+                                    form_row(ui, "World", &mut |ui| {
+                                        styled_text_input(ui, &mut edit_action_world, Some("(empty = all worlds)"), "action_world");
+                                    });
+
+                                    // Match Type (custom styled dropdown, full width, NO border - exactly like World Editor)
+                                    form_row(ui, "Match Type", &mut |ui| {
+                                        let dropdown_id = ui.id().with("match_type_dropdown");
+                                        let _is_open = ui.memory(|mem| mem.is_popup_open(dropdown_id));
+                                        let dropdown_width = ui.available_width();
+
+                                        let button_rect = ui.allocate_space(egui::vec2(dropdown_width, row_height)).1;
+                                        let response = ui.interact(button_rect, dropdown_id.with("button"), egui::Sense::click());
+
+                                        // Background only - NO border
+                                        ui.painter().rect_filled(button_rect, egui::Rounding::same(4.0), theme.bg_deep());
+
                                         let match_type_text = match edit_action_match_type {
                                             MatchType::Regexp => "Regexp",
                                             MatchType::Wildcard => "Wildcard",
                                         };
-                                        if ui.button(match_type_text).clicked() {
-                                            edit_action_match_type = edit_action_match_type.next();
+                                        ui.painter().text(
+                                            egui::pos2(button_rect.min.x + 12.0, button_rect.center().y),
+                                            egui::Align2::LEFT_CENTER,
+                                            match_type_text,
+                                            egui::FontId::monospace(11.0),
+                                            theme.fg()
+                                        );
+
+                                        draw_chevron(ui.painter(), egui::pos2(button_rect.max.x - 16.0, button_rect.center().y), theme.fg_muted());
+
+                                        if response.clicked() {
+                                            ui.memory_mut(|mem| mem.toggle_popup(dropdown_id));
                                         }
-                                        ui.end_row();
 
-                                        ui.label("Pattern:");
-                                        let pattern_hint = match edit_action_match_type {
-                                            MatchType::Regexp => "(regex, empty = manual only)",
-                                            MatchType::Wildcard => "(wildcard: * and ?, empty = manual only)",
-                                        };
-                                        ui.add(egui::TextEdit::singleline(&mut edit_action_pattern)
-                                            .hint_text(pattern_hint)
-                                            .desired_width(250.0));
-                                        ui.end_row();
+                                        egui::popup_below_widget(ui, dropdown_id, &response, egui::PopupCloseBehavior::CloseOnClickOutside, |ui| {
+                                            ui.set_min_width(dropdown_width);
+                                            ui.style_mut().visuals.widgets.inactive.fg_stroke = egui::Stroke::new(1.0, theme.fg());
+                                            ui.style_mut().visuals.widgets.hovered.fg_stroke = egui::Stroke::new(1.0, theme.fg());
+                                            ui.style_mut().visuals.widgets.active.fg_stroke = egui::Stroke::new(1.0, theme.fg());
+                                            if ui.selectable_label(edit_action_match_type == MatchType::Regexp,
+                                                egui::RichText::new("Regexp").size(11.0).color(theme.fg()).family(egui::FontFamily::Monospace)).clicked() {
+                                                edit_action_match_type = MatchType::Regexp;
+                                                ui.memory_mut(|mem| mem.close_popup());
+                                            }
+                                            if ui.selectable_label(edit_action_match_type == MatchType::Wildcard,
+                                                egui::RichText::new("Wildcard").size(11.0).color(theme.fg()).family(egui::FontFamily::Monospace)).clicked() {
+                                                edit_action_match_type = MatchType::Wildcard;
+                                                ui.memory_mut(|mem| mem.close_popup());
+                                            }
+                                        });
+                                    });
+                                    ui.add_space(6.0);
 
-                                        ui.label("Command:");
-                                        ui.end_row();
+                                    // Pattern
+                                    let pattern_hint = match edit_action_match_type {
+                                        MatchType::Regexp => "(regex, empty = manual only)",
+                                        MatchType::Wildcard => "(wildcard: * ?, empty = manual only)",
+                                    };
+                                    form_row(ui, "Pattern", &mut |ui| {
+                                        styled_text_input(ui, &mut edit_action_pattern, Some(pattern_hint), "action_pattern");
                                     });
 
-                                // Larger command area
-                                ui.add(egui::TextEdit::multiline(&mut edit_action_command)
-                                    .hint_text("Commands (semicolon-separated)")
-                                    .desired_width(f32::INFINITY)
-                                    .desired_rows(5));
+                                    ui.add_space(4.0);
 
-                                // Error message
-                                if let Some(ref err) = action_error {
-                                    ui.colored_label(egui::Color32::RED, err);
-                                }
-                            });
+                                    // Command label (right-aligned like other labels)
+                                    ui.horizontal(|ui| {
+                                        ui.spacing_mut().item_spacing = egui::vec2(0.0, 0.0);
+                                        ui.allocate_ui_with_layout(
+                                            egui::vec2(label_width, row_height),
+                                            egui::Layout::right_to_left(egui::Align::Center),
+                                            |ui| {
+                                                ui.label(egui::RichText::new("COMMAND")
+                                                    .size(10.0)
+                                                    .color(theme.fg_muted()));
+                                            }
+                                        );
+                                    });
+                                    ui.add_space(4.0);
+
+                                    // Command area with background (full width)
+                                    let cmd_rect = ui.allocate_space(egui::vec2(ui.available_width(), 100.0)).1;
+                                    ui.painter().rect_filled(cmd_rect, egui::Rounding::same(4.0), theme.bg_deep());
+                                    let cmd_inner = cmd_rect.shrink2(egui::vec2(8.0, 6.0));
+                                    let mut cmd_ui = ui.new_child(egui::UiBuilder::new()
+                                        .max_rect(cmd_inner)
+                                        .layout(egui::Layout::left_to_right(egui::Align::TOP)));
+                                    cmd_ui.add(egui::TextEdit::multiline(&mut edit_action_command)
+                                        .frame(false)
+                                        .hint_text(egui::RichText::new("Commands (semicolon-separated)").color(theme.fg_dim()))
+                                        .desired_width(cmd_inner.width())
+                                        .desired_rows(3)
+                                        .text_color(theme.fg())
+                                        .font(egui::FontId::monospace(11.0)));
+
+                                    // Error message
+                                    if let Some(ref err) = action_error {
+                                        ui.add_space(8.0);
+                                        ui.label(egui::RichText::new(err)
+                                            .size(11.0)
+                                            .color(theme.error()));
+                                    }
+                                });
                         },
                     );
 
@@ -10464,26 +12144,108 @@ mod remote_gui {
                         egui::ViewportId::from_hash_of("action_confirm_delete_window"),
                         egui::ViewportBuilder::default()
                             .with_title("Confirm Delete - Clay MUD Client")
-                            .with_inner_size([300.0, 100.0]),
+                            .with_inner_size([340.0, 140.0]),
                         |ctx, _class| {
-                            egui::CentralPanel::default().show(ctx, |ui| {
-                                if ui.input(|i| i.key_pressed(egui::Key::Escape)) ||
-                                   ui.input(|i| i.viewport().close_requested()) {
-                                    should_close = true;
-                                }
+                            // Apply popup styling
+                            ctx.style_mut(|style| {
+                                style.visuals.window_fill = theme.bg_elevated();
+                                style.visuals.panel_fill = theme.bg_elevated();
+                                style.visuals.window_stroke = egui::Stroke::NONE;
+                                style.visuals.window_shadow = egui::epaint::Shadow::NONE;
 
-                                ui.label(format!("Delete action '{}'?", action_name));
-                                ui.add_space(8.0);
+                                let widget_bg = theme.bg_deep();
+                                let widget_rounding = egui::Rounding::same(4.0);
 
-                                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                    if ui.button("No").clicked() {
-                                        should_close = true;
-                                    }
-                                    if ui.button("Yes").clicked() {
-                                        should_delete = true;
-                                    }
-                                });
+                                style.visuals.widgets.noninteractive.bg_fill = widget_bg;
+                                style.visuals.widgets.noninteractive.bg_stroke = egui::Stroke::NONE;
+                                style.visuals.widgets.noninteractive.fg_stroke = egui::Stroke::NONE;
+                                style.visuals.widgets.noninteractive.rounding = widget_rounding;
+                                style.visuals.widgets.noninteractive.weak_bg_fill = widget_bg;
+
+                                style.visuals.widgets.inactive.bg_fill = theme.bg_hover();
+                                style.visuals.widgets.inactive.bg_stroke = egui::Stroke::NONE;
+                                style.visuals.widgets.inactive.fg_stroke = egui::Stroke::NONE;
+                                style.visuals.widgets.inactive.rounding = widget_rounding;
+                                style.visuals.widgets.inactive.weak_bg_fill = theme.bg_hover();
+
+                                style.visuals.widgets.hovered.bg_fill = theme.bg_hover();
+                                style.visuals.widgets.hovered.bg_stroke = egui::Stroke::NONE;
+                                style.visuals.widgets.hovered.fg_stroke = egui::Stroke::NONE;
+                                style.visuals.widgets.hovered.rounding = widget_rounding;
+                                style.visuals.widgets.hovered.weak_bg_fill = theme.bg_hover();
+
+                                style.visuals.widgets.active.bg_fill = theme.accent_dim();
+                                style.visuals.widgets.active.bg_stroke = egui::Stroke::NONE;
+                                style.visuals.widgets.active.fg_stroke = egui::Stroke::NONE;
+                                style.visuals.widgets.active.rounding = widget_rounding;
+                                style.visuals.widgets.active.weak_bg_fill = theme.accent_dim();
+
+                                style.visuals.widgets.open.bg_fill = theme.bg_hover();
+                                style.visuals.widgets.open.bg_stroke = egui::Stroke::NONE;
+                                style.visuals.widgets.open.fg_stroke = egui::Stroke::NONE;
+                                style.visuals.widgets.open.rounding = widget_rounding;
+                                style.visuals.widgets.open.weak_bg_fill = theme.bg_hover();
+
+                                style.visuals.selection.bg_fill = Color32::from_rgba_unmultiplied(34, 211, 238, 38);
+                                style.visuals.selection.stroke = egui::Stroke::NONE;
+                                style.visuals.extreme_bg_color = widget_bg;
                             });
+
+                            if ctx.input(|i| i.key_pressed(egui::Key::Escape)) ||
+                               ctx.input(|i| i.viewport().close_requested()) {
+                                should_close = true;
+                            }
+
+                            // Bottom panel for buttons
+                            egui::TopBottomPanel::bottom("action_confirm_delete_buttons")
+                                .exact_height(44.0)
+                                .frame(egui::Frame::none()
+                                    .fill(theme.bg_surface())
+                                    .stroke(egui::Stroke::NONE)
+                                    .inner_margin(egui::Margin { left: 16.0, right: 17.0, top: 8.0, bottom: 8.0 }))
+                                .show(ctx, |ui| {
+                                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                        ui.spacing_mut().item_spacing = egui::vec2(8.0, 0.0);
+
+                                        // No button (secondary)
+                                        if ui.add(egui::Button::new(
+                                            egui::RichText::new("NO").size(11.0).color(theme.fg_secondary()).family(egui::FontFamily::Monospace))
+                                            .fill(theme.bg_hover())
+                                            .stroke(egui::Stroke::new(1.0, theme.border_medium()))
+                                            .rounding(egui::Rounding::same(4.0))
+                                            .min_size(egui::vec2(70.0, 28.0))
+                                        ).clicked() {
+                                            should_close = true;
+                                        }
+
+                                        // Yes button (danger)
+                                        if ui.add(egui::Button::new(
+                                            egui::RichText::new("YES").size(11.0).color(Color32::WHITE).strong().family(egui::FontFamily::Monospace))
+                                            .fill(theme.error_dim())
+                                            .stroke(egui::Stroke::NONE)
+                                            .rounding(egui::Rounding::same(4.0))
+                                            .min_size(egui::vec2(70.0, 28.0))
+                                        ).clicked() {
+                                            should_delete = true;
+                                        }
+                                    });
+                                });
+
+                            egui::CentralPanel::default()
+                                .frame(egui::Frame::none()
+                                    .fill(theme.bg_elevated())
+                                    .inner_margin(egui::Margin::same(16.0)))
+                                .show(ctx, |ui| {
+                                    ui.label(egui::RichText::new("CONFIRM DELETE")
+                                        .size(11.0)
+                                        .color(theme.fg_muted())
+                                        .strong());
+                                    ui.add_space(16.0);
+
+                                    ui.label(egui::RichText::new(format!("Delete action '{}'?", action_name))
+                                        .size(12.0)
+                                        .color(theme.fg()));
+                                });
                         },
                     );
 
@@ -11939,11 +13701,12 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                     app.worlds[world_index].settings.keep_alive_cmd = keep_alive_cmd.clone();
                                     // Save settings to persist changes
                                     let _ = save_settings(&app);
-                                    // Build settings message for broadcast
+                                    // Build settings message for broadcast (encrypt password)
                                     let settings_msg = WorldSettingsMsg {
                                         hostname,
                                         port,
                                         user,
+                                        password: encrypt_password(&password),
                                         use_ssl,
                                         log_file: if log_file.is_empty() { None } else { Some(log_file) },
                                         encoding,
@@ -12640,7 +14403,9 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                 app.worlds[world_index].settings.keep_alive_cmd = keep_alive_cmd.clone();
                                 let _ = save_settings(&app);
                                 let settings_msg = WorldSettingsMsg {
-                                    hostname, port, user, use_ssl,
+                                    hostname, port, user,
+                                    password: encrypt_password(&password),
+                                    use_ssl,
                                     log_file: if log_file.is_empty() { None } else { Some(log_file) },
                                     encoding,
                                     auto_connect_type: auto_login,

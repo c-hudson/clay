@@ -143,12 +143,15 @@ pub struct WorldStateMsg {
     pub pending_lines_ts: Vec<TimestampedLine>,
 }
 
-/// World settings for WebSocket protocol (password intentionally omitted)
+/// World settings for WebSocket protocol
+/// Password is always transmitted encrypted (with "ENC:" prefix)
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct WorldSettingsMsg {
     pub hostname: String,
     pub port: String,
     pub user: String,
+    #[serde(default)]
+    pub password: String,  // Always encrypted when transmitted
     pub use_ssl: bool,
     pub log_file: Option<String>,
     pub encoding: String,
