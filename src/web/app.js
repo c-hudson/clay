@@ -2756,19 +2756,17 @@
         };
 
         // Track button press timing for long-press detection
-        let upBtnPressStart = 0;
-        let downBtnPressStart = 0;
+        let upBtnTimer = null;
+        let upBtnLongPressed = false;
+        let downBtnTimer = null;
+        let downBtnLongPressed = false;
 
-        // Up button - short press: prev world, long press (3s+): prev history
+        // Up button - short press: prev world, long press (3s): prev history (triggers immediately at 3s)
         function upBtnStart(e) {
             e.preventDefault();
-            upBtnPressStart = Date.now();
-        }
-        function upBtnEnd(e) {
-            e.preventDefault();
-            e.stopPropagation();
-            const pressDuration = Date.now() - upBtnPressStart;
-            if (pressDuration >= 3000) {
+            upBtnLongPressed = false;
+            upBtnTimer = setTimeout(function() {
+                upBtnLongPressed = true;
                 // Long press: cycle to previous command in history
                 if (commandHistory.length > 0) {
                     if (historyIndex === -1) {
@@ -2778,7 +2776,17 @@
                     }
                     elements.input.value = commandHistory[historyIndex];
                 }
-            } else {
+                elements.input.focus();
+            }, 3000);
+        }
+        function upBtnEnd(e) {
+            e.preventDefault();
+            e.stopPropagation();
+            if (upBtnTimer) {
+                clearTimeout(upBtnTimer);
+                upBtnTimer = null;
+            }
+            if (!upBtnLongPressed) {
                 // Short press: cycle to previous active world
                 requestPrevWorld();
             }
@@ -2789,16 +2797,12 @@
         elements.mobileUpBtn.addEventListener('touchstart', upBtnStart, { passive: false });
         elements.mobileUpBtn.addEventListener('touchend', upBtnEnd, { passive: false });
 
-        // Down button - short press: next world, long press (3s+): next history
+        // Down button - short press: next world, long press (3s): next history (triggers immediately at 3s)
         function downBtnStart(e) {
             e.preventDefault();
-            downBtnPressStart = Date.now();
-        }
-        function downBtnEnd(e) {
-            e.preventDefault();
-            e.stopPropagation();
-            const pressDuration = Date.now() - downBtnPressStart;
-            if (pressDuration >= 3000) {
+            downBtnLongPressed = false;
+            downBtnTimer = setTimeout(function() {
+                downBtnLongPressed = true;
                 // Long press: cycle to next command in history
                 if (historyIndex !== -1) {
                     if (historyIndex < commandHistory.length - 1) {
@@ -2809,7 +2813,17 @@
                         elements.input.value = '';
                     }
                 }
-            } else {
+                elements.input.focus();
+            }, 3000);
+        }
+        function downBtnEnd(e) {
+            e.preventDefault();
+            e.stopPropagation();
+            if (downBtnTimer) {
+                clearTimeout(downBtnTimer);
+                downBtnTimer = null;
+            }
+            if (!downBtnLongPressed) {
                 // Short press: cycle to next active world
                 requestNextWorld();
             }
