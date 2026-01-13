@@ -8199,7 +8199,10 @@ mod remote_gui {
 
                             // Large "A" label on the right (added first in RTL layout)
                             let label_color = egui::Color32::from_gray(128);
-                            ui.label(egui::RichText::new("A").color(label_color).size(14.0));
+                            ui.vertical(|ui| {
+                                ui.add_space(5.0);
+                                ui.label(egui::RichText::new("A").color(label_color).size(14.0));
+                            });
 
                             // Slider dimensions
                             let slider_width = 80.0;
@@ -8214,7 +8217,7 @@ mod remote_gui {
                             if ui.is_rect_visible(rect) {
                                 let painter = ui.painter();
 
-                                // Draw triangle background (tall on left, point on right)
+                                // Draw triangle background (point on left, tall on right)
                                 let triangle_color = if theme.is_dark() {
                                     egui::Color32::from_gray(60)
                                 } else {
@@ -8224,7 +8227,7 @@ mod remote_gui {
                                 let triangle_points = vec![
                                     egui::pos2(rect.left() + 2.0, rect.bottom() - 2.0),  // Bottom left
                                     egui::pos2(rect.right() - 2.0, rect.bottom() - 2.0), // Bottom right
-                                    egui::pos2(rect.left() + 2.0, rect.top() + 2.0),     // Top left
+                                    egui::pos2(rect.right() - 2.0, rect.top() + 2.0),    // Top right
                                 ];
                                 painter.add(egui::Shape::convex_polygon(
                                     triangle_points,
@@ -8262,7 +8265,10 @@ mod remote_gui {
                             }
 
                             // Small "A" label on the left (added last in RTL layout)
-                            ui.label(egui::RichText::new("A").color(label_color).size(8.0));
+                            ui.vertical(|ui| {
+                                ui.add_space(5.0);
+                                ui.label(egui::RichText::new("A").color(label_color).size(8.0));
+                            });
                         });
                     });
                 });
