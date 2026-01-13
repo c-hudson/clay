@@ -124,6 +124,9 @@
     // Cached rendered output per world (array of DOM elements)
     let worldOutputCache = [];
 
+    // Partial line buffer per world (for handling split lines across reads)
+    let partialLines = {};
+
     // More-mode state (per world)
     let moreModeEnabled = true;
     let paused = false;
@@ -188,9 +191,9 @@
     let menuOpen = false;
     let mobileMenuOpen = false;
 
-    // Font size state: position 0-3 mapping to [10, 12, 14, 18] pixels
+    // Font size state: position 0-3 mapping to [8.5, 12, 14, 18] pixels
     let currentFontPos = 2;  // Default to position 2 (14px)
-    const fontSizes = [10, 12, 14, 18];
+    const fontSizes = [8.5, 12, 14, 18];
 
     // Device mode: 'desktop' or 'mobile'
     let deviceMode = 'desktop';
@@ -636,8 +639,25 @@
                     if (msg.data) {
                         // Get timestamp from message or use current time
                         const lineTs = msg.ts || Math.floor(Date.now() / 1000);
+
+                        // Prepend any partial line from previous read
+                        let data = msg.data;
+                        if (partialLines[msg.world_index]) {
+                            data = partialLines[msg.world_index] + data;
+                            partialLines[msg.world_index] = '';
+                        }
+
+                        // Check if data ends with a newline (complete line)
+                        const endsWithNewline = /[\r\n]$/.test(data);
+
                         // Split by any line ending
-                        const rawLines = msg.data.split(/\r\n|\n|\r/);
+                        const rawLines = data.split(/\r\n|\n|\r/);
+
+                        // If data doesn't end with newline, last element is a partial line
+                        if (!endsWithNewline && rawLines.length > 0) {
+                            partialLines[msg.world_index] = rawLines.pop();
+                        }
+
                         rawLines.forEach(line => {
                             // Strip ANSI codes to check if line has actual content
                             // Some MUDs send trailing ANSI reset codes after newlines

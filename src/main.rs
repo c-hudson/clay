@@ -8190,12 +8190,16 @@ mod remote_gui {
                         // Font size slider on the right side of menu bar
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                             // Define the 4 font size positions
-                            const FONT_SIZES: [f32; 4] = [10.0, 12.0, 14.0, 18.0];
+                            const FONT_SIZES: [f32; 4] = [8.5, 12.0, 14.0, 18.0];
 
                             // Find current position (0-3)
                             let current_pos = FONT_SIZES.iter()
                                 .position(|&s| (s - self.font_size).abs() < 0.5)
-                                .unwrap_or(1) as i32;
+                                .unwrap_or(2) as i32;
+
+                            // Small "A" label on the right (added first in RTL layout)
+                            let label_color = egui::Color32::from_gray(128);
+                            ui.label(egui::RichText::new("A").color(label_color).size(8.0));
 
                             // Slider dimensions
                             let slider_width = 80.0;
@@ -8210,7 +8214,7 @@ mod remote_gui {
                             if ui.is_rect_visible(rect) {
                                 let painter = ui.painter();
 
-                                // Draw triangle background (grows from left to right)
+                                // Draw triangle background (tall on left, point on right)
                                 let triangle_color = if theme.is_dark() {
                                     egui::Color32::from_gray(60)
                                 } else {
@@ -8220,28 +8224,13 @@ mod remote_gui {
                                 let triangle_points = vec![
                                     egui::pos2(rect.left() + 2.0, rect.bottom() - 2.0),  // Bottom left
                                     egui::pos2(rect.right() - 2.0, rect.bottom() - 2.0), // Bottom right
-                                    egui::pos2(rect.right() - 2.0, rect.top() + 2.0),    // Top right
+                                    egui::pos2(rect.left() + 2.0, rect.top() + 2.0),     // Top left
                                 ];
                                 painter.add(egui::Shape::convex_polygon(
                                     triangle_points,
                                     triangle_color,
                                     egui::Stroke::NONE,
                                 ));
-
-                                // Draw tick marks for the 4 positions
-                                let tick_color = if theme.is_dark() {
-                                    egui::Color32::from_gray(100)
-                                } else {
-                                    egui::Color32::from_gray(140)
-                                };
-
-                                for i in 0..4 {
-                                    let x = rect.left() + 6.0 + (i as f32) * ((slider_width - 12.0) / 3.0);
-                                    painter.line_segment(
-                                        [egui::pos2(x, rect.bottom() - 4.0), egui::pos2(x, rect.bottom() - 8.0)],
-                                        egui::Stroke::new(1.0, tick_color)
-                                    );
-                                }
 
                                 // Draw slider handle
                                 let handle_x = rect.left() + 6.0 + (current_pos as f32) * ((slider_width - 12.0) / 3.0);
@@ -8271,6 +8260,9 @@ mod remote_gui {
                                     }
                                 }
                             }
+
+                            // Large "A" label on the left (added last in RTL layout)
+                            ui.label(egui::RichText::new("A").color(label_color).size(14.0));
                         });
                     });
                 });
@@ -10701,8 +10693,8 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                 // Spawn reader task
                 let event_tx_read = event_tx.clone();
                 tokio::spawn(async move {
-                    let mut buffer = BytesMut::with_capacity(4096);
-                    buffer.resize(4096, 0);
+                    let mut buffer = BytesMut::with_capacity(10240);
+                    buffer.resize(10240, 0);
                     let mut line_buffer: Vec<u8> = Vec::new();
 
                     loop {
