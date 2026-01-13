@@ -8519,12 +8519,40 @@ mod remote_gui {
                     .show(ctx, |ui| {
                         ui.spacing_mut().item_spacing.x = 0.0; // Remove horizontal spacing
 
-                        // Use ScrollArea to allow input content to scroll when it exceeds panel height
-                        egui::ScrollArea::vertical()
+                        // Text input takes full area
+                        // Build layout job with spell check coloring (misspelled words in red)
+                        let input_id = egui::Id::new("main_input");
+                        let misspelled = self.find_misspelled_words();
+                        let font_id = egui::FontId::monospace(self.font_size);
+                        let default_color = theme.fg();
+                        let line_height = 16.0_f32; // Approximate line height for scrolling calc
+
+                        // Build layouter using actual text parameter (not pre-computed job)
+                        // This ensures cursor positioning works correctly when text changes
+                        let misspelled_ranges = misspelled;
+                        let layouter_font_id = font_id.clone();
+                        let layouter_default_color = default_color;
+
+                        // Calculate prompt width for offset
+                        let prompt_width = if !prompt_text.is_empty() {
+                            ui.fonts(|f| f.glyph_width(&egui::FontId::monospace(self.font_size), ' ')) * prompt_text.len() as f32
+                        } else {
+                            0.0
+                        };
+
+                        // Use ScrollArea to handle scrolling, with manual scroll-to-cursor
+                        let available_height = ui.available_height();
+                        let scroll_id = egui::Id::new("input_scroll_area");
+
+                        let mut scroll_to_y: Option<f32> = None;
+
+                        let scroll_output = egui::ScrollArea::vertical()
+                            .id_salt(scroll_id)
+                            .max_height(available_height)
                             .auto_shrink([false, false])
-                            .stick_to_bottom(true)
+                            .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden)
                             .show(ui, |ui| {
-                            ui.horizontal(|ui| {
+                            ui.horizontal_top(|ui| {
                                 // Show prompt if present (cyan colored like TUI)
                                 if !prompt_text.is_empty() {
                                     ui.label(egui::RichText::new(&prompt_text)
@@ -8532,232 +8560,262 @@ mod remote_gui {
                                         .color(theme.prompt()));
                                 }
 
-                                // Text input takes remaining width (no border)
-                                // Build layout job with spell check coloring (misspelled words in red)
-                                let input_id = egui::Id::new("main_input");
-                                let misspelled = self.find_misspelled_words();
-                                let font_id = egui::FontId::monospace(self.font_size);
-                                let default_color = theme.fg();
-
-                                // Build layouter using actual text parameter (not pre-computed job)
-                                // This ensures cursor positioning works correctly when text changes
-                                let misspelled_ranges = misspelled;
-                                let layouter_font_id = font_id.clone();
-                                let layouter_default_color = default_color;
-
-                                let response = ui.add_sized(
-                                    ui.available_size(),
+                                let available_width = ui.available_width();
+                                let response = ui.add(
                                     TextEdit::multiline(&mut self.input_buffer)
                                         .font(egui::TextStyle::Monospace)
-                                        .desired_rows(self.input_height as usize)
+                                        .desired_width(available_width)
                                         .margin(egui::Margin::ZERO)
                                         .frame(false)
                                         .id(input_id)
                                         .layouter(&mut |_ui, text, wrap_width| {
-                                        // Build layout job from actual text parameter
-                                        let mut job = egui::text::LayoutJob::default();
-                                        let chars: Vec<char> = text.chars().collect();
-                                        let mut pos = 0;
+                                            // Build layout job from actual text parameter
+                                            let mut job = egui::text::LayoutJob::default();
+                                            let chars: Vec<char> = text.chars().collect();
+                                            let mut pos = 0;
 
-                                        // Use misspelled ranges (may be slightly stale for one frame)
-                                        let mut ranges = misspelled_ranges.clone();
-                                        ranges.sort_by_key(|(start, _)| *start);
+                                            // Use misspelled ranges (may be slightly stale for one frame)
+                                            let mut ranges = misspelled_ranges.clone();
+                                            ranges.sort_by_key(|(start, _)| *start);
 
-                                        for (start, end) in ranges {
-                                            if start >= chars.len() || end > chars.len() {
-                                                continue; // Skip stale ranges
+                                            for (start, end) in ranges {
+                                                if start >= chars.len() || end > chars.len() {
+                                                    continue; // Skip stale ranges
+                                                }
+                                                // Add normal text before misspelled word
+                                                if pos < start {
+                                                    let normal_text: String = chars[pos..start].iter().collect();
+                                                    job.append(&normal_text, 0.0, egui::TextFormat {
+                                                        font_id: layouter_font_id.clone(),
+                                                        color: layouter_default_color,
+                                                        ..Default::default()
+                                                    });
+                                                }
+                                                // Add misspelled word in red
+                                                let misspelled_text: String = chars[start..end].iter().collect();
+                                                job.append(&misspelled_text, 0.0, egui::TextFormat {
+                                                    font_id: layouter_font_id.clone(),
+                                                    color: egui::Color32::RED,
+                                                    ..Default::default()
+                                                });
+                                                pos = end;
                                             }
-                                            // Add normal text before misspelled word
-                                            if pos < start {
-                                                let normal_text: String = chars[pos..start].iter().collect();
-                                                job.append(&normal_text, 0.0, egui::TextFormat {
+                                            // Add remaining text
+                                            if pos < chars.len() {
+                                                let remaining: String = chars[pos..].iter().collect();
+                                                job.append(&remaining, 0.0, egui::TextFormat {
                                                     font_id: layouter_font_id.clone(),
                                                     color: layouter_default_color,
                                                     ..Default::default()
                                                 });
                                             }
-                                            // Add misspelled word in red
-                                            let misspelled_text: String = chars[start..end].iter().collect();
-                                            job.append(&misspelled_text, 0.0, egui::TextFormat {
-                                                font_id: layouter_font_id.clone(),
-                                                color: egui::Color32::RED,
-                                                ..Default::default()
-                                            });
-                                            pos = end;
-                                        }
-                                        // Add remaining text
-                                        if pos < chars.len() {
-                                            let remaining: String = chars[pos..].iter().collect();
-                                            job.append(&remaining, 0.0, egui::TextFormat {
-                                                font_id: layouter_font_id.clone(),
-                                                color: layouter_default_color,
-                                                ..Default::default()
-                                            });
-                                        }
-                                        // Handle empty text
-                                        if chars.is_empty() {
-                                            job.append("", 0.0, egui::TextFormat {
-                                                font_id: layouter_font_id.clone(),
-                                                color: layouter_default_color,
-                                                ..Default::default()
-                                            });
-                                        }
+                                            // Handle empty text
+                                            if chars.is_empty() {
+                                                job.append("", 0.0, egui::TextFormat {
+                                                    font_id: layouter_font_id.clone(),
+                                                    color: layouter_default_color,
+                                                    ..Default::default()
+                                                });
+                                            }
 
-                                        job.wrap = egui::text::TextWrapping {
-                                            max_width: wrap_width,
-                                            ..Default::default()
-                                        };
-                                        _ui.fonts(|f| f.layout_job(job))
-                                    })
-                            );
+                                            job.wrap = egui::text::TextWrapping {
+                                                max_width: wrap_width,
+                                                ..Default::default()
+                                            };
+                                            _ui.fonts(|f| f.layout_job(job))
+                                        })
+                                );
+                                response
+                            }).inner
+                        });
 
-                            // Always keep cursor visible in input area when no popup is open
-                            // But don't steal focus if user is selecting text with mouse
-                            if !response.has_focus() && self.popup_state == PopupState::None && !self.filter_active {
-                                let mouse_down = ctx.input(|i| i.pointer.any_down());
-                                let typed_text: Option<String> = ctx.input(|i| {
-                                    // Find any text that was typed
-                                    for e in &i.events {
-                                        if let egui::Event::Text(text) = e {
-                                            return Some(text.clone());
-                                        }
+                        let response = scroll_output.inner;
+
+                        // Calculate cursor position and scroll to it if needed
+                        if response.has_focus() {
+                            if let Some(state) = egui::TextEdit::load_state(ctx, input_id) {
+                                if let Some(cursor_range) = state.cursor.char_range() {
+                                    // Estimate cursor Y position based on character position
+                                    // Count newlines before cursor to estimate line number
+                                    let cursor_pos = cursor_range.primary.index;
+                                    let text_before_cursor: String = self.input_buffer.chars().take(cursor_pos).collect();
+                                    let lines_before = text_before_cursor.matches('\n').count();
+                                    // Also account for wrapped lines (rough estimate)
+                                    let wrap_width = ui.available_width() - prompt_width;
+                                    let char_width = ui.fonts(|f| f.glyph_width(&egui::FontId::monospace(self.font_size), 'M'));
+                                    let chars_per_line = (wrap_width / char_width).max(1.0) as usize;
+                                    let wrapped_lines: usize = text_before_cursor.lines()
+                                        .map(|line| (line.len() / chars_per_line.max(1)).max(0))
+                                        .sum();
+                                    let cursor_line = lines_before + wrapped_lines;
+                                    let cursor_y = cursor_line as f32 * line_height;
+
+                                    // Check if cursor is outside visible area
+                                    let scroll_offset = scroll_output.state.offset.y;
+                                    let visible_top = scroll_offset;
+                                    let visible_bottom = scroll_offset + available_height - line_height;
+
+                                    if cursor_y < visible_top {
+                                        scroll_to_y = Some(cursor_y);
+                                    } else if cursor_y > visible_bottom {
+                                        scroll_to_y = Some(cursor_y - available_height + line_height * 2.0);
                                     }
-                                    None
-                                });
-
-                                // Request focus if mouse isn't being held (not selecting text)
-                                // or if user started typing
-                                if !mouse_down || typed_text.is_some() {
-                                    response.request_focus();
-                                }
-
-                                if let Some(text) = typed_text {
-                                    // Add the typed text to input buffer
-                                    self.input_buffer.push_str(&text);
-                                    // Set cursor position to end of buffer (create state if needed)
-                                    let mut state = egui::TextEdit::load_state(ctx, input_id)
-                                        .unwrap_or_default();
-                                    let ccursor = egui::text::CCursor::new(self.input_buffer.len());
-                                    state.cursor.set_char_range(Some(egui::text::CCursorRange::one(ccursor)));
-                                    state.store(ctx, input_id);
                                 }
                             }
+                        }
 
-                            // Apply cursor_home (Ctrl+A)
-                            if cursor_home {
+                        // Apply scroll adjustment if needed
+                        if let Some(target_y) = scroll_to_y {
+                            let mut scroll_state = scroll_output.state;
+                            scroll_state.offset.y = target_y.max(0.0);
+                            scroll_state.store(ctx, scroll_output.id);
+                        }
+
+                        // Always keep cursor visible in input area when no popup is open
+                        // But don't steal focus if user is selecting text with mouse
+                        if !response.has_focus() && self.popup_state == PopupState::None && !self.filter_active {
+                            let mouse_down = ctx.input(|i| i.pointer.any_down());
+                            let typed_text: Option<String> = ctx.input(|i| {
+                                // Find any text that was typed
+                                for e in &i.events {
+                                    if let egui::Event::Text(text) = e {
+                                        return Some(text.clone());
+                                    }
+                                }
+                                None
+                            });
+
+                            // Request focus if mouse isn't being held (not selecting text)
+                            // or if user started typing
+                            if !mouse_down || typed_text.is_some() {
+                                response.request_focus();
+                            }
+
+                            if let Some(text) = typed_text {
+                                // Add the typed text to input buffer
+                                self.input_buffer.push_str(&text);
+                                // Set cursor position to end of buffer (create state if needed)
                                 let mut state = egui::TextEdit::load_state(ctx, input_id)
                                     .unwrap_or_default();
-                                let ccursor = egui::text::CCursor::new(0);
+                                let ccursor = egui::text::CCursor::new(self.input_buffer.len());
                                 state.cursor.set_char_range(Some(egui::text::CCursorRange::one(ccursor)));
                                 state.store(ctx, input_id);
                             }
+                        }
 
-                            // Send on Enter (without Shift)
-                            if response.has_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter) && !i.modifiers.shift) {
-                                // Remove all newlines from the command (cursor in middle causes TextEdit to insert newline)
-                                let cmd: String = std::mem::take(&mut self.input_buffer)
-                                    .chars()
-                                    .filter(|c| *c != '\n')
-                                    .collect();
-                                // Reset spell state when sending command
-                                self.reset_spell_state();
-                                if !cmd.is_empty() {
-                                    // Use shared command parsing
-                                    let parsed = super::parse_command(&cmd);
+                        // Apply cursor_home (Ctrl+A)
+                        if cursor_home {
+                            let mut state = egui::TextEdit::load_state(ctx, input_id)
+                                .unwrap_or_default();
+                            let ccursor = egui::text::CCursor::new(0);
+                            state.cursor.set_char_range(Some(egui::text::CCursorRange::one(ccursor)));
+                            state.store(ctx, input_id);
+                        }
 
-                                    // Handle local GUI popup commands
-                                    match parsed {
-                                        super::Command::Setup => {
-                                            self.popup_state = PopupState::Setup;
-                                        }
-                                        super::Command::Web => {
-                                            self.popup_state = PopupState::Web;
-                                        }
-                                        super::Command::WorldSelector => {
-                                            self.popup_state = PopupState::ConnectedWorlds;
-                                            self.world_list_selected = self.current_world;
-                                            self.only_connected_worlds = false;
-                                        }
-                                        super::Command::WorldsList => {
-                                            self.popup_state = PopupState::ConnectedWorlds;
-                                            self.world_list_selected = self.current_world;
-                                            self.only_connected_worlds = true;
-                                        }
-                                        super::Command::Help => {
-                                            self.popup_state = PopupState::Help;
-                                        }
-                                        super::Command::Actions { .. } => {
-                                            self.actions_selected = 0;
-                                            self.popup_state = PopupState::ActionsList;
-                                        }
-                                        super::Command::WorldEdit { name } => {
-                                            // Open world editor
-                                            let idx = if let Some(ref world_name) = name {
-                                                self.worlds.iter().position(|w| w.name.eq_ignore_ascii_case(world_name))
-                                                    .unwrap_or(self.current_world)
-                                            } else {
-                                                self.current_world
-                                            };
-                                            self.open_world_editor(idx);
-                                        }
-                                        super::Command::WorldSwitch { ref name } => {
-                                            // /worlds <name> - switch to world, connect if not connected
-                                            if let Some(idx) = self.worlds.iter().position(|w| w.name.eq_ignore_ascii_case(name)) {
-                                                // Switch locally
-                                                self.current_world = idx;
-                                                // If not connected, send connect command to server
-                                                if !self.worlds[idx].connected {
-                                                    self.connect_world(idx);
-                                                }
-                                            } else {
-                                                // World not found - show error locally (red with %% prefix)
-                                                let ts = current_timestamp_secs();
-                                                if self.current_world < self.worlds.len() {
-                                                    self.worlds[self.current_world].output_lines.push(
-                                                        TimestampedLine { text: format!("\x1b[31m%% World '{}' not found.\x1b[0m", name), ts }
-                                                    );
-                                                }
+                        // Send on Enter (without Shift)
+                        if response.has_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter) && !i.modifiers.shift) {
+                            // Remove all newlines from the command (cursor in middle causes TextEdit to insert newline)
+                            let cmd: String = std::mem::take(&mut self.input_buffer)
+                                .chars()
+                                .filter(|c| *c != '\n')
+                                .collect();
+                            // Reset spell state when sending command
+                            self.reset_spell_state();
+                            if !cmd.is_empty() {
+                                // Use shared command parsing
+                                let parsed = super::parse_command(&cmd);
+
+                                // Handle local GUI popup commands
+                                match parsed {
+                                    super::Command::Setup => {
+                                        self.popup_state = PopupState::Setup;
+                                    }
+                                    super::Command::Web => {
+                                        self.popup_state = PopupState::Web;
+                                    }
+                                    super::Command::WorldSelector => {
+                                        self.popup_state = PopupState::ConnectedWorlds;
+                                        self.world_list_selected = self.current_world;
+                                        self.only_connected_worlds = false;
+                                    }
+                                    super::Command::WorldsList => {
+                                        self.popup_state = PopupState::ConnectedWorlds;
+                                        self.world_list_selected = self.current_world;
+                                        self.only_connected_worlds = true;
+                                    }
+                                    super::Command::Help => {
+                                        self.popup_state = PopupState::Help;
+                                    }
+                                    super::Command::Actions { .. } => {
+                                        self.actions_selected = 0;
+                                        self.popup_state = PopupState::ActionsList;
+                                    }
+                                    super::Command::WorldEdit { name } => {
+                                        // Open world editor
+                                        let idx = if let Some(ref world_name) = name {
+                                            self.worlds.iter().position(|w| w.name.eq_ignore_ascii_case(world_name))
+                                                .unwrap_or(self.current_world)
+                                        } else {
+                                            self.current_world
+                                        };
+                                        self.open_world_editor(idx);
+                                    }
+                                    super::Command::WorldSwitch { ref name } => {
+                                        // /worlds <name> - switch to world, connect if not connected
+                                        if let Some(idx) = self.worlds.iter().position(|w| w.name.eq_ignore_ascii_case(name)) {
+                                            // Switch locally
+                                            self.current_world = idx;
+                                            // If not connected, send connect command to server
+                                            if !self.worlds[idx].connected {
+                                                self.connect_world(idx);
+                                            }
+                                        } else {
+                                            // World not found - show error locally (red with %% prefix)
+                                            let ts = current_timestamp_secs();
+                                            if self.current_world < self.worlds.len() {
+                                                self.worlds[self.current_world].output_lines.push(
+                                                    TimestampedLine { text: format!("\x1b[31m%% World '{}' not found.\x1b[0m", name), ts }
+                                                );
                                             }
                                         }
-                                        super::Command::WorldConnectNoLogin { ref name } => {
-                                            // /worlds -l <name> - switch to world, connect without auto-login
-                                            if let Some(idx) = self.worlds.iter().position(|w| w.name.eq_ignore_ascii_case(name)) {
-                                                self.current_world = idx;
-                                                if !self.worlds[idx].connected {
-                                                    // Send the command to server (it handles -l flag)
-                                                    self.send_command(idx, cmd);
-                                                }
-                                            } else {
-                                                // World not found - show error locally (red with %% prefix)
-                                                let ts = current_timestamp_secs();
-                                                if self.current_world < self.worlds.len() {
-                                                    self.worlds[self.current_world].output_lines.push(
-                                                        TimestampedLine { text: format!("\x1b[31m%% World '{}' not found.\x1b[0m", name), ts }
-                                                    );
-                                                }
+                                    }
+                                    super::Command::WorldConnectNoLogin { ref name } => {
+                                        // /worlds -l <name> - switch to world, connect without auto-login
+                                        if let Some(idx) = self.worlds.iter().position(|w| w.name.eq_ignore_ascii_case(name)) {
+                                            self.current_world = idx;
+                                            if !self.worlds[idx].connected {
+                                                // Send the command to server (it handles -l flag)
+                                                self.send_command(idx, cmd);
+                                            }
+                                        } else {
+                                            // World not found - show error locally (red with %% prefix)
+                                            let ts = current_timestamp_secs();
+                                            if self.current_world < self.worlds.len() {
+                                                self.worlds[self.current_world].output_lines.push(
+                                                    TimestampedLine { text: format!("\x1b[31m%% World '{}' not found.\x1b[0m", name), ts }
+                                                );
                                             }
                                         }
-                                        _ => {
-                                            // Check for /font which is GUI-specific
-                                            if cmd.trim().eq_ignore_ascii_case("/font") {
-                                                self.edit_font_name = self.font_name.clone();
-                                                self.edit_font_size = format!("{:.1}", self.font_size);
-                                                self.popup_state = PopupState::Font;
-                                            } else {
-                                                // Send other commands to server
-                                                self.send_command(self.current_world, cmd);
-                                            }
+                                    }
+                                    _ => {
+                                        // Check for /font which is GUI-specific
+                                        if cmd.trim().eq_ignore_ascii_case("/font") {
+                                            self.edit_font_name = self.font_name.clone();
+                                            self.edit_font_size = format!("{:.1}", self.font_size);
+                                            self.popup_state = PopupState::Font;
+                                        } else {
+                                            // Send other commands to server
+                                            self.send_command(self.current_world, cmd);
                                         }
                                     }
                                 }
                             }
+                        }
 
-                                // Show suggestion message if present
-                                if let Some(ref msg) = self.suggestion_message {
-                                    ui.label(egui::RichText::new(msg).color(theme.prompt()).monospace());
-                                }
-                            });
-                        });
+                        // Show suggestion message if present
+                        if let Some(ref msg) = self.suggestion_message {
+                            ui.label(egui::RichText::new(msg).color(theme.prompt()).monospace());
+                        }
                     });
 
                 // Separator bar (matches TUI style)
