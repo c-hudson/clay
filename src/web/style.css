@@ -153,28 +153,49 @@ body {
     margin: 4px 0;
 }
 
-/* Font size buttons */
-.font-btn {
-    background-color: #222;
-    border: 1px solid var(--separator-color);
-    color: var(--text-color);
-    padding: 4px 10px;
+/* Toolbar right side */
+#toolbar-right {
+    margin-left: auto;
+    display: flex;
+    align-items: center;
+}
+
+/* Font size slider */
+.font-slider {
+    width: 80px;
+    height: 20px;
+    position: relative;
     cursor: pointer;
-    font-family: inherit;
-    font-size: 12px;
-    min-width: 28px;
-    border-radius: 3px;
+    touch-action: none;
 }
 
-.font-btn:hover {
-    background-color: #333;
+.font-slider .slider-track {
+    position: absolute;
+    bottom: 2px;
+    left: 2px;
+    right: 2px;
+    height: 0;
+    border-left: 0px solid transparent;
+    border-right: 76px solid transparent;
+    border-bottom: 16px solid #3c3c3c;
 }
 
-.font-btn.active {
-    background-color: var(--accent-color);
-    color: #000;
-    border-color: var(--accent-color);
+.font-slider .slider-handle {
+    position: absolute;
+    width: 12px;
+    height: 12px;
+    background-color: #64b4ff;
+    border-radius: 50%;
+    top: 50%;
+    transform: translateY(-50%);
+    pointer-events: none;
 }
+
+/* Position handle based on data-pos attribute (0-3) */
+.font-slider .slider-handle[data-pos="0"] { left: 6px; }
+.font-slider .slider-handle[data-pos="1"] { left: calc(6px + 22px); }
+.font-slider .slider-handle[data-pos="2"] { left: calc(6px + 44px); }
+.font-slider .slider-handle[data-pos="3"] { left: calc(6px + 66px); }
 
 /* Mobile toolbar - shown on phones/tablets, hidden on desktop */
 #mobile-toolbar {

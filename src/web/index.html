@@ -23,10 +23,13 @@
                     <div class="dropdown-divider"></div>
                     <div class="dropdown-item" data-action="resync">Resync</div>
                 </div>
-                <button id="font-small" class="font-btn" title="Small font (phone)">S</button>
-                <button id="font-medium" class="font-btn active" title="Medium font (default)">M</button>
-                <button id="font-large" class="font-btn" title="Large font (tablet)">L</button>
                 <span id="toolbar-title">Clay MUD Client</span>
+            </div>
+            <div id="toolbar-right">
+                <div id="font-slider" class="font-slider" title="Font size">
+                    <div class="slider-track"></div>
+                    <div class="slider-handle" data-pos="2"></div>
+                </div>
             </div>
         </div>
 
@@ -52,7 +55,10 @@
                 </div>
                 <button id="mobile-pgup-btn" class="mobile-btn" title="Page Up">PgUp</button>
                 <button id="mobile-pgdn-btn" class="mobile-btn" title="Page Down">PgDn</button>
-                <button id="mobile-tag-btn" class="mobile-btn" title="Toggle Tags (F2)">👁</button>
+                <div id="mobile-font-slider" class="font-slider" title="Font size">
+                    <div class="slider-track"></div>
+                    <div class="slider-handle" data-pos="2"></div>
+                </div>
             </div>
             <div id="mobile-toolbar-right">
                 <button id="mobile-up-btn" class="mobile-btn" title="Previous World">▲</button>

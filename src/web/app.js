@@ -24,9 +24,8 @@
         toolbar: document.getElementById('toolbar'),
         menuBtn: document.getElementById('menu-btn'),
         menuDropdown: document.getElementById('menu-dropdown'),
-        fontSmall: document.getElementById('font-small'),
-        fontMedium: document.getElementById('font-medium'),
-        fontLarge: document.getElementById('font-large'),
+        fontSlider: document.getElementById('font-slider'),
+        fontSliderHandle: document.querySelector('#font-slider .slider-handle'),
         // Mobile toolbar
         mobileToolbar: document.getElementById('mobile-toolbar'),
         mobileMenuBtn: document.getElementById('mobile-menu-btn'),
@@ -34,8 +33,9 @@
         mobilePgUpBtn: document.getElementById('mobile-pgup-btn'),
         mobileUpBtn: document.getElementById('mobile-up-btn'),
         mobileDownBtn: document.getElementById('mobile-down-btn'),
-        mobileTagBtn: document.getElementById('mobile-tag-btn'),
         mobilePgDnBtn: document.getElementById('mobile-pgdn-btn'),
+        mobileFontSlider: document.getElementById('mobile-font-slider'),
+        mobileFontSliderHandle: document.querySelector('#mobile-font-slider .slider-handle'),
         // Actions List popup
         actionsListModal: document.getElementById('actions-list-modal'),
         actionFilter: document.getElementById('action-filter'),
@@ -188,13 +188,9 @@
     let menuOpen = false;
     let mobileMenuOpen = false;
 
-    // Font size state: 'small' (8px), 'medium' (14px), 'large' (18px)
-    let currentFontSize = 'medium';
-    const fontSizes = {
-        small: 8,    // Phone
-        medium: 14,  // Tablet
-        large: 18    // Desktop
-    };
+    // Font size state: position 0-3 mapping to [10, 12, 14, 18] pixels
+    let currentFontPos = 2;  // Default to position 2 (14px)
+    const fontSizes = [10, 12, 14, 18];
 
     // Device mode: 'desktop' or 'mobile'
     let deviceMode = 'desktop';
@@ -423,21 +419,21 @@
     // Device Detection
     // ============================================================================
 
-    // Detect device type and return appropriate font size
+    // Detect device type and return appropriate font size position (0-3)
     function detectDeviceType() {
         const width = window.innerWidth;
         const hasTouch = 'ontouchstart' in window || navigator.maxTouchPoints > 0;
 
-        // Phone: narrow screen (< 768px)
+        // Phone: narrow screen (< 768px) - position 0 (10px)
         if (width < 768) {
-            return { fontSize: 'small', mode: 'mobile' };
+            return { fontPos: 0, mode: 'mobile' };
         }
-        // Tablet: medium screen with touch (768-1024px)
+        // Tablet: medium screen with touch (768-1024px) - position 2 (14px)
         if (width <= 1024 && hasTouch) {
-            return { fontSize: 'medium', mode: 'mobile' };
+            return { fontPos: 2, mode: 'mobile' };
         }
-        // Desktop: wide screen or no touch
-        return { fontSize: 'large', mode: 'desktop' };
+        // Desktop: wide screen or no touch - position 3 (18px)
+        return { fontPos: 3, mode: 'desktop' };
     }
 
     // Setup toolbars based on device mode
@@ -462,7 +458,7 @@
     function init() {
         // Detect device type and configure UI
         const device = detectDeviceType();
-        setFontSize(device.fontSize);
+        setFontPos(device.fontPos);
         setupToolbars(device.mode);
 
         setupEventListeners();
@@ -473,7 +469,7 @@
 
     // Get visible line count in output area
     function getVisibleLineCount() {
-        const fontSize = fontSizes[currentFontSize] || 14;
+        const fontSize = fontSizes[currentFontPos] || 14;
         const lineHeight = fontSize * 1.2; // font-size * line-height
         return Math.floor(elements.outputContainer.clientHeight / lineHeight);
     }
@@ -1677,7 +1673,7 @@
         } else if (!isAtBottom()) {
             // Calculate lines from bottom
             const container = elements.outputContainer;
-            const fontSize = fontSizes[currentFontSize] || 14;
+            const fontSize = fontSizes[currentFontPos] || 14;
             const lineHeight = fontSize * 1.2;
             const linesFromBottom = Math.floor((container.scrollHeight - container.scrollTop - container.clientHeight) / lineHeight);
             elements.statusIndicator.textContent = 'Hist:' + formatCount(linesFromBottom);
@@ -1704,7 +1700,7 @@
         // Fill remaining space with underscores
         // Calculate how many underscores fit based on container width and font size
         const fillWidth = elements.separatorFill.offsetWidth || window.innerWidth;
-        const fontSize = fontSizes[currentFontSize] || 14;
+        const fontSize = fontSizes[currentFontPos] || 14;
         const charWidth = fontSize * 0.6; // Approximate width ratio for monospace
         const numUnderscores = Math.ceil(fillWidth / charWidth) + 20; // Add buffer
         elements.separatorFill.textContent = '_'.repeat(Math.max(200, numUnderscores));
@@ -1721,7 +1717,7 @@
     // Set input area height (number of lines)
     function setInputHeight(lines) {
         inputHeight = Math.max(1, Math.min(15, lines));
-        const fontSize = fontSizes[currentFontSize] || 14;
+        const fontSize = fontSizes[currentFontPos] || 14;
         const lineHeight = 1.2 * fontSize; // line-height * font-size
         elements.input.style.height = (inputHeight * lineHeight) + 'px';
         elements.input.rows = inputHeight;
@@ -2622,21 +2618,73 @@
         }
     }
 
-    // Set font size
-    function setFontSize(size) {
+    // Setup slider event handlers
+    function setupSlider(slider, handle) {
+        if (!slider || !handle) return;
+
+        const sliderWidth = 80;  // Match CSS width
+        const handleRadius = 6;  // Half of handle width
+
+        function posFromX(clientX) {
+            const rect = slider.getBoundingClientRect();
+            const x = clientX - rect.left;
+            // Positions are at: 6px, 28px, 50px, 72px (for positions 0-3)
+            const stepWidth = (sliderWidth - 2 * handleRadius) / 3;
+            const pos = Math.round((x - handleRadius) / stepWidth);
+            return Math.max(0, Math.min(3, pos));
+        }
+
+        slider.addEventListener('click', function(e) {
+            e.stopPropagation();
+            const newPos = posFromX(e.clientX);
+            if (newPos !== currentFontPos) {
+                setFontPos(newPos);
+            }
+            elements.input.focus();
+        });
+
+        // Touch support
+        slider.addEventListener('touchstart', function(e) {
+            e.preventDefault();
+            e.stopPropagation();
+            const touch = e.touches[0];
+            const newPos = posFromX(touch.clientX);
+            if (newPos !== currentFontPos) {
+                setFontPos(newPos);
+            }
+        }, { passive: false });
+
+        slider.addEventListener('touchmove', function(e) {
+            e.preventDefault();
+            e.stopPropagation();
+            const touch = e.touches[0];
+            const newPos = posFromX(touch.clientX);
+            if (newPos !== currentFontPos) {
+                setFontPos(newPos);
+            }
+        }, { passive: false });
+    }
+
+    // Set font size by position (0-3)
+    function setFontPos(pos) {
+        pos = Math.max(0, Math.min(3, pos));
+
         // Check if we were at the bottom before changing size
         const wasAtBottom = isAtBottom();
 
-        currentFontSize = size;
-        const px = fontSizes[size];
+        currentFontPos = pos;
+        const px = fontSizes[pos];
 
         // Update body font size
         document.body.style.fontSize = px + 'px';
 
-        // Update active button
-        elements.fontSmall.className = 'font-btn' + (size === 'small' ? ' active' : '');
-        elements.fontMedium.className = 'font-btn' + (size === 'medium' ? ' active' : '');
-        elements.fontLarge.className = 'font-btn' + (size === 'large' ? ' active' : '');
+        // Update slider handles
+        if (elements.fontSliderHandle) {
+            elements.fontSliderHandle.setAttribute('data-pos', pos);
+        }
+        if (elements.mobileFontSliderHandle) {
+            elements.mobileFontSliderHandle.setAttribute('data-pos', pos);
+        }
 
         // If we were at the bottom, stay at the bottom after font size change
         if (wasAtBottom) {
@@ -2667,19 +2715,10 @@
             }
         };
 
-        // Font size buttons
-        elements.fontSmall.onclick = function(e) {
-            e.stopPropagation();
-            setFontSize('small');
-        };
-        elements.fontMedium.onclick = function(e) {
-            e.stopPropagation();
-            setFontSize('medium');
-        };
-        elements.fontLarge.onclick = function(e) {
-            e.stopPropagation();
-            setFontSize('large');
-        };
+        // Font size slider handler (desktop)
+        setupSlider(elements.fontSlider, elements.fontSliderHandle);
+        // Font size slider handler (mobile)
+        setupSlider(elements.mobileFontSlider, elements.mobileFontSliderHandle);
 
         // Mobile toolbar buttons
         elements.mobileMenuBtn.onclick = function(e) {
@@ -2708,15 +2747,6 @@
             e.stopPropagation();
             // Cycle to next active world (request from server)
             requestNextWorld();
-            elements.input.focus();
-        };
-
-        elements.mobileTagBtn.onclick = function(e) {
-            e.preventDefault();
-            e.stopPropagation();
-            // Toggle MUD tag display (same as F2)
-            showTags = !showTags;
-            renderOutput();
             elements.input.focus();
         };
 
