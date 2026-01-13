@@ -3088,7 +3088,7 @@ fn check_action_triggers(
             MatchType::Regexp => action.pattern.clone(),
         };
 
-        // Try to compile and match the regex (case-insensitive to match line_matches_action)
+        // Try to compile and match the regex (case-insensitive)
         if let Ok(regex) = RegexBuilder::new(&regex_pattern)
             .case_insensitive(true)
             .build()
@@ -3363,6 +3363,7 @@ struct World {
     last_user_command_time: Option<std::time::Instant>, // Last time user sent a command
     partial_line: String,        // Buffer for incomplete lines (no trailing newline)
     partial_in_pending: bool,    // True if partial_line is in pending_lines (vs output_lines)
+    trigger_partial_line: String, // Buffer for incomplete lines for action trigger checking
     is_initial_world: bool,      // True for the auto-created world before first connection
     was_connected: bool,         // True if world has ever been connected (for world cycling)
     skip_auto_login: bool,       // True to skip auto-login on next connect (for /worlds -l)
@@ -3410,6 +3411,7 @@ impl World {
             last_user_command_time: None,
             partial_line: String::new(),
             partial_in_pending: false,
+            trigger_partial_line: String::new(),
             is_initial_world: false,
             was_connected: false,
             skip_auto_login: false,
@@ -13106,13 +13108,24 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                             let world_name_for_triggers = world_name.clone();
                             let actions = app.settings.actions.clone();
 
+                            // Combine with any partial line from previous data chunk
+                            let had_trigger_partial = !app.worlds[world_idx].trigger_partial_line.is_empty();
+                            let combined_data = if had_trigger_partial {
+                                let mut s = std::mem::take(&mut app.worlds[world_idx].trigger_partial_line);
+                                s.push_str(&data);
+                                s
+                            } else {
+                                data.clone()
+                            };
+
                             // Process action triggers on complete lines
                             // Track lines with gagged flag: (line, is_gagged)
                             let mut processed_lines: Vec<(&str, bool)> = Vec::new();
                             let mut commands_to_execute: Vec<String> = Vec::new();
-                            let ends_with_newline = data.ends_with('\n');
-                            let lines: Vec<&str> = data.lines().collect();
+                            let ends_with_newline = combined_data.ends_with('\n');
+                            let lines: Vec<&str> = combined_data.lines().collect();
                             let line_count = lines.len();
+                            let mut has_partial = false;
 
                             for (i, line) in lines.iter().enumerate() {
                                 let is_last = i == line_count - 1;
@@ -13123,18 +13136,21 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                     continue;
                                 }
 
-                                // Check triggers on complete lines
-                                let mut is_gagged = false;
-                                if !is_partial {
+                                // Check triggers on complete lines only
+                                if is_partial {
+                                    // Store partial line for next chunk - don't process yet
+                                    app.worlds[world_idx].trigger_partial_line = line.to_string();
+                                    has_partial = true;
+                                } else {
+                                    let mut is_gagged = false;
                                     if let Some(result) = check_action_triggers(line, &world_name_for_triggers, &actions) {
                                         // Collect commands to execute
                                         commands_to_execute.extend(result.commands);
                                         is_gagged = result.should_gag;
                                     }
+                                    // Only add complete lines with gagged flag
+                                    processed_lines.push((line, is_gagged));
                                 }
-
-                                // Add line with gagged flag
-                                processed_lines.push((line, is_gagged));
                             }
 
                             // Separate gagged and non-gagged lines
@@ -13148,11 +13164,13 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                 .collect();
 
                             // Rebuild data for non-gagged lines
+                            // Add trailing newline if original ended with newline OR if we have a partial
+                            // (because a partial means there was a newline before it that we need to preserve)
                             let filtered_data = if non_gagged_lines.is_empty() {
                                 String::new()
                             } else {
                                 let mut result = non_gagged_lines.join("\n");
-                                if ends_with_newline {
+                                if ends_with_newline || has_partial {
                                     result.push('\n');
                                 }
                                 result
@@ -13948,13 +13966,24 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                         let world_name_for_triggers = world_name.clone();
                         let actions = app.settings.actions.clone();
 
+                        // Combine with any partial line from previous data chunk
+                        let had_trigger_partial = !app.worlds[world_idx].trigger_partial_line.is_empty();
+                        let combined_data = if had_trigger_partial {
+                            let mut s = std::mem::take(&mut app.worlds[world_idx].trigger_partial_line);
+                            s.push_str(&data);
+                            s
+                        } else {
+                            data.clone()
+                        };
+
                         // Process action triggers on complete lines
                         // Track lines with gagged flag: (line, is_gagged)
                         let mut processed_lines: Vec<(&str, bool)> = Vec::new();
                         let mut commands_to_execute: Vec<String> = Vec::new();
-                        let ends_with_newline = data.ends_with('\n');
-                        let lines: Vec<&str> = data.lines().collect();
+                        let ends_with_newline = combined_data.ends_with('\n');
+                        let lines: Vec<&str> = combined_data.lines().collect();
                         let line_count = lines.len();
+                        let mut has_partial = false;
 
                         for (i, line) in lines.iter().enumerate() {
                             let is_last = i == line_count - 1;
@@ -13965,14 +13994,20 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                 continue;
                             }
 
-                            let mut is_gagged = false;
-                            if !is_partial {
+                            // Check triggers on complete lines only
+                            if is_partial {
+                                // Store partial line for next chunk - don't process yet
+                                app.worlds[world_idx].trigger_partial_line = line.to_string();
+                                has_partial = true;
+                            } else {
+                                let mut is_gagged = false;
                                 if let Some(result) = check_action_triggers(line, &world_name_for_triggers, &actions) {
                                     commands_to_execute.extend(result.commands);
                                     is_gagged = result.should_gag;
                                 }
+                                // Only add complete lines with gagged flag
+                                processed_lines.push((line, is_gagged));
                             }
-                            processed_lines.push((line, is_gagged));
                         }
 
                         // Separate gagged and non-gagged lines
@@ -13985,11 +14020,13 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                             .map(|(line, _)| *line)
                             .collect();
 
+                        // Add trailing newline if original ended with newline OR if we have a partial
+                        // (because a partial means there was a newline before it that we need to preserve)
                         let filtered_data = if non_gagged_lines.is_empty() {
                             String::new()
                         } else {
                             let mut result = non_gagged_lines.join("\n");
-                            if ends_with_newline {
+                            if ends_with_newline || has_partial {
                                 result.push('\n');
                             }
                             result
