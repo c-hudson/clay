@@ -78,6 +78,7 @@ pub enum WsMessage {
     UpdateGlobalSettings {
         console_theme: String,
         gui_theme: String,
+        gui_transparency: f32,
         input_height: u16,
         font_name: String,
         font_size: f32,
@@ -166,6 +167,8 @@ pub struct GlobalSettingsMsg {
     pub show_tags: bool,
     pub console_theme: String,
     pub gui_theme: String,
+    #[serde(default = "default_gui_transparency")]
+    pub gui_transparency: f32,
     pub input_height: u16,
     pub font_name: String,
     pub font_size: f32,
@@ -177,6 +180,10 @@ pub struct GlobalSettingsMsg {
     pub ws_port: u16,
     pub ws_cert_file: String,
     pub ws_key_file: String,
+}
+
+fn default_gui_transparency() -> f32 {
+    1.0
 }
 
 /// Information about a connected WebSocket client

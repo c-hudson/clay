@@ -2557,6 +2557,7 @@ struct Settings {
     debug_enabled: bool,    // Debug logging to clay.debug.log
     theme: Theme,           // Console theme
     gui_theme: Theme,       // GUI theme (separate from console)
+    gui_transparency: f32,  // GUI window transparency (0.0-1.0)
     // Remote GUI font settings
     font_name: String,
     font_size: f32,
@@ -2584,6 +2585,7 @@ impl Default for Settings {
             debug_enabled: false,
             theme: Theme::Dark,
             gui_theme: Theme::Dark,
+            gui_transparency: 1.0,
             font_name: String::new(),  // Empty means use system default
             font_size: 14.0,
             web_secure: false,         // Default to non-secure
@@ -4121,6 +4123,7 @@ impl App {
             show_tags: self.show_tags,
             console_theme: self.settings.theme.name().to_string(),
             gui_theme: self.settings.gui_theme.name().to_string(),
+            gui_transparency: self.settings.gui_transparency,
             input_height: self.input_height,
             font_name: self.settings.font_name.clone(),
             font_size: self.settings.font_size,
@@ -4697,6 +4700,7 @@ fn save_settings(app: &App) -> io::Result<()> {
     writeln!(file, "input_height={}", app.input_height)?;
     writeln!(file, "theme={}", app.settings.theme.name())?;
     writeln!(file, "gui_theme={}", app.settings.gui_theme.name())?;
+    writeln!(file, "gui_transparency={}", app.settings.gui_transparency)?;
     writeln!(file, "font_name={}", app.settings.font_name)?;
     writeln!(file, "font_size={}", app.settings.font_size)?;
     writeln!(file, "web_secure={}", app.settings.web_secure)?;
@@ -4892,6 +4896,11 @@ fn load_settings(app: &mut App) -> io::Result<()> {
                     "font_size" => {
                         if let Ok(s) = value.parse::<f32>() {
                             app.settings.font_size = s.clamp(8.0, 48.0);
+                        }
+                    }
+                    "gui_transparency" => {
+                        if let Ok(t) = value.parse::<f32>() {
+                            app.settings.gui_transparency = t.clamp(0.3, 1.0);
                         }
                     }
                     "web_secure" => {
@@ -5403,6 +5412,11 @@ fn load_reload_state(app: &mut App) -> io::Result<bool> {
                     "font_size" => {
                         if let Ok(s) = value.parse::<f32>() {
                             app.settings.font_size = s.clamp(8.0, 48.0);
+                        }
+                    }
+                    "gui_transparency" => {
+                        if let Ok(t) = value.parse::<f32>() {
+                            app.settings.gui_transparency = t.clamp(0.3, 1.0);
                         }
                     }
                     "web_secure" => {
@@ -6358,6 +6372,7 @@ mod remote_gui {
                             self.theme = GuiTheme::from_name(&settings.gui_theme);
                             self.font_name = settings.font_name;
                             self.font_size = settings.font_size;
+                            self.transparency = settings.gui_transparency;
                             self.ws_allow_list = settings.ws_allow_list;
                             self.web_secure = settings.web_secure;
                             self.http_enabled = settings.http_enabled;
@@ -6472,6 +6487,7 @@ mod remote_gui {
                             self.input_height = input_height;
                             self.font_name = settings.font_name;
                             self.font_size = settings.font_size;
+                            self.transparency = settings.gui_transparency;
                             self.ws_allow_list = settings.ws_allow_list;
                             self.web_secure = settings.web_secure;
                             self.http_enabled = settings.http_enabled;
@@ -6869,6 +6885,7 @@ mod remote_gui {
                 let _ = tx.send(WsMessage::UpdateGlobalSettings {
                     console_theme: self.console_theme.to_string_value(),
                     gui_theme: self.theme.to_string_value(),
+                    gui_transparency: self.transparency,
                     input_height: self.input_height,
                     font_name: self.font_name.clone(),
                     font_size: self.font_size,
@@ -11942,12 +11959,13 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                     });
                                 }
                             }
-                            WsMessage::UpdateGlobalSettings { console_theme, gui_theme, input_height, font_name, font_size, ws_allow_list, web_secure, http_enabled, http_port, ws_enabled, ws_port, ws_cert_file, ws_key_file } => {
+                            WsMessage::UpdateGlobalSettings { console_theme, gui_theme, gui_transparency, input_height, font_name, font_size, ws_allow_list, web_secure, http_enabled, http_port, ws_enabled, ws_port, ws_cert_file, ws_key_file } => {
                                 // Update global settings from remote client
                                 // Console theme affects the TUI on the server
                                 app.settings.theme = Theme::from_name(&console_theme);
                                 // GUI theme is stored for sending back to GUI clients
                                 app.settings.gui_theme = Theme::from_name(&gui_theme);
+                                app.settings.gui_transparency = gui_transparency.clamp(0.3, 1.0);
                                 app.input_height = input_height.clamp(1, 15);
                                 app.input.visible_height = app.input_height;
                                 app.settings.font_name = font_name;
@@ -11976,6 +11994,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                     show_tags: app.show_tags,
                                     console_theme: app.settings.theme.name().to_string(),
                                     gui_theme: app.settings.gui_theme.name().to_string(),
+                                    gui_transparency: app.settings.gui_transparency,
                                     input_height: app.input_height,
                                     font_name: app.settings.font_name.clone(),
                                     font_size: app.settings.font_size,
@@ -12631,9 +12650,10 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                 app.ws_broadcast(WsMessage::WorldSettingsUpdated { world_index, settings: settings_msg, name });
                             }
                         }
-                        WsMessage::UpdateGlobalSettings { console_theme, gui_theme, input_height, font_name, font_size, ws_allow_list, web_secure, http_enabled, http_port, ws_enabled, ws_port, ws_cert_file, ws_key_file } => {
+                        WsMessage::UpdateGlobalSettings { console_theme, gui_theme, gui_transparency, input_height, font_name, font_size, ws_allow_list, web_secure, http_enabled, http_port, ws_enabled, ws_port, ws_cert_file, ws_key_file } => {
                             app.settings.theme = Theme::from_name(&console_theme);
                             app.settings.gui_theme = Theme::from_name(&gui_theme);
+                            app.settings.gui_transparency = gui_transparency.clamp(0.3, 1.0);
                             app.input_height = input_height.clamp(1, 15);
                             app.input.visible_height = app.input_height;
                             app.settings.font_name = font_name;
@@ -12658,6 +12678,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                 show_tags: app.show_tags,
                                 console_theme: app.settings.theme.name().to_string(),
                                 gui_theme: app.settings.gui_theme.name().to_string(),
+                                gui_transparency: app.settings.gui_transparency,
                                 input_height: app.input_height,
                                 font_name: app.settings.font_name.clone(),
                                 font_size: app.settings.font_size,
