@@ -6007,6 +6007,8 @@ mod remote_gui {
         action_error: Option<String>,
         /// Debug text for showing raw ANSI codes
         debug_text: String,
+        /// Window transparency (0.0 = fully transparent, 1.0 = fully opaque)
+        transparency: f32,
     }
 
     /// Discord emoji segment for rendering
@@ -6090,6 +6092,7 @@ mod remote_gui {
                 edit_action_command: String::new(),
                 action_error: None,
                 debug_text: String::new(),
+                transparency: 1.0,
             }
         }
 
@@ -7612,8 +7615,11 @@ mod remote_gui {
             // Customize based on our theme
             // NOTE: Do NOT set override_text_color as it overrides LayoutJob colors!
             visuals.override_text_color = None;
-            visuals.panel_fill = theme.panel_bg();
-            visuals.window_fill = theme.panel_bg();
+            // Apply transparency to panel and window fills
+            let alpha = (self.transparency * 255.0) as u8;
+            let panel_bg = theme.panel_bg();
+            visuals.panel_fill = egui::Color32::from_rgba_unmultiplied(panel_bg.r(), panel_bg.g(), panel_bg.b(), alpha);
+            visuals.window_fill = egui::Color32::from_rgba_unmultiplied(panel_bg.r(), panel_bg.g(), panel_bg.b(), alpha);
             visuals.widgets.noninteractive.bg_fill = theme.button_bg();
             visuals.widgets.inactive.bg_fill = theme.button_bg();
             visuals.widgets.hovered.bg_fill = theme.selection_bg();
@@ -8710,9 +8716,12 @@ mod remote_gui {
                 }
 
                 // Main output area with scrollbar (no frame/border/margin)
+                let bg = theme.bg();
+                let alpha = (self.transparency * 255.0) as u8;
+                let transparent_bg = egui::Color32::from_rgba_unmultiplied(bg.r(), bg.g(), bg.b(), alpha);
                 egui::CentralPanel::default()
                     .frame(egui::Frame::none()
-                        .fill(theme.bg())
+                        .fill(transparent_bg)
                         .inner_margin(egui::Margin::same(0.0))
                         .stroke(egui::Stroke::NONE))
                     .show(ctx, |ui| {
@@ -9679,6 +9688,7 @@ mod remote_gui {
                     let mut show_tags = self.show_tags;
                     let mut input_height = self.input_height;
                     let mut gui_theme = self.theme;
+                    let mut transparency = self.transparency;
                     let mut should_close = false;
                     let mut should_save = false;
 
@@ -9763,6 +9773,12 @@ mod remote_gui {
                                             gui_theme = gui_theme.next();
                                         }
                                         ui.end_row();
+
+                                        ui.label("Transparency:");
+                                        ui.add(egui::Slider::new(&mut transparency, 0.3..=1.0)
+                                            .show_value(false)
+                                            .clamping(egui::SliderClamping::Always));
+                                        ui.end_row();
                                     });
                             });
                         },
@@ -9776,6 +9792,7 @@ mod remote_gui {
                     self.show_tags = show_tags;
                     self.input_height = input_height;
                     self.theme = gui_theme;
+                    self.transparency = transparency;
 
                     if should_save {
                         self.update_global_settings();
@@ -10498,7 +10515,8 @@ mod remote_gui {
         let options = eframe::NativeOptions {
             viewport: egui::ViewportBuilder::default()
                 .with_inner_size([800.0, 600.0])
-                .with_title("Clay Mud Client"),
+                .with_title("Clay Mud Client")
+                .with_transparent(true),
             ..Default::default()
         };
 
