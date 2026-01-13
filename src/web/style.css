@@ -1018,6 +1018,35 @@ body {
     background-color: #fff;
 }
 
+/* Desktop/Mobile column visibility */
+.mobile-only {
+    display: none;
+}
+
+.desktop-only {
+    display: table-cell;
+}
+
+/* Mobile styles for world selector */
+@media (max-width: 600px) {
+    .world-selector-modal-content {
+        min-width: 280px;
+        max-width: 95%;
+    }
+
+    .mobile-only {
+        display: table-cell;
+    }
+
+    .desktop-only {
+        display: none;
+    }
+
+    #world-selector-table-container {
+        max-height: 150px; /* ~5 rows */
+    }
+}
+
 /* Setup popup (/setup) */
 .setup-modal-content {
     min-width: 280px;

@@ -2471,20 +2471,31 @@
             tdName.textContent = stripAnsi(world.name || '(unnamed)').trim();
             tr.appendChild(tdName);
 
-            // Hostname column
+            // Hostname column (desktop only)
             const tdHost = document.createElement('td');
+            tdHost.className = 'desktop-only';
             tdHost.textContent = world.settings?.hostname || '';
             tr.appendChild(tdHost);
 
-            // Port column
+            // Port column (desktop only)
             const tdPort = document.createElement('td');
+            tdPort.className = 'desktop-only';
             tdPort.textContent = world.settings?.port || '';
             tr.appendChild(tdPort);
 
-            // User column
+            // User column (desktop only)
             const tdUser = document.createElement('td');
+            tdUser.className = 'desktop-only';
             tdUser.textContent = world.settings?.user || '';
             tr.appendChild(tdUser);
+
+            // Address column (mobile only) - combines host:port
+            const tdAddress = document.createElement('td');
+            tdAddress.className = 'mobile-only';
+            const host = world.settings?.hostname || '';
+            const port = world.settings?.port || '';
+            tdAddress.textContent = host ? (port ? host + ':' + port : host) : '';
+            tr.appendChild(tdAddress);
 
             tr.onclick = () => selectWorld(index);
             tr.ondblclick = () => {
