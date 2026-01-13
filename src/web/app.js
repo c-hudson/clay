@@ -2755,19 +2755,60 @@
             }
         };
 
-        elements.mobileUpBtn.onclick = function(e) {
+        // Track button press timing for long-press detection
+        let upBtnPressStart = 0;
+        let downBtnPressStart = 0;
+
+        // Up button - short press: prev world, long press (3s+): prev history
+        elements.mobileUpBtn.onmousedown = elements.mobileUpBtn.ontouchstart = function(e) {
+            e.preventDefault();
+            upBtnPressStart = Date.now();
+        };
+        elements.mobileUpBtn.onmouseup = elements.mobileUpBtn.ontouchend = function(e) {
             e.preventDefault();
             e.stopPropagation();
-            // Cycle to previous active world (request from server)
-            requestPrevWorld();
+            const pressDuration = Date.now() - upBtnPressStart;
+            if (pressDuration >= 3000) {
+                // Long press: cycle to previous command in history
+                if (commandHistory.length > 0) {
+                    if (historyIndex === -1) {
+                        historyIndex = commandHistory.length - 1;
+                    } else if (historyIndex > 0) {
+                        historyIndex--;
+                    }
+                    elements.input.value = commandHistory[historyIndex];
+                }
+            } else {
+                // Short press: cycle to previous active world
+                requestPrevWorld();
+            }
             elements.input.focus();
         };
 
-        elements.mobileDownBtn.onclick = function(e) {
+        // Down button - short press: next world, long press (3s+): next history
+        elements.mobileDownBtn.onmousedown = elements.mobileDownBtn.ontouchstart = function(e) {
+            e.preventDefault();
+            downBtnPressStart = Date.now();
+        };
+        elements.mobileDownBtn.onmouseup = elements.mobileDownBtn.ontouchend = function(e) {
             e.preventDefault();
             e.stopPropagation();
-            // Cycle to next active world (request from server)
-            requestNextWorld();
+            const pressDuration = Date.now() - downBtnPressStart;
+            if (pressDuration >= 3000) {
+                // Long press: cycle to next command in history
+                if (historyIndex !== -1) {
+                    if (historyIndex < commandHistory.length - 1) {
+                        historyIndex++;
+                        elements.input.value = commandHistory[historyIndex];
+                    } else {
+                        historyIndex = -1;
+                        elements.input.value = '';
+                    }
+                }
+            } else {
+                // Short press: cycle to next active world
+                requestNextWorld();
+            }
             elements.input.focus();
         };
 
