@@ -2761,7 +2761,7 @@
         let downBtnTimer = null;
         let downBtnLongPressed = false;
 
-        // Up button - short press: prev world, long press (3s): prev history (triggers immediately at 3s)
+        // Up button - short press: prev world, long press (2s): prev history (triggers immediately at 2s)
         function upBtnStart(e) {
             e.preventDefault();
             upBtnLongPressed = false;
@@ -2777,7 +2777,7 @@
                     elements.input.value = commandHistory[historyIndex];
                 }
                 elements.input.focus();
-            }, 3000);
+            }, 2000);
         }
         function upBtnEnd(e) {
             e.preventDefault();
@@ -2797,7 +2797,7 @@
         elements.mobileUpBtn.addEventListener('touchstart', upBtnStart, { passive: false });
         elements.mobileUpBtn.addEventListener('touchend', upBtnEnd, { passive: false });
 
-        // Down button - short press: next world, long press (3s): next history (triggers immediately at 3s)
+        // Down button - short press: next world, long press (2s): next history (triggers immediately at 2s)
         function downBtnStart(e) {
             e.preventDefault();
             downBtnLongPressed = false;
@@ -2814,7 +2814,7 @@
                     }
                 }
                 elements.input.focus();
-            }, 3000);
+            }, 2000);
         }
         function downBtnEnd(e) {
             e.preventDefault();
