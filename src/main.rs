@@ -715,7 +715,6 @@ enum SettingsField {
     Debug,
     ShowTags,
     InputHeight,
-    Theme,          // Console theme
     GuiTheme,       // GUI theme
     SaveSetup,
     CancelSetup,
@@ -874,8 +873,7 @@ impl SettingsField {
             SettingsField::WorldSwitching => SettingsField::Debug,
             SettingsField::Debug => SettingsField::ShowTags,
             SettingsField::ShowTags => SettingsField::InputHeight,
-            SettingsField::InputHeight => SettingsField::Theme,
-            SettingsField::Theme => SettingsField::GuiTheme,
+            SettingsField::InputHeight => SettingsField::GuiTheme,
             SettingsField::GuiTheme => SettingsField::SaveSetup,
             SettingsField::SaveSetup => SettingsField::CancelSetup,
             SettingsField::CancelSetup => SettingsField::MoreMode,
@@ -893,8 +891,7 @@ impl SettingsField {
             SettingsField::Debug => SettingsField::WorldSwitching,
             SettingsField::ShowTags => SettingsField::Debug,
             SettingsField::InputHeight => SettingsField::ShowTags,
-            SettingsField::Theme => SettingsField::InputHeight,
-            SettingsField::GuiTheme => SettingsField::Theme,
+            SettingsField::GuiTheme => SettingsField::InputHeight,
             SettingsField::SaveSetup => SettingsField::GuiTheme,
             SettingsField::CancelSetup => SettingsField::SaveSetup,
             // World fields wrap to global fields
@@ -1146,9 +1143,6 @@ impl SettingsPopup {
                 } else {
                     self.temp_input_height + 1
                 };
-            }
-            SettingsField::Theme => {
-                self.temp_theme = self.temp_theme.next();
             }
             SettingsField::GuiTheme => {
                 self.temp_gui_theme = self.temp_gui_theme.next();
@@ -9659,7 +9653,6 @@ mod remote_gui {
                     let mut debug_enabled = self.debug_enabled;
                     let mut show_tags = self.show_tags;
                     let mut input_height = self.input_height;
-                    let mut console_theme = self.console_theme;
                     let mut gui_theme = self.theme;
                     let mut should_close = false;
                     let mut should_save = false;
@@ -9740,12 +9733,6 @@ mod remote_gui {
                                         });
                                         ui.end_row();
 
-                                        ui.label("Console Theme:");
-                                        if ui.button(console_theme.name()).clicked() {
-                                            console_theme = console_theme.next();
-                                        }
-                                        ui.end_row();
-
                                         ui.label("GUI Theme:");
                                         if ui.button(gui_theme.name()).clicked() {
                                             gui_theme = gui_theme.next();
@@ -9763,7 +9750,6 @@ mod remote_gui {
                     self.debug_enabled = debug_enabled;
                     self.show_tags = show_tags;
                     self.input_height = input_height;
-                    self.console_theme = console_theme;
                     self.theme = gui_theme;
 
                     if should_save {
@@ -16618,16 +16604,6 @@ fn render_settings_popup(f: &mut Frame, app: &App) {
             render_toggle_field("Debug:", popup.temp_debug_enabled, SettingsField::Debug, w),
             render_toggle_field("Show tags:", popup.temp_show_tags, SettingsField::ShowTags, w),
             render_height_field("Input height:", popup.temp_input_height, SettingsField::InputHeight, w),
-            Line::from(vec![
-                Span::styled(
-                    format!("  {:<w$}", "Console Theme:"),
-                    field_style(SettingsField::Theme),
-                ),
-                Span::styled(
-                    format!("[{}]", popup.temp_theme.name()),
-                    field_style(SettingsField::Theme),
-                ),
-            ]),
             Line::from(vec![
                 Span::styled(
                     format!("  {:<w$}", "GUI Theme:"),

@@ -103,7 +103,6 @@
         setupWorldSwitchBtn: document.getElementById('setup-world-switch-btn'),
         setupShowTagsBtn: document.getElementById('setup-show-tags-btn'),
         setupInputHeight: document.getElementById('setup-input-height'),
-        setupConsoleThemeBtn: document.getElementById('setup-console-theme-btn'),
         setupGuiThemeBtn: document.getElementById('setup-gui-theme-btn'),
         setupSaveBtn: document.getElementById('setup-save-btn'),
         setupCancelBtn: document.getElementById('setup-cancel-btn'),
@@ -175,7 +174,6 @@
     let setupWorldSwitchMode = 'Unseen First';
     let setupShowTags = false;
     let setupInputHeightValue = 1;
-    let setupConsoleTheme = 'dark';
     let setupGuiTheme = 'dark';
 
     // Filter popup state (F4)
@@ -2012,7 +2010,6 @@
         setupWorldSwitchMode = worldSwitchMode;
         setupShowTags = showTags;
         setupInputHeightValue = inputHeight;
-        setupConsoleTheme = consoleTheme;
         setupGuiTheme = guiTheme;
         elements.setupModal.className = 'modal visible';
         elements.setupModal.style.display = 'flex';
@@ -2032,7 +2029,6 @@
         elements.setupShowTagsBtn.textContent = setupShowTags ? 'on' : 'off';
         elements.setupInputHeight.value = setupInputHeightValue;
         // Capitalize first letter for display
-        elements.setupConsoleThemeBtn.textContent = setupConsoleTheme.charAt(0).toUpperCase() + setupConsoleTheme.slice(1);
         elements.setupGuiThemeBtn.textContent = setupGuiTheme.charAt(0).toUpperCase() + setupGuiTheme.slice(1);
     }
 
@@ -2046,7 +2042,6 @@
         moreModeEnabled = setupMoreMode;
         worldSwitchMode = setupWorldSwitchMode;
         showTags = setupShowTags;
-        consoleTheme = setupConsoleTheme;
         guiTheme = setupGuiTheme;
         setInputHeight(setupInputHeightValue);
 
@@ -3311,11 +3306,6 @@
         };
         elements.setupShowTagsBtn.onclick = function() {
             setupShowTags = !setupShowTags;
-            updateSetupPopupUI();
-        };
-        elements.setupConsoleThemeBtn.onclick = function() {
-            // Toggle between 'dark' and 'light'
-            setupConsoleTheme = setupConsoleTheme === 'dark' ? 'light' : 'dark';
             updateSetupPopupUI();
         };
         elements.setupGuiThemeBtn.onclick = function() {
