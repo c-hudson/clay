@@ -1250,7 +1250,7 @@ body {
 
 /* Form select (mockup style) */
 .setup-modal-content .form-select {
-    min-width: 160px;
+    width: 100%;
     background: #08080a;
     border: 1px solid rgba(255, 255, 255, 0.1);
     border-radius: 4px;
