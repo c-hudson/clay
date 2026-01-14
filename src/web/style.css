@@ -1133,6 +1133,10 @@ body {
 }
 
 /* Setup popup (/setup) */
+#setup-modal {
+    background-color: transparent;
+}
+
 .setup-modal-content {
     width: 460px;
     max-width: 90%;
