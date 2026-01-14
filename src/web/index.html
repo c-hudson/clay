@@ -316,23 +316,35 @@
                 <div class="setup-form">
                     <div class="setup-field">
                         <label>More Mode:</label>
-                        <button id="setup-more-mode-btn" class="toggle-btn">on</button>
-                    </div>
-                    <div class="setup-field">
-                        <label>World Switching:</label>
-                        <button id="setup-world-switch-btn" class="toggle-btn">Unseen First</button>
+                        <label class="toggle-switch">
+                            <input type="checkbox" id="setup-more-mode-toggle">
+                            <span class="toggle-slider"></span>
+                        </label>
                     </div>
                     <div class="setup-field">
                         <label>Show Tags:</label>
-                        <button id="setup-show-tags-btn" class="toggle-btn">off</button>
+                        <label class="toggle-switch">
+                            <input type="checkbox" id="setup-show-tags-toggle">
+                            <span class="toggle-slider"></span>
+                        </label>
+                    </div>
+                    <div class="setup-field">
+                        <label>World Switching:</label>
+                        <select id="setup-world-switch-select" class="setup-select">
+                            <option value="Unseen First">Unseen First</option>
+                            <option value="Alphabetical">Alphabetical</option>
+                        </select>
+                    </div>
+                    <div class="setup-field">
+                        <label>GUI Theme:</label>
+                        <select id="setup-gui-theme-select" class="setup-select">
+                            <option value="Dark">Dark</option>
+                            <option value="Light">Light</option>
+                        </select>
                     </div>
                     <div class="setup-field">
                         <label>Input Height:</label>
                         <input type="number" id="setup-input-height" autocomplete="off" class="setup-input" min="1" max="15">
-                    </div>
-                    <div class="setup-field">
-                        <label>GUI Theme:</label>
-                        <button id="setup-gui-theme-btn" class="toggle-btn">Dark</button>
                     </div>
                 </div>
                 <div class="modal-buttons">

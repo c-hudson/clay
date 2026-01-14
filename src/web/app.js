@@ -118,11 +118,11 @@
         wsPortLabel: document.getElementById('ws-port-label'),
         // Setup popup
         setupModal: document.getElementById('setup-modal'),
-        setupMoreModeBtn: document.getElementById('setup-more-mode-btn'),
-        setupWorldSwitchBtn: document.getElementById('setup-world-switch-btn'),
-        setupShowTagsBtn: document.getElementById('setup-show-tags-btn'),
+        setupMoreModeToggle: document.getElementById('setup-more-mode-toggle'),
+        setupShowTagsToggle: document.getElementById('setup-show-tags-toggle'),
+        setupWorldSwitchSelect: document.getElementById('setup-world-switch-select'),
+        setupGuiThemeSelect: document.getElementById('setup-gui-theme-select'),
         setupInputHeight: document.getElementById('setup-input-height'),
-        setupGuiThemeBtn: document.getElementById('setup-gui-theme-btn'),
         setupSaveBtn: document.getElementById('setup-save-btn'),
         setupCancelBtn: document.getElementById('setup-cancel-btn'),
         // Filter popup (F4)
@@ -2084,12 +2084,12 @@
     }
 
     function updateSetupPopupUI() {
-        elements.setupMoreModeBtn.textContent = setupMoreMode ? 'on' : 'off';
-        elements.setupWorldSwitchBtn.textContent = setupWorldSwitchMode;
-        elements.setupShowTagsBtn.textContent = setupShowTags ? 'on' : 'off';
+        elements.setupMoreModeToggle.checked = setupMoreMode;
+        elements.setupShowTagsToggle.checked = setupShowTags;
+        elements.setupWorldSwitchSelect.value = setupWorldSwitchMode;
+        // Capitalize first letter for select value
+        elements.setupGuiThemeSelect.value = setupGuiTheme.charAt(0).toUpperCase() + setupGuiTheme.slice(1);
         elements.setupInputHeight.value = setupInputHeightValue;
-        // Capitalize first letter for display
-        elements.setupGuiThemeBtn.textContent = setupGuiTheme.charAt(0).toUpperCase() + setupGuiTheme.slice(1);
     }
 
     function saveSetupSettings() {
@@ -3771,23 +3771,17 @@
         };
 
         // Setup popup
-        elements.setupMoreModeBtn.onclick = function() {
-            setupMoreMode = !setupMoreMode;
-            updateSetupPopupUI();
+        elements.setupMoreModeToggle.onchange = function() {
+            setupMoreMode = this.checked;
         };
-        elements.setupWorldSwitchBtn.onclick = function() {
-            // Toggle between 'Unseen First' and 'Alphabetical'
-            setupWorldSwitchMode = setupWorldSwitchMode === 'Unseen First' ? 'Alphabetical' : 'Unseen First';
-            updateSetupPopupUI();
+        elements.setupShowTagsToggle.onchange = function() {
+            setupShowTags = this.checked;
         };
-        elements.setupShowTagsBtn.onclick = function() {
-            setupShowTags = !setupShowTags;
-            updateSetupPopupUI();
+        elements.setupWorldSwitchSelect.onchange = function() {
+            setupWorldSwitchMode = this.value;
         };
-        elements.setupGuiThemeBtn.onclick = function() {
-            // Toggle between 'dark' and 'light'
-            setupGuiTheme = setupGuiTheme === 'dark' ? 'light' : 'dark';
-            updateSetupPopupUI();
+        elements.setupGuiThemeSelect.onchange = function() {
+            setupGuiTheme = this.value.toLowerCase();
         };
         elements.setupSaveBtn.onclick = saveSetupSettings;
         elements.setupCancelBtn.onclick = closeSetupPopup;
