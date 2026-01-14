@@ -1035,6 +1035,10 @@ body {
         position: relative;
     }
 
+    .world-selector-modal-content h2 {
+        text-align: left;
+    }
+
     .world-selector-modal-content .modal-footer-left {
         position: absolute;
         top: 8px;
