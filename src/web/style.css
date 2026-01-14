@@ -1295,7 +1295,7 @@ body {
 }
 
 .stepper-btn {
-    width: 28px;
+    width: 68px;
     height: 28px;
     display: flex;
     align-items: center;
@@ -1315,8 +1315,8 @@ body {
 }
 
 .stepper-value {
-    width: 34px;
-    height: 34px;
+    width: 68px;
+    height: 28px;
     display: flex;
     align-items: center;
     justify-content: center;
@@ -1370,13 +1370,13 @@ body {
 
 /* Buttons (mockup style) */
 .setup-modal-content .btn {
-    padding: 8px 12px;
+    padding: 4px 6px;
     background: #222228;
     border: 1px solid rgba(255, 255, 255, 0.1);
     border-radius: 4px;
     color: #a1a1aa;
     font-family: inherit;
-    font-size: 11px;
+    font-size: 10px;
     font-weight: 500;
     text-transform: uppercase;
     letter-spacing: 0.03em;
