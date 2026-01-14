@@ -1294,7 +1294,7 @@ body {
     display: inline-flex;
     align-items: center;
     gap: 10px;
-    justify-content: flex-end;
+    justify-content: flex-start;
     width: 100%;
 }
 
@@ -1320,14 +1320,14 @@ body {
 }
 
 .stepper-value {
-    width: 68px;
-    height: 28px;
+    width: 30px;
+    height: 23px;
     display: flex;
     align-items: center;
     justify-content: center;
-    background: #08080a;
+    background: #000000;
     border-radius: 3px;
-    color: #e4e4e7;
+    color: #ffffff;
     font-size: 13px;
 }
 
