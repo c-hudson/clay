@@ -250,6 +250,65 @@
             </div>
         </div>
 
+        <!-- World Editor popup (/worlds -e) -->
+        <div id="world-editor-modal" class="modal">
+            <div class="modal-content world-editor-modal-content">
+                <h2 id="world-editor-title">Edit World</h2>
+                <div class="world-editor-form">
+                    <div class="editor-field">
+                        <label>Name:</label>
+                        <input type="text" id="world-edit-name" autocomplete="off">
+                    </div>
+                    <div class="editor-field">
+                        <label>Hostname:</label>
+                        <input type="text" id="world-edit-hostname" autocomplete="off">
+                    </div>
+                    <div class="editor-field">
+                        <label>Port:</label>
+                        <input type="text" id="world-edit-port" autocomplete="off">
+                    </div>
+                    <div class="editor-field">
+                        <label>User:</label>
+                        <input type="text" id="world-edit-user" autocomplete="off">
+                    </div>
+                    <div class="editor-field">
+                        <label>Password:</label>
+                        <input type="password" id="world-edit-password" autocomplete="off">
+                    </div>
+                    <div class="editor-field">
+                        <label>Use SSL:</label>
+                        <button id="world-edit-ssl-btn" class="toggle-btn">off</button>
+                    </div>
+                    <div class="editor-field">
+                        <label>Auto Login:</label>
+                        <button id="world-edit-auto-login-btn" class="toggle-btn">Connect</button>
+                    </div>
+                    <div class="editor-field">
+                        <label>Keep Alive:</label>
+                        <button id="world-edit-keep-alive-btn" class="toggle-btn">NOP</button>
+                    </div>
+                    <div class="editor-field" id="world-edit-keep-alive-cmd-field">
+                        <label>Keep Alive Cmd:</label>
+                        <input type="text" id="world-edit-keep-alive-cmd" autocomplete="off">
+                    </div>
+                    <div class="editor-field">
+                        <label>Encoding:</label>
+                        <button id="world-edit-encoding-btn" class="toggle-btn">UTF-8</button>
+                    </div>
+                    <div class="editor-field">
+                        <label>Log File:</label>
+                        <input type="text" id="world-edit-log-file" autocomplete="off">
+                    </div>
+                </div>
+                <div class="modal-buttons">
+                    <button id="world-edit-delete-btn">Delete</button>
+                    <button id="world-edit-cancel-btn">Cancel</button>
+                    <button id="world-edit-save-btn">Save</button>
+                    <button id="world-edit-connect-btn">Connect</button>
+                </div>
+            </div>
+        </div>
+
         <!-- Setup popup (/setup) -->
         <div id="setup-modal" class="modal">
             <div class="modal-content setup-modal-content">

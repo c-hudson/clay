@@ -79,6 +79,25 @@
         worldConfirmText: document.getElementById('world-confirm-text'),
         worldConfirmYesBtn: document.getElementById('world-confirm-yes-btn'),
         worldConfirmNoBtn: document.getElementById('world-confirm-no-btn'),
+        // World editor popup
+        worldEditorModal: document.getElementById('world-editor-modal'),
+        worldEditorTitle: document.getElementById('world-editor-title'),
+        worldEditName: document.getElementById('world-edit-name'),
+        worldEditHostname: document.getElementById('world-edit-hostname'),
+        worldEditPort: document.getElementById('world-edit-port'),
+        worldEditUser: document.getElementById('world-edit-user'),
+        worldEditPassword: document.getElementById('world-edit-password'),
+        worldEditSslBtn: document.getElementById('world-edit-ssl-btn'),
+        worldEditAutoLoginBtn: document.getElementById('world-edit-auto-login-btn'),
+        worldEditKeepAliveBtn: document.getElementById('world-edit-keep-alive-btn'),
+        worldEditKeepAliveCmdField: document.getElementById('world-edit-keep-alive-cmd-field'),
+        worldEditKeepAliveCmd: document.getElementById('world-edit-keep-alive-cmd'),
+        worldEditEncodingBtn: document.getElementById('world-edit-encoding-btn'),
+        worldEditLogFile: document.getElementById('world-edit-log-file'),
+        worldEditDeleteBtn: document.getElementById('world-edit-delete-btn'),
+        worldEditCancelBtn: document.getElementById('world-edit-cancel-btn'),
+        worldEditSaveBtn: document.getElementById('world-edit-save-btn'),
+        worldEditConnectBtn: document.getElementById('world-edit-connect-btn'),
         // Web settings popup
         webModal: document.getElementById('web-modal'),
         webProtocolBtn: document.getElementById('web-protocol-btn'),
@@ -158,6 +177,8 @@
     let worldSelectorPopupOpen = false;
     let worldConfirmPopupOpen = false;
     let worldSelectorOnlyConnected = false;
+    let worldEditorPopupOpen = false;
+    let worldEditorIndex = -1;  // Index of world being edited
 
     // Web settings popup state
     let webPopupOpen = false;
@@ -1069,9 +1090,18 @@
                 return;
 
             case CommandType.WORLD_EDIT:
-                // Open world editor - for now just send to server
-                // (world editor UI not implemented in web interface yet)
-                break;
+                elements.input.value = '';
+                // Find the world to edit
+                if (parsed.name) {
+                    const idx = worlds.findIndex(w => w.name.toLowerCase() === parsed.name.toLowerCase());
+                    if (idx >= 0) {
+                        openWorldEditorPopup(idx);
+                    }
+                } else {
+                    // Edit current world
+                    openWorldEditorPopup(currentWorldIndex);
+                }
+                return;
 
             case CommandType.WORLD_CONNECT_NO_LOGIN:
                 // Connect without auto-login - send to server
@@ -1135,6 +1165,18 @@
 
             case CommandType.WORLD_SWITCH:
                 handleWorldCommand(parsed.name);
+                break;
+
+            case CommandType.WORLD_EDIT:
+                // Open world editor
+                if (parsed.name) {
+                    const idx = worlds.findIndex(w => w.name.toLowerCase() === parsed.name.toLowerCase());
+                    if (idx >= 0) {
+                        openWorldEditorPopup(idx);
+                    }
+                } else {
+                    openWorldEditorPopup(currentWorldIndex);
+                }
                 break;
 
             case CommandType.HELP:
@@ -2606,15 +2648,128 @@
 
     function editSelectedWorld() {
         if (selectedWorldIndex >= 0 && selectedWorldIndex < worlds.length) {
-            const world = worlds[selectedWorldIndex];
-            // Send command to open world editor on server
-            send({
-                type: 'SendCommand',
-                command: '/worlds -e ' + world.name,
-                world_index: currentWorldIndex
-            });
+            openWorldEditorPopup(selectedWorldIndex);
             closeWorldSelectorPopup();
         }
+    }
+
+    // World Editor popup functions
+    function openWorldEditorPopup(worldIndex) {
+        if (worldIndex < 0 || worldIndex >= worlds.length) return;
+
+        worldEditorPopupOpen = true;
+        worldEditorIndex = worldIndex;
+        const world = worlds[worldIndex];
+
+        // Populate form fields
+        elements.worldEditorTitle.textContent = 'Edit World: ' + (world.name || 'New World');
+        elements.worldEditName.value = world.name || '';
+        elements.worldEditHostname.value = world.settings?.hostname || '';
+        elements.worldEditPort.value = world.settings?.port || '';
+        elements.worldEditUser.value = world.settings?.user || '';
+        elements.worldEditPassword.value = world.settings?.password || '';
+        elements.worldEditLogFile.value = world.settings?.log_file || '';
+        elements.worldEditKeepAliveCmd.value = world.settings?.keep_alive_cmd || '';
+
+        // Set toggle buttons
+        const useSsl = world.settings?.use_ssl || false;
+        elements.worldEditSslBtn.textContent = useSsl ? 'on' : 'off';
+
+        const autoLogin = world.settings?.auto_login || 'Connect';
+        elements.worldEditAutoLoginBtn.textContent = autoLogin;
+
+        const keepAlive = world.settings?.keep_alive_type || 'NOP';
+        elements.worldEditKeepAliveBtn.textContent = keepAlive;
+        updateKeepAliveCmdVisibility(keepAlive);
+
+        const encoding = world.settings?.encoding || 'UTF-8';
+        elements.worldEditEncodingBtn.textContent = encoding;
+
+        elements.worldEditorModal.className = 'modal visible';
+        elements.worldEditorModal.style.display = 'flex';
+        elements.worldEditName.focus();
+    }
+
+    function closeWorldEditorPopup() {
+        worldEditorPopupOpen = false;
+        worldEditorIndex = -1;
+        elements.worldEditorModal.className = 'modal';
+        elements.worldEditorModal.style.display = 'none';
+        elements.input.focus();
+    }
+
+    function updateKeepAliveCmdVisibility(keepAliveType) {
+        if (keepAliveType === 'Custom') {
+            elements.worldEditKeepAliveCmdField.classList.add('visible');
+        } else {
+            elements.worldEditKeepAliveCmdField.classList.remove('visible');
+        }
+    }
+
+    function saveWorldEditor() {
+        if (worldEditorIndex < 0 || worldEditorIndex >= worlds.length) return;
+
+        // Send update to server
+        send({
+            type: 'UpdateWorldSettings',
+            world_index: worldEditorIndex,
+            name: elements.worldEditName.value,
+            hostname: elements.worldEditHostname.value,
+            port: elements.worldEditPort.value,
+            user: elements.worldEditUser.value,
+            password: elements.worldEditPassword.value,
+            use_ssl: elements.worldEditSslBtn.textContent === 'on',
+            log_file: elements.worldEditLogFile.value,
+            encoding: elements.worldEditEncodingBtn.textContent,
+            auto_login: elements.worldEditAutoLoginBtn.textContent,
+            keep_alive_type: elements.worldEditKeepAliveBtn.textContent,
+            keep_alive_cmd: elements.worldEditKeepAliveCmd.value
+        });
+
+        // Update local state
+        const world = worlds[worldEditorIndex];
+        world.name = elements.worldEditName.value;
+        if (!world.settings) world.settings = {};
+        world.settings.hostname = elements.worldEditHostname.value;
+        world.settings.port = elements.worldEditPort.value;
+        world.settings.user = elements.worldEditUser.value;
+        world.settings.password = elements.worldEditPassword.value;
+        world.settings.use_ssl = elements.worldEditSslBtn.textContent === 'on';
+        world.settings.log_file = elements.worldEditLogFile.value;
+        world.settings.encoding = elements.worldEditEncodingBtn.textContent;
+        world.settings.auto_login = elements.worldEditAutoLoginBtn.textContent;
+        world.settings.keep_alive_type = elements.worldEditKeepAliveBtn.textContent;
+        world.settings.keep_alive_cmd = elements.worldEditKeepAliveCmd.value;
+
+        closeWorldEditorPopup();
+    }
+
+    function saveAndConnectWorldEditor() {
+        if (worldEditorIndex < 0 || worldEditorIndex >= worlds.length) return;
+
+        // Save first
+        saveWorldEditor();
+
+        // Then connect
+        send({
+            type: 'ConnectWorld',
+            world_index: worldEditorIndex
+        });
+    }
+
+    function deleteWorldFromEditor() {
+        if (worldEditorIndex < 0 || worldEditorIndex >= worlds.length) return;
+        if (worlds.length <= 1) return;  // Can't delete last world
+
+        const world = worlds[worldEditorIndex];
+        closeWorldEditorPopup();
+
+        // Open confirm dialog
+        selectedWorldIndex = worldEditorIndex;
+        worldConfirmPopupOpen = true;
+        elements.worldConfirmText.textContent = `Delete world '${world.name}'?`;
+        elements.worldConfirmModal.className = 'modal visible';
+        elements.worldConfirmModal.style.display = 'flex';
     }
 
     // Open world delete confirmation popup
@@ -3579,6 +3734,33 @@
         // World delete confirm popup
         elements.worldConfirmYesBtn.onclick = confirmDeleteWorld;
         elements.worldConfirmNoBtn.onclick = closeWorldConfirmPopup;
+
+        // World editor popup
+        elements.worldEditSaveBtn.onclick = saveWorldEditor;
+        elements.worldEditCancelBtn.onclick = closeWorldEditorPopup;
+        elements.worldEditConnectBtn.onclick = saveAndConnectWorldEditor;
+        elements.worldEditDeleteBtn.onclick = deleteWorldFromEditor;
+        elements.worldEditSslBtn.onclick = function() {
+            this.textContent = this.textContent === 'on' ? 'off' : 'on';
+        };
+        elements.worldEditAutoLoginBtn.onclick = function() {
+            const modes = ['Connect', 'Prompt', 'MOO_prompt'];
+            const idx = modes.indexOf(this.textContent);
+            this.textContent = modes[(idx + 1) % modes.length];
+        };
+        elements.worldEditKeepAliveBtn.onclick = function() {
+            const types = ['NOP', 'Custom', 'Generic', 'None'];
+            const idx = types.indexOf(this.textContent);
+            const newType = types[(idx + 1) % types.length];
+            this.textContent = newType;
+            updateKeepAliveCmdVisibility(newType);
+        };
+        elements.worldEditEncodingBtn.onclick = function() {
+            const encodings = ['UTF-8', 'Latin1', 'Fansi'];
+            const idx = encodings.indexOf(this.textContent);
+            this.textContent = encodings[(idx + 1) % encodings.length];
+        };
+
         elements.worldFilter.oninput = function() {
             // Update selection if current selection is filtered out
             const visibleIndices = getFilteredWorldIndices();

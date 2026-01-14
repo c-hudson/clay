@@ -1062,6 +1062,76 @@ body {
     }
 }
 
+/* World Editor popup (/worlds -e) */
+.world-editor-modal-content {
+    min-width: 320px;
+    max-width: 450px;
+    width: 90%;
+    padding: 12px;
+}
+
+.world-editor-modal-content h2 {
+    margin-bottom: 10px;
+}
+
+.world-editor-form {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    margin-bottom: 12px;
+}
+
+.editor-field {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+}
+
+.editor-field label {
+    min-width: 100px;
+    color: var(--accent-color);
+    font-size: 13px;
+}
+
+.editor-field input {
+    flex: 1;
+    padding: 4px 6px;
+    background-color: #000;
+    color: var(--text-color);
+    border: 1px solid var(--separator-color);
+    font-family: inherit;
+    font-size: 13px;
+}
+
+.editor-field input:focus {
+    outline: none;
+    border-color: var(--accent-color);
+}
+
+.editor-field .toggle-btn {
+    min-width: 80px;
+    padding: 4px 8px;
+    background-color: #444;
+    color: #fff;
+    border: 1px solid #666;
+    border-radius: 3px;
+    cursor: pointer;
+    font-family: inherit;
+    font-size: 12px;
+}
+
+.editor-field .toggle-btn:hover {
+    background-color: #555;
+}
+
+#world-edit-keep-alive-cmd-field {
+    display: none;
+}
+
+#world-edit-keep-alive-cmd-field.visible {
+    display: flex;
+}
+
 /* Setup popup (/setup) */
 .setup-modal-content {
     min-width: 280px;
