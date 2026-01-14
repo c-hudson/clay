@@ -9551,8 +9551,8 @@ mod remote_gui {
                                     ui.horizontal(|ui| {
                                         ui.spacing_mut().item_spacing = egui::vec2(8.0, 0.0);
 
-                                        // Left side: Only Connected toggle
-                                        ui.label(egui::RichText::new("Only Connected")
+                                        // Left side: Connected toggle
+                                        ui.label(egui::RichText::new("Connected")
                                             .size(11.0)
                                             .color(theme.fg_secondary())
                                             .family(egui::FontFamily::Monospace));
