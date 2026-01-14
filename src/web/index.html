@@ -312,44 +312,50 @@
         <!-- Setup popup (/setup) -->
         <div id="setup-modal" class="modal">
             <div class="modal-content setup-modal-content">
-                <h2>Setup</h2>
-                <div class="setup-form">
-                    <div class="setup-field">
-                        <label>More Mode:</label>
-                        <label class="toggle-switch">
-                            <input type="checkbox" id="setup-more-mode-toggle">
-                            <span class="toggle-slider"></span>
-                        </label>
+                <div class="popup-header">
+                    <span class="popup-title">Settings</span>
+                    <button id="setup-close-btn" class="popup-close">✕</button>
+                </div>
+                <div class="popup-body">
+                    <div class="settings-group">
+                        <div class="settings-group-title">Behavior</div>
+                        <div class="setting-row">
+                            <span class="setting-label">More mode</span>
+                            <div id="setup-more-mode-toggle" class="toggle"></div>
+                        </div>
+                        <div class="setting-row">
+                            <span class="setting-label">Show tags</span>
+                            <div id="setup-show-tags-toggle" class="toggle"></div>
+                        </div>
+                        <div class="setting-row">
+                            <span class="setting-label">World switching</span>
+                            <select id="setup-world-switch-select" class="form-select">
+                                <option value="Unseen First">Unseen First</option>
+                                <option value="Alphabetical">Alphabetical</option>
+                            </select>
+                        </div>
                     </div>
-                    <div class="setup-field">
-                        <label>Show Tags:</label>
-                        <label class="toggle-switch">
-                            <input type="checkbox" id="setup-show-tags-toggle">
-                            <span class="toggle-slider"></span>
-                        </label>
-                    </div>
-                    <div class="setup-field">
-                        <label>World Switching:</label>
-                        <select id="setup-world-switch-select" class="setup-select">
-                            <option value="Unseen First">Unseen First</option>
-                            <option value="Alphabetical">Alphabetical</option>
-                        </select>
-                    </div>
-                    <div class="setup-field">
-                        <label>GUI Theme:</label>
-                        <select id="setup-gui-theme-select" class="setup-select">
-                            <option value="Dark">Dark</option>
-                            <option value="Light">Light</option>
-                        </select>
-                    </div>
-                    <div class="setup-field">
-                        <label>Input Height:</label>
-                        <input type="number" id="setup-input-height" autocomplete="off" class="setup-input" min="1" max="15">
+                    <div class="settings-group">
+                        <div class="settings-group-title">Display</div>
+                        <div class="setting-row">
+                            <span class="setting-label">Input height</span>
+                            <div class="slider-container">
+                                <input type="range" id="setup-input-height" class="slider" min="1" max="15" value="3">
+                                <span id="setup-input-height-value" class="slider-value">3</span>
+                            </div>
+                        </div>
+                        <div class="setting-row">
+                            <span class="setting-label">Theme</span>
+                            <div class="theme-selector">
+                                <button id="setup-theme-dark" class="theme-option active">Dark</button>
+                                <button id="setup-theme-light" class="theme-option">Light</button>
+                            </div>
+                        </div>
                     </div>
                 </div>
-                <div class="modal-buttons">
-                    <button id="setup-save-btn">Save</button>
-                    <button id="setup-cancel-btn">Cancel</button>
+                <div class="popup-footer">
+                    <button id="setup-cancel-btn" class="btn">Cancel</button>
+                    <button id="setup-save-btn" class="btn btn-primary">Save</button>
                 </div>
             </div>
         </div>

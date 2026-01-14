@@ -1134,61 +1134,254 @@ body {
 
 /* Setup popup (/setup) */
 .setup-modal-content {
-    min-width: 280px;
-    max-width: 350px;
-    width: 90%;
-    padding: 12px;
+    width: 360px;
+    max-width: 90%;
+    padding: 0;
+    background: #1a1a1f;
+    border: 1px solid rgba(255, 255, 255, 0.1);
+    border-radius: 8px;
+    box-shadow: 0 16px 48px rgba(0, 0, 0, 0.5);
 }
 
-.setup-modal-content h2 {
-    margin-bottom: 10px;
-}
-
-.setup-form {
+.setup-modal-content .popup-header {
     display: flex;
-    flex-direction: column;
-    gap: 8px;
+    align-items: center;
+    justify-content: space-between;
+    padding: 12px 16px;
+    border-bottom: 1px solid rgba(255, 255, 255, 0.06);
 }
 
-.setup-field {
+.setup-modal-content .popup-title {
+    font-size: 12px;
+    font-weight: 600;
+    color: #e4e4e7;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+}
+
+.setup-modal-content .popup-close {
+    width: 24px;
+    height: 24px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    background: transparent;
+    border: none;
+    border-radius: 4px;
+    color: #71717a;
+    cursor: pointer;
+    transition: all 0.1s ease;
+}
+
+.setup-modal-content .popup-close:hover {
+    background: #222228;
+    color: #e4e4e7;
+}
+
+.setup-modal-content .popup-body {
+    padding: 16px;
+}
+
+.setup-modal-content .popup-footer {
+    display: flex;
+    align-items: center;
+    justify-content: flex-end;
+    gap: 8px;
+    padding: 12px 16px;
+    border-top: 1px solid rgba(255, 255, 255, 0.06);
+    background: #141418;
+}
+
+/* Settings groups */
+.settings-group {
+    margin-bottom: 16px;
+}
+
+.settings-group:last-child {
+    margin-bottom: 0;
+}
+
+.settings-group-title {
+    color: #71717a;
+    font-size: 11px;
+    text-transform: uppercase;
+    letter-spacing: 0.1em;
+    margin-bottom: 12px;
+    padding-bottom: 8px;
+    border-bottom: 1px solid rgba(255, 255, 255, 0.06);
+}
+
+.setting-row {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 8px 0;
+}
+
+.setting-label {
+    color: #a1a1aa;
+    font-size: 13px;
+}
+
+/* Toggle switch (mockup style) */
+.toggle {
+    position: relative;
+    width: 36px;
+    height: 20px;
+    background: #08080a;
+    border: 1px solid rgba(255, 255, 255, 0.1);
+    border-radius: 10px;
+    cursor: pointer;
+    transition: all 0.1s ease;
+}
+
+.toggle.active {
+    background: #0891b2;
+    border-color: #0891b2;
+}
+
+.toggle::after {
+    content: '';
+    position: absolute;
+    top: 2px;
+    left: 2px;
+    width: 14px;
+    height: 14px;
+    background: #71717a;
+    border-radius: 50%;
+    transition: all 0.1s ease;
+}
+
+.toggle.active::after {
+    left: 18px;
+    background: #08080a;
+}
+
+/* Form select (mockup style) */
+.form-select {
+    background: #08080a;
+    border: 1px solid rgba(255, 255, 255, 0.1);
+    border-radius: 4px;
+    padding: 8px 28px 8px 12px;
+    color: #e4e4e7;
+    font-family: inherit;
+    font-size: 13px;
+    cursor: pointer;
+    appearance: none;
+    background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 24 24' fill='none' stroke='%2371717a' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M6 9l6 6 6-6'/%3E%3C/svg%3E");
+    background-repeat: no-repeat;
+    background-position: right 8px center;
+}
+
+.form-select:focus {
+    outline: none;
+    border-color: #0891b2;
+}
+
+/* Slider */
+.slider-container {
     display: flex;
     align-items: center;
     gap: 8px;
 }
 
-.setup-field label {
-    min-width: 120px;
-    color: var(--accent-color);
-}
-
-.setup-field .setup-input {
-    width: 60px;
-    padding: 4px 6px;
-    background-color: #2a2a2a;
-    color: #fff;
-    border: 1px solid #444;
-    border-radius: 3px;
-}
-
-.setup-field .setup-select {
-    min-width: 120px;
-    padding: 4px 8px;
-    background-color: #2a2a2a;
-    color: #fff;
-    border: 1px solid #444;
-    border-radius: 3px;
+.slider {
+    width: 100px;
+    height: 4px;
+    background: #08080a;
+    border-radius: 2px;
+    appearance: none;
     cursor: pointer;
+}
+
+.slider::-webkit-slider-thumb {
+    appearance: none;
+    width: 14px;
+    height: 14px;
+    background: #22d3ee;
+    border-radius: 50%;
+    cursor: pointer;
+    box-shadow: 0 0 8px rgba(34, 211, 238, 0.15);
+}
+
+.slider::-moz-range-thumb {
+    width: 14px;
+    height: 14px;
+    background: #22d3ee;
+    border-radius: 50%;
+    cursor: pointer;
+    border: none;
+}
+
+.slider-value {
+    color: #71717a;
+    font-size: 11px;
+    min-width: 20px;
+    text-align: right;
+}
+
+/* Theme selector */
+.theme-selector {
+    display: flex;
+    gap: 2px;
+    background: #08080a;
+    border-radius: 4px;
+    padding: 2px;
+}
+
+.theme-option {
+    padding: 4px 8px;
+    background: transparent;
+    border: none;
+    border-radius: 3px;
+    color: #71717a;
     font-family: inherit;
-    font-size: inherit;
+    font-size: 11px;
+    cursor: pointer;
+    transition: all 0.1s ease;
 }
 
-.setup-field .setup-select:focus {
-    outline: none;
-    border-color: var(--accent-color);
+.theme-option:hover {
+    color: #a1a1aa;
 }
 
-.setup-field .toggle-switch {
-    margin-left: 0;
+.theme-option.active {
+    background: #0891b2;
+    color: #08080a;
+}
+
+/* Buttons (mockup style) */
+.setup-modal-content .btn {
+    padding: 8px 12px;
+    background: #222228;
+    border: 1px solid rgba(255, 255, 255, 0.1);
+    border-radius: 4px;
+    color: #a1a1aa;
+    font-family: inherit;
+    font-size: 11px;
+    font-weight: 500;
+    text-transform: uppercase;
+    letter-spacing: 0.03em;
+    cursor: pointer;
+    transition: all 0.1s ease;
+}
+
+.setup-modal-content .btn:hover {
+    background: #1a1a1f;
+    color: #e4e4e7;
+    border-color: #52525b;
+}
+
+.setup-modal-content .btn-primary {
+    background: #0891b2;
+    border-color: #0891b2;
+    color: #08080a;
+}
+
+.setup-modal-content .btn-primary:hover {
+    background: #22d3ee;
+    border-color: #22d3ee;
+    color: #08080a;
 }
 
 /* Web Settings popup (/web) */

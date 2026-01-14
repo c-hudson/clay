@@ -118,11 +118,14 @@
         wsPortLabel: document.getElementById('ws-port-label'),
         // Setup popup
         setupModal: document.getElementById('setup-modal'),
+        setupCloseBtn: document.getElementById('setup-close-btn'),
         setupMoreModeToggle: document.getElementById('setup-more-mode-toggle'),
         setupShowTagsToggle: document.getElementById('setup-show-tags-toggle'),
         setupWorldSwitchSelect: document.getElementById('setup-world-switch-select'),
-        setupGuiThemeSelect: document.getElementById('setup-gui-theme-select'),
         setupInputHeight: document.getElementById('setup-input-height'),
+        setupInputHeightValue: document.getElementById('setup-input-height-value'),
+        setupThemeDark: document.getElementById('setup-theme-dark'),
+        setupThemeLight: document.getElementById('setup-theme-light'),
         setupSaveBtn: document.getElementById('setup-save-btn'),
         setupCancelBtn: document.getElementById('setup-cancel-btn'),
         // Filter popup (F4)
@@ -2084,12 +2087,30 @@
     }
 
     function updateSetupPopupUI() {
-        elements.setupMoreModeToggle.checked = setupMoreMode;
-        elements.setupShowTagsToggle.checked = setupShowTags;
+        // Toggle switches
+        if (setupMoreMode) {
+            elements.setupMoreModeToggle.classList.add('active');
+        } else {
+            elements.setupMoreModeToggle.classList.remove('active');
+        }
+        if (setupShowTags) {
+            elements.setupShowTagsToggle.classList.add('active');
+        } else {
+            elements.setupShowTagsToggle.classList.remove('active');
+        }
+        // World switching dropdown
         elements.setupWorldSwitchSelect.value = setupWorldSwitchMode;
-        // Capitalize first letter for select value
-        elements.setupGuiThemeSelect.value = setupGuiTheme.charAt(0).toUpperCase() + setupGuiTheme.slice(1);
+        // Input height slider
         elements.setupInputHeight.value = setupInputHeightValue;
+        elements.setupInputHeightValue.textContent = setupInputHeightValue;
+        // Theme buttons
+        if (setupGuiTheme === 'dark') {
+            elements.setupThemeDark.classList.add('active');
+            elements.setupThemeLight.classList.remove('active');
+        } else {
+            elements.setupThemeDark.classList.remove('active');
+            elements.setupThemeLight.classList.add('active');
+        }
     }
 
     function saveSetupSettings() {
@@ -3771,17 +3792,28 @@
         };
 
         // Setup popup
-        elements.setupMoreModeToggle.onchange = function() {
-            setupMoreMode = this.checked;
+        elements.setupCloseBtn.onclick = closeSetupPopup;
+        elements.setupMoreModeToggle.onclick = function() {
+            setupMoreMode = !setupMoreMode;
+            updateSetupPopupUI();
         };
-        elements.setupShowTagsToggle.onchange = function() {
-            setupShowTags = this.checked;
+        elements.setupShowTagsToggle.onclick = function() {
+            setupShowTags = !setupShowTags;
+            updateSetupPopupUI();
         };
         elements.setupWorldSwitchSelect.onchange = function() {
             setupWorldSwitchMode = this.value;
         };
-        elements.setupGuiThemeSelect.onchange = function() {
-            setupGuiTheme = this.value.toLowerCase();
+        elements.setupInputHeight.oninput = function() {
+            elements.setupInputHeightValue.textContent = this.value;
+        };
+        elements.setupThemeDark.onclick = function() {
+            setupGuiTheme = 'dark';
+            updateSetupPopupUI();
+        };
+        elements.setupThemeLight.onclick = function() {
+            setupGuiTheme = 'light';
+            updateSetupPopupUI();
         };
         elements.setupSaveBtn.onclick = saveSetupSettings;
         elements.setupCancelBtn.onclick = closeSetupPopup;
