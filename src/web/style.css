@@ -1298,7 +1298,7 @@ body {
     width: 100%;
 }
 
-.stepper-btn {
+.stepper .stepper-btn {
     width: 30px;
     height: 23px;
     display: flex;
@@ -1311,9 +1311,11 @@ body {
     font-size: 16px;
     cursor: pointer;
     transition: all 0.1s ease;
+    margin: 0;
+    padding: 0;
 }
 
-.stepper-btn:hover {
+.stepper .stepper-btn:hover {
     background: #222222;
 }
 
