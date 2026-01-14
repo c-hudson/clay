@@ -1809,7 +1809,7 @@
     function convertTemperatures(text) {
         if (!text) return text;
         // Pattern: number (with optional decimal), optional space, C or F, followed by delimiter or end
-        return text.replace(/(-?\d+(?:\.\d+)?)\s?([CcFf])([\s.,;:!?\]\)]|$)/g, (match, num, unit, delim) => {
+        return text.replace(/(-?\d+(?:\.\d+)?)\s?([CcFf])([\s.,;:!?\]\)"']|$)/g, (match, num, unit, delim) => {
             const n = parseFloat(num);
             if (isNaN(n)) return match;
             let converted, newUnit;

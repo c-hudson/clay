@@ -411,60 +411,121 @@ pub fn format_worlds_list(worlds: &[WorldListInfo]) -> String {
 }
 
 /// Convert temperatures in text: "32C" -> "32C (90F)", "100F" -> "100F (38C)"
-/// Matches numbers followed by C or F (with optional space), followed by space, period, comma, or end
+/// Matches numbers followed by C or F (with optional space), followed by delimiter or end
+/// Uses fast character scanning instead of regex for performance
 pub fn convert_temperatures(text: &str) -> String {
-    use regex::Regex;
+    let bytes = text.as_bytes();
 
-    // Pattern: number (with optional decimal), optional space, C or F, followed by delimiter
-    // Capture the delimiter so we can put it back after the conversion
-    let re = Regex::new(r"(-?\d+(?:\.\d+)?)\s?([CcFf])([\s.,;:!?\]\)]|$)").unwrap();
-
-    let mut result = String::new();
-    let mut last_end = 0;
-
-    for cap in re.captures_iter(text) {
-        let full_match = cap.get(0).unwrap();
-        let num_str = cap.get(1).unwrap().as_str();
-        let unit = cap.get(2).unwrap().as_str();
-        let delimiter = cap.get(3).map(|m| m.as_str()).unwrap_or("");
-
-        // Add text before this match
-        result.push_str(&text[last_end..full_match.start()]);
-
-        // Parse the number
-        if let Ok(num) = num_str.parse::<f64>() {
-            let (converted, new_unit) = if unit.eq_ignore_ascii_case("C") {
-                // Celsius to Fahrenheit: (C * 9/5) + 32
-                let f = (num * 9.0 / 5.0) + 32.0;
-                (f.round() as i64, "F")
-            } else {
-                // Fahrenheit to Celsius: (F - 32) * 5/9
-                let c = (num - 32.0) * 5.0 / 9.0;
-                (c.round() as i64, "C")
-            };
-
-            // Add number + unit + conversion + delimiter
-            result.push_str(num_str);
-            if full_match.as_str().contains(' ') && !num_str.ends_with(' ') {
-                // Preserve space between number and unit if it was there
-                let space_idx = full_match.as_str().find(unit).unwrap_or(0);
-                if space_idx > 0 && full_match.as_str().chars().nth(space_idx - 1) == Some(' ') {
-                    result.push(' ');
-                }
+    // Quick scan: does this line have any potential temperature patterns?
+    // Look for C or F that could follow a digit
+    let mut has_potential = false;
+    for i in 1..bytes.len() {
+        let c = bytes[i];
+        if c == b'C' || c == b'c' || c == b'F' || c == b'f' {
+            // Check if preceded by digit or space+digit
+            let prev = bytes[i - 1];
+            if prev.is_ascii_digit() || (prev == b' ' && i >= 2 && bytes[i - 2].is_ascii_digit()) {
+                has_potential = true;
+                break;
             }
-            result.push_str(unit);
-            result.push_str(&format!(" ({}{})", converted, new_unit));
-            result.push_str(delimiter);
-        } else {
-            // Couldn't parse, just add original
-            result.push_str(full_match.as_str());
         }
-
-        last_end = full_match.end();
     }
 
-    // Add remaining text
-    result.push_str(&text[last_end..]);
+    if !has_potential {
+        return text.to_string();
+    }
+
+    // Full parse - we have at least one potential match
+    let mut result = String::with_capacity(text.len() + 32);
+    let chars: Vec<char> = text.chars().collect();
+    let mut i = 0;
+
+    while i < chars.len() {
+        // Look for start of a number (digit or minus followed by digit)
+        let num_start = i;
+        let mut num_end;
+
+        // Check for optional minus sign
+        if chars[i] == '-' {
+            if i + 1 < chars.len() && chars[i + 1].is_ascii_digit() {
+                num_end = i + 1;
+            } else {
+                result.push(chars[i]);
+                i += 1;
+                continue;
+            }
+        } else if chars[i].is_ascii_digit() {
+            num_end = i;
+        } else {
+            result.push(chars[i]);
+            i += 1;
+            continue;
+        }
+
+        // Consume digits
+        while num_end < chars.len() && chars[num_end].is_ascii_digit() {
+            num_end += 1;
+        }
+
+        // Check for decimal part
+        if num_end < chars.len() && chars[num_end] == '.' {
+            let dot_pos = num_end;
+            num_end += 1;
+            if num_end < chars.len() && chars[num_end].is_ascii_digit() {
+                while num_end < chars.len() && chars[num_end].is_ascii_digit() {
+                    num_end += 1;
+                }
+            } else {
+                // Not a decimal, just a period - backtrack
+                num_end = dot_pos;
+            }
+        }
+
+        // Check for optional space then C/F
+        let mut unit_pos = num_end;
+        let has_space = unit_pos < chars.len() && chars[unit_pos] == ' ';
+        if has_space {
+            unit_pos += 1;
+        }
+
+        // Check for C or F
+        if unit_pos < chars.len() {
+            let unit_char = chars[unit_pos];
+            if unit_char == 'C' || unit_char == 'c' || unit_char == 'F' || unit_char == 'f' {
+                // Check delimiter after unit (space, period, comma, quotes, etc.)
+                let after_unit = unit_pos + 1;
+                let is_valid_end = after_unit >= chars.len() ||
+                    matches!(chars[after_unit], ' ' | '.' | ',' | ';' | ':' | '!' | '?' | ']' | ')' | '\n' | '\r' | '"' | '\'');
+
+                if is_valid_end {
+                    // Valid temperature - convert it
+                    let num_str: String = chars[num_start..num_end].iter().collect();
+                    if let Ok(num) = num_str.parse::<f64>() {
+                        let (converted, new_unit) = if unit_char == 'C' || unit_char == 'c' {
+                            (((num * 9.0 / 5.0) + 32.0).round() as i64, 'F')
+                        } else {
+                            (((num - 32.0) * 5.0 / 9.0).round() as i64, 'C')
+                        };
+
+                        result.push_str(&num_str);
+                        if has_space {
+                            result.push(' ');
+                        }
+                        result.push(unit_char);
+                        result.push_str(&format!(" ({}{})", converted, new_unit));
+                        i = after_unit;
+                        continue;
+                    }
+                }
+            }
+        }
+
+        // Not a valid temperature pattern - output the number as-is
+        for c in &chars[num_start..num_end] {
+            result.push(*c);
+        }
+        i = num_end;
+    }
 
     result
 }

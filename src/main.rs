@@ -3324,24 +3324,51 @@ impl OutputLine {
     /// Same day: HH:MM>
     /// Previous days: DD/MM HH:MM>
     fn format_timestamp(&self) -> String {
-        let now = SystemTime::now();
+        self.format_timestamp_with_now(&CachedNow::new())
+    }
+
+    /// Format timestamp using a pre-computed "now" value for batch rendering
+    fn format_timestamp_with_now(&self, now: &CachedNow) -> String {
         let ts_secs = self.timestamp.duration_since(UNIX_EPOCH).unwrap_or_default().as_secs() as libc::time_t;
-        let now_secs = now.duration_since(UNIX_EPOCH).unwrap_or_default().as_secs() as libc::time_t;
 
         let mut ts_tm: libc::tm = unsafe { std::mem::zeroed() };
-        let mut now_tm: libc::tm = unsafe { std::mem::zeroed() };
         unsafe {
             libc::localtime_r(&ts_secs, &mut ts_tm);
-            libc::localtime_r(&now_secs, &mut now_tm);
         }
 
         // Check if same day (year, day of year match)
-        let same_day = ts_tm.tm_yday == now_tm.tm_yday && ts_tm.tm_year == now_tm.tm_year;
+        let same_day = ts_tm.tm_yday == now.yday && ts_tm.tm_year == now.year;
 
         if same_day {
             format!("{:02}:{:02}>", ts_tm.tm_hour, ts_tm.tm_min)
         } else {
             format!("{:02}/{:02} {:02}:{:02}>", ts_tm.tm_mday, ts_tm.tm_mon + 1, ts_tm.tm_hour, ts_tm.tm_min)
+        }
+    }
+}
+
+/// Cached "now" time for batch timestamp formatting
+/// Computing localtime_r once per frame instead of once per line
+struct CachedNow {
+    year: i32,
+    yday: i32,
+}
+
+impl CachedNow {
+    fn new() -> Self {
+        let now_secs = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as libc::time_t;
+
+        let mut now_tm: libc::tm = unsafe { std::mem::zeroed() };
+        unsafe {
+            libc::localtime_r(&now_secs, &mut now_tm);
+        }
+
+        Self {
+            year: now_tm.tm_year,
+            yday: now_tm.tm_yday,
         }
     }
 }
@@ -5746,6 +5773,32 @@ mod remote_gui {
     use egui::{Color32, ScrollArea, TextEdit};
     use tokio_tungstenite::{connect_async, tungstenite::Message as WsRawMessage};
 
+    /// Cached "now" time for batch timestamp formatting in GUI
+    struct GuiCachedNow {
+        year: i32,
+        yday: i32,
+    }
+
+    impl GuiCachedNow {
+        fn new() -> Self {
+            use std::time::{SystemTime, UNIX_EPOCH};
+            let now_secs = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs() as libc::time_t;
+
+            let mut now_tm: libc::tm = unsafe { std::mem::zeroed() };
+            unsafe {
+                libc::localtime_r(&now_secs, &mut now_tm);
+            }
+
+            Self {
+                year: now_tm.tm_year,
+                yday: now_tm.tm_yday,
+            }
+        }
+    }
+
     /// World settings for remote GUI
     #[derive(Clone, Default)]
     pub struct RemoteWorldSettings {
@@ -7248,22 +7301,20 @@ mod remote_gui {
         /// Same day: HH:MM>
         /// Previous days: DD/MM HH:MM>
         fn format_timestamp_gui(ts: u64) -> String {
-            use std::time::{SystemTime, UNIX_EPOCH};
+            Self::format_timestamp_gui_cached(ts, &GuiCachedNow::new())
+        }
 
-            let now = SystemTime::now();
-
+        /// Format timestamp using cached "now" value for batch rendering
+        fn format_timestamp_gui_cached(ts: u64, now: &GuiCachedNow) -> String {
             let ts_secs = ts as libc::time_t;
-            let now_secs = now.duration_since(UNIX_EPOCH).unwrap_or_default().as_secs() as libc::time_t;
 
             let mut ts_tm: libc::tm = unsafe { std::mem::zeroed() };
-            let mut now_tm: libc::tm = unsafe { std::mem::zeroed() };
             unsafe {
                 libc::localtime_r(&ts_secs, &mut ts_tm);
-                libc::localtime_r(&now_secs, &mut now_tm);
             }
 
             // Check if same day (year, day of year match)
-            let same_day = ts_tm.tm_yday == now_tm.tm_yday && ts_tm.tm_year == now_tm.tm_year;
+            let same_day = ts_tm.tm_yday == now.yday && ts_tm.tm_year == now.year;
 
             if same_day {
                 format!("{:02}:{:02}>", ts_tm.tm_hour, ts_tm.tm_min)
@@ -9175,6 +9226,9 @@ mod remote_gui {
                         .stroke(egui::Stroke::NONE))
                     .show(ctx, |ui| {
                     if let Some(world) = self.worlds.get(self.current_world) {
+                        // Cache "now" for timestamp formatting - compute once per frame
+                        let cached_now = GuiCachedNow::new();
+
                         // Keep original lines with ANSI for coloring
                         let colored_lines: Vec<&TimestampedLine> = world.output_lines.iter()
                             .filter(|line| {
@@ -9195,7 +9249,7 @@ mod remote_gui {
                                 if self.show_tags {
                                     // Add timestamp prefix when showing tags
                                     // Also convert temperatures
-                                    let ts_prefix = Self::format_timestamp_gui(line.ts);
+                                    let ts_prefix = Self::format_timestamp_gui_cached(line.ts, &cached_now);
                                     let with_temps = convert_temperatures(&stripped);
                                     format!("{} {}", ts_prefix, with_temps)
                                 } else {
@@ -9240,7 +9294,7 @@ mod remote_gui {
                         let actions = &self.actions;
                         let display_lines: Vec<String> = non_empty_lines.iter().map(|line| {
                             let base_line = if self.show_tags {
-                                let ts_prefix = Self::format_timestamp_gui(line.ts);
+                                let ts_prefix = Self::format_timestamp_gui_cached(line.ts, &cached_now);
                                 // Also convert temperatures when showing tags
                                 let with_temps = convert_temperatures(&line.text);
                                 format!("\x1b[36m{}\x1b[0m {}", ts_prefix, with_temps)
@@ -17988,7 +18042,10 @@ fn render_output_crossterm(app: &App) {
     let world_name = &world.name;
     let actions = &app.settings.actions;
 
-    let expand_and_wrap = |line: &OutputLine, term_width: usize, show_tags: bool, highlight: bool| -> Vec<(String, bool)> {
+    // Cache "now" for timestamp formatting - compute once per frame, not per line
+    let cached_now = CachedNow::new();
+
+    let expand_and_wrap = |line: &OutputLine, term_width: usize, show_tags: bool, highlight: bool, cached_now: &CachedNow| -> Vec<(String, bool)> {
         // Skip gagged lines unless show_tags (F2) is enabled
         if line.gagged && !show_tags {
             return Vec::new();
@@ -18009,7 +18066,7 @@ fn render_output_crossterm(app: &App) {
             // Show timestamp + original text when tags are shown
             // Also convert temperatures (32C -> 32C (90F), etc.)
             let text_with_temps = convert_temperatures(&text);
-            format!("\x1b[36m{}\x1b[0m {}", line.format_timestamp(), text_with_temps)
+            format!("\x1b[36m{}\x1b[0m {}", line.format_timestamp_with_now(cached_now), text_with_temps)
         } else {
             strip_mud_tag(&text)
         };
@@ -18040,7 +18097,7 @@ fn render_output_crossterm(app: &App) {
                 if line_idx < world.output_lines.len() {
                     let line = &world.output_lines[line_idx];
                     let highlight = should_highlight(line);
-                    let wrapped = expand_and_wrap(line, term_width, show_tags, highlight);
+                    let wrapped = expand_and_wrap(line, term_width, show_tags, highlight, &cached_now);
 
                     for w in wrapped.into_iter().rev() {
                         visual_lines.insert(0, w);
@@ -18058,7 +18115,7 @@ fn render_output_crossterm(app: &App) {
                     if line_idx < world.output_lines.len() {
                         let line = &world.output_lines[line_idx];
                         let highlight = should_highlight(line);
-                        let wrapped = expand_and_wrap(line, term_width, show_tags, highlight);
+                        let wrapped = expand_and_wrap(line, term_width, show_tags, highlight, &cached_now);
 
                         for w in wrapped {
                             visual_lines.push(w);
@@ -18080,7 +18137,7 @@ fn render_output_crossterm(app: &App) {
             first_line_idx = line_idx;
             let line = &world.output_lines[line_idx];
             let highlight = should_highlight(line);
-            let wrapped = expand_and_wrap(line, term_width, show_tags, highlight);
+            let wrapped = expand_and_wrap(line, term_width, show_tags, highlight, &cached_now);
 
             for w in wrapped.into_iter().rev() {
                 visual_lines.insert(0, w);
@@ -18095,7 +18152,7 @@ fn render_output_crossterm(app: &App) {
             for line_idx in (end_line + 1)..world.output_lines.len() {
                 let line = &world.output_lines[line_idx];
                 let highlight = should_highlight(line);
-                let wrapped = expand_and_wrap(line, term_width, show_tags, highlight);
+                let wrapped = expand_and_wrap(line, term_width, show_tags, highlight, &cached_now);
 
                 for w in wrapped {
                     visual_lines.push(w);
