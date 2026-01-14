@@ -1,0 +1,1003 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, interactive-widget=resizes-content">
+    <title>Clay - Web Interface (Full Mockup)</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@300;400;500;600&display=swap" rel="stylesheet">
+    <style>
+        :root {
+            /* Core palette */
+            --bg-deep: #0a0c10;
+            --bg-primary: #0d1117;
+            --bg-elevated: #161b22;
+            --bg-surface: #1c2128;
+            --bg-overlay: rgba(0, 0, 0, 0.7);
+
+            /* Text */
+            --text-primary: #e6edf3;
+            --text-secondary: #8b949e;
+            --text-muted: #484f58;
+
+            /* Accents */
+            --accent-primary: #58a6ff;
+            --accent-green: #3fb950;
+            --accent-warning: #d29922;
+            --accent-danger: #f85149;
+            --accent-subtle: #388bfd26;
+
+            /* ANSI */
+            --ansi-red: #ff7b72;
+            --ansi-green: #7ee787;
+            --ansi-yellow: #d29922;
+            --ansi-blue: #79c0ff;
+            --ansi-magenta: #d2a8ff;
+            --ansi-cyan: #a5d6ff;
+
+            /* Structure */
+            --border-default: #30363d;
+            --border-subtle: #21262d;
+            --border-focus: var(--accent-primary);
+
+            /* Popup */
+            --popup-shadow: 0 16px 48px rgba(0, 0, 0, 0.4), 0 4px 16px rgba(0, 0, 0, 0.3);
+        }
+
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+
+        html, body {
+            height: 100%;
+            background: var(--bg-deep);
+            color: var(--text-primary);
+            font-family: 'JetBrains Mono', monospace;
+            font-size: 14px;
+            line-height: 1.5;
+            -webkit-font-smoothing: antialiased;
+        }
+
+        .app {
+            display: flex;
+            flex-direction: column;
+            height: 100vh;
+            background: var(--bg-primary);
+            position: relative;
+        }
+
+        /* ═══════════════════════════════════════
+           OUTPUT AREA
+           ═══════════════════════════════════════ */
+        .output {
+            flex: 1;
+            overflow-y: auto;
+            padding: 16px 20px;
+            position: relative;
+        }
+
+        .output::before {
+            content: '';
+            position: sticky;
+            display: block;
+            top: 0;
+            height: 32px;
+            margin-bottom: -32px;
+            background: linear-gradient(to bottom, var(--bg-primary), transparent);
+            pointer-events: none;
+            z-index: 5;
+        }
+
+        .output::-webkit-scrollbar { width: 6px; }
+        .output::-webkit-scrollbar-track { background: transparent; }
+        .output::-webkit-scrollbar-thumb { background: var(--border-default); border-radius: 3px; }
+
+        .line {
+            padding: 1px 0;
+            white-space: pre-wrap;
+            font-size: 13px;
+        }
+
+        .line:hover {
+            background: var(--accent-subtle);
+            margin: 0 -20px;
+            padding-left: 20px;
+            padding-right: 20px;
+        }
+
+        .system { color: var(--text-muted); font-style: italic; }
+        .room-name { color: var(--ansi-cyan); font-weight: 600; }
+        .room-desc { color: var(--text-secondary); }
+        .player { color: var(--ansi-yellow); font-weight: 500; }
+        .channel { color: var(--ansi-magenta); }
+
+        /* ═══════════════════════════════════════
+           SEPARATOR BAR
+           ═══════════════════════════════════════ */
+        .separator {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            padding: 6px 20px;
+            background: var(--bg-elevated);
+            border-top: 1px solid var(--border-subtle);
+            border-bottom: 1px solid var(--border-subtle);
+            min-height: 32px;
+        }
+
+        .separator-left, .separator-right {
+            display: flex;
+            align-items: center;
+            gap: 12px;
+        }
+
+        .status-dot {
+            width: 7px;
+            height: 7px;
+            border-radius: 50%;
+            background: var(--accent-green);
+            box-shadow: 0 0 6px var(--accent-green);
+            animation: pulse 2.5s ease-in-out infinite;
+        }
+
+        @keyframes pulse {
+            0%, 100% { opacity: 1; }
+            50% { opacity: 0.5; }
+        }
+
+        .world-name { font-size: 13px; font-weight: 500; }
+        .activity { font-size: 11px; color: var(--accent-warning); }
+        .time { font-size: 12px; color: var(--text-muted); font-variant-numeric: tabular-nums; }
+
+        /* ═══════════════════════════════════════
+           INPUT AREA
+           ═══════════════════════════════════════ */
+        .input-container {
+            background: var(--bg-surface);
+            padding: 10px 20px 12px;
+            border-top: 1px solid var(--border-default);
+        }
+
+        .input-wrapper {
+            display: flex;
+            align-items: flex-start;
+            gap: 8px;
+            background: var(--bg-primary);
+            border: 1px solid var(--border-default);
+            border-radius: 5px;
+            padding: 8px 12px;
+            transition: border-color 0.15s, box-shadow 0.15s;
+        }
+
+        .input-wrapper:focus-within {
+            border-color: var(--accent-primary);
+            box-shadow: 0 0 0 3px var(--accent-subtle);
+        }
+
+        .prompt { color: var(--ansi-cyan); font-size: 13px; }
+
+        .input {
+            flex: 1;
+            background: transparent;
+            border: none;
+            outline: none;
+            color: var(--text-primary);
+            font-family: inherit;
+            font-size: 13px;
+            line-height: 1.5;
+            resize: none;
+            min-height: 63px;
+        }
+
+        /* ═══════════════════════════════════════
+           POPUP OVERLAY
+           ═══════════════════════════════════════ */
+        .overlay {
+            position: fixed;
+            inset: 0;
+            background: var(--bg-overlay);
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            z-index: 1000;
+            opacity: 0;
+            visibility: hidden;
+            transition: opacity 0.15s, visibility 0.15s;
+        }
+
+        .overlay.active {
+            opacity: 1;
+            visibility: visible;
+        }
+
+        .popup {
+            background: var(--bg-elevated);
+            border: 1px solid var(--border-default);
+            border-radius: 8px;
+            box-shadow: var(--popup-shadow);
+            max-width: 90vw;
+            max-height: 85vh;
+            overflow: hidden;
+            display: flex;
+            flex-direction: column;
+            animation: popup-in 0.15s ease-out;
+        }
+
+        @keyframes popup-in {
+            from { transform: scale(0.95); opacity: 0; }
+            to { transform: scale(1); opacity: 1; }
+        }
+
+        .popup-header {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            padding: 12px 16px;
+            border-bottom: 1px solid var(--border-subtle);
+            background: var(--bg-surface);
+        }
+
+        .popup-title {
+            font-size: 14px;
+            font-weight: 600;
+            color: var(--text-primary);
+        }
+
+        .popup-close {
+            width: 24px;
+            height: 24px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            background: transparent;
+            border: none;
+            color: var(--text-secondary);
+            cursor: pointer;
+            border-radius: 4px;
+            font-size: 16px;
+        }
+
+        .popup-close:hover {
+            background: var(--border-default);
+            color: var(--text-primary);
+        }
+
+        .popup-body {
+            padding: 16px;
+            overflow-y: auto;
+        }
+
+        .popup-footer {
+            display: flex;
+            justify-content: flex-end;
+            gap: 8px;
+            padding: 12px 16px;
+            border-top: 1px solid var(--border-subtle);
+            background: var(--bg-surface);
+        }
+
+        /* ═══════════════════════════════════════
+           BUTTONS
+           ═══════════════════════════════════════ */
+        .btn {
+            padding: 6px 14px;
+            border-radius: 5px;
+            font-family: inherit;
+            font-size: 12px;
+            font-weight: 500;
+            cursor: pointer;
+            transition: all 0.15s;
+            border: 1px solid transparent;
+        }
+
+        .btn-primary {
+            background: var(--accent-primary);
+            color: #fff;
+        }
+        .btn-primary:hover { filter: brightness(1.1); }
+
+        .btn-secondary {
+            background: var(--bg-primary);
+            border-color: var(--border-default);
+            color: var(--text-primary);
+        }
+        .btn-secondary:hover { background: var(--bg-surface); }
+
+        .btn-danger {
+            background: var(--accent-danger);
+            color: #fff;
+        }
+        .btn-danger:hover { filter: brightness(1.1); }
+
+        .btn-success {
+            background: var(--accent-green);
+            color: #000;
+        }
+        .btn-success:hover { filter: brightness(1.1); }
+
+        /* ═══════════════════════════════════════
+           FORM ELEMENTS
+           ═══════════════════════════════════════ */
+        .form-group {
+            margin-bottom: 12px;
+        }
+
+        .form-label {
+            display: block;
+            font-size: 11px;
+            font-weight: 500;
+            color: var(--text-secondary);
+            margin-bottom: 4px;
+            text-transform: uppercase;
+            letter-spacing: 0.05em;
+        }
+
+        .form-input {
+            width: 100%;
+            padding: 8px 10px;
+            background: var(--bg-primary);
+            border: 1px solid var(--border-default);
+            border-radius: 4px;
+            color: var(--text-primary);
+            font-family: inherit;
+            font-size: 13px;
+        }
+
+        .form-input:focus {
+            outline: none;
+            border-color: var(--accent-primary);
+            box-shadow: 0 0 0 2px var(--accent-subtle);
+        }
+
+        .form-select {
+            appearance: none;
+            background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 24 24' fill='none' stroke='%238b949e' stroke-width='2'%3E%3Cpath d='M6 9l6 6 6-6'/%3E%3C/svg%3E");
+            background-repeat: no-repeat;
+            background-position: right 10px center;
+            padding-right: 32px;
+        }
+
+        .form-row {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 12px;
+        }
+
+        .form-checkbox {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            cursor: pointer;
+        }
+
+        .form-checkbox input {
+            width: 16px;
+            height: 16px;
+            accent-color: var(--accent-primary);
+        }
+
+        /* ═══════════════════════════════════════
+           WORLD LIST
+           ═══════════════════════════════════════ */
+        .world-list {
+            min-width: 400px;
+        }
+
+        .world-list-filter {
+            margin-bottom: 12px;
+        }
+
+        .world-list-items {
+            max-height: 300px;
+            overflow-y: auto;
+        }
+
+        .world-item {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            padding: 8px 12px;
+            border-radius: 4px;
+            cursor: pointer;
+            transition: background 0.1s;
+        }
+
+        .world-item:hover {
+            background: var(--bg-surface);
+        }
+
+        .world-item.selected {
+            background: var(--accent-subtle);
+            outline: 1px solid var(--accent-primary);
+        }
+
+        .world-item-dot {
+            width: 6px;
+            height: 6px;
+            border-radius: 50%;
+            background: var(--text-muted);
+        }
+
+        .world-item-dot.connected {
+            background: var(--accent-green);
+            box-shadow: 0 0 4px var(--accent-green);
+        }
+
+        .world-item-name {
+            flex: 1;
+            font-size: 13px;
+        }
+
+        .world-item-host {
+            font-size: 11px;
+            color: var(--text-muted);
+        }
+
+        /* ═══════════════════════════════════════
+           ACTIONS LIST
+           ═══════════════════════════════════════ */
+        .actions-list {
+            min-width: 500px;
+        }
+
+        .action-item {
+            display: grid;
+            grid-template-columns: 100px 1fr 80px;
+            gap: 12px;
+            padding: 10px 12px;
+            border-radius: 4px;
+            align-items: center;
+        }
+
+        .action-item:hover {
+            background: var(--bg-surface);
+        }
+
+        .action-item.selected {
+            background: var(--accent-subtle);
+            outline: 1px solid var(--accent-primary);
+        }
+
+        .action-name {
+            font-weight: 500;
+            font-size: 13px;
+        }
+
+        .action-pattern {
+            font-size: 12px;
+            color: var(--text-secondary);
+            font-family: inherit;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            white-space: nowrap;
+        }
+
+        .action-type {
+            font-size: 10px;
+            color: var(--text-muted);
+            text-transform: uppercase;
+            letter-spacing: 0.05em;
+            text-align: right;
+        }
+
+        /* ═══════════════════════════════════════
+           SETUP POPUP
+           ═══════════════════════════════════════ */
+        .setup-popup {
+            min-width: 350px;
+        }
+
+        .setup-section {
+            margin-bottom: 16px;
+        }
+
+        .setup-section-title {
+            font-size: 12px;
+            font-weight: 600;
+            color: var(--text-secondary);
+            margin-bottom: 10px;
+            padding-bottom: 6px;
+            border-bottom: 1px solid var(--border-subtle);
+        }
+
+        /* ═══════════════════════════════════════
+           FILTER POPUP (top-right)
+           ═══════════════════════════════════════ */
+        .filter-popup {
+            position: fixed;
+            top: 12px;
+            right: 12px;
+            background: var(--bg-elevated);
+            border: 1px solid var(--border-default);
+            border-radius: 6px;
+            box-shadow: var(--popup-shadow);
+            padding: 8px;
+            z-index: 1001;
+            display: none;
+        }
+
+        .filter-popup.active {
+            display: block;
+        }
+
+        .filter-input {
+            width: 250px;
+            padding: 6px 10px;
+            background: var(--bg-primary);
+            border: 1px solid var(--border-default);
+            border-radius: 4px;
+            color: var(--text-primary);
+            font-family: inherit;
+            font-size: 13px;
+        }
+
+        .filter-input:focus {
+            outline: none;
+            border-color: var(--accent-primary);
+        }
+
+        /* ═══════════════════════════════════════
+           CONFIRM DIALOG
+           ═══════════════════════════════════════ */
+        .confirm-dialog {
+            min-width: 320px;
+            text-align: center;
+        }
+
+        .confirm-message {
+            font-size: 14px;
+            margin-bottom: 16px;
+            color: var(--text-primary);
+        }
+
+        .confirm-warning {
+            color: var(--accent-danger);
+        }
+
+        /* ═══════════════════════════════════════
+           DEMO CONTROLS
+           ═══════════════════════════════════════ */
+        .demo-controls {
+            position: fixed;
+            bottom: 20px;
+            right: 20px;
+            background: var(--bg-elevated);
+            border: 1px solid var(--border-default);
+            border-radius: 8px;
+            padding: 12px;
+            z-index: 2000;
+            display: flex;
+            flex-direction: column;
+            gap: 6px;
+        }
+
+        .demo-controls-title {
+            font-size: 10px;
+            font-weight: 600;
+            color: var(--text-muted);
+            text-transform: uppercase;
+            letter-spacing: 0.1em;
+            margin-bottom: 4px;
+        }
+
+        .demo-btn {
+            padding: 6px 10px;
+            background: var(--bg-surface);
+            border: 1px solid var(--border-default);
+            border-radius: 4px;
+            color: var(--text-primary);
+            font-family: inherit;
+            font-size: 11px;
+            cursor: pointer;
+            text-align: left;
+        }
+
+        .demo-btn:hover {
+            background: var(--border-default);
+        }
+    </style>
+</head>
+<body>
+    <div class="app">
+        <!-- Output Area -->
+        <div class="output" id="output">
+            <div class="line system">Connected to Realm of Shadows...</div>
+            <div class="line">&nbsp;</div>
+            <div class="line room-name">The Grand Hall of Echoes</div>
+            <div class="line room-desc">You stand in a vast chamber where ancient stone columns rise into</div>
+            <div class="line room-desc">darkness above. Torchlight flickers against weathered tapestries.</div>
+            <div class="line">&nbsp;</div>
+            <div class="line"><span class="channel">[gossip]</span> <span class="player">Theron:</span> Anyone online?</div>
+            <div class="line"><span class="channel">[gossip]</span> <span class="player">Lyra:</span> Just got here!</div>
+        </div>
+
+        <!-- Separator -->
+        <div class="separator">
+            <div class="separator-left">
+                <div class="status-dot"></div>
+                <div class="world-name">Realm of Shadows</div>
+                <div class="activity">(Activity: 2)</div>
+            </div>
+            <div class="separator-right">
+                <div class="time" id="time">3:42</div>
+            </div>
+        </div>
+
+        <!-- Input -->
+        <div class="input-container">
+            <div class="input-wrapper">
+                <span class="prompt">&gt;</span>
+                <textarea class="input" rows="3" placeholder="Enter command..."></textarea>
+            </div>
+        </div>
+    </div>
+
+    <!-- Filter Popup (F4) -->
+    <div class="filter-popup" id="filter-popup">
+        <input type="text" class="filter-input" placeholder="Filter output..." autofocus>
+    </div>
+
+    <!-- World List Overlay -->
+    <div class="overlay" id="worlds-overlay">
+        <div class="popup world-list">
+            <div class="popup-header">
+                <span class="popup-title">Worlds</span>
+                <button class="popup-close" onclick="hidePopup('worlds-overlay')">&times;</button>
+            </div>
+            <div class="popup-body">
+                <div class="world-list-filter">
+                    <input type="text" class="form-input" placeholder="Filter worlds...">
+                </div>
+                <div class="world-list-items">
+                    <div class="world-item selected">
+                        <div class="world-item-dot connected"></div>
+                        <span class="world-item-name">Realm of Shadows</span>
+                        <span class="world-item-host">shadows.mud.org:4000</span>
+                    </div>
+                    <div class="world-item">
+                        <div class="world-item-dot connected"></div>
+                        <span class="world-item-name">Discworld</span>
+                        <span class="world-item-host">discworld.starturtle.net:4242</span>
+                    </div>
+                    <div class="world-item">
+                        <div class="world-item-dot"></div>
+                        <span class="world-item-name">BatMUD</span>
+                        <span class="world-item-host">batmud.bat.org:23</span>
+                    </div>
+                    <div class="world-item">
+                        <div class="world-item-dot"></div>
+                        <span class="world-item-name">Aardwolf</span>
+                        <span class="world-item-host">aardmud.org:23</span>
+                    </div>
+                </div>
+            </div>
+            <div class="popup-footer">
+                <button class="btn btn-secondary">Add</button>
+                <button class="btn btn-secondary">Edit</button>
+                <button class="btn btn-success">Connect</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- World Editor Overlay -->
+    <div class="overlay" id="editor-overlay">
+        <div class="popup" style="min-width: 420px;">
+            <div class="popup-header">
+                <span class="popup-title">Edit World</span>
+                <button class="popup-close" onclick="hidePopup('editor-overlay')">&times;</button>
+            </div>
+            <div class="popup-body">
+                <div class="form-group">
+                    <label class="form-label">World Name</label>
+                    <input type="text" class="form-input" value="Realm of Shadows">
+                </div>
+                <div class="form-row">
+                    <div class="form-group">
+                        <label class="form-label">Hostname</label>
+                        <input type="text" class="form-input" value="shadows.mud.org">
+                    </div>
+                    <div class="form-group">
+                        <label class="form-label">Port</label>
+                        <input type="text" class="form-input" value="4000">
+                    </div>
+                </div>
+                <div class="form-row">
+                    <div class="form-group">
+                        <label class="form-label">Username</label>
+                        <input type="text" class="form-input" value="wanderer">
+                    </div>
+                    <div class="form-group">
+                        <label class="form-label">Password</label>
+                        <input type="password" class="form-input" value="••••••••">
+                    </div>
+                </div>
+                <div class="form-row">
+                    <div class="form-group">
+                        <label class="form-label">Encoding</label>
+                        <select class="form-input form-select">
+                            <option selected>UTF-8</option>
+                            <option>Latin-1</option>
+                            <option>FANSI</option>
+                        </select>
+                    </div>
+                    <div class="form-group">
+                        <label class="form-label">Auto Login</label>
+                        <select class="form-input form-select">
+                            <option selected>Connect</option>
+                            <option>Prompt</option>
+                            <option>MOO Prompt</option>
+                        </select>
+                    </div>
+                </div>
+                <div class="form-group">
+                    <label class="form-checkbox">
+                        <input type="checkbox" checked>
+                        <span>Use SSL/TLS</span>
+                    </label>
+                </div>
+                <div class="form-group">
+                    <label class="form-label">Log File</label>
+                    <input type="text" class="form-input" placeholder="/path/to/logfile.txt">
+                </div>
+            </div>
+            <div class="popup-footer">
+                <button class="btn btn-danger">Delete</button>
+                <div style="flex: 1;"></div>
+                <button class="btn btn-secondary" onclick="hidePopup('editor-overlay')">Cancel</button>
+                <button class="btn btn-primary">Save</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Setup Overlay -->
+    <div class="overlay" id="setup-overlay">
+        <div class="popup setup-popup">
+            <div class="popup-header">
+                <span class="popup-title">Settings</span>
+                <button class="popup-close" onclick="hidePopup('setup-overlay')">&times;</button>
+            </div>
+            <div class="popup-body">
+                <div class="setup-section">
+                    <div class="setup-section-title">Display</div>
+                    <div class="form-group">
+                        <label class="form-checkbox">
+                            <input type="checkbox" checked>
+                            <span>More mode (pause on new output)</span>
+                        </label>
+                    </div>
+                    <div class="form-group">
+                        <label class="form-checkbox">
+                            <input type="checkbox" checked>
+                            <span>Show MUD tags</span>
+                        </label>
+                    </div>
+                    <div class="form-group">
+                        <label class="form-checkbox">
+                            <input type="checkbox">
+                            <span>Spell check</span>
+                        </label>
+                    </div>
+                </div>
+                <div class="setup-section">
+                    <div class="setup-section-title">Input</div>
+                    <div class="form-group">
+                        <label class="form-label">Input Height (lines)</label>
+                        <input type="number" class="form-input" value="3" min="1" max="15" style="width: 80px;">
+                    </div>
+                </div>
+                <div class="setup-section">
+                    <div class="setup-section-title">World Switching</div>
+                    <div class="form-group">
+                        <select class="form-input form-select">
+                            <option selected>Unseen First</option>
+                            <option>Alphabetical</option>
+                        </select>
+                    </div>
+                </div>
+            </div>
+            <div class="popup-footer">
+                <button class="btn btn-secondary" onclick="hidePopup('setup-overlay')">Cancel</button>
+                <button class="btn btn-primary">Save</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Actions List Overlay -->
+    <div class="overlay" id="actions-overlay">
+        <div class="popup actions-list">
+            <div class="popup-header">
+                <span class="popup-title">Actions</span>
+                <button class="popup-close" onclick="hidePopup('actions-overlay')">&times;</button>
+            </div>
+            <div class="popup-body" style="padding: 8px;">
+                <div class="action-item selected">
+                    <span class="action-name">gag_spam</span>
+                    <span class="action-pattern">^You feel a bit hungry\.$</span>
+                    <span class="action-type">Regexp</span>
+                </div>
+                <div class="action-item">
+                    <span class="action-name">auto_look</span>
+                    <span class="action-pattern">*You have arrived*</span>
+                    <span class="action-type">Wildcard</span>
+                </div>
+                <div class="action-item">
+                    <span class="action-name">highlight_tells</span>
+                    <span class="action-pattern">*tells you*</span>
+                    <span class="action-type">Wildcard</span>
+                </div>
+                <div class="action-item">
+                    <span class="action-name">combat_alert</span>
+                    <span class="action-pattern">^.+ attacks you!</span>
+                    <span class="action-type">Regexp</span>
+                </div>
+            </div>
+            <div class="popup-footer">
+                <button class="btn btn-secondary">Add</button>
+                <button class="btn btn-secondary">Edit</button>
+                <button class="btn btn-danger">Delete</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Action Editor Overlay -->
+    <div class="overlay" id="action-editor-overlay">
+        <div class="popup" style="min-width: 450px;">
+            <div class="popup-header">
+                <span class="popup-title">Edit Action</span>
+                <button class="popup-close" onclick="hidePopup('action-editor-overlay')">&times;</button>
+            </div>
+            <div class="popup-body">
+                <div class="form-row">
+                    <div class="form-group">
+                        <label class="form-label">Name</label>
+                        <input type="text" class="form-input" value="gag_spam">
+                    </div>
+                    <div class="form-group">
+                        <label class="form-label">World (blank = all)</label>
+                        <input type="text" class="form-input" placeholder="All worlds">
+                    </div>
+                </div>
+                <div class="form-row">
+                    <div class="form-group">
+                        <label class="form-label">Pattern</label>
+                        <input type="text" class="form-input" value="^You feel a bit hungry\.$">
+                    </div>
+                    <div class="form-group">
+                        <label class="form-label">Match Type</label>
+                        <select class="form-input form-select">
+                            <option selected>Regexp</option>
+                            <option>Wildcard</option>
+                        </select>
+                    </div>
+                </div>
+                <div class="form-group">
+                    <label class="form-label">Command(s)</label>
+                    <input type="text" class="form-input" value="/gag" placeholder="Commands separated by semicolons">
+                </div>
+            </div>
+            <div class="popup-footer">
+                <button class="btn btn-secondary" onclick="hidePopup('action-editor-overlay')">Cancel</button>
+                <button class="btn btn-primary">Save</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Confirm Delete Overlay -->
+    <div class="overlay" id="confirm-overlay">
+        <div class="popup confirm-dialog">
+            <div class="popup-header">
+                <span class="popup-title">Confirm Delete</span>
+                <button class="popup-close" onclick="hidePopup('confirm-overlay')">&times;</button>
+            </div>
+            <div class="popup-body">
+                <p class="confirm-message">
+                    Delete world <span class="confirm-warning">"Realm of Shadows"</span>?
+                </p>
+                <p style="font-size: 12px; color: var(--text-muted);">This action cannot be undone.</p>
+            </div>
+            <div class="popup-footer">
+                <button class="btn btn-secondary" onclick="hidePopup('confirm-overlay')">Cancel</button>
+                <button class="btn btn-danger">Delete</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Help Overlay -->
+    <div class="overlay" id="help-overlay">
+        <div class="popup" style="min-width: 500px; max-height: 70vh;">
+            <div class="popup-header">
+                <span class="popup-title">Help</span>
+                <button class="popup-close" onclick="hidePopup('help-overlay')">&times;</button>
+            </div>
+            <div class="popup-body" style="font-size: 12px; line-height: 1.6;">
+                <div class="setup-section">
+                    <div class="setup-section-title">Keyboard Shortcuts</div>
+                    <div style="display: grid; grid-template-columns: 120px 1fr; gap: 4px 16px; color: var(--text-secondary);">
+                        <span style="color: var(--ansi-cyan);">Up / Down</span><span>Switch worlds</span>
+                        <span style="color: var(--ansi-cyan);">PageUp / Down</span><span>Scroll output</span>
+                        <span style="color: var(--ansi-cyan);">Tab</span><span>Release paused lines</span>
+                        <span style="color: var(--ansi-cyan);">Ctrl+P / N</span><span>Command history</span>
+                        <span style="color: var(--ansi-cyan);">Ctrl+U</span><span>Clear input</span>
+                        <span style="color: var(--ansi-cyan);">F2</span><span>Toggle MUD tags</span>
+                        <span style="color: var(--ansi-cyan);">F4</span><span>Filter output</span>
+                        <span style="color: var(--ansi-cyan);">F8</span><span>Highlight actions</span>
+                    </div>
+                </div>
+                <div class="setup-section">
+                    <div class="setup-section-title">Commands</div>
+                    <div style="display: grid; grid-template-columns: 120px 1fr; gap: 4px 16px; color: var(--text-secondary);">
+                        <span style="color: var(--ansi-cyan);">/worlds</span><span>World selector</span>
+                        <span style="color: var(--ansi-cyan);">/worlds -e</span><span>Edit world</span>
+                        <span style="color: var(--ansi-cyan);">/connections</span><span>Connected worlds</span>
+                        <span style="color: var(--ansi-cyan);">/actions</span><span>Action editor</span>
+                        <span style="color: var(--ansi-cyan);">/setup</span><span>Settings</span>
+                        <span style="color: var(--ansi-cyan);">/disconnect</span><span>Disconnect world</span>
+                    </div>
+                </div>
+            </div>
+            <div class="popup-footer">
+                <button class="btn btn-primary" onclick="hidePopup('help-overlay')">Close</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Demo Controls -->
+    <div class="demo-controls">
+        <div class="demo-controls-title">Show Popup</div>
+        <button class="demo-btn" onclick="showPopup('worlds-overlay')">Worlds List</button>
+        <button class="demo-btn" onclick="showPopup('editor-overlay')">World Editor</button>
+        <button class="demo-btn" onclick="showPopup('setup-overlay')">Settings</button>
+        <button class="demo-btn" onclick="showPopup('actions-overlay')">Actions List</button>
+        <button class="demo-btn" onclick="showPopup('action-editor-overlay')">Action Editor</button>
+        <button class="demo-btn" onclick="showPopup('confirm-overlay')">Confirm Delete</button>
+        <button class="demo-btn" onclick="showPopup('help-overlay')">Help</button>
+        <button class="demo-btn" onclick="toggleFilter()">Filter (F4)</button>
+    </div>
+
+    <script>
+        // Time
+        function updateTime() {
+            const now = new Date();
+            let h = now.getHours() % 12 || 12;
+            const m = now.getMinutes().toString().padStart(2, '0');
+            document.getElementById('time').textContent = `${h}:${m}`;
+        }
+        updateTime();
+        setInterval(updateTime, 1000);
+
+        // Popups
+        function showPopup(id) {
+            document.querySelectorAll('.overlay').forEach(o => o.classList.remove('active'));
+            document.getElementById(id).classList.add('active');
+        }
+
+        function hidePopup(id) {
+            document.getElementById(id).classList.remove('active');
+        }
+
+        function toggleFilter() {
+            document.getElementById('filter-popup').classList.toggle('active');
+        }
+
+        // Close on Escape
+        document.addEventListener('keydown', (e) => {
+            if (e.key === 'Escape') {
+                document.querySelectorAll('.overlay.active').forEach(o => o.classList.remove('active'));
+                document.getElementById('filter-popup').classList.remove('active');
+            }
+            if (e.key === 'F4') {
+                e.preventDefault();
+                toggleFilter();
+            }
+        });
+
+        // Click overlay to close
+        document.querySelectorAll('.overlay').forEach(overlay => {
+            overlay.addEventListener('click', (e) => {
+                if (e.target === overlay) {
+                    overlay.classList.remove('active');
+                }
+            });
+        });
+    </script>
+</body>
+</html>

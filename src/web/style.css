@@ -742,6 +742,18 @@ body {
     background-color: #444;
 }
 
+.modal-buttons button.btn-primary {
+    background: #0891b2;
+    border-color: #0891b2;
+    color: #08080a;
+}
+
+.modal-buttons button.btn-primary:hover {
+    background: #22d3ee;
+    border-color: #22d3ee;
+    color: #08080a;
+}
+
 #action-error {
     color: var(--error-color);
     font-size: 12px;

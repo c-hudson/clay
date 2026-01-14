@@ -1,0 +1,435 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, interactive-widget=resizes-content">
+    <title>Clay - Web Interface</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@300;400;500;600&display=swap" rel="stylesheet">
+    <style>
+        :root {
+            /* Core palette - matches remote GUI */
+            --bg-deep: #0a0c10;
+            --bg-primary: #0d1117;
+            --bg-elevated: #161b22;
+            --bg-surface: #1c2128;
+
+            /* Text */
+            --text-primary: #e6edf3;
+            --text-secondary: #8b949e;
+            --text-muted: #484f58;
+
+            /* Accents */
+            --accent-primary: #58a6ff;
+            --accent-green: #3fb950;
+            --accent-warning: #d29922;
+            --accent-subtle: #388bfd26;
+
+            /* ANSI palette */
+            --ansi-red: #ff7b72;
+            --ansi-green: #7ee787;
+            --ansi-yellow: #d29922;
+            --ansi-blue: #79c0ff;
+            --ansi-magenta: #d2a8ff;
+            --ansi-cyan: #a5d6ff;
+            --ansi-white: #f0f6fc;
+            --ansi-bright-black: #6e7681;
+
+            /* Structure */
+            --border-default: #30363d;
+            --border-subtle: #21262d;
+
+            /* Sizing */
+            --input-rows: 3;
+            --line-height: 1.5;
+            --font-size: 14px;
+        }
+
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        html {
+            height: 100%;
+            overflow: hidden;
+        }
+
+        body {
+            height: 100%;
+            height: 100dvh;
+            background: var(--bg-deep);
+            color: var(--text-primary);
+            font-family: 'JetBrains Mono', monospace;
+            font-size: var(--font-size);
+            line-height: var(--line-height);
+            -webkit-font-smoothing: antialiased;
+            -moz-osx-font-smoothing: grayscale;
+            overflow: hidden;
+            overscroll-behavior: contain;
+        }
+
+        .app {
+            display: flex;
+            flex-direction: column;
+            height: 100%;
+            height: 100dvh;
+            background: var(--bg-primary);
+            position: relative;
+        }
+
+        /* Subtle grain overlay */
+        .app::after {
+            content: '';
+            position: fixed;
+            inset: 0;
+            background-image: url("data:image/svg+xml,%3Csvg viewBox='0 0 512 512' xmlns='http://www.w3.org/2000/svg'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.8' numOctaves='4' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)'/%3E%3C/svg%3E");
+            opacity: 0.018;
+            pointer-events: none;
+            z-index: 9999;
+        }
+
+        /* ═══════════════════════════════════════
+           OUTPUT AREA
+           ═══════════════════════════════════════ */
+        .output {
+            flex: 1;
+            overflow-y: auto;
+            overflow-x: hidden;
+            padding: 16px 20px;
+            position: relative;
+            -webkit-overflow-scrolling: touch;
+        }
+
+        /* Top fade for depth */
+        .output::before {
+            content: '';
+            position: sticky;
+            display: block;
+            top: 0;
+            left: 0;
+            right: 0;
+            height: 32px;
+            margin-bottom: -32px;
+            background: linear-gradient(to bottom, var(--bg-primary), transparent);
+            pointer-events: none;
+            z-index: 5;
+        }
+
+        /* Scrollbar */
+        .output::-webkit-scrollbar {
+            width: 6px;
+        }
+        .output::-webkit-scrollbar-track {
+            background: transparent;
+        }
+        .output::-webkit-scrollbar-thumb {
+            background: var(--border-default);
+            border-radius: 3px;
+        }
+        .output::-webkit-scrollbar-thumb:hover {
+            background: var(--text-muted);
+        }
+
+        .line {
+            padding: 1px 0;
+            white-space: pre-wrap;
+            word-wrap: break-word;
+            font-size: 13px;
+            letter-spacing: 0.01em;
+        }
+
+        .line:hover {
+            background: var(--accent-subtle);
+            margin: 0 -20px;
+            padding-left: 20px;
+            padding-right: 20px;
+        }
+
+        /* ANSI classes */
+        .fg-red { color: var(--ansi-red); }
+        .fg-green { color: var(--ansi-green); }
+        .fg-yellow { color: var(--ansi-yellow); }
+        .fg-blue { color: var(--ansi-blue); }
+        .fg-magenta { color: var(--ansi-magenta); }
+        .fg-cyan { color: var(--ansi-cyan); }
+        .fg-white { color: var(--ansi-white); }
+        .fg-gray { color: var(--ansi-bright-black); }
+        .bold { font-weight: 600; }
+        .dim { opacity: 0.6; }
+        .italic { font-style: italic; }
+
+        /* Semantic styles */
+        .system { color: var(--text-muted); font-style: italic; }
+        .room-name { color: var(--ansi-cyan); font-weight: 600; }
+        .room-desc { color: var(--text-secondary); }
+        .exits { color: var(--ansi-green); }
+        .player { color: var(--ansi-yellow); font-weight: 500; }
+        .channel { color: var(--ansi-magenta); }
+        .combat { color: var(--ansi-red); }
+        .success { color: var(--ansi-green); }
+
+        /* Clickable links */
+        .link {
+            color: var(--ansi-cyan);
+            text-decoration: underline;
+            text-underline-offset: 2px;
+            cursor: pointer;
+        }
+        .link:hover {
+            color: var(--accent-primary);
+        }
+
+        /* ═══════════════════════════════════════
+           SEPARATOR BAR
+           ═══════════════════════════════════════ */
+        .separator {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            padding: 6px 20px;
+            background: var(--bg-elevated);
+            border-top: 1px solid var(--border-subtle);
+            border-bottom: 1px solid var(--border-subtle);
+            min-height: 32px;
+            flex-shrink: 0;
+            position: relative;
+        }
+
+        /* Subtle top highlight */
+        .separator::before {
+            content: '';
+            position: absolute;
+            top: 0;
+            left: 10%;
+            right: 10%;
+            height: 1px;
+            background: linear-gradient(90deg, transparent, var(--border-default), transparent);
+        }
+
+        .separator-left {
+            display: flex;
+            align-items: center;
+            gap: 12px;
+        }
+
+        .separator-right {
+            display: flex;
+            align-items: center;
+            gap: 12px;
+        }
+
+        .status-dot {
+            width: 7px;
+            height: 7px;
+            border-radius: 50%;
+            background: var(--accent-green);
+            box-shadow: 0 0 6px var(--accent-green);
+            animation: pulse 2.5s ease-in-out infinite;
+        }
+
+        .status-dot.disconnected {
+            background: var(--text-muted);
+            box-shadow: none;
+            animation: none;
+        }
+
+        @keyframes pulse {
+            0%, 100% { opacity: 1; transform: scale(1); }
+            50% { opacity: 0.5; transform: scale(0.95); }
+        }
+
+        .world-name {
+            font-size: 13px;
+            font-weight: 500;
+            color: var(--text-primary);
+            letter-spacing: 0.02em;
+        }
+
+        .activity {
+            font-size: 11px;
+            color: var(--accent-warning);
+            letter-spacing: 0.01em;
+        }
+
+        .activity.hidden {
+            visibility: hidden;
+        }
+
+        .time {
+            font-size: 12px;
+            color: var(--text-muted);
+            font-variant-numeric: tabular-nums;
+            letter-spacing: 0.03em;
+        }
+
+        /* ═══════════════════════════════════════
+           INPUT AREA
+           ═══════════════════════════════════════ */
+        .input-container {
+            background: var(--bg-surface);
+            padding: 10px 20px 12px;
+            border-top: 1px solid var(--border-default);
+            flex-shrink: 0;
+        }
+
+        .input-wrapper {
+            display: flex;
+            align-items: flex-start;
+            gap: 8px;
+            background: var(--bg-primary);
+            border: 1px solid var(--border-default);
+            border-radius: 5px;
+            padding: 8px 12px;
+            transition: border-color 0.15s ease, box-shadow 0.15s ease;
+        }
+
+        .input-wrapper:focus-within {
+            border-color: var(--accent-primary);
+            box-shadow: 0 0 0 3px var(--accent-subtle);
+        }
+
+        .prompt {
+            color: var(--ansi-cyan);
+            font-size: 13px;
+            line-height: var(--line-height);
+            user-select: none;
+            flex-shrink: 0;
+            padding-top: 1px;
+        }
+
+        .input {
+            flex: 1;
+            background: transparent;
+            border: none;
+            outline: none;
+            color: var(--text-primary);
+            font-family: inherit;
+            font-size: 13px;
+            line-height: var(--line-height);
+            resize: none;
+            min-height: calc(var(--font-size) * var(--line-height) * var(--input-rows));
+        }
+
+        .input::placeholder {
+            color: var(--text-muted);
+        }
+
+        /* ═══════════════════════════════════════
+           MOBILE ADJUSTMENTS
+           ═══════════════════════════════════════ */
+        @media (max-width: 600px) {
+            .output {
+                padding: 12px 16px;
+            }
+            .line:hover {
+                margin: 0 -16px;
+                padding-left: 16px;
+                padding-right: 16px;
+            }
+            .separator {
+                padding: 6px 16px;
+            }
+            .input-container {
+                padding: 8px 16px 10px;
+            }
+        }
+    </style>
+</head>
+<body>
+    <div class="app">
+        <!-- Output Area -->
+        <div class="output" id="output">
+            <div class="line system">Connected to Realm of Shadows...</div>
+            <div class="line">&nbsp;</div>
+            <div class="line room-name">The Grand Hall of Echoes</div>
+            <div class="line room-desc">You stand in a vast chamber where ancient stone columns rise into</div>
+            <div class="line room-desc">darkness above. Torchlight flickers against weathered tapestries</div>
+            <div class="line room-desc">depicting battles long forgotten. The air carries whispers of ages</div>
+            <div class="line room-desc">past, and your footsteps echo endlessly in the gloom.</div>
+            <div class="line">&nbsp;</div>
+            <div class="line exits">Obvious exits: <span class="fg-white">north, east, down</span></div>
+            <div class="line">&nbsp;</div>
+            <div class="line"><span class="player">Alaric the Wanderer</span> is standing here, examining an ancient map.</div>
+            <div class="line dim">A weathered stone pedestal stands in the center of the room.</div>
+            <div class="line">&nbsp;</div>
+            <div class="line"><span class="channel">[gossip]</span> <span class="player">Theron:</span> Anyone know where the Caverns of Mist entrance is?</div>
+            <div class="line"><span class="channel">[gossip]</span> <span class="player">Lyra:</span> North from the village, past the old windmill</div>
+            <div class="line">&nbsp;</div>
+            <div class="line"><span class="player">Alaric the Wanderer</span> says, "Greetings, traveler. These halls have</div>
+            <div class="line">seen better days, but secrets still linger in the shadows."</div>
+            <div class="line">&nbsp;</div>
+            <div class="line combat">&gt; You attack the Shadow Wraith!</div>
+            <div class="line combat">Your sword strikes true, dealing 24 damage.</div>
+            <div class="line combat">The Shadow Wraith shrieks and dissolves into mist.</div>
+            <div class="line success">You gain 150 experience points.</div>
+            <div class="line">&nbsp;</div>
+            <div class="line system">*** Server announcement: Maintenance in 30 minutes ***</div>
+            <div class="line">&nbsp;</div>
+            <div class="line"><span class="channel">[newbie]</span> <span class="player">Novak:</span> How do I equip items?</div>
+            <div class="line"><span class="channel">[newbie]</span> <span class="player">Guide_Mira:</span> Type 'wear &lt;item&gt;' or 'wield &lt;weapon&gt;'</div>
+            <div class="line">&nbsp;</div>
+            <div class="line room-desc">A cool breeze drifts through the hall, carrying the scent of rain.</div>
+            <div class="line">&nbsp;</div>
+            <div class="line dim">For help, visit <span class="link">https://realm-of-shadows.com/guide</span></div>
+        </div>
+
+        <!-- Separator Bar -->
+        <div class="separator">
+            <div class="separator-left">
+                <div class="status-dot"></div>
+                <div class="world-name">Realm of Shadows</div>
+                <div class="activity">(Activity: 2)</div>
+            </div>
+            <div class="separator-right">
+                <div class="time" id="time">3:42</div>
+            </div>
+        </div>
+
+        <!-- Input Area -->
+        <div class="input-container">
+            <div class="input-wrapper">
+                <span class="prompt">&gt;</span>
+                <textarea class="input" id="input" rows="3" placeholder="Enter command..." autofocus>look pedestal</textarea>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        // Update clock
+        function updateTime() {
+            const now = new Date();
+            let h = now.getHours();
+            const m = now.getMinutes().toString().padStart(2, '0');
+            h = h % 12 || 12;
+            document.getElementById('time').textContent = `${h}:${m}`;
+        }
+        updateTime();
+        setInterval(updateTime, 1000);
+
+        // Scroll to bottom
+        const output = document.getElementById('output');
+        output.scrollTop = output.scrollHeight;
+
+        // Input handling
+        const input = document.getElementById('input');
+        input.addEventListener('keydown', (e) => {
+            if (e.key === 'Enter' && !e.shiftKey) {
+                e.preventDefault();
+                const cmd = input.value.trim();
+                if (cmd) {
+                    // Echo command to output
+                    const line = document.createElement('div');
+                    line.className = 'line fg-cyan';
+                    line.textContent = '> ' + cmd;
+                    output.appendChild(line);
+                    output.scrollTop = output.scrollHeight;
+                    input.value = '';
+                }
+            }
+        });
+    </script>
+</body>
+</html>

@@ -1,0 +1,311 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Connected Worlds - GUI Style Popup</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@300;400;500;600&display=swap" rel="stylesheet">
+    <style>
+        :root {
+            --bg-deep: #0a0c10;
+            --bg-primary: #0d1117;
+            --bg-elevated: #161b22;
+            --bg-surface: #1c2128;
+            --bg-hover: #21262d;
+
+            --text-primary: #e6edf3;
+            --text-secondary: #8b949e;
+            --text-muted: #484f58;
+
+            --accent-primary: #58a6ff;
+            --accent-green: #3fb950;
+            --accent-warning: #d29922;
+            --accent-subtle: #388bfd26;
+
+            --border-default: #30363d;
+            --border-subtle: #21262d;
+        }
+
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+
+        body {
+            min-height: 100vh;
+            background: var(--bg-deep);
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-family: 'JetBrains Mono', monospace;
+            padding: 40px;
+        }
+
+        .popup {
+            background: var(--bg-elevated);
+            border: 1px solid var(--border-default);
+            border-radius: 8px;
+            box-shadow: 0 16px 48px rgba(0, 0, 0, 0.4), 0 4px 16px rgba(0, 0, 0, 0.3);
+            min-width: 480px;
+            overflow: hidden;
+        }
+
+        .popup-header {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            padding: 10px 14px;
+            background: var(--bg-surface);
+            border-bottom: 1px solid var(--border-subtle);
+        }
+
+        .popup-title {
+            font-size: 13px;
+            font-weight: 600;
+            color: var(--text-primary);
+            letter-spacing: 0.02em;
+        }
+
+        .popup-close {
+            width: 22px;
+            height: 22px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            background: transparent;
+            border: none;
+            color: var(--text-muted);
+            cursor: pointer;
+            border-radius: 4px;
+            font-size: 14px;
+            transition: all 0.1s;
+        }
+
+        .popup-close:hover {
+            background: var(--border-default);
+            color: var(--text-primary);
+        }
+
+        .popup-body {
+            padding: 8px;
+        }
+
+        /* World List Table */
+        .world-table {
+            width: 100%;
+            border-collapse: collapse;
+        }
+
+        .world-table th {
+            text-align: left;
+            padding: 6px 10px;
+            font-size: 10px;
+            font-weight: 600;
+            color: var(--text-muted);
+            text-transform: uppercase;
+            letter-spacing: 0.08em;
+            border-bottom: 1px solid var(--border-subtle);
+        }
+
+        .world-table td {
+            padding: 8px 10px;
+            font-size: 12px;
+            color: var(--text-secondary);
+            border-bottom: 1px solid var(--border-subtle);
+        }
+
+        .world-table tr:last-child td {
+            border-bottom: none;
+        }
+
+        .world-table tbody tr {
+            cursor: pointer;
+            transition: background 0.1s;
+        }
+
+        .world-table tbody tr:hover {
+            background: var(--bg-hover);
+        }
+
+        .world-table tbody tr.selected {
+            background: var(--accent-subtle);
+        }
+
+        .world-table tbody tr.selected td {
+            color: var(--text-primary);
+        }
+
+        /* Status indicator */
+        .status-cell {
+            width: 24px;
+            text-align: center;
+        }
+
+        .status-dot {
+            display: inline-block;
+            width: 6px;
+            height: 6px;
+            border-radius: 50%;
+            background: var(--text-muted);
+        }
+
+        .status-dot.connected {
+            background: var(--accent-green);
+            box-shadow: 0 0 6px var(--accent-green);
+        }
+
+        /* World name column */
+        .world-name {
+            font-weight: 500;
+            color: var(--text-primary);
+        }
+
+        .world-name.current::before {
+            content: '* ';
+            color: var(--accent-primary);
+        }
+
+        /* Unseen count */
+        .unseen-cell {
+            width: 60px;
+            text-align: right;
+        }
+
+        .unseen-count {
+            color: var(--accent-warning);
+            font-weight: 500;
+        }
+
+        .unseen-count.none {
+            color: var(--text-muted);
+        }
+
+        /* Time columns */
+        .time-cell {
+            width: 70px;
+            text-align: right;
+            font-variant-numeric: tabular-nums;
+            color: var(--text-muted);
+            font-size: 11px;
+        }
+
+        /* Footer */
+        .popup-footer {
+            display: flex;
+            justify-content: flex-end;
+            gap: 8px;
+            padding: 10px 14px;
+            background: var(--bg-surface);
+            border-top: 1px solid var(--border-subtle);
+        }
+
+        .btn {
+            padding: 5px 12px;
+            border-radius: 5px;
+            font-family: inherit;
+            font-size: 11px;
+            font-weight: 500;
+            cursor: pointer;
+            transition: all 0.15s;
+            border: 1px solid transparent;
+        }
+
+        .btn-secondary {
+            background: var(--bg-primary);
+            border-color: var(--border-default);
+            color: var(--text-primary);
+        }
+
+        .btn-secondary:hover {
+            background: var(--bg-hover);
+        }
+
+        .btn-primary {
+            background: var(--accent-primary);
+            color: #fff;
+        }
+
+        .btn-primary:hover {
+            filter: brightness(1.1);
+        }
+
+        /* Hint text */
+        .hint {
+            font-size: 10px;
+            color: var(--text-muted);
+            padding: 6px 10px;
+            border-top: 1px solid var(--border-subtle);
+            background: var(--bg-primary);
+        }
+
+        .hint kbd {
+            display: inline-block;
+            padding: 1px 5px;
+            background: var(--bg-surface);
+            border: 1px solid var(--border-default);
+            border-radius: 3px;
+            font-family: inherit;
+            font-size: 10px;
+        }
+    </style>
+</head>
+<body>
+    <div class="popup">
+        <div class="popup-header">
+            <span class="popup-title">Connected Worlds</span>
+            <button class="popup-close">&times;</button>
+        </div>
+        <div class="popup-body">
+            <table class="world-table">
+                <thead>
+                    <tr>
+                        <th class="status-cell"></th>
+                        <th>World</th>
+                        <th class="unseen-cell">Unseen</th>
+                        <th class="time-cell">Last Send</th>
+                        <th class="time-cell">Last Recv</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    <tr class="selected">
+                        <td class="status-cell"><span class="status-dot connected"></span></td>
+                        <td><span class="world-name current">Realm of Shadows</span></td>
+                        <td class="unseen-cell"><span class="unseen-count none">—</span></td>
+                        <td class="time-cell">0:12</td>
+                        <td class="time-cell">0:02</td>
+                    </tr>
+                    <tr>
+                        <td class="status-cell"><span class="status-dot connected"></span></td>
+                        <td><span class="world-name">Discworld</span></td>
+                        <td class="unseen-cell"><span class="unseen-count">24</span></td>
+                        <td class="time-cell">2:45</td>
+                        <td class="time-cell">0:08</td>
+                    </tr>
+                    <tr>
+                        <td class="status-cell"><span class="status-dot connected"></span></td>
+                        <td><span class="world-name">Aardwolf</span></td>
+                        <td class="unseen-cell"><span class="unseen-count">156</span></td>
+                        <td class="time-cell">15:22</td>
+                        <td class="time-cell">0:01</td>
+                    </tr>
+                    <tr>
+                        <td class="status-cell"><span class="status-dot"></span></td>
+                        <td><span class="world-name">BatMUD</span></td>
+                        <td class="unseen-cell"><span class="unseen-count none">—</span></td>
+                        <td class="time-cell">—</td>
+                        <td class="time-cell">—</td>
+                    </tr>
+                </tbody>
+            </table>
+        </div>
+        <div class="hint">
+            <kbd>↑</kbd> <kbd>↓</kbd> Navigate &nbsp;&nbsp;
+            <kbd>Enter</kbd> Switch &nbsp;&nbsp;
+            <kbd>Esc</kbd> Close
+        </div>
+        <div class="popup-footer">
+            <button class="btn btn-secondary">Edit</button>
+            <button class="btn btn-primary">Switch</button>
+        </div>
+    </div>
+</body>
+</html>

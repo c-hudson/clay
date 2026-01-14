@@ -184,7 +184,7 @@
     let worldEditorPopupOpen = false;
     let worldEditorIndex = -1;  // Index of world being edited
 
-    // Web settings popup state
+    // Web settings popup state (global state from server)
     let webPopupOpen = false;
     let webSecure = false;
     let httpEnabled = false;
@@ -194,6 +194,10 @@
     let wsAllowList = '';
     let wsCertFile = '';
     let wsKeyFile = '';
+    // Temporary editing state for web popup (only saved on Save button)
+    let editWebSecure = false;
+    let editHttpEnabled = false;
+    let editWsEnabled = false;
     let selectedWorldIndex = -1;
     let selectedWorldsRowIndex = -1; // For worlds list popup (/connections)
 
@@ -2158,6 +2162,10 @@
     // Web settings popup functions (/web)
     function openWebPopup() {
         webPopupOpen = true;
+        // Copy global state to edit state
+        editWebSecure = webSecure;
+        editHttpEnabled = httpEnabled;
+        editWsEnabled = wsEnabled;
         elements.webModal.className = 'modal visible';
         elements.webModal.style.display = 'flex';
         updateWebPopupUI();
@@ -2171,20 +2179,20 @@
     }
 
     function updateWebPopupUI() {
-        // Update protocol button
-        elements.webProtocolBtn.textContent = webSecure ? 'Secure' : 'Non-Secure';
+        // Update protocol button (use edit state)
+        elements.webProtocolBtn.textContent = editWebSecure ? 'Secure' : 'Non-Secure';
 
         // Update labels based on protocol
-        elements.httpLabel.textContent = webSecure ? 'HTTPS enabled:' : 'HTTP enabled:';
-        elements.httpPortLabel.textContent = webSecure ? 'HTTPS port:' : 'HTTP port:';
-        elements.wsLabel.textContent = webSecure ? 'WSS enabled:' : 'WS enabled:';
-        elements.wsPortLabel.textContent = webSecure ? 'WSS port:' : 'WS port:';
+        elements.httpLabel.textContent = editWebSecure ? 'HTTPS enabled:' : 'HTTP enabled:';
+        elements.httpPortLabel.textContent = editWebSecure ? 'HTTPS port:' : 'HTTP port:';
+        elements.wsLabel.textContent = editWebSecure ? 'WSS enabled:' : 'WS enabled:';
+        elements.wsPortLabel.textContent = editWebSecure ? 'WSS port:' : 'WS port:';
 
-        // Update toggle buttons
-        elements.webHttpEnabledBtn.textContent = httpEnabled ? 'on' : 'off';
-        elements.webWsEnabledBtn.textContent = wsEnabled ? 'on' : 'off';
+        // Update toggle buttons (use edit state)
+        elements.webHttpEnabledBtn.textContent = editHttpEnabled ? 'on' : 'off';
+        elements.webWsEnabledBtn.textContent = editWsEnabled ? 'on' : 'off';
 
-        // Update input fields
+        // Update input fields (from global state - text fields are read on save)
         elements.webHttpPort.value = httpPort;
         elements.webWsPort.value = wsPort;
         elements.webAllowList.value = wsAllowList;
@@ -2192,12 +2200,17 @@
         elements.webKeyFile.value = wsKeyFile;
 
         // Show/hide TLS fields based on protocol
-        elements.tlsCertField.style.display = webSecure ? 'flex' : 'none';
-        elements.tlsKeyField.style.display = webSecure ? 'flex' : 'none';
+        elements.tlsCertField.style.display = editWebSecure ? 'flex' : 'none';
+        elements.tlsKeyField.style.display = editWebSecure ? 'flex' : 'none';
     }
 
     function saveWebSettings() {
-        // Read values from UI
+        // Copy edit state to global state
+        webSecure = editWebSecure;
+        httpEnabled = editHttpEnabled;
+        wsEnabled = editWsEnabled;
+
+        // Read text field values from UI
         httpPort = parseInt(elements.webHttpPort.value) || 9000;
         wsPort = parseInt(elements.webWsPort.value) || 9001;
         wsAllowList = elements.webAllowList.value;
@@ -3818,17 +3831,17 @@
         elements.setupSaveBtn.onclick = saveSetupSettings;
         elements.setupCancelBtn.onclick = closeSetupPopup;
 
-        // Web settings popup
+        // Web settings popup (use edit state, not global state)
         elements.webProtocolBtn.onclick = function() {
-            webSecure = !webSecure;
+            editWebSecure = !editWebSecure;
             updateWebPopupUI();
         };
         elements.webHttpEnabledBtn.onclick = function() {
-            httpEnabled = !httpEnabled;
+            editHttpEnabled = !editHttpEnabled;
             updateWebPopupUI();
         };
         elements.webWsEnabledBtn.onclick = function() {
-            wsEnabled = !wsEnabled;
+            editWsEnabled = !editWsEnabled;
             updateWebPopupUI();
         };
         elements.webSaveBtn.onclick = saveWebSettings;
