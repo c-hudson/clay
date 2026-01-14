@@ -16,7 +16,7 @@ pub use telnet::{
 };
 pub use spell::{SpellChecker, SpellState};
 pub use input::InputArea;
-pub use util::{get_binary_name, strip_ansi_codes, visual_line_count, get_current_time_12hr, strip_mud_tag, truncate_str};
+pub use util::{get_binary_name, strip_ansi_codes, visual_line_count, get_current_time_12hr, strip_mud_tag, truncate_str, convert_temperatures};
 pub use websocket::{
     WsMessage, WorldStateMsg, WorldSettingsMsg, GlobalSettingsMsg, TimestampedLine,
     WsClientInfo, WebSocketServer,
@@ -9194,8 +9194,10 @@ mod remote_gui {
                                 let stripped = Self::strip_ansi_for_copy(&line.text);
                                 if self.show_tags {
                                     // Add timestamp prefix when showing tags
+                                    // Also convert temperatures
                                     let ts_prefix = Self::format_timestamp_gui(line.ts);
-                                    format!("{} {}", ts_prefix, stripped)
+                                    let with_temps = convert_temperatures(&stripped);
+                                    format!("{} {}", ts_prefix, with_temps)
                                 } else {
                                     // Strip MUD tags like [channel:] or [channel(player)]
                                     Self::strip_mud_tags(&stripped)
@@ -9239,7 +9241,9 @@ mod remote_gui {
                         let display_lines: Vec<String> = non_empty_lines.iter().map(|line| {
                             let base_line = if self.show_tags {
                                 let ts_prefix = Self::format_timestamp_gui(line.ts);
-                                format!("\x1b[36m{}\x1b[0m {}", ts_prefix, line.text)
+                                // Also convert temperatures when showing tags
+                                let with_temps = convert_temperatures(&line.text);
+                                format!("\x1b[36m{}\x1b[0m {}", ts_prefix, with_temps)
                             } else {
                                 Self::strip_mud_tags_ansi(&line.text)
                             };
@@ -18003,7 +18007,9 @@ fn render_output_crossterm(app: &App) {
         };
         let processed = if show_tags {
             // Show timestamp + original text when tags are shown
-            format!("\x1b[36m{}\x1b[0m {}", line.format_timestamp(), text)
+            // Also convert temperatures (32C -> 32C (90F), etc.)
+            let text_with_temps = convert_temperatures(&text);
+            format!("\x1b[36m{}\x1b[0m {}", line.format_timestamp(), text_with_temps)
         } else {
             strip_mud_tag(&text)
         };

@@ -1333,7 +1333,8 @@
             // Format timestamp prefix if showTags is enabled
             const tsPrefix = showTags && lineTs ? `<span class="timestamp">${formatTimestamp(lineTs)}</span>` : '';
 
-            const displayText = showTags ? cleanLine : stripMudTag(cleanLine);
+            const strippedText = showTags ? cleanLine : stripMudTag(cleanLine);
+            const displayText = showTags ? convertTemperatures(strippedText) : strippedText;
             let html = tsPrefix + convertDiscordEmojis(linkifyUrls(parseAnsi(insertWordBreaks(displayText))));
 
             // Apply action highlighting if enabled
@@ -1358,7 +1359,8 @@
         if (!worldOutputCache[worldIndex]) {
             worldOutputCache[worldIndex] = [];
         }
-        const displayText = showTags ? text : stripMudTag(text);
+        const strippedText = showTags ? text : stripMudTag(text);
+        const displayText = showTags ? convertTemperatures(strippedText) : strippedText;
         const html = convertDiscordEmojis(linkifyUrls(parseAnsi(insertWordBreaks(displayText))));
         worldOutputCache[worldIndex][lineIndex] = { html, showTags };
         return html;
@@ -1385,7 +1387,8 @@
         // Format timestamp prefix if showTags is enabled
         const tsPrefix = showTags && ts ? `<span class="timestamp">${formatTimestamp(ts)}</span>` : '';
 
-        const displayText = showTags ? cleanText : stripMudTag(cleanText);
+        const strippedText = showTags ? cleanText : stripMudTag(cleanText);
+        const displayText = showTags ? convertTemperatures(strippedText) : strippedText;
         const html = tsPrefix + convertDiscordEmojis(linkifyUrls(parseAnsi(insertWordBreaks(displayText))));
 
         // Append to output with a <br> prefix (if not first line)
@@ -1800,6 +1803,27 @@
         }
 
         return text;
+    }
+
+    // Convert temperatures: "32C" -> "32C (90F)", "100F" -> "100F (38C)"
+    function convertTemperatures(text) {
+        if (!text) return text;
+        // Pattern: number (with optional decimal), optional space, C or F, followed by delimiter or end
+        return text.replace(/(-?\d+(?:\.\d+)?)\s?([CcFf])([\s.,;:!?\]\)]|$)/g, (match, num, unit, delim) => {
+            const n = parseFloat(num);
+            if (isNaN(n)) return match;
+            let converted, newUnit;
+            if (unit.toUpperCase() === 'C') {
+                // Celsius to Fahrenheit: (C * 9/5) + 32
+                converted = Math.round((n * 9 / 5) + 32);
+                newUnit = 'F';
+            } else {
+                // Fahrenheit to Celsius: (F - 32) * 5/9
+                converted = Math.round((n - 32) * 5 / 9);
+                newUnit = 'C';
+            }
+            return `${num}${match.includes(' ' + unit) ? ' ' : ''}${unit} (${converted}${newUnit})${delim}`;
+        });
     }
 
     // Scroll to bottom

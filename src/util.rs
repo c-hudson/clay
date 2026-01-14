@@ -409,3 +409,62 @@ pub fn format_worlds_list(worlds: &[WorldListInfo]) -> String {
 
     lines.join("\n")
 }
+
+/// Convert temperatures in text: "32C" -> "32C (90F)", "100F" -> "100F (38C)"
+/// Matches numbers followed by C or F (with optional space), followed by space, period, comma, or end
+pub fn convert_temperatures(text: &str) -> String {
+    use regex::Regex;
+
+    // Pattern: number (with optional decimal), optional space, C or F, followed by delimiter
+    // Capture the delimiter so we can put it back after the conversion
+    let re = Regex::new(r"(-?\d+(?:\.\d+)?)\s?([CcFf])([\s.,;:!?\]\)]|$)").unwrap();
+
+    let mut result = String::new();
+    let mut last_end = 0;
+
+    for cap in re.captures_iter(text) {
+        let full_match = cap.get(0).unwrap();
+        let num_str = cap.get(1).unwrap().as_str();
+        let unit = cap.get(2).unwrap().as_str();
+        let delimiter = cap.get(3).map(|m| m.as_str()).unwrap_or("");
+
+        // Add text before this match
+        result.push_str(&text[last_end..full_match.start()]);
+
+        // Parse the number
+        if let Ok(num) = num_str.parse::<f64>() {
+            let (converted, new_unit) = if unit.eq_ignore_ascii_case("C") {
+                // Celsius to Fahrenheit: (C * 9/5) + 32
+                let f = (num * 9.0 / 5.0) + 32.0;
+                (f.round() as i64, "F")
+            } else {
+                // Fahrenheit to Celsius: (F - 32) * 5/9
+                let c = (num - 32.0) * 5.0 / 9.0;
+                (c.round() as i64, "C")
+            };
+
+            // Add number + unit + conversion + delimiter
+            result.push_str(num_str);
+            if full_match.as_str().contains(' ') && !num_str.ends_with(' ') {
+                // Preserve space between number and unit if it was there
+                let space_idx = full_match.as_str().find(unit).unwrap_or(0);
+                if space_idx > 0 && full_match.as_str().chars().nth(space_idx - 1) == Some(' ') {
+                    result.push(' ');
+                }
+            }
+            result.push_str(unit);
+            result.push_str(&format!(" ({}{})", converted, new_unit));
+            result.push_str(delimiter);
+        } else {
+            // Couldn't parse, just add original
+            result.push_str(full_match.as_str());
+        }
+
+        last_end = full_match.end();
+    }
+
+    // Add remaining text
+    result.push_str(&text[last_end..]);
+
+    result
+}
