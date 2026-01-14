@@ -9,6 +9,7 @@ use tokio_tungstenite::{accept_async, tungstenite::Message as WsRawMessage};
 
 // Import AppEvent and Action from the main crate
 use crate::{AppEvent, Action};
+use crate::ansi_music::MusicNote;
 
 // ============================================================================
 // WebSocket Protocol Types
@@ -48,6 +49,9 @@ pub enum WsMessage {
     /// Tell client to execute a command locally (for action commands like /worlds)
     ExecuteLocalCommand { command: String },
 
+    /// ANSI Music sequence to play (server -> client)
+    AnsiMusic { world_index: usize, notes: Vec<MusicNote> },
+
     // Commands (client -> server)
     SendCommand { world_index: usize, command: String },
     SwitchWorld { world_index: usize },
@@ -76,6 +80,11 @@ pub enum WsMessage {
         keep_alive_cmd: String,
     },
     UpdateGlobalSettings {
+        more_mode_enabled: bool,
+        spell_check_enabled: bool,
+        world_switch_mode: String,
+        show_tags: bool,
+        ansi_music_enabled: bool,
         console_theme: String,
         gui_theme: String,
         gui_transparency: f32,
@@ -168,6 +177,7 @@ pub struct GlobalSettingsMsg {
     pub world_switch_mode: String,
     pub debug_enabled: bool,
     pub show_tags: bool,
+    pub ansi_music_enabled: bool,
     pub console_theme: String,
     pub gui_theme: String,
     #[serde(default = "default_gui_transparency")]

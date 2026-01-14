@@ -122,6 +122,7 @@
         setupCloseBtn: document.getElementById('setup-close-btn'),
         setupMoreModeToggle: document.getElementById('setup-more-mode-toggle'),
         setupShowTagsToggle: document.getElementById('setup-show-tags-toggle'),
+        setupAnsiMusicToggle: document.getElementById('setup-ansi-music-toggle'),
         setupWorldSwitchSelect: document.getElementById('setup-world-switch-select'),
         setupInputHeightValue: document.getElementById('setup-input-height-value'),
         setupHeightMinus: document.getElementById('setup-height-minus'),
@@ -206,6 +207,7 @@
     let setupMoreMode = true;
     let setupWorldSwitchMode = 'Unseen First';
     let setupShowTags = false;
+    let setupAnsiMusic = true;
     let setupInputHeightValue = 1;
     let setupGuiTheme = 'dark';
 
@@ -227,6 +229,10 @@
 
     // Device mode: 'desktop' or 'mobile'
     let deviceMode = 'desktop';
+
+    // ANSI Music audio context (lazily initialized)
+    let audioContext = null;
+    let ansiMusicEnabled = true;  // Will be synced from server settings
 
     // ============================================================================
     // Command Parsing (mirrors Rust parse_command)
@@ -627,6 +633,9 @@
                     if (msg.settings.show_tags !== undefined) {
                         showTags = msg.settings.show_tags;
                     }
+                    if (msg.settings.ansi_music_enabled !== undefined) {
+                        ansiMusicEnabled = msg.settings.ansi_music_enabled;
+                    }
                     // Web settings
                     if (msg.settings.web_secure !== undefined) {
                         webSecure = msg.settings.web_secure;
@@ -795,6 +804,9 @@
                             renderOutput(); // Re-render with new tag visibility
                         }
                     }
+                    if (msg.settings.ansi_music_enabled !== undefined) {
+                        ansiMusicEnabled = msg.settings.ansi_music_enabled;
+                    }
                     if (msg.settings.world_switch_mode !== undefined) {
                         worldSwitchMode = msg.settings.world_switch_mode;
                     }
@@ -885,6 +897,13 @@
                 // Server wants us to execute a command locally (from action)
                 if (msg.command) {
                     executeLocalCommand(msg.command);
+                }
+                break;
+
+            case 'AnsiMusic':
+                // Play ANSI music notes via Web Audio API
+                if (msg.notes && msg.notes.length > 0) {
+                    playAnsiMusic(msg.notes);
                 }
                 break;
 
@@ -1635,6 +1654,58 @@
         return text.replace(/\x1b\[[0-9;]*[A-Za-z@`~]/g, '').replace(/[\x00-\x1f]/g, '');
     }
 
+    // Play ANSI music notes using Web Audio API
+    // Uses square wave oscillator for authentic PC speaker sound
+    function playAnsiMusic(notes) {
+        if (!ansiMusicEnabled || !notes || notes.length === 0) return;
+
+        // Lazily initialize AudioContext (requires user interaction in some browsers)
+        if (!audioContext) {
+            try {
+                audioContext = new (window.AudioContext || window.webkitAudioContext)();
+            } catch (e) {
+                console.warn('Web Audio API not supported:', e);
+                return;
+            }
+        }
+
+        // Resume audio context if suspended (browser autoplay policy)
+        if (audioContext.state === 'suspended') {
+            audioContext.resume();
+        }
+
+        let startTime = audioContext.currentTime;
+
+        notes.forEach(note => {
+            if (note.frequency > 0) {
+                // Create oscillator for this note
+                const oscillator = audioContext.createOscillator();
+                const gainNode = audioContext.createGain();
+
+                oscillator.type = 'square';  // PC speaker sound
+                oscillator.frequency.setValueAtTime(note.frequency, startTime);
+
+                // Set volume (not too loud)
+                gainNode.gain.setValueAtTime(0.15, startTime);
+
+                // Quick fade out to avoid clicks
+                const fadeTime = 0.01;
+                const noteEnd = startTime + (note.duration_ms / 1000);
+                gainNode.gain.setValueAtTime(0.15, noteEnd - fadeTime);
+                gainNode.gain.linearRampToValueAtTime(0, noteEnd);
+
+                oscillator.connect(gainNode);
+                gainNode.connect(audioContext.destination);
+
+                oscillator.start(startTime);
+                oscillator.stop(noteEnd);
+            }
+
+            // Move start time forward for next note
+            startTime += note.duration_ms / 1000;
+        });
+    }
+
     // Linkify URLs in HTML text (after ANSI parsing)
     // Matches http://, https://, and www. URLs
     function linkifyUrls(html) {
@@ -2086,6 +2157,7 @@
         setupMoreMode = moreModeEnabled;
         setupWorldSwitchMode = worldSwitchMode;
         setupShowTags = showTags;
+        setupAnsiMusic = ansiMusicEnabled;
         setupInputHeightValue = inputHeight;
         setupGuiTheme = guiTheme;
         elements.setupModal.className = 'modal visible';
@@ -2112,6 +2184,11 @@
         } else {
             elements.setupShowTagsToggle.classList.remove('active');
         }
+        if (setupAnsiMusic) {
+            elements.setupAnsiMusicToggle.classList.add('active');
+        } else {
+            elements.setupAnsiMusicToggle.classList.remove('active');
+        }
         // World switching dropdown
         elements.setupWorldSwitchSelect.value = setupWorldSwitchMode;
         // Input height stepper
@@ -2129,6 +2206,7 @@
         moreModeEnabled = setupMoreMode;
         worldSwitchMode = setupWorldSwitchMode;
         showTags = setupShowTags;
+        ansiMusicEnabled = setupAnsiMusic;
         guiTheme = setupGuiTheme;
         setInputHeight(setupInputHeightValue);
 
@@ -2139,11 +2217,14 @@
         send({
             type: 'UpdateGlobalSettings',
             more_mode_enabled: moreModeEnabled,
+            spell_check_enabled: true,
             world_switch_mode: worldSwitchMode,
             show_tags: showTags,
+            ansi_music_enabled: ansiMusicEnabled,
             input_height: setupInputHeightValue,
             console_theme: consoleTheme,
             gui_theme: guiTheme,
+            gui_transparency: 1.0,
             font_name: '',
             font_size: 14.0,
             ws_allow_list: wsAllowList,
@@ -3808,6 +3889,10 @@
         };
         elements.setupShowTagsToggle.onclick = function() {
             setupShowTags = !setupShowTags;
+            updateSetupPopupUI();
+        };
+        elements.setupAnsiMusicToggle.onclick = function() {
+            setupAnsiMusic = !setupAnsiMusic;
             updateSetupPopupUI();
         };
         elements.setupWorldSwitchSelect.onchange = function() {

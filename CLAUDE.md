@@ -292,7 +292,30 @@ Prompts that are auto-answered are immediately cleared and not displayed in the 
   - **LastNOP**: Time since last NOP keepalive was sent
   - **NextNOP**: Time until next NOP keepalive
 - `/reload` - Hot reload: exec new binary while preserving TCP connections
+- `/testmusic` - Play a test ANSI music sequence (C-D-E-F-G) to verify audio works
 - `/quit` - Exit the client
+
+### ANSI Music
+
+The client supports ANSI music sequences (BBS-style PC speaker music). When enabled, music sequences are extracted from MUD output and played through the web interface or remote GUI.
+
+**Format:** `ESC [ M <music_string> Ctrl-N` or `ESC [ N <music_string> Ctrl-N`
+- Also supports `MF` (foreground) and `MB` (background) modifiers
+- Music string uses BASIC PLAY command syntax: notes (A-G), octave (O, <, >), tempo (T), length (L)
+
+**Configuration:**
+- Toggle "ANSI Music" in Setup (`/setup`)
+- Use `/testmusic` to verify audio is working
+
+**Playback:**
+- Web interface: Uses Web Audio API with square wave oscillator
+- Remote GUI: Uses rodio library (requires `remote-gui-audio` feature and ALSA dev libraries)
+- Console: No audio playback (music sequences are stripped from display)
+
+**Building with audio support:**
+```bash
+cargo build --features remote-gui-audio  # Requires libasound2-dev on Linux
+```
 
 ### Hot Reload
 

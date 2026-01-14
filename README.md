@@ -18,6 +18,7 @@ A terminal-based MUD (Multi-User Dungeon) client built with Rust featuring multi
 - **Spell Check** - Built-in spell checking with suggestions
 - **Output Filtering** - Search/filter output with F4
 - **File Logging** - Per-world output logging
+- **ANSI Music** - BBS-style music playback (web/GUI interfaces)
 
 ## Building
 
@@ -30,6 +31,9 @@ CC=musl-gcc cargo build --release --target x86_64-unknown-linux-musl --no-defaul
 
 # With remote GUI support (requires X11/Wayland)
 cargo build --release --features remote-gui
+
+# With remote GUI and ANSI music audio (requires libasound2-dev on Linux)
+cargo build --release --features remote-gui-audio
 ```
 
 ## Usage
@@ -54,6 +58,7 @@ cargo build --release --features remote-gui
 | `/worlds` or `/l` | List connected worlds |
 | `/setup` | Open global settings |
 | `/reload` | Hot reload the binary |
+| `/testmusic` | Play test ANSI music sequence |
 | `/quit` | Exit the client |
 | `/help` | Show help |
 
@@ -74,6 +79,7 @@ cargo build --release --features remote-gui
 | `F1` | Help |
 | `F2` | Toggle MUD tag display |
 | `F4` | Filter output |
+| `F8` | Toggle action highlighting |
 | `Ctrl+C` (x2) | Quit |
 
 ## Web Interface

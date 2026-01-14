@@ -5,6 +5,7 @@ pub mod spell;
 pub mod input;
 pub mod util;
 pub mod websocket;
+pub mod ansi_music;
 
 // Re-export commonly used types from modules
 pub use encoding::{Encoding, Theme, WorldSwitchMode, convert_discord_emojis, is_visually_empty, strip_non_sgr_sequences};
@@ -1648,6 +1649,7 @@ impl WorldsPopup {
         }
     }
 
+    #[allow(dead_code)]
     fn show(&mut self, worlds: &[World], current_world_index: usize, screen_width: u16) {
         self.visible = true;
         self.lines.clear();
@@ -1734,7 +1736,7 @@ impl WorldsPopup {
             // Layout 3: Remove KeepAlive column
             let width_no_ka_type = 2 + name_width + 2 + unseen_width + 2 + send_recv_combined_width + 2 + ka_next_combined_width;
             // Layout 4: Remove LastKA/NextKA columns entirely
-            let width_minimal = 2 + name_width + 2 + unseen_width + 2 + send_recv_combined_width;
+            let _width_minimal = 2 + name_width + 2 + unseen_width + 2 + send_recv_combined_width;
 
             let available = screen_width as usize;
 
@@ -1745,10 +1747,8 @@ impl WorldsPopup {
                 2  // Combined Send/Recv and LastKA/NextKA
             } else if available >= width_no_ka_type {
                 3  // Remove KeepAlive type column
-            } else if available >= width_minimal {
-                4  // Remove KA columns entirely
             } else {
-                4  // Fallback to minimal
+                4  // Remove KA columns entirely (or fallback to minimal)
             };
 
             // Generate header and data based on layout
@@ -2555,6 +2555,7 @@ struct Settings {
     spell_check_enabled: bool,
     world_switch_mode: WorldSwitchMode,
     debug_enabled: bool,    // Debug logging to clay.debug.log
+    ansi_music_enabled: bool, // Enable ANSI music playback (web/GUI only)
     theme: Theme,           // Console theme
     gui_theme: Theme,       // GUI theme (separate from console)
     gui_transparency: f32,  // GUI window transparency (0.0-1.0)
@@ -2583,6 +2584,7 @@ impl Default for Settings {
             spell_check_enabled: true,
             world_switch_mode: WorldSwitchMode::UnseenFirst,
             debug_enabled: false,
+            ansi_music_enabled: true,  // ANSI music enabled by default
             theme: Theme::Dark,
             gui_theme: Theme::Dark,
             gui_transparency: 1.0,
@@ -2769,6 +2771,7 @@ fn is_internal_command(name: &str) -> bool {
 
 /// Parsed command representation - shared across console, GUI, and web interfaces
 #[derive(Debug, Clone, PartialEq)]
+#[allow(clippy::enum_variant_names)]
 enum Command {
     /// /help - show help popup
     Help,
@@ -2802,6 +2805,8 @@ enum Command {
     Keepalive,
     /// /gag <pattern> - gag lines matching pattern
     Gag { pattern: String },
+    /// /testmusic - play a test ANSI music sequence
+    TestMusic,
     /// /<action_name> [args] - execute action
     ActionCommand { name: String, args: String },
     /// Not a command (regular text to send to MUD)
@@ -2854,6 +2859,7 @@ fn parse_command(input: &str) -> Command {
                 Command::Gag { pattern: args.join(" ") }
             }
         }
+        "/testmusic" => Command::TestMusic,
         _ => {
             // Check if it's an action command (starts with / but not a known command)
             let action_name = cmd.trim_start_matches('/');
@@ -2924,8 +2930,8 @@ fn parse_send_command(args: &[&str], full_cmd: &str) -> Command {
         if *arg == "-W" {
             all_worlds = true;
             text_start = i + 1;
-        } else if arg.starts_with("-w") {
-            target_world = Some(arg[2..].to_string());
+        } else if let Some(world) = arg.strip_prefix("-w") {
+            target_world = Some(world.to_string());
             text_start = i + 1;
         } else if *arg == "-n" {
             no_newline = true;
@@ -2941,7 +2947,7 @@ fn parse_send_command(args: &[&str], full_cmd: &str) -> Command {
         let mut pos = 0;
         let mut found_flags = 0;
         for c in full_cmd.chars() {
-            if found_flags >= text_start + 1 { // +1 for /send itself
+            if found_flags > text_start { // +1 for /send itself
                 break;
             }
             if c.is_whitespace() && pos > 0 {
@@ -3424,6 +3430,7 @@ impl World {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn add_output(
         &mut self,
         text: &str,
@@ -3720,6 +3727,8 @@ struct App {
     is_master: bool,
     /// True if this session started from a hot reload (suppress server startup messages)
     is_reload: bool,
+    /// True if the output area needs to be redrawn (optimization to avoid unnecessary redraws)
+    needs_output_redraw: bool,
 }
 
 impl App {
@@ -3760,6 +3769,7 @@ impl App {
             ws_client_worlds: std::collections::HashMap::new(),
             is_master: true, // Console app is always master (remote GUI is separate execution path)
             is_reload: false, // Set to true in run_app if started from hot reload
+            needs_output_redraw: true, // Start with true to ensure initial render
         }
         // Note: No initial world created here - it will be created after load_settings()
         // if no worlds are configured
@@ -3816,6 +3826,8 @@ impl App {
             self.worlds[index].mark_seen();
             // Broadcast to WebSocket clients that this world's unseen count is cleared
             self.ws_broadcast(WsMessage::UnseenCleared { world_index: index });
+            // Mark output for redraw since we switched worlds
+            self.needs_output_redraw = true;
         }
     }
 
@@ -3883,6 +3895,7 @@ impl App {
                 name: w.name.clone(),
                 connected: w.connected,
                 unseen_lines: w.unseen_lines,
+                pending_lines: w.pending_lines.len(),
             })
             .collect();
 
@@ -3902,6 +3915,7 @@ impl App {
                 name: w.name.clone(),
                 connected: w.connected,
                 unseen_lines: w.unseen_lines,
+                pending_lines: w.pending_lines.len(),
             })
             .collect();
 
@@ -4008,6 +4022,8 @@ impl App {
         };
         self.current_world_mut()
             .add_output(&text_with_newline, is_current, &settings, output_height, output_width, false, false);
+        // Mark output for redraw since we added content
+        self.needs_output_redraw = true;
     }
 
     /// Broadcast a message to all authenticated WebSocket clients
@@ -4124,6 +4140,7 @@ impl App {
             world_switch_mode: self.settings.world_switch_mode.name().to_string(),
             debug_enabled: self.settings.debug_enabled,
             show_tags: self.show_tags,
+            ansi_music_enabled: self.settings.ansi_music_enabled,
             console_theme: self.settings.theme.name().to_string(),
             gui_theme: self.settings.gui_theme.name().to_string(),
             gui_transparency: self.settings.gui_transparency,
@@ -4390,6 +4407,8 @@ impl App {
         if more_mode && !world.paused {
             world.paused = true;
         }
+        // Mark output for redraw
+        self.needs_output_redraw = true;
     }
 
     fn scroll_output_down(&mut self) {
@@ -4419,6 +4438,8 @@ impl App {
         if world.is_at_bottom() {
             world.paused = false;
         }
+        // Mark output for redraw
+        self.needs_output_redraw = true;
     }
 }
 
@@ -4700,6 +4721,7 @@ fn save_settings(app: &App) -> io::Result<()> {
     writeln!(file, "spell_check={}", app.settings.spell_check_enabled)?;
     writeln!(file, "world_switch_mode={}", app.settings.world_switch_mode.name())?;
     writeln!(file, "debug_enabled={}", app.settings.debug_enabled)?;
+    writeln!(file, "ansi_music_enabled={}", app.settings.ansi_music_enabled)?;
     writeln!(file, "input_height={}", app.input_height)?;
     writeln!(file, "theme={}", app.settings.theme.name())?;
     writeln!(file, "gui_theme={}", app.settings.gui_theme.name())?;
@@ -4881,6 +4903,9 @@ fn load_settings(app: &mut App) -> io::Result<()> {
                     "debug_enabled" => {
                         app.settings.debug_enabled = value == "true";
                     }
+                    "ansi_music_enabled" => {
+                        app.settings.ansi_music_enabled = value == "true";
+                    }
                     "input_height" => {
                         if let Ok(h) = value.parse::<u16>() {
                             app.input_height = h.clamp(1, 15);
@@ -5044,6 +5069,7 @@ fn save_reload_state(app: &App) -> io::Result<()> {
     writeln!(file, "spell_check={}", app.settings.spell_check_enabled)?;
     writeln!(file, "world_switch_mode={}", app.settings.world_switch_mode.name())?;
     writeln!(file, "debug_enabled={}", app.settings.debug_enabled)?;
+    writeln!(file, "ansi_music_enabled={}", app.settings.ansi_music_enabled)?;
     writeln!(file, "show_tags={}", app.show_tags)?;
     writeln!(file, "theme={}", app.settings.theme.name())?;
     writeln!(file, "font_name={}", app.settings.font_name)?;
@@ -5399,6 +5425,9 @@ fn load_reload_state(app: &mut App) -> io::Result<bool> {
                     }
                     "debug_enabled" => {
                         app.settings.debug_enabled = value == "true";
+                    }
+                    "ansi_music_enabled" => {
+                        app.settings.ansi_music_enabled = value == "true";
                     }
                     "show_tags" => {
                         app.show_tags = value == "true";
@@ -6096,6 +6125,80 @@ mod remote_gui {
         transparency: f32,
         /// Original transparency when setup popup opened (for cancel/revert)
         original_transparency: Option<f32>,
+        /// ANSI music enabled
+        ansi_music_enabled: bool,
+        /// Audio output stream (must stay alive for audio to play)
+        #[cfg(feature = "rodio")]
+        audio_stream: Option<rodio::OutputStream>,
+        /// Audio output stream handle for playing sounds
+        #[cfg(feature = "rodio")]
+        audio_stream_handle: Option<rodio::OutputStreamHandle>,
+    }
+
+    /// Square wave audio source for ANSI music playback
+    #[cfg(feature = "rodio")]
+    struct SquareWaveSource {
+        sample_rate: u32,
+        frequency: f32,
+        duration_samples: usize,
+        current_sample: usize,
+    }
+
+    #[cfg(feature = "rodio")]
+    impl SquareWaveSource {
+        fn new(frequency: f32, duration_ms: u32, sample_rate: u32) -> Self {
+            let duration_samples = (sample_rate as f32 * duration_ms as f32 / 1000.0) as usize;
+            Self {
+                sample_rate,
+                frequency,
+                duration_samples,
+                current_sample: 0,
+            }
+        }
+    }
+
+    #[cfg(feature = "rodio")]
+    impl Iterator for SquareWaveSource {
+        type Item = f32;
+
+        fn next(&mut self) -> Option<Self::Item> {
+            if self.current_sample >= self.duration_samples {
+                return None;
+            }
+
+            let t = self.current_sample as f32 / self.sample_rate as f32;
+            let sample = if self.frequency > 0.0 {
+                // Square wave: sign of sine wave
+                let phase = (t * self.frequency * 2.0 * std::f32::consts::PI).sin();
+                if phase >= 0.0 { 0.15 } else { -0.15 }  // Low volume to not be too loud
+            } else {
+                0.0  // Rest/silence
+            };
+
+            self.current_sample += 1;
+            Some(sample)
+        }
+    }
+
+    #[cfg(feature = "rodio")]
+    impl rodio::Source for SquareWaveSource {
+        fn current_frame_len(&self) -> Option<usize> {
+            Some(self.duration_samples - self.current_sample)
+        }
+
+        fn channels(&self) -> u16 {
+            1  // Mono
+        }
+
+        fn sample_rate(&self) -> u32 {
+            self.sample_rate
+        }
+
+        fn total_duration(&self) -> Option<std::time::Duration> {
+            Some(std::time::Duration::from_millis(
+                (self.duration_samples as f32 / self.sample_rate as f32 * 1000.0) as u64
+            ))
+        }
     }
 
     /// Discord emoji segment for rendering
@@ -6184,7 +6287,57 @@ mod remote_gui {
                 debug_text: String::new(),
                 transparency: 1.0,
                 original_transparency: None,
+                ansi_music_enabled: true,
+                #[cfg(feature = "rodio")]
+                audio_stream: None,
+                #[cfg(feature = "rodio")]
+                audio_stream_handle: None,
             }
+        }
+
+        /// Initialize audio output for ANSI music playback
+        #[cfg(feature = "rodio")]
+        fn init_audio(&mut self) {
+            if self.audio_stream.is_none() {
+                match rodio::OutputStream::try_default() {
+                    Ok((stream, handle)) => {
+                        self.audio_stream = Some(stream);
+                        self.audio_stream_handle = Some(handle);
+                    }
+                    Err(_) => {
+                        // Audio initialization failed - music will be silently disabled
+                    }
+                }
+            }
+        }
+
+        /// Play ANSI music notes
+        #[cfg(feature = "rodio")]
+        fn play_ansi_music(&mut self, notes: &[crate::ansi_music::MusicNote]) {
+            if !self.ansi_music_enabled || notes.is_empty() {
+                return;
+            }
+
+            // Initialize audio if not already done
+            self.init_audio();
+
+            if let Some(handle) = &self.audio_stream_handle {
+                // Create a sink for sequential playback
+                if let Ok(sink) = rodio::Sink::try_new(handle) {
+                    for note in notes {
+                        let source = SquareWaveSource::new(note.frequency, note.duration_ms, 44100);
+                        sink.append(source);
+                    }
+                    // Detach the sink so it plays in the background
+                    sink.detach();
+                }
+            }
+        }
+
+        /// Play ANSI music notes (no-op when rodio is not available)
+        #[cfg(not(feature = "rodio"))]
+        fn play_ansi_music(&mut self, _notes: &[crate::ansi_music::MusicNote]) {
+            // Audio playback disabled - rodio feature not enabled
         }
 
         /// Try to find a system font file by name
@@ -6400,6 +6553,7 @@ mod remote_gui {
             let mut deferred_switch: Option<usize> = None;
             let mut deferred_connect: Option<usize> = None;
             let mut deferred_edit: Option<usize> = None;
+            let mut deferred_music: Vec<crate::ansi_music::MusicNote> = Vec::new();
 
             if let Some(ref mut rx) = self.ws_rx {
                 while let Ok(msg) = rx.try_recv() {
@@ -6481,6 +6635,7 @@ mod remote_gui {
                             self.more_mode = settings.more_mode_enabled;
                             self.spell_check_enabled = settings.spell_check_enabled;
                             self.show_tags = settings.show_tags;
+                            self.ansi_music_enabled = settings.ansi_music_enabled;
                             self.actions = actions;
                         }
                         WsMessage::ServerData { world_index, data, is_viewed: _, ts } => {
@@ -6533,6 +6688,10 @@ mod remote_gui {
                             if world_index < self.worlds.len() {
                                 self.worlds[world_index].connected = false;
                             }
+                        }
+                        WsMessage::AnsiMusic { world_index: _, notes } => {
+                            // Defer playing music to avoid borrow issues
+                            deferred_music.extend(notes);
                         }
                         WsMessage::WorldRemoved { world_index } => {
                             if world_index < self.worlds.len() {
@@ -6596,6 +6755,7 @@ mod remote_gui {
                             self.more_mode = settings.more_mode_enabled;
                             self.spell_check_enabled = settings.spell_check_enabled;
                             self.show_tags = settings.show_tags;
+                            self.ansi_music_enabled = settings.ansi_music_enabled;
                         }
                         WsMessage::PendingLinesUpdate { world_index, count } => {
                             // Update pending count for world
@@ -6728,6 +6888,9 @@ mod remote_gui {
             }
             if let Some(idx) = deferred_edit {
                 self.open_world_editor(idx);
+            }
+            if !deferred_music.is_empty() {
+                self.play_ansi_music(&deferred_music);
             }
         }
 
@@ -7003,6 +7166,11 @@ mod remote_gui {
         fn update_global_settings(&mut self) {
             if let Some(ref tx) = self.ws_tx {
                 let _ = tx.send(WsMessage::UpdateGlobalSettings {
+                    more_mode_enabled: self.more_mode,
+                    spell_check_enabled: self.spell_check_enabled,
+                    world_switch_mode: self.world_switch_mode.name().to_string(),
+                    show_tags: self.show_tags,
+                    ansi_music_enabled: self.ansi_music_enabled,
                     console_theme: self.console_theme.to_string_value(),
                     gui_theme: self.theme.to_string_value(),
                     gui_transparency: self.transparency,
@@ -8138,6 +8306,7 @@ mod remote_gui {
                                     name: w.name.clone(),
                                     connected: w.connected,
                                     unseen_lines: w.unseen_lines,
+                                    pending_lines: w.pending_count,
                                 })
                                 .collect();
 
@@ -8195,7 +8364,7 @@ mod remote_gui {
                         // Build list of completions: internal commands + manual actions
                         let internal_commands = vec![
                             "/help", "/disconnect", "/dc", "/send", "/worlds", "/connections",
-                            "/setup", "/web", "/actions", "/keepalive", "/reload", "/quit", "/gag",
+                            "/setup", "/web", "/actions", "/keepalive", "/reload", "/quit", "/gag", "/testmusic",
                         ];
 
                         // Get manual actions (empty pattern)
@@ -10478,6 +10647,7 @@ mod remote_gui {
                     let mut world_switch = self.world_switch_mode;
                     let debug_enabled = self.debug_enabled;
                     let mut show_tags = self.show_tags;
+                    let mut ansi_music = self.ansi_music_enabled;
                     let mut input_height = self.input_height;
                     let mut gui_theme = self.theme;
                     let mut transparency = self.transparency;
@@ -10834,6 +11004,20 @@ mod remote_gui {
                                         ui.painter().circle_filled(egui::pos2(knob_x, switch_rect.center().y), 7.0, knob_color);
                                         if response.clicked() { show_tags = !show_tags; }
                                     });
+
+                                    // ANSI Music
+                                    form_row(ui, "ANSI Music", &mut |ui| {
+                                        let switch_width = 44.0;
+                                        let switch_height = 22.0;
+                                        let switch_rect = ui.allocate_space(egui::vec2(switch_width, switch_height)).1;
+                                        let response = ui.interact(switch_rect, ui.id().with("ansi_music_toggle"), egui::Sense::click());
+                                        let track_color = if ansi_music { theme.accent_dim() } else { theme.bg_deep() };
+                                        ui.painter().rect_filled(switch_rect, egui::Rounding::same(11.0), track_color);
+                                        let knob_x = if ansi_music { switch_rect.right() - 11.0 } else { switch_rect.left() + 11.0 };
+                                        let knob_color = if ansi_music { theme.accent() } else { theme.fg_muted() };
+                                        ui.painter().circle_filled(egui::pos2(knob_x, switch_rect.center().y), 7.0, knob_color);
+                                        if response.clicked() { ansi_music = !ansi_music; }
+                                    });
                             });
                         },
                     );
@@ -10844,6 +11028,7 @@ mod remote_gui {
                     self.world_switch_mode = world_switch;
                     self.debug_enabled = debug_enabled;
                     self.show_tags = show_tags;
+                    self.ansi_music_enabled = ansi_music;
                     self.input_height = input_height;
                     self.theme = gui_theme;
                     self.transparency = transparency;
@@ -13013,6 +13198,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                             // Filter output to only show server data (remove client-generated lines)
                             app.current_world_mut().filter_to_server_output();
                             terminal.clear()?;
+                            app.needs_output_redraw = true;
                         }
                         KeyAction::Connect => {
                             if !app.current_world().connected
@@ -13224,7 +13410,23 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                             app.worlds[world_idx].last_receive_time = Some(std::time::Instant::now());
                             // Consider "current" if console OR any web/GUI client is viewing this world
                             let is_current = world_idx == app.current_world_index || app.ws_client_viewing(world_idx);
-                            let data = app.worlds[world_idx].settings.encoding.decode(&bytes);
+                            let decoded_data = app.worlds[world_idx].settings.encoding.decode(&bytes);
+
+                            // Extract ANSI music sequences FIRST, before any other processing
+                            let (data, music_sequences) = if app.settings.ansi_music_enabled {
+                                ansi_music::extract_music(&decoded_data)
+                            } else {
+                                (decoded_data, Vec::new())
+                            };
+
+                            // Broadcast music to WebSocket clients (web/GUI play audio)
+                            for notes in music_sequences {
+                                app.ws_broadcast(WsMessage::AnsiMusic {
+                                    world_index: world_idx,
+                                    notes,
+                                });
+                            }
+
                             let world_name_for_triggers = world_name.clone();
                             let actions = app.settings.actions.clone();
 
@@ -13302,12 +13504,16 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                 let output_height = app.output_height;
                                 let output_width = app.output_width;
                                 app.worlds[world_idx].add_output(&filtered_data, is_current, &settings, output_height, output_width, true, true);
+                                // Mark output for redraw if this is the current world
+                                if world_idx == app.current_world_index {
+                                    app.needs_output_redraw = true;
+                                }
                                 // Check if terminal needs full redraw (after splash clear)
                                 if app.worlds[world_idx].needs_redraw {
                                     app.worlds[world_idx].needs_redraw = false;
                                     terminal.clear()?;
                                 }
-                                // Broadcast filtered data to WebSocket clients
+                                // Broadcast filtered data to WebSocket clients (music already extracted above)
                                 // Strip carriage returns - some MUDs send \r\n or bare \r
                                 let ws_data = filtered_data.replace('\r', "");
                                 app.ws_broadcast(WsMessage::ServerData {
@@ -13656,6 +13862,26 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                             ts: current_timestamp_secs(),
                                         });
                                     }
+                                    Command::TestMusic => {
+                                        // Broadcast a test ANSI music sequence (C-D-E-F-G melody)
+                                        let test_notes = vec![
+                                            ansi_music::MusicNote { frequency: 261.63, duration_ms: 250 }, // C4
+                                            ansi_music::MusicNote { frequency: 293.66, duration_ms: 250 }, // D4
+                                            ansi_music::MusicNote { frequency: 329.63, duration_ms: 250 }, // E4
+                                            ansi_music::MusicNote { frequency: 349.23, duration_ms: 250 }, // F4
+                                            ansi_music::MusicNote { frequency: 392.00, duration_ms: 250 }, // G4
+                                        ];
+                                        app.ws_broadcast(WsMessage::AnsiMusic {
+                                            world_index,
+                                            notes: test_notes,
+                                        });
+                                        app.ws_broadcast(WsMessage::ServerData {
+                                            world_index,
+                                            data: "Playing test music (C-D-E-F-G)...".to_string(),
+                                            is_viewed: false,
+                                            ts: current_timestamp_secs(),
+                                        });
+                                    }
                                     // Commands that should be blocked from remote
                                     Command::Quit | Command::Reload => {
                                         app.ws_broadcast(WsMessage::ServerData {
@@ -13699,17 +13925,17 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                             app.switch_world(idx);
                                             app.ws_broadcast(WsMessage::WorldSwitched { new_index: idx });
                                             // Connect if not connected and has settings
-                                            if !app.worlds[idx].connected {
-                                                if app.worlds[idx].settings.has_connection_settings() {
-                                                    // For WorldConnectNoLogin, set skip flag
-                                                    if matches!(parsed, Command::WorldConnectNoLogin { .. }) {
-                                                        app.worlds[idx].skip_auto_login = true;
-                                                    }
-                                                    let prev_index = app.current_world_index;
-                                                    app.current_world_index = idx;
-                                                    let _ = handle_command("/connect", &mut app, event_tx.clone()).await;
-                                                    app.current_world_index = prev_index;
+                                            if !app.worlds[idx].connected
+                                                && app.worlds[idx].settings.has_connection_settings()
+                                            {
+                                                // For WorldConnectNoLogin, set skip flag
+                                                if matches!(parsed, Command::WorldConnectNoLogin { .. }) {
+                                                    app.worlds[idx].skip_auto_login = true;
                                                 }
+                                                let prev_index = app.current_world_index;
+                                                app.current_world_index = idx;
+                                                let _ = handle_command("/connect", &mut app, event_tx.clone()).await;
+                                                app.current_world_index = prev_index;
                                             }
                                         } else {
                                             app.ws_broadcast(WsMessage::ServerData {
@@ -13778,7 +14004,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                     app.add_output(&format!("World '{}' deleted.\n", deleted_name));
                                     // Broadcast WorldRemoved to all clients
                                     app.ws_broadcast(WsMessage::WorldRemoved { world_index });
-                                    let _ = save_settings(&mut app);
+                                    let _ = save_settings(&app);
                                 }
                             }
                             WsMessage::MarkWorldSeen { world_index } => {
@@ -13860,8 +14086,13 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                     });
                                 }
                             }
-                            WsMessage::UpdateGlobalSettings { console_theme, gui_theme, gui_transparency, input_height, font_name, font_size, ws_allow_list, web_secure, http_enabled, http_port, ws_enabled, ws_port, ws_cert_file, ws_key_file } => {
+                            WsMessage::UpdateGlobalSettings { more_mode_enabled, spell_check_enabled, world_switch_mode, show_tags, ansi_music_enabled, console_theme, gui_theme, gui_transparency, input_height, font_name, font_size, ws_allow_list, web_secure, http_enabled, http_port, ws_enabled, ws_port, ws_cert_file, ws_key_file } => {
                                 // Update global settings from remote client
+                                app.settings.more_mode_enabled = more_mode_enabled;
+                                app.settings.spell_check_enabled = spell_check_enabled;
+                                app.settings.world_switch_mode = WorldSwitchMode::from_name(&world_switch_mode);
+                                app.show_tags = show_tags;
+                                app.settings.ansi_music_enabled = ansi_music_enabled;
                                 // Console theme affects the TUI on the server
                                 app.settings.theme = Theme::from_name(&console_theme);
                                 // GUI theme is stored for sending back to GUI clients
@@ -13893,6 +14124,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                     world_switch_mode: app.settings.world_switch_mode.name().to_string(),
                                     debug_enabled: app.settings.debug_enabled,
                                     show_tags: app.show_tags,
+                                    ansi_music_enabled: app.settings.ansi_music_enabled,
                                     console_theme: app.settings.theme.name().to_string(),
                                     gui_theme: app.settings.gui_theme.name().to_string(),
                                     gui_transparency: app.settings.gui_transparency,
@@ -13931,6 +14163,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                         name: w.name.clone(),
                                         connected: w.connected,
                                         unseen_lines: w.unseen_lines,
+                                        pending_lines: w.pending_lines.len(),
                                     })
                                     .collect();
                                 let next_idx = crate::util::calculate_next_world(
@@ -13947,6 +14180,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                         name: w.name.clone(),
                                         connected: w.connected,
                                         unseen_lines: w.unseen_lines,
+                                        pending_lines: w.pending_lines.len(),
                                     })
                                     .collect();
                                 let prev_idx = crate::util::calculate_prev_world(
@@ -14059,14 +14293,20 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
         if any_popup_visible && !app.popup_was_visible {
             terminal.clear()?;
         }
+        // Detect popup visibility change before updating
+        let popup_visibility_changed = any_popup_visible != app.popup_was_visible;
         app.popup_was_visible = any_popup_visible;
 
         // Use ratatui for everything, but render output area with raw crossterm
         // after the ratatui draw (ratatui's Paragraph has rendering bugs)
         terminal.draw(|f| ui(f, &mut app))?;
 
-        // Render output area with crossterm (ratatui early-returns when no popup visible)
-        render_output_crossterm(&app);
+        // Render output area with crossterm only when needed (optimization)
+        // Also redraw when popup visibility changes
+        if app.needs_output_redraw || popup_visibility_changed {
+            render_output_crossterm(&app);
+            app.needs_output_redraw = false;
+        }
 
         // Process any additional queued server events before next select
         // Track if we processed any events to know if we need to redraw
@@ -14079,10 +14319,25 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                         app.worlds[world_idx].last_receive_time = Some(std::time::Instant::now());
                         // Consider "current" if console OR any web/GUI client is viewing this world
                         let is_current = world_idx == app.current_world_index || app.ws_client_viewing(world_idx);
-                        let data = app.worlds[world_idx].settings.encoding.decode(&bytes);
+                        let decoded_data = app.worlds[world_idx].settings.encoding.decode(&bytes);
+
+                        // Extract ANSI music sequences FIRST, before any other processing
+                        let (data, music_sequences) = if app.settings.ansi_music_enabled {
+                            ansi_music::extract_music(&decoded_data)
+                        } else {
+                            (decoded_data.clone(), Vec::new())
+                        };
+
+                        // Broadcast music to WebSocket clients (web/GUI play audio)
+                        for notes in music_sequences {
+                            app.ws_broadcast(WsMessage::AnsiMusic {
+                                world_index: world_idx,
+                                notes,
+                            });
+                        }
 
                         // Debug log the raw input (increments sequence number)
-                        debug_log_input(&mut app.worlds[world_idx], &data);
+                        debug_log_input(&mut app.worlds[world_idx], &decoded_data);
                         let world_name_for_triggers = world_name.clone();
                         let actions = app.settings.actions.clone();
 
@@ -14157,11 +14412,16 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                             let output_height = app.output_height;
                             let output_width = app.output_width;
                             app.worlds[world_idx].add_output(&filtered_data, is_current, &settings, output_height, output_width, true, true);
+                            // Mark output for redraw if this is the current world
+                            if world_idx == app.current_world_index {
+                                app.needs_output_redraw = true;
+                            }
                             if app.worlds[world_idx].needs_redraw {
                                 app.worlds[world_idx].needs_redraw = false;
                                 let _ = terminal.clear();
                             }
                             // Strip carriage returns for WebSocket - some MUDs send \r\n or bare \r
+                            // Music already extracted above
                             let ws_data = filtered_data.replace('\r', "");
                             app.ws_broadcast(WsMessage::ServerData {
                                 world_index: world_idx,
@@ -14493,6 +14753,26 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                         ts: current_timestamp_secs(),
                                     });
                                 }
+                                Command::TestMusic => {
+                                    // Broadcast a test ANSI music sequence (C-D-E-F-G melody)
+                                    let test_notes = vec![
+                                        ansi_music::MusicNote { frequency: 261.63, duration_ms: 250 }, // C4
+                                        ansi_music::MusicNote { frequency: 293.66, duration_ms: 250 }, // D4
+                                        ansi_music::MusicNote { frequency: 329.63, duration_ms: 250 }, // E4
+                                        ansi_music::MusicNote { frequency: 349.23, duration_ms: 250 }, // F4
+                                        ansi_music::MusicNote { frequency: 392.00, duration_ms: 250 }, // G4
+                                    ];
+                                    app.ws_broadcast(WsMessage::AnsiMusic {
+                                        world_index,
+                                        notes: test_notes,
+                                    });
+                                    app.ws_broadcast(WsMessage::ServerData {
+                                        world_index,
+                                        data: "Playing test music (C-D-E-F-G)...".to_string(),
+                                        is_viewed: false,
+                                        ts: current_timestamp_secs(),
+                                    });
+                                }
                                 // Commands that should be blocked from remote
                                 Command::Quit | Command::Reload => {
                                     app.ws_broadcast(WsMessage::ServerData {
@@ -14572,7 +14852,12 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                 app.ws_broadcast(WsMessage::WorldSettingsUpdated { world_index, settings: settings_msg, name });
                             }
                         }
-                        WsMessage::UpdateGlobalSettings { console_theme, gui_theme, gui_transparency, input_height, font_name, font_size, ws_allow_list, web_secure, http_enabled, http_port, ws_enabled, ws_port, ws_cert_file, ws_key_file } => {
+                        WsMessage::UpdateGlobalSettings { more_mode_enabled, spell_check_enabled, world_switch_mode, show_tags, ansi_music_enabled, console_theme, gui_theme, gui_transparency, input_height, font_name, font_size, ws_allow_list, web_secure, http_enabled, http_port, ws_enabled, ws_port, ws_cert_file, ws_key_file } => {
+                            app.settings.more_mode_enabled = more_mode_enabled;
+                            app.settings.spell_check_enabled = spell_check_enabled;
+                            app.settings.world_switch_mode = WorldSwitchMode::from_name(&world_switch_mode);
+                            app.show_tags = show_tags;
+                            app.settings.ansi_music_enabled = ansi_music_enabled;
                             app.settings.theme = Theme::from_name(&console_theme);
                             app.settings.gui_theme = Theme::from_name(&gui_theme);
                             app.settings.gui_transparency = gui_transparency.clamp(0.3, 1.0);
@@ -14598,6 +14883,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                 world_switch_mode: app.settings.world_switch_mode.name().to_string(),
                                 debug_enabled: app.settings.debug_enabled,
                                 show_tags: app.show_tags,
+                                ansi_music_enabled: app.settings.ansi_music_enabled,
                                 console_theme: app.settings.theme.name().to_string(),
                                 gui_theme: app.settings.gui_theme.name().to_string(),
                                 gui_transparency: app.settings.gui_transparency,
@@ -14626,6 +14912,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                     name: w.name.clone(),
                                     connected: w.connected,
                                     unseen_lines: w.unseen_lines,
+                                    pending_lines: w.pending_lines.len(),
                                 })
                                 .collect();
                             let next_idx = crate::util::calculate_next_world(
@@ -14641,6 +14928,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                     name: w.name.clone(),
                                     connected: w.connected,
                                     unseen_lines: w.unseen_lines,
+                                    pending_lines: w.pending_lines.len(),
                                 })
                                 .collect();
                             let prev_idx = crate::util::calculate_prev_world(
@@ -15159,10 +15447,12 @@ fn handle_key_event(key: KeyEvent, app: &mut App) -> KeyAction {
         match key.code {
             KeyCode::Esc => {
                 app.filter_popup.close();
+                app.needs_output_redraw = true;
             }
             KeyCode::F(4) => {
                 // F4 again closes the filter
                 app.filter_popup.close();
+                app.needs_output_redraw = true;
             }
             KeyCode::Backspace => {
                 if app.filter_popup.cursor > 0 {
@@ -15170,6 +15460,7 @@ fn handle_key_event(key: KeyEvent, app: &mut App) -> KeyAction {
                     app.filter_popup.filter_text.remove(app.filter_popup.cursor);
                     let output_lines = app.current_world().output_lines.clone();
                     app.filter_popup.update_filter(&output_lines);
+                    app.needs_output_redraw = true;
                 }
             }
             KeyCode::Delete => {
@@ -15177,6 +15468,7 @@ fn handle_key_event(key: KeyEvent, app: &mut App) -> KeyAction {
                     app.filter_popup.filter_text.remove(app.filter_popup.cursor);
                     let output_lines = app.current_world().output_lines.clone();
                     app.filter_popup.update_filter(&output_lines);
+                    app.needs_output_redraw = true;
                 }
             }
             KeyCode::Left | KeyCode::Char('b') if key.code == KeyCode::Left || key.modifiers.contains(KeyModifiers::CONTROL) => {
@@ -15202,6 +15494,7 @@ fn handle_key_event(key: KeyEvent, app: &mut App) -> KeyAction {
                 let visible_height = app.output_height as usize;
                 app.filter_popup.scroll_offset = app.filter_popup.scroll_offset
                     .saturating_sub(visible_height.saturating_sub(2));
+                app.needs_output_redraw = true;
             }
             KeyCode::PageDown => {
                 // Scroll down in filtered results
@@ -15209,12 +15502,14 @@ fn handle_key_event(key: KeyEvent, app: &mut App) -> KeyAction {
                 let max_offset = app.filter_popup.filtered_indices.len().saturating_sub(1);
                 app.filter_popup.scroll_offset = (app.filter_popup.scroll_offset + visible_height.saturating_sub(2))
                     .min(max_offset);
+                app.needs_output_redraw = true;
             }
             KeyCode::Char(c) => {
                 app.filter_popup.filter_text.insert(app.filter_popup.cursor, c);
                 app.filter_popup.cursor += 1;
                 let output_lines = app.current_world().output_lines.clone();
                 app.filter_popup.update_filter(&output_lines);
+                app.needs_output_redraw = true;
             }
             _ => {}
         }
@@ -15801,10 +16096,10 @@ fn handle_key_event(key: KeyEvent, app: &mut App) -> KeyAction {
                     let idx = app.world_selector.selected_index;
                     app.world_selector.close();
                     app.switch_world(idx);
-                    if !app.current_world().connected {
-                        if app.current_world().settings.has_connection_settings() {
-                            return KeyAction::Connect;
-                        }
+                    if !app.current_world().connected
+                        && app.current_world().settings.has_connection_settings()
+                    {
+                        return KeyAction::Connect;
                     }
                 }
                 KeyCode::Backspace => {
@@ -15884,10 +16179,10 @@ fn handle_key_event(key: KeyEvent, app: &mut App) -> KeyAction {
                             let idx = app.world_selector.selected_index;
                             app.world_selector.close();
                             app.switch_world(idx);
-                            if !app.current_world().connected {
-                                if app.current_world().settings.has_connection_settings() {
-                                    return KeyAction::Connect;
-                                }
+                            if !app.current_world().connected
+                                && app.current_world().settings.has_connection_settings()
+                            {
+                                return KeyAction::Connect;
                             }
                         }
                         WorldSelectorFocus::AddButton => {
@@ -16013,7 +16308,7 @@ fn handle_key_event(key: KeyEvent, app: &mut App) -> KeyAction {
             // Build list of completions: internal commands + manual actions
             let internal_commands = vec![
                 "/help", "/disconnect", "/dc", "/send", "/worlds", "/connections",
-                "/setup", "/web", "/actions", "/keepalive", "/reload", "/quit", "/gag",
+                "/setup", "/web", "/actions", "/keepalive", "/reload", "/quit", "/gag", "/testmusic",
             ];
 
             // Get manual actions (empty pattern)
@@ -16075,6 +16370,7 @@ fn handle_key_event(key: KeyEvent, app: &mut App) -> KeyAction {
             // Also broadcast updated pending count
             let pending_count = app.worlds[world_idx].pending_lines.len();
             app.ws_broadcast(WsMessage::PendingLinesUpdate { world_index: world_idx, count: pending_count });
+            app.needs_output_redraw = true;
             return KeyAction::None;
         } else if !app.current_world().is_at_bottom() {
             // Not paused but scrolled back (Hist indicator showing) - scroll down like PgDn
@@ -16105,6 +16401,7 @@ fn handle_key_event(key: KeyEvent, app: &mut App) -> KeyAction {
             app.ws_broadcast(WsMessage::PendingReleased { world_index: world_idx, count: released });
             // Also broadcast updated pending count
             app.ws_broadcast(WsMessage::PendingLinesUpdate { world_index: world_idx, count: 0 });
+            app.needs_output_redraw = true;
         }
         return KeyAction::None;
     }
@@ -16159,6 +16456,7 @@ fn handle_key_event(key: KeyEvent, app: &mut App) -> KeyAction {
             app.filter_popup.open();
             let output_lines = app.current_world().output_lines.clone();
             app.filter_popup.update_filter(&output_lines);
+            app.needs_output_redraw = true;
             KeyAction::None
         }
 
@@ -16524,7 +16822,7 @@ async fn connect_discord(app: &mut App, event_tx: mpsc::Sender<AppEvent>) -> boo
                 channel_id = id.to_string();
                 app.add_output(&format!("DM channel created: {}", channel_id));
             } else {
-                app.add_output(&format!("Failed to create DM channel: no channel ID in response"));
+                app.add_output("Failed to create DM channel: no channel ID in response");
                 app.add_output(&format!("Response: {}", body));
                 return false;
             }
@@ -16868,10 +17166,10 @@ async fn handle_command(cmd: &str, app: &mut App, event_tx: mpsc::Sender<AppEven
                 // World exists - switch to it
                 app.switch_world(idx);
                 // Connect if not already connected and has settings
-                if !app.current_world().connected {
-                    if app.current_world().settings.has_connection_settings() {
-                        return Box::pin(handle_command("/connect", app, event_tx)).await;
-                    }
+                if !app.current_world().connected
+                    && app.current_world().settings.has_connection_settings()
+                {
+                    return Box::pin(handle_command("/connect", app, event_tx)).await;
                 }
             } else {
                 // World doesn't exist - show error message (goes through more-mode flow)
@@ -17388,6 +17686,21 @@ async fn handle_command(cmd: &str, app: &mut App, event_tx: mpsc::Sender<AppEven
             // TODO: Implement gag patterns
             app.add_output(&format!("Gag pattern set: {}", pattern));
         }
+        Command::TestMusic => {
+            // Broadcast a test ANSI music sequence (C-D-E-F-G melody)
+            let test_notes = vec![
+                ansi_music::MusicNote { frequency: 261.63, duration_ms: 250 }, // C4
+                ansi_music::MusicNote { frequency: 293.66, duration_ms: 250 }, // D4
+                ansi_music::MusicNote { frequency: 329.63, duration_ms: 250 }, // E4
+                ansi_music::MusicNote { frequency: 349.23, duration_ms: 250 }, // F4
+                ansi_music::MusicNote { frequency: 392.00, duration_ms: 250 }, // G4
+            ];
+            app.ws_broadcast(WsMessage::AnsiMusic {
+                world_index: app.current_world_index,
+                notes: test_notes,
+            });
+            app.add_output("Playing test music (C-D-E-F-G)...");
+        }
         Command::ActionCommand { name, args } => {
             // Check if this is an action command (/name)
             let action_found = app.settings.actions.iter()
@@ -17451,8 +17764,14 @@ fn ui(f: &mut Frame, app: &mut App) {
 
     // Store output dimensions for scrolling and more-mode calculations
     // Use max(1) to prevent any division by zero elsewhere
-    app.output_height = output_height.max(1);
-    app.output_width = f.area().width.max(1);
+    let new_output_height = output_height.max(1);
+    let new_output_width = f.area().width.max(1);
+    // Mark output for redraw if dimensions changed (terminal resize)
+    if new_output_height != app.output_height || new_output_width != app.output_width {
+        app.needs_output_redraw = true;
+    }
+    app.output_height = new_output_height;
+    app.output_width = new_output_width;
 
     let chunks = Layout::default()
         .direction(Direction::Vertical)
@@ -17596,7 +17915,7 @@ fn render_output_crossterm(app: &App) {
                         let remainder_start = last_space_line.len();
                         let remainder = &current_line[remainder_start..];
                         current_line = last_space_codes.join("") + remainder;
-                        current_width = current_width - last_space_width;
+                        current_width -= last_space_width;
                     } else if last_break_width > 0 {
                         // No space, but we have a break char (for long words) - use it
                         let mut break_line = last_break_line.clone();
@@ -17606,7 +17925,7 @@ fn render_output_crossterm(app: &App) {
                         let remainder_start = last_break_line.len();
                         let remainder = &current_line[remainder_start..];
                         current_line = last_break_codes.join("") + remainder;
-                        current_width = current_width - last_break_width;
+                        current_width -= last_break_width;
                     } else {
                         // No break point at all - hard wrap at current position
                         current_line.push_str("\x1b[0m");
@@ -17729,8 +18048,7 @@ fn render_output_crossterm(app: &App) {
 
             // If we still have room, show lines after scroll_offset
             if visual_lines.len() < visible_height {
-                for pos in (end_pos + 1)..filtered.len() {
-                    let line_idx = filtered[pos];
+                for &line_idx in filtered.iter().skip(end_pos + 1) {
                     if line_idx < world.output_lines.len() {
                         let line = &world.output_lines[line_idx];
                         let highlight = should_highlight(line);

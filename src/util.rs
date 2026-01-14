@@ -158,17 +158,18 @@ pub struct WorldSwitchInfo {
     pub name: String,
     pub connected: bool,
     pub unseen_lines: usize,
+    pub pending_lines: usize,
 }
 
 /// Determine if a world should be included in the cycle list
-/// (connected OR has unseen output)
+/// (connected OR has unseen output OR has pending lines from more-mode)
 pub fn world_should_cycle(info: &WorldSwitchInfo) -> bool {
-    info.connected || info.unseen_lines > 0
+    info.connected || info.unseen_lines > 0 || info.pending_lines > 0
 }
 
-/// Check if a world has pending/unseen output
+/// Check if a world has pending/unseen output (including more-mode pending lines)
 pub fn world_has_pending(info: &WorldSwitchInfo) -> bool {
-    info.unseen_lines > 0
+    info.unseen_lines > 0 || info.pending_lines > 0
 }
 
 /// Get the next world index to switch to

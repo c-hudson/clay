@@ -46,8 +46,12 @@ egui = { version = "0.30", optional = true }
 egui_extras = { version = "0.30", optional = true, features = ["image", "http", "svg"] }
 image = { version = "0.25", optional = true, default-features = false, features = ["png", "gif"] }
 
+# Audio playback for ANSI music (optional, requires ALSA dev libraries on Linux)
+rodio = { version = "0.19", optional = true, default-features = false, features = ["wav"] }
+
 [features]
 default = ["rustls-backend"]
 native-tls-backend = ["tokio-native-tls", "native-tls", "tokio-tungstenite/native-tls"]
 rustls-backend = ["tokio-rustls", "rustls", "rustls-pemfile", "webpki-roots", "rustls-webpki", "tokio-tungstenite/rustls-tls-webpki-roots"]
 remote-gui = ["eframe", "egui", "egui_extras", "image"]
+remote-gui-audio = ["remote-gui", "rodio"]

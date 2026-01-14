@@ -170,10 +170,11 @@ impl Encoding {
         };
         // Strip control characters that could cause rendering issues
         // Keep: \t (tab), \n (newline), \x1b (escape for ANSI sequences), \x07 (BEL for OSC termination)
+        // Keep: \x0e (Ctrl-N, ANSI music terminator)
         // Also strip DEL (0x7F) and other high control chars
         let filtered: String = result
             .chars()
-            .filter(|&c| (c >= ' ' && c != '\x7f') || c == '\t' || c == '\n' || c == '\x1b' || c == '\x07')
+            .filter(|&c| (c >= ' ' && c != '\x7f') || c == '\t' || c == '\n' || c == '\x1b' || c == '\x07' || c == '\x0e')
             .collect();
 
         // Strip non-color ANSI sequences (cursor movement, erase, etc.)
@@ -181,7 +182,8 @@ impl Encoding {
         let result = strip_non_sgr_sequences(&filtered);
 
         // Strip any remaining control characters (BEL, carriage returns, etc.)
-        result.chars().filter(|&c| (c >= ' ' && c != '\x7f') || c == '\t' || c == '\n' || c == '\x1b').collect()
+        // Keep Ctrl-N for ANSI music terminator
+        result.chars().filter(|&c| (c >= ' ' && c != '\x7f') || c == '\t' || c == '\n' || c == '\x1b' || c == '\x0e').collect()
     }
 
     pub fn name(&self) -> &'static str {
@@ -368,6 +370,33 @@ pub fn strip_non_sgr_sequences(s: &str) -> String {
                     // CSI sequence: ESC [ <params> <final byte>
                     // Final byte is 0x40-0x7E (@ through ~)
                     chars.next(); // consume '['
+
+                    // Check for ANSI music sequence (ESC [ M or ESC [ N followed by music content)
+                    // Preserve these entirely so music parser can process them
+                    if chars.peek() == Some(&'M') || chars.peek() == Some(&'N') {
+                        let music_prefix = chars.next().unwrap(); // consume M or N
+                        // Preserve the sequence - add ESC [ M/N and continue collecting until terminator
+                        result.push('\x1b');
+                        result.push('[');
+                        result.push(music_prefix);
+                        // Collect rest of music sequence (terminated by Ctrl-N, newline, or another ESC)
+                        while let Some(&sc) = chars.peek() {
+                            if sc == '\x0e' || sc == '\n' || sc == '\r' {
+                                // Include terminator
+                                result.push(sc);
+                                chars.next();
+                                break;
+                            } else if sc == '\x1b' {
+                                // Another escape sequence starts - stop here
+                                break;
+                            } else {
+                                result.push(sc);
+                                chars.next();
+                            }
+                        }
+                        continue;
+                    }
+
                     let mut seq = String::new();
                     seq.push('\x1b');
                     seq.push('[');
