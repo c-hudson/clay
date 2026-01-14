@@ -4103,7 +4103,7 @@ impl App {
                     hostname: world.settings.hostname.clone(),
                     port: world.settings.port.clone(),
                     user: world.settings.user.clone(),
-                    password: encrypt_password(&world.settings.password),
+                    password: world.settings.password.clone(),
                     use_ssl: world.settings.use_ssl,
                     log_file: world.settings.log_file.clone(),
                     encoding: world.settings.encoding.name().to_string(),
@@ -6414,16 +6414,33 @@ mod remote_gui {
                             }
                         }
                         WsMessage::InitialState { worlds, current_world_index, settings, actions } => {
-                            self.worlds = worlds.into_iter().map(|w| RemoteWorld {
+                            self.worlds = worlds.into_iter().map(|w| {
+                                // Calculate pending count before moving pending_lines
+                                let pending_count = if !w.pending_lines_ts.is_empty() {
+                                    w.pending_lines_ts.len()
+                                } else {
+                                    w.pending_lines.len()
+                                };
+                                RemoteWorld {
                                 name: w.name,
                                 connected: w.connected,
-                                // Use timestamped lines if available, otherwise fall back to plain lines
-                                output_lines: if !w.output_lines_ts.is_empty() {
-                                    w.output_lines_ts
-                                } else {
-                                    // Fallback for old protocol: use current time
-                                    let now = current_timestamp_secs();
-                                    w.output_lines.into_iter().map(|text| TimestampedLine { text, ts: now }).collect()
+                                // Combine output_lines and pending_lines (each client handles more mode locally)
+                                output_lines: {
+                                    let mut lines = if !w.output_lines_ts.is_empty() {
+                                        w.output_lines_ts
+                                    } else {
+                                        // Fallback for old protocol: use current time
+                                        let now = current_timestamp_secs();
+                                        w.output_lines.into_iter().map(|text| TimestampedLine { text, ts: now }).collect()
+                                    };
+                                    // Append pending lines (server's more mode shouldn't affect clients)
+                                    if !w.pending_lines_ts.is_empty() {
+                                        lines.extend(w.pending_lines_ts);
+                                    } else {
+                                        let now = current_timestamp_secs();
+                                        lines.extend(w.pending_lines.into_iter().map(|text| TimestampedLine { text, ts: now }));
+                                    }
+                                    lines
                                 },
                                 prompt: w.prompt,
                                 settings: RemoteWorldSettings {
@@ -6439,12 +6456,12 @@ mod remote_gui {
                                     keep_alive_cmd: w.settings.keep_alive_cmd.clone(),
                                 },
                                 unseen_lines: w.unseen_lines,  // Use server's centralized unseen tracking
-                                pending_count: w.pending_lines.len(),  // Show server's pending count
+                                pending_count,
                                 last_send_secs: w.last_send_secs,
                                 last_recv_secs: w.last_recv_secs,
                                 last_nop_secs: w.last_nop_secs,
                                 partial_line: String::new(),
-                            }).collect();
+                            }}).collect();
                             self.current_world = current_world_index;
                             self.console_theme = GuiTheme::from_name(&settings.console_theme);
                             self.theme = GuiTheme::from_name(&settings.gui_theme);
@@ -8337,6 +8354,10 @@ mod remote_gui {
                                 action = Some("setup");
                                 ui.close_menu();
                             }
+                            if ui.button("Web").clicked() {
+                                action = Some("web");
+                                ui.close_menu();
+                            }
                             if ui.button("Worlds").clicked() {
                                 action = Some("connected_worlds");
                                 ui.close_menu();
@@ -8488,6 +8509,7 @@ mod remote_gui {
                     }
                     Some("edit_current") => self.open_world_editor(self.current_world),
                     Some("setup") => self.popup_state = PopupState::Setup,
+                    Some("web") => self.popup_state = PopupState::Web,
                     Some("font") => {
                         self.edit_font_name = self.font_name.clone();
                         self.edit_font_size = self.font_size.to_string();

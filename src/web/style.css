@@ -1063,65 +1063,156 @@ body {
 }
 
 /* World Editor popup (/worlds -e) */
+#world-editor-modal {
+    background-color: transparent;
+}
+
 .world-editor-modal-content {
-    min-width: 320px;
-    max-width: 450px;
-    width: 90%;
-    padding: 12px;
+    width: 460px;
+    max-width: 90%;
+    padding: 0;
+    background: #1a1a1f;
+    border: 1px solid rgba(255, 255, 255, 0.1);
+    border-radius: 8px;
+    box-shadow: 0 16px 48px rgba(0, 0, 0, 0.5);
 }
 
-.world-editor-modal-content h2 {
-    margin-bottom: 10px;
-}
-
-.world-editor-form {
-    display: flex;
-    flex-direction: column;
-    gap: 6px;
-    margin-bottom: 12px;
-}
-
-.editor-field {
+.world-editor-modal-content .popup-header {
     display: flex;
     align-items: center;
-    gap: 8px;
+    justify-content: space-between;
+    padding: 12px 16px 2px 16px;
 }
 
-.editor-field label {
-    min-width: 100px;
-    color: var(--accent-color);
-    font-size: 13px;
-}
-
-.editor-field input {
-    flex: 1;
-    padding: 4px 6px;
-    background-color: #000;
-    color: var(--text-color);
-    border: 1px solid var(--separator-color);
-    font-family: inherit;
-    font-size: 13px;
-}
-
-.editor-field input:focus {
-    outline: none;
-    border-color: var(--accent-color);
-}
-
-.editor-field .toggle-btn {
-    min-width: 80px;
-    padding: 4px 8px;
-    background-color: #444;
-    color: #fff;
-    border: 1px solid #666;
-    border-radius: 3px;
-    cursor: pointer;
-    font-family: inherit;
+.world-editor-modal-content .popup-title {
     font-size: 12px;
+    font-weight: 600;
+    color: #e4e4e7;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
 }
 
-.editor-field .toggle-btn:hover {
-    background-color: #555;
+.world-editor-modal-content .popup-close {
+    width: 24px;
+    height: 24px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    background: transparent;
+    border: none;
+    border-radius: 4px;
+    color: #71717a;
+    cursor: pointer;
+    transition: all 0.1s ease;
+}
+
+.world-editor-modal-content .popup-close:hover {
+    background: #222228;
+    color: #e4e4e7;
+}
+
+.world-editor-modal-content .popup-body {
+    padding: 8px 16px 16px 16px;
+    display: flex;
+    flex-direction: column;
+    gap: 0;
+}
+
+.world-editor-modal-content .popup-footer {
+    display: flex;
+    align-items: center;
+    justify-content: flex-end;
+    gap: 8px;
+    padding: 12px 16px;
+    border-top: 1px solid rgba(255, 255, 255, 0.06);
+    background: #141418;
+}
+
+.world-editor-modal-content .btn {
+    padding: 9px 6px;
+    width: 70px;
+    background: #222228;
+    border: 1px solid rgba(255, 255, 255, 0.1);
+    border-radius: 4px;
+    color: #a1a1aa;
+    font-family: inherit;
+    font-size: 10px;
+    font-weight: 500;
+    text-transform: uppercase;
+    letter-spacing: 0.03em;
+    cursor: pointer;
+    transition: all 0.1s ease;
+}
+
+.world-editor-modal-content .btn:hover {
+    background: #1a1a1f;
+    color: #e4e4e7;
+    border-color: #52525b;
+}
+
+.world-editor-modal-content .btn-primary {
+    background: #0891b2;
+    border-color: #0891b2;
+    color: #08080a;
+}
+
+.world-editor-modal-content .btn-primary:hover {
+    background: #22d3ee;
+    border-color: #22d3ee;
+    color: #08080a;
+}
+
+.world-editor-modal-content .btn-danger {
+    background: #dc2626;
+    border-color: #dc2626;
+    color: #ffffff;
+    font-weight: 700;
+    margin-right: auto;
+}
+
+.world-editor-modal-content .btn-danger:hover {
+    background: #ef4444;
+    border-color: #ef4444;
+    color: #ffffff;
+}
+
+.world-editor-modal-content .setting-row {
+    display: flex;
+    align-items: center;
+    padding: 0;
+}
+
+.world-editor-modal-content .setting-label {
+    width: 120px;
+    color: #a1a1aa;
+    font-size: 13px;
+    text-align: right;
+    padding-right: 5px;
+    flex-shrink: 0;
+}
+
+.world-editor-modal-content .setting-value {
+    flex: 1;
+}
+
+.world-editor-modal-content .editor-input {
+    width: 100%;
+    padding: 8px 12px;
+    background: #08080a;
+    border: 1px solid rgba(255, 255, 255, 0.1);
+    border-radius: 4px;
+    color: #e4e4e7;
+    font-family: inherit;
+    font-size: 13px;
+}
+
+.world-editor-modal-content .editor-input:focus {
+    outline: none;
+    border-color: #0891b2;
+}
+
+.world-editor-modal-content .form-select {
+    width: 100%;
 }
 
 #world-edit-keep-alive-cmd-field {

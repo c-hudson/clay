@@ -87,13 +87,14 @@
         worldEditPort: document.getElementById('world-edit-port'),
         worldEditUser: document.getElementById('world-edit-user'),
         worldEditPassword: document.getElementById('world-edit-password'),
-        worldEditSslBtn: document.getElementById('world-edit-ssl-btn'),
-        worldEditAutoLoginBtn: document.getElementById('world-edit-auto-login-btn'),
-        worldEditKeepAliveBtn: document.getElementById('world-edit-keep-alive-btn'),
+        worldEditSslToggle: document.getElementById('world-edit-ssl-toggle'),
+        worldEditAutoLoginSelect: document.getElementById('world-edit-auto-login-select'),
+        worldEditKeepAliveSelect: document.getElementById('world-edit-keep-alive-select'),
         worldEditKeepAliveCmdField: document.getElementById('world-edit-keep-alive-cmd-field'),
         worldEditKeepAliveCmd: document.getElementById('world-edit-keep-alive-cmd'),
-        worldEditEncodingBtn: document.getElementById('world-edit-encoding-btn'),
+        worldEditEncodingSelect: document.getElementById('world-edit-encoding-select'),
         worldEditLogFile: document.getElementById('world-edit-log-file'),
+        worldEditCloseBtn: document.getElementById('world-edit-close-btn'),
         worldEditDeleteBtn: document.getElementById('world-edit-delete-btn'),
         worldEditCancelBtn: document.getElementById('world-edit-cancel-btn'),
         worldEditSaveBtn: document.getElementById('world-edit-save-btn'),
@@ -576,6 +577,11 @@
                 worlds = msg.worlds || [];
                 currentWorldIndex = msg.current_world_index || 0;
                 actions = msg.actions || [];
+                // Reset client-side more-mode state (each client handles more locally)
+                paused = false;
+                pendingLines = [];
+                linesSincePause = 0;
+                partialLines = {};
                 // Initialize output cache for each world (empty - will be populated on render)
                 worldOutputCache = worlds.map(() => []);
                 // Ensure output_lines arrays exist, prefer timestamped versions
@@ -592,18 +598,20 @@
                     } else {
                         world.output_lines = [];
                     }
-                    // Same for pending_lines
+                    // Append pending_lines to output_lines (each client handles more mode locally)
+                    let pendingLines = [];
                     if (world.pending_lines_ts && world.pending_lines_ts.length > 0) {
-                        world.pending_lines = world.pending_lines_ts;
-                    } else if (world.pending_lines) {
-                        world.pending_lines = world.pending_lines.map(line =>
+                        pendingLines = world.pending_lines_ts;
+                    } else if (world.pending_lines && world.pending_lines.length > 0) {
+                        pendingLines = world.pending_lines.map(line =>
                             typeof line === 'string' ? { text: line, ts: currentTs } : line
                         );
                     }
+                    // Combine output and pending lines - server's more mode shouldn't affect clients
+                    world.output_lines = world.output_lines.concat(pendingLines);
+                    world.pending_count = pendingLines.length;
                     // Use server's centralized unseen tracking - don't reset to 0
-                    // Note: pending_count is server-side more-mode concept for activity display
                     // world.unseen_lines comes from server, keep it as-is
-                    world.pending_count = (world.pending_lines && world.pending_lines.length) || 0;
                 });
                 if (msg.settings) {
                     if (msg.settings.input_height) {
@@ -945,7 +953,7 @@
 
     // Send message to server
     function send(msg) {
-        if (ws && ws.readyState === WebSocket.OPEN) {
+        if (ws && ws.readyState === WebSocket.OPEN && authenticated) {
             ws.send(JSON.stringify(msg));
         }
     }
@@ -1055,7 +1063,9 @@
     // Send command
     function sendCommand() {
         const cmd = elements.input.value;
-        if (cmd.length === 0 && !authenticated) return;
+        // Don't send empty commands, or any commands if not authenticated
+        if (cmd.length === 0) return;
+        if (!authenticated) return;
 
         // Use shared command parsing
         const parsed = parseCommand(cmd);
@@ -2675,7 +2685,7 @@
         const world = worlds[worldIndex];
 
         // Populate form fields
-        elements.worldEditorTitle.textContent = 'Edit World: ' + (world.name || 'New World');
+        elements.worldEditorTitle.textContent = 'World Editor';
         elements.worldEditName.value = world.name || '';
         elements.worldEditHostname.value = world.settings?.hostname || '';
         elements.worldEditPort.value = world.settings?.port || '';
@@ -2684,19 +2694,23 @@
         elements.worldEditLogFile.value = world.settings?.log_file || '';
         elements.worldEditKeepAliveCmd.value = world.settings?.keep_alive_cmd || '';
 
-        // Set toggle buttons
+        // Set toggle and selects
         const useSsl = world.settings?.use_ssl || false;
-        elements.worldEditSslBtn.textContent = useSsl ? 'on' : 'off';
+        if (useSsl) {
+            elements.worldEditSslToggle.classList.add('active');
+        } else {
+            elements.worldEditSslToggle.classList.remove('active');
+        }
 
         const autoLogin = world.settings?.auto_login || 'Connect';
-        elements.worldEditAutoLoginBtn.textContent = autoLogin;
+        elements.worldEditAutoLoginSelect.value = autoLogin;
 
         const keepAlive = world.settings?.keep_alive_type || 'NOP';
-        elements.worldEditKeepAliveBtn.textContent = keepAlive;
+        elements.worldEditKeepAliveSelect.value = keepAlive;
         updateKeepAliveCmdVisibility(keepAlive);
 
         const encoding = world.settings?.encoding || 'UTF-8';
-        elements.worldEditEncodingBtn.textContent = encoding;
+        elements.worldEditEncodingSelect.value = encoding;
 
         elements.worldEditorModal.className = 'modal visible';
         elements.worldEditorModal.style.display = 'flex';
@@ -2731,11 +2745,11 @@
             port: elements.worldEditPort.value,
             user: elements.worldEditUser.value,
             password: elements.worldEditPassword.value,
-            use_ssl: elements.worldEditSslBtn.textContent === 'on',
+            use_ssl: elements.worldEditSslToggle.classList.contains('active'),
             log_file: elements.worldEditLogFile.value,
-            encoding: elements.worldEditEncodingBtn.textContent,
-            auto_login: elements.worldEditAutoLoginBtn.textContent,
-            keep_alive_type: elements.worldEditKeepAliveBtn.textContent,
+            encoding: elements.worldEditEncodingSelect.value,
+            auto_login: elements.worldEditAutoLoginSelect.value,
+            keep_alive_type: elements.worldEditKeepAliveSelect.value,
             keep_alive_cmd: elements.worldEditKeepAliveCmd.value
         });
 
@@ -2747,11 +2761,11 @@
         world.settings.port = elements.worldEditPort.value;
         world.settings.user = elements.worldEditUser.value;
         world.settings.password = elements.worldEditPassword.value;
-        world.settings.use_ssl = elements.worldEditSslBtn.textContent === 'on';
+        world.settings.use_ssl = elements.worldEditSslToggle.classList.contains('active');
         world.settings.log_file = elements.worldEditLogFile.value;
-        world.settings.encoding = elements.worldEditEncodingBtn.textContent;
-        world.settings.auto_login = elements.worldEditAutoLoginBtn.textContent;
-        world.settings.keep_alive_type = elements.worldEditKeepAliveBtn.textContent;
+        world.settings.encoding = elements.worldEditEncodingSelect.value;
+        world.settings.auto_login = elements.worldEditAutoLoginSelect.value;
+        world.settings.keep_alive_type = elements.worldEditKeepAliveSelect.value;
         world.settings.keep_alive_cmd = elements.worldEditKeepAliveCmd.value;
 
         closeWorldEditorPopup();
@@ -2951,6 +2965,9 @@
                 break;
             case 'setup':
                 openSetupPopup();
+                break;
+            case 'web':
+                openWebPopup();
                 break;
             case 'toggle-tags':
                 showTags = !showTags;
@@ -3753,25 +3770,12 @@
         elements.worldEditCancelBtn.onclick = closeWorldEditorPopup;
         elements.worldEditConnectBtn.onclick = saveAndConnectWorldEditor;
         elements.worldEditDeleteBtn.onclick = deleteWorldFromEditor;
-        elements.worldEditSslBtn.onclick = function() {
-            this.textContent = this.textContent === 'on' ? 'off' : 'on';
+        elements.worldEditCloseBtn.onclick = closeWorldEditorPopup;
+        elements.worldEditSslToggle.onclick = function() {
+            this.classList.toggle('active');
         };
-        elements.worldEditAutoLoginBtn.onclick = function() {
-            const modes = ['Connect', 'Prompt', 'MOO_prompt'];
-            const idx = modes.indexOf(this.textContent);
-            this.textContent = modes[(idx + 1) % modes.length];
-        };
-        elements.worldEditKeepAliveBtn.onclick = function() {
-            const types = ['NOP', 'Custom', 'Generic', 'None'];
-            const idx = types.indexOf(this.textContent);
-            const newType = types[(idx + 1) % types.length];
-            this.textContent = newType;
-            updateKeepAliveCmdVisibility(newType);
-        };
-        elements.worldEditEncodingBtn.onclick = function() {
-            const encodings = ['UTF-8', 'Latin1', 'Fansi'];
-            const idx = encodings.indexOf(this.textContent);
-            this.textContent = encodings[(idx + 1) % encodings.length];
+        elements.worldEditKeepAliveSelect.onchange = function() {
+            updateKeepAliveCmdVisibility(this.value);
         };
 
         elements.worldFilter.oninput = function() {
