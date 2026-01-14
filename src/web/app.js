@@ -122,10 +122,10 @@
         setupMoreModeToggle: document.getElementById('setup-more-mode-toggle'),
         setupShowTagsToggle: document.getElementById('setup-show-tags-toggle'),
         setupWorldSwitchSelect: document.getElementById('setup-world-switch-select'),
-        setupInputHeight: document.getElementById('setup-input-height'),
         setupInputHeightValue: document.getElementById('setup-input-height-value'),
-        setupThemeDark: document.getElementById('setup-theme-dark'),
-        setupThemeLight: document.getElementById('setup-theme-light'),
+        setupHeightMinus: document.getElementById('setup-height-minus'),
+        setupHeightPlus: document.getElementById('setup-height-plus'),
+        setupThemeSelect: document.getElementById('setup-theme-select'),
         setupSaveBtn: document.getElementById('setup-save-btn'),
         setupCancelBtn: document.getElementById('setup-cancel-btn'),
         // Filter popup (F4)
@@ -2100,22 +2100,14 @@
         }
         // World switching dropdown
         elements.setupWorldSwitchSelect.value = setupWorldSwitchMode;
-        // Input height slider
-        elements.setupInputHeight.value = setupInputHeightValue;
+        // Input height stepper
         elements.setupInputHeightValue.textContent = setupInputHeightValue;
-        // Theme buttons
-        if (setupGuiTheme === 'dark') {
-            elements.setupThemeDark.classList.add('active');
-            elements.setupThemeLight.classList.remove('active');
-        } else {
-            elements.setupThemeDark.classList.remove('active');
-            elements.setupThemeLight.classList.add('active');
-        }
+        // Theme dropdown
+        elements.setupThemeSelect.value = setupGuiTheme.charAt(0).toUpperCase() + setupGuiTheme.slice(1);
     }
 
     function saveSetupSettings() {
-        // Read values from UI
-        setupInputHeightValue = parseInt(elements.setupInputHeight.value) || 1;
+        // Read values from UI (stepper value is already tracked)
         if (setupInputHeightValue < 1) setupInputHeightValue = 1;
         if (setupInputHeightValue > 15) setupInputHeightValue = 15;
 
@@ -3804,16 +3796,20 @@
         elements.setupWorldSwitchSelect.onchange = function() {
             setupWorldSwitchMode = this.value;
         };
-        elements.setupInputHeight.oninput = function() {
-            elements.setupInputHeightValue.textContent = this.value;
+        elements.setupHeightMinus.onclick = function() {
+            if (setupInputHeightValue > 1) {
+                setupInputHeightValue--;
+                updateSetupPopupUI();
+            }
         };
-        elements.setupThemeDark.onclick = function() {
-            setupGuiTheme = 'dark';
-            updateSetupPopupUI();
+        elements.setupHeightPlus.onclick = function() {
+            if (setupInputHeightValue < 15) {
+                setupInputHeightValue++;
+                updateSetupPopupUI();
+            }
         };
-        elements.setupThemeLight.onclick = function() {
-            setupGuiTheme = 'light';
-            updateSetupPopupUI();
+        elements.setupThemeSelect.onchange = function() {
+            setupGuiTheme = this.value.toLowerCase();
         };
         elements.setupSaveBtn.onclick = saveSetupSettings;
         elements.setupCancelBtn.onclick = closeSetupPopup;

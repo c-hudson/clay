@@ -317,39 +317,44 @@
                     <button id="setup-close-btn" class="popup-close">✕</button>
                 </div>
                 <div class="popup-body">
-                    <div class="settings-group">
-                        <div class="settings-group-title">Behavior</div>
-                        <div class="setting-row">
-                            <span class="setting-label">More mode</span>
+                    <div class="setting-row">
+                        <span class="setting-label">More mode</span>
+                        <div class="setting-value">
                             <div id="setup-more-mode-toggle" class="toggle"></div>
                         </div>
-                        <div class="setting-row">
-                            <span class="setting-label">Show tags</span>
+                    </div>
+                    <div class="setting-row">
+                        <span class="setting-label">Show tags</span>
+                        <div class="setting-value">
                             <div id="setup-show-tags-toggle" class="toggle"></div>
                         </div>
-                        <div class="setting-row">
-                            <span class="setting-label">World switching</span>
+                    </div>
+                    <div class="setting-row">
+                        <span class="setting-label">World switching</span>
+                        <div class="setting-value">
                             <select id="setup-world-switch-select" class="form-select">
                                 <option value="Unseen First">Unseen First</option>
                                 <option value="Alphabetical">Alphabetical</option>
                             </select>
                         </div>
                     </div>
-                    <div class="settings-group">
-                        <div class="settings-group-title">Display</div>
-                        <div class="setting-row">
-                            <span class="setting-label">Input height</span>
-                            <div class="slider-container">
-                                <input type="range" id="setup-input-height" class="slider" min="1" max="15" value="3">
-                                <span id="setup-input-height-value" class="slider-value">3</span>
+                    <div class="setting-row">
+                        <span class="setting-label">Input height</span>
+                        <div class="setting-value">
+                            <div class="stepper">
+                                <button id="setup-height-minus" class="stepper-btn">−</button>
+                                <span id="setup-input-height-value" class="stepper-value">3</span>
+                                <button id="setup-height-plus" class="stepper-btn">+</button>
                             </div>
                         </div>
-                        <div class="setting-row">
-                            <span class="setting-label">Theme</span>
-                            <div class="theme-selector">
-                                <button id="setup-theme-dark" class="theme-option active">Dark</button>
-                                <button id="setup-theme-light" class="theme-option">Light</button>
-                            </div>
+                    </div>
+                    <div class="setting-row">
+                        <span class="setting-label">Theme</span>
+                        <div class="setting-value">
+                            <select id="setup-theme-select" class="form-select">
+                                <option value="Dark">Dark</option>
+                                <option value="Light">Light</option>
+                            </select>
                         </div>
                     </div>
                 </div>
