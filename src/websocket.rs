@@ -73,7 +73,7 @@ pub enum WsMessage {
         user: String,
         password: String,
         use_ssl: bool,
-        log_file: String,
+        log_enabled: bool,
         encoding: String,
         auto_login: String,
         keep_alive_type: String,
@@ -162,7 +162,7 @@ pub struct WorldSettingsMsg {
     #[serde(default)]
     pub password: String,  // Always encrypted when transmitted
     pub use_ssl: bool,
-    pub log_file: Option<String>,
+    pub log_enabled: bool,
     pub encoding: String,
     pub auto_connect_type: String,
     pub keep_alive_type: String,

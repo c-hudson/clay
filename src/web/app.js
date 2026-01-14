@@ -93,7 +93,7 @@
         worldEditKeepAliveCmdField: document.getElementById('world-edit-keep-alive-cmd-field'),
         worldEditKeepAliveCmd: document.getElementById('world-edit-keep-alive-cmd'),
         worldEditEncodingSelect: document.getElementById('world-edit-encoding-select'),
-        worldEditLogFile: document.getElementById('world-edit-log-file'),
+        worldEditLoggingToggle: document.getElementById('world-edit-logging-toggle'),
         worldEditCloseBtn: document.getElementById('world-edit-close-btn'),
         worldEditDeleteBtn: document.getElementById('world-edit-delete-btn'),
         worldEditCancelBtn: document.getElementById('world-edit-cancel-btn'),
@@ -2809,7 +2809,12 @@
         elements.worldEditPort.value = world.settings?.port || '';
         elements.worldEditUser.value = world.settings?.user || '';
         elements.worldEditPassword.value = world.settings?.password || '';
-        elements.worldEditLogFile.value = world.settings?.log_file || '';
+        const logEnabled = world.settings?.log_enabled || false;
+        if (logEnabled) {
+            elements.worldEditLoggingToggle.classList.add('active');
+        } else {
+            elements.worldEditLoggingToggle.classList.remove('active');
+        }
         elements.worldEditKeepAliveCmd.value = world.settings?.keep_alive_cmd || '';
 
         // Set toggle and selects
@@ -2864,7 +2869,7 @@
             user: elements.worldEditUser.value,
             password: elements.worldEditPassword.value,
             use_ssl: elements.worldEditSslToggle.classList.contains('active'),
-            log_file: elements.worldEditLogFile.value,
+            log_enabled: elements.worldEditLoggingToggle.classList.contains('active'),
             encoding: elements.worldEditEncodingSelect.value,
             auto_login: elements.worldEditAutoLoginSelect.value,
             keep_alive_type: elements.worldEditKeepAliveSelect.value,
@@ -2880,7 +2885,7 @@
         world.settings.user = elements.worldEditUser.value;
         world.settings.password = elements.worldEditPassword.value;
         world.settings.use_ssl = elements.worldEditSslToggle.classList.contains('active');
-        world.settings.log_file = elements.worldEditLogFile.value;
+        world.settings.log_enabled = elements.worldEditLoggingToggle.classList.contains('active');
         world.settings.encoding = elements.worldEditEncodingSelect.value;
         world.settings.auto_login = elements.worldEditAutoLoginSelect.value;
         world.settings.keep_alive_type = elements.worldEditKeepAliveSelect.value;
@@ -3890,6 +3895,9 @@
         elements.worldEditDeleteBtn.onclick = deleteWorldFromEditor;
         elements.worldEditCloseBtn.onclick = closeWorldEditorPopup;
         elements.worldEditSslToggle.onclick = function() {
+            this.classList.toggle('active');
+        };
+        elements.worldEditLoggingToggle.onclick = function() {
             this.classList.toggle('active');
         };
         elements.worldEditKeepAliveSelect.onchange = function() {

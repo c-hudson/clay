@@ -730,7 +730,6 @@ impl SettingsField {
                 | SettingsField::Port
                 | SettingsField::User
                 | SettingsField::Password
-                | SettingsField::LogFile
                 | SettingsField::KeepAliveCmd
                 | SettingsField::SlackToken
                 | SettingsField::SlackChannel
@@ -919,7 +918,7 @@ struct SettingsPopup {
     temp_user: String,
     temp_password: String,
     temp_use_ssl: bool,
-    temp_log_file: String,
+    temp_log_enabled: bool,
     temp_encoding: Encoding,
     temp_auto_connect_type: AutoConnectType,
     temp_keep_alive_type: KeepAliveType,
@@ -962,7 +961,7 @@ impl SettingsPopup {
             temp_user: String::new(),
             temp_password: String::new(),
             temp_use_ssl: false,
-            temp_log_file: String::new(),
+            temp_log_enabled: false,
             temp_encoding: Encoding::Utf8,
             temp_auto_connect_type: AutoConnectType::Connect,
             temp_keep_alive_type: KeepAliveType::Nop,
@@ -1000,7 +999,7 @@ impl SettingsPopup {
         self.temp_user = world.settings.user.clone();
         self.temp_password = world.settings.password.clone();
         self.temp_use_ssl = world.settings.use_ssl;
-        self.temp_log_file = world.settings.log_file.clone().unwrap_or_default();
+        self.temp_log_enabled = world.settings.log_enabled;
         self.temp_encoding = world.settings.encoding;
         self.temp_auto_connect_type = world.settings.auto_connect_type;
         self.temp_keep_alive_type = world.settings.keep_alive_type;
@@ -1070,7 +1069,6 @@ impl SettingsPopup {
             SettingsField::Port => self.temp_port.clone(),
             SettingsField::User => self.temp_user.clone(),
             SettingsField::Password => self.temp_password.clone(),
-            SettingsField::LogFile => self.temp_log_file.clone(),
             SettingsField::KeepAliveCmd => self.temp_keep_alive_cmd.clone(),
             SettingsField::SlackToken => self.temp_slack_token.clone(),
             SettingsField::SlackChannel => self.temp_slack_channel.clone(),
@@ -1108,7 +1106,6 @@ impl SettingsPopup {
             SettingsField::Port => self.temp_port = self.edit_buffer.clone(),
             SettingsField::User => self.temp_user = self.edit_buffer.clone(),
             SettingsField::Password => self.temp_password = self.edit_buffer.clone(),
-            SettingsField::LogFile => self.temp_log_file = self.edit_buffer.clone(),
             SettingsField::KeepAliveCmd => self.temp_keep_alive_cmd = self.edit_buffer.clone(),
             SettingsField::SlackToken => self.temp_slack_token = self.edit_buffer.clone(),
             SettingsField::SlackChannel => self.temp_slack_channel = self.edit_buffer.clone(),
@@ -1132,6 +1129,7 @@ impl SettingsPopup {
                 self.temp_world_type = self.temp_world_type.cycle_next();
             }
             SettingsField::UseSsl => self.temp_use_ssl = !self.temp_use_ssl,
+            SettingsField::LogFile => self.temp_log_enabled = !self.temp_log_enabled,
             SettingsField::MoreMode => self.temp_more_mode = !self.temp_more_mode,
             SettingsField::SpellCheck => self.temp_spell_check = !self.temp_spell_check,
             SettingsField::WorldSwitching => self.temp_world_switch_mode = self.temp_world_switch_mode.next(),
@@ -1182,11 +1180,7 @@ impl SettingsPopup {
             world.settings.user = self.temp_user.clone();
             world.settings.password = self.temp_password.clone();
             world.settings.use_ssl = self.temp_use_ssl;
-            world.settings.log_file = if self.temp_log_file.is_empty() {
-                None
-            } else {
-                Some(self.temp_log_file.clone())
-            };
+            world.settings.log_enabled = self.temp_log_enabled;
             world.settings.encoding = self.temp_encoding;
             world.settings.auto_connect_type = self.temp_auto_connect_type;
             world.settings.keep_alive_type = self.temp_keep_alive_type;
@@ -2649,7 +2643,7 @@ struct WorldSettings {
     user: String,
     password: String,
     use_ssl: bool,
-    log_file: Option<String>,
+    log_enabled: bool,
     encoding: Encoding,
     auto_connect_type: AutoConnectType,
     keep_alive_type: KeepAliveType,
@@ -2674,7 +2668,7 @@ impl Default for WorldSettings {
             user: String::new(),
             password: String::new(),
             use_ssl: false,
-            log_file: None,
+            log_enabled: false,
             encoding: Encoding::Utf8,
             auto_connect_type: AutoConnectType::Connect,
             keep_alive_type: KeepAliveType::Nop,
@@ -3385,6 +3379,7 @@ struct World {
     lines_since_pause: usize,
     settings: WorldSettings,
     log_handle: Option<std::sync::Arc<std::sync::Mutex<std::fs::File>>>,
+    log_date: Option<String>,    // Current log file date (MMDDYY) for day rollover detection
     socket_fd: Option<RawFd>,    // Store fd for hot reload (plain TCP only)
     is_tls: bool,                // Track if using TLS
     telnet_mode: bool,           // True if telnet negotiation detected
@@ -3433,6 +3428,7 @@ impl World {
             lines_since_pause: 0,
             settings: WorldSettings::default(),
             log_handle: None,
+            log_date: None,
             socket_fd: None,
             is_tls: false,
             telnet_mode: false,
@@ -3454,6 +3450,107 @@ impl World {
             debug_seq: 0,
             debug_input_log: None,
             debug_output_log: None,
+        }
+    }
+
+    /// Get the current date as MMDDYY string for log file naming
+    fn get_current_date_string() -> String {
+        let now_secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as libc::time_t;
+
+        let mut tm: libc::tm = unsafe { std::mem::zeroed() };
+        unsafe {
+            libc::localtime_r(&now_secs, &mut tm);
+        }
+
+        format!("{:02}{:02}{:02}", tm.tm_mon + 1, tm.tm_mday, (tm.tm_year + 1900) % 100)
+    }
+
+    /// Get the path to the logs directory, creating it if needed
+    fn get_logs_dir() -> std::path::PathBuf {
+        let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
+        let logs_dir = std::path::PathBuf::from(home).join(".clay").join("logs");
+        if !logs_dir.exists() {
+            let _ = std::fs::create_dir_all(&logs_dir);
+        }
+        logs_dir
+    }
+
+    /// Get the full path to this world's log file for the current date
+    fn get_log_path(&self) -> std::path::PathBuf {
+        let date_str = Self::get_current_date_string();
+        // Sanitize world name for use in filename (replace invalid chars with _)
+        let safe_name: String = self.name.chars()
+            .map(|c| if c.is_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
+            .collect();
+        Self::get_logs_dir().join(format!("{}.{}.log", safe_name, date_str))
+    }
+
+    /// Open the log file for this world (creates logs directory if needed)
+    fn open_log_file(&mut self) -> bool {
+        if !self.settings.log_enabled {
+            return false;
+        }
+
+        let date_str = Self::get_current_date_string();
+        let log_path = self.get_log_path();
+
+        match std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&log_path)
+        {
+            Ok(file) => {
+                self.log_handle = Some(std::sync::Arc::new(std::sync::Mutex::new(file)));
+                self.log_date = Some(date_str);
+                true
+            }
+            Err(_) => false,
+        }
+    }
+
+    /// Close the log file
+    fn close_log_file(&mut self) {
+        self.log_handle = None;
+        self.log_date = None;
+    }
+
+    /// Write a line to the log file with timestamp prefix
+    /// Handles day rollover (opens new file if date changed)
+    fn write_log_line(&mut self, line: &str) {
+        if !self.settings.log_enabled {
+            return;
+        }
+
+        // Check for day rollover
+        let current_date = Self::get_current_date_string();
+        if self.log_date.as_ref() != Some(&current_date) {
+            // Date changed, close old file and open new one
+            self.close_log_file();
+            if !self.open_log_file() {
+                return;
+            }
+        }
+
+        if let Some(ref handle) = self.log_handle {
+            if let Ok(mut file) = handle.lock() {
+                // Get current time for timestamp
+                let now_secs = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs() as libc::time_t;
+
+                let mut tm: libc::tm = unsafe { std::mem::zeroed() };
+                unsafe {
+                    libc::localtime_r(&now_secs, &mut tm);
+                }
+
+                // Format: [HH:MM:SS] line
+                let _ = writeln!(file, "[{:02}:{:02}:{:02}] {}",
+                    tm.tm_hour, tm.tm_min, tm.tm_sec, line);
+            }
         }
     }
 
@@ -3535,13 +3632,9 @@ impl World {
                 continue;
             }
 
-            // Write to log file if configured (only for complete lines)
+            // Write to log file if enabled (only for complete lines)
             if !is_partial {
-                if let Some(ref handle) = self.log_handle {
-                    if let Ok(mut file) = handle.lock() {
-                        let _ = writeln!(file, "{}", line);
-                    }
-                }
+                self.write_log_line(line);
             }
 
             // Track if this line goes to pending (for partial tracking)
@@ -4148,7 +4241,7 @@ impl App {
                     user: world.settings.user.clone(),
                     password: world.settings.password.clone(),
                     use_ssl: world.settings.use_ssl,
-                    log_file: world.settings.log_file.clone(),
+                    log_enabled: world.settings.log_enabled,
                     encoding: world.settings.encoding.name().to_string(),
                     auto_connect_type: world.settings.auto_connect_type.name().to_string(),
                     keep_alive_type: world.settings.keep_alive_type.name().to_string(),
@@ -4790,8 +4883,8 @@ fn save_settings(app: &App) -> io::Result<()> {
         if !world.settings.keep_alive_cmd.is_empty() {
             writeln!(file, "keep_alive_cmd={}", world.settings.keep_alive_cmd)?;
         }
-        if let Some(ref log) = world.settings.log_file {
-            writeln!(file, "log_file={}", log)?;
+        if world.settings.log_enabled {
+            writeln!(file, "log_enabled=true")?;
         }
         // Slack settings
         if !world.settings.slack_token.is_empty() {
@@ -5048,7 +5141,8 @@ fn load_settings(app: &mut App) -> io::Result<()> {
                         "user" => world.settings.user = value.to_string(),
                         "password" => world.settings.password = decrypt_password(value),
                         "use_ssl" => world.settings.use_ssl = value == "true",
-                        "log_file" => world.settings.log_file = Some(value.to_string()),
+                        "log_enabled" => world.settings.log_enabled = value == "true",
+                        "log_file" => world.settings.log_enabled = true, // Backward compat: old log_file setting enables logging
                         "encoding" => {
                             world.settings.encoding = match value {
                                 "latin1" => Encoding::Latin1,
@@ -5172,8 +5266,8 @@ fn save_reload_state(app: &App) -> io::Result<()> {
         if !world.settings.keep_alive_cmd.is_empty() {
             writeln!(file, "keep_alive_cmd={}", world.settings.keep_alive_cmd.replace('=', "\\e"))?;
         }
-        if let Some(ref log) = world.settings.log_file {
-            writeln!(file, "log_file={}", log)?;
+        if world.settings.log_enabled {
+            writeln!(file, "log_enabled=true")?;
         }
         // Slack settings
         if !world.settings.slack_token.is_empty() {
@@ -5589,7 +5683,8 @@ fn load_reload_state(app: &mut App) -> io::Result<bool> {
                             "user" => tw.settings.user = unescape_string(value),
                             "password" => tw.settings.password = unescape_string(value),
                             "use_ssl" => tw.settings.use_ssl = value == "true",
-                            "log_file" => tw.settings.log_file = Some(value.to_string()),
+                            "log_enabled" => tw.settings.log_enabled = value == "true",
+                            "log_file" => tw.settings.log_enabled = true, // Backward compat
                             "encoding" => {
                                 tw.settings.encoding = match value {
                                     "latin1" => Encoding::Latin1,
@@ -5807,7 +5902,7 @@ mod remote_gui {
         pub user: String,
         pub password: String,
         pub use_ssl: bool,
-        pub log_file: String,
+        pub log_enabled: bool,
         pub encoding: String,
         pub auto_login: String,
         pub keep_alive_type: String,
@@ -6089,7 +6184,7 @@ mod remote_gui {
         edit_user: String,
         edit_password: String,
         edit_ssl: bool,
-        edit_log_file: String,
+        edit_log_enabled: bool,
         edit_encoding: Encoding,
         edit_auto_login: AutoConnectType,
         edit_keep_alive_type: KeepAliveType,
@@ -6291,7 +6386,7 @@ mod remote_gui {
                 edit_user: String::new(),
                 edit_password: String::new(),
                 edit_ssl: false,
-                edit_log_file: String::new(),
+                edit_log_enabled: false,
                 edit_encoding: Encoding::Utf8,
                 edit_auto_login: AutoConnectType::Connect,
                 edit_keep_alive_type: KeepAliveType::Nop,
@@ -6656,7 +6751,7 @@ mod remote_gui {
                                     user: w.settings.user,
                                     password: decrypt_password(&w.settings.password),
                                     use_ssl: w.settings.use_ssl,
-                                    log_file: w.settings.log_file.unwrap_or_default(),
+                                    log_enabled: w.settings.log_enabled,
                                     encoding: w.settings.encoding,
                                     auto_login: w.settings.auto_connect_type,
                                     keep_alive_type: w.keep_alive_type.clone(),
@@ -7207,7 +7302,7 @@ mod remote_gui {
                     user: self.edit_user.clone(),
                     password: self.edit_password.clone(),
                     use_ssl: self.edit_ssl,
-                    log_file: self.edit_log_file.clone(),
+                    log_enabled: self.edit_log_enabled,
                     encoding: self.edit_encoding.name().to_string(),
                     auto_login: self.edit_auto_login.name().to_string(),
                     keep_alive_type: self.edit_keep_alive_type.name().to_string(),
@@ -7258,7 +7353,7 @@ mod remote_gui {
                 self.edit_user = world.settings.user.clone();
                 self.edit_password = world.settings.password.clone();
                 self.edit_ssl = world.settings.use_ssl;
-                self.edit_log_file = world.settings.log_file.clone();
+                self.edit_log_enabled = world.settings.log_enabled;
                 self.edit_encoding = match world.settings.encoding.as_str() {
                     "latin1" => Encoding::Latin1,
                     "fansi" => Encoding::Fansi,
@@ -10070,7 +10165,7 @@ mod remote_gui {
                     let mut edit_user = self.edit_user.clone();
                     let mut edit_password = self.edit_password.clone();
                     let mut edit_ssl = self.edit_ssl;
-                    let mut edit_log_file = self.edit_log_file.clone();
+                    let mut edit_log_enabled = self.edit_log_enabled;
                     let mut edit_encoding = self.edit_encoding;
                     let mut edit_auto_login = self.edit_auto_login;
                     let mut edit_keep_alive_type = self.edit_keep_alive_type;
@@ -10357,9 +10452,41 @@ mod remote_gui {
                                         ui.painter().circle_filled(knob_center, 7.0, knob_color);
                                     });
 
-                                    // Log File (full width)
-                                    form_row(ui, "Log File", &mut |ui| {
-                                        styled_text_input(ui, &mut edit_log_file, None, "log_file_input");
+                                    // Logging (toggle)
+                                    form_row(ui, "Logging", &mut |ui| {
+                                        // Toggle switch style
+                                        let (toggle_bg, toggle_border, knob_pos) = if edit_log_enabled {
+                                            (theme.accent_dim(), theme.accent_dim(), 18.0)
+                                        } else {
+                                            (theme.bg_deep(), theme.border_medium(), 3.0)
+                                        };
+
+                                        let toggle_rect = ui.allocate_space(egui::vec2(36.0, 20.0));
+                                        let response = ui.interact(toggle_rect.1, ui.id().with("log_toggle"), egui::Sense::click());
+
+                                        if response.clicked() {
+                                            edit_log_enabled = !edit_log_enabled;
+                                        }
+
+                                        // Draw toggle background
+                                        ui.painter().rect_filled(
+                                            toggle_rect.1,
+                                            egui::Rounding::same(10.0),
+                                            toggle_bg
+                                        );
+                                        ui.painter().rect_stroke(
+                                            toggle_rect.1,
+                                            egui::Rounding::same(10.0),
+                                            egui::Stroke::new(1.0, toggle_border)
+                                        );
+
+                                        // Draw knob
+                                        let knob_color = if edit_log_enabled { theme.bg_deep() } else { theme.fg_muted() };
+                                        let knob_center = egui::pos2(
+                                            toggle_rect.1.min.x + knob_pos + 7.0,
+                                            toggle_rect.1.center().y
+                                        );
+                                        ui.painter().circle_filled(knob_center, 7.0, knob_color);
                                     });
 
                                     // Encoding (custom styled dropdown, full width, NO border)
@@ -10526,7 +10653,7 @@ mod remote_gui {
                     self.edit_user = edit_user;
                     self.edit_password = edit_password;
                     self.edit_ssl = edit_ssl;
-                    self.edit_log_file = edit_log_file;
+                    self.edit_log_enabled = edit_log_enabled;
                     self.edit_encoding = edit_encoding;
                     self.edit_auto_login = edit_auto_login;
                     self.edit_keep_alive_type = edit_keep_alive_type;
@@ -10541,7 +10668,7 @@ mod remote_gui {
                             world.settings.user = self.edit_user.clone();
                             world.settings.password = self.edit_password.clone();
                             world.settings.use_ssl = self.edit_ssl;
-                            world.settings.log_file = self.edit_log_file.clone();
+                            world.settings.log_enabled = self.edit_log_enabled;
                             world.settings.encoding = self.edit_encoding.name().to_string();
                             world.settings.auto_login = self.edit_auto_login.name().to_string();
                             world.settings.keep_alive_type = self.edit_keep_alive_type.name().to_string();
@@ -12867,17 +12994,8 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                 // Skip auto-login for restored connections (only fresh connects should auto-login)
                 app.worlds[world_idx].skip_auto_login = true;
 
-                // Re-open log file if configured
-                if let Some(ref log_path) = app.worlds[world_idx].settings.log_file.clone() {
-                    if let Ok(file) = std::fs::OpenOptions::new()
-                        .create(true)
-                        .append(true)
-                        .open(log_path)
-                    {
-                        app.worlds[world_idx].log_handle =
-                            Some(std::sync::Arc::new(std::sync::Mutex::new(file)));
-                    }
-                }
+                // Re-open log file if enabled
+                app.worlds[world_idx].open_log_file();
 
                 // Clone tx for use in reader (for telnet responses)
                 let telnet_tx = cmd_tx;
@@ -13872,7 +13990,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                             app.worlds[world_index].command_tx = None;
                                             app.worlds[world_index].connected = false;
                                             app.worlds[world_index].socket_fd = None;
-                                            app.worlds[world_index].log_handle = None;
+                                            app.worlds[world_index].close_log_file();
                                             app.worlds[world_index].prompt.clear();
                                             app.ws_broadcast(WsMessage::ServerData {
                                                 world_index,
@@ -14103,7 +14221,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                     }
                                 }
                             }
-                            WsMessage::UpdateWorldSettings { world_index, name, hostname, port, user, password, use_ssl, log_file, encoding, auto_login, keep_alive_type, keep_alive_cmd } => {
+                            WsMessage::UpdateWorldSettings { world_index, name, hostname, port, user, password, use_ssl, log_enabled, encoding, auto_login, keep_alive_type, keep_alive_cmd } => {
                                 // Update world settings from remote client
                                 if world_index < app.worlds.len() {
                                     app.worlds[world_index].name = name.clone();
@@ -14112,7 +14230,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                     app.worlds[world_index].settings.user = user.clone();
                                     app.worlds[world_index].settings.password = password.clone();
                                     app.worlds[world_index].settings.use_ssl = use_ssl;
-                                    app.worlds[world_index].settings.log_file = if log_file.is_empty() { None } else { Some(log_file.clone()) };
+                                    app.worlds[world_index].settings.log_enabled = log_enabled;
                                     app.worlds[world_index].settings.encoding = match encoding.as_str() {
                                         "latin1" => Encoding::Latin1,
                                         "fansi" => Encoding::Fansi,
@@ -14130,7 +14248,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                         user,
                                         password: encrypt_password(&password),
                                         use_ssl,
-                                        log_file: if log_file.is_empty() { None } else { Some(log_file) },
+                                        log_enabled,
                                         encoding,
                                         auto_connect_type: auto_login,
                                         keep_alive_type,
@@ -14763,7 +14881,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                         app.worlds[world_index].command_tx = None;
                                         app.worlds[world_index].connected = false;
                                         app.worlds[world_index].socket_fd = None;
-                                        app.worlds[world_index].log_handle = None;
+                                        app.worlds[world_index].close_log_file();
                                         app.worlds[world_index].prompt.clear();
                                         app.ws_broadcast(WsMessage::ServerData {
                                             world_index,
@@ -14879,7 +14997,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                 app.ws_broadcast(WsMessage::WorldSwitched { new_index: world_index });
                             }
                         }
-                        WsMessage::UpdateWorldSettings { world_index, name, hostname, port, user, password, use_ssl, log_file, encoding, auto_login, keep_alive_type, keep_alive_cmd } => {
+                        WsMessage::UpdateWorldSettings { world_index, name, hostname, port, user, password, use_ssl, log_enabled, encoding, auto_login, keep_alive_type, keep_alive_cmd } => {
                             if world_index < app.worlds.len() {
                                 app.worlds[world_index].name = name.clone();
                                 app.worlds[world_index].settings.hostname = hostname.clone();
@@ -14887,7 +15005,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                 app.worlds[world_index].settings.user = user.clone();
                                 app.worlds[world_index].settings.password = password.clone();
                                 app.worlds[world_index].settings.use_ssl = use_ssl;
-                                app.worlds[world_index].settings.log_file = if log_file.is_empty() { None } else { Some(log_file.clone()) };
+                                app.worlds[world_index].settings.log_enabled = log_enabled;
                                 app.worlds[world_index].settings.encoding = match encoding.as_str() {
                                     "latin1" => Encoding::Latin1,
                                     "fansi" => Encoding::Fansi,
@@ -14901,7 +15019,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                     hostname, port, user,
                                     password: encrypt_password(&password),
                                     use_ssl,
-                                    log_file: if log_file.is_empty() { None } else { Some(log_file) },
+                                    log_enabled,
                                     encoding,
                                     auto_connect_type: auto_login,
                                     keep_alive_type,
@@ -17444,22 +17562,13 @@ async fn handle_command(cmd: &str, app: &mut App, event_tx: mpsc::Sender<AppEven
                     // Capture world name for the reader task (stable across world deletions)
                     let world_name = app.current_world().name.clone();
 
-                    // Open log file if configured
-                    let log_path = app.current_world().settings.log_file.clone();
-                    if let Some(log_path) = log_path {
-                        match std::fs::OpenOptions::new()
-                            .create(true)
-                            .append(true)
-                            .open(&log_path)
-                        {
-                            Ok(file) => {
-                                app.current_world_mut().log_handle =
-                                    Some(std::sync::Arc::new(std::sync::Mutex::new(file)));
-                                app.add_output(&format!("Logging to: {}", log_path));
-                            }
-                            Err(e) => {
-                                app.add_output(&format!("Warning: Could not open log file: {}", e));
-                            }
+                    // Open log file if enabled
+                    if app.current_world().settings.log_enabled {
+                        if app.current_world_mut().open_log_file() {
+                            let log_path = app.current_world().get_log_path();
+                            app.add_output(&format!("Logging to: {}", log_path.display()));
+                        } else {
+                            app.add_output("Warning: Could not open log file");
                         }
                     }
 
@@ -17613,7 +17722,7 @@ async fn handle_command(cmd: &str, app: &mut App, event_tx: mpsc::Sender<AppEven
                 app.current_world_mut().command_tx = None;
                 app.current_world_mut().connected = false;
                 app.current_world_mut().socket_fd = None;
-                app.current_world_mut().log_handle = None;
+                app.current_world_mut().close_log_file();
                 app.current_world_mut().prompt.clear();
                 app.add_output("Disconnected.");
             } else {
@@ -19033,7 +19142,7 @@ fn render_settings_popup(f: &mut Frame, app: &App) {
                 lines.push(render_text_field("User:", &popup.temp_user, SettingsField::User, w));
                 lines.push(render_text_field("Password:", &popup.temp_password, SettingsField::Password, w));
                 lines.push(render_toggle_field("Use SSL:", popup.temp_use_ssl, SettingsField::UseSsl, w));
-                lines.push(render_text_field("Log file:", &popup.temp_log_file, SettingsField::LogFile, w));
+                lines.push(render_toggle_field("Logging:", popup.temp_log_enabled, SettingsField::LogFile, w));
                 lines.push(Line::from(vec![
                     Span::styled(
                         format!("  {:<w$}", "Encoding:"),
@@ -19073,14 +19182,14 @@ fn render_settings_popup(f: &mut Frame, app: &App) {
                 lines.push(render_text_field("Token:", &popup.temp_slack_token, SettingsField::SlackToken, w));
                 lines.push(render_text_field("Channel:", &popup.temp_slack_channel, SettingsField::SlackChannel, w));
                 lines.push(render_text_field("Workspace:", &popup.temp_slack_workspace, SettingsField::SlackWorkspace, w));
-                lines.push(render_text_field("Log file:", &popup.temp_log_file, SettingsField::LogFile, w));
+                lines.push(render_toggle_field("Logging:", popup.temp_log_enabled, SettingsField::LogFile, w));
             }
             WorldType::Discord => {
                 lines.push(render_text_field("Token:", &popup.temp_discord_token, SettingsField::DiscordToken, w));
                 lines.push(render_text_field("Guild:", &popup.temp_discord_guild, SettingsField::DiscordGuild, w));
                 lines.push(render_text_field("Channel:", &popup.temp_discord_channel, SettingsField::DiscordChannel, w));
                 lines.push(render_text_field("DM User:", &popup.temp_discord_dm_user, SettingsField::DiscordDmUser, w));
-                lines.push(render_text_field("Log file:", &popup.temp_log_file, SettingsField::LogFile, w));
+                lines.push(render_toggle_field("Logging:", popup.temp_log_enabled, SettingsField::LogFile, w));
             }
         }
 
