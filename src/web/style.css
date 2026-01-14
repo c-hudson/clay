@@ -1032,6 +1032,17 @@ body {
     .world-selector-modal-content {
         min-width: 280px;
         max-width: 95%;
+        position: relative;
+    }
+
+    .world-selector-modal-content .modal-footer-left {
+        position: absolute;
+        top: 8px;
+        right: 12px;
+    }
+
+    .world-selector-modal-content .modal-footer-split {
+        justify-content: flex-end;
     }
 
     .mobile-only {
