@@ -305,7 +305,6 @@ impl WebSocketServer {
     /// Add a user for multiuser authentication
     pub fn add_user(&self, username: &str, password: &str) {
         let password_hash = hash_password(password);
-        eprintln!("WS DEBUG: Adding user '{}' with password_hash prefix '{}'", username, &password_hash[..16]);
         let mut users = self.users.write().unwrap();
         users.insert(username.to_string(), UserCredential { password_hash });
     }
@@ -525,12 +524,9 @@ pub async fn start_websocket_server(
                 result = listener.accept() => {
                     match result {
                         Ok((stream, client_addr)) => {
-                            eprintln!("WS DEBUG: TCP connection accepted from {}", client_addr);
-
                             // Check if IP is banned
                             let client_ip = client_addr.ip().to_string();
                             if ban_list.is_banned(&client_ip) {
-                                eprintln!("WS DEBUG: Connection banned from {}", client_addr);
                                 // Silently drop connection for banned IPs
                                 continue;
                             }
@@ -700,21 +696,15 @@ where
     // Reject connection if:
     // - Allow list is non-empty AND IP is not in list AND not whitelisted
     // (Empty allow list = allow everyone, they still need password to authenticate)
-    eprintln!("WS DEBUG: handle_ws_client from {}, allow_list_empty={}, in_allow_list={}, is_whitelisted={}", client_addr, allow_list_empty, in_allow_list, is_whitelisted);
     if !allow_list_empty && !in_allow_list && !is_whitelisted {
         let msg = format!("WS connection rejected from {} (not in allow list)", client_addr);
         let _ = event_tx.send(AppEvent::SystemMessage(msg)).await;
         return Ok(());
     }
 
-    eprintln!("WS DEBUG: Calling accept_async for {}", client_addr);
     let ws_stream = match accept_async(stream).await {
-        Ok(ws) => {
-            eprintln!("WS DEBUG: WebSocket handshake successful for {}", client_addr);
-            ws
-        }
+        Ok(ws) => ws,
         Err(e) => {
-            eprintln!("WS DEBUG: WebSocket handshake failed for {}: {}", client_addr, e);
             return Err(e.into());
         }
     };
@@ -773,16 +763,13 @@ where
                 if let Ok(ws_msg) = serde_json::from_str::<WsMessage>(&text) {
                     match &ws_msg {
                         WsMessage::AuthRequest { username, password_hash: client_hash } => {
-                            eprintln!("WS DEBUG: AuthRequest received from {}, username={:?}, multiuser_mode={}", client_addr, username, multiuser_mode);
                             // Verify credentials
                             let (auth_success, auth_error, auth_username) = if multiuser_mode {
                                 // Multiuser mode: require username and validate against users map
                                 match username {
                                     Some(uname) if !uname.is_empty() => {
                                         let users_guard = users.read().unwrap();
-                                        eprintln!("WS DEBUG: Looking up user '{}', users_count={}", uname, users_guard.len());
                                         if let Some(user_cred) = users_guard.get(uname) {
-                                            eprintln!("WS DEBUG: Found user '{}', stored_hash={}, client_hash={}", uname, &user_cred.password_hash[..16], &client_hash[..16]);
                                             if user_cred.password_hash == *client_hash {
                                                 (true, None, Some(uname.clone()))
                                             } else {
@@ -803,7 +790,6 @@ where
                                 }
                             };
 
-                            eprintln!("WS DEBUG: Auth result for {}: success={}, error={:?}, username={:?}", client_addr, auth_success, auth_error, auth_username);
                             if auth_success {
                                 // Mark as authenticated and set username
                                 let mut clients_guard = clients.write().await;
@@ -855,7 +841,6 @@ where
                                 let _ = event_tx.send(AppEvent::WsClientMessage(client_id, Box::new(ws_msg))).await;
                             } else {
                                 // Record violation - unauthenticated client trying to send non-auth messages
-                                eprintln!("WS DEBUG: Violation - unauthenticated client sent non-auth message from {}", client_ip);
                                 ban_list.record_violation(&client_ip);
                                 break; // Disconnect the client
                             }
@@ -863,13 +848,11 @@ where
                     }
                 } else {
                     // Invalid JSON - record violation
-                    eprintln!("WS DEBUG: Violation - invalid JSON from {}: {}", client_ip, &text[..text.len().min(100)]);
                     ban_list.record_violation(&client_ip);
                     break;
                 }
             }
             Ok(WsRawMessage::Close(_)) => {
-                eprintln!("WS DEBUG: Client {} sent close frame", client_ip);
                 break;
             }
             Ok(WsRawMessage::Ping(data)) => {
@@ -878,13 +861,11 @@ where
             }
             Ok(WsRawMessage::Binary(_)) => {
                 // Binary messages not supported - record violation
-                eprintln!("WS DEBUG: Violation - binary message from {}", client_ip);
                 ban_list.record_violation(&client_ip);
                 break;
             }
-            Err(e) => {
+            Err(_) => {
                 // Protocol error - record violation
-                eprintln!("WS DEBUG: Violation - protocol error from {}: {}", client_ip, e);
                 ban_list.record_violation(&client_ip);
                 break;
             }

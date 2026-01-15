@@ -22,19 +22,39 @@ A terminal-based MUD (Multi-User Dungeon) client built with Rust featuring multi
 
 ## Building
 
+### Linux
+
+Use the included build script to build with GUI and audio support:
+
+```bash
+./build.sh
+```
+
+This builds a release binary with `--features remote-gui-audio` and prompts for an install location (defaults to `$HOME`).
+
+**Manual build options:**
+
 ```bash
 # Standard build
 cargo build --release
 
-# Static binary (Linux, requires musl)
+# Static binary (requires musl)
 CC=musl-gcc cargo build --release --target x86_64-unknown-linux-musl --no-default-features --features rustls-backend
 
 # With remote GUI support (requires X11/Wayland)
 cargo build --release --features remote-gui
 
-# With remote GUI and ANSI music audio (requires libasound2-dev on Linux)
+# With remote GUI and ANSI music audio (requires libasound2-dev)
 cargo build --release --features remote-gui-audio
 ```
+
+### macOS
+
+*To be determined*
+
+### Windows
+
+*To be determined*
 
 ## Usage
 
