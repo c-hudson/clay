@@ -7,6 +7,12 @@ set -e
 echo "Building Clay MUD Client (release, GUI + audio)..."
 echo ""
 
+# Remove Cargo.lock to avoid version compatibility issues
+if [ -f "Cargo.lock" ]; then
+    echo "Removing Cargo.lock for compatibility..."
+    rm Cargo.lock
+fi
+
 # Build release with remote-gui-audio feature
 cargo build --release --features remote-gui-audio
 
