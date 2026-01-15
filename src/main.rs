@@ -3919,8 +3919,12 @@ impl World {
             let is_last = i == line_count - 1;
             let is_partial = is_last && !ends_with_newline;
 
-            // Filter out keep-alive idler message lines (don't show or log them)
-            if line.contains("###_idler_message_") && line.contains("_###") {
+            // Filter out keep-alive idler message lines (only for Custom/Generic keep-alive types)
+            let uses_idler_keepalive = matches!(
+                self.settings.keep_alive_type,
+                KeepAliveType::Custom | KeepAliveType::Generic
+            );
+            if uses_idler_keepalive && line.contains("###_idler_message_") && line.contains("_###") {
                 continue;
             }
 
@@ -15057,8 +15061,12 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                 let is_last = i == line_count - 1;
                                 let is_partial = is_last && !ends_with_newline;
 
-                                // Filter out keep-alive idler message lines
-                                if line.contains("###_idler_message_") && line.contains("_###") {
+                                // Filter out keep-alive idler message lines (only for Custom/Generic keep-alive types)
+                                let uses_idler_keepalive = matches!(
+                                    app.worlds[world_idx].settings.keep_alive_type,
+                                    KeepAliveType::Custom | KeepAliveType::Generic
+                                );
+                                if uses_idler_keepalive && line.contains("###_idler_message_") && line.contains("_###") {
                                     just_filtered_idler = true;
                                     continue;
                                 }
@@ -16095,8 +16103,12 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                             let is_last = i == line_count - 1;
                             let is_partial = is_last && !ends_with_newline;
 
-                            // Filter out keep-alive idler message lines
-                            if line.contains("###_idler_message_") && line.contains("_###") {
+                            // Filter out keep-alive idler message lines (only for Custom/Generic keep-alive types)
+                            let uses_idler_keepalive = matches!(
+                                app.worlds[world_idx].settings.keep_alive_type,
+                                KeepAliveType::Custom | KeepAliveType::Generic
+                            );
+                            if uses_idler_keepalive && line.contains("###_idler_message_") && line.contains("_###") {
                                 just_filtered_idler = true;
                                 continue;
                             }
