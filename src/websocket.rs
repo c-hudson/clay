@@ -8,7 +8,7 @@ use sha2::{Sha256, Digest};
 use tokio_tungstenite::{accept_async, tungstenite::Message as WsRawMessage};
 
 // Import AppEvent and Action from the main crate
-use crate::{AppEvent, Action};
+use crate::{AppEvent, Action, BanList};
 use crate::ansi_music::MusicNote;
 
 // ============================================================================
@@ -19,9 +19,40 @@ use crate::ansi_music::MusicNote;
 #[derive(Serialize, Deserialize, Clone, Debug)]
 #[serde(tag = "type")]
 pub enum WsMessage {
+    // Server hello (sent immediately on connection, before auth)
+    ServerHello {
+        multiuser_mode: bool,  // True if server requires username + password
+    },
+
     // Authentication
-    AuthRequest { password_hash: String },
-    AuthResponse { success: bool, error: Option<String> },
+    AuthRequest {
+        #[serde(default)]
+        username: Option<String>,  // Required in multiuser mode
+        password_hash: String,
+    },
+    AuthResponse {
+        success: bool,
+        error: Option<String>,
+        #[serde(default)]
+        username: Option<String>,  // Confirmed username on success (multiuser mode)
+        #[serde(default)]
+        multiuser_mode: bool,      // True if server is in multiuser mode
+    },
+
+    // Password change (multiuser mode)
+    ChangePassword {
+        old_password_hash: String,
+        new_password_hash: String,
+    },
+    PasswordChanged {
+        success: bool,
+        error: Option<String>,
+    },
+
+    // Logout (multiuser mode - client -> server)
+    Logout,
+    // Logout response (server -> client)
+    LoggedOut,
 
     // Initial state (server -> client after auth)
     InitialState {
@@ -29,6 +60,8 @@ pub enum WsMessage {
         settings: GlobalSettingsMsg,
         current_world_index: usize,
         actions: Vec<Action>,
+        #[serde(default)]
+        splash_lines: Vec<String>,
     },
 
     // Real-time updates (server -> client)
@@ -46,6 +79,8 @@ pub enum WsMessage {
     PendingReleased { world_index: usize, count: usize },
     UnseenCleared { world_index: usize },
     UnseenUpdate { world_index: usize, count: usize },
+    /// Clear all output for a world (from /flush command)
+    WorldFlushed { world_index: usize },
     /// Tell client to execute a command locally (for action commands like /worlds)
     ExecuteLocalCommand { command: String },
 
@@ -205,6 +240,14 @@ pub struct WsClientInfo {
     pub tx: mpsc::UnboundedSender<WsMessage>,
     /// Which world this client is currently viewing (for activity indicator)
     pub current_world: Option<usize>,
+    /// Username of the authenticated user (multiuser mode only)
+    pub username: Option<String>,
+}
+
+/// User credential for multiuser authentication
+#[derive(Clone, Debug)]
+pub struct UserCredential {
+    pub password_hash: String,
 }
 
 /// WebSocket server state
@@ -219,6 +262,12 @@ pub struct WebSocketServer {
     /// Single whitelisted host that can connect without password
     /// Set when a user authenticates from an allow-list host
     pub whitelisted_host: Arc<std::sync::RwLock<Option<String>>>,
+    /// True if server is running in multiuser mode
+    pub multiuser_mode: bool,
+    /// User credentials for multiuser mode (username -> password_hash)
+    pub users: Arc<std::sync::RwLock<HashMap<String, UserCredential>>>,
+    /// Ban list for security (shared with HTTP server)
+    pub ban_list: BanList,
     #[cfg(feature = "native-tls-backend")]
     pub tls_acceptor: Option<Arc<tokio_native_tls::TlsAcceptor>>,
     #[cfg(feature = "rustls-backend")]
@@ -226,7 +275,7 @@ pub struct WebSocketServer {
 }
 
 impl WebSocketServer {
-    pub fn new(password: &str, port: u16, allow_list: &str, whitelisted_host: Option<String>) -> Self {
+    pub fn new(password: &str, port: u16, allow_list: &str, whitelisted_host: Option<String>, multiuser_mode: bool, ban_list: BanList) -> Self {
         let password_hash = hash_password(password);
         // Parse allow list: comma-separated, trimmed entries
         let allow_list_vec: Vec<String> = allow_list
@@ -243,10 +292,92 @@ impl WebSocketServer {
             port,
             allow_list: Arc::new(std::sync::RwLock::new(allow_list_vec)),
             whitelisted_host: Arc::new(std::sync::RwLock::new(whitelisted_host)),
+            multiuser_mode,
+            users: Arc::new(std::sync::RwLock::new(HashMap::new())),
+            ban_list,
             #[cfg(feature = "native-tls-backend")]
             tls_acceptor: None,
             #[cfg(feature = "rustls-backend")]
             tls_acceptor: None,
+        }
+    }
+
+    /// Add a user for multiuser authentication
+    pub fn add_user(&self, username: &str, password: &str) {
+        let password_hash = hash_password(password);
+        eprintln!("WS DEBUG: Adding user '{}' with password_hash prefix '{}'", username, &password_hash[..16]);
+        let mut users = self.users.write().unwrap();
+        users.insert(username.to_string(), UserCredential { password_hash });
+    }
+
+    /// Set the username for a connected client
+    pub fn set_client_username(&self, client_id: u64, username: Option<String>) {
+        if let Ok(mut clients) = self.clients.try_write() {
+            if let Some(client) = clients.get_mut(&client_id) {
+                client.username = username;
+            }
+        }
+    }
+
+    /// Get the username of a connected client (multiuser mode)
+    pub fn get_client_username(&self, client_id: u64) -> Option<String> {
+        // Use try_read to avoid blocking in async context
+        if let Ok(clients) = self.clients.try_read() {
+            clients.get(&client_id).and_then(|c| c.username.clone())
+        } else {
+            None
+        }
+    }
+
+    /// Clear a client's authentication state (for logout)
+    pub fn clear_client_auth(&self, client_id: u64) {
+        if let Ok(mut clients) = self.clients.try_write() {
+            if let Some(client) = clients.get_mut(&client_id) {
+                client.authenticated = false;
+                client.username = None;
+            }
+        }
+    }
+
+    /// Broadcast a message to all clients owned by a specific user
+    pub fn broadcast_to_owner(&self, msg: WsMessage, owner: Option<&str>) {
+        // Use try_read to avoid blocking in async context
+        if let Ok(clients) = self.clients.try_read() {
+            for client in clients.values() {
+                if client.authenticated {
+                    // In multiuser mode, only send to clients with matching username
+                    if self.multiuser_mode {
+                        if client.username.as_deref() == owner {
+                            let _ = client.tx.send(msg.clone());
+                        }
+                    } else {
+                        // In single-user mode, broadcast to all authenticated clients
+                        let _ = client.tx.send(msg.clone());
+                    }
+                }
+            }
+        }
+    }
+
+    /// Broadcast a message to all authenticated clients (regardless of owner)
+    pub fn broadcast_to_all(&self, msg: WsMessage) {
+        // Use try_read to avoid blocking in async context
+        if let Ok(clients) = self.clients.try_read() {
+            for client in clients.values() {
+                if client.authenticated {
+                    let _ = client.tx.send(msg.clone());
+                }
+            }
+        }
+    }
+
+    /// Send a message to a specific client
+    pub fn send_to_client(&self, client_id: u64, msg: WsMessage) {
+        // Use try_read to avoid blocking in async context
+        if let Ok(clients) = self.clients.try_read() {
+            if let Some(client) = clients.get(&client_id) {
+                let _ = client.tx.send(msg);
+            }
         }
     }
 
@@ -378,6 +509,9 @@ pub async fn start_websocket_server(
     let allow_list = server.allow_list.clone();
     let whitelisted_host = server.whitelisted_host.clone();
     let running = Arc::clone(&server.running);
+    let multiuser_mode = server.multiuser_mode;
+    let users = server.users.clone();
+    let ban_list = server.ban_list.clone();
     #[cfg(feature = "native-tls-backend")]
     let tls_acceptor = server.tls_acceptor.clone();
     #[cfg(feature = "rustls-backend")]
@@ -391,6 +525,16 @@ pub async fn start_websocket_server(
                 result = listener.accept() => {
                     match result {
                         Ok((stream, client_addr)) => {
+                            eprintln!("WS DEBUG: TCP connection accepted from {}", client_addr);
+
+                            // Check if IP is banned
+                            let client_ip = client_addr.ip().to_string();
+                            if ban_list.is_banned(&client_ip) {
+                                eprintln!("WS DEBUG: Connection banned from {}", client_addr);
+                                // Silently drop connection for banned IPs
+                                continue;
+                            }
+
                             // Disable Nagle's algorithm for lower latency
                             let _ = stream.set_nodelay(true);
 
@@ -406,6 +550,9 @@ pub async fn start_websocket_server(
                             let allow_list = allow_list.clone();
                             let whitelisted_host = whitelisted_host.clone();
                             let event_tx = event_tx.clone();
+                            let multiuser_mode = multiuser_mode;
+                            let users = users.clone();
+                            let ban_list = ban_list.clone();
                             #[cfg(feature = "native-tls-backend")]
                             let tls_acceptor = tls_acceptor.clone();
                             #[cfg(feature = "rustls-backend")]
@@ -426,6 +573,9 @@ pub async fn start_websocket_server(
                                                 whitelisted_host,
                                                 client_addr,
                                                 event_tx,
+                                                multiuser_mode,
+                                                users,
+                                                ban_list,
                                             ).await {
                                                 // Connection error, client disconnected
                                             }
@@ -443,6 +593,9 @@ pub async fn start_websocket_server(
                                     whitelisted_host,
                                     client_addr,
                                     event_tx,
+                                    multiuser_mode,
+                                    users,
+                                    ban_list,
                                 ).await {
                                     // Connection error, client disconnected
                                 }
@@ -461,6 +614,9 @@ pub async fn start_websocket_server(
                                                 whitelisted_host,
                                                 client_addr,
                                                 event_tx,
+                                                multiuser_mode,
+                                                users,
+                                                ban_list,
                                             ).await {
                                                 // Connection error, client disconnected
                                             }
@@ -480,6 +636,9 @@ pub async fn start_websocket_server(
                                     whitelisted_host,
                                     client_addr,
                                     event_tx,
+                                    multiuser_mode,
+                                    users,
+                                    ban_list,
                                 ).await {
                                     // Connection error, client disconnected
                                 }
@@ -514,6 +673,9 @@ pub async fn handle_ws_client<S>(
     whitelisted_host: Arc<std::sync::RwLock<Option<String>>>,
     client_addr: std::net::SocketAddr,
     event_tx: mpsc::Sender<AppEvent>,
+    multiuser_mode: bool,
+    users: Arc<std::sync::RwLock<HashMap<String, UserCredential>>>,
+    ban_list: BanList,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
@@ -536,19 +698,33 @@ where
     };
 
     // Reject connection if:
-    // - Allow list is empty (no connections allowed), OR
-    // - Allow list is non-empty but IP is not in list and not whitelisted
-    if allow_list_empty || (!in_allow_list && !is_whitelisted) {
+    // - Allow list is non-empty AND IP is not in list AND not whitelisted
+    // (Empty allow list = allow everyone, they still need password to authenticate)
+    eprintln!("WS DEBUG: handle_ws_client from {}, allow_list_empty={}, in_allow_list={}, is_whitelisted={}", client_addr, allow_list_empty, in_allow_list, is_whitelisted);
+    if !allow_list_empty && !in_allow_list && !is_whitelisted {
         let msg = format!("WS connection rejected from {} (not in allow list)", client_addr);
         let _ = event_tx.send(AppEvent::SystemMessage(msg)).await;
         return Ok(());
     }
 
-    let ws_stream = accept_async(stream).await?;
+    eprintln!("WS DEBUG: Calling accept_async for {}", client_addr);
+    let ws_stream = match accept_async(stream).await {
+        Ok(ws) => {
+            eprintln!("WS DEBUG: WebSocket handshake successful for {}", client_addr);
+            ws
+        }
+        Err(e) => {
+            eprintln!("WS DEBUG: WebSocket handshake failed for {}: {}", client_addr, e);
+            return Err(e.into());
+        }
+    };
     let (mut ws_sink, mut ws_source) = ws_stream.split();
 
     // Create channel for sending messages to this client
     let (tx, mut rx) = mpsc::unbounded_channel::<WsMessage>();
+
+    // Send ServerHello immediately to tell client about multiuser mode
+    let _ = tx.send(WsMessage::ServerHello { multiuser_mode });
 
     // Add client to clients map (auto-authenticated if whitelisted)
     {
@@ -557,6 +733,7 @@ where
             authenticated: is_whitelisted,
             tx: tx.clone(),
             current_world: None,
+            username: None,
         });
     }
 
@@ -568,10 +745,12 @@ where
         let response = WsMessage::AuthResponse {
             success: true,
             error: None,
+            username: None,
+            multiuser_mode,
         };
         let _ = tx.send(response);
         // Create a fake AuthRequest to trigger initial state send
-        let _ = event_tx.send(AppEvent::WsClientMessage(client_id, Box::new(WsMessage::AuthRequest { password_hash: String::new() }))).await;
+        let _ = event_tx.send(AppEvent::WsClientMessage(client_id, Box::new(WsMessage::AuthRequest { username: None, password_hash: String::new() }))).await;
     }
 
     // Spawn task to send messages from rx to WebSocket
@@ -593,31 +772,68 @@ where
             Ok(WsRawMessage::Text(text)) => {
                 if let Ok(ws_msg) = serde_json::from_str::<WsMessage>(&text) {
                     match &ws_msg {
-                        WsMessage::AuthRequest { password_hash: client_hash } => {
-                            // Verify password
-                            let auth_success = *client_hash == password_hash;
+                        WsMessage::AuthRequest { username, password_hash: client_hash } => {
+                            eprintln!("WS DEBUG: AuthRequest received from {}, username={:?}, multiuser_mode={}", client_addr, username, multiuser_mode);
+                            // Verify credentials
+                            let (auth_success, auth_error, auth_username) = if multiuser_mode {
+                                // Multiuser mode: require username and validate against users map
+                                match username {
+                                    Some(uname) if !uname.is_empty() => {
+                                        let users_guard = users.read().unwrap();
+                                        eprintln!("WS DEBUG: Looking up user '{}', users_count={}", uname, users_guard.len());
+                                        if let Some(user_cred) = users_guard.get(uname) {
+                                            eprintln!("WS DEBUG: Found user '{}', stored_hash={}, client_hash={}", uname, &user_cred.password_hash[..16], &client_hash[..16]);
+                                            if user_cred.password_hash == *client_hash {
+                                                (true, None, Some(uname.clone()))
+                                            } else {
+                                                (false, Some("Invalid password".to_string()), None)
+                                            }
+                                        } else {
+                                            (false, Some("Unknown user".to_string()), None)
+                                        }
+                                    }
+                                    _ => (false, Some("Username required".to_string()), None),
+                                }
+                            } else {
+                                // Single-user mode: just validate password
+                                if *client_hash == password_hash {
+                                    (true, None, None)
+                                } else {
+                                    (false, Some("Invalid password".to_string()), None)
+                                }
+                            };
+
+                            eprintln!("WS DEBUG: Auth result for {}: success={}, error={:?}, username={:?}", client_addr, auth_success, auth_error, auth_username);
                             if auth_success {
-                                // Mark as authenticated
+                                // Mark as authenticated and set username
                                 let mut clients_guard = clients.write().await;
                                 if let Some(client) = clients_guard.get_mut(&client_id) {
                                     client.authenticated = true;
+                                    client.username = auth_username.clone();
                                 }
 
-                                // If client IP is in allow list, whitelist this host
+                                // If client IP is in allow list, whitelist this host (single-user mode only)
                                 // This clears any previously whitelisted host
-                                let in_allow_list = {
-                                    let allow_list_guard = allow_list.read().unwrap();
-                                    is_ip_in_allow_list(&client_ip, &allow_list_guard)
-                                };
-                                if in_allow_list {
-                                    let mut whitelist = whitelisted_host.write().unwrap();
-                                    *whitelist = Some(client_ip.clone());
+                                if !multiuser_mode {
+                                    let in_allow_list = {
+                                        let allow_list_guard = allow_list.read().unwrap();
+                                        is_ip_in_allow_list(&client_ip, &allow_list_guard)
+                                    };
+                                    if in_allow_list {
+                                        let mut whitelist = whitelisted_host.write().unwrap();
+                                        *whitelist = Some(client_ip.clone());
+                                    }
                                 }
+                            } else {
+                                // Record violation for failed auth attempt
+                                ban_list.record_violation(&client_ip);
                             }
                             // Send auth response
                             let response = WsMessage::AuthResponse {
                                 success: auth_success,
-                                error: if auth_success { None } else { Some("Invalid password".to_string()) },
+                                error: auth_error,
+                                username: auth_username,
+                                multiuser_mode,
                             };
                             let _ = tx.send(response);
 
@@ -637,19 +853,39 @@ where
                             };
                             if is_authed {
                                 let _ = event_tx.send(AppEvent::WsClientMessage(client_id, Box::new(ws_msg))).await;
+                            } else {
+                                // Record violation - unauthenticated client trying to send non-auth messages
+                                eprintln!("WS DEBUG: Violation - unauthenticated client sent non-auth message from {}", client_ip);
+                                ban_list.record_violation(&client_ip);
+                                break; // Disconnect the client
                             }
                         }
                     }
+                } else {
+                    // Invalid JSON - record violation
+                    eprintln!("WS DEBUG: Violation - invalid JSON from {}: {}", client_ip, &text[..text.len().min(100)]);
+                    ban_list.record_violation(&client_ip);
+                    break;
                 }
             }
             Ok(WsRawMessage::Close(_)) => {
+                eprintln!("WS DEBUG: Client {} sent close frame", client_ip);
                 break;
             }
             Ok(WsRawMessage::Ping(data)) => {
                 // Pong is handled automatically by tungstenite
                 let _ = data;
             }
-            Err(_) => {
+            Ok(WsRawMessage::Binary(_)) => {
+                // Binary messages not supported - record violation
+                eprintln!("WS DEBUG: Violation - binary message from {}", client_ip);
+                ban_list.record_violation(&client_ip);
+                break;
+            }
+            Err(e) => {
+                // Protocol error - record violation
+                eprintln!("WS DEBUG: Violation - protocol error from {}: {}", client_ip, e);
+                ban_list.record_violation(&client_ip);
                 break;
             }
             _ => {}

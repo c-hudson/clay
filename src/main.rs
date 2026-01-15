@@ -572,6 +572,12 @@ impl BanList {
     /// Record a violation for an IP address
     /// Returns true if the IP should be banned (5+ violations in 1 hour = permanent)
     pub fn record_violation(&self, ip: &str) -> bool {
+        // Never ban localhost during development
+        if ip == "127.0.0.1" || ip == "::1" || ip == "localhost" {
+            eprintln!("BAN DEBUG: Skipping ban for localhost ({})", ip);
+            return false;
+        }
+
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
@@ -588,16 +594,21 @@ impl BanList {
         ip_violations.push(now);
 
         let violation_count = ip_violations.len();
+        eprintln!("BAN DEBUG: Violation #{} for IP {}", violation_count, ip);
 
         if violation_count >= 5 {
             // Permanent ban
             self.permanent_bans.write().unwrap().insert(ip.to_string());
             violations.remove(ip); // Clear violations since permanently banned
+            eprintln!("BAN DEBUG: Permanent ban for IP {}", ip);
+            true
+        } else if violation_count >= 3 {
+            // Temporary ban (5 minutes) after 3+ violations
+            self.temp_bans.write().unwrap().insert(ip.to_string(), now + 300);
+            eprintln!("BAN DEBUG: Temporary ban (5 min) for IP {}", ip);
             true
         } else {
-            // Temporary ban (1 hour from now)
-            self.temp_bans.write().unwrap().insert(ip.to_string(), now + 3600);
-            true
+            false
         }
     }
 
@@ -4152,6 +4163,8 @@ struct App {
     users: Vec<User>,
     /// Ban list for HTTP/WebSocket security
     ban_list: BanList,
+    /// Per-user connections in multiuser mode: (world_index, username) -> UserConnection
+    user_connections: std::collections::HashMap<(usize, String), UserConnection>,
 }
 
 impl App {
@@ -4197,6 +4210,7 @@ impl App {
             multiuser_mode: false, // Set to true in main if started with --multiuser
             users: Vec::new(),
             ban_list: BanList::new(),
+            user_connections: std::collections::HashMap::new(),
         }
         // Note: No initial world created here - it will be created after load_settings()
         // if no worlds are configured
@@ -4589,6 +4603,7 @@ impl App {
             settings,
             current_world_index: self.current_world_index,
             actions: self.settings.actions.clone(),
+            splash_lines: Vec::new(),
         }
     }
 
@@ -4881,9 +4896,58 @@ pub enum AppEvent {
     WsClientConnected(u64),                    // client_id
     WsClientDisconnected(u64),                 // client_id
     WsClientMessage(u64, Box<WsMessage>),      // client_id, message
+    // Multiuser mode events (include username for per-user connection isolation)
+    ConnectWorldRequest(usize, String),  // world_index, requesting username
+    MultiuserServerData(usize, String, Vec<u8>),  // world_index, username, raw bytes
+    MultiuserDisconnected(usize, String),         // world_index, username
+    MultiuserTelnetDetected(usize, String),       // world_index, username
+    MultiuserPrompt(usize, String, Vec<u8>),      // world_index, username, prompt bytes
     // Slack/Discord events
     SlackMessage(String, String), // world_name, formatted message
     DiscordMessage(String, String), // world_name, formatted message
+}
+
+/// Per-user connection state for multiuser mode
+/// Each user has their own independent connection to each world
+#[derive(Clone)]
+pub struct UserConnection {
+    pub connected: bool,
+    pub command_tx: Option<mpsc::Sender<WriteCommand>>,
+    pub output_lines: Vec<OutputLine>,
+    pub pending_lines: Vec<OutputLine>,
+    pub scroll_offset: usize,
+    pub unseen_lines: usize,
+    pub paused: bool,
+    pub lines_since_pause: usize,
+    pub telnet_mode: bool,
+    pub prompt: String,
+    pub prompt_count: usize,
+    pub last_send_time: Option<std::time::Instant>,
+    pub last_receive_time: Option<std::time::Instant>,
+    pub partial_line: String,
+    pub partial_in_pending: bool,
+}
+
+impl UserConnection {
+    pub fn new() -> Self {
+        Self {
+            connected: false,
+            command_tx: None,
+            output_lines: Vec::new(),
+            pending_lines: Vec::new(),
+            scroll_offset: 0,
+            unseen_lines: 0,
+            paused: false,
+            lines_since_pause: 0,
+            telnet_mode: false,
+            prompt: String::new(),
+            prompt_count: 0,
+            last_send_time: None,
+            last_receive_time: None,
+            partial_line: String::new(),
+            partial_in_pending: false,
+        }
+    }
 }
 
 fn get_settings_path() -> PathBuf {
@@ -13770,9 +13834,43 @@ async fn run_multiuser_server() -> io::Result<()> {
     // Load multiuser settings from separate file
     let settings_path = get_multiuser_settings_path();
     if !settings_path.exists() {
-        eprintln!("Error: Multiuser settings file not found: {}", settings_path.display());
-        eprintln!("Create this file with [user:NAME] and [world:NAME:OWNER] sections.");
-        return Ok(());
+        println!("Multiuser settings file not found: {}", settings_path.display());
+        print!("Would you like to create a sample configuration? (y/n): ");
+        io::stdout().flush()?;
+
+        let mut input = String::new();
+        io::stdin().read_line(&mut input)?;
+
+        if input.trim().eq_ignore_ascii_case("y") || input.trim().eq_ignore_ascii_case("yes") {
+            // Create sample multiuser configuration
+            let sample_config = r#"[global]
+ws_enabled=true
+ws_port=9002
+http_enabled=true
+http_port=9000
+
+[user:star]
+password=xyzzy
+
+[world:ascii:star]
+world_type=mud
+hostname=teenymush.dynu.net
+port=4096
+use_ssl=false
+encoding=utf8
+auto_connect_type=Connect
+keep_alive_type=Generic
+"#;
+            std::fs::write(&settings_path, sample_config)?;
+            println!("Created sample configuration at: {}", settings_path.display());
+            println!("Default user: star, password: xyzzy");
+            println!("IMPORTANT: Change the user password before production use!");
+            println!();
+        } else {
+            println!("Multiuser mode requires a configuration file.");
+            println!("Create {} with [user:NAME] and [world:NAME:OWNER] sections.", settings_path.display());
+            return Ok(());
+        }
     }
 
     if let Err(e) = load_multiuser_settings(&mut app) {
@@ -13896,36 +13994,119 @@ async fn run_multiuser_server() -> io::Result<()> {
                     AppEvent::WsClientMessage(client_id, msg) => {
                         handle_multiuser_ws_message(&mut app, client_id, *msg, &event_tx).await;
                     }
-                    AppEvent::ServerData(world_name, data) => {
-                        // Find the world and add output
-                        if let Some(world) = app.worlds.iter_mut().find(|w| w.name == world_name) {
-                            let encoding = world.settings.encoding;
-                            let decoded = encoding.decode(&data);
-                            // Process telnet and add to output
-                            for line in decoded.lines() {
-                                world.output_lines.push(OutputLine::new(line.to_string()));
-                            }
-                            // Broadcast to WebSocket clients who own this world
-                            if let Some(ws) = &app.ws_server {
-                                let owner = world.owner.clone();
-                                ws.broadcast_to_owner(WsMessage::ServerData {
-                                    world_index: app.worlds.iter().position(|w| w.name == world_name).unwrap_or(0),
-                                    data: decoded,
-                                    is_viewed: false,
-                                    ts: current_timestamp_secs(),
-                                }, owner.as_deref());
+                    // Legacy events - not used in multiuser mode (we use Multiuser* variants)
+                    AppEvent::ServerData(_, _) => {}
+                    AppEvent::Disconnected(_) => {}
+                    AppEvent::ConnectWorldRequest(world_index, requesting_username) => {
+                        // Connect a world on behalf of a user (per-user isolated connection)
+                        let key = (world_index, requesting_username.clone());
+                        let already_connected = app.user_connections.get(&key).map(|c| c.connected).unwrap_or(false);
+
+                        if world_index < app.worlds.len() && !already_connected {
+                            let settings = app.worlds[world_index].settings.clone();
+                            let world_name = app.worlds[world_index].name.clone();
+
+                            // Create per-user connection
+                            if let Some(cmd_tx) = connect_multiuser_world(
+                                world_index,
+                                requesting_username.clone(),
+                                &settings,
+                                event_tx.clone(),
+                            ).await {
+                                // Store connection in user_connections
+                                let mut conn = UserConnection::new();
+                                conn.connected = true;
+                                conn.command_tx = Some(cmd_tx);
+                                conn.last_send_time = Some(std::time::Instant::now());
+                                conn.last_receive_time = Some(std::time::Instant::now());
+                                app.user_connections.insert(key, conn);
+
+                                // Send WorldConnected only to this user
+                                if let Some(ws) = &app.ws_server {
+                                    ws.broadcast_to_owner(
+                                        WsMessage::WorldConnected { world_index, name: world_name },
+                                        Some(&requesting_username)
+                                    );
+                                }
+                            } else {
+                                // Connection failed - send error to user
+                                if let Some(ws) = &app.ws_server {
+                                    ws.broadcast_to_owner(WsMessage::ServerData {
+                                        world_index,
+                                        data: format!("\x1b[31m%% Connection failed.\x1b[0m\n"),
+                                        is_viewed: true,
+                                        ts: current_timestamp_secs(),
+                                    }, Some(&requesting_username));
+                                }
                             }
                         }
                     }
-                    AppEvent::Disconnected(world_name) => {
-                        if let Some(world) = app.worlds.iter_mut().find(|w| w.name == world_name) {
-                            world.connected = false;
-                            world.command_tx = None;
-                            // Broadcast disconnect to owner
+                    AppEvent::MultiuserServerData(world_index, username, data) => {
+                        // Route server data to specific user's connection
+                        let key = (world_index, username.clone());
+                        if let Some(conn) = app.user_connections.get_mut(&key) {
+                            let encoding = if world_index < app.worlds.len() {
+                                app.worlds[world_index].settings.encoding
+                            } else {
+                                Encoding::Utf8
+                            };
+                            let decoded = encoding.decode(&data);
+
+                            // Add to user's output buffer
+                            for line in decoded.lines() {
+                                conn.output_lines.push(OutputLine::new(line.to_string()));
+                            }
+
+                            // Send to this user's WebSocket clients only
                             if let Some(ws) = &app.ws_server {
-                                let owner = world.owner.clone();
-                                let world_idx = app.worlds.iter().position(|w| w.name == world_name).unwrap_or(0);
-                                ws.broadcast_to_owner(WsMessage::WorldDisconnected { world_index: world_idx }, owner.as_deref());
+                                ws.broadcast_to_owner(WsMessage::ServerData {
+                                    world_index,
+                                    data: decoded,
+                                    is_viewed: true,
+                                    ts: current_timestamp_secs(),
+                                }, Some(&username));
+                            }
+                        }
+                    }
+                    AppEvent::MultiuserDisconnected(world_index, username) => {
+                        // Handle disconnect for specific user's connection
+                        let key = (world_index, username.clone());
+                        if let Some(conn) = app.user_connections.get_mut(&key) {
+                            conn.connected = false;
+                            conn.command_tx = None;
+
+                            // Send disconnect to this user only
+                            if let Some(ws) = &app.ws_server {
+                                ws.broadcast_to_owner(
+                                    WsMessage::WorldDisconnected { world_index },
+                                    Some(&username)
+                                );
+                            }
+                        }
+                    }
+                    AppEvent::MultiuserTelnetDetected(world_index, username) => {
+                        let key = (world_index, username.clone());
+                        if let Some(conn) = app.user_connections.get_mut(&key) {
+                            conn.telnet_mode = true;
+                        }
+                    }
+                    AppEvent::MultiuserPrompt(world_index, username, prompt_bytes) => {
+                        let key = (world_index, username.clone());
+                        if let Some(conn) = app.user_connections.get_mut(&key) {
+                            let encoding = if world_index < app.worlds.len() {
+                                app.worlds[world_index].settings.encoding
+                            } else {
+                                Encoding::Utf8
+                            };
+                            let prompt_text = encoding.decode(&prompt_bytes);
+                            conn.prompt = prompt_text.trim_end().to_string() + " ";
+
+                            // Send prompt update to this user
+                            if let Some(ws) = &app.ws_server {
+                                ws.broadcast_to_owner(WsMessage::PromptUpdate {
+                                    world_index,
+                                    prompt: conn.prompt.clone(),
+                                }, Some(&username));
                             }
                         }
                     }
@@ -13942,21 +14123,250 @@ async fn run_multiuser_server() -> io::Result<()> {
     Ok(())
 }
 
-/// Build initial state message filtered for a specific user (multiuser mode)
+/// Connect to a world for a specific user in multiuser mode
+/// Returns the command sender if successful
+async fn connect_multiuser_world(
+    world_index: usize,
+    username: String,
+    settings: &WorldSettings,
+    event_tx: mpsc::Sender<AppEvent>,
+) -> Option<mpsc::Sender<WriteCommand>> {
+    use tokio::net::TcpStream;
+    use tokio::io::AsyncReadExt;
+    use bytes::BytesMut;
+
+    let host = &settings.hostname;
+    let port = &settings.port;
+    let use_ssl = settings.use_ssl;
+
+    if host.is_empty() || port.is_empty() {
+        return None;
+    }
+
+    match TcpStream::connect(format!("{}:{}", host, port)).await {
+        Ok(tcp_stream) => {
+            let _ = tcp_stream.set_nodelay(true);
+
+            // Handle SSL if needed
+            let (mut read_half, mut write_half): (StreamReader, StreamWriter) = if use_ssl {
+                #[cfg(feature = "native-tls-backend")]
+                {
+                    let connector = match native_tls::TlsConnector::builder()
+                        .danger_accept_invalid_certs(true)
+                        .build()
+                    {
+                        Ok(c) => c,
+                        Err(_) => return None,
+                    };
+                    let connector = tokio_native_tls::TlsConnector::from(connector);
+
+                    match connector.connect(host, tcp_stream).await {
+                        Ok(tls_stream) => {
+                            let (r, w) = tokio::io::split(tls_stream);
+                            (StreamReader::Tls(r), StreamWriter::Tls(w))
+                        }
+                        Err(_) => return None,
+                    }
+                }
+
+                #[cfg(feature = "rustls-backend")]
+                {
+                    use std::sync::Arc;
+                    use rustls::RootCertStore;
+                    use tokio_rustls::TlsConnector;
+                    use rustls::pki_types::ServerName;
+
+                    let mut root_store = RootCertStore::empty();
+                    root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+
+                    let config = rustls::ClientConfig::builder()
+                        .dangerous()
+                        .with_custom_certificate_verifier(Arc::new(danger::NoCertificateVerification::new()))
+                        .with_no_client_auth();
+
+                    let connector = TlsConnector::from(Arc::new(config));
+                    let server_name = match ServerName::try_from(host.clone()) {
+                        Ok(sn) => sn,
+                        Err(_) => return None,
+                    };
+
+                    match connector.connect(server_name, tcp_stream).await {
+                        Ok(tls_stream) => {
+                            let (r, w) = tokio::io::split(tls_stream);
+                            (StreamReader::Tls(r), StreamWriter::Tls(w))
+                        }
+                        Err(_) => return None,
+                    }
+                }
+
+                #[cfg(not(any(feature = "native-tls-backend", feature = "rustls-backend")))]
+                {
+                    return None;
+                }
+            } else {
+                let (r, w) = tcp_stream.into_split();
+                (StreamReader::Plain(r), StreamWriter::Plain(w))
+            };
+
+            let (cmd_tx, mut cmd_rx) = mpsc::channel::<WriteCommand>(100);
+
+            // Send auto-login if configured
+            let user = settings.user.clone();
+            let password = settings.password.clone();
+            let auto_connect_type = settings.auto_connect_type;
+            if !user.is_empty() && auto_connect_type == AutoConnectType::Connect {
+                let tx = cmd_tx.clone();
+                tokio::spawn(async move {
+                    tokio::time::sleep(Duration::from_millis(500)).await;
+                    let connect_cmd = format!("connect {} {}", user, password);
+                    let _ = tx.send(WriteCommand::Text(connect_cmd)).await;
+                });
+            }
+
+            // Clone for reader task
+            let telnet_tx = cmd_tx.clone();
+            let event_tx_read = event_tx.clone();
+            let username_read = username.clone();
+
+            // Spawn reader task
+            tokio::spawn(async move {
+                let mut buffer = BytesMut::with_capacity(4096);
+                buffer.resize(4096, 0);
+                let mut line_buffer: Vec<u8> = Vec::new();
+
+                loop {
+                    match read_half.read(&mut buffer).await {
+                        Ok(0) => {
+                            // Connection closed
+                            if !line_buffer.is_empty() {
+                                let (cleaned, responses, detected, prompt, _wont_echo) = process_telnet(&line_buffer);
+                                if !responses.is_empty() {
+                                    let _ = telnet_tx.send(WriteCommand::Raw(responses)).await;
+                                }
+                                if detected {
+                                    let _ = event_tx_read.send(AppEvent::MultiuserTelnetDetected(world_index, username_read.clone())).await;
+                                }
+                                if let Some(prompt_bytes) = prompt {
+                                    let _ = event_tx_read.send(AppEvent::MultiuserPrompt(world_index, username_read.clone(), prompt_bytes)).await;
+                                }
+                                if !cleaned.is_empty() {
+                                    let _ = event_tx_read.send(AppEvent::MultiuserServerData(world_index, username_read.clone(), cleaned)).await;
+                                }
+                            }
+                            let _ = event_tx_read.send(AppEvent::MultiuserServerData(
+                                world_index,
+                                username_read.clone(),
+                                "Connection closed by server.".as_bytes().to_vec(),
+                            )).await;
+                            let _ = event_tx_read.send(AppEvent::MultiuserDisconnected(world_index, username_read.clone())).await;
+                            break;
+                        }
+                        Ok(n) => {
+                            line_buffer.extend_from_slice(&buffer[..n]);
+                            let split_at = find_safe_split_point(&line_buffer);
+                            let to_send = if split_at > 0 {
+                                line_buffer.drain(..split_at).collect()
+                            } else if !line_buffer.is_empty() {
+                                std::mem::take(&mut line_buffer)
+                            } else {
+                                Vec::new()
+                            };
+
+                            if !to_send.is_empty() {
+                                let (cleaned, responses, detected, prompt, _wont_echo) = process_telnet(&to_send);
+                                if !responses.is_empty() {
+                                    let _ = telnet_tx.send(WriteCommand::Raw(responses)).await;
+                                }
+                                if detected {
+                                    let _ = event_tx_read.send(AppEvent::MultiuserTelnetDetected(world_index, username_read.clone())).await;
+                                }
+                                if let Some(prompt_bytes) = prompt {
+                                    let _ = event_tx_read.send(AppEvent::MultiuserPrompt(world_index, username_read.clone(), prompt_bytes)).await;
+                                }
+                                if !cleaned.is_empty() {
+                                    let _ = event_tx_read.send(AppEvent::MultiuserServerData(world_index, username_read.clone(), cleaned)).await;
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            let msg = format!("Read error: {}", e);
+                            let _ = event_tx_read.send(AppEvent::MultiuserServerData(world_index, username_read.clone(), msg.into_bytes())).await;
+                            let _ = event_tx_read.send(AppEvent::MultiuserDisconnected(world_index, username_read.clone())).await;
+                            break;
+                        }
+                    }
+                }
+            });
+
+            // Spawn writer task
+            tokio::spawn(async move {
+                use tokio::io::AsyncWriteExt;
+                while let Some(cmd) = cmd_rx.recv().await {
+                    match cmd {
+                        WriteCommand::Text(text) => {
+                            let bytes = format!("{}\r\n", text).into_bytes();
+                            if write_half.write_all(&bytes).await.is_err() {
+                                break;
+                            }
+                            let _ = write_half.flush().await;
+                        }
+                        WriteCommand::Raw(raw) => {
+                            if write_half.write_all(&raw).await.is_err() {
+                                break;
+                            }
+                            let _ = write_half.flush().await;
+                        }
+                        WriteCommand::Shutdown => {
+                            // Gracefully shutdown the connection
+                            let _ = write_half.shutdown().await;
+                            break;
+                        }
+                    }
+                }
+            });
+
+            Some(cmd_tx)
+        }
+        Err(_) => None,
+    }
+}
+
+/// Build initial state message for a specific user (multiuser mode)
+/// World definitions are shared, but connection state is per-user
+/// Actions are still filtered per-user
 fn build_multiuser_initial_state(app: &App, username: &str) -> WsMessage {
-    // Filter worlds owned by this user and create WorldStateMsg for each
+    // Show all worlds with per-user connection state
     let worlds: Vec<WorldStateMsg> = app.worlds.iter().enumerate()
-        .filter(|(_, world)| world.owner.as_deref() == Some(username))
         .map(|(idx, world)| {
-            // Strip carriage returns from output/pending lines for web clients
-            let clean_output: Vec<String> = world.output_lines.iter()
+            // Get user's connection state for this world (if any)
+            let key = (idx, username.to_string());
+            let user_conn = app.user_connections.get(&key);
+
+            // Use user's connection state or empty defaults
+            let (connected, output_lines, pending_lines, prompt, scroll_offset, paused, unseen_lines, last_send, last_recv) =
+                if let Some(conn) = user_conn {
+                    (
+                        conn.connected,
+                        &conn.output_lines,
+                        &conn.pending_lines,
+                        conn.prompt.clone(),
+                        conn.scroll_offset,
+                        conn.paused,
+                        conn.unseen_lines,
+                        conn.last_send_time,
+                        conn.last_receive_time,
+                    )
+                } else {
+                    (false, &vec![] as &Vec<OutputLine>, &vec![] as &Vec<OutputLine>, String::new(), 0, false, 0, None, None)
+                };
+
+            let clean_output: Vec<String> = output_lines.iter()
                 .map(|s| s.text.replace('\r', ""))
                 .collect();
-            let clean_pending: Vec<String> = world.pending_lines.iter()
+            let clean_pending: Vec<String> = pending_lines.iter()
                 .map(|s| s.text.replace('\r', ""))
                 .collect();
-            // Create timestamped versions
-            let output_lines_ts: Vec<TimestampedLine> = world.output_lines.iter()
+            let output_lines_ts: Vec<TimestampedLine> = output_lines.iter()
                 .map(|s| {
                     let text = s.text.replace('\r', "");
                     let text = if !s.from_server {
@@ -13970,7 +14380,7 @@ fn build_multiuser_initial_state(app: &App, username: &str) -> WsMessage {
                     }
                 })
                 .collect();
-            let pending_lines_ts: Vec<TimestampedLine> = world.pending_lines.iter()
+            let pending_lines_ts: Vec<TimestampedLine> = pending_lines.iter()
                 .map(|s| {
                     let text = s.text.replace('\r', "");
                     let text = if !s.from_server {
@@ -13984,18 +14394,19 @@ fn build_multiuser_initial_state(app: &App, username: &str) -> WsMessage {
                     }
                 })
                 .collect();
+
             WorldStateMsg {
                 index: idx,
                 name: world.name.clone(),
-                connected: world.connected,
+                connected,
                 output_lines: clean_output,
                 pending_lines: clean_pending,
                 output_lines_ts,
                 pending_lines_ts,
-                prompt: world.prompt.replace('\r', ""),
-                scroll_offset: world.scroll_offset,
-                paused: world.paused,
-                unseen_lines: world.unseen_lines,
+                prompt: prompt.replace('\r', ""),
+                scroll_offset,
+                paused,
+                unseen_lines,
                 settings: WorldSettingsMsg {
                     hostname: world.settings.hostname.clone(),
                     port: world.settings.port.clone(),
@@ -14008,9 +14419,9 @@ fn build_multiuser_initial_state(app: &App, username: &str) -> WsMessage {
                     keep_alive_type: world.settings.keep_alive_type.name().to_string(),
                     keep_alive_cmd: world.settings.keep_alive_cmd.clone(),
                 },
-                last_send_secs: world.last_send_time.map(|t| t.elapsed().as_secs()),
-                last_recv_secs: world.last_receive_time.map(|t| t.elapsed().as_secs()),
-                last_nop_secs: world.last_nop_time.map(|t| t.elapsed().as_secs()),
+                last_send_secs: last_send.map(|t| t.elapsed().as_secs()),
+                last_recv_secs: last_recv.map(|t| t.elapsed().as_secs()),
+                last_nop_secs: None,
                 keep_alive_type: world.settings.keep_alive_type.name().to_string(),
             }
         }).collect();
@@ -14045,17 +14456,42 @@ fn build_multiuser_initial_state(app: &App, username: &str) -> WsMessage {
         ws_key_file: app.settings.websocket_key_file.clone(),
     };
 
-    // Find current world index for this user (first owned world, or 0)
-    let current_world_index = app.worlds.iter()
-        .position(|w| w.owner.as_deref() == Some(username))
-        .unwrap_or(0);
+    // Find current world index for this user
+    // Use the first world they have a connection to, or 9999 if none (no world selected)
+    let current_world_index = app.user_connections.keys()
+        .filter(|(_, u)| u == username)
+        .map(|(idx, _)| *idx)
+        .min()
+        .unwrap_or(9999);
+
+    // Generate splash lines for multiuser mode
+    let splash_lines = generate_splash_strings();
 
     WsMessage::InitialState {
         worlds,
         settings,
         current_world_index,
         actions,
+        splash_lines,
     }
+}
+
+/// Generate splash screen content as strings (for web client)
+fn generate_splash_strings() -> Vec<String> {
+    vec![
+        "".to_string(),
+        "\x1b[38;5;180m          (\\/\\__o     \x1b[38;5;209m ██████╗██╗      █████╗ ██╗   ██╗\x1b[0m".to_string(),
+        "\x1b[38;5;180m  __      `-/ `_/     \x1b[38;5;208m██╔════╝██║     ██╔══██╗╚██╗ ██╔╝\x1b[0m".to_string(),
+        "\x1b[38;5;180m `--\\______/  |       \x1b[38;5;215m██║     ██║     ███████║ ╚████╔╝ \x1b[0m".to_string(),
+        "\x1b[38;5;180m    /        /        \x1b[38;5;216m██║     ██║     ██╔══██║  ╚██╔╝  \x1b[0m".to_string(),
+        "\x1b[38;5;180m -`/_------'\\_.       \x1b[38;5;217m╚██████╗███████╗██║  ██║   ██║   \x1b[0m".to_string(),
+        "\x1b[38;5;218m                       ╚═════╝╚══════╝╚═╝  ╚═╝   ╚═╝   \x1b[0m".to_string(),
+        "".to_string(),
+        "\x1b[38;5;213m✨ A 90dies mud client written today ✨\x1b[0m".to_string(),
+        "".to_string(),
+        "\x1b[38;5;244mSelect a world to connect\x1b[0m".to_string(),
+        "".to_string(),
+    ]
 }
 
 /// Handle WebSocket message in multiuser mode
@@ -14063,7 +14499,7 @@ async fn handle_multiuser_ws_message(
     app: &mut App,
     client_id: u64,
     msg: WsMessage,
-    _event_tx: &mpsc::Sender<AppEvent>,
+    event_tx: &mpsc::Sender<AppEvent>,
 ) {
     // Get the username for this client
     let username = if let Some(ws) = &app.ws_server {
@@ -14083,29 +14519,38 @@ async fn handle_multiuser_ws_message(
             }
         }
         WsMessage::SendCommand { world_index, command } => {
-            // Verify the client owns this world
-            if let Some(world) = app.worlds.get_mut(world_index) {
-                if world.owner.as_ref() == username.as_ref() {
-                    if let Some(tx) = &world.command_tx {
+            // Send command to user's own connection
+            if let Some(ref uname) = username {
+                let key = (world_index, uname.clone());
+                if let Some(conn) = app.user_connections.get(&key) {
+                    if let Some(tx) = &conn.command_tx {
                         let _ = tx.send(WriteCommand::Text(command)).await;
                     }
                 }
             }
         }
         WsMessage::ConnectWorld { world_index } => {
-            // Verify the client owns this world
-            if let Some(world) = app.worlds.get(world_index) {
-                if world.owner.as_ref() == username.as_ref() {
-                    // TODO: Connect the world
+            // Any user can connect to any world
+            if world_index < app.worlds.len() {
+                if let Some(ref uname) = username {
+                    let _ = event_tx.send(AppEvent::ConnectWorldRequest(world_index, uname.clone())).await;
                 }
             }
         }
         WsMessage::DisconnectWorld { world_index } => {
-            // Verify the client owns this world
-            if let Some(world) = app.worlds.get_mut(world_index) {
-                if world.owner.as_ref() == username.as_ref() {
-                    world.command_tx = None;
-                    world.connected = false;
+            // Disconnect user's own connection
+            if let Some(ref uname) = username {
+                let key = (world_index, uname.clone());
+                if let Some(conn) = app.user_connections.get_mut(&key) {
+                    conn.command_tx = None;
+                    conn.connected = false;
+                    // Notify the user
+                    if let Some(ws) = &app.ws_server {
+                        ws.broadcast_to_owner(
+                            WsMessage::WorldDisconnected { world_index },
+                            Some(uname)
+                        );
+                    }
                 }
             }
         }
@@ -14137,6 +14582,36 @@ async fn handle_multiuser_ws_message(
                             });
                         }
                     }
+                }
+            }
+        }
+        WsMessage::Logout => {
+            if let Some(ref uname) = username {
+                // Close all connections for this user
+                let keys_to_remove: Vec<_> = app.user_connections.keys()
+                    .filter(|(_, u)| u == uname)
+                    .cloned()
+                    .collect();
+
+                for key in &keys_to_remove {
+                    // Send shutdown command to gracefully close the TCP connection
+                    if let Some(conn) = app.user_connections.get(key) {
+                        if let Some(tx) = &conn.command_tx {
+                            let _ = tx.try_send(WriteCommand::Shutdown);
+                        }
+                    }
+                }
+
+                for key in keys_to_remove {
+                    // Remove the connection entry
+                    app.user_connections.remove(&key);
+                }
+
+                // Clear the client's authentication state
+                if let Some(ws) = &app.ws_server {
+                    ws.clear_client_auth(client_id);
+                    // Send LoggedOut response
+                    ws.send_to_client(client_id, WsMessage::LoggedOut);
                 }
             }
         }
@@ -14525,13 +15000,24 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
 
                 // Spawn writer task
                 tokio::spawn(async move {
+                    use tokio::io::AsyncWriteExt;
                     while let Some(cmd) = cmd_rx.recv().await {
-                        let bytes = match cmd {
-                            WriteCommand::Text(text) => format!("{}\r\n", text).into_bytes(),
-                            WriteCommand::Raw(raw) => raw,
-                        };
-                        if write_half.write_all(&bytes).await.is_err() {
-                            break;
+                        match cmd {
+                            WriteCommand::Text(text) => {
+                                let bytes = format!("{}\r\n", text).into_bytes();
+                                if write_half.write_all(&bytes).await.is_err() {
+                                    break;
+                                }
+                            }
+                            WriteCommand::Raw(raw) => {
+                                if write_half.write_all(&raw).await.is_err() {
+                                    break;
+                                }
+                            }
+                            WriteCommand::Shutdown => {
+                                let _ = write_half.shutdown().await;
+                                break;
+                            }
                         }
                     }
                 });
@@ -15281,6 +15767,12 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                         // Display system message in current world's output
                         app.add_output(&message);
                     }
+                    // Multiuser events are only used in multiuser mode, ignore in normal mode
+                    AppEvent::ConnectWorldRequest(_, _) => {}
+                    AppEvent::MultiuserServerData(_, _, _) => {}
+                    AppEvent::MultiuserDisconnected(_, _) => {}
+                    AppEvent::MultiuserTelnetDetected(_, _) => {}
+                    AppEvent::MultiuserPrompt(_, _, _) => {}
                     // Slack/Discord events
                     AppEvent::SlackMessage(ref world_name, message) | AppEvent::DiscordMessage(ref world_name, message) => {
                         if let Some(world_idx) = app.find_world_index(world_name) {
@@ -16305,6 +16797,12 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                     // Display system message in current world's output
                     app.add_output(&message);
                 }
+                // Multiuser events are only used in multiuser mode, ignore in normal mode
+                AppEvent::ConnectWorldRequest(_, _) => {}
+                AppEvent::MultiuserServerData(_, _, _) => {}
+                AppEvent::MultiuserDisconnected(_, _) => {}
+                AppEvent::MultiuserTelnetDetected(_, _) => {}
+                AppEvent::MultiuserPrompt(_, _, _) => {}
                 // Slack/Discord events
                 AppEvent::SlackMessage(ref world_name, message) | AppEvent::DiscordMessage(ref world_name, message) => {
                     if let Some(world_idx) = app.find_world_index(world_name) {
@@ -18568,6 +19066,7 @@ async fn connect_slack(app: &mut App, event_tx: mpsc::Sender<AppEvent>) -> bool 
             let text = match cmd {
                 WriteCommand::Text(t) => t,
                 WriteCommand::Raw(r) => String::from_utf8_lossy(&r).to_string(),
+                WriteCommand::Shutdown => break,
             };
             // Send message via chat.postMessage API
             let _ = client
@@ -18892,6 +19391,7 @@ async fn connect_discord(app: &mut App, event_tx: mpsc::Sender<AppEvent>) -> boo
             let text = match cmd {
                 WriteCommand::Text(t) => t,
                 WriteCommand::Raw(r) => String::from_utf8_lossy(&r).to_string(),
+                WriteCommand::Shutdown => break,
             };
             if channel_for_writer.is_empty() {
                 let _ = event_tx_for_writer.send(AppEvent::DiscordMessage(world_name_for_writer.clone(), "Error: No channel configured".to_string())).await;
@@ -19358,13 +19858,24 @@ async fn handle_command(cmd: &str, app: &mut App, event_tx: mpsc::Sender<AppEven
                     });
 
                     tokio::spawn(async move {
+                        use tokio::io::AsyncWriteExt;
                         while let Some(cmd) = cmd_rx.recv().await {
-                            let bytes = match cmd {
-                                WriteCommand::Text(text) => format!("{}\r\n", text).into_bytes(),
-                                WriteCommand::Raw(raw) => raw,
-                            };
-                            if write_half.write_all(&bytes).await.is_err() {
-                                break;
+                            match cmd {
+                                WriteCommand::Text(text) => {
+                                    let bytes = format!("{}\r\n", text).into_bytes();
+                                    if write_half.write_all(&bytes).await.is_err() {
+                                        break;
+                                    }
+                                }
+                                WriteCommand::Raw(raw) => {
+                                    if write_half.write_all(&raw).await.is_err() {
+                                        break;
+                                    }
+                                }
+                                WriteCommand::Shutdown => {
+                                    let _ = write_half.shutdown().await;
+                                    break;
+                                }
                             }
                         }
                     });

@@ -21,7 +21,10 @@
                     <div class="dropdown-item" data-action="toggle-highlight">Toggle Highlight</div>
                     <div class="dropdown-item" data-action="toggle-tags">Toggle Tags</div>
                     <div class="dropdown-divider"></div>
+                    <div class="dropdown-item menu-change-password" data-action="change-password" style="display: none;">Change Password</div>
                     <div class="dropdown-item" data-action="resync">Resync</div>
+                    <div class="dropdown-divider menu-logout-divider" style="display: none;"></div>
+                    <div class="dropdown-item menu-logout" data-action="logout" style="display: none;">Logout</div>
                 </div>
                 <span id="toolbar-title">Clay MUD Client</span>
             </div>
@@ -53,7 +56,10 @@
                     <div class="dropdown-item" data-action="toggle-highlight">Toggle Highlight</div>
                     <div class="dropdown-item" data-action="toggle-tags">Toggle Tags</div>
                     <div class="dropdown-divider"></div>
+                    <div class="dropdown-item menu-change-password" data-action="change-password" style="display: none;">Change Password</div>
                     <div class="dropdown-item" data-action="resync">Resync</div>
+                    <div class="dropdown-divider menu-logout-divider" style="display: none;"></div>
+                    <div class="dropdown-item menu-logout" data-action="logout" style="display: none;">Logout</div>
                 </div>
                 <button id="mobile-pgup-btn" class="mobile-btn" title="Page Up">PgUp</button>
                 <button id="mobile-pgdn-btn" class="mobile-btn" title="Page Down">PgDn</button>
@@ -71,13 +77,7 @@
         </div>
 
         <!-- Separator bar (like console) -->
-        <div id="status-bar">
-            <span id="status-indicator">___________</span>
-            <span id="world-name"></span>
-            <span id="activity-indicator"></span>
-            <span id="separator-fill"></span>
-            <span id="status-time"></span>
-        </div>
+        <div id="status-bar"><span id="status-indicator">___________</span><span id="world-name"></span><span id="activity-indicator"></span><span id="separator-fill"></span><span id="status-time"></span></div>
 
         <!-- Input area -->
         <div id="input-container">
@@ -90,8 +90,11 @@
         <div id="auth-modal" class="modal">
             <div class="modal-content">
                 <h2>Authentication Required</h2>
-                <p>Enter the WebSocket password to connect:</p>
-                <input type="password" id="auth-password" autocomplete="off">
+                <p id="auth-prompt">Enter the WebSocket password to connect:</p>
+                <div id="auth-username-row" style="display: none;">
+                    <input type="text" id="auth-username" placeholder="Username" autocomplete="off">
+                </div>
+                <input type="password" id="auth-password" placeholder="Password" autocomplete="off">
                 <div id="auth-error" class="error"></div>
                 <button id="auth-submit">Connect</button>
             </div>
@@ -105,12 +108,40 @@
             </div>
         </div>
 
+        <!-- Connection error modal -->
+        <div id="connection-error-modal" class="modal">
+            <div class="modal-content">
+                <h2>Connection Failed</h2>
+                <p id="connection-error-text">Unable to connect to the server after multiple attempts.</p>
+                <div class="modal-buttons">
+                    <button id="connection-retry-btn">Retry</button>
+                    <button id="connection-cancel-btn">Cancel</button>
+                </div>
+            </div>
+        </div>
+
         <!-- Filter popup (F4) -->
         <div id="filter-popup" class="filter-popup" style="display: none;">
             <div class="filter-popup-header">Find [Esc to close]</div>
             <div class="filter-popup-content">
                 <span>Filter: </span>
                 <input type="text" id="filter-input" autocomplete="off">
+            </div>
+        </div>
+
+        <!-- Menu popup (/menu) -->
+        <div id="menu-modal" class="modal">
+            <div class="modal-content menu-modal-content">
+                <h2>Menu</h2>
+                <div id="menu-list" class="menu-list">
+                    <div class="menu-item" data-command="/help">Help</div>
+                    <div class="menu-item" data-command="/setup">Setup</div>
+                    <div class="menu-item" data-command="/web">Web Settings</div>
+                    <div class="menu-item" data-command="/actions">Actions</div>
+                    <div class="menu-item" data-command="/worlds">World Selector</div>
+                    <div class="menu-item" data-command="/connections">Connected Worlds</div>
+                </div>
+                <div class="menu-hint">↑↓ select, Enter open, Esc close</div>
             </div>
         </div>
 
@@ -450,6 +481,30 @@
                 <div class="modal-buttons">
                     <button id="web-cancel-btn">Cancel</button>
                     <button id="web-save-btn" class="btn-primary">Save</button>
+                </div>
+            </div>
+        </div>
+
+        <!-- Password Change modal (multiuser mode only) -->
+        <div id="password-modal" class="modal">
+            <div class="modal-content">
+                <h2>Change Password</h2>
+                <div class="password-field">
+                    <label for="password-old">Current Password:</label>
+                    <input type="password" id="password-old" autocomplete="off">
+                </div>
+                <div class="password-field">
+                    <label for="password-new">New Password:</label>
+                    <input type="password" id="password-new" autocomplete="off">
+                </div>
+                <div class="password-field">
+                    <label for="password-confirm">Confirm Password:</label>
+                    <input type="password" id="password-confirm" autocomplete="off">
+                </div>
+                <div id="password-error" class="error"></div>
+                <div class="modal-buttons">
+                    <button id="password-cancel-btn">Cancel</button>
+                    <button id="password-save-btn" class="btn-primary">Change Password</button>
                 </div>
             </div>
         </div>

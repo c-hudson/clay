@@ -21,10 +21,14 @@ pub const TELNET_GA: u8 = 249;   // Go Ahead (prompt marker)
 pub const TELNET_SE: u8 = 240;   // Subnegotiation End
 pub const TELNET_NOP: u8 = 241;  // No Operation (keepalive)
 
+// Telnet options
+pub const TELNET_OPT_ECHO: u8 = 1;  // Echo option
+
 /// Command types for the writer task
 pub enum WriteCommand {
     Text(String),     // Regular command (will add \r\n)
     Raw(Vec<u8>),     // Raw bytes (for telnet responses and NOP)
+    Shutdown,         // Close the connection gracefully
 }
 
 /// Stream wrapper enums for supporting both plain TCP and TLS connections
@@ -79,16 +83,18 @@ impl AsyncWrite for StreamWriter {
 }
 
 /// Process telnet sequences in incoming data.
-/// Returns (cleaned_data, telnet_responses, telnet_detected, prompt).
+/// Returns (cleaned_data, telnet_responses, telnet_detected, prompt, wont_echo_seen).
 /// - cleaned_data: data with telnet sequences removed (prompt text excluded if GA found)
 /// - telnet_responses: bytes to send back (WONT/DONT responses)
 /// - telnet_detected: true if any telnet IAC sequences were found
-/// - prompt: text from last newline to GA, if GA was found
-pub fn process_telnet(data: &[u8]) -> (Vec<u8>, Vec<u8>, bool, Option<Vec<u8>>) {
+/// - prompt: text from last newline to GA/WONT_ECHO, if found
+/// - wont_echo_seen: true if IAC WONT ECHO was received (prompt may follow)
+pub fn process_telnet(data: &[u8]) -> (Vec<u8>, Vec<u8>, bool, Option<Vec<u8>>, bool) {
     let mut cleaned = Vec::with_capacity(data.len());
     let mut responses = Vec::new();
     let mut telnet_detected = false;
     let mut prompt: Option<Vec<u8>> = None;
+    let mut wont_echo_seen = false;
     let mut i = 0;
 
     while i < data.len() {
@@ -117,7 +123,12 @@ pub fn process_telnet(data: &[u8]) -> (Vec<u8>, Vec<u8>, bool, Option<Vec<u8>>) 
                         TELNET_DO => {
                             responses.extend_from_slice(&[TELNET_IAC, TELNET_WONT, option]);
                         }
-                        _ => {} // WONT/DONT - no response needed
+                        TELNET_WONT if option == TELNET_OPT_ECHO => {
+                            // WONT ECHO often precedes login/password prompts
+                            // Mark that we saw it - we'll extract prompt at end
+                            wont_echo_seen = true;
+                        }
+                        _ => {} // Other WONT/DONT - no response needed
                     }
                     i += 3;
                 }
@@ -159,7 +170,19 @@ pub fn process_telnet(data: &[u8]) -> (Vec<u8>, Vec<u8>, bool, Option<Vec<u8>>) 
         }
     }
 
-    (cleaned, responses, telnet_detected, prompt)
+    // If WONT ECHO was seen, extract any trailing partial line as prompt
+    // (the prompt text comes AFTER the IAC WONT ECHO sequence)
+    if wont_echo_seen && prompt.is_none() {
+        let last_newline = cleaned.iter().rposition(|&b| b == b'\n');
+        let prompt_start = last_newline.map(|p| p + 1).unwrap_or(0);
+
+        // Only extract if there's text after the last newline and it doesn't end with newline
+        if prompt_start < cleaned.len() && cleaned.last() != Some(&b'\n') {
+            prompt = Some(cleaned.drain(prompt_start..).collect());
+        }
+    }
+
+    (cleaned, responses, telnet_detected, prompt, wont_echo_seen)
 }
 
 /// Check if there's an incomplete ANSI escape sequence or telnet sequence at the end.

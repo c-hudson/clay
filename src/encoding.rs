@@ -510,6 +510,30 @@ pub fn is_visually_empty(s: &str) -> bool {
     true
 }
 
+/// Check if a line contains ANSI codes but no visible content.
+/// Returns true for lines that should be filtered (ANSI-only garbage).
+/// Returns false for legitimate blank lines (empty or whitespace-only) and lines with content.
+pub fn is_ansi_only_line(s: &str) -> bool {
+    let mut has_ansi = false;
+    let mut in_escape = false;
+    for c in s.chars() {
+        if c == '\x1b' {
+            has_ansi = true;
+            in_escape = true;
+        } else if in_escape {
+            // Wait for end of escape sequence (alphabetic char or ~)
+            if c.is_alphabetic() || c == '~' {
+                in_escape = false;
+            }
+        } else if !c.is_whitespace() {
+            // Found visible content - not ANSI-only
+            return false;
+        }
+    }
+    // Only filter if it had ANSI codes but no visible content
+    has_ansi
+}
+
 /// Convert Discord custom emoji tags to Unicode or :name: fallback
 /// Format: <:name:id> or <a:name:id> (animated)
 pub fn convert_discord_emojis(s: &str) -> String {

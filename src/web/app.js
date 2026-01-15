@@ -3,6 +3,17 @@
 (function() {
     'use strict';
 
+    // Maximum line length to prevent performance issues with extremely long lines
+    const MAX_LINE_LENGTH = 10000;
+
+    // Truncate text if it exceeds MAX_LINE_LENGTH
+    function truncateIfNeeded(text) {
+        if (text.length > MAX_LINE_LENGTH) {
+            return text.substring(0, MAX_LINE_LENGTH) + '\x1b[0m\x1b[33m... [truncated]\x1b[0m';
+        }
+        return text;
+    }
+
     // DOM elements
     const elements = {
         output: document.getElementById('output'),
@@ -16,9 +27,25 @@
         input: document.getElementById('input'),
         sendBtn: document.getElementById('send-btn'),
         authModal: document.getElementById('auth-modal'),
+        authPrompt: document.getElementById('auth-prompt'),
+        authUsernameRow: document.getElementById('auth-username-row'),
+        authUsername: document.getElementById('auth-username'),
         authPassword: document.getElementById('auth-password'),
         authError: document.getElementById('auth-error'),
         authSubmit: document.getElementById('auth-submit'),
+        // Connection error modal
+        connectionErrorModal: document.getElementById('connection-error-modal'),
+        connectionErrorText: document.getElementById('connection-error-text'),
+        connectionRetryBtn: document.getElementById('connection-retry-btn'),
+        connectionCancelBtn: document.getElementById('connection-cancel-btn'),
+        // Password change modal (multiuser mode)
+        passwordModal: document.getElementById('password-modal'),
+        passwordOld: document.getElementById('password-old'),
+        passwordNew: document.getElementById('password-new'),
+        passwordConfirm: document.getElementById('password-confirm'),
+        passwordError: document.getElementById('password-error'),
+        passwordSaveBtn: document.getElementById('password-save-btn'),
+        passwordCancelBtn: document.getElementById('password-cancel-btn'),
         connectingOverlay: document.getElementById('connecting-overlay'),
         // Toolbar (desktop)
         toolbar: document.getElementById('toolbar'),
@@ -132,18 +159,23 @@
         setupCancelBtn: document.getElementById('setup-cancel-btn'),
         // Filter popup (F4)
         filterPopup: document.getElementById('filter-popup'),
-        filterInput: document.getElementById('filter-input')
+        filterInput: document.getElementById('filter-input'),
+        // Menu popup (/menu)
+        menuModal: document.getElementById('menu-modal'),
+        menuList: document.getElementById('menu-list')
     };
 
     // State
     let ws = null;
     let authenticated = false;
+    let multiuserMode = false;  // True when server is in multiuser mode
     let worlds = [];
     let currentWorldIndex = 0;
     let commandHistory = [];
     let historyIndex = -1;
     let connectionFailures = 0;
     let inputHeight = 1;
+    let splashLines = [];  // Splash screen lines for multiuser mode
 
     // Cached rendered output per world (array of DOM elements)
     let worldOutputCache = [];
@@ -215,6 +247,18 @@
     let filterPopupOpen = false;
     let filterText = '';
 
+    // Menu popup state (/menu)
+    let menuPopupOpen = false;
+    let menuSelectedIndex = 0;
+    const menuItems = [
+        { label: 'Help', command: '/help' },
+        { label: 'Setup', command: '/setup' },
+        { label: 'Web Settings', command: '/web' },
+        { label: 'Actions', command: '/actions' },
+        { label: 'World Selector', command: '/worlds' },
+        { label: 'Connected Worlds', command: '/connections' }
+    ];
+
     // Current theme values (synced from server)
     let consoleTheme = 'dark';
     let guiTheme = 'dark';
@@ -241,6 +285,7 @@
     // Command types enum (as object)
     const CommandType = {
         HELP: 'Help',
+        MENU: 'Menu',
         QUIT: 'Quit',
         RELOAD: 'Reload',
         SETUP: 'Setup',
@@ -263,7 +308,7 @@
 
     // Internal commands that are handled by the server (not action names)
     const INTERNAL_COMMANDS = [
-        'help', 'quit', 'reload', 'setup', 'web', 'actions', 'worlds', 'connections',
+        'help', 'menu', 'quit', 'reload', 'setup', 'web', 'actions', 'worlds', 'connections',
         'l', 'disconnect', 'dc', 'send', 'keepalive', 'gag'
     ];
 
@@ -351,6 +396,8 @@
         switch (cmd) {
             case '/help':
                 return { type: CommandType.HELP };
+            case '/menu':
+                return { type: CommandType.MENU };
             case '/quit':
                 return { type: CommandType.QUIT };
             case '/reload':
@@ -520,16 +567,35 @@
     }
 
     // Connect to WebSocket server
+    let connectionTimeout = null;
+
     function connect() {
         showConnecting(true);
 
         const host = window.location.hostname;
         const wsUrl = `${window.WS_PROTOCOL}://${host}:${window.WS_PORT}`;
 
+        // Clear any existing timeout
+        if (connectionTimeout) {
+            clearTimeout(connectionTimeout);
+            connectionTimeout = null;
+        }
+
         try {
             ws = new WebSocket(wsUrl);
 
+            // Set a 5-second timeout for connection
+            connectionTimeout = setTimeout(function() {
+                if (ws && ws.readyState === WebSocket.CONNECTING) {
+                    ws.close();
+                }
+            }, 5000);
+
             ws.onopen = function() {
+                if (connectionTimeout) {
+                    clearTimeout(connectionTimeout);
+                    connectionTimeout = null;
+                }
                 connectionFailures = 0;
                 hideCertWarning();
                 showConnecting(false);
@@ -538,14 +604,25 @@
             };
 
             ws.onclose = function() {
+                if (connectionTimeout) {
+                    clearTimeout(connectionTimeout);
+                    connectionTimeout = null;
+                }
                 authenticated = false;
                 showConnecting(false);
                 connectionFailures++;
-                // If using wss:// and connection keeps failing, show certificate warning
-                if (window.WS_PROTOCOL === 'wss' && connectionFailures >= 2) {
-                    showCertWarning();
+
+                // After 2 failures, show error modal instead of auto-reconnecting
+                if (connectionFailures >= 2) {
+                    // If using wss://, show certificate warning
+                    if (window.WS_PROTOCOL === 'wss') {
+                        showCertWarning();
+                    }
+                    showConnectionErrorModal();
+                } else {
+                    // First failure - try once more after 3 seconds
+                    setTimeout(connect, 3000);
                 }
-                setTimeout(connect, 3000); // Reconnect after 3 seconds
             };
 
             ws.onerror = function() {
@@ -570,23 +647,69 @@
     // Handle incoming messages
     function handleMessage(msg) {
         switch (msg.type) {
+            case 'ServerHello':
+                // Server tells us upfront if it's in multiuser mode
+                if (msg.multiuser_mode) {
+                    enableMultiuserAuthUI();
+                }
+                break;
+
             case 'AuthResponse':
                 if (msg.success) {
                     authenticated = true;
+                    multiuserMode = msg.multiuser_mode || false;
                     showAuthModal(false);
                     elements.authError.textContent = '';
                     elements.input.focus();
+                    // Update UI based on multiuser mode
+                    updateMultiuserUI();
                 } else {
                     elements.authError.textContent = msg.error || 'Authentication failed';
                     elements.authPassword.value = '';
-                    elements.authPassword.focus();
+                    // Detect multiuser mode from error messages
+                    if (msg.error === 'Username required' || msg.error === 'Unknown user' || msg.multiuser_mode) {
+                        enableMultiuserAuthUI();
+                    }
+                    if (multiuserMode && elements.authUsername) {
+                        elements.authUsername.focus();
+                    } else {
+                        elements.authPassword.focus();
+                    }
                 }
+                break;
+
+            case 'PasswordChanged':
+                if (msg.success) {
+                    showPasswordModal(false);
+                    // Show brief success message in output
+                    addSystemMessage('Password changed successfully.');
+                } else {
+                    elements.passwordError.textContent = msg.error || 'Password change failed';
+                }
+                break;
+
+            case 'LoggedOut':
+                // Server confirmed logout - reset state and show login screen
+                worlds = [];
+                currentWorldIndex = 0;
+                actions = [];
+                splashLines = [];
+                authenticated = false;
+                // Clear output display
+                if (elements.output) {
+                    elements.output.innerHTML = '';
+                }
+                // Update status bar to show no world
+                updateStatusBar();
+                // Show auth modal again
+                showAuthModal(true);
                 break;
 
             case 'InitialState':
                 worlds = msg.worlds || [];
-                currentWorldIndex = msg.current_world_index || 0;
+                currentWorldIndex = msg.current_world_index !== undefined ? msg.current_world_index : 0;
                 actions = msg.actions || [];
+                splashLines = msg.splash_lines || [];
                 // Reset client-side more-mode state (each client handles more locally)
                 paused = false;
                 pendingLines = [];
@@ -718,7 +841,7 @@
                                 return;
                             }
                             const lineIndex = world.output_lines.length;
-                            world.output_lines.push({ text: line, ts: lineTs });
+                            world.output_lines.push({ text: truncateIfNeeded(line), ts: lineTs });
                             if (msg.world_index === currentWorldIndex) {
                                 handleIncomingLine(line, lineTs, msg.world_index, lineIndex);
                             }
@@ -772,6 +895,19 @@
             case 'WorldSwitched':
                 // Console switched worlds - we ignore this to maintain independent view
                 // Web interface tracks its own current world separately
+                break;
+
+            case 'WorldFlushed':
+                // Clear output buffer for this world
+                if (msg.world_index !== undefined && worlds[msg.world_index]) {
+                    worlds[msg.world_index].scrollback = [];
+                    worlds[msg.world_index].pendingCount = 0;
+                    // If it's the current world, clear the display
+                    if (msg.world_index === currentWorldIndex) {
+                        elements.output.innerHTML = '';
+                        scrollOffset = 0;
+                    }
+                }
                 break;
 
             case 'PromptUpdate':
@@ -888,7 +1024,7 @@
 
             case 'PendingReleased':
                 // Server/another client released pending lines - sync our state
-                if (msg.world_index === currentWorld && msg.count > 0) {
+                if (msg.world_index === currentWorldIndex && msg.count > 0) {
                     doReleasePending(msg.count);
                 }
                 break;
@@ -942,17 +1078,16 @@
         if (!paused || pendingLines.length === 0) return;
 
         const count = Math.max(1, getVisibleLineCount() - 2);
-        // Send release request to server instead of local release
-        // Server will broadcast PendingReleased which triggers actual release
-        send({ type: 'ReleasePending', world_index: currentWorld, count: count });
+        // Release locally - server-side more mode is separate from client-side
+        doReleasePending(count);
     }
 
     // Release all pending lines
     function releaseAll() {
         if (!paused) return;
 
-        // Send release request to server (count: 0 = all)
-        send({ type: 'ReleasePending', world_index: currentWorld, count: 0 });
+        // Release locally - server-side more mode is separate from client-side
+        doReleasePending(0);
     }
 
     // Actually release pending lines (called when server broadcasts PendingReleased)
@@ -981,26 +1116,49 @@
         }
     }
 
-    // Authenticate
+    // Authenticate - sends directly via ws.send since authenticated is still false
     function authenticate() {
         const password = elements.authPassword.value;
         if (!password) return;
+        if (!ws || ws.readyState !== WebSocket.OPEN) return;
+
+        // Get username if in multiuser mode (visible input)
+        const username = elements.authUsername && elements.authUsernameRow.style.display !== 'none'
+            ? elements.authUsername.value.trim()
+            : null;
 
         // Hash password with SHA-256
         hashPassword(password).then(hash => {
-            send({ type: 'AuthRequest', password_hash: hash });
+            const msg = { type: 'AuthRequest', password_hash: hash };
+            if (username) {
+                msg.username = username;
+            }
+            ws.send(JSON.stringify(msg));
+        }).catch(err => {
+            // Try fallback directly if hashPassword somehow failed
+            const hash = sha256Fallback(password);
+            const msg = { type: 'AuthRequest', password_hash: hash };
+            if (username) {
+                msg.username = username;
+            }
+            ws.send(JSON.stringify(msg));
         });
     }
 
     // SHA-256 hash (with fallback for insecure contexts where crypto.subtle is unavailable)
     async function hashPassword(password) {
         // Try native crypto.subtle first (only available in secure contexts)
+        // Firefox throws errors on insecure contexts even when crypto.subtle exists
         if (window.crypto && window.crypto.subtle) {
-            const encoder = new TextEncoder();
-            const data = encoder.encode(password);
-            const hashBuffer = await crypto.subtle.digest('SHA-256', data);
-            const hashArray = Array.from(new Uint8Array(hashBuffer));
-            return hashArray.map(b => b.toString(16).padStart(2, '0')).join('');
+            try {
+                const encoder = new TextEncoder();
+                const data = encoder.encode(password);
+                const hashBuffer = await crypto.subtle.digest('SHA-256', data);
+                const hashArray = Array.from(new Uint8Array(hashBuffer));
+                return hashArray.map(b => b.toString(16).padStart(2, '0')).join('');
+            } catch (err) {
+                // Fall through to fallback
+            }
         }
         // Fallback: pure JavaScript SHA-256 for insecure contexts (HTTP)
         return sha256Fallback(password);
@@ -1219,6 +1377,10 @@
                 // Help popup not implemented in web, just ignore
                 break;
 
+            case CommandType.MENU:
+                openMenuPopup();
+                break;
+
             default:
                 // For commands not handled locally, send to server
                 // (e.g., /send, /disconnect)
@@ -1276,6 +1438,37 @@
         renderOutput();
     }
 
+    // Menu popup functions (/menu)
+    function openMenuPopup() {
+        menuPopupOpen = true;
+        menuSelectedIndex = 0;
+        elements.menuModal.classList.add('active');
+        updateMenuSelection();
+    }
+
+    function closeMenuPopup() {
+        menuPopupOpen = false;
+        elements.menuModal.classList.remove('active');
+        elements.input.focus();
+    }
+
+    function updateMenuSelection() {
+        const items = elements.menuList.querySelectorAll('.menu-item');
+        items.forEach((item, i) => {
+            if (i === menuSelectedIndex) {
+                item.classList.add('selected');
+            } else {
+                item.classList.remove('selected');
+            }
+        });
+    }
+
+    function selectMenuItem() {
+        const cmd = menuItems[menuSelectedIndex].command;
+        closeMenuPopup();
+        handleLocalCommand(cmd);
+    }
+
     // Strip ANSI codes for filter matching
     function stripAnsiForFilter(text) {
         return text.replace(/\x1b\[[0-9;]*[a-zA-Z]/g, '');
@@ -1301,11 +1494,31 @@
         return false;
     }
 
+    // Render splash screen in output area
+    function renderSplashScreen() {
+        if (!splashLines || splashLines.length === 0) return;
+
+        // Just render splash lines as regular output
+        const htmlParts = [];
+        for (const line of splashLines) {
+            const lineHtml = parseAnsi(line);
+            htmlParts.push(lineHtml);
+        }
+        elements.output.innerHTML = htmlParts.join('<br>');
+    }
+
     function renderOutput() {
         elements.output.innerHTML = '';
 
         const world = worlds[currentWorldIndex];
-        if (!world) return;
+
+        // If no world selected (multiuser mode before connecting), show splash
+        if (!world) {
+            if (splashLines && splashLines.length > 0) {
+                renderSplashScreen();
+            }
+            return;
+        }
 
         const lines = world.output_lines || [];
 
@@ -1859,8 +2072,10 @@
             elements.statusIndicator.className = '';
         }
 
-        if (world) {
-            elements.worldName.textContent = ' ' + (world.name || '');
+        if (world && world.name) {
+            elements.worldName.textContent = ' ' + world.name;
+        } else {
+            elements.worldName.textContent = '';
         }
 
         // Activity indicator (worlds with unseen lines only)
@@ -1910,6 +2125,18 @@
         forceRepaint(elements.connectingOverlay);
     }
 
+    // Show/hide connection error modal
+    function showConnectionErrorModal() {
+        elements.connectionErrorModal.className = 'modal visible';
+        elements.connectionErrorModal.style.display = 'flex';
+        forceRepaint(elements.connectionErrorModal);
+    }
+
+    function hideConnectionErrorModal() {
+        elements.connectionErrorModal.className = 'modal';
+        elements.connectionErrorModal.style.display = 'none';
+    }
+
     // Show/hide auth modal
     function showAuthModal(show) {
         elements.authModal.className = 'modal' + (show ? ' visible' : '');
@@ -1917,6 +2144,78 @@
         if (show) {
             elements.authPassword.value = '';
             elements.authError.textContent = '';
+            if (elements.authUsername) {
+                elements.authUsername.value = '';
+            }
+        }
+    }
+
+    // Show/hide password change modal (multiuser mode only)
+    function showPasswordModal(show) {
+        if (!elements.passwordModal) return;
+        elements.passwordModal.className = 'modal' + (show ? ' visible' : '');
+        forceRepaint(elements.passwordModal);
+        if (show) {
+            elements.passwordOld.value = '';
+            elements.passwordNew.value = '';
+            elements.passwordConfirm.value = '';
+            elements.passwordError.textContent = '';
+            elements.passwordOld.focus();
+        }
+    }
+
+    // Update UI based on multiuser mode
+    function updateMultiuserUI() {
+        // Show/hide change password menu item
+        document.querySelectorAll('.menu-change-password').forEach(el => {
+            el.style.display = multiuserMode ? '' : 'none';
+        });
+
+        // Show/hide logout menu item and its divider
+        document.querySelectorAll('.menu-logout').forEach(el => {
+            el.style.display = multiuserMode ? '' : 'none';
+        });
+        document.querySelectorAll('.menu-logout-divider').forEach(el => {
+            el.style.display = multiuserMode ? '' : 'none';
+        });
+
+        // In multiuser mode, hide world editor buttons (Add, Edit, Delete)
+        if (multiuserMode) {
+            if (elements.worldAddBtn) elements.worldAddBtn.style.display = 'none';
+            if (elements.worldEditBtn) elements.worldEditBtn.style.display = 'none';
+            if (elements.worldEditDeleteBtn) elements.worldEditDeleteBtn.style.display = 'none';
+
+            // Hide web settings menu item
+            document.querySelectorAll('[data-action="web"]').forEach(el => {
+                el.style.display = 'none';
+            });
+        }
+    }
+
+    // Enable multiuser mode UI (show username field in auth modal)
+    function enableMultiuserAuthUI() {
+        multiuserMode = true;
+        if (elements.authUsernameRow) {
+            elements.authUsernameRow.style.display = '';
+        }
+        if (elements.authPrompt) {
+            elements.authPrompt.textContent = 'Enter your username and password:';
+        }
+        if (elements.authUsername) {
+            elements.authUsername.focus();
+        }
+    }
+
+    // Add a system message to the current world's output
+    function addSystemMessage(text) {
+        const currentWorld = worlds[currentWorldIndex];
+        if (currentWorld) {
+            const ts = Math.floor(Date.now() / 1000);
+            currentWorld.output_lines.push({ text: '\x1b[33m%% ' + text + '\x1b[0m', ts: ts });
+            if (worldOutputCache[currentWorldIndex]) {
+                worldOutputCache[currentWorldIndex] = []; // Clear cache to force re-render
+            }
+            renderOutput();
         }
     }
 
@@ -2266,6 +2565,11 @@
 
     // Web settings popup functions (/web)
     function openWebPopup() {
+        // Block web settings in multiuser mode
+        if (multiuserMode) {
+            addSystemMessage('Web settings are disabled in multiuser mode.');
+            return;
+        }
         webPopupOpen = true;
         // Copy global state to edit state
         editWebSecure = webSecure;
@@ -2796,6 +3100,11 @@
 
     // World Editor popup functions
     function openWorldEditorPopup(worldIndex) {
+        // Block world editing in multiuser mode
+        if (multiuserMode) {
+            addSystemMessage('World editing is disabled in multiuser mode.');
+            return;
+        }
         if (worldIndex < 0 || worldIndex >= worlds.length) return;
 
         worldEditorPopupOpen = true;
@@ -2897,13 +3206,16 @@
     function saveAndConnectWorldEditor() {
         if (worldEditorIndex < 0 || worldEditorIndex >= worlds.length) return;
 
-        // Save first
+        // Save the index before saveWorldEditor() resets it via closeWorldEditorPopup()
+        const indexToConnect = worldEditorIndex;
+
+        // Save first (this closes the popup and resets worldEditorIndex to -1)
         saveWorldEditor();
 
-        // Then connect
+        // Then connect using the saved index
         send({
             type: 'ConnectWorld',
-            world_index: worldEditorIndex
+            world_index: indexToConnect
         });
     }
 
@@ -3106,6 +3418,25 @@
                     ws.send(JSON.stringify({ type: 'RequestState' }));
                 }
                 break;
+            case 'change-password':
+                // Open password change modal (multiuser mode only)
+                if (multiuserMode) {
+                    showPasswordModal(true);
+                }
+                break;
+            case 'logout':
+                // Logout (multiuser mode only)
+                if (multiuserMode) {
+                    performLogout();
+                }
+                break;
+        }
+    }
+
+    // Perform logout in multiuser mode
+    function performLogout() {
+        if (ws && ws.readyState === WebSocket.OPEN) {
+            ws.send(JSON.stringify({ type: 'Logout' }));
         }
     }
 
@@ -3444,6 +3775,14 @@
             }
         });
 
+        // Menu popup item click handlers
+        elements.menuList.querySelectorAll('.menu-item').forEach((item, i) => {
+            item.addEventListener('click', () => {
+                menuSelectedIndex = i;
+                selectMenuItem();
+            });
+        });
+
         // Document-level keyboard handler for navigation keys
         document.onkeydown = function(e) {
             // Skip if auth modal is visible
@@ -3480,6 +3819,36 @@
                     closeFilterPopup();
                 } else {
                     openFilterPopup();
+                }
+                return;
+            }
+
+            // Handle menu popup
+            if (menuPopupOpen) {
+                if (e.key === 'Escape') {
+                    e.preventDefault();
+                    closeMenuPopup();
+                } else if (e.key === 'ArrowUp') {
+                    e.preventDefault();
+                    e.stopPropagation();
+                    if (menuSelectedIndex > 0) {
+                        menuSelectedIndex--;
+                    } else {
+                        menuSelectedIndex = menuItems.length - 1;
+                    }
+                    updateMenuSelection();
+                } else if (e.key === 'ArrowDown') {
+                    e.preventDefault();
+                    e.stopPropagation();
+                    if (menuSelectedIndex < menuItems.length - 1) {
+                        menuSelectedIndex++;
+                    } else {
+                        menuSelectedIndex = 0;
+                    }
+                    updateMenuSelection();
+                } else if (e.key === 'Enter') {
+                    e.preventDefault();
+                    selectMenuItem();
                 }
                 return;
             }
@@ -3830,6 +4199,42 @@
             }
         };
 
+        // Connection error modal buttons
+        elements.connectionRetryBtn.onclick = function() {
+            hideConnectionErrorModal();
+            connectionFailures = 0;
+            connect();
+        };
+        elements.connectionCancelBtn.onclick = function() {
+            hideConnectionErrorModal();
+            // Just leave it disconnected - user can refresh to try again
+        };
+
+        // Auth username field Enter key handler (multiuser mode)
+        if (elements.authUsername) {
+            elements.authUsername.onkeydown = function(e) {
+                if (e.key === 'Enter') {
+                    elements.authPassword.focus();
+                }
+            };
+        }
+
+        // Password modal keyboard handlers
+        if (elements.passwordOld && elements.passwordNew && elements.passwordConfirm) {
+            elements.passwordOld.onkeydown = function(e) {
+                if (e.key === 'Enter') elements.passwordNew.focus();
+                if (e.key === 'Escape') showPasswordModal(false);
+            };
+            elements.passwordNew.onkeydown = function(e) {
+                if (e.key === 'Enter') elements.passwordConfirm.focus();
+                if (e.key === 'Escape') showPasswordModal(false);
+            };
+            elements.passwordConfirm.onkeydown = function(e) {
+                if (e.key === 'Enter') elements.passwordSaveBtn.click();
+                if (e.key === 'Escape') showPasswordModal(false);
+            };
+        }
+
         // Actions List popup
         elements.actionAddBtn.onclick = () => openActionsEditorPopup(-1);
         elements.actionEditBtn.onclick = () => {
@@ -3963,6 +4368,42 @@
         };
         elements.webSaveBtn.onclick = saveWebSettings;
         elements.webCancelBtn.onclick = closeWebPopup;
+
+        // Password change modal handlers
+        if (elements.passwordSaveBtn) {
+            elements.passwordSaveBtn.onclick = function() {
+                const oldPassword = elements.passwordOld.value;
+                const newPassword = elements.passwordNew.value;
+                const confirmPassword = elements.passwordConfirm.value;
+
+                if (!oldPassword || !newPassword || !confirmPassword) {
+                    elements.passwordError.textContent = 'All fields are required';
+                    return;
+                }
+                if (newPassword !== confirmPassword) {
+                    elements.passwordError.textContent = 'New passwords do not match';
+                    return;
+                }
+                if (newPassword.length < 4) {
+                    elements.passwordError.textContent = 'New password must be at least 4 characters';
+                    return;
+                }
+
+                // Hash both passwords and send change request
+                Promise.all([hashPassword(oldPassword), hashPassword(newPassword)]).then(([oldHash, newHash]) => {
+                    send({ type: 'ChangePassword', old_password_hash: oldHash, new_password_hash: newHash });
+                }).catch(err => {
+                    const oldHash = sha256Fallback(oldPassword);
+                    const newHash = sha256Fallback(newPassword);
+                    send({ type: 'ChangePassword', old_password_hash: oldHash, new_password_hash: newHash });
+                });
+            };
+        }
+        if (elements.passwordCancelBtn) {
+            elements.passwordCancelBtn.onclick = function() {
+                showPasswordModal(false);
+            };
+        }
 
         // Keepalive ping every 30 seconds
         setInterval(function() {

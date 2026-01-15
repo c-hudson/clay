@@ -388,11 +388,17 @@ body {
 #world-name {
     font-weight: bold;
     color: #ffffff;
+}
+
+#world-name:not(:empty) {
     padding: 0 4px;
 }
 
 #activity-indicator {
     color: var(--warning-color);
+}
+
+#activity-indicator:not(:empty) {
     padding: 0 4px;
 }
 
@@ -758,6 +764,62 @@ body {
     color: var(--error-color);
     font-size: 12px;
     min-height: 14px;
+}
+
+/* Password change modal (multiuser mode) */
+.password-field {
+    display: flex;
+    flex-direction: column;
+    gap: 1px;
+    margin-bottom: 8px;
+}
+
+.password-field label {
+    color: var(--accent-color);
+    font-size: 11px;
+}
+
+.password-field input {
+    width: 100%;
+    padding: 4px;
+    background-color: #000;
+    border: 1px solid var(--separator-color);
+    color: var(--text-color);
+    font-family: inherit;
+    font-size: inherit;
+    box-sizing: border-box;
+}
+
+.password-field input:focus {
+    outline: none;
+    border-color: var(--accent-color);
+}
+
+#password-error {
+    color: var(--error-color);
+    font-size: 12px;
+    min-height: 14px;
+}
+
+/* Auth username row (multiuser mode) */
+#auth-username-row {
+    margin-bottom: 8px;
+}
+
+#auth-username {
+    width: 100%;
+    padding: 8px;
+    font-family: inherit;
+    font-size: inherit;
+    background: #000;
+    border: 1px solid var(--separator-color);
+    color: var(--text-color);
+    box-sizing: border-box;
+}
+
+#auth-username:focus {
+    outline: none;
+    border-color: var(--accent-color);
 }
 
 /* Worlds list popup */
@@ -1664,6 +1726,58 @@ body.theme-light .filter-popup-header {
 body.theme-light .filter-popup-content input {
     background-color: #ffffff;
     border-color: #cccccc;
+}
+
+/* Menu popup (/menu) */
+.menu-modal-content {
+    min-width: 200px;
+    max-width: 280px;
+}
+
+.menu-list {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    margin-bottom: 12px;
+}
+
+.menu-item {
+    padding: 8px 12px;
+    cursor: pointer;
+    color: var(--text-color);
+    border-radius: 4px;
+}
+
+.menu-item:hover {
+    background-color: #333;
+}
+
+.menu-item.selected {
+    background-color: var(--accent-color);
+    color: #000;
+    font-weight: bold;
+}
+
+.menu-hint {
+    color: #666;
+    font-size: 11px;
+    text-align: center;
+    padding-top: 8px;
+    border-top: 1px solid #333;
+}
+
+body.theme-light .menu-item:hover {
+    background-color: #e0e0e0;
+}
+
+body.theme-light .menu-item.selected {
+    background-color: var(--accent-color);
+    color: #fff;
+}
+
+body.theme-light .menu-hint {
+    color: #999;
+    border-top-color: #ccc;
 }
 
 /* Action highlighting (F8) */
