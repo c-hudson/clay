@@ -7444,7 +7444,7 @@ mod remote_gui {
                                 self.authenticated = false;
                             }
                         }
-                        WsMessage::InitialState { worlds, current_world_index, settings, actions } => {
+                        WsMessage::InitialState { worlds, current_world_index, settings, actions, .. } => {
                             self.worlds = worlds.into_iter().map(|w| {
                                 // Calculate pending count before moving pending_lines
                                 let pending_count = if !w.pending_lines_ts.is_empty() {
