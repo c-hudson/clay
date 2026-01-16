@@ -123,7 +123,12 @@ echo "This may take a few minutes..."
 echo ""
 
 # Build release with remote-gui-audio feature
-if ! cargo build --release --features "$BUILD_FEATURES"; then
+# Use native target (not musl) since GUI/audio require glibc
+NATIVE_TARGET=$(rustc -vV | grep host | cut -d' ' -f2)
+echo "Target: $NATIVE_TARGET"
+echo ""
+
+if ! cargo build --release --target "$NATIVE_TARGET" --features "$BUILD_FEATURES"; then
     echo ""
     echo "=============================================="
     echo "  Build failed!"
@@ -135,6 +140,9 @@ if ! cargo build --release --features "$BUILD_FEATURES"; then
     echo "  3. Try building without GUI/audio: cargo build --release"
     exit 1
 fi
+
+# Set binary path based on native target
+BINARY_PATH="target/$NATIVE_TARGET/release/clay"
 
 echo ""
 echo "=============================================="
@@ -162,7 +170,7 @@ fi
 # Copy the binary
 echo ""
 echo "Copying to $DEST..."
-cp target/release/clay "$DEST"
+cp "$BINARY_PATH" "$DEST"
 chmod +x "$DEST"
 
 echo ""
