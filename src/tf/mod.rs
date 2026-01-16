@@ -5,6 +5,7 @@
 
 pub mod parser;
 pub mod variables;
+pub mod expressions;
 
 use std::collections::HashMap;
 use regex::Regex;

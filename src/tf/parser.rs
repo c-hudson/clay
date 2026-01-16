@@ -63,9 +63,10 @@ pub fn execute_command(engine: &mut TfEngine, input: &str) -> TfCommandResult {
         "if" | "elseif" | "else" | "endif" | "while" | "done" | "for" | "break" => {
             TfCommandResult::Error(format!("#{} not yet implemented (Phase 3)", cmd))
         }
-        "expr" | "eval" | "test" => {
-            TfCommandResult::Error(format!("#{} not yet implemented (Phase 2)", cmd))
-        }
+        // Expression commands
+        "expr" => cmd_expr(engine, args),
+        "eval" => cmd_eval(engine, args),
+        "test" => cmd_test(engine, args),
         "hook" | "unhook" | "bind" | "unbind" => {
             TfCommandResult::Error(format!("#{} not yet implemented (Phase 5)", cmd))
         }
@@ -318,8 +319,61 @@ More commands coming in future phases:
 /// #version - Show version info
 fn cmd_version() -> TfCommandResult {
     TfCommandResult::Success(Some(
-        "Clay MUD Client with TinyFugue compatibility\nTF compatibility layer: Phase 1".to_string()
+        "Clay MUD Client with TinyFugue compatibility\nTF compatibility layer: Phase 2".to_string()
     ))
+}
+
+/// #expr expression - Evaluate expression and display result
+fn cmd_expr(engine: &mut TfEngine, args: &str) -> TfCommandResult {
+    if args.is_empty() {
+        return TfCommandResult::Error("Usage: #expr expression".to_string());
+    }
+
+    match super::expressions::evaluate(engine, args) {
+        Ok(value) => TfCommandResult::Success(Some(value.to_string_value())),
+        Err(e) => TfCommandResult::Error(format!("Expression error: {}", e)),
+    }
+}
+
+/// #eval expression - Evaluate expression and execute result as command
+fn cmd_eval(engine: &mut TfEngine, args: &str) -> TfCommandResult {
+    if args.is_empty() {
+        return TfCommandResult::Error("Usage: #eval expression".to_string());
+    }
+
+    match super::expressions::evaluate(engine, args) {
+        Ok(value) => {
+            let cmd = value.to_string_value();
+            if cmd.is_empty() {
+                TfCommandResult::Success(None)
+            } else if cmd.starts_with('#') {
+                // Execute as TF command (recursive)
+                execute_command(engine, &cmd)
+            } else if cmd.starts_with('/') {
+                // Execute as Clay command
+                TfCommandResult::ClayCommand(cmd)
+            } else {
+                // Send to MUD
+                TfCommandResult::SendToMud(cmd)
+            }
+        }
+        Err(e) => TfCommandResult::Error(format!("Expression error: {}", e)),
+    }
+}
+
+/// #test expression - Evaluate expression as boolean, return 0 or 1
+fn cmd_test(engine: &mut TfEngine, args: &str) -> TfCommandResult {
+    if args.is_empty() {
+        return TfCommandResult::Error("Usage: #test expression".to_string());
+    }
+
+    match super::expressions::evaluate(engine, args) {
+        Ok(value) => {
+            let result = if value.to_bool() { "1" } else { "0" };
+            TfCommandResult::Success(Some(result.to_string()))
+        }
+        Err(e) => TfCommandResult::Error(format!("Expression error: {}", e)),
+    }
 }
 
 /// Check if a variable name is valid (starts with letter, contains only alphanumeric and underscore)
