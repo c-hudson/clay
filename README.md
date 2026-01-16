@@ -15,6 +15,7 @@ A terminal-based MUD (Multi-User Dungeon) client built with Rust featuring multi
 - **Telnet Protocol** - Full telnet negotiation with keepalive support
 - **Auto-Login** - Configurable automatic login (Connect, Prompt, MOO modes)
 - **Hot Reload** - Update the binary without losing connections (`/reload`)
+- **TLS Proxy** - Optional proxy to preserve TLS connections across hot reload
 - **Spell Check** - Built-in spell checking with suggestions
 - **Output Filtering** - Search/filter output with F4
 - **File Logging** - Per-world output logging

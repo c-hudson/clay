@@ -26,6 +26,7 @@ pub use websocket::{
 use std::collections::{HashMap, HashSet};
 use std::io::{self, stdout, BufRead, Write as IoWrite};
 use std::os::unix::io::{AsRawFd, FromRawFd, RawFd};
+use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicPtr, AtomicU32, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -891,6 +892,7 @@ enum SettingsField {
     ShowTags,
     InputHeight,
     GuiTheme,       // GUI theme
+    TLSProxy,       // TLS proxy for connection preservation over hot reload
     SaveSetup,
     CancelSetup,
 }
@@ -1048,7 +1050,8 @@ impl SettingsField {
             SettingsField::Debug => SettingsField::ShowTags,
             SettingsField::ShowTags => SettingsField::InputHeight,
             SettingsField::InputHeight => SettingsField::GuiTheme,
-            SettingsField::GuiTheme => SettingsField::SaveSetup,
+            SettingsField::GuiTheme => SettingsField::TLSProxy,
+            SettingsField::TLSProxy => SettingsField::SaveSetup,
             SettingsField::SaveSetup => SettingsField::CancelSetup,
             SettingsField::CancelSetup => SettingsField::MoreMode,
             // World fields wrap to global fields
@@ -1066,7 +1069,8 @@ impl SettingsField {
             SettingsField::ShowTags => SettingsField::Debug,
             SettingsField::InputHeight => SettingsField::ShowTags,
             SettingsField::GuiTheme => SettingsField::InputHeight,
-            SettingsField::SaveSetup => SettingsField::GuiTheme,
+            SettingsField::TLSProxy => SettingsField::GuiTheme,
+            SettingsField::SaveSetup => SettingsField::TLSProxy,
             SettingsField::CancelSetup => SettingsField::SaveSetup,
             // World fields wrap to global fields
             _ => SettingsField::CancelSetup,
@@ -1115,6 +1119,7 @@ struct SettingsPopup {
     temp_input_height: u16,
     temp_theme: Theme,
     temp_gui_theme: Theme,
+    temp_tls_proxy_enabled: bool,
 }
 
 impl SettingsPopup {
@@ -1155,6 +1160,7 @@ impl SettingsPopup {
             temp_input_height: 3,
             temp_theme: Theme::Dark,
             temp_gui_theme: Theme::Dark,
+            temp_tls_proxy_enabled: false,
         }
     }
 
@@ -1210,6 +1216,7 @@ impl SettingsPopup {
         self.temp_input_height = input_height;
         self.temp_theme = settings.theme;
         self.temp_gui_theme = settings.gui_theme;
+        self.temp_tls_proxy_enabled = settings.tls_proxy_enabled;
     }
 
     fn close(&mut self) {
@@ -1320,6 +1327,7 @@ impl SettingsPopup {
             SettingsField::GuiTheme => {
                 self.temp_gui_theme = self.temp_gui_theme.next();
             }
+            SettingsField::TLSProxy => self.temp_tls_proxy_enabled = !self.temp_tls_proxy_enabled,
             SettingsField::Encoding => {
                 self.temp_encoding = match self.temp_encoding {
                     Encoding::Utf8 => Encoding::Latin1,
@@ -1380,6 +1388,7 @@ impl SettingsPopup {
         settings.debug_enabled = self.temp_debug_enabled;
         settings.theme = self.temp_theme;
         settings.gui_theme = self.temp_gui_theme;
+        settings.tls_proxy_enabled = self.temp_tls_proxy_enabled;
         (self.temp_input_height, self.temp_show_tags)
     }
 }
@@ -2842,6 +2851,8 @@ struct Settings {
     websocket_key_file: String,    // Path to TLS private key file (PEM) - only used when web_secure=true
     // User-defined actions/triggers
     actions: Vec<Action>,
+    // TLS proxy for connection preservation over hot reload
+    tls_proxy_enabled: bool,
 }
 
 impl Default for Settings {
@@ -2868,6 +2879,7 @@ impl Default for Settings {
             websocket_cert_file: String::new(),
             websocket_key_file: String::new(),
             actions: Vec::new(),
+            tls_proxy_enabled: false,
         }
     }
 }
@@ -3744,6 +3756,8 @@ struct World {
     needs_redraw: bool,          // True when terminal needs full redraw (after splash clear)
     pending_since: Option<std::time::Instant>, // When pending output first appeared (for Alt-w)
     owner: Option<String>,       // Username who owns this world (multiuser mode)
+    proxy_pid: Option<u32>,      // PID of TLS proxy process (if using TLS proxy)
+    proxy_socket_path: Option<std::path::PathBuf>, // Unix socket path for TLS proxy
 }
 
 impl World {
@@ -3793,6 +3807,8 @@ impl World {
             needs_redraw: false,
             pending_since: None,
             owner: None,
+            proxy_pid: None,
+            proxy_socket_path: None,
         }
     }
 
@@ -4637,6 +4653,7 @@ impl App {
             ws_port: self.settings.ws_port,
             ws_cert_file: self.settings.websocket_cert_file.clone(),
             ws_key_file: self.settings.websocket_key_file.clone(),
+            tls_proxy_enabled: self.settings.tls_proxy_enabled,
         };
 
         WsMessage::InitialState {
@@ -5165,6 +5182,7 @@ fn save_settings(app: &App) -> io::Result<()> {
     if !app.settings.websocket_key_file.is_empty() {
         writeln!(file, "websocket_key_file={}", app.settings.websocket_key_file)?;
     }
+    writeln!(file, "tls_proxy_enabled={}", app.settings.tls_proxy_enabled)?;
 
     // Save each world's settings
     for world in &app.worlds {
@@ -5489,6 +5507,9 @@ fn load_settings(app: &mut App) -> io::Result<()> {
                     }
                     // Legacy: ignore global encoding, it's now per-world
                     "encoding" => {}
+                    "tls_proxy_enabled" => {
+                        app.settings.tls_proxy_enabled = value == "true";
+                    }
                     _ => {}
                 }
             } else if let Some(ref world_name) = current_world {
@@ -5993,6 +6014,14 @@ fn save_reload_state(app: &App) -> io::Result<()> {
             writeln!(file, "socket_fd={}", fd)?;
         }
 
+        // TLS proxy info (for connection preservation over hot reload)
+        if let Some(proxy_pid) = world.proxy_pid {
+            writeln!(file, "proxy_pid={}", proxy_pid)?;
+        }
+        if let Some(ref proxy_socket_path) = world.proxy_socket_path {
+            writeln!(file, "proxy_socket_path={}", proxy_socket_path.display())?;
+        }
+
         // World settings
         writeln!(file, "world_type={}", world.settings.world_type.name())?;
         writeln!(file, "hostname={}", world.settings.hostname)?;
@@ -6136,6 +6165,8 @@ fn load_reload_state(app: &mut App) -> io::Result<bool> {
         scroll_offset: usize,
         connected: bool,
         socket_fd: Option<RawFd>,
+        proxy_pid: Option<u32>,
+        proxy_socket_path: Option<PathBuf>,
         unseen_lines: usize,
         paused: bool,
         pending_lines: Vec<OutputLine>,
@@ -6207,6 +6238,8 @@ fn load_reload_state(app: &mut App) -> io::Result<bool> {
                         scroll_offset: 0,
                         connected: false,
                         socket_fd: None,
+                        proxy_pid: None,
+                        proxy_socket_path: None,
                         unseen_lines: 0,
                         paused: false,
                         pending_lines: Vec::new(),
@@ -6452,6 +6485,8 @@ fn load_reload_state(app: &mut App) -> io::Result<bool> {
                                 tw.prompt = if p.is_empty() { p } else { format!("{} ", p.trim_end()) };
                             }
                             "socket_fd" => tw.socket_fd = value.parse().ok(),
+                            "proxy_pid" => tw.proxy_pid = value.parse().ok(),
+                            "proxy_socket_path" => tw.proxy_socket_path = Some(PathBuf::from(value)),
                             "world_type" => tw.settings.world_type = WorldType::from_name(value),
                             "hostname" => tw.settings.hostname = value.to_string(),
                             "port" => tw.settings.port = value.to_string(),
@@ -6528,6 +6563,8 @@ fn load_reload_state(app: &mut App) -> io::Result<bool> {
         world.uses_wont_echo_prompt = tw.uses_wont_echo_prompt;
         world.prompt = tw.prompt;
         world.socket_fd = tw.socket_fd;
+        world.proxy_pid = tw.proxy_pid;
+        world.proxy_socket_path = tw.proxy_socket_path;
         world.settings = tw.settings;
         // Leave timing fields as None for connected worlds after reload
         // This triggers immediate keepalive since we don't know how long connection was idle
@@ -6561,6 +6598,261 @@ fn clear_cloexec(fd: RawFd) -> io::Result<()> {
         }
     }
     Ok(())
+}
+
+/// Check if a process with the given PID is still alive
+fn is_process_alive(pid: u32) -> bool {
+    // Use waitpid with WNOHANG to check without blocking
+    // A return of 0 means the process is still running
+    // A return of -1 with ECHILD means the process doesn't exist (not our child)
+    // Use kill with signal 0 instead - this works for any process we can signal
+    unsafe {
+        libc::kill(pid as libc::pid_t, 0) == 0
+    }
+}
+
+/// Generate a unique socket path for the TLS proxy
+fn get_proxy_socket_path(world_name: &str) -> PathBuf {
+    let sanitized_name = world_name
+        .chars()
+        .map(|c| if c.is_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
+        .collect::<String>();
+    PathBuf::from(format!(
+        "/tmp/clay-tls-{}-{}.sock",
+        std::process::id(),
+        sanitized_name
+    ))
+}
+
+/// Spawn a TLS proxy process for a world connection.
+/// Returns (proxy_pid, socket_path) on success.
+/// The proxy process handles the TLS connection to the MUD server and exposes
+/// a Unix socket for the main client to connect to.
+fn spawn_tls_proxy(
+    world_name: &str,
+    host: &str,
+    port: &str,
+) -> io::Result<(u32, PathBuf)> {
+    let socket_path = get_proxy_socket_path(world_name);
+    let host = host.to_string();
+    let port = port.to_string();
+
+    // Remove any existing socket file
+    let _ = std::fs::remove_file(&socket_path);
+
+    // Fork the process
+    let pid = unsafe { libc::fork() };
+
+    match pid {
+        -1 => {
+            // Fork failed
+            Err(io::Error::last_os_error())
+        }
+        0 => {
+            // Child process - run the TLS proxy
+            // Ignore SIGHUP so we survive terminal close
+            unsafe {
+                libc::signal(libc::SIGHUP, libc::SIG_IGN);
+            }
+
+            // Create a new session to detach from terminal
+            unsafe {
+                libc::setsid();
+            }
+
+            // Run the proxy (this blocks and handles the connection)
+            run_tls_proxy(&host, &port, &socket_path);
+
+            // If we return, exit the child process
+            std::process::exit(0);
+        }
+        child_pid => {
+            // Parent process - wait for socket to appear
+            let child_pid = child_pid as u32;
+
+            // Wait up to 10 seconds for the socket to appear
+            let start = std::time::Instant::now();
+            let timeout = std::time::Duration::from_secs(10);
+
+            while start.elapsed() < timeout {
+                if socket_path.exists() {
+                    // Socket exists, proxy is ready
+                    return Ok((child_pid, socket_path));
+                }
+
+                // Check if child process died
+                let mut status: libc::c_int = 0;
+                let result = unsafe {
+                    libc::waitpid(child_pid as libc::pid_t, &mut status, libc::WNOHANG)
+                };
+
+                if result == child_pid as libc::pid_t {
+                    // Child exited
+                    return Err(io::Error::new(
+                        io::ErrorKind::Other,
+                        "TLS proxy process exited unexpectedly",
+                    ));
+                }
+
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+
+            // Timeout - kill the child and return error
+            unsafe {
+                libc::kill(child_pid as libc::pid_t, libc::SIGTERM);
+            }
+            Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "TLS proxy socket not created in time",
+            ))
+        }
+    }
+}
+
+/// Run the TLS proxy main loop (called in child process after fork).
+/// This function creates its own tokio runtime and blocks.
+fn run_tls_proxy(host: &str, port: &str, socket_path: &PathBuf) {
+    // Create a new runtime for this proxy process
+    let rt = match tokio::runtime::Runtime::new() {
+        Ok(rt) => rt,
+        Err(_) => return,
+    };
+
+    rt.block_on(async {
+        run_tls_proxy_async(host, port, socket_path).await;
+    });
+}
+
+/// Async implementation of the TLS proxy main loop
+async fn run_tls_proxy_async(host: &str, port: &str, socket_path: &PathBuf) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::{TcpStream, UnixListener};
+
+    // Step 1: Connect to the MUD server with TLS
+    let tcp_stream = match TcpStream::connect(format!("{}:{}", host, port)).await {
+        Ok(s) => s,
+        Err(_) => return,
+    };
+
+    // Establish TLS connection
+    #[cfg(feature = "rustls-backend")]
+    let tls_stream = {
+        use std::sync::Arc;
+        use rustls::RootCertStore;
+        use tokio_rustls::TlsConnector;
+        use rustls::pki_types::ServerName;
+
+        // Create a config that accepts invalid certs (common for MUD servers)
+        let mut root_store = RootCertStore::empty();
+        root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+
+        let config = match rustls::ClientConfig::builder()
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(danger::NoCertificateVerification::new()))
+            .with_no_client_auth()
+            .try_into()
+        {
+            Ok(c) => c,
+            Err(_) => return,
+        };
+
+        let connector = TlsConnector::from(Arc::new(config));
+        let server_name = match ServerName::try_from(host.to_string()) {
+            Ok(sn) => sn,
+            Err(_) => return,
+        };
+
+        match connector.connect(server_name, tcp_stream).await {
+            Ok(s) => s,
+            Err(_) => return,
+        }
+    };
+
+    #[cfg(feature = "native-tls-backend")]
+    let tls_stream = {
+        let connector = match native_tls::TlsConnector::builder()
+            .danger_accept_invalid_certs(true)
+            .build()
+        {
+            Ok(c) => c,
+            Err(_) => return,
+        };
+        let connector = tokio_native_tls::TlsConnector::from(connector);
+
+        match connector.connect(host, tcp_stream).await {
+            Ok(s) => s,
+            Err(_) => return,
+        }
+    };
+
+    #[cfg(not(any(feature = "native-tls-backend", feature = "rustls-backend")))]
+    {
+        // No TLS backend available
+        return;
+    }
+
+    // Step 2: Create Unix socket listener
+    // Set socket permissions to owner-only (0600)
+    let listener = match UnixListener::bind(socket_path) {
+        Ok(l) => l,
+        Err(_) => return,
+    };
+
+    // Try to set restrictive permissions on the socket
+    let _ = std::fs::set_permissions(socket_path, std::fs::Permissions::from_mode(0o600));
+
+    // Step 3: Accept client connection (wait for main process to connect)
+    let (client_stream, _) = match listener.accept().await {
+        Ok(s) => s,
+        Err(_) => {
+            let _ = std::fs::remove_file(socket_path);
+            return;
+        }
+    };
+
+    // Step 4: Bidirectional relay between client and TLS server
+    let (mut tls_read, mut tls_write) = tokio::io::split(tls_stream);
+    let (mut client_read, mut client_write) = client_stream.into_split();
+
+    // Relay tasks
+    let client_to_tls = async {
+        let mut buf = [0u8; 8192];
+        loop {
+            match client_read.read(&mut buf).await {
+                Ok(0) => break, // Client disconnected
+                Ok(n) => {
+                    if tls_write.write_all(&buf[..n]).await.is_err() {
+                        break;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+    };
+
+    let tls_to_client = async {
+        let mut buf = [0u8; 8192];
+        loop {
+            match tls_read.read(&mut buf).await {
+                Ok(0) => break, // Server disconnected
+                Ok(n) => {
+                    if client_write.write_all(&buf[..n]).await.is_err() {
+                        break;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+    };
+
+    // Run both relay directions concurrently, exit when either finishes
+    tokio::select! {
+        _ = client_to_tls => {}
+        _ = tls_to_client => {}
+    }
+
+    // Clean up socket file
+    let _ = std::fs::remove_file(socket_path);
 }
 
 /// Strip " (deleted)" suffix from a path string if present.
@@ -7056,6 +7348,8 @@ mod remote_gui {
         original_transparency: Option<f32>,
         /// ANSI music enabled
         ansi_music_enabled: bool,
+        /// TLS proxy enabled (for connection preservation over hot reload)
+        tls_proxy_enabled: bool,
         /// Audio output stream (must stay alive for audio to play)
         #[cfg(feature = "rodio")]
         audio_stream: Option<rodio::OutputStream>,
@@ -7218,6 +7512,7 @@ mod remote_gui {
                 transparency: 1.0,
                 original_transparency: None,
                 ansi_music_enabled: true,
+                tls_proxy_enabled: false,
                 #[cfg(feature = "rodio")]
                 audio_stream: None,
                 #[cfg(feature = "rodio")]
@@ -7500,6 +7795,8 @@ mod remote_gui {
                             }
                         }
                         WsMessage::InitialState { worlds, current_world_index, settings, actions, .. } => {
+                            // Track if this is first InitialState or a resync
+                            let is_resync = !self.worlds.is_empty();
                             self.worlds = worlds.into_iter().map(|w| {
                                 // Calculate pending count before moving pending_lines
                                 let pending_count = if !w.pending_lines_ts.is_empty() {
@@ -7548,7 +7845,13 @@ mod remote_gui {
                                 last_nop_secs: w.last_nop_secs,
                                 partial_line: String::new(),
                             }}).collect();
-                            self.current_world = current_world_index;
+                            // On first InitialState, use server's world index
+                            // On resync, preserve current world (bounded by new world count)
+                            if !is_resync {
+                                self.current_world = current_world_index;
+                            } else if self.current_world >= self.worlds.len() {
+                                self.current_world = self.worlds.len().saturating_sub(1);
+                            }
                             self.console_theme = GuiTheme::from_name(&settings.console_theme);
                             self.theme = GuiTheme::from_name(&settings.gui_theme);
                             self.font_name = settings.font_name;
@@ -7568,6 +7871,7 @@ mod remote_gui {
                             self.spell_check_enabled = settings.spell_check_enabled;
                             self.show_tags = settings.show_tags;
                             self.ansi_music_enabled = settings.ansi_music_enabled;
+                            self.tls_proxy_enabled = settings.tls_proxy_enabled;
                             self.actions = actions;
                         }
                         WsMessage::ServerData { world_index, data, is_viewed: _, ts } => {
@@ -7703,6 +8007,7 @@ mod remote_gui {
                             self.spell_check_enabled = settings.spell_check_enabled;
                             self.show_tags = settings.show_tags;
                             self.ansi_music_enabled = settings.ansi_music_enabled;
+                            self.tls_proxy_enabled = settings.tls_proxy_enabled;
                         }
                         WsMessage::PendingLinesUpdate { world_index, count } => {
                             // Update pending count for world
@@ -8142,6 +8447,7 @@ mod remote_gui {
                     ws_port: self.ws_port,
                     ws_cert_file: self.ws_cert_file.clone(),
                     ws_key_file: self.ws_key_file.clone(),
+                    tls_proxy_enabled: self.tls_proxy_enabled,
                 });
             }
         }
@@ -11635,6 +11941,7 @@ mod remote_gui {
                     let debug_enabled = self.debug_enabled;
                     let mut show_tags = self.show_tags;
                     let mut ansi_music = self.ansi_music_enabled;
+                    let mut tls_proxy = self.tls_proxy_enabled;
                     let mut input_height = self.input_height;
                     let mut gui_theme = self.theme;
                     let mut transparency = self.transparency;
@@ -12005,6 +12312,20 @@ mod remote_gui {
                                         ui.painter().circle_filled(egui::pos2(knob_x, switch_rect.center().y), 7.0, knob_color);
                                         if response.clicked() { ansi_music = !ansi_music; }
                                     });
+
+                                    // TLS Proxy
+                                    form_row(ui, "TLS Proxy", &mut |ui| {
+                                        let switch_width = 44.0;
+                                        let switch_height = 22.0;
+                                        let switch_rect = ui.allocate_space(egui::vec2(switch_width, switch_height)).1;
+                                        let response = ui.interact(switch_rect, ui.id().with("tls_proxy_toggle"), egui::Sense::click());
+                                        let track_color = if tls_proxy { theme.accent_dim() } else { theme.bg_deep() };
+                                        ui.painter().rect_filled(switch_rect, egui::Rounding::same(11.0), track_color);
+                                        let knob_x = if tls_proxy { switch_rect.right() - 11.0 } else { switch_rect.left() + 11.0 };
+                                        let knob_color = if tls_proxy { theme.accent() } else { theme.fg_muted() };
+                                        ui.painter().circle_filled(egui::pos2(knob_x, switch_rect.center().y), 7.0, knob_color);
+                                        if response.clicked() { tls_proxy = !tls_proxy; }
+                                    });
                             });
                         },
                     );
@@ -12016,6 +12337,7 @@ mod remote_gui {
                     self.debug_enabled = debug_enabled;
                     self.show_tags = show_tags;
                     self.ansi_music_enabled = ansi_music;
+                    self.tls_proxy_enabled = tls_proxy;
                     self.input_height = input_height;
                     self.theme = gui_theme;
                     self.transparency = transparency;
@@ -14384,6 +14706,7 @@ fn build_multiuser_initial_state(app: &App, username: &str) -> WsMessage {
         ws_port: app.settings.ws_port,
         ws_cert_file: app.settings.websocket_cert_file.clone(),
         ws_key_file: app.settings.websocket_key_file.clone(),
+        tls_proxy_enabled: app.settings.tls_proxy_enabled,
     };
 
     // Find current world index for this user
@@ -14778,15 +15101,16 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
 
     // If in reload or crash recovery mode, reconstruct connections from saved fds
     if should_load_state {
-        // First pass: identify TLS worlds that need to be disconnected
+        // First pass: identify TLS worlds WITHOUT proxy that need to be disconnected
+        // TLS worlds WITH proxy will be reconnected via Unix socket
         let mut tls_disconnect_worlds: Vec<usize> = Vec::new();
         for (world_idx, world) in app.worlds.iter().enumerate() {
-            if world.connected && world.is_tls {
+            if world.connected && world.is_tls && world.proxy_pid.is_none() {
                 tls_disconnect_worlds.push(world_idx);
             }
         }
 
-        // Disconnect TLS worlds
+        // Disconnect TLS worlds without proxy
         let tls_msg = if is_crash {
             "TLS connection was closed during crash recovery. Use /worlds to reconnect."
         } else {
@@ -14951,6 +15275,99 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                         }
                     }
                 });
+            }
+        }
+
+        // Third pass: reconnect to TLS proxy connections
+        for world_idx in 0..app.worlds.len() {
+            let world = &app.worlds[world_idx];
+            if world.connected && world.is_tls && world.proxy_pid.is_some() {
+                let proxy_pid = world.proxy_pid.unwrap();
+                let socket_path = world.proxy_socket_path.clone();
+
+                // Check if proxy is still alive and socket exists
+                if !is_process_alive(proxy_pid) || socket_path.is_none() || !socket_path.as_ref().unwrap().exists() {
+                    // Proxy died, mark disconnected
+                    app.worlds[world_idx].connected = false;
+                    app.worlds[world_idx].proxy_pid = None;
+                    app.worlds[world_idx].proxy_socket_path = None;
+                    app.worlds[world_idx].output_lines.push(OutputLine::new(
+                        "TLS proxy terminated during reload. Use /worlds to reconnect.".to_string()
+                    ));
+                    continue;
+                }
+
+                let socket_path = socket_path.unwrap();
+
+                // Reconnect to proxy via Unix socket
+                match tokio::net::UnixStream::connect(&socket_path).await {
+                    Ok(unix_stream) => {
+                        let (r, w) = unix_stream.into_split();
+                        let mut read_half = StreamReader::Proxy(r);
+                        let mut write_half = StreamWriter::Proxy(w);
+
+                        let (cmd_tx, mut cmd_rx) = mpsc::channel::<WriteCommand>(100);
+                        app.worlds[world_idx].command_tx = Some(cmd_tx.clone());
+                        app.worlds[world_idx].skip_auto_login = true;
+
+                        // Re-open log file if enabled
+                        app.worlds[world_idx].open_log_file();
+
+                        let world_name = app.worlds[world_idx].name.clone();
+
+                        // Spawn reader task (simplified since proxy handles TLS)
+                        let event_tx_read = event_tx.clone();
+                        tokio::spawn(async move {
+                            let mut buf = [0u8; 4096];
+                            loop {
+                                match tokio::io::AsyncReadExt::read(&mut read_half, &mut buf).await {
+                                    Ok(0) => {
+                                        let _ = event_tx_read.send(AppEvent::Disconnected(world_name.clone())).await;
+                                        break;
+                                    }
+                                    Ok(n) => {
+                                        let _ = event_tx_read.send(AppEvent::ServerData(world_name.clone(), buf[..n].to_vec())).await;
+                                    }
+                                    Err(_) => {
+                                        let _ = event_tx_read.send(AppEvent::Disconnected(world_name.clone())).await;
+                                        break;
+                                    }
+                                }
+                            }
+                        });
+
+                        // Spawn writer task
+                        tokio::spawn(async move {
+                            while let Some(cmd) = cmd_rx.recv().await {
+                                let bytes = match &cmd {
+                                    WriteCommand::Text(text) => {
+                                        let mut b = text.as_bytes().to_vec();
+                                        b.extend_from_slice(b"\r\n");
+                                        b
+                                    }
+                                    WriteCommand::Raw(raw) => raw.clone(),
+                                    WriteCommand::Shutdown => break,
+                                };
+                                if tokio::io::AsyncWriteExt::write_all(&mut write_half, &bytes).await.is_err() {
+                                    break;
+                                }
+                            }
+                        });
+
+                        app.worlds[world_idx].output_lines.push(OutputLine::new(
+                            "TLS connection restored via proxy.".to_string()
+                        ));
+                    }
+                    Err(e) => {
+                        // Failed to reconnect
+                        app.worlds[world_idx].connected = false;
+                        app.worlds[world_idx].proxy_pid = None;
+                        app.worlds[world_idx].proxy_socket_path = None;
+                        app.worlds[world_idx].output_lines.push(OutputLine::new(
+                            format!("Failed to reconnect to TLS proxy: {}. Use /worlds to reconnect.", e)
+                        ));
+                    }
+                }
             }
         }
 
@@ -15883,6 +16300,15 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                     Command::Disconnect => {
                                         // Disconnect the specified world
                                         if world_index < app.worlds.len() && app.worlds[world_index].connected {
+                                            // Kill proxy process if one exists
+                                            if let Some(proxy_pid) = app.worlds[world_index].proxy_pid {
+                                                unsafe { libc::kill(proxy_pid as libc::pid_t, libc::SIGTERM); }
+                                            }
+                                            if let Some(ref socket_path) = app.worlds[world_index].proxy_socket_path {
+                                                let _ = std::fs::remove_file(socket_path);
+                                            }
+                                            app.worlds[world_index].proxy_pid = None;
+                                            app.worlds[world_index].proxy_socket_path = None;
                                             app.worlds[world_index].command_tx = None;
                                             app.worlds[world_index].connected = false;
                                             app.worlds[world_index].socket_fd = None;
@@ -16231,7 +16657,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                     });
                                 }
                             }
-                            WsMessage::UpdateGlobalSettings { more_mode_enabled, spell_check_enabled, world_switch_mode, show_tags, ansi_music_enabled, console_theme, gui_theme, gui_transparency, input_height, font_name, font_size, ws_allow_list, web_secure, http_enabled, http_port, ws_enabled, ws_port, ws_cert_file, ws_key_file } => {
+                            WsMessage::UpdateGlobalSettings { more_mode_enabled, spell_check_enabled, world_switch_mode, show_tags, ansi_music_enabled, console_theme, gui_theme, gui_transparency, input_height, font_name, font_size, ws_allow_list, web_secure, http_enabled, http_port, ws_enabled, ws_port, ws_cert_file, ws_key_file, tls_proxy_enabled } => {
                                 // Update global settings from remote client
                                 app.settings.more_mode_enabled = more_mode_enabled;
                                 app.settings.spell_check_enabled = spell_check_enabled;
@@ -16260,6 +16686,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                 app.settings.ws_port = ws_port;
                                 app.settings.websocket_cert_file = ws_cert_file;
                                 app.settings.websocket_key_file = ws_key_file;
+                                app.settings.tls_proxy_enabled = tls_proxy_enabled;
                                 // Save settings to persist changes
                                 let _ = save_settings(&app);
                                 // Build settings message for broadcast
@@ -16284,6 +16711,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                     ws_port: app.settings.ws_port,
                                     ws_cert_file: app.settings.websocket_cert_file.clone(),
                                     ws_key_file: app.settings.websocket_key_file.clone(),
+                                    tls_proxy_enabled: app.settings.tls_proxy_enabled,
                                 };
                                 // Broadcast update to all clients
                                 app.ws_broadcast(WsMessage::GlobalSettingsUpdated {
@@ -16432,6 +16860,22 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                         world.last_nop_time = Some(now);
                                     }
                                 }
+                            }
+                        }
+                    }
+                }
+
+                // Check proxy health for TLS proxy connections
+                for world in &mut app.worlds {
+                    if world.connected {
+                        if let Some(proxy_pid) = world.proxy_pid {
+                            if !is_process_alive(proxy_pid) {
+                                // Proxy died - mark world as disconnected
+                                world.connected = false;
+                                world.command_tx = None;
+                                world.proxy_pid = None;
+                                world.proxy_socket_path = None;
+                                world.output_lines.push(OutputLine::new("TLS proxy terminated. Connection lost.".to_string()));
                             }
                         }
                     }
@@ -16980,6 +17424,15 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                 Command::Disconnect => {
                                     // Disconnect the specified world
                                     if world_index < app.worlds.len() && app.worlds[world_index].connected {
+                                        // Kill proxy process if one exists
+                                        if let Some(proxy_pid) = app.worlds[world_index].proxy_pid {
+                                            unsafe { libc::kill(proxy_pid as libc::pid_t, libc::SIGTERM); }
+                                        }
+                                        if let Some(ref socket_path) = app.worlds[world_index].proxy_socket_path {
+                                            let _ = std::fs::remove_file(socket_path);
+                                        }
+                                        app.worlds[world_index].proxy_pid = None;
+                                        app.worlds[world_index].proxy_socket_path = None;
                                         app.worlds[world_index].command_tx = None;
                                         app.worlds[world_index].connected = false;
                                         app.worlds[world_index].socket_fd = None;
@@ -17203,7 +17656,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                 app.ws_broadcast(WsMessage::WorldSettingsUpdated { world_index, settings: settings_msg, name });
                             }
                         }
-                        WsMessage::UpdateGlobalSettings { more_mode_enabled, spell_check_enabled, world_switch_mode, show_tags, ansi_music_enabled, console_theme, gui_theme, gui_transparency, input_height, font_name, font_size, ws_allow_list, web_secure, http_enabled, http_port, ws_enabled, ws_port, ws_cert_file, ws_key_file } => {
+                        WsMessage::UpdateGlobalSettings { more_mode_enabled, spell_check_enabled, world_switch_mode, show_tags, ansi_music_enabled, console_theme, gui_theme, gui_transparency, input_height, font_name, font_size, ws_allow_list, web_secure, http_enabled, http_port, ws_enabled, ws_port, ws_cert_file, ws_key_file, tls_proxy_enabled } => {
                             app.settings.more_mode_enabled = more_mode_enabled;
                             app.settings.spell_check_enabled = spell_check_enabled;
                             app.settings.world_switch_mode = WorldSwitchMode::from_name(&world_switch_mode);
@@ -17227,6 +17680,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                             app.settings.ws_port = ws_port;
                             app.settings.websocket_cert_file = ws_cert_file;
                             app.settings.websocket_key_file = ws_key_file;
+                            app.settings.tls_proxy_enabled = tls_proxy_enabled;
                             let _ = save_settings(&app);
                             let settings_msg = GlobalSettingsMsg {
                                 more_mode_enabled: app.settings.more_mode_enabled,
@@ -17249,6 +17703,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                 ws_port: app.settings.ws_port,
                                 ws_cert_file: app.settings.websocket_cert_file.clone(),
                                 ws_key_file: app.settings.websocket_key_file.clone(),
+                                tls_proxy_enabled: app.settings.tls_proxy_enabled,
                             };
                             app.ws_broadcast(WsMessage::GlobalSettingsUpdated { settings: settings_msg, input_height: app.input_height });
                         }
@@ -19663,10 +20118,115 @@ async fn handle_command(cmd: &str, app: &mut App, event_tx: mpsc::Sender<AppEven
                 return false;
             };
 
-            let ssl_msg = if use_ssl { " with SSL" } else { "" };
+            // Check if using TLS proxy for connection preservation
+            let use_tls_proxy = use_ssl && app.settings.tls_proxy_enabled;
+
+            let ssl_msg = if use_ssl {
+                if use_tls_proxy { " with SSL (via proxy)" } else { " with SSL" }
+            } else { "" };
             app.add_output("");
             app.add_output(&format!("Connecting to {}:{}{}...", host, port, ssl_msg));
             app.add_output("");
+
+            // Handle TLS proxy case separately (proxy does its own TCP connect)
+            if use_tls_proxy {
+                let world_name = app.current_world().name.clone();
+                match spawn_tls_proxy(&world_name, &host, &port) {
+                    Ok((proxy_pid, socket_path)) => {
+                        // Connect to the proxy via Unix socket
+                        match tokio::net::UnixStream::connect(&socket_path).await {
+                            Ok(unix_stream) => {
+                                app.add_output("SSL connection established via proxy.");
+                                app.current_world_mut().socket_fd = None;  // Can't preserve TLS fd directly
+                                app.current_world_mut().is_tls = true;
+                                app.current_world_mut().proxy_pid = Some(proxy_pid);
+                                app.current_world_mut().proxy_socket_path = Some(socket_path);
+
+                                let (r, w) = unix_stream.into_split();
+                                let mut read_half = StreamReader::Proxy(r);
+                                let mut write_half = StreamWriter::Proxy(w);
+
+                                app.current_world_mut().connected = true;
+                                app.current_world_mut().was_connected = true;
+                                app.current_world_mut().prompt_count = 0;
+                                let now = std::time::Instant::now();
+                                app.current_world_mut().last_send_time = Some(now);
+                                app.current_world_mut().last_receive_time = Some(now);
+                                app.current_world_mut().is_initial_world = false;
+                                app.discard_initial_world();
+
+                                let world_name = app.current_world().name.clone();
+
+                                // Open log file if enabled
+                                if app.current_world().settings.log_enabled {
+                                    if app.current_world_mut().open_log_file() {
+                                        let log_path = app.current_world().get_log_path();
+                                        app.add_output(&format!("Logging to: {}", log_path.display()));
+                                    } else {
+                                        app.add_output("Warning: Could not open log file");
+                                    }
+                                }
+
+                                // Start reader task (similar to the regular connection flow)
+                                let event_tx_read = event_tx.clone();
+                                let read_world_name = world_name.clone();
+                                tokio::spawn(async move {
+                                    let mut buf = [0u8; 4096];
+                                    loop {
+                                        match tokio::io::AsyncReadExt::read(&mut read_half, &mut buf).await {
+                                            Ok(0) => {
+                                                let _ = event_tx_read.send(AppEvent::Disconnected(read_world_name.clone())).await;
+                                                break;
+                                            }
+                                            Ok(n) => {
+                                                let _ = event_tx_read.send(AppEvent::ServerData(read_world_name.clone(), buf[..n].to_vec())).await;
+                                            }
+                                            Err(_) => {
+                                                let _ = event_tx_read.send(AppEvent::Disconnected(read_world_name.clone())).await;
+                                                break;
+                                            }
+                                        }
+                                    }
+                                });
+
+                                // Setup writer channel
+                                let (cmd_tx, mut cmd_rx) = mpsc::channel::<WriteCommand>(100);
+                                app.current_world_mut().command_tx = Some(cmd_tx);
+
+                                tokio::spawn(async move {
+                                    while let Some(cmd) = cmd_rx.recv().await {
+                                        let bytes = match &cmd {
+                                            WriteCommand::Text(text) => {
+                                                let mut b = text.as_bytes().to_vec();
+                                                b.extend_from_slice(b"\r\n");
+                                                b
+                                            }
+                                            WriteCommand::Raw(raw) => raw.clone(),
+                                            WriteCommand::Shutdown => break,
+                                        };
+                                        if tokio::io::AsyncWriteExt::write_all(&mut write_half, &bytes).await.is_err() {
+                                            break;
+                                        }
+                                    }
+                                });
+
+                                return true;
+                            }
+                            Err(e) => {
+                                app.add_output(&format!("Failed to connect to TLS proxy: {}", e));
+                                // Kill the proxy process
+                                unsafe { libc::kill(proxy_pid as libc::pid_t, libc::SIGTERM); }
+                                return false;
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        app.add_output(&format!("Failed to spawn TLS proxy: {}", e));
+                        app.add_output("Falling back to direct TLS connection...");
+                        // Fall through to direct TLS connection below
+                    }
+                }
+            }
 
             match TcpStream::connect(format!("{}:{}", host, port)).await {
                 Ok(tcp_stream) => {
@@ -19946,6 +20506,15 @@ async fn handle_command(cmd: &str, app: &mut App, event_tx: mpsc::Sender<AppEven
         }
         Command::Disconnect => {
             if app.current_world().connected {
+                // Kill proxy process if one exists
+                if let Some(proxy_pid) = app.current_world().proxy_pid {
+                    unsafe { libc::kill(proxy_pid as libc::pid_t, libc::SIGTERM); }
+                }
+                if let Some(ref socket_path) = app.current_world().proxy_socket_path {
+                    let _ = std::fs::remove_file(socket_path);
+                }
+                app.current_world_mut().proxy_pid = None;
+                app.current_world_mut().proxy_socket_path = None;
                 app.current_world_mut().command_tx = None;
                 app.current_world_mut().connected = false;
                 app.current_world_mut().socket_fd = None;
@@ -21400,6 +21969,7 @@ fn render_settings_popup(f: &mut Frame, app: &App) {
                     field_style(SettingsField::GuiTheme),
                 ),
             ]),
+            render_toggle_field("TLS Proxy:", popup.temp_tls_proxy_enabled, SettingsField::TLSProxy, w),
             Line::from(""),
             Line::from(vec![
                 render_button("Save", SettingsField::SaveSetup),

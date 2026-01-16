@@ -134,6 +134,7 @@ pub enum WsMessage {
         ws_port: u16,
         ws_cert_file: String,
         ws_key_file: String,
+        tls_proxy_enabled: bool,
     },
 
     // Settings update confirmations (server -> client)
@@ -239,6 +240,8 @@ pub struct GlobalSettingsMsg {
     pub ws_port: u16,
     pub ws_cert_file: String,
     pub ws_key_file: String,
+    #[serde(default)]
+    pub tls_proxy_enabled: bool,
 }
 
 fn default_gui_transparency() -> f32 {

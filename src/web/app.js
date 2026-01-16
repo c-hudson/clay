@@ -154,6 +154,7 @@
         setupMoreModeToggle: document.getElementById('setup-more-mode-toggle'),
         setupShowTagsToggle: document.getElementById('setup-show-tags-toggle'),
         setupAnsiMusicToggle: document.getElementById('setup-ansi-music-toggle'),
+        setupTlsProxyToggle: document.getElementById('setup-tls-proxy-toggle'),
         setupWorldSwitchSelect: document.getElementById('setup-world-switch-select'),
         setupInputHeightValue: document.getElementById('setup-input-height-value'),
         setupHeightMinus: document.getElementById('setup-height-minus'),
@@ -245,6 +246,7 @@
     let setupWorldSwitchMode = 'Unseen First';
     let setupShowTags = false;
     let setupAnsiMusic = true;
+    let setupTlsProxy = false;
     let setupInputHeightValue = 1;
     let setupGuiTheme = 'dark';
 
@@ -282,6 +284,7 @@
     // ANSI Music audio context (lazily initialized)
     let audioContext = null;
     let ansiMusicEnabled = true;  // Will be synced from server settings
+    let tlsProxyEnabled = false;  // TLS proxy for connection preservation over hot reload
 
     // ============================================================================
     // Theme Application
@@ -787,6 +790,9 @@
                     if (msg.settings.ansi_music_enabled !== undefined) {
                         ansiMusicEnabled = msg.settings.ansi_music_enabled;
                     }
+                    if (msg.settings.tls_proxy_enabled !== undefined) {
+                        tlsProxyEnabled = msg.settings.tls_proxy_enabled;
+                    }
                     // Web settings
                     if (msg.settings.web_secure !== undefined) {
                         webSecure = msg.settings.web_secure;
@@ -971,6 +977,9 @@
                     }
                     if (msg.settings.ansi_music_enabled !== undefined) {
                         ansiMusicEnabled = msg.settings.ansi_music_enabled;
+                    }
+                    if (msg.settings.tls_proxy_enabled !== undefined) {
+                        tlsProxyEnabled = msg.settings.tls_proxy_enabled;
                     }
                     if (msg.settings.world_switch_mode !== undefined) {
                         worldSwitchMode = msg.settings.world_switch_mode;
@@ -2523,6 +2532,7 @@
         setupWorldSwitchMode = worldSwitchMode;
         setupShowTags = showTags;
         setupAnsiMusic = ansiMusicEnabled;
+        setupTlsProxy = tlsProxyEnabled;
         setupInputHeightValue = inputHeight;
         setupGuiTheme = guiTheme;
         elements.setupModal.className = 'modal visible';
@@ -2554,6 +2564,11 @@
         } else {
             elements.setupAnsiMusicToggle.classList.remove('active');
         }
+        if (setupTlsProxy) {
+            elements.setupTlsProxyToggle.classList.add('active');
+        } else {
+            elements.setupTlsProxyToggle.classList.remove('active');
+        }
         // World switching dropdown
         elements.setupWorldSwitchSelect.value = setupWorldSwitchMode;
         // Input height stepper
@@ -2572,6 +2587,7 @@
         worldSwitchMode = setupWorldSwitchMode;
         showTags = setupShowTags;
         ansiMusicEnabled = setupAnsiMusic;
+        tlsProxyEnabled = setupTlsProxy;
         guiTheme = setupGuiTheme;
         applyTheme(guiTheme);
         setInputHeight(setupInputHeightValue);
@@ -2600,7 +2616,8 @@
             ws_enabled: wsEnabled,
             ws_port: wsPort,
             ws_cert_file: wsCertFile,
-            ws_key_file: wsKeyFile
+            ws_key_file: wsKeyFile,
+            tls_proxy_enabled: tlsProxyEnabled
         });
 
         closeSetupPopup();
@@ -4376,6 +4393,10 @@
         };
         elements.setupAnsiMusicToggle.onclick = function() {
             setupAnsiMusic = !setupAnsiMusic;
+            updateSetupPopupUI();
+        };
+        elements.setupTlsProxyToggle.onclick = function() {
+            setupTlsProxy = !setupTlsProxy;
             updateSetupPopupUI();
         };
         elements.setupWorldSwitchSelect.onchange = function() {

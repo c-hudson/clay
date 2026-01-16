@@ -146,6 +146,36 @@ Encoding is configurable per-world in the world settings popup.
 - `StreamReader`/`StreamWriter` enums wrap both plain TCP and TLS streams
 - Implements `AsyncRead`/`AsyncWrite` traits for unified handling
 
+### TLS Proxy (Optional)
+
+When enabled, TLS connections use a proxy process to preserve connections across hot reloads.
+
+**Problem:** TLS encryption state (session keys, IVs, sequence numbers) exists only in process memory. When `exec()` replaces the process during hot reload, this state is lost even though the underlying TCP socket fd can survive.
+
+**Solution:** A forked child process handles TLS, communicating with the main process via Unix socket:
+
+```
+MUD Server (TLS) <--TLS--> TLS Proxy (child) <--Unix Socket--> Main Client
+```
+
+**Configuration:**
+- Toggle "TLS Proxy" in Global Settings (`/setup`) - default: disabled
+- When enabled, new TLS connections spawn a proxy process
+- Proxy process survives `exec()` and reconnects after reload
+
+**Behavior:**
+- Proxy spawns on TLS connect, dies on disconnect or main client exit
+- Socket path: `/tmp/clay-tls-<pid>-<world_name>.sock`
+- Proxy PID and socket path saved/restored during reload
+- Health monitoring detects proxy death and marks world disconnected
+- Falls back to direct TLS if proxy spawn fails
+
+**Implementation:**
+- `spawn_tls_proxy()` - Forks child process
+- `run_tls_proxy()` - Child main loop (TLS ↔ Unix socket relay)
+- `StreamReader::Proxy` / `StreamWriter::Proxy` - Unix socket variants
+- Proxy state saved in reload: `proxy_pid`, `proxy_socket_path`
+
 ### File Logging
 
 - Configure log file path in world settings popup
@@ -340,8 +370,8 @@ Works with updated binaries: On Linux, when the binary is rebuilt while running,
 - Send SIGUSR1 signal: `kill -USR1 $(pgrep clay)`
 
 **Limitations:**
-- TLS/SSL connections cannot be preserved (TLS state is in userspace)
-- TLS connections will be closed and need manual reconnection after reload
+- TLS/SSL connections: By default, TLS connections cannot be preserved (TLS state is in userspace) and will need manual reconnection after reload
+- Enable "TLS Proxy" in `/setup` to preserve TLS connections across reload (uses forked proxy process)
 - Requires the new binary to be compatible with the state format
 
 **Use cases:**
