@@ -1862,7 +1862,7 @@
     // Must be applied BEFORE parseAnsi (on raw text, not HTML)
     function insertWordBreaks(text) {
         const ZWSP = '\u200B'; // Zero-width space
-        const BREAK_CHARS = ['[', ']', '(', ')', ',', '\\', '/', '-', '&', '=', '?', ' '];
+        const BREAK_CHARS = ['[', ']', '(', ')', ',', '\\', '/', '-', '&', '=', '?', '.', ';', ' '];
         const MIN_WORD_LEN = 15;
 
         let result = '';

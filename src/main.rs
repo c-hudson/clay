@@ -8717,7 +8717,7 @@ mod remote_gui {
         /// Skips ANSI escape sequences to avoid corrupting them
         fn insert_word_breaks(text: &str) -> String {
             const ZWSP: char = '\u{200B}'; // Zero-width space
-            const BREAK_CHARS: &[char] = &['[', ']', '(', ')', ',', '\\', '/', '-', '&', '=', '?', ' '];
+            const BREAK_CHARS: &[char] = &['[', ']', '(', ')', ',', '\\', '/', '-', '&', '=', '?', '.', ';', ' '];
             const MIN_WORD_LEN: usize = 15;
 
             let mut result = String::with_capacity(text.len() * 2);
@@ -20303,8 +20303,7 @@ fn render_output_crossterm(app: &App) {
     }
 
     // Break characters for word wrapping within long words
-    // Note: '.' is excluded because it breaks filenames (image.png) and domains awkwardly
-    const BREAK_CHARS: &[char] = &['[', ']', '(', ')', ',', '\\', '/', '-', '&', '=', '?'];
+    const BREAK_CHARS: &[char] = &['[', ']', '(', ')', ',', '\\', '/', '-', '&', '=', '?', '.', ';'];
 
     // Wrap a line with ANSI codes by visible width, preferring to break at word boundaries
     // Similar to CSS white-space: pre-wrap; word-wrap: break-word
