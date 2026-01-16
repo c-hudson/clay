@@ -4,7 +4,7 @@
 
 set -e
 
-REQUIRED_RUST_VERSION="1.75.0"
+REQUIRED_RUST_VERSION="1.83.0"
 
 echo "=============================================="
 echo "  Clay MUD Client - Build Script"
