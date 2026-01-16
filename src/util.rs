@@ -317,6 +317,7 @@ pub struct WorldListInfo {
     pub name: String,
     pub connected: bool,
     pub is_current: bool,
+    pub is_ssl: bool,
     pub unseen_lines: usize,
     pub last_send_secs: Option<u64>,
     pub last_recv_secs: Option<u64>,
@@ -345,65 +346,104 @@ pub fn format_worlds_list(worlds: &[WorldListInfo]) -> String {
         return "No worlds connected.".to_string();
     }
 
-    let mut lines = Vec::new();
+    // Build formatted data for each world first to calculate column widths
+    struct FormattedWorld {
+        ssl: String,
+        current_marker: String,
+        name: String,
+        unseen: String,
+        unseen_raw: String,  // Without color codes for width calculation
+        last_send: String,
+        last_recv: String,
+        last_ak: String,
+        next_ak: String,
+    }
 
-    // Header line
-    lines.push(format!(
-        "{:20} {:>6}  {:>8}  {:>8}  {:>8}  {:>8}",
-        "World", "Unseen", "LastSend", "LastRecv", "LastNOP", "NextNOP"
-    ));
-
-    for world in connected_worlds {
-        // Current world marker
+    let formatted: Vec<FormattedWorld> = connected_worlds.iter().map(|world| {
+        let ssl = if world.is_ssl { "*".to_string() } else { " ".to_string() };
         let current_marker = if world.is_current {
             format!("{}*{}", CYAN, RESET)
         } else {
             " ".to_string()
         };
-
-        // Unseen count: yellow if > 0, gray dash otherwise
-        let unseen = if world.unseen_lines > 0 {
-            format!("{}{:>6}{}", YELLOW, world.unseen_lines, RESET)
+        let unseen_raw = if world.unseen_lines > 0 {
+            world.unseen_lines.to_string()
         } else {
-            format!("{}{:>6}{}", GRAY, "—", RESET)
+            "—".to_string()
         };
-
-        // Time columns
+        let unseen = if world.unseen_lines > 0 {
+            format!("{}{}{}", YELLOW, world.unseen_lines, RESET)
+        } else {
+            format!("{}—{}", GRAY, RESET)
+        };
         let last_send = world.last_send_secs
             .map(format_duration_short)
             .unwrap_or_else(|| "—".to_string());
         let last_recv = world.last_recv_secs
             .map(format_duration_short)
             .unwrap_or_else(|| "—".to_string());
-        let last_nop = world.last_nop_secs
+        let last_ak = world.last_nop_secs
             .map(format_duration_short)
             .unwrap_or_else(|| "—".to_string());
-
-        // NextNOP: calculate based on last activity
         let last_activity = match (world.last_send_secs, world.last_recv_secs) {
             (Some(s), Some(r)) => Some(s.min(r)),
             (Some(s), None) => Some(s),
             (None, Some(r)) => Some(r),
             (None, None) => None,
         };
-        let next_nop = match last_activity {
+        let next_ak = match last_activity {
             Some(elapsed) => {
                 let remaining = KEEPALIVE_SECS.saturating_sub(elapsed);
                 format_duration_short(remaining)
             }
             None => "—".to_string(),
         };
+        FormattedWorld {
+            ssl,
+            current_marker,
+            name: world.name.clone(),
+            unseen,
+            unseen_raw,
+            last_send,
+            last_recv,
+            last_ak,
+            next_ak,
+        }
+    }).collect();
 
-        // Truncate world name to 18 chars to fit with marker
-        let name_display = if world.name.len() > 18 {
-            format!("{}...", &world.name[..15])
-        } else {
-            world.name.clone()
-        };
+    // Calculate dynamic column widths (minimum is header width)
+    let name_width = formatted.iter().map(|w| w.name.len()).max().unwrap_or(5).max(5);
+    let unseen_width = formatted.iter().map(|w| w.unseen_raw.len()).max().unwrap_or(6).max(6);
+    let send_width = formatted.iter().map(|w| w.last_send.len()).max().unwrap_or(8).max(8);
+    let recv_width = formatted.iter().map(|w| w.last_recv.len()).max().unwrap_or(8).max(8);
+    let last_ak_width = formatted.iter().map(|w| w.last_ak.len()).max().unwrap_or(6).max(6);
+    let next_ak_width = formatted.iter().map(|w| w.next_ak.len()).max().unwrap_or(6).max(6);
 
+    let mut lines = Vec::new();
+
+    // Header line with dynamic widths
+    lines.push(format!(
+        "   {:name_w$}  {:>unseen_w$}  {:>send_w$}  {:>recv_w$}  {:>last_ak_w$}  {:>next_ak_w$}",
+        "World", "Unseen", "LastSend", "LastRecv", "LastAK", "NextAK",
+        name_w = name_width,
+        unseen_w = unseen_width,
+        send_w = send_width,
+        recv_w = recv_width,
+        last_ak_w = last_ak_width,
+        next_ak_w = next_ak_width
+    ));
+
+    for world in &formatted {
         lines.push(format!(
-            "{} {:18} {}  {:>8}  {:>8}  {:>8}  {:>8}",
-            current_marker, name_display, unseen, last_send, last_recv, last_nop, next_nop
+            "{}{}  {:name_w$}  {:>unseen_w$}  {:>send_w$}  {:>recv_w$}  {:>last_ak_w$}  {:>next_ak_w$}",
+            world.ssl, world.current_marker, world.name, world.unseen,
+            world.last_send, world.last_recv, world.last_ak, world.next_ak,
+            name_w = name_width,
+            unseen_w = unseen_width + (world.unseen.len() - world.unseen_raw.len()),  // Account for color codes
+            send_w = send_width,
+            recv_w = recv_width,
+            last_ak_w = last_ak_width,
+            next_ak_w = next_ak_width
         ));
     }
 
