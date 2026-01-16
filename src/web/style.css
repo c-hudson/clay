@@ -2092,3 +2092,44 @@ body.theme-light .toggle-slider {
 body.theme-light .toggle-slider:before {
     background-color: #888888;
 }
+
+/* Light theme: Web settings form */
+body.theme-light .web-field .toggle-btn {
+    background-color: #d8d8d8;
+    border-color: #bbbbbb;
+    color: #333333;
+}
+
+body.theme-light .web-field .toggle-btn:hover {
+    background-color: #cccccc;
+}
+
+body.theme-light .web-field .web-input {
+    background-color: #ffffff;
+    border-color: #cccccc;
+    color: #333333;
+}
+
+body.theme-light .web-field .web-input:focus {
+    border-color: var(--accent-color);
+}
+
+body.theme-light .web-modal-content {
+    background: #ffffff;
+    border-color: #cccccc;
+}
+
+body.theme-light .web-modal-content h2 {
+    color: #333333;
+}
+
+/* Light theme: Password change modal */
+body.theme-light .password-field input {
+    background-color: #ffffff;
+    border-color: #cccccc;
+    color: #333333;
+}
+
+body.theme-light .password-field input:focus {
+    border-color: var(--accent-color);
+}
