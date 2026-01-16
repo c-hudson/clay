@@ -15317,18 +15317,58 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
 
                         let world_name = app.worlds[world_idx].name.clone();
 
-                        // Spawn reader task (simplified since proxy handles TLS)
+                        // Spawn reader task with telnet processing
                         let event_tx_read = event_tx.clone();
+                        let telnet_tx = cmd_tx.clone();
                         tokio::spawn(async move {
                             let mut buf = [0u8; 4096];
+                            let mut line_buffer = Vec::new();
                             loop {
                                 match tokio::io::AsyncReadExt::read(&mut read_half, &mut buf).await {
                                     Ok(0) => {
+                                        if !line_buffer.is_empty() {
+                                            let (cleaned, responses, detected, prompt, _) = process_telnet(&line_buffer);
+                                            if !responses.is_empty() {
+                                                let _ = telnet_tx.send(WriteCommand::Raw(responses)).await;
+                                            }
+                                            if detected {
+                                                let _ = event_tx_read.send(AppEvent::TelnetDetected(world_name.clone())).await;
+                                            }
+                                            if let Some(prompt_bytes) = prompt {
+                                                let _ = event_tx_read.send(AppEvent::Prompt(world_name.clone(), prompt_bytes)).await;
+                                            }
+                                            if !cleaned.is_empty() {
+                                                let _ = event_tx_read.send(AppEvent::ServerData(world_name.clone(), cleaned)).await;
+                                            }
+                                        }
                                         let _ = event_tx_read.send(AppEvent::Disconnected(world_name.clone())).await;
                                         break;
                                     }
                                     Ok(n) => {
-                                        let _ = event_tx_read.send(AppEvent::ServerData(world_name.clone(), buf[..n].to_vec())).await;
+                                        line_buffer.extend_from_slice(&buf[..n]);
+                                        let split_at = find_safe_split_point(&line_buffer);
+                                        let to_send = if split_at > 0 {
+                                            line_buffer.drain(..split_at).collect()
+                                        } else if !line_buffer.is_empty() {
+                                            std::mem::take(&mut line_buffer)
+                                        } else {
+                                            Vec::new()
+                                        };
+                                        if !to_send.is_empty() {
+                                            let (cleaned, responses, detected, prompt, _) = process_telnet(&to_send);
+                                            if !responses.is_empty() {
+                                                let _ = telnet_tx.send(WriteCommand::Raw(responses)).await;
+                                            }
+                                            if detected {
+                                                let _ = event_tx_read.send(AppEvent::TelnetDetected(world_name.clone())).await;
+                                            }
+                                            if let Some(prompt_bytes) = prompt {
+                                                let _ = event_tx_read.send(AppEvent::Prompt(world_name.clone(), prompt_bytes)).await;
+                                            }
+                                            if !cleaned.is_empty() {
+                                                let _ = event_tx_read.send(AppEvent::ServerData(world_name.clone(), cleaned)).await;
+                                            }
+                                        }
                                     }
                                     Err(_) => {
                                         let _ = event_tx_read.send(AppEvent::Disconnected(world_name.clone())).await;
@@ -15355,10 +15395,6 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                 }
                             }
                         });
-
-                        app.worlds[world_idx].output_lines.push(OutputLine::new(
-                            "TLS connection restored via proxy.".to_string()
-                        ));
                     }
                     Err(e) => {
                         // Failed to reconnect
@@ -20169,19 +20205,64 @@ async fn handle_command(cmd: &str, app: &mut App, event_tx: mpsc::Sender<AppEven
                                     }
                                 }
 
-                                // Start reader task (similar to the regular connection flow)
+                                // Setup writer channel (before reader task so telnet_tx is available)
+                                let (cmd_tx, mut cmd_rx) = mpsc::channel::<WriteCommand>(100);
+                                app.current_world_mut().command_tx = Some(cmd_tx.clone());
+
+                                // Start reader task with telnet processing
                                 let event_tx_read = event_tx.clone();
                                 let read_world_name = world_name.clone();
+                                let telnet_tx = cmd_tx;
                                 tokio::spawn(async move {
                                     let mut buf = [0u8; 4096];
+                                    let mut line_buffer = Vec::new();
                                     loop {
                                         match tokio::io::AsyncReadExt::read(&mut read_half, &mut buf).await {
                                             Ok(0) => {
+                                                // Send any remaining buffered data
+                                                if !line_buffer.is_empty() {
+                                                    let (cleaned, responses, detected, prompt, _) = process_telnet(&line_buffer);
+                                                    if !responses.is_empty() {
+                                                        let _ = telnet_tx.send(WriteCommand::Raw(responses)).await;
+                                                    }
+                                                    if detected {
+                                                        let _ = event_tx_read.send(AppEvent::TelnetDetected(read_world_name.clone())).await;
+                                                    }
+                                                    if let Some(prompt_bytes) = prompt {
+                                                        let _ = event_tx_read.send(AppEvent::Prompt(read_world_name.clone(), prompt_bytes)).await;
+                                                    }
+                                                    if !cleaned.is_empty() {
+                                                        let _ = event_tx_read.send(AppEvent::ServerData(read_world_name.clone(), cleaned)).await;
+                                                    }
+                                                }
                                                 let _ = event_tx_read.send(AppEvent::Disconnected(read_world_name.clone())).await;
                                                 break;
                                             }
                                             Ok(n) => {
-                                                let _ = event_tx_read.send(AppEvent::ServerData(read_world_name.clone(), buf[..n].to_vec())).await;
+                                                line_buffer.extend_from_slice(&buf[..n]);
+                                                let split_at = find_safe_split_point(&line_buffer);
+                                                let to_send = if split_at > 0 {
+                                                    line_buffer.drain(..split_at).collect()
+                                                } else if !line_buffer.is_empty() {
+                                                    std::mem::take(&mut line_buffer)
+                                                } else {
+                                                    Vec::new()
+                                                };
+                                                if !to_send.is_empty() {
+                                                    let (cleaned, responses, detected, prompt, _) = process_telnet(&to_send);
+                                                    if !responses.is_empty() {
+                                                        let _ = telnet_tx.send(WriteCommand::Raw(responses)).await;
+                                                    }
+                                                    if detected {
+                                                        let _ = event_tx_read.send(AppEvent::TelnetDetected(read_world_name.clone())).await;
+                                                    }
+                                                    if let Some(prompt_bytes) = prompt {
+                                                        let _ = event_tx_read.send(AppEvent::Prompt(read_world_name.clone(), prompt_bytes)).await;
+                                                    }
+                                                    if !cleaned.is_empty() {
+                                                        let _ = event_tx_read.send(AppEvent::ServerData(read_world_name.clone(), cleaned)).await;
+                                                    }
+                                                }
                                             }
                                             Err(_) => {
                                                 let _ = event_tx_read.send(AppEvent::Disconnected(read_world_name.clone())).await;
@@ -20191,10 +20272,7 @@ async fn handle_command(cmd: &str, app: &mut App, event_tx: mpsc::Sender<AppEven
                                     }
                                 });
 
-                                // Setup writer channel
-                                let (cmd_tx, mut cmd_rx) = mpsc::channel::<WriteCommand>(100);
-                                app.current_world_mut().command_tx = Some(cmd_tx);
-
+                                // Spawn writer task
                                 tokio::spawn(async move {
                                     while let Some(cmd) = cmd_rx.recv().await {
                                         let bytes = match &cmd {
