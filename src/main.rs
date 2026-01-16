@@ -6633,97 +6633,66 @@ fn spawn_tls_proxy(
     host: &str,
     port: &str,
 ) -> io::Result<(u32, PathBuf)> {
+    use std::process::{Command, Stdio};
+
     let socket_path = get_proxy_socket_path(world_name);
-    let host = host.to_string();
-    let port = port.to_string();
 
     // Remove any existing socket file
     let _ = std::fs::remove_file(&socket_path);
 
-    // Fork the process
-    let pid = unsafe { libc::fork() };
+    // Get the current executable path
+    let exe_path = std::env::current_exe()?;
 
-    match pid {
-        -1 => {
-            // Fork failed
-            Err(io::Error::last_os_error())
+    // Spawn the proxy as a separate process using --tls-proxy argument
+    // Format: --tls-proxy=host:port:socket_path
+    let proxy_arg = format!(
+        "--tls-proxy={}:{}:{}",
+        host,
+        port,
+        socket_path.display()
+    );
+
+    let child = Command::new(&exe_path)
+        .arg(&proxy_arg)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()?;
+
+    let child_pid = child.id();
+
+    // Wait up to 10 seconds for the socket to appear
+    let start = std::time::Instant::now();
+    let timeout = std::time::Duration::from_secs(10);
+
+    while start.elapsed() < timeout {
+        if socket_path.exists() {
+            // Socket exists, proxy is ready
+            return Ok((child_pid, socket_path));
         }
-        0 => {
-            // Child process - run the TLS proxy
-            // Ignore SIGHUP so we survive terminal close
-            unsafe {
-                libc::signal(libc::SIGHUP, libc::SIG_IGN);
-            }
 
-            // Create a new session to detach from terminal
-            unsafe {
-                libc::setsid();
-            }
-
-            // Run the proxy (this blocks and handles the connection)
-            run_tls_proxy(&host, &port, &socket_path);
-
-            // If we return, exit the child process
-            std::process::exit(0);
+        // Check if child process died
+        if !is_process_alive(child_pid) {
+            return Err(io::Error::new(
+                io::ErrorKind::Other,
+                "TLS proxy process exited unexpectedly",
+            ));
         }
-        child_pid => {
-            // Parent process - wait for socket to appear
-            let child_pid = child_pid as u32;
 
-            // Wait up to 10 seconds for the socket to appear
-            let start = std::time::Instant::now();
-            let timeout = std::time::Duration::from_secs(10);
-
-            while start.elapsed() < timeout {
-                if socket_path.exists() {
-                    // Socket exists, proxy is ready
-                    return Ok((child_pid, socket_path));
-                }
-
-                // Check if child process died
-                let mut status: libc::c_int = 0;
-                let result = unsafe {
-                    libc::waitpid(child_pid as libc::pid_t, &mut status, libc::WNOHANG)
-                };
-
-                if result == child_pid as libc::pid_t {
-                    // Child exited
-                    return Err(io::Error::new(
-                        io::ErrorKind::Other,
-                        "TLS proxy process exited unexpectedly",
-                    ));
-                }
-
-                std::thread::sleep(std::time::Duration::from_millis(50));
-            }
-
-            // Timeout - kill the child and return error
-            unsafe {
-                libc::kill(child_pid as libc::pid_t, libc::SIGTERM);
-            }
-            Err(io::Error::new(
-                io::ErrorKind::TimedOut,
-                "TLS proxy socket not created in time",
-            ))
-        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
     }
+
+    // Timeout - kill the child and return error
+    unsafe {
+        libc::kill(child_pid as libc::pid_t, libc::SIGTERM);
+    }
+    Err(io::Error::new(
+        io::ErrorKind::TimedOut,
+        "TLS proxy socket not created in time",
+    ))
 }
 
-/// Run the TLS proxy main loop (called in child process after fork).
-/// This function creates its own tokio runtime and blocks.
-fn run_tls_proxy(host: &str, port: &str, socket_path: &PathBuf) {
-    // Create a new runtime for this proxy process
-    let rt = match tokio::runtime::Runtime::new() {
-        Ok(rt) => rt,
-        Err(_) => return,
-    };
-
-    rt.block_on(async {
-        run_tls_proxy_async(host, port, socket_path).await;
-    });
-}
-
-/// Async implementation of the TLS proxy main loop
+/// Async implementation of the TLS proxy main loop (runs in separate process via --tls-proxy)
 async fn run_tls_proxy_async(host: &str, port: &str, socket_path: &PathBuf) {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::{TcpStream, UnixListener};
@@ -14956,6 +14925,20 @@ async fn handle_multiuser_ws_message(
 
 #[tokio::main]
 async fn main() -> io::Result<()> {
+    // Check for --tls-proxy=host:port:socket_path argument for TLS proxy mode
+    // This is used internally when spawning TLS proxy processes
+    if let Some(proxy_arg) = std::env::args().find(|a| a.starts_with("--tls-proxy=")) {
+        let params = proxy_arg.strip_prefix("--tls-proxy=").unwrap();
+        let parts: Vec<&str> = params.splitn(3, ':').collect();
+        if parts.len() == 3 {
+            let host = parts[0];
+            let port = parts[1];
+            let socket_path = PathBuf::from(parts[2]);
+            run_tls_proxy_async(host, port, &socket_path).await;
+        }
+        return Ok(());
+    }
+
     // Check for --remote=host:port argument for GUI client mode
     if let Some(remote_arg) = std::env::args().find(|a| a.starts_with("--remote=")) {
         #[cfg(feature = "remote-gui")]
