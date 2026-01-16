@@ -20209,6 +20209,21 @@ async fn handle_command(cmd: &str, app: &mut App, event_tx: mpsc::Sender<AppEven
                                 let (cmd_tx, mut cmd_rx) = mpsc::channel::<WriteCommand>(100);
                                 app.current_world_mut().command_tx = Some(cmd_tx.clone());
 
+                                // Send auto-login if configured (for Connect type)
+                                let skip_login = app.current_world().skip_auto_login;
+                                app.current_world_mut().skip_auto_login = false;
+                                let user = app.current_world().settings.user.clone();
+                                let password = app.current_world().settings.password.clone();
+                                let auto_connect_type = app.current_world().settings.auto_connect_type;
+                                if !skip_login && !user.is_empty() && auto_connect_type == AutoConnectType::Connect {
+                                    let tx = cmd_tx.clone();
+                                    tokio::spawn(async move {
+                                        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                                        let connect_cmd = format!("connect {} {}", user, password);
+                                        let _ = tx.send(WriteCommand::Text(connect_cmd)).await;
+                                    });
+                                }
+
                                 // Start reader task with telnet processing
                                 let event_tx_read = event_tx.clone();
                                 let read_world_name = world_name.clone();
@@ -20693,11 +20708,11 @@ async fn handle_command(cmd: &str, app: &mut App, event_tx: mpsc::Sender<AppEven
                 return false;
             }
 
-            // Check if there are any TLS connections that will be lost
+            // Check if there are any TLS connections that will be lost (only those without proxy)
             let tls_worlds: Vec<_> = app
                 .worlds
                 .iter()
-                .filter(|w| w.connected && w.is_tls)
+                .filter(|w| w.connected && w.is_tls && w.proxy_pid.is_none())
                 .map(|w| w.name.clone())
                 .collect();
 
