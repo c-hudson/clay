@@ -6611,6 +6611,22 @@ fn is_process_alive(pid: u32) -> bool {
     }
 }
 
+/// Log a message to the TLS proxy debug log file
+fn proxy_log(msg: &str) {
+    use std::io::Write;
+    if let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open("/tmp/clay-tls-proxy.log")
+    {
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let _ = writeln!(file, "[{}] [pid:{}] {}", timestamp, std::process::id(), msg);
+    }
+}
+
 /// Generate a unique socket path for the TLS proxy
 fn get_proxy_socket_path(world_name: &str) -> PathBuf {
     let sanitized_name = world_name
@@ -6652,11 +6668,13 @@ fn spawn_tls_proxy(
         socket_path.display()
     );
 
+    proxy_log(&format!("[Main] Spawning TLS proxy: {} {}", exe_path.display(), proxy_arg));
+
     let child = Command::new(&exe_path)
         .arg(&proxy_arg)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stderr(Stdio::inherit())  // Inherit stderr for debugging
         .spawn()?;
 
     let child_pid = child.id();
@@ -6697,10 +6715,18 @@ async fn run_tls_proxy_async(host: &str, port: &str, socket_path: &PathBuf) {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::{TcpStream, UnixListener};
 
+    proxy_log(&format!("Starting proxy for {}:{} -> {}", host, port, socket_path.display()));
+
     // Step 1: Connect to the MUD server with TLS
     let tcp_stream = match TcpStream::connect(format!("{}:{}", host, port)).await {
-        Ok(s) => s,
-        Err(_) => return,
+        Ok(s) => {
+            proxy_log("TCP connected");
+            s
+        }
+        Err(e) => {
+            proxy_log(&format!("TCP connect failed: {}", e));
+            return;
+        }
     };
 
     // Establish TLS connection
@@ -6722,18 +6748,30 @@ async fn run_tls_proxy_async(host: &str, port: &str, socket_path: &PathBuf) {
             .try_into()
         {
             Ok(c) => c,
-            Err(_) => return,
+            Err(e) => {
+                proxy_log(&format!("Config build failed: {:?}", e));
+                return;
+            }
         };
 
         let connector = TlsConnector::from(Arc::new(config));
         let server_name = match ServerName::try_from(host.to_string()) {
             Ok(sn) => sn,
-            Err(_) => return,
+            Err(e) => {
+                proxy_log(&format!("ServerName parse failed: {:?}", e));
+                return;
+            }
         };
 
         match connector.connect(server_name, tcp_stream).await {
-            Ok(s) => s,
-            Err(_) => return,
+            Ok(s) => {
+                proxy_log("TLS connected");
+                s
+            }
+            Err(e) => {
+                proxy_log(&format!("TLS connect failed: {}", e));
+                return;
+            }
         }
     };
 
@@ -6762,66 +6800,114 @@ async fn run_tls_proxy_async(host: &str, port: &str, socket_path: &PathBuf) {
 
     // Step 2: Create Unix socket listener
     // Set socket permissions to owner-only (0600)
+    proxy_log(&format!("Creating Unix socket at {}", socket_path.display()));
     let listener = match UnixListener::bind(socket_path) {
-        Ok(l) => l,
-        Err(_) => return,
+        Ok(l) => {
+            proxy_log("Unix socket created");
+            l
+        }
+        Err(e) => {
+            proxy_log(&format!("Unix socket bind failed: {}", e));
+            return;
+        }
     };
 
     // Try to set restrictive permissions on the socket
     let _ = std::fs::set_permissions(socket_path, std::fs::Permissions::from_mode(0o600));
 
-    // Step 3: Accept client connection (wait for main process to connect)
-    let (client_stream, _) = match listener.accept().await {
-        Ok(s) => s,
-        Err(_) => {
-            let _ = std::fs::remove_file(socket_path);
-            return;
-        }
-    };
-
-    // Step 4: Bidirectional relay between client and TLS server
+    // Step 3: Main loop - accept clients and relay data
+    // Supports reconnection: when client disconnects, wait for new client (for hot reload)
     let (mut tls_read, mut tls_write) = tokio::io::split(tls_stream);
-    let (mut client_read, mut client_write) = client_stream.into_split();
 
-    // Relay tasks
-    let client_to_tls = async {
-        let mut buf = [0u8; 8192];
+    loop {
+        proxy_log("Waiting for client connection...");
+
+        // Wait for client connection with timeout (60 seconds for reconnection)
+        let client_stream = match tokio::time::timeout(
+            std::time::Duration::from_secs(60),
+            listener.accept()
+        ).await {
+            Ok(Ok((stream, _))) => {
+                proxy_log("Client connected");
+                stream
+            }
+            Ok(Err(e)) => {
+                proxy_log(&format!("Accept error: {}", e));
+                break;
+            }
+            Err(_) => {
+                proxy_log("Timeout waiting for client, exiting");
+                break;
+            }
+        };
+
+        let (mut client_read, mut client_write) = client_stream.into_split();
+
+        // Track why we exited the relay loop
+        let mut tls_server_disconnected = false;
+
+        // Relay data between client and TLS server
+        let mut client_buf = [0u8; 8192];
+        let mut tls_buf = [0u8; 8192];
+
         loop {
-            match client_read.read(&mut buf).await {
-                Ok(0) => break, // Client disconnected
-                Ok(n) => {
-                    if tls_write.write_all(&buf[..n]).await.is_err() {
-                        break;
+            tokio::select! {
+                // Client -> TLS
+                result = client_read.read(&mut client_buf) => {
+                    match result {
+                        Ok(0) => {
+                            proxy_log("Client disconnected, waiting for reconnect...");
+                            break; // Client disconnected, wait for new client
+                        }
+                        Ok(n) => {
+                            if tls_write.write_all(&client_buf[..n]).await.is_err() {
+                                proxy_log("TLS write failed");
+                                tls_server_disconnected = true;
+                                break;
+                            }
+                        }
+                        Err(e) => {
+                            proxy_log(&format!("Client read error: {}", e));
+                            break;
+                        }
                     }
                 }
-                Err(_) => break,
-            }
-        }
-    };
-
-    let tls_to_client = async {
-        let mut buf = [0u8; 8192];
-        loop {
-            match tls_read.read(&mut buf).await {
-                Ok(0) => break, // Server disconnected
-                Ok(n) => {
-                    if client_write.write_all(&buf[..n]).await.is_err() {
-                        break;
+                // TLS -> Client
+                result = tls_read.read(&mut tls_buf) => {
+                    match result {
+                        Ok(0) => {
+                            proxy_log("TLS server disconnected");
+                            tls_server_disconnected = true;
+                            break;
+                        }
+                        Ok(n) => {
+                            if client_write.write_all(&tls_buf[..n]).await.is_err() {
+                                proxy_log("Client write failed, waiting for reconnect...");
+                                break; // Client write failed, wait for new client
+                            }
+                        }
+                        Err(e) => {
+                            proxy_log(&format!("TLS read error: {}", e));
+                            tls_server_disconnected = true;
+                            break;
+                        }
                     }
                 }
-                Err(_) => break,
             }
         }
-    };
 
-    // Run both relay directions concurrently, exit when either finishes
-    tokio::select! {
-        _ = client_to_tls => {}
-        _ = tls_to_client => {}
+        // If TLS server disconnected, exit the proxy
+        if tls_server_disconnected {
+            proxy_log("TLS connection lost, proxy exiting");
+            break;
+        }
+
+        // Otherwise, loop back to accept a new client (for hot reload)
     }
 
     // Clean up socket file
     let _ = std::fs::remove_file(socket_path);
+    proxy_log("Socket cleaned up, proxy process exiting");
 }
 
 /// Strip " (deleted)" suffix from a path string if present.
@@ -14928,13 +15014,18 @@ async fn main() -> io::Result<()> {
     // Check for --tls-proxy=host:port:socket_path argument for TLS proxy mode
     // This is used internally when spawning TLS proxy processes
     if let Some(proxy_arg) = std::env::args().find(|a| a.starts_with("--tls-proxy=")) {
+        proxy_log(&format!("Starting in proxy mode with: {}", proxy_arg));
         let params = proxy_arg.strip_prefix("--tls-proxy=").unwrap();
         let parts: Vec<&str> = params.splitn(3, ':').collect();
         if parts.len() == 3 {
             let host = parts[0];
             let port = parts[1];
             let socket_path = PathBuf::from(parts[2]);
+            proxy_log(&format!("Parsed: host={}, port={}, socket={}", host, port, socket_path.display()));
             run_tls_proxy_async(host, port, &socket_path).await;
+            proxy_log("Proxy finished");
+        } else {
+            proxy_log(&format!("Failed to parse arguments, got {} parts", parts.len()));
         }
         return Ok(());
     }
