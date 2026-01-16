@@ -303,7 +303,7 @@ fn compile_pattern(pattern: &str, mode: TfMatchMode) -> Result<Option<Regex>, St
 }
 
 /// Convert a glob pattern to a regex pattern
-fn glob_to_regex(glob: &str) -> String {
+pub fn glob_to_regex(glob: &str) -> String {
     let mut regex = String::with_capacity(glob.len() * 2);
     let mut chars = glob.chars().peekable();
 

@@ -6,6 +6,7 @@ use super::{TfCommandResult, TfEngine, TfValue, TfHookEvent};
 use super::control_flow::{self, ControlState, ControlResult, IfState, WhileState, ForState};
 use super::macros;
 use super::hooks;
+use super::builtins;
 
 /// Check if input is a TF command (starts with #)
 pub fn is_tf_command(input: &str) -> bool {
@@ -125,6 +126,21 @@ pub fn execute_command(engine: &mut TfEngine, input: &str) -> TfCommandResult {
         "unhook" => cmd_unhook(engine, args),
         "bind" => cmd_bind(engine, args),
         "unbind" => cmd_unbind(engine, args),
+
+        // Additional builtins
+        "beep" => builtins::cmd_beep(),
+        "time" => builtins::cmd_time(args),
+        "lcd" => builtins::cmd_lcd(engine, args),
+        "sh" => builtins::cmd_sh(args),
+        "quote" => builtins::cmd_quote(args),
+        "recall" => builtins::cmd_recall(args),
+        "gag" => builtins::cmd_gag(engine, args),
+        "ungag" => builtins::cmd_ungag(engine, args),
+        "load" => builtins::cmd_load(engine, args),
+        "save" => builtins::cmd_save(engine, args),
+        "log" => builtins::cmd_log(args),
+        "ps" => builtins::cmd_ps(),
+        "kill" => builtins::cmd_kill(args),
 
         _ => TfCommandResult::UnknownCommand(cmd.to_string()),
     }
@@ -406,7 +422,7 @@ More commands coming in future phases:
 /// #version - Show version info
 fn cmd_version() -> TfCommandResult {
     TfCommandResult::Success(Some(
-        "Clay MUD Client with TinyFugue compatibility\nTF compatibility layer: Phase 5".to_string()
+        "Clay MUD Client with TinyFugue compatibility\nTF compatibility layer: Phase 6".to_string()
     ))
 }
 
