@@ -1949,7 +1949,7 @@ body.theme-light .world-editor-modal-content .editor-input:focus {
 body.theme-light .actions-list-modal-content,
 body.theme-light .actions-editor-modal-content,
 body.theme-light .action-confirm-modal-content {
-    background: #ffffff;
+    background: #ffffff !important;
     border-color: #cccccc;
 }
 
@@ -1959,31 +1959,38 @@ body.theme-light .action-confirm-modal-content p {
     color: #333333;
 }
 
-body.theme-light .actions-filter input {
-    background-color: #ffffff;
+body.theme-light .actions-filter input,
+body.theme-light #action-filter {
+    background-color: #ffffff !important;
     border-color: #cccccc;
     color: #333333;
 }
 
-body.theme-light .actions-list {
-    background-color: #f8f8f8;
+body.theme-light .actions-list,
+body.theme-light #actions-list {
+    background-color: #f0f0f0 !important;
     border-color: #cccccc;
 }
 
 body.theme-light .actions-list-item {
     border-bottom-color: #dddddd;
+    color: #333333;
 }
 
 body.theme-light .actions-list-item:hover {
-    background-color: #e8e8e8;
+    background-color: #e0e0e0;
+}
+
+body.theme-light .actions-list-item .action-name {
+    color: #000000;
 }
 
 body.theme-light .actions-list-item .action-world {
-    color: #666666;
+    color: #555555;
 }
 
 body.theme-light .actions-list-item .action-pattern {
-    color: #888888;
+    color: #666666;
 }
 
 body.theme-light .action-field label {
@@ -1991,30 +1998,48 @@ body.theme-light .action-field label {
 }
 
 body.theme-light .action-field input,
-body.theme-light .action-field textarea {
-    background-color: #ffffff;
+body.theme-light .action-field textarea,
+body.theme-light #action-name,
+body.theme-light #action-world,
+body.theme-light #action-pattern,
+body.theme-light #action-command {
+    background-color: #ffffff !important;
     border-color: #cccccc;
     color: #333333;
 }
 
-body.theme-light .modal-buttons button {
-    background-color: #e8e8e8;
-    border-color: #cccccc;
+body.theme-light .action-field .toggle-btn,
+body.theme-light #action-match-type {
+    background-color: #d8d8d8;
+    border: 1px solid #bbbbbb;
     color: #333333;
 }
 
-body.theme-light .modal-buttons button:hover {
-    background-color: #dcdcdc;
+body.theme-light .action-field .toggle-btn:hover,
+body.theme-light #action-match-type:hover {
+    background-color: #cccccc;
+}
+
+body.theme-light .modal-buttons button,
+body.theme-light .action-btn {
+    background-color: #d8d8d8 !important;
+    border-color: #bbbbbb;
+    color: #333333;
+}
+
+body.theme-light .modal-buttons button:hover,
+body.theme-light .action-btn:hover {
+    background-color: #cccccc !important;
 }
 
 body.theme-light .modal-buttons button.btn-primary {
-    background: #0891b2;
+    background: #0891b2 !important;
     border-color: #0891b2;
     color: #ffffff;
 }
 
 body.theme-light .modal-buttons button.btn-primary:hover {
-    background: #0e7490;
+    background: #0e7490 !important;
     border-color: #0e7490;
 }
 
