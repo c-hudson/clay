@@ -148,7 +148,10 @@
         <!-- Actions List popup (first window) -->
         <div id="actions-list-modal" class="modal">
             <div class="modal-content actions-list-modal-content">
-                <h2>Actions</h2>
+                <div class="popup-header">
+                    <span class="popup-title">Actions</span>
+                    <button id="actions-list-close-btn" class="popup-close">✕</button>
+                </div>
                 <div class="actions-filter">
                     <input type="text" id="action-filter" placeholder="Filter actions..." autocomplete="off">
                     <div id="action-world-filter" class="action-world-filter-indicator"></div>
@@ -166,7 +169,10 @@
         <!-- Actions Editor popup (second window) -->
         <div id="actions-editor-modal" class="modal">
             <div class="modal-content actions-editor-modal-content">
-                <h2 id="action-editor-title">Edit Action</h2>
+                <div class="popup-header">
+                    <span class="popup-title" id="action-editor-title">Edit Action</span>
+                    <button id="actions-editor-close-btn" class="popup-close">✕</button>
+                </div>
                 <div class="action-field">
                     <label for="action-name">Name:</label>
                     <input type="text" id="action-name" autocomplete="off">
@@ -209,7 +215,10 @@
         <!-- Worlds list popup (/connections or /l) -->
         <div id="worlds-modal" class="modal">
             <div class="modal-content worlds-modal-content">
-                <h2>Connected Worlds</h2>
+                <div class="popup-header">
+                    <span class="popup-title">Connected Worlds</span>
+                    <button id="worlds-list-close-btn" class="popup-close">✕</button>
+                </div>
                 <div id="worlds-table-container">
                     <table id="worlds-table">
                         <thead>
@@ -443,7 +452,10 @@
         <!-- Web Settings popup (/web) -->
         <div id="web-modal" class="modal">
             <div class="modal-content web-modal-content">
-                <h2>Web Settings</h2>
+                <div class="popup-header">
+                    <span class="popup-title">Web Settings</span>
+                    <button id="web-close-btn" class="popup-close">✕</button>
+                </div>
                 <div class="web-settings-form">
                     <div class="web-field">
                         <label>Protocol:</label>

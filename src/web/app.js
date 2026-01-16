@@ -72,6 +72,7 @@
         actionEditBtn: document.getElementById('action-edit-btn'),
         actionDeleteBtn: document.getElementById('action-delete-btn'),
         actionCancelBtn: document.getElementById('action-cancel-btn'),
+        actionsListCloseBtn: document.getElementById('actions-list-close-btn'),
         // Actions Editor popup
         actionsEditorModal: document.getElementById('actions-editor-modal'),
         actionEditorTitle: document.getElementById('action-editor-title'),
@@ -83,6 +84,7 @@
         actionError: document.getElementById('action-error'),
         actionSaveBtn: document.getElementById('action-save-btn'),
         actionEditorCancelBtn: document.getElementById('action-editor-cancel-btn'),
+        actionsEditorCloseBtn: document.getElementById('actions-editor-close-btn'),
         // Actions Confirm Delete popup
         actionConfirmModal: document.getElementById('action-confirm-modal'),
         actionConfirmText: document.getElementById('action-confirm-text'),
@@ -92,6 +94,7 @@
         worldsModal: document.getElementById('worlds-modal'),
         worldsTableBody: document.getElementById('worlds-table-body'),
         worldsCloseBtn: document.getElementById('worlds-close-btn'),
+        worldsListCloseBtn: document.getElementById('worlds-list-close-btn'),
         // World selector popup
         worldSelectorModal: document.getElementById('world-selector-modal'),
         worldFilter: document.getElementById('world-filter'),
@@ -140,6 +143,7 @@
         tlsKeyField: document.getElementById('tls-key-field'),
         webSaveBtn: document.getElementById('web-save-btn'),
         webCancelBtn: document.getElementById('web-cancel-btn'),
+        webCloseBtn: document.getElementById('web-close-btn'),
         httpLabel: document.getElementById('http-label'),
         httpPortLabel: document.getElementById('http-port-label'),
         wsLabel: document.getElementById('ws-label'),
@@ -4283,6 +4287,7 @@
         };
         elements.actionDeleteBtn.onclick = openActionsConfirmPopup;
         elements.actionCancelBtn.onclick = closeActionsListPopup;
+        elements.actionsListCloseBtn.onclick = closeActionsListPopup;
         elements.actionFilter.oninput = function() {
             // Update selection if current selection is filtered out
             const visibleIndices = getFilteredActionIndices();
@@ -4295,6 +4300,7 @@
         // Actions Editor popup
         elements.actionSaveBtn.onclick = saveAction;
         elements.actionEditorCancelBtn.onclick = closeActionsEditorPopup;
+        elements.actionsEditorCloseBtn.onclick = closeActionsEditorPopup;
         elements.actionMatchType.onclick = function() {
             // Toggle between Regexp and Wildcard
             if (elements.actionMatchType.textContent === 'Regexp') {
@@ -4312,6 +4318,7 @@
 
         // Worlds list popup
         elements.worldsCloseBtn.onclick = closeWorldsPopup;
+        elements.worldsListCloseBtn.onclick = closeWorldsPopup;
 
         // World selector popup
         elements.worldAddBtn.onclick = addNewWorld;
@@ -4407,6 +4414,7 @@
         };
         elements.webSaveBtn.onclick = saveWebSettings;
         elements.webCancelBtn.onclick = closeWebPopup;
+        elements.webCloseBtn.onclick = closeWebPopup;
 
         // Password change modal handlers
         if (elements.passwordSaveBtn) {
