@@ -7007,12 +7007,6 @@ mod remote_gui {
         /// Audio output stream handle for playing sounds
         #[cfg(feature = "rodio")]
         audio_stream_handle: Option<rodio::OutputStreamHandle>,
-        /// Stored text selection (plain text for copying)
-        stored_selection: Option<String>,
-        /// Stored selection range (start, end char indices)
-        stored_selection_range: Option<(usize, usize)>,
-        /// Stored raw selection (with ANSI codes escaped)
-        stored_selection_raw: Option<String>,
     }
 
     /// Square wave audio source for ANSI music playback
@@ -7173,9 +7167,6 @@ mod remote_gui {
                 audio_stream: None,
                 #[cfg(feature = "rodio")]
                 audio_stream_handle: None,
-                stored_selection: None,
-                stored_selection_range: None,
-                stored_selection_raw: None,
             }
         }
 
@@ -10281,11 +10272,16 @@ mod remote_gui {
                                     })
                                     .show(ui);
 
-                                // Store selection in struct fields for persistence across frames
-                                // Only update if there's an active selection (don't clear on secondary click)
+                                // Store selection in egui memory on every frame when there is one
+                                // This ensures we have it captured before any click clears it
+                                // Skip storage on secondary click to preserve existing selection
+                                let selection_id = egui::Id::new("output_selection");
+                                let selection_range_id = egui::Id::new("output_selection_range");
+                                let selection_raw_id = egui::Id::new("output_selection_raw");
                                 let is_secondary_click = response.response.secondary_clicked();
+                                if !is_secondary_click {
                                 if let Some(cursor_range) = response.cursor_range {
-                                    if cursor_range.primary != cursor_range.secondary && !is_secondary_click {
+                                    if cursor_range.primary != cursor_range.secondary {
                                         let start_char = cursor_range.primary.ccursor.index.min(cursor_range.secondary.ccursor.index);
                                         let end_char = cursor_range.primary.ccursor.index.max(cursor_range.secondary.ccursor.index);
                                         // Convert character indices to byte indices for proper UTF-8 slicing
@@ -10356,12 +10352,15 @@ mod remote_gui {
                                         }
                                         let raw_text = raw_selected_parts.join("\n").replace('\x1b', "<esc>");
 
-                                        // Store selection in struct fields for persistence
-                                        self.stored_selection = Some(selected);
-                                        self.stored_selection_range = Some((start_char, end_char));
-                                        self.stored_selection_raw = Some(raw_text);
+                                        // Always store selection text, range, and raw lines when we have one
+                                        ui.ctx().data_mut(|d| {
+                                            d.insert_temp(selection_id, selected);
+                                            d.insert_temp(selection_range_id, (start_char, end_char));
+                                            d.insert_temp(selection_raw_id, raw_text);
+                                        });
                                     }
                                 }
+                                } // end if !is_secondary_click
                                 // Handle clicks - check for URL clicks and clear selection
                                 if response.response.clicked() {
                                     if let Some(cursor_range) = response.cursor_range {
@@ -10385,22 +10384,26 @@ mod remote_gui {
 
                                             // Clear selection if not clicking a URL
                                             if !url_clicked {
-                                                self.stored_selection = None;
-                                                self.stored_selection_range = None;
-                                                self.stored_selection_raw = None;
+                                                ui.ctx().data_mut(|d| {
+                                                    d.remove::<String>(selection_id);
+                                                    d.remove::<(usize, usize)>(selection_range_id);
+                                                    d.remove::<String>(selection_raw_id);
+                                                });
                                             }
                                         }
                                     } else {
-                                        self.stored_selection = None;
-                                        self.stored_selection_range = None;
-                                        self.stored_selection_raw = None;
+                                        ui.ctx().data_mut(|d| {
+                                            d.remove::<String>(selection_id);
+                                            d.remove::<(usize, usize)>(selection_range_id);
+                                            d.remove::<String>(selection_raw_id);
+                                        });
                                     }
                                 }
 
                                 // Always draw custom selection highlight when we have a stored selection
                                 // This ensures no flicker when context menu opens/closes
                                 {
-                                    if let Some((start, end)) = self.stored_selection_range {
+                                    if let Some((start, end)) = ui.ctx().data(|d| d.get_temp::<(usize, usize)>(selection_range_id)) {
                                         let galley = &response.galley;
                                         let text_pos = response.galley_pos;
 
@@ -10494,12 +10497,13 @@ mod remote_gui {
                                 // Right-click context menu
                                 let plain_text_for_menu = plain_text.clone();
                                 let debug_request_id = egui::Id::new("debug_text_request");
-                                // Clone selection from struct fields for use in closure
-                                let menu_selection = self.stored_selection.clone();
-                                let menu_selection_raw = self.stored_selection_raw.clone();
                                 response.response.context_menu(|ui| {
+                                    // Get stored selection from egui memory
+                                    let stored_selection: Option<String> = ui.ctx().data(|d| d.get_temp(selection_id));
+                                    let stored_raw: Option<String> = ui.ctx().data(|d| d.get_temp(selection_raw_id));
+
                                     // Show Copy button if there's stored selected text
-                                    if let Some(ref selected) = menu_selection {
+                                    if let Some(ref selected) = stored_selection {
                                         if ui.button("Copy").clicked() {
                                             ui.ctx().copy_text(selected.clone());
                                             ui.close_menu();
@@ -10511,10 +10515,10 @@ mod remote_gui {
                                     }
                                     ui.separator();
                                     // Debug option - show raw ANSI codes
-                                    if let Some(ref raw_text) = menu_selection_raw {
+                                    if let Some(raw_text) = stored_raw {
                                         if ui.button("Debug Selection").clicked() {
                                             // Store in egui memory for retrieval outside closure
-                                            ui.ctx().data_mut(|d| d.insert_temp(debug_request_id, raw_text.clone()));
+                                            ui.ctx().data_mut(|d| d.insert_temp(debug_request_id, raw_text));
                                             ui.close_menu();
                                         }
                                     }
