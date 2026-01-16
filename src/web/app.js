@@ -169,6 +169,7 @@
     let ws = null;
     let authenticated = false;
     let multiuserMode = false;  // True when server is in multiuser mode
+    let hasReceivedInitialState = false;  // True after first InitialState (to preserve world on resync)
     let worlds = [];
     let currentWorldIndex = 0;
     let commandHistory = [];
@@ -277,6 +278,19 @@
     // ANSI Music audio context (lazily initialized)
     let audioContext = null;
     let ansiMusicEnabled = true;  // Will be synced from server settings
+
+    // ============================================================================
+    // Theme Application
+    // ============================================================================
+
+    // Apply theme to the document body
+    function applyTheme(theme) {
+        if (theme === 'light') {
+            document.body.classList.add('theme-light');
+        } else {
+            document.body.classList.remove('theme-light');
+        }
+    }
 
     // ============================================================================
     // Command Parsing (mirrors Rust parse_command)
@@ -695,6 +709,7 @@
                 actions = [];
                 splashLines = [];
                 authenticated = false;
+                hasReceivedInitialState = false;
                 // Clear output display
                 if (elements.output) {
                     elements.output.innerHTML = '';
@@ -707,7 +722,16 @@
 
             case 'InitialState':
                 worlds = msg.worlds || [];
-                currentWorldIndex = msg.current_world_index !== undefined ? msg.current_world_index : 0;
+                // On first connection, use server's world index. On resync, preserve local world.
+                if (!hasReceivedInitialState) {
+                    currentWorldIndex = msg.current_world_index !== undefined ? msg.current_world_index : 0;
+                    hasReceivedInitialState = true;
+                } else {
+                    // Resync - preserve current world, but validate it's still valid
+                    if (currentWorldIndex >= worlds.length) {
+                        currentWorldIndex = Math.max(0, worlds.length - 1);
+                    }
+                }
                 actions = msg.actions || [];
                 splashLines = msg.splash_lines || [];
                 // Reset client-side more-mode state (each client handles more locally)
@@ -792,6 +816,7 @@
                     }
                     if (msg.settings.gui_theme !== undefined) {
                         guiTheme = msg.settings.gui_theme;
+                        applyTheme(guiTheme);
                     }
                 }
                 renderOutput();
@@ -976,6 +1001,7 @@
                     }
                     if (msg.settings.gui_theme !== undefined) {
                         guiTheme = msg.settings.gui_theme;
+                        applyTheme(guiTheme);
                     }
                 }
                 break;
@@ -1931,8 +1957,10 @@
         const urlPattern = /(\b(?:https?:\/\/|www\.)[^\s<>"']*[^\s<>"'.,;:!?\)\]}>])/gi;
 
         return html.replace(urlPattern, function(url) {
+            // Strip zero-width spaces from href (inserted by insertWordBreaks)
+            const cleanUrl = url.replace(/\u200B/g, '');
             // Add protocol if missing (for www. URLs)
-            const href = url.startsWith('www.') ? 'https://' + url : url;
+            const href = cleanUrl.startsWith('www.') ? 'https://' + cleanUrl : cleanUrl;
             return `<a href="${href}" target="_blank" rel="noopener" class="output-link">${url}</a>`;
         });
     }
@@ -2531,6 +2559,7 @@
         showTags = setupShowTags;
         ansiMusicEnabled = setupAnsiMusic;
         guiTheme = setupGuiTheme;
+        applyTheme(guiTheme);
         setInputHeight(setupInputHeightValue);
 
         // Re-render output with new show_tags setting
