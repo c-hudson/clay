@@ -5930,6 +5930,8 @@ fn save_reload_state(app: &App) -> io::Result<()> {
     writeln!(file, "ansi_music_enabled={}", app.settings.ansi_music_enabled)?;
     writeln!(file, "show_tags={}", app.show_tags)?;
     writeln!(file, "theme={}", app.settings.theme.name())?;
+    writeln!(file, "gui_theme={}", app.settings.gui_theme.name())?;
+    writeln!(file, "gui_transparency={}", app.settings.gui_transparency)?;
     writeln!(file, "font_name={}", app.settings.font_name)?;
     writeln!(file, "font_size={}", app.settings.font_size)?;
     writeln!(file, "web_secure={}", app.settings.web_secure)?;
@@ -6593,11 +6595,6 @@ fn get_executable_path() -> io::Result<(PathBuf, String)> {
 fn exec_reload(app: &App) -> io::Result<()> {
     // Save the current state
     save_reload_state(app)?;
-
-    // Also save settings to convert any old format (e.g., actions by index) to new format
-    if let Err(e) = save_settings(app) {
-        eprintln!("Warning: Failed to save settings during reload: {}", e);
-    }
 
     // Collect socket fds that need to survive exec
     let mut fds_to_keep: Vec<RawFd> = Vec::new();
