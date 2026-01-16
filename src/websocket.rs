@@ -144,6 +144,17 @@ pub enum WsMessage {
     ActionsUpdated { actions: Vec<Action> },
     UpdateActions { actions: Vec<Action> },
 
+    // Ban list management
+    /// Request current ban list (client -> server)
+    BanListRequest,
+    /// Current ban list (server -> client)
+    /// Each entry is (ip, ban_type, reason) where ban_type is "permanent" or "temporary"
+    BanListResponse { bans: Vec<(String, String, String)> },
+    /// Request to unban a host (client -> server)
+    UnbanRequest { host: String },
+    /// Result of unban request (server -> client)
+    UnbanResult { success: bool, host: String, error: Option<String> },
+
     // World switching calculation (client -> server)
     CalculateNextWorld { current_index: usize },
     CalculatePrevWorld { current_index: usize },
@@ -812,7 +823,7 @@ where
                                 }
                             } else {
                                 // Record violation for failed auth attempt
-                                ban_list.record_violation(&client_ip);
+                                ban_list.record_violation(&client_ip, "WebSocket: failed auth");
                             }
                             // Send auth response
                             let response = WsMessage::AuthResponse {
@@ -841,14 +852,14 @@ where
                                 let _ = event_tx.send(AppEvent::WsClientMessage(client_id, Box::new(ws_msg))).await;
                             } else {
                                 // Record violation - unauthenticated client trying to send non-auth messages
-                                ban_list.record_violation(&client_ip);
+                                ban_list.record_violation(&client_ip, "WebSocket: unauthenticated message");
                                 break; // Disconnect the client
                             }
                         }
                     }
                 } else {
                     // Invalid JSON - record violation
-                    ban_list.record_violation(&client_ip);
+                    ban_list.record_violation(&client_ip, "WebSocket: invalid JSON");
                     break;
                 }
             }
@@ -861,12 +872,12 @@ where
             }
             Ok(WsRawMessage::Binary(_)) => {
                 // Binary messages not supported - record violation
-                ban_list.record_violation(&client_ip);
+                ban_list.record_violation(&client_ip, "WebSocket: binary message");
                 break;
             }
             Err(_) => {
                 // Protocol error - record violation
-                ban_list.record_violation(&client_ip);
+                ban_list.record_violation(&client_ip, "WebSocket: protocol error");
                 break;
             }
             _ => {}

@@ -1069,6 +1069,16 @@
                 }
                 break;
 
+            case 'BanListResponse':
+                // Ban list received - output is already sent via ServerData
+                // This message can be used for future UI enhancements
+                break;
+
+            case 'UnbanResult':
+                // Unban result received - output is already sent via ServerData
+                // This message can be used for future UI enhancements
+                break;
+
             default:
                 console.log('Unknown message type:', msg.type);
         }

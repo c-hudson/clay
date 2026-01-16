@@ -539,6 +539,8 @@ pub struct BanList {
     temp_bans: Arc<std::sync::RwLock<HashMap<String, u64>>>,
     /// Violation tracking: IP -> list of violation timestamps
     violations: Arc<std::sync::RwLock<HashMap<String, Vec<u64>>>>,
+    /// Ban reasons: IP -> last URL/reason that caused the ban
+    ban_reasons: Arc<std::sync::RwLock<HashMap<String, String>>>,
 }
 
 impl BanList {
@@ -547,6 +549,7 @@ impl BanList {
             permanent_bans: Arc::new(std::sync::RwLock::new(HashSet::new())),
             temp_bans: Arc::new(std::sync::RwLock::new(HashMap::new())),
             violations: Arc::new(std::sync::RwLock::new(HashMap::new())),
+            ban_reasons: Arc::new(std::sync::RwLock::new(HashMap::new())),
         }
     }
 
@@ -569,13 +572,16 @@ impl BanList {
         false
     }
 
-    /// Record a violation for an IP address
+    /// Record a violation for an IP address with a reason (URL or description)
     /// Returns true if the IP should be banned (5+ violations in 1 hour = permanent)
-    pub fn record_violation(&self, ip: &str) -> bool {
+    pub fn record_violation(&self, ip: &str, reason: &str) -> bool {
         // Never ban localhost
         if ip == "127.0.0.1" || ip == "::1" || ip == "localhost" {
             return false;
         }
+
+        // Store the reason for this violation
+        self.ban_reasons.write().unwrap().insert(ip.to_string(), reason.to_string());
 
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -626,6 +632,44 @@ impl BanList {
             .as_secs();
         self.temp_bans.write().unwrap().retain(|_, &mut expiry| expiry > now);
     }
+
+    /// Remove a ban (both permanent and temporary) for an IP
+    /// Returns true if a ban was removed
+    pub fn remove_ban(&self, ip: &str) -> bool {
+        let removed_perm = self.permanent_bans.write().unwrap().remove(ip);
+        let removed_temp = self.temp_bans.write().unwrap().remove(ip).is_some();
+        // Also clear violations and reason
+        self.violations.write().unwrap().remove(ip);
+        self.ban_reasons.write().unwrap().remove(ip);
+        removed_perm || removed_temp
+    }
+
+    /// Get all current bans with their reasons
+    /// Returns Vec of (ip, ban_type, reason) where ban_type is "permanent" or "temporary"
+    pub fn get_ban_info(&self) -> Vec<(String, String, String)> {
+        let mut result = Vec::new();
+        let reasons = self.ban_reasons.read().unwrap();
+
+        // Get permanent bans
+        for ip in self.permanent_bans.read().unwrap().iter() {
+            let reason = reasons.get(ip).cloned().unwrap_or_default();
+            result.push((ip.clone(), "permanent".to_string(), reason));
+        }
+
+        // Get active temporary bans
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        for (ip, expiry) in self.temp_bans.read().unwrap().iter() {
+            if *expiry > now {
+                let reason = reasons.get(ip).cloned().unwrap_or_default();
+                result.push((ip.clone(), "temporary".to_string(), reason));
+            }
+        }
+
+        result
+    }
 }
 
 impl Default for BanList {
@@ -668,7 +712,8 @@ async fn handle_http_client(
 
     // Check if IP is banned
     if ban_list.is_banned(&client_ip) {
-        // Silently close connection for banned IPs
+        // Send minimal response and close
+        let _ = stream.write_all(b"HTTP/1.1 403 Forbidden\r\nContent-Length: 7\r\nConnection: close\r\n\r\nBanned\n").await;
         return;
     }
 
@@ -747,7 +792,7 @@ async fn handle_http_client(
             }
             _ => {
                 // Record violation for accessing non-existent page
-                ban_list.record_violation(&client_ip);
+                ban_list.record_violation(&client_ip, path);
                 build_response(404, "Not Found", "text/plain", "Not Found")
             }
         };
@@ -778,11 +823,12 @@ async fn start_http_server(
             tokio::select! {
                 result = listener.accept() => {
                     match result {
-                        Ok((stream, addr)) => {
+                        Ok((mut stream, addr)) => {
                             let client_ip = addr.ip().to_string();
                             // Check if banned before processing
                             if ban_list.is_banned(&client_ip) {
-                                // Silently drop connection
+                                // Send minimal response and close
+                                let _ = stream.write_all(b"HTTP/1.1 403 Forbidden\r\nContent-Length: 7\r\nConnection: close\r\n\r\nBanned\n").await;
                                 continue;
                             }
                             // Disable Nagle's algorithm for lower latency
@@ -3049,6 +3095,10 @@ enum Command {
     Keepalive,
     /// /gag <pattern> - gag lines matching pattern
     Gag { pattern: String },
+    /// /ban - show banned hosts
+    BanList,
+    /// /unban <host> - remove ban for host
+    Unban { host: String },
     /// /testmusic - play a test ANSI music sequence
     TestMusic,
     /// /<action_name> [args] - execute action
@@ -3103,6 +3153,14 @@ fn parse_command(input: &str) -> Command {
                 Command::Unknown { cmd: trimmed.to_string() }
             } else {
                 Command::Gag { pattern: args.join(" ") }
+            }
+        }
+        "/ban" => Command::BanList,
+        "/unban" => {
+            if args.is_empty() {
+                Command::Unknown { cmd: trimmed.to_string() }
+            } else {
+                Command::Unban { host: args[0].to_string() }
             }
         }
         "/testmusic" => Command::TestMusic,
@@ -7769,6 +7827,12 @@ mod remote_gui {
                                     }
                                 }
                             }
+                        }
+                        WsMessage::BanListResponse { .. } => {
+                            // Ban list received - output is already displayed via ServerData
+                        }
+                        WsMessage::UnbanResult { .. } => {
+                            // Unban result received - output is already displayed via ServerData
                         }
                         _ => {}
                     }
@@ -15891,6 +15955,61 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                             ts: current_timestamp_secs(),
                                         });
                                     }
+                                    Command::BanList => {
+                                        // Send current ban list
+                                        let bans = app.ban_list.get_ban_info();
+                                        if bans.is_empty() {
+                                            app.ws_broadcast(WsMessage::ServerData {
+                                                world_index,
+                                                data: "No hosts are currently banned.".to_string(),
+                                                is_viewed: false,
+                                                ts: current_timestamp_secs(),
+                                            });
+                                        } else {
+                                            let mut output = String::new();
+                                            output.push_str("\nBanned Hosts:\n");
+                                            output.push_str(&"─".repeat(70));
+                                            output.push_str(&format!("\n{:<20} {:<12} {}\n", "Host", "Type", "Last URL/Reason"));
+                                            output.push_str(&"─".repeat(70));
+                                            output.push('\n');
+                                            for (ip, ban_type, reason) in &bans {
+                                                let reason_display = if reason.is_empty() { "(unknown)" } else { reason };
+                                                output.push_str(&format!("{:<20} {:<12} {}\n", ip, ban_type, reason_display));
+                                            }
+                                            output.push_str(&"─".repeat(70));
+                                            output.push_str("\nUse /unban <host> to remove a ban.");
+                                            app.ws_broadcast(WsMessage::ServerData {
+                                                world_index,
+                                                data: output,
+                                                is_viewed: false,
+                                                ts: current_timestamp_secs(),
+                                            });
+                                        }
+                                        app.ws_send_to_client(client_id, WsMessage::BanListResponse { bans });
+                                    }
+                                    Command::Unban { host } => {
+                                        if app.ban_list.remove_ban(&host) {
+                                            // Save settings to persist the change
+                                            let _ = save_settings(&app);
+                                            app.ws_broadcast(WsMessage::ServerData {
+                                                world_index,
+                                                data: format!("Removed ban for: {}", host),
+                                                is_viewed: false,
+                                                ts: current_timestamp_secs(),
+                                            });
+                                            // Broadcast updated ban list
+                                            app.ws_broadcast(WsMessage::BanListResponse { bans: app.ban_list.get_ban_info() });
+                                            app.ws_send_to_client(client_id, WsMessage::UnbanResult { success: true, host, error: None });
+                                        } else {
+                                            app.ws_broadcast(WsMessage::ServerData {
+                                                world_index,
+                                                data: format!("No ban found for: {}", host),
+                                                is_viewed: false,
+                                                ts: current_timestamp_secs(),
+                                            });
+                                            app.ws_send_to_client(client_id, WsMessage::UnbanResult { success: false, host, error: Some("No ban found".to_string()) });
+                                        }
+                                    }
                                     Command::TestMusic => {
                                         // Broadcast a test ANSI music sequence (C-D-E-F-G melody)
                                         let test_notes = vec![
@@ -16223,6 +16342,22 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                 // Client requested full state resync - send initial state
                                 let initial_state = app.build_initial_state();
                                 app.ws_send_to_client(client_id, initial_state);
+                            }
+                            WsMessage::BanListRequest => {
+                                // Send current ban list to client
+                                let bans = app.ban_list.get_ban_info();
+                                app.ws_send_to_client(client_id, WsMessage::BanListResponse { bans });
+                            }
+                            WsMessage::UnbanRequest { host } => {
+                                if app.ban_list.remove_ban(&host) {
+                                    // Save settings to persist the change
+                                    let _ = save_settings(&app);
+                                    // Broadcast updated ban list to all clients
+                                    app.ws_broadcast(WsMessage::BanListResponse { bans: app.ban_list.get_ban_info() });
+                                    app.ws_send_to_client(client_id, WsMessage::UnbanResult { success: true, host, error: None });
+                                } else {
+                                    app.ws_send_to_client(client_id, WsMessage::UnbanResult { success: false, host, error: Some("No ban found".to_string()) });
+                                }
                             }
                             _ => {
                                 // Other message types handled elsewhere or ignored
@@ -16917,6 +17052,61 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                         ts: current_timestamp_secs(),
                                     });
                                 }
+                                Command::BanList => {
+                                    // Send current ban list
+                                    let bans = app.ban_list.get_ban_info();
+                                    if bans.is_empty() {
+                                        app.ws_broadcast(WsMessage::ServerData {
+                                            world_index,
+                                            data: "No hosts are currently banned.".to_string(),
+                                            is_viewed: false,
+                                            ts: current_timestamp_secs(),
+                                        });
+                                    } else {
+                                        let mut output = String::new();
+                                        output.push_str("\nBanned Hosts:\n");
+                                        output.push_str(&"─".repeat(70));
+                                        output.push_str(&format!("\n{:<20} {:<12} {}\n", "Host", "Type", "Last URL/Reason"));
+                                        output.push_str(&"─".repeat(70));
+                                        output.push('\n');
+                                        for (ip, ban_type, reason) in &bans {
+                                            let reason_display = if reason.is_empty() { "(unknown)" } else { reason };
+                                            output.push_str(&format!("{:<20} {:<12} {}\n", ip, ban_type, reason_display));
+                                        }
+                                        output.push_str(&"─".repeat(70));
+                                        output.push_str("\nUse /unban <host> to remove a ban.");
+                                        app.ws_broadcast(WsMessage::ServerData {
+                                            world_index,
+                                            data: output,
+                                            is_viewed: false,
+                                            ts: current_timestamp_secs(),
+                                        });
+                                    }
+                                    app.ws_send_to_client(client_id, WsMessage::BanListResponse { bans });
+                                }
+                                Command::Unban { host } => {
+                                    if app.ban_list.remove_ban(&host) {
+                                        // Save settings to persist the change
+                                        let _ = save_settings(&app);
+                                        app.ws_broadcast(WsMessage::ServerData {
+                                            world_index,
+                                            data: format!("Removed ban for: {}", host),
+                                            is_viewed: false,
+                                            ts: current_timestamp_secs(),
+                                        });
+                                        // Broadcast updated ban list
+                                        app.ws_broadcast(WsMessage::BanListResponse { bans: app.ban_list.get_ban_info() });
+                                        app.ws_send_to_client(client_id, WsMessage::UnbanResult { success: true, host, error: None });
+                                    } else {
+                                        app.ws_broadcast(WsMessage::ServerData {
+                                            world_index,
+                                            data: format!("No ban found for: {}", host),
+                                            is_viewed: false,
+                                            ts: current_timestamp_secs(),
+                                        });
+                                        app.ws_send_to_client(client_id, WsMessage::UnbanResult { success: false, host, error: Some("No ban found".to_string()) });
+                                    }
+                                }
                                 Command::TestMusic => {
                                     // Broadcast a test ANSI music sequence (C-D-E-F-G melody)
                                     let test_notes = vec![
@@ -17106,6 +17296,22 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                             // Client requested full state resync - send initial state
                             let initial_state = app.build_initial_state();
                             app.ws_send_to_client(client_id, initial_state);
+                        }
+                        WsMessage::BanListRequest => {
+                            // Send current ban list to client
+                            let bans = app.ban_list.get_ban_info();
+                            app.ws_send_to_client(client_id, WsMessage::BanListResponse { bans });
+                        }
+                        WsMessage::UnbanRequest { host } => {
+                            if app.ban_list.remove_ban(&host) {
+                                // Save settings to persist the change
+                                let _ = save_settings(&app);
+                                // Broadcast updated ban list to all clients
+                                app.ws_broadcast(WsMessage::BanListResponse { bans: app.ban_list.get_ban_info() });
+                                app.ws_send_to_client(client_id, WsMessage::UnbanResult { success: true, host, error: None });
+                            } else {
+                                app.ws_send_to_client(client_id, WsMessage::UnbanResult { success: false, host, error: Some("No ban found".to_string()) });
+                            }
                         }
                         _ => {}
                     }
@@ -19888,6 +20094,48 @@ async fn handle_command(cmd: &str, app: &mut App, event_tx: mpsc::Sender<AppEven
         Command::Gag { pattern } => {
             // TODO: Implement gag patterns
             app.add_output(&format!("Gag pattern set: {}", pattern));
+        }
+        Command::BanList => {
+            // Show current banned hosts
+            let bans = app.ban_list.get_ban_info();
+            if bans.is_empty() {
+                app.add_output("No hosts are currently banned.");
+            } else {
+                app.add_output("");
+                app.add_output("Banned Hosts:");
+                app.add_output("─".repeat(70).as_str());
+                app.add_output(&format!("{:<20} {:<12} {}", "Host", "Type", "Last URL/Reason"));
+                app.add_output("─".repeat(70).as_str());
+                for (ip, ban_type, reason) in bans {
+                    let reason_display = if reason.is_empty() { "(unknown)" } else { &reason };
+                    app.add_output(&format!("{:<20} {:<12} {}", ip, ban_type, reason_display));
+                }
+                app.add_output("─".repeat(70).as_str());
+                app.add_output("Use /unban <host> to remove a ban.");
+            }
+            // Broadcast to remote clients
+            app.ws_broadcast(WsMessage::BanListResponse { bans: app.ban_list.get_ban_info() });
+        }
+        Command::Unban { host } => {
+            if app.ban_list.remove_ban(&host) {
+                app.add_output(&format!("Removed ban for: {}", host));
+                // Save settings to persist the change
+                if app.multiuser_mode {
+                    if let Err(e) = save_multiuser_settings(&app) {
+                        app.add_output(&format!("Warning: Failed to save settings: {}", e));
+                    }
+                } else {
+                    if let Err(e) = save_settings(&app) {
+                        app.add_output(&format!("Warning: Failed to save settings: {}", e));
+                    }
+                }
+                // Broadcast updated ban list to remote clients
+                app.ws_broadcast(WsMessage::BanListResponse { bans: app.ban_list.get_ban_info() });
+                app.ws_broadcast(WsMessage::UnbanResult { success: true, host: host.clone(), error: None });
+            } else {
+                app.add_output(&format!("No ban found for: {}", host));
+                app.ws_broadcast(WsMessage::UnbanResult { success: false, host: host.clone(), error: Some("No ban found".to_string()) });
+            }
         }
         Command::TestMusic => {
             // Broadcast a test ANSI music sequence (C-D-E-F-G melody)
