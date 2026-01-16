@@ -6611,22 +6611,6 @@ fn is_process_alive(pid: u32) -> bool {
     }
 }
 
-/// Log a message to the TLS proxy debug log file
-fn proxy_log(msg: &str) {
-    use std::io::Write;
-    if let Ok(mut file) = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open("/tmp/clay-tls-proxy.log")
-    {
-        let timestamp = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
-        let _ = writeln!(file, "[{}] [pid:{}] {}", timestamp, std::process::id(), msg);
-    }
-}
-
 /// Generate a unique socket path for the TLS proxy
 fn get_proxy_socket_path(world_name: &str) -> PathBuf {
     let sanitized_name = world_name
@@ -6668,13 +6652,11 @@ fn spawn_tls_proxy(
         socket_path.display()
     );
 
-    proxy_log(&format!("[Main] Spawning TLS proxy: {} {}", exe_path.display(), proxy_arg));
-
     let child = Command::new(&exe_path)
         .arg(&proxy_arg)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::inherit())  // Inherit stderr for debugging
+        .stderr(Stdio::null())
         .spawn()?;
 
     let child_pid = child.id();
@@ -6715,18 +6697,10 @@ async fn run_tls_proxy_async(host: &str, port: &str, socket_path: &PathBuf) {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::{TcpStream, UnixListener};
 
-    proxy_log(&format!("Starting proxy for {}:{} -> {}", host, port, socket_path.display()));
-
     // Step 1: Connect to the MUD server with TLS
     let tcp_stream = match TcpStream::connect(format!("{}:{}", host, port)).await {
-        Ok(s) => {
-            proxy_log("TCP connected");
-            s
-        }
-        Err(e) => {
-            proxy_log(&format!("TCP connect failed: {}", e));
-            return;
-        }
+        Ok(s) => s,
+        Err(_) => return,
     };
 
     // Establish TLS connection
@@ -6748,30 +6722,18 @@ async fn run_tls_proxy_async(host: &str, port: &str, socket_path: &PathBuf) {
             .try_into()
         {
             Ok(c) => c,
-            Err(e) => {
-                proxy_log(&format!("Config build failed: {:?}", e));
-                return;
-            }
+            Err(_) => return,
         };
 
         let connector = TlsConnector::from(Arc::new(config));
         let server_name = match ServerName::try_from(host.to_string()) {
             Ok(sn) => sn,
-            Err(e) => {
-                proxy_log(&format!("ServerName parse failed: {:?}", e));
-                return;
-            }
+            Err(_) => return,
         };
 
         match connector.connect(server_name, tcp_stream).await {
-            Ok(s) => {
-                proxy_log("TLS connected");
-                s
-            }
-            Err(e) => {
-                proxy_log(&format!("TLS connect failed: {}", e));
-                return;
-            }
+            Ok(s) => s,
+            Err(_) => return,
         }
     };
 
@@ -6800,16 +6762,10 @@ async fn run_tls_proxy_async(host: &str, port: &str, socket_path: &PathBuf) {
 
     // Step 2: Create Unix socket listener
     // Set socket permissions to owner-only (0600)
-    proxy_log(&format!("Creating Unix socket at {}", socket_path.display()));
+    // Step 2: Create Unix socket listener
     let listener = match UnixListener::bind(socket_path) {
-        Ok(l) => {
-            proxy_log("Unix socket created");
-            l
-        }
-        Err(e) => {
-            proxy_log(&format!("Unix socket bind failed: {}", e));
-            return;
-        }
+        Ok(l) => l,
+        Err(_) => return,
     };
 
     // Try to set restrictive permissions on the socket
@@ -6820,25 +6776,14 @@ async fn run_tls_proxy_async(host: &str, port: &str, socket_path: &PathBuf) {
     let (mut tls_read, mut tls_write) = tokio::io::split(tls_stream);
 
     loop {
-        proxy_log("Waiting for client connection...");
-
         // Wait for client connection with timeout (60 seconds for reconnection)
         let client_stream = match tokio::time::timeout(
             std::time::Duration::from_secs(60),
             listener.accept()
         ).await {
-            Ok(Ok((stream, _))) => {
-                proxy_log("Client connected");
-                stream
-            }
-            Ok(Err(e)) => {
-                proxy_log(&format!("Accept error: {}", e));
-                break;
-            }
-            Err(_) => {
-                proxy_log("Timeout waiting for client, exiting");
-                break;
-            }
+            Ok(Ok((stream, _))) => stream,
+            Ok(Err(_)) => break,
+            Err(_) => break, // Timeout waiting for client
         };
 
         let (mut client_read, mut client_write) = client_stream.into_split();
@@ -6855,39 +6800,29 @@ async fn run_tls_proxy_async(host: &str, port: &str, socket_path: &PathBuf) {
                 // Client -> TLS
                 result = client_read.read(&mut client_buf) => {
                     match result {
-                        Ok(0) => {
-                            proxy_log("Client disconnected, waiting for reconnect...");
-                            break; // Client disconnected, wait for new client
-                        }
+                        Ok(0) => break, // Client disconnected, wait for new client
                         Ok(n) => {
                             if tls_write.write_all(&client_buf[..n]).await.is_err() {
-                                proxy_log("TLS write failed");
                                 tls_server_disconnected = true;
                                 break;
                             }
                         }
-                        Err(e) => {
-                            proxy_log(&format!("Client read error: {}", e));
-                            break;
-                        }
+                        Err(_) => break,
                     }
                 }
                 // TLS -> Client
                 result = tls_read.read(&mut tls_buf) => {
                     match result {
                         Ok(0) => {
-                            proxy_log("TLS server disconnected");
                             tls_server_disconnected = true;
                             break;
                         }
                         Ok(n) => {
                             if client_write.write_all(&tls_buf[..n]).await.is_err() {
-                                proxy_log("Client write failed, waiting for reconnect...");
                                 break; // Client write failed, wait for new client
                             }
                         }
-                        Err(e) => {
-                            proxy_log(&format!("TLS read error: {}", e));
+                        Err(_) => {
                             tls_server_disconnected = true;
                             break;
                         }
@@ -6898,7 +6833,6 @@ async fn run_tls_proxy_async(host: &str, port: &str, socket_path: &PathBuf) {
 
         // If TLS server disconnected, exit the proxy
         if tls_server_disconnected {
-            proxy_log("TLS connection lost, proxy exiting");
             break;
         }
 
@@ -6907,7 +6841,6 @@ async fn run_tls_proxy_async(host: &str, port: &str, socket_path: &PathBuf) {
 
     // Clean up socket file
     let _ = std::fs::remove_file(socket_path);
-    proxy_log("Socket cleaned up, proxy process exiting");
 }
 
 /// Strip " (deleted)" suffix from a path string if present.
@@ -15014,18 +14947,13 @@ async fn main() -> io::Result<()> {
     // Check for --tls-proxy=host:port:socket_path argument for TLS proxy mode
     // This is used internally when spawning TLS proxy processes
     if let Some(proxy_arg) = std::env::args().find(|a| a.starts_with("--tls-proxy=")) {
-        proxy_log(&format!("Starting in proxy mode with: {}", proxy_arg));
         let params = proxy_arg.strip_prefix("--tls-proxy=").unwrap();
         let parts: Vec<&str> = params.splitn(3, ':').collect();
         if parts.len() == 3 {
             let host = parts[0];
             let port = parts[1];
             let socket_path = PathBuf::from(parts[2]);
-            proxy_log(&format!("Parsed: host={}, port={}, socket={}", host, port, socket_path.display()));
             run_tls_proxy_async(host, port, &socket_path).await;
-            proxy_log("Proxy finished");
-        } else {
-            proxy_log(&format!("Failed to parse arguments, got {} parts", parts.len()));
         }
         return Ok(());
     }
