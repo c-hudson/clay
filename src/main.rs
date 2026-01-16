@@ -6,6 +6,7 @@ pub mod input;
 pub mod util;
 pub mod websocket;
 pub mod ansi_music;
+pub mod tf;
 
 // Re-export commonly used types from modules
 pub use encoding::{Encoding, Theme, WorldSwitchMode, convert_discord_emojis, is_visually_empty, is_ansi_only_line, strip_non_sgr_sequences};
@@ -4220,6 +4221,8 @@ struct App {
     ban_list: BanList,
     /// Per-user connections in multiuser mode: (world_index, username) -> UserConnection
     user_connections: std::collections::HashMap<(usize, String), UserConnection>,
+    /// TinyFugue scripting engine
+    tf_engine: tf::TfEngine,
 }
 
 impl App {
@@ -4266,6 +4269,7 @@ impl App {
             users: Vec::new(),
             ban_list: BanList::new(),
             user_connections: std::collections::HashMap::new(),
+            tf_engine: tf::TfEngine::new(),
         }
         // Note: No initial world created here - it will be created after load_settings()
         // if no worlds are configured
@@ -5270,6 +5274,20 @@ fn save_settings(app: &App) -> io::Result<()> {
         }
     }
 
+    // Save TF global variables
+    if !app.tf_engine.global_vars.is_empty() {
+        writeln!(file)?;
+        writeln!(file, "[tf_globals]")?;
+        for (name, value) in &app.tf_engine.global_vars {
+            // Escape special characters in value
+            let val_str = value.to_string_value()
+                .replace('\\', "\\\\")
+                .replace('=', "\\e")
+                .replace('\n', "\\n");
+            writeln!(file, "{}={}", name, val_str)?;
+        }
+    }
+
     Ok(())
 }
 
@@ -5285,6 +5303,7 @@ fn load_settings(app: &mut App) -> io::Result<()> {
     let mut current_world: Option<String> = None;
     let mut current_action: Option<usize> = None;
     let mut in_banned_hosts = false;
+    let mut in_tf_globals = false;
 
     for line in reader.lines() {
         let line = line?;
@@ -5298,6 +5317,7 @@ fn load_settings(app: &mut App) -> io::Result<()> {
             current_world = None;
             current_action = None;
             in_banned_hosts = false;
+            in_tf_globals = false;
             continue;
         }
 
@@ -5305,6 +5325,15 @@ fn load_settings(app: &mut App) -> io::Result<()> {
             current_world = None;
             current_action = None;
             in_banned_hosts = true;
+            in_tf_globals = false;
+            continue;
+        }
+
+        if line.starts_with("[tf_globals]") {
+            current_world = None;
+            current_action = None;
+            in_banned_hosts = false;
+            in_tf_globals = true;
             continue;
         }
 
@@ -5315,6 +5344,7 @@ fn load_settings(app: &mut App) -> io::Result<()> {
             current_world = Some(app.worlds[idx].name.clone());
             current_action = None;
             in_banned_hosts = false;
+            in_tf_globals = false;
             continue;
         }
 
@@ -5322,6 +5352,7 @@ fn load_settings(app: &mut App) -> io::Result<()> {
             // Parse action section - supports both old format [action:NUMBER] and new format [action:NAME]
             current_world = None;
             in_banned_hosts = false;
+            in_tf_globals = false;
             let section_content = &line[8..line.len() - 1]; // Extract between "[action:" and "]"
 
             // Unescape the section content (for new format names with special chars)
@@ -5362,6 +5393,17 @@ fn load_settings(app: &mut App) -> io::Result<()> {
                 if key == "ip" && !value.is_empty() {
                     app.ban_list.add_permanent_ban(value);
                 }
+                continue;
+            }
+
+            // Check for TF globals section
+            if in_tf_globals {
+                // Unescape the value
+                let unescaped = value
+                    .replace("\\n", "\n")
+                    .replace("\\e", "=")
+                    .replace("\\\\", "\\");
+                app.tf_engine.set_global(key, tf::TfValue::from(unescaped));
                 continue;
             }
 
@@ -15703,6 +15745,47 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                 if handle_command(&cmd, &mut app, event_tx.clone()).await {
                                     return Ok(());
                                 }
+                            } else if cmd.starts_with('#') {
+                                // TinyFugue command
+                                match app.tf_engine.execute(&cmd) {
+                                    tf::TfCommandResult::Success(Some(msg)) => {
+                                        app.add_output(&msg);
+                                    }
+                                    tf::TfCommandResult::Success(None) => {
+                                        // Silent success
+                                    }
+                                    tf::TfCommandResult::Error(err) => {
+                                        app.add_output(&format!("%% {}", err));
+                                    }
+                                    tf::TfCommandResult::SendToMud(text) => {
+                                        if app.current_world().connected {
+                                            if let Some(tx) = &app.current_world().command_tx {
+                                                if tx.send(WriteCommand::Text(text)).await.is_err() {
+                                                    app.add_output("Failed to send command");
+                                                } else {
+                                                    let now = std::time::Instant::now();
+                                                    app.current_world_mut().last_send_time = Some(now);
+                                                    app.current_world_mut().last_user_command_time = Some(now);
+                                                    app.current_world_mut().prompt.clear();
+                                                }
+                                            }
+                                        } else {
+                                            app.add_output("Not connected. Use /worlds to connect.");
+                                        }
+                                    }
+                                    tf::TfCommandResult::ClayCommand(clay_cmd) => {
+                                        if handle_command(&clay_cmd, &mut app, event_tx.clone()).await {
+                                            return Ok(());
+                                        }
+                                    }
+                                    tf::TfCommandResult::NotTfCommand => {
+                                        // Shouldn't happen since we checked for #
+                                        app.add_output("Internal error: not a TF command");
+                                    }
+                                    tf::TfCommandResult::UnknownCommand(cmd_name) => {
+                                        app.add_output(&format!("%% Unknown command: #{}", cmd_name));
+                                    }
+                                }
                             } else if app.current_world().connected {
                                 if let Some(tx) = &app.current_world().command_tx {
                                     if tx.send(WriteCommand::Text(cmd)).await.is_err() {
@@ -23686,7 +23769,7 @@ mod tests {
                 if let Ok(WsRawMessage::Text(text)) = msg_result {
                     println!("Server received: {}", text);
                     if let Ok(ws_msg) = serde_json::from_str::<WsMessage>(&text) {
-                        if let WsMessage::AuthRequest { password_hash: client_hash } = ws_msg {
+                        if let WsMessage::AuthRequest { password_hash: client_hash, .. } = ws_msg {
                             println!("Client hash: {}", client_hash);
                             println!("Server hash: {}", server_hash);
                             let auth_success = client_hash == server_hash;
@@ -23694,6 +23777,8 @@ mod tests {
                             let response = WsMessage::AuthResponse {
                                 success: auth_success,
                                 error: if auth_success { None } else { Some("Invalid password".to_string()) },
+                                username: None,
+                                multiuser_mode: false,
                             };
                             let json = serde_json::to_string(&response).unwrap();
                             ws_sink.send(WsRawMessage::Text(json.into())).await.unwrap();
@@ -23716,7 +23801,7 @@ mod tests {
         let client_password = "test";
         let client_hash = hash_password(client_password);
         println!("Client sending hash: {}", client_hash);
-        let auth_msg = WsMessage::AuthRequest { password_hash: client_hash };
+        let auth_msg = WsMessage::AuthRequest { password_hash: client_hash, username: None };
         let json = serde_json::to_string(&auth_msg).unwrap();
         ws_sink.send(WsRawMessage::Text(json.into())).await.unwrap();
 
@@ -23724,7 +23809,7 @@ mod tests {
         if let Some(Ok(WsRawMessage::Text(text))) = ws_source.next().await {
             println!("Client received: {}", text);
             let response: WsMessage = serde_json::from_str(&text).unwrap();
-            if let WsMessage::AuthResponse { success, error } = response {
+            if let WsMessage::AuthResponse { success, error, .. } = response {
                 assert!(success, "Auth should succeed but got error: {:?}", error);
             } else {
                 panic!("Expected AuthResponse");
