@@ -20174,7 +20174,6 @@ async fn handle_command(cmd: &str, app: &mut App, event_tx: mpsc::Sender<AppEven
                         // Connect to the proxy via Unix socket
                         match tokio::net::UnixStream::connect(&socket_path).await {
                             Ok(unix_stream) => {
-                                app.add_output("SSL connection established via proxy.");
                                 app.current_world_mut().socket_fd = None;  // Can't preserve TLS fd directly
                                 app.current_world_mut().is_tls = true;
                                 app.current_world_mut().proxy_pid = Some(proxy_pid);
@@ -20305,7 +20304,8 @@ async fn handle_command(cmd: &str, app: &mut App, event_tx: mpsc::Sender<AppEven
                                     }
                                 });
 
-                                return true;
+                                // Connection established successfully via proxy, skip regular connection code
+                                return false;
                             }
                             Err(e) => {
                                 app.add_output(&format!("Failed to connect to TLS proxy: {}", e));
