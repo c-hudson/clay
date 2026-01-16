@@ -1,5 +1,6 @@
 # Build artifacts
 /target/
+/output/
 
 # Claude Code local settings
 .claude/
