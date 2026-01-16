@@ -3,6 +3,7 @@
 //! Parses commands starting with `#` and routes them to appropriate handlers.
 
 use super::{TfCommandResult, TfEngine, TfValue};
+use super::control_flow::{self, ControlState, ControlResult, IfState, WhileState, ForState};
 
 /// Check if input is a TF command (starts with #)
 pub fn is_tf_command(input: &str) -> bool {
@@ -12,6 +13,44 @@ pub fn is_tf_command(input: &str) -> bool {
 /// Execute a TF command and return the result.
 pub fn execute_command(engine: &mut TfEngine, input: &str) -> TfCommandResult {
     let input = input.trim();
+
+    // Check for internal encoded commands (from control flow)
+    if input.starts_with("__tf_if_eval__:") {
+        let results = control_flow::execute_if_encoded(engine, input);
+        return aggregate_results(results);
+    }
+    if input.starts_with("__tf_while_eval__:") {
+        let results = control_flow::execute_while_encoded(engine, input);
+        return aggregate_results(results);
+    }
+    if input.starts_with("__tf_for_eval__:") {
+        let results = control_flow::execute_for_encoded(engine, input);
+        return aggregate_results(results);
+    }
+
+    // Check if we're currently in a control flow state
+    if !matches!(engine.control_state, ControlState::None) {
+        let result = control_flow::process_control_line(&mut engine.control_state, input);
+        return match result {
+            ControlResult::Consumed => TfCommandResult::Success(None),
+            ControlResult::Execute(commands) => {
+                // Execute the collected commands
+                let mut results = vec![];
+                for cmd in commands {
+                    results.push(execute_command(engine, &cmd));
+                }
+                aggregate_results(results)
+            }
+            ControlResult::Error(e) => {
+                engine.control_state = ControlState::None;
+                TfCommandResult::Error(e)
+            }
+            ControlResult::NotControlFlow => {
+                // Shouldn't happen, but fall through
+                TfCommandResult::Success(None)
+            }
+        };
+    }
 
     if !input.starts_with('#') {
         return TfCommandResult::NotTfCommand;
@@ -56,12 +95,19 @@ pub fn execute_command(engine: &mut TfEngine, input: &str) -> TfCommandResult {
         "help" => cmd_help(args),
         "version" => cmd_version(),
 
+        // Control flow commands
+        "if" => cmd_if(engine, args),
+        "elseif" => TfCommandResult::Error("#elseif outside of #if block".to_string()),
+        "else" => TfCommandResult::Error("#else outside of #if block".to_string()),
+        "endif" => TfCommandResult::Error("#endif without matching #if".to_string()),
+        "while" => cmd_while(engine, args),
+        "for" => cmd_for(engine, args),
+        "done" => TfCommandResult::Error("#done without matching #while or #for".to_string()),
+        "break" => TfCommandResult::Error("__break__".to_string()), // Special marker
+
         // Not yet implemented - placeholder
         "def" | "undef" | "undefn" | "undeft" | "list" | "purge" => {
             TfCommandResult::Error(format!("#{} not yet implemented (Phase 4)", cmd))
-        }
-        "if" | "elseif" | "else" | "endif" | "while" | "done" | "for" | "break" => {
-            TfCommandResult::Error(format!("#{} not yet implemented (Phase 3)", cmd))
         }
         // Expression commands
         "expr" => cmd_expr(engine, args),
@@ -72,6 +118,38 @@ pub fn execute_command(engine: &mut TfEngine, input: &str) -> TfCommandResult {
         }
 
         _ => TfCommandResult::UnknownCommand(cmd.to_string()),
+    }
+}
+
+/// Aggregate multiple results into one
+fn aggregate_results(results: Vec<TfCommandResult>) -> TfCommandResult {
+    let mut messages = vec![];
+    let mut has_error = false;
+
+    for result in results {
+        match result {
+            TfCommandResult::Success(Some(msg)) => messages.push(msg),
+            TfCommandResult::Error(e) if e != "__break__" => {
+                messages.push(format!("Error: {}", e));
+                has_error = true;
+            }
+            TfCommandResult::SendToMud(cmd) => {
+                // This should be handled by the caller
+                messages.push(format!("[send: {}]", cmd));
+            }
+            TfCommandResult::ClayCommand(cmd) => {
+                messages.push(format!("[clay: {}]", cmd));
+            }
+            _ => {}
+        }
+    }
+
+    if has_error {
+        TfCommandResult::Error(messages.join("\n"))
+    } else if messages.is_empty() {
+        TfCommandResult::Success(None)
+    } else {
+        TfCommandResult::Success(Some(messages.join("\n")))
     }
 }
 
@@ -319,7 +397,7 @@ More commands coming in future phases:
 /// #version - Show version info
 fn cmd_version() -> TfCommandResult {
     TfCommandResult::Success(Some(
-        "Clay MUD Client with TinyFugue compatibility\nTF compatibility layer: Phase 2".to_string()
+        "Clay MUD Client with TinyFugue compatibility\nTF compatibility layer: Phase 3".to_string()
     ))
 }
 
@@ -384,6 +462,49 @@ fn is_valid_var_name(name: &str) -> bool {
             chars.all(|c| c.is_alphanumeric() || c == '_')
         }
         _ => false,
+    }
+}
+
+// =============================================================================
+// Control Flow Commands
+// =============================================================================
+
+/// #if (condition) [command] - Conditional execution
+fn cmd_if(engine: &mut TfEngine, args: &str) -> TfCommandResult {
+    // Check for single-line form: #if (condition) command
+    if let Some((condition, command)) = control_flow::parse_single_line_if(args) {
+        return control_flow::execute_single_if(engine, &condition, &command);
+    }
+
+    // Multi-line form: #if (condition)
+    match control_flow::parse_condition(args) {
+        Ok(condition) => {
+            engine.control_state = ControlState::If(IfState::new(condition));
+            TfCommandResult::Success(None)
+        }
+        Err(e) => TfCommandResult::Error(e),
+    }
+}
+
+/// #while (condition) - Start a while loop
+fn cmd_while(engine: &mut TfEngine, args: &str) -> TfCommandResult {
+    match control_flow::parse_condition(args) {
+        Ok(condition) => {
+            engine.control_state = ControlState::While(WhileState::new(condition));
+            TfCommandResult::Success(None)
+        }
+        Err(e) => TfCommandResult::Error(e),
+    }
+}
+
+/// #for var start end [step] - Start a for loop
+fn cmd_for(engine: &mut TfEngine, args: &str) -> TfCommandResult {
+    match control_flow::parse_for_args(args) {
+        Ok((var_name, start, end, step)) => {
+            engine.control_state = ControlState::For(ForState::new(var_name, start, end, step));
+            TfCommandResult::Success(None)
+        }
+        Err(e) => TfCommandResult::Error(e),
     }
 }
 

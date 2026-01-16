@@ -6,6 +6,7 @@
 pub mod parser;
 pub mod variables;
 pub mod expressions;
+pub mod control_flow;
 
 use std::collections::HashMap;
 use regex::Regex;
@@ -216,6 +217,8 @@ pub struct TfEngine {
     pub keybindings: HashMap<String, String>,
     /// Current working directory for #lcd
     pub current_dir: Option<String>,
+    /// Current control flow state (for multi-line if/while/for)
+    pub control_state: control_flow::ControlState,
 }
 
 impl TfEngine {
