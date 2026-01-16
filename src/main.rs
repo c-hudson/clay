@@ -3976,10 +3976,8 @@ impl World {
                     if let Some(last) = self.pending_lines.last_mut() {
                         last.text = completed_line.to_string();
                     }
-                } else {
-                    if let Some(last) = self.output_lines.last_mut() {
-                        last.text = completed_line.to_string();
-                    }
+                } else if let Some(last) = self.output_lines.last_mut() {
+                    last.text = completed_line.to_string();
                 }
             }
             1 // Skip first line since we handled it
@@ -4971,8 +4969,8 @@ pub enum AppEvent {
 pub struct UserConnection {
     pub connected: bool,
     pub command_tx: Option<mpsc::Sender<WriteCommand>>,
-    pub output_lines: Vec<OutputLine>,
-    pub pending_lines: Vec<OutputLine>,
+    output_lines: Vec<OutputLine>,
+    pending_lines: Vec<OutputLine>,
     pub scroll_offset: usize,
     pub unseen_lines: usize,
     pub paused: bool,
@@ -4984,6 +4982,12 @@ pub struct UserConnection {
     pub last_receive_time: Option<std::time::Instant>,
     pub partial_line: String,
     pub partial_in_pending: bool,
+}
+
+impl Default for UserConnection {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl UserConnection {
@@ -6673,8 +6677,7 @@ fn spawn_tls_proxy(
 
         // Check if child process died
         if !is_process_alive(child_pid) {
-            return Err(io::Error::new(
-                io::ErrorKind::Other,
+            return Err(io::Error::other(
                 "TLS proxy process exited unexpectedly",
             ));
         }
@@ -6715,15 +6718,10 @@ async fn run_tls_proxy_async(host: &str, port: &str, socket_path: &PathBuf) {
         let mut root_store = RootCertStore::empty();
         root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
 
-        let config = match rustls::ClientConfig::builder()
+        let config = rustls::ClientConfig::builder()
             .dangerous()
             .with_custom_certificate_verifier(Arc::new(danger::NoCertificateVerification::new()))
-            .with_no_client_auth()
-            .try_into()
-        {
-            Ok(c) => c,
-            Err(_) => return,
-        };
+            .with_no_client_auth();
 
         let connector = TlsConnector::from(Arc::new(config));
         let server_name = match ServerName::try_from(host.to_string()) {
@@ -7038,7 +7036,7 @@ mod remote_gui {
             matches!(self, GuiTheme::Dark)
         }
 
-        fn to_string_value(&self) -> String {
+        fn to_string_value(self) -> String {
             match self {
                 GuiTheme::Dark => "dark".to_string(),
                 GuiTheme::Light => "light".to_string(),
@@ -8498,6 +8496,7 @@ mod remote_gui {
         /// Format timestamp for GUI display
         /// Same day: HH:MM>
         /// Previous days: DD/MM HH:MM>
+        #[allow(dead_code)]
         fn format_timestamp_gui(ts: u64) -> String {
             Self::format_timestamp_gui_cached(ts, &GuiCachedNow::new())
         }
@@ -9074,9 +9073,11 @@ mod remote_gui {
                             if urls.is_empty() {
                                 // No URLs, render as normal text with word breaks
                                 let txt_with_breaks = Self::insert_word_breaks(&txt);
-                                let mut job = egui::text::LayoutJob::default();
-                                job.wrap = egui::text::TextWrapping {
-                                    max_width: available_width,
+                                let mut job = egui::text::LayoutJob {
+                                    wrap: egui::text::TextWrapping {
+                                        max_width: available_width,
+                                        ..Default::default()
+                                    },
                                     ..Default::default()
                                 };
                                 Self::append_ansi_to_job(&txt_with_breaks, default_color, font_id.clone(), &mut job, is_light_theme);
@@ -9089,9 +9090,11 @@ mod remote_gui {
                                     // Render text before URL
                                     if start > last_end {
                                         let before = Self::insert_word_breaks(&txt[last_end..start]);
-                                        let mut job = egui::text::LayoutJob::default();
-                                        job.wrap = egui::text::TextWrapping {
-                                            max_width: available_width,
+                                        let mut job = egui::text::LayoutJob {
+                                            wrap: egui::text::TextWrapping {
+                                                max_width: available_width,
+                                                ..Default::default()
+                                            },
                                             ..Default::default()
                                         };
                                         Self::append_ansi_to_job(&before, default_color, font_id.clone(), &mut job, is_light_theme);
@@ -9118,9 +9121,11 @@ mod remote_gui {
                                 // Render text after last URL
                                 if last_end < txt.len() {
                                     let after = Self::insert_word_breaks(&txt[last_end..]);
-                                    let mut job = egui::text::LayoutJob::default();
-                                    job.wrap = egui::text::TextWrapping {
-                                        max_width: available_width,
+                                    let mut job = egui::text::LayoutJob {
+                                        wrap: egui::text::TextWrapping {
+                                            max_width: available_width,
+                                            ..Default::default()
+                                        },
                                         ..Default::default()
                                     };
                                     Self::append_ansi_to_job(&after, default_color, font_id.clone(), &mut job, is_light_theme);
@@ -9360,7 +9365,7 @@ mod remote_gui {
                                 let still_checking_allow_list = self.connected
                                     && !self.authenticated
                                     && !self.password_submitted
-                                    && self.connect_time.map_or(false, |t| t.elapsed() < allow_list_timeout);
+                                    && self.connect_time.is_some_and(|t| t.elapsed() < allow_list_timeout);
 
                                 // Show connection status or password prompt
                                 if still_checking_allow_list {
@@ -9497,12 +9502,11 @@ mod remote_gui {
                                     };
                                     switch_world = Some(prev);
                                 }
-                            } else if i.consume_key(egui::Modifiers::SHIFT, egui::Key::ArrowDown) {
-                                if !self.worlds.is_empty() {
+                            } else if i.consume_key(egui::Modifiers::SHIFT, egui::Key::ArrowDown)
+                                && !self.worlds.is_empty() {
                                     let next = (self.current_world + 1) % self.worlds.len();
                                     switch_world = Some(next);
                                 }
-                            }
                         } else {
                             // Non-modified keys - consume to prevent widgets from handling
                             if i.consume_key(egui::Modifiers::NONE, egui::Key::PageUp) {
@@ -10465,9 +10469,11 @@ mod remote_gui {
                         // Build combined LayoutJob with ANSI colors
                         let default_color = theme.fg();
                         let font_id = egui::FontId::monospace(self.font_size);
-                        let mut combined_job = egui::text::LayoutJob::default();
-                        combined_job.wrap = egui::text::TextWrapping {
-                            max_width: ui.available_width(),
+                        let mut combined_job = egui::text::LayoutJob {
+                            wrap: egui::text::TextWrapping {
+                                max_width: ui.available_width(),
+                                ..Default::default()
+                            },
                             ..Default::default()
                         };
 
@@ -10524,12 +10530,7 @@ mod remote_gui {
                         let stick_to_bottom = self.scroll_offset.is_none() && !self.filter_active;
 
                         // Apply scroll offset if set (from PageUp/PageDown)
-                        let scroll_delta = if let Some(offset) = self.scroll_offset.take() {
-                            // Convert our offset to a delta we want to apply
-                            Some(offset)
-                        } else {
-                            None
-                        };
+                        let scroll_delta = self.scroll_offset.take();
 
                         let mut scroll_area = ScrollArea::vertical()
                             .id_salt(scroll_id)
@@ -11348,8 +11349,8 @@ mod remote_gui {
                                         ui.spacing_mut().item_spacing = egui::vec2(8.0, 0.0);
 
                                         // Delete button (danger, left side)
-                                        if can_delete {
-                                            if ui.add(egui::Button::new(
+                                        if can_delete
+                                            && ui.add(egui::Button::new(
                                                 egui::RichText::new("Delete").size(11.0).color(theme.error()))
                                                 .fill(Color32::TRANSPARENT)
                                                 .stroke(egui::Stroke::new(1.0, theme.error_dim()))
@@ -11358,7 +11359,6 @@ mod remote_gui {
                                             ).clicked() {
                                                 should_delete = true;
                                             }
-                                        }
 
                                         // Spacer to push remaining buttons to the right
                                         let remaining = ui.available_width() - 240.0; // 3 buttons * 70 + spacing
@@ -14273,7 +14273,7 @@ keep_alive_type=Generic
                                 if let Some(ws) = &app.ws_server {
                                     ws.broadcast_to_owner(WsMessage::ServerData {
                                         world_index,
-                                        data: format!("\x1b[31m%% Connection failed.\x1b[0m\n"),
+                                        data: "\x1b[31m%% Connection failed.\x1b[0m\n".to_string(),
                                         is_viewed: true,
                                         ts: current_timestamp_secs(),
                                     }, Some(&requesting_username));
@@ -20795,13 +20795,11 @@ async fn handle_command(cmd: &str, app: &mut App, event_tx: mpsc::Sender<AppEven
                 app.add_output(&format!("Removed ban for: {}", host));
                 // Save settings to persist the change
                 if app.multiuser_mode {
-                    if let Err(e) = save_multiuser_settings(&app) {
+                    if let Err(e) = save_multiuser_settings(app) {
                         app.add_output(&format!("Warning: Failed to save settings: {}", e));
                     }
-                } else {
-                    if let Err(e) = save_settings(&app) {
-                        app.add_output(&format!("Warning: Failed to save settings: {}", e));
-                    }
+                } else if let Err(e) = save_settings(app) {
+                    app.add_output(&format!("Warning: Failed to save settings: {}", e));
                 }
                 // Broadcast updated ban list to remote clients
                 app.ws_broadcast(WsMessage::BanListResponse { bans: app.ban_list.get_ban_info() });
