@@ -16062,6 +16062,8 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                 app.worlds[world_idx].output_lines.push(OutputLine::new(prompt_text));
                             }
                             app.worlds[world_idx].prompt.clear();
+                            // Show disconnection message
+                            app.worlds[world_idx].output_lines.push(OutputLine::new_client("Disconnected.".to_string()));
                             // Broadcast to WebSocket clients
                             app.ws_broadcast(WsMessage::WorldDisconnected { world_index: world_idx });
                         }
@@ -17191,6 +17193,8 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                             app.worlds[world_idx].output_lines.push(OutputLine::new(prompt_text));
                         }
                         app.worlds[world_idx].prompt.clear();
+                        // Show disconnection message
+                        app.worlds[world_idx].output_lines.push(OutputLine::new_client("Disconnected.".to_string()));
                         app.ws_broadcast(WsMessage::WorldDisconnected { world_index: world_idx });
                     }
                 }
@@ -19999,6 +20003,15 @@ async fn handle_command(cmd: &str, app: &mut App, event_tx: mpsc::Sender<AppEven
             app.menu_popup.open();
         }
         Command::Quit => {
+            // Kill all TLS proxy processes before quitting
+            for world in &app.worlds {
+                if let Some(proxy_pid) = world.proxy_pid {
+                    unsafe { libc::kill(proxy_pid as libc::pid_t, libc::SIGTERM); }
+                }
+                if let Some(ref socket_path) = world.proxy_socket_path {
+                    let _ = std::fs::remove_file(socket_path);
+                }
+            }
             return true; // Signal to quit
         }
         Command::Setup => {
