@@ -4,7 +4,36 @@
 
 set -e
 
+REQUIRED_RUST_VERSION="1.75.0"
+
 echo "Building Clay MUD Client (release, GUI + audio)..."
+echo ""
+
+# Check if cargo is installed
+if ! command -v cargo &> /dev/null; then
+    echo "Error: Cargo is not installed."
+    echo "Install Rust via: curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh"
+    exit 1
+fi
+
+# Check Rust version
+RUST_VERSION=$(rustc --version | grep -oE '[0-9]+\.[0-9]+\.[0-9]+')
+echo "Found Rust version: $RUST_VERSION"
+echo "Required minimum:   $REQUIRED_RUST_VERSION"
+
+# Compare versions (simple numeric comparison)
+version_ge() {
+    [ "$(printf '%s\n' "$1" "$2" | sort -V | head -n1)" = "$2" ]
+}
+
+if ! version_ge "$RUST_VERSION" "$REQUIRED_RUST_VERSION"; then
+    echo ""
+    echo "Error: Rust version $REQUIRED_RUST_VERSION or higher is required."
+    echo "Update Rust via: rustup update"
+    echo "Or reinstall:    curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh"
+    exit 1
+fi
+
 echo ""
 
 # Remove Cargo.lock to avoid version compatibility issues
