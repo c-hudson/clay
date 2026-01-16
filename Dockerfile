@@ -8,7 +8,7 @@
 #
 # The binary will be in ./output/clay
 
-FROM rust:1.83-bookworm AS builder
+FROM rust:latest AS builder
 
 # Install system dependencies for GUI and audio
 RUN apt-get update && apt-get install -y \
