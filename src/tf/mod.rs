@@ -8,6 +8,7 @@ pub mod variables;
 pub mod expressions;
 pub mod control_flow;
 pub mod macros;
+pub mod hooks;
 
 use std::collections::HashMap;
 use regex::Regex;

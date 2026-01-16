@@ -2,9 +2,10 @@
 //!
 //! Parses commands starting with `#` and routes them to appropriate handlers.
 
-use super::{TfCommandResult, TfEngine, TfValue};
+use super::{TfCommandResult, TfEngine, TfValue, TfHookEvent};
 use super::control_flow::{self, ControlState, ControlResult, IfState, WhileState, ForState};
 use super::macros;
+use super::hooks;
 
 /// Check if input is a TF command (starts with #)
 pub fn is_tf_command(input: &str) -> bool {
@@ -118,9 +119,12 @@ pub fn execute_command(engine: &mut TfEngine, input: &str) -> TfCommandResult {
         "expr" => cmd_expr(engine, args),
         "eval" => cmd_eval(engine, args),
         "test" => cmd_test(engine, args),
-        "hook" | "unhook" | "bind" | "unbind" => {
-            TfCommandResult::Error(format!("#{} not yet implemented (Phase 5)", cmd))
-        }
+
+        // Hook and keybinding commands
+        "hook" => cmd_hook(engine, args),
+        "unhook" => cmd_unhook(engine, args),
+        "bind" => cmd_bind(engine, args),
+        "unbind" => cmd_unbind(engine, args),
 
         _ => TfCommandResult::UnknownCommand(cmd.to_string()),
     }
@@ -402,7 +406,7 @@ More commands coming in future phases:
 /// #version - Show version info
 fn cmd_version() -> TfCommandResult {
     TfCommandResult::Success(Some(
-        "Clay MUD Client with TinyFugue compatibility\nTF compatibility layer: Phase 4".to_string()
+        "Clay MUD Client with TinyFugue compatibility\nTF compatibility layer: Phase 5".to_string()
     ))
 }
 
@@ -608,6 +612,104 @@ fn cmd_list(engine: &TfEngine, args: &str) -> TfCommandResult {
 fn cmd_purge(engine: &mut TfEngine) -> TfCommandResult {
     let count = macros::purge_macros(engine);
     TfCommandResult::Success(Some(format!("{} macro(s) purged.", count)))
+}
+
+// =============================================================================
+// Hook and Keybinding Commands
+// =============================================================================
+
+/// #hook [event [command]] - Register or list hooks
+fn cmd_hook(engine: &mut TfEngine, args: &str) -> TfCommandResult {
+    let args = args.trim();
+
+    if args.is_empty() {
+        // List all hooks
+        return TfCommandResult::Success(Some(hooks::list_hooks(engine)));
+    }
+
+    // Parse event and optional command
+    let parts: Vec<&str> = args.splitn(2, char::is_whitespace).collect();
+    let event_str = parts[0];
+
+    let event = TfHookEvent::parse(event_str)
+        .ok_or_else(|| format!("Unknown hook event: {}", event_str));
+
+    match event {
+        Ok(event) => {
+            if parts.len() > 1 {
+                // Register hook with command
+                let command = parts[1].trim().to_string();
+                hooks::register_hook(engine, event, command);
+                TfCommandResult::Success(Some(format!("Hook registered for {:?}", event)))
+            } else {
+                // List hooks for this event
+                let hook_list = engine.hooks.get(&event)
+                    .map(|v| v.join(", "))
+                    .unwrap_or_else(|| "none".to_string());
+                TfCommandResult::Success(Some(format!("{:?}: {}", event, hook_list)))
+            }
+        }
+        Err(e) => TfCommandResult::Error(e),
+    }
+}
+
+/// #unhook event - Remove all hooks for an event
+fn cmd_unhook(engine: &mut TfEngine, args: &str) -> TfCommandResult {
+    let event_str = args.trim();
+
+    if event_str.is_empty() {
+        return TfCommandResult::Error("Usage: #unhook event".to_string());
+    }
+
+    match TfHookEvent::parse(event_str) {
+        Some(event) => {
+            let count = hooks::unregister_hooks(engine, event);
+            TfCommandResult::Success(Some(format!("{} hook(s) removed for {:?}", count, event)))
+        }
+        None => TfCommandResult::Error(format!("Unknown hook event: {}", event_str)),
+    }
+}
+
+/// #bind [key [= command]] - Register or list keybindings
+fn cmd_bind(engine: &mut TfEngine, args: &str) -> TfCommandResult {
+    let args = args.trim();
+
+    if args.is_empty() {
+        // List all bindings
+        return TfCommandResult::Success(Some(hooks::list_bindings(engine)));
+    }
+
+    // Parse key = command
+    if let Some(eq_pos) = args.find('=') {
+        let key = args[..eq_pos].trim();
+        let command = args[eq_pos + 1..].trim();
+
+        match hooks::bind_key(engine, key, command.to_string()) {
+            Ok(()) => TfCommandResult::Success(None),
+            Err(e) => TfCommandResult::Error(e),
+        }
+    } else {
+        // Show binding for this key
+        match hooks::get_binding(engine, args) {
+            Some(cmd) => TfCommandResult::Success(Some(format!("{} = {}", args, cmd))),
+            None => TfCommandResult::Success(Some(format!("{} is not bound", args))),
+        }
+    }
+}
+
+/// #unbind key - Remove a keybinding
+fn cmd_unbind(engine: &mut TfEngine, args: &str) -> TfCommandResult {
+    let key = args.trim();
+
+    if key.is_empty() {
+        return TfCommandResult::Error("Usage: #unbind key".to_string());
+    }
+
+    match hooks::unbind_key(engine, key) {
+        Ok(true) => TfCommandResult::Success(Some(format!("Unbound {}", key))),
+        Ok(false) => TfCommandResult::Error(format!("{} was not bound", key)),
+        Err(e) => TfCommandResult::Error(e),
+    }
 }
 
 #[cfg(test)]
