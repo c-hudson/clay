@@ -458,10 +458,15 @@ body {
     left: 0;
     width: 100%;
     height: 100%;
-    background-color: rgba(0, 0, 0, 0.9);
+    background-color: transparent;
     justify-content: center;
     align-items: center;
     z-index: 1000;
+    pointer-events: none;
+}
+
+.modal .modal-content {
+    pointer-events: auto;
 }
 
 .modal.visible {
@@ -1643,6 +1648,23 @@ body.theme-light #mobile-toolbar {
     background-color: #e8e8e8;
 }
 
+body.theme-light .toolbar-btn,
+body.theme-light .mobile-btn {
+    background-color: #d8d8d8;
+    border-color: #bbbbbb;
+    color: #333333;
+}
+
+body.theme-light .toolbar-btn:hover,
+body.theme-light .mobile-btn:hover {
+    background-color: #cccccc;
+}
+
+body.theme-light .toolbar-btn:active,
+body.theme-light .mobile-btn:active {
+    background-color: #c0c0c0;
+}
+
 body.theme-light .modal-content {
     background-color: #f5f5f5;
 }
@@ -1803,4 +1825,245 @@ body.theme-light .world-editor-modal-content .form-select {
 
 body.theme-light .form-select:focus {
     border-color: var(--accent-color);
+}
+
+/* Light theme: Setup modal */
+body.theme-light .setup-modal-content,
+body.theme-light .world-editor-modal-content {
+    background: #ffffff;
+    border-color: #cccccc;
+}
+
+body.theme-light .setup-modal-content .popup-title,
+body.theme-light .world-editor-modal-content .popup-title {
+    color: #333333;
+}
+
+body.theme-light .setup-modal-content .popup-close,
+body.theme-light .world-editor-modal-content .popup-close {
+    color: #666666;
+}
+
+body.theme-light .setup-modal-content .popup-close:hover,
+body.theme-light .world-editor-modal-content .popup-close:hover {
+    background: #e8e8e8;
+    color: #333333;
+}
+
+body.theme-light .setup-modal-content .popup-footer,
+body.theme-light .world-editor-modal-content .popup-footer {
+    background: #f0f0f0;
+    border-top-color: #cccccc;
+}
+
+body.theme-light .setting-label {
+    color: #555555;
+}
+
+body.theme-light .setup-modal-content .btn,
+body.theme-light .world-editor-modal-content .btn {
+    background: #e8e8e8;
+    border-color: #cccccc;
+    color: #333333;
+}
+
+body.theme-light .setup-modal-content .btn:hover,
+body.theme-light .world-editor-modal-content .btn:hover {
+    background: #dcdcdc;
+    color: #000000;
+    border-color: #999999;
+}
+
+body.theme-light .setup-modal-content .btn-primary,
+body.theme-light .world-editor-modal-content .btn-primary {
+    background: #0891b2;
+    border-color: #0891b2;
+    color: #ffffff;
+}
+
+body.theme-light .setup-modal-content .btn-primary:hover,
+body.theme-light .world-editor-modal-content .btn-primary:hover {
+    background: #0e7490;
+    border-color: #0e7490;
+    color: #ffffff;
+}
+
+body.theme-light .world-editor-modal-content .btn-danger {
+    background: #dc2626;
+    border-color: #dc2626;
+    color: #ffffff;
+}
+
+body.theme-light .world-editor-modal-content .btn-danger:hover {
+    background: #b91c1c;
+    border-color: #b91c1c;
+    color: #ffffff;
+}
+
+/* Light theme: Toggle switch */
+body.theme-light .toggle {
+    background: #e0e0e0;
+    border-color: #cccccc;
+}
+
+body.theme-light .toggle::after {
+    background: #888888;
+}
+
+body.theme-light .toggle.active {
+    background: #0891b2;
+    border-color: #0891b2;
+}
+
+body.theme-light .toggle.active::after {
+    background: #ffffff;
+}
+
+/* Light theme: Stepper */
+body.theme-light .stepper .stepper-btn {
+    background: #e0e0e0;
+    color: #333333;
+}
+
+body.theme-light .stepper .stepper-btn:hover {
+    background: #d0d0d0;
+}
+
+body.theme-light .stepper-value {
+    background: #f0f0f0;
+    color: #333333;
+}
+
+/* Light theme: Editor input */
+body.theme-light .world-editor-modal-content .editor-input {
+    background: #ffffff;
+    border-color: #cccccc;
+    color: #333333;
+}
+
+body.theme-light .world-editor-modal-content .editor-input:focus {
+    border-color: var(--accent-color);
+}
+
+/* Light theme: Actions list modal */
+body.theme-light .actions-list-modal-content,
+body.theme-light .actions-editor-modal-content,
+body.theme-light .action-confirm-modal-content {
+    background: #ffffff;
+    border-color: #cccccc;
+}
+
+body.theme-light .actions-list-modal-content h2,
+body.theme-light .actions-editor-modal-content h2,
+body.theme-light .action-confirm-modal-content p {
+    color: #333333;
+}
+
+body.theme-light .actions-filter input {
+    background-color: #ffffff;
+    border-color: #cccccc;
+    color: #333333;
+}
+
+body.theme-light .actions-list {
+    background-color: #f8f8f8;
+    border-color: #cccccc;
+}
+
+body.theme-light .actions-list-item {
+    border-bottom-color: #dddddd;
+}
+
+body.theme-light .actions-list-item:hover {
+    background-color: #e8e8e8;
+}
+
+body.theme-light .actions-list-item .action-world {
+    color: #666666;
+}
+
+body.theme-light .actions-list-item .action-pattern {
+    color: #888888;
+}
+
+body.theme-light .action-field label {
+    color: var(--accent-color);
+}
+
+body.theme-light .action-field input,
+body.theme-light .action-field textarea {
+    background-color: #ffffff;
+    border-color: #cccccc;
+    color: #333333;
+}
+
+body.theme-light .modal-buttons button {
+    background-color: #e8e8e8;
+    border-color: #cccccc;
+    color: #333333;
+}
+
+body.theme-light .modal-buttons button:hover {
+    background-color: #dcdcdc;
+}
+
+body.theme-light .modal-buttons button.btn-primary {
+    background: #0891b2;
+    border-color: #0891b2;
+    color: #ffffff;
+}
+
+body.theme-light .modal-buttons button.btn-primary:hover {
+    background: #0e7490;
+    border-color: #0e7490;
+}
+
+/* Light theme: Worlds list modal */
+body.theme-light .worlds-modal-content,
+body.theme-light .world-selector-modal-content {
+    background: #ffffff;
+    border-color: #cccccc;
+}
+
+body.theme-light .worlds-modal-content h2,
+body.theme-light .world-selector-modal-content h2 {
+    color: #333333;
+}
+
+body.theme-light .world-selector-filter input {
+    background-color: #ffffff;
+    border-color: #cccccc;
+    color: #333333;
+}
+
+body.theme-light #worlds-table th,
+body.theme-light #world-selector-table th {
+    color: var(--accent-color);
+}
+
+body.theme-light #worlds-table td,
+body.theme-light #world-selector-table td {
+    border-bottom-color: #dddddd;
+}
+
+body.theme-light #worlds-table tr.current-world,
+body.theme-light #world-selector-table tr.current-world {
+    background-color: #f0f0f0;
+}
+
+body.theme-light #worlds-table tr:hover,
+body.theme-light #world-selector-table tr:hover {
+    background-color: #e8e8e8;
+}
+
+body.theme-light .toggle-label {
+    color: #333333;
+}
+
+body.theme-light .toggle-slider {
+    background-color: #cccccc;
+}
+
+body.theme-light .toggle-slider:before {
+    background-color: #888888;
 }
