@@ -20355,8 +20355,18 @@ fn render_output_crossterm(app: &App) {
 
                 // Check if we need to wrap before adding this character
                 if current_width + char_width > max_width && current_width > 0 {
-                    // Prefer to break at the last space (word boundary)
-                    if has_space_on_line && last_space_width > 0 {
+                    // Prefer break char over space when it's further along (packs more on line)
+                    if last_break_width > last_space_width {
+                        // Break at period/hyphen/etc within the current word
+                        let mut break_line = current_line[..last_break_byte_pos].to_string();
+                        break_line.push_str("\x1b[0m");
+                        result.push(break_line);
+
+                        let codes_prefix: String = last_break_codes.join("");
+                        let remainder = &current_line[last_break_byte_pos..];
+                        current_line = codes_prefix + remainder;
+                        current_width -= last_break_width;
+                    } else if has_space_on_line && last_space_width > 0 {
                         // Break at word boundary - emit up to and including the space
                         let mut break_line = current_line[..last_space_byte_pos].to_string();
                         break_line.push_str("\x1b[0m");
@@ -20367,16 +20377,6 @@ fn render_output_crossterm(app: &App) {
                         let remainder = &current_line[last_space_byte_pos..];
                         current_line = codes_prefix + remainder;
                         current_width -= last_space_width;
-                    } else if last_break_width > 0 {
-                        // No space, but we have a break char (for long words) - use it
-                        let mut break_line = current_line[..last_break_byte_pos].to_string();
-                        break_line.push_str("\x1b[0m");
-                        result.push(break_line);
-
-                        let codes_prefix: String = last_break_codes.join("");
-                        let remainder = &current_line[last_break_byte_pos..];
-                        current_line = codes_prefix + remainder;
-                        current_width -= last_break_width;
                     } else {
                         // No break point at all - hard wrap at current position
                         current_line.push_str("\x1b[0m");
