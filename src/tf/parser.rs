@@ -4,6 +4,7 @@
 
 use super::{TfCommandResult, TfEngine, TfValue};
 use super::control_flow::{self, ControlState, ControlResult, IfState, WhileState, ForState};
+use super::macros;
 
 /// Check if input is a TF command (starts with #)
 pub fn is_tf_command(input: &str) -> bool {
@@ -105,10 +106,14 @@ pub fn execute_command(engine: &mut TfEngine, input: &str) -> TfCommandResult {
         "done" => TfCommandResult::Error("#done without matching #while or #for".to_string()),
         "break" => TfCommandResult::Error("__break__".to_string()), // Special marker
 
-        // Not yet implemented - placeholder
-        "def" | "undef" | "undefn" | "undeft" | "list" | "purge" => {
-            TfCommandResult::Error(format!("#{} not yet implemented (Phase 4)", cmd))
-        }
+        // Macro commands
+        "def" => cmd_def(engine, args),
+        "undef" => cmd_undef(engine, args),
+        "undefn" => cmd_undefn(engine, args),
+        "undeft" => cmd_undeft(engine, args),
+        "list" => cmd_list(engine, args),
+        "purge" => cmd_purge(engine),
+
         // Expression commands
         "expr" => cmd_expr(engine, args),
         "eval" => cmd_eval(engine, args),
@@ -397,7 +402,7 @@ More commands coming in future phases:
 /// #version - Show version info
 fn cmd_version() -> TfCommandResult {
     TfCommandResult::Success(Some(
-        "Clay MUD Client with TinyFugue compatibility\nTF compatibility layer: Phase 3".to_string()
+        "Clay MUD Client with TinyFugue compatibility\nTF compatibility layer: Phase 4".to_string()
     ))
 }
 
@@ -506,6 +511,103 @@ fn cmd_for(engine: &mut TfEngine, args: &str) -> TfCommandResult {
         }
         Err(e) => TfCommandResult::Error(e),
     }
+}
+
+// =============================================================================
+// Macro Commands
+// =============================================================================
+
+/// #def [options] name = body - Define a macro
+fn cmd_def(engine: &mut TfEngine, args: &str) -> TfCommandResult {
+    if args.trim().is_empty() {
+        // No args: list all macros
+        return TfCommandResult::Success(Some(macros::list_macros(engine, None)));
+    }
+
+    match macros::parse_def(args) {
+        Ok(macro_def) => {
+            // Check if macro with same name exists
+            let existing_idx = engine.macros.iter().position(|m| m.name == macro_def.name);
+
+            // Register hook if present
+            if let Some(ref event) = macro_def.hook {
+                engine.hooks.entry(*event)
+                    .or_default()
+                    .push(macro_def.name.clone());
+            }
+
+            // Register keybinding if present
+            if let Some(ref keys) = macro_def.keybinding {
+                engine.keybindings.insert(keys.clone(), macro_def.name.clone());
+            }
+
+            // Replace existing or add new
+            if let Some(idx) = existing_idx {
+                engine.macros[idx] = macro_def;
+                TfCommandResult::Success(Some("Macro redefined.".to_string()))
+            } else {
+                engine.macros.push(macro_def);
+                TfCommandResult::Success(None)
+            }
+        }
+        Err(e) => TfCommandResult::Error(e),
+    }
+}
+
+/// #undef name - Undefine a macro by exact name
+fn cmd_undef(engine: &mut TfEngine, args: &str) -> TfCommandResult {
+    let name = args.trim();
+
+    if name.is_empty() {
+        return TfCommandResult::Error("Usage: #undef name".to_string());
+    }
+
+    if macros::undef_macro(engine, name) {
+        TfCommandResult::Success(Some(format!("Macro '{}' undefined.", name)))
+    } else {
+        TfCommandResult::Error(format!("Macro '{}' not found.", name))
+    }
+}
+
+/// #undefn pattern - Undefine macros by name pattern
+fn cmd_undefn(engine: &mut TfEngine, args: &str) -> TfCommandResult {
+    let pattern = args.trim();
+
+    if pattern.is_empty() {
+        return TfCommandResult::Error("Usage: #undefn pattern".to_string());
+    }
+
+    let count = macros::undef_by_name_pattern(engine, pattern);
+    TfCommandResult::Success(Some(format!("{} macro(s) undefined.", count)))
+}
+
+/// #undeft pattern - Undefine macros by trigger pattern
+fn cmd_undeft(engine: &mut TfEngine, args: &str) -> TfCommandResult {
+    let pattern = args.trim();
+
+    if pattern.is_empty() {
+        return TfCommandResult::Error("Usage: #undeft pattern".to_string());
+    }
+
+    let count = macros::undef_by_trigger_pattern(engine, pattern);
+    TfCommandResult::Success(Some(format!("{} macro(s) undefined.", count)))
+}
+
+/// #list [pattern] - List macros
+fn cmd_list(engine: &TfEngine, args: &str) -> TfCommandResult {
+    let pattern = if args.trim().is_empty() {
+        None
+    } else {
+        Some(args.trim())
+    };
+
+    TfCommandResult::Success(Some(macros::list_macros(engine, pattern)))
+}
+
+/// #purge - Remove all macros
+fn cmd_purge(engine: &mut TfEngine) -> TfCommandResult {
+    let count = macros::purge_macros(engine);
+    TfCommandResult::Success(Some(format!("{} macro(s) purged.", count)))
 }
 
 #[cfg(test)]

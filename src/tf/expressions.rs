@@ -1089,7 +1089,7 @@ fn glob_to_regex(pattern: &str) -> String {
 }
 
 /// Simple random number generator (xorshift32)
-fn simple_random() -> u32 {
+pub fn simple_random() -> u32 {
     use std::time::{SystemTime, UNIX_EPOCH};
     static SEED: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
