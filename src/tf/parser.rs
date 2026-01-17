@@ -422,7 +422,7 @@ More commands coming in future phases:
 /// #version - Show version info
 fn cmd_version() -> TfCommandResult {
     TfCommandResult::Success(Some(
-        "Clay MUD Client with TinyFugue compatibility\nTF compatibility layer: Phase 6".to_string()
+        "Clay MUD Client with TinyFugue compatibility\nTF compatibility layer: Complete".to_string()
     ))
 }
 
