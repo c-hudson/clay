@@ -134,18 +134,40 @@ pub fn cmd_quote(args: &str) -> TfCommandResult {
     TfCommandResult::SendToMud(args.to_string())
 }
 
-/// #recall [pattern] - Search output history
-/// Note: This returns a message indicating the feature needs main.rs integration
+/// #recall [-<count>] <pattern> - Search output history
+/// Examples:
+///   #recall *combat*     - Show all lines matching *combat*
+///   #recall -10 *combat* - Show last 10 lines matching *combat*
 pub fn cmd_recall(args: &str) -> TfCommandResult {
-    let pattern = args.trim();
+    let args = args.trim();
+
+    if args.is_empty() {
+        return TfCommandResult::Success(Some("Usage: #recall [-count] pattern - Search output history".to_string()));
+    }
+
+    // Parse optional -count prefix
+    let (count, pattern) = if args.starts_with('-') {
+        if let Some(space_pos) = args.find(|c: char| c.is_whitespace()) {
+            let count_str = &args[1..space_pos];
+            if let Ok(n) = count_str.parse::<usize>() {
+                (Some(n), args[space_pos..].trim())
+            } else {
+                // Not a number, treat whole thing as pattern
+                (None, args)
+            }
+        } else {
+            // No space, might be just "-10" which isn't valid
+            return TfCommandResult::Success(Some("Usage: #recall [-count] pattern - Search output history".to_string()));
+        }
+    } else {
+        (None, args)
+    };
 
     if pattern.is_empty() {
-        TfCommandResult::Success(Some("Usage: #recall pattern - Search output history".to_string()))
-    } else {
-        // This would need integration with the main output buffer
-        // For now, return a message
-        TfCommandResult::Success(Some(format!("Recall '{}' - requires main.rs integration", pattern)))
+        return TfCommandResult::Success(Some("Usage: #recall [-count] pattern - Search output history".to_string()));
     }
+
+    TfCommandResult::Recall { pattern: pattern.to_string(), count }
 }
 
 /// #gag pattern - Add a gag pattern (suppress matching output)

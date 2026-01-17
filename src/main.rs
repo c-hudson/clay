@@ -15741,6 +15741,68 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                             app.spell_state.reset();
                             app.suggestion_message = None;
 
+                            // Check for TF-style /N pattern shorthand (e.g., /10 *combat*)
+                            if cmd.starts_with('/') && cmd.len() > 1 {
+                                let rest = &cmd[1..];
+                                // Check if it starts with a number followed by space and pattern
+                                if let Some(space_pos) = rest.find(char::is_whitespace) {
+                                    let num_part = &rest[..space_pos];
+                                    if num_part.chars().all(|c| c.is_ascii_digit()) && !num_part.is_empty() {
+                                        let pattern = rest[space_pos..].trim();
+                                        if !pattern.is_empty() {
+                                            // Convert to #recall -N pattern
+                                            let recall_cmd = format!("#recall -{} {}", num_part, pattern);
+                                            match app.tf_engine.execute(&recall_cmd) {
+                                                tf::TfCommandResult::Recall { pattern, count } => {
+                                                    // Handle recall inline
+                                                    let regex_pattern = wildcard_to_regex(&pattern);
+                                                    if let Ok(re) = regex::Regex::new(&format!("(?i){}", regex_pattern)) {
+                                                        let matches: Vec<String> = {
+                                                            let world = app.current_world();
+                                                            let mut m: Vec<String> = Vec::new();
+                                                            for output_line in world.output_lines.iter().rev() {
+                                                                let plain = strip_ansi_codes(&output_line.text);
+                                                                if re.is_match(&plain) {
+                                                                    m.push(output_line.text.clone());
+                                                                    if let Some(limit) = count {
+                                                                        if m.len() >= limit {
+                                                                            break;
+                                                                        }
+                                                                    }
+                                                                }
+                                                            }
+                                                            m.reverse();
+                                                            m
+                                                        };
+
+                                                        if matches.is_empty() {
+                                                            app.add_output(&format!("%% No matches for '{}'", pattern));
+                                                        } else {
+                                                            app.add_output(&format!("%% {} match{} for '{}':",
+                                                                matches.len(),
+                                                                if matches.len() == 1 { "" } else { "es" },
+                                                                pattern));
+                                                            for m in &matches {
+                                                                app.add_output(m);
+                                                            }
+                                                        }
+                                                    } else {
+                                                        app.add_output(&format!("%% Invalid pattern: {}", pattern));
+                                                    }
+                                                }
+                                                other => {
+                                                    // Shouldn't happen but handle other results
+                                                    if let tf::TfCommandResult::Error(err) = other {
+                                                        app.add_output(&format!("%% {}", err));
+                                                    }
+                                                }
+                                            }
+                                            continue;
+                                        }
+                                    }
+                                }
+                            }
+
                             if cmd.starts_with('/') {
                                 if handle_command(&cmd, &mut app, event_tx.clone()).await {
                                     return Ok(());
@@ -15776,6 +15838,43 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                     tf::TfCommandResult::ClayCommand(clay_cmd) => {
                                         if handle_command(&clay_cmd, &mut app, event_tx.clone()).await {
                                             return Ok(());
+                                        }
+                                    }
+                                    tf::TfCommandResult::Recall { pattern, count } => {
+                                        // Convert glob pattern to regex
+                                        let regex_pattern = wildcard_to_regex(&pattern);
+                                        if let Ok(re) = regex::Regex::new(&format!("(?i){}", regex_pattern)) {
+                                            let matches: Vec<String> = {
+                                                let world = app.current_world();
+                                                let mut m: Vec<String> = Vec::new();
+                                                for output_line in world.output_lines.iter().rev() {
+                                                    let plain = strip_ansi_codes(&output_line.text);
+                                                    if re.is_match(&plain) {
+                                                        m.push(output_line.text.clone());
+                                                        if let Some(limit) = count {
+                                                            if m.len() >= limit {
+                                                                break;
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                                m.reverse();
+                                                m
+                                            };
+
+                                            if matches.is_empty() {
+                                                app.add_output(&format!("%% No matches for '{}'", pattern));
+                                            } else {
+                                                app.add_output(&format!("%% {} match{} for '{}':",
+                                                    matches.len(),
+                                                    if matches.len() == 1 { "" } else { "es" },
+                                                    pattern));
+                                                for m in &matches {
+                                                    app.add_output(m);
+                                                }
+                                            }
+                                        } else {
+                                            app.add_output(&format!("%% Invalid pattern: {}", pattern));
                                         }
                                     }
                                     tf::TfCommandResult::NotTfCommand => {

@@ -97,6 +97,8 @@ pub enum TfCommandResult {
     SendToMud(String),
     /// Command maps to a Clay command that should be executed
     ClayCommand(String),
+    /// Recall output history with pattern and optional count limit
+    Recall { pattern: String, count: Option<usize> },
     /// Not a TF command (doesn't start with #)
     NotTfCommand,
     /// Unknown TF command
