@@ -367,17 +367,45 @@ fn cmd_help(args: &str) -> TfCommandResult {
     let topic = args.trim().to_lowercase();
 
     if topic.is_empty() {
-        let help_text = r#"TinyFugue Commands (Phase 1)
+        let help_text = r#"TinyFugue Commands
 
 Variables:
   #set [name [value]]  - Set/list global variables
   #unset name          - Remove a variable
   #let name value      - Set a local variable
-  #setenv name value   - Set an environment variable
+  #setenv name         - Export variable to environment
+  #listvar [pattern]   - List variables
+
+Expressions:
+  #expr expression     - Evaluate and display result
+  #test expression     - Evaluate as boolean (0 or 1)
+  #eval expression     - Evaluate and execute as command
+
+Control Flow:
+  #if (expr) cmd       - Conditional execution
+  #if/#elseif/#else/#endif - Multi-line conditional
+  #while (expr)/#done  - While loop
+  #for var s e [step]/#done - For loop
+  #break               - Exit loop
+
+Macros/Triggers:
+  #def [opts] name=body - Define macro (-t -m -p -F -1 -ag -h -b)
+  #undef name          - Remove macro
+  #list [pattern]      - List macros
+  #purge [pattern]     - Remove all macros
+
+Hooks & Keys:
+  #bind key=command    - Bind key to command
+  #unbind key          - Remove key binding
 
 Output:
   #echo message        - Display message locally
   #send [-w world] text - Send text to MUD
+  #beep                - Terminal bell
+  #quote text          - Send without substitution
+  #gag pattern         - Suppress matching lines
+  #ungag pattern       - Remove gag
+  #recall [pattern]    - Search output history
 
 World Management:
   #world [name]        - Switch to or list worlds
@@ -386,22 +414,27 @@ World Management:
   #listsockets         - List connected worlds
   #dc, #disconnect     - Disconnect current world
 
+File Operations:
+  #load filename       - Load TF script
+  #save filename       - Save macros to file
+  #lcd path            - Change local directory
+
 Misc:
+  #time                - Display current time
+  #sh command          - Execute shell command
+  #ps                  - List background processes
+  #kill id             - Kill background process
   #help [topic]        - Show this help
   #version             - Show version info
   #quit                - Exit Clay
 
 Variable Substitution:
-  %{varname}           - Substitute variable value
-  %varname             - Short form (ends at non-alphanumeric)
+  %{varname}           - Variable value
+  %1-%9, %*            - Positional params from trigger
+  %L, %R               - Left/right of match
   %%                   - Literal percent sign
 
-More commands coming in future phases:
-  Phase 2: #expr, #eval, #test (expressions)
-  Phase 3: #if, #while, #for (control flow)
-  Phase 4: #def, #undef (macros/triggers)
-  Phase 5: #hook, #bind (hooks/keybindings)
-  Phase 6: Additional builtins"#;
+Use #help <command> for detailed help on specific commands."#;
         TfCommandResult::Success(Some(help_text.to_string()))
     } else {
         match topic.as_str() {
@@ -414,7 +447,50 @@ More commands coming in future phases:
             "send" => TfCommandResult::Success(Some(
                 "#send [-w world] text\n\nSend text to the MUD server.\n-w world: Send to specific world\nExample: #send say Hello everyone!".to_string()
             )),
-            _ => TfCommandResult::Success(Some(format!("No help available for '{}'", topic))),
+            "def" => TfCommandResult::Success(Some(
+                r#"#def [options] name = body
+
+Define a macro. Options:
+  -t"pattern"   Trigger pattern (fires on matching MUD output)
+  -mtype        Match type: simple, glob (default), regexp
+  -p priority   Execution priority (higher = first)
+  -F            Fall-through (continue checking other triggers)
+  -1            One-shot (delete after firing once)
+  -n count      Fire only N times
+  -ag           Gag (suppress) matched line
+  -ah           Highlight matched line
+  -ab           Bold
+  -au           Underline
+  -E"expr"      Conditional (only fire if expression is true)
+  -c chance     Probability (0.0-1.0)
+  -w world      Restrict to specific world
+  -h event      Hook event (CONNECT, DISCONNECT, etc.)
+  -b"key"       Key binding
+
+Examples:
+  #def -t"You are hungry" eat = get food bag%; eat food
+  #def -t"^(\w+) tells you" -mregexp reply = tell %1 Got it!
+  #def -hCONNECT greet = look"#.to_string()
+            )),
+            "if" => TfCommandResult::Success(Some(
+                "#if (expression) command\n#if (expr) ... #elseif (expr) ... #else ... #endif\n\nConditional execution.\nExamples:\n  #if (hp < 50) cast heal\n  #if (%1 == \"yes\") #echo Confirmed #else #echo Cancelled #endif".to_string()
+            )),
+            "while" => TfCommandResult::Success(Some(
+                "#while (expression) ... #done\n\nRepeat commands while expression is true.\nExample:\n  #while (count < 10) #echo %count%; #set count $[count+1] #done".to_string()
+            )),
+            "for" => TfCommandResult::Success(Some(
+                "#for variable start end [step] ... #done\n\nLoop from start to end.\nExample:\n  #for i 1 5 #echo Number %i #done".to_string()
+            )),
+            "expr" => TfCommandResult::Success(Some(
+                "#expr expression\n\nEvaluate expression and display result.\nOperators: + - * / % == != < > <= >= & | ! =~ !~ ?:\nFunctions: strlen() substr() strcat() tolower() toupper() rand() time() abs() min() max()\nExample: #expr 2 + 2 * 3".to_string()
+            )),
+            "bind" => TfCommandResult::Success(Some(
+                "#bind key = command\n\nBind a key to execute a command.\nKey names: F1-F12, ^A-^Z (Ctrl), @a-@z (Alt), PgUp, PgDn, Home, End, Insert, Delete\nExample: #bind F5 = cast heal".to_string()
+            )),
+            "hook" | "hooks" => TfCommandResult::Success(Some(
+                "Hooks fire macros on events. Use #def -h<event> to register.\n\nEvents:\n  CONNECT     - When connected to MUD\n  DISCONNECT  - When disconnected\n  LOGIN       - After login\n  PROMPT      - On prompt received\n  SEND        - Before sending command\n\nExample: #def -hCONNECT auto_look = look".to_string()
+            )),
+            _ => TfCommandResult::Success(Some(format!("No help available for '{}'\nTry: set, echo, send, def, if, while, for, expr, bind, hooks", topic))),
         }
     }
 }
