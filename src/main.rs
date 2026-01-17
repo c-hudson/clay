@@ -17266,6 +17266,12 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
         if app.needs_output_redraw || popup_visibility_changed {
             render_output_crossterm(&app);
             app.needs_output_redraw = false;
+            // Mark current world as seen since its output was just displayed
+            if app.current_world().unseen_lines > 0 {
+                app.current_world_mut().mark_seen();
+                // Broadcast to WebSocket clients
+                app.ws_broadcast(WsMessage::UnseenCleared { world_index: app.current_world_index });
+            }
         }
 
         // Process any additional queued server events before next select
