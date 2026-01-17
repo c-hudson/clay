@@ -147,6 +147,139 @@ pub fn truncate_str(s: &str, max_len: usize) -> String {
     }
 }
 
+/// Parse Discord timestamps in text and convert them to human-readable format
+/// Discord format: <t:TIMESTAMP:FORMAT> where FORMAT is t, T, d, D, f, F, s, S, or R
+/// - t: short time (10:17 PM)
+/// - T: long time (10:17:46 PM)
+/// - d: short date (01/17/2026)
+/// - D: long date (January 17, 2026)
+/// - f: short date/time (January 17, 2026 10:17 PM)
+/// - F: long date/time (Friday, January 17, 2026 10:17 PM)
+/// - s: short date + time (01/16/2026, 10:27 PM)
+/// - S: short date + time with seconds (01/16/2026, 10:27:33 PM)
+/// - R: relative time (in 2 hours, 3 days ago)
+pub fn parse_discord_timestamps(text: &str) -> String {
+    let mut result = String::with_capacity(text.len());
+    let mut remaining = text;
+
+    while let Some(start) = remaining.find("<t:") {
+        // Add text before the timestamp
+        result.push_str(&remaining[..start]);
+
+        // Find the end of the timestamp
+        let after_start = &remaining[start + 3..];
+        if let Some(end) = after_start.find('>') {
+            let inner = &after_start[..end];
+
+            // Parse timestamp and optional format
+            let (timestamp_str, format) = if let Some(colon_pos) = inner.rfind(':') {
+                (&inner[..colon_pos], &inner[colon_pos + 1..])
+            } else {
+                (inner, "f") // Default format
+            };
+
+            if let Ok(timestamp) = timestamp_str.parse::<i64>() {
+                // Convert timestamp to formatted string
+                let formatted = format_discord_timestamp(timestamp, format);
+                result.push_str(&formatted);
+                remaining = &after_start[end + 1..];
+                continue;
+            }
+        }
+
+        // Couldn't parse, keep the original text
+        result.push_str("<t:");
+        remaining = after_start;
+    }
+
+    // Add any remaining text
+    result.push_str(remaining);
+    result
+}
+
+/// Format a Unix timestamp according to Discord format specifier
+fn format_discord_timestamp(timestamp: i64, format: &str) -> String {
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    // Convert timestamp to tm struct using libc
+    let time_t = timestamp as libc::time_t;
+    let mut tm: libc::tm = unsafe { std::mem::zeroed() };
+    unsafe {
+        libc::localtime_r(&time_t, &mut tm);
+    }
+
+    let year = tm.tm_year + 1900;
+    let month = tm.tm_mon + 1;
+    let day = tm.tm_mday;
+    let hour = tm.tm_hour;
+    let minute = tm.tm_min;
+    let second = tm.tm_sec;
+    let weekday = tm.tm_wday;
+
+    let month_names = ["January", "February", "March", "April", "May", "June",
+                       "July", "August", "September", "October", "November", "December"];
+    let weekday_names = ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"];
+
+    let month_name = month_names.get((month - 1) as usize).unwrap_or(&"???");
+    let weekday_name = weekday_names.get(weekday as usize).unwrap_or(&"???");
+
+    // 12-hour format
+    let (hour_12, am_pm) = if hour == 0 {
+        (12, "AM")
+    } else if hour < 12 {
+        (hour, "AM")
+    } else if hour == 12 {
+        (12, "PM")
+    } else {
+        (hour - 12, "PM")
+    };
+
+    match format {
+        "t" => format!("{}:{:02} {}", hour_12, minute, am_pm),
+        "T" => format!("{}:{:02}:{:02} {}", hour_12, minute, second, am_pm),
+        "d" => format!("{:02}/{:02}/{}", month, day, year),
+        "D" => format!("{} {}, {}", month_name, day, year),
+        "f" => format!("{} {}, {} {}:{:02} {}", month_name, day, year, hour_12, minute, am_pm),
+        "F" => format!("{}, {} {}, {} {}:{:02} {}", weekday_name, month_name, day, year, hour_12, minute, am_pm),
+        "s" => format!("{:02}/{:02}/{}, {}:{:02} {}", month, day, year, hour_12, minute, am_pm),
+        "S" => format!("{:02}/{:02}/{}, {}:{:02}:{:02} {}", month, day, year, hour_12, minute, second, am_pm),
+        "R" => {
+            // Relative time
+            let now = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_secs() as i64)
+                .unwrap_or(0);
+            let diff = timestamp - now;
+
+            if diff.abs() < 60 {
+                "just now".to_string()
+            } else if diff.abs() < 3600 {
+                let mins = diff.abs() / 60;
+                if diff > 0 {
+                    format!("in {} minute{}", mins, if mins == 1 { "" } else { "s" })
+                } else {
+                    format!("{} minute{} ago", mins, if mins == 1 { "" } else { "s" })
+                }
+            } else if diff.abs() < 86400 {
+                let hours = diff.abs() / 3600;
+                if diff > 0 {
+                    format!("in {} hour{}", hours, if hours == 1 { "" } else { "s" })
+                } else {
+                    format!("{} hour{} ago", hours, if hours == 1 { "" } else { "s" })
+                }
+            } else {
+                let days = diff.abs() / 86400;
+                if diff > 0 {
+                    format!("in {} day{}", days, if days == 1 { "" } else { "s" })
+                } else {
+                    format!("{} day{} ago", days, if days == 1 { "" } else { "s" })
+                }
+            }
+        }
+        _ => format!("{} {}, {} {}:{:02} {}", month_name, day, year, hour_12, minute, am_pm), // Default to 'f'
+    }
+}
+
 // ============================================================================
 // Shared World Switching Logic
 // ============================================================================

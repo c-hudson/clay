@@ -17,7 +17,7 @@ pub use telnet::{
 };
 pub use spell::{SpellChecker, SpellState};
 pub use input::InputArea;
-pub use util::{get_binary_name, strip_ansi_codes, visual_line_count, get_current_time_12hr, strip_mud_tag, truncate_str, convert_temperatures};
+pub use util::{get_binary_name, strip_ansi_codes, visual_line_count, get_current_time_12hr, strip_mud_tag, truncate_str, convert_temperatures, parse_discord_timestamps};
 pub use websocket::{
     WsMessage, WorldStateMsg, WorldSettingsMsg, GlobalSettingsMsg, TimestampedLine,
     WsClientInfo, WebSocketServer,
@@ -3947,6 +3947,9 @@ impl World {
         } else {
             text.to_string()
         };
+
+        // Parse Discord timestamps (e.g., <t:1234567890:f>)
+        let combined = parse_discord_timestamps(&combined);
 
         // Check if text ends with newline (all lines complete) or not (last line is partial)
         let ends_with_newline = combined.ends_with('\n');
