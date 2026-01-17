@@ -19378,10 +19378,15 @@ fn handle_key_event(key: KeyEvent, app: &mut App) -> KeyAction {
         }
     }
 
-    // Handle Tab - release pending lines when paused, or scroll down when viewing history
+    // Handle Tab - scroll down when viewing history, release pending when at bottom and paused
     if key.code == KeyCode::Tab && key.modifiers.is_empty() {
-        if app.current_world().paused {
-            // Paused with pending lines - release one screenful
+        if !app.current_world().is_at_bottom() {
+            // Viewing history (Hist indicator showing) - scroll down like PgDn
+            app.scroll_output_down();
+            app.needs_output_redraw = true;
+            return KeyAction::None;
+        } else if app.current_world().paused {
+            // At bottom and paused with pending lines - release one screenful
             let batch_size = (app.output_height as usize).saturating_sub(2);
             let world_idx = app.current_world_index;
             let pending_before = app.worlds[world_idx].pending_lines.len();
@@ -19393,10 +19398,6 @@ fn handle_key_event(key: KeyEvent, app: &mut App) -> KeyAction {
             let pending_count = app.worlds[world_idx].pending_lines.len();
             app.ws_broadcast(WsMessage::PendingLinesUpdate { world_index: world_idx, count: pending_count });
             app.needs_output_redraw = true;
-            return KeyAction::None;
-        } else if !app.current_world().is_at_bottom() {
-            // Not paused but scrolled back (Hist indicator showing) - scroll down like PgDn
-            app.scroll_output_down();
             return KeyAction::None;
         }
     }
