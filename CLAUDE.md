@@ -123,10 +123,11 @@ Encoding is configurable per-world in the world settings popup.
 ### Multi-World System
 
 - Each world has independent: output buffer, scroll position, connection, unseen line count
-- `unseen_lines` tracks lines that have not been displayed in any output window
-- Lines are only marked as seen when they are actually printed to an output window (console, web, or GUI)
-- The master instance tracks which lines have been viewed via a `last_seen_line` index per world
-- Switching worlds does NOT reset the unseen counter
+- `unseen_lines` increments when output arrives for a non-current world
+- `first_unseen_at` tracks when unseen output first arrived (for "Unseen First" world switching)
+- Lines are marked as seen when the world's output is rendered to the console
+- Switching worlds triggers a redraw, which clears the unseen count for the newly viewed world
+- WebSocket clients receive `UnseenCleared` broadcast when a world is marked as seen
 
 ### More-Style Pausing
 
@@ -530,15 +531,11 @@ The client includes an embedded WebSocket server that allows remote GUI clients 
 
 **Cross-Interface Sync:**
 
-Instead of marking lines as seen when switching worlds, "last seen" is based on the last line index displayed in each viewer's output window:
-
-- Each client (console, web, or GUI) tracks the last line index it displayed to the user for each world
-- Clients send a `LastLineDisplayed` message to the master with `(world, line_index)` when their view updates
-- The master maintains a table of `{world, viewer, last_seen_line}` for tracking
-- The unseen count for a world = total lines minus the maximum `last_seen_line` across all viewers
-- A line is "seen" once ANY viewer has shown it
-- "Unseen" decrements naturally as viewers catch up to the latest output
-- Switching worlds does NOT automatically mark lines as seen - only displaying them does
+- Console marks a world as seen when its output is rendered (clears `unseen_lines` to 0)
+- `UnseenCleared` message broadcast to all clients when a world is marked as seen
+- `UnseenUpdate` message sent when a world's unseen count changes
+- Web/GUI clients send `MarkWorldSeen` when switching to a world
+- All interfaces stay synchronized via these broadcasts
 
 **Allow List Whitelist:**
 
