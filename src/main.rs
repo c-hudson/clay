@@ -4326,9 +4326,7 @@ impl App {
             // Track previous world for Alt+w fallback
             self.previous_world_index = Some(self.current_world_index);
             self.current_world_index = index;
-            self.worlds[index].mark_seen();
-            // Broadcast to WebSocket clients that this world's unseen count is cleared
-            self.ws_broadcast(WsMessage::UnseenCleared { world_index: index });
+            // Note: mark_seen() is NOT called here - lines are only marked seen when displayed
             // Mark output for redraw since we switched worlds
             self.needs_output_redraw = true;
         }
@@ -9570,9 +9568,9 @@ mod remote_gui {
                                 // F8 - toggle action pattern highlighting
                                 self.highlight_actions = !self.highlight_actions;
                             } else if i.consume_key(egui::Modifiers::NONE, egui::Key::Tab) {
-                                // Tab - command completion if input starts with /
+                                // Tab - command completion if input starts with / or #
                                 // Otherwise release pending lines or scroll down if viewing history
-                                if self.input_buffer.starts_with('/') {
+                                if self.input_buffer.starts_with('/') || self.input_buffer.starts_with('#') {
                                     tab_complete = true;
                                 } else if self.current_world < self.worlds.len()
                                     && self.worlds[self.current_world].pending_count > 0
@@ -9651,7 +9649,8 @@ mod remote_gui {
                     }
 
                     // Apply tab completion
-                    if tab_complete && self.input_buffer.starts_with('/') {
+                    let is_cmd_prefix = self.input_buffer.starts_with('/') || self.input_buffer.starts_with('#');
+                    if tab_complete && is_cmd_prefix {
                         // Get the partial command (everything up to first space)
                         let input = self.input_buffer.clone();
                         let (partial, args) = if let Some(space_pos) = input.find(' ') {
@@ -9660,32 +9659,52 @@ mod remote_gui {
                             (input.as_str(), "")
                         };
 
-                        // Build list of completions: internal commands + manual actions
-                        let internal_commands = vec![
-                            "/help", "/disconnect", "/dc", "/send", "/worlds", "/connections",
-                            "/setup", "/web", "/actions", "/keepalive", "/reload", "/quit", "/gag", "/testmusic",
-                        ];
+                        let matches = if input.starts_with('#') {
+                            // TF commands
+                            let tf_commands = vec![
+                                "#set", "#unset", "#let", "#echo", "#send", "#beep", "#quote",
+                                "#expr", "#test", "#eval", "#if", "#elseif", "#else", "#endif",
+                                "#while", "#done", "#for", "#break", "#def", "#undef", "#undefn",
+                                "#undeft", "#list", "#purge", "#bind", "#unbind", "#load", "#save",
+                                "#lcd", "#time", "#version", "#help", "#ps", "#kill", "#sh", "#recall",
+                                "#setenv", "#listvar",
+                            ];
+                            let partial_lower = partial.to_lowercase();
+                            let mut m: Vec<String> = tf_commands.iter()
+                                .filter(|cmd| cmd.to_lowercase().starts_with(&partial_lower))
+                                .map(|s| s.to_string())
+                                .collect();
+                            m.sort();
+                            m.dedup();
+                            m
+                        } else {
+                            // Clay / commands: internal commands + manual actions
+                            let internal_commands = vec![
+                                "/help", "/disconnect", "/dc", "/send", "/worlds", "/connections",
+                                "/setup", "/web", "/actions", "/keepalive", "/reload", "/quit", "/gag", "/testmusic",
+                            ];
 
-                        // Get manual actions (empty pattern)
-                        let manual_actions: Vec<String> = self.actions.iter()
-                            .filter(|a| a.pattern.is_empty())
-                            .map(|a| format!("/{}", a.name))
-                            .collect();
+                            // Get manual actions (empty pattern)
+                            let manual_actions: Vec<String> = self.actions.iter()
+                                .filter(|a| a.pattern.is_empty())
+                                .map(|a| format!("/{}", a.name))
+                                .collect();
 
-                        // Find all matches
-                        let partial_lower = partial.to_lowercase();
-                        let mut matches: Vec<String> = internal_commands.iter()
-                            .filter(|cmd| cmd.to_lowercase().starts_with(&partial_lower))
-                            .map(|s| s.to_string())
-                            .collect();
-                        matches.extend(manual_actions.iter()
-                            .filter(|cmd| cmd.to_lowercase().starts_with(&partial_lower))
-                            .cloned());
+                            // Find all matches
+                            let partial_lower = partial.to_lowercase();
+                            let mut m: Vec<String> = internal_commands.iter()
+                                .filter(|cmd| cmd.to_lowercase().starts_with(&partial_lower))
+                                .map(|s| s.to_string())
+                                .collect();
+                            m.extend(manual_actions.iter()
+                                .filter(|cmd| cmd.to_lowercase().starts_with(&partial_lower))
+                                .cloned());
+                            m.sort();
+                            m.dedup();
+                            m
+                        };
 
                         if !matches.is_empty() {
-                            matches.sort();
-                            matches.dedup();
-
                             // Find next match index
                             let next_idx = if partial.to_lowercase() == self.completion_prefix.to_lowercase() {
                                 // Cycle to next match
@@ -16324,7 +16343,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                             let password = world.settings.password.clone();
                             let prompt_num = world.prompt_count;
 
-                            if !user.is_empty() || !password.is_empty() {
+                            if !user.is_empty() && !password.is_empty() {
                                 let cmd_to_send = match auto_type {
                                     AutoConnectType::Prompt => {
                                         match prompt_num {
@@ -16797,8 +16816,6 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                     // Restore previous world if it wasn't the target
                                     if prev_index != world_index {
                                         app.current_world_index = prev_index;
-                                        // Mark the restored world as seen (data may have arrived during connect)
-                                        app.current_world_mut().mark_seen();
                                     }
                                 }
                             }
@@ -16811,8 +16828,6 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                         return Ok(());
                                     }
                                     app.current_world_index = prev_index;
-                                    // Mark the restored world as seen (data may have arrived during disconnect)
-                                    app.current_world_mut().mark_seen();
                                     // WorldDisconnected broadcast happens via AppEvent::Disconnected
                                 }
                             }
@@ -17171,7 +17186,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                     let password = world.settings.password.clone();
                                     let prompt_num = world.prompt_count;
 
-                                    if !user.is_empty() || !password.is_empty() {
+                                    if !user.is_empty() && !password.is_empty() {
                                         let cmd_to_send = match auto_type {
                                             AutoConnectType::Prompt => {
                                                 match prompt_num {
@@ -17479,7 +17494,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                         let password = world.settings.password.clone();
                         let prompt_num = world.prompt_count;
 
-                        if !user.is_empty() || !password.is_empty() {
+                        if !user.is_empty() && !password.is_empty() {
                             let cmd_to_send = match auto_type {
                                 AutoConnectType::Prompt => {
                                     match prompt_num {
@@ -19417,8 +19432,9 @@ fn handle_key_event(key: KeyEvent, app: &mut App) -> KeyAction {
         return KeyAction::None;
     }
 
-    // Handle Tab for command completion when input starts with /
-    if key.code == KeyCode::Tab && key.modifiers.is_empty() && app.input.buffer.starts_with('/') {
+    // Handle Tab for command completion when input starts with / or #
+    let is_command_prefix = app.input.buffer.starts_with('/') || app.input.buffer.starts_with('#');
+    if key.code == KeyCode::Tab && key.modifiers.is_empty() && is_command_prefix {
         // Get the current partial command (everything up to first space, or whole buffer)
         let input = app.input.buffer.clone();
         let partial = if let Some(space_pos) = input.find(' ') {
@@ -19429,33 +19445,52 @@ fn handle_key_event(key: KeyEvent, app: &mut App) -> KeyAction {
 
         // Only complete if we're still in the command part (no space yet or cursor before space)
         if !input.contains(' ') || app.input.cursor_position <= input.find(' ').unwrap_or(input.len()) {
-            // Build list of completions: internal commands + manual actions
-            let internal_commands = vec![
-                "/help", "/disconnect", "/dc", "/send", "/worlds", "/connections",
-                "/setup", "/web", "/actions", "/keepalive", "/reload", "/quit", "/gag", "/testmusic",
-            ];
+            let matches = if input.starts_with('#') {
+                // TF commands
+                let tf_commands = vec![
+                    "#set", "#unset", "#let", "#echo", "#send", "#beep", "#quote",
+                    "#expr", "#test", "#eval", "#if", "#elseif", "#else", "#endif",
+                    "#while", "#done", "#for", "#break", "#def", "#undef", "#undefn",
+                    "#undeft", "#list", "#purge", "#bind", "#unbind", "#load", "#save",
+                    "#lcd", "#time", "#version", "#help", "#ps", "#kill", "#sh", "#recall",
+                    "#setenv", "#listvar",
+                ];
+                let partial_lower = partial.to_lowercase();
+                let mut m: Vec<String> = tf_commands.iter()
+                    .filter(|cmd| cmd.to_lowercase().starts_with(&partial_lower))
+                    .map(|s| s.to_string())
+                    .collect();
+                m.sort();
+                m.dedup();
+                m
+            } else {
+                // Clay / commands: internal commands + manual actions
+                let internal_commands = vec![
+                    "/help", "/disconnect", "/dc", "/send", "/worlds", "/connections",
+                    "/setup", "/web", "/actions", "/keepalive", "/reload", "/quit", "/gag", "/testmusic",
+                ];
 
-            // Get manual actions (empty pattern)
-            let manual_actions: Vec<String> = app.settings.actions.iter()
-                .filter(|a| a.pattern.is_empty())
-                .map(|a| format!("/{}", a.name))
-                .collect();
+                // Get manual actions (empty pattern)
+                let manual_actions: Vec<String> = app.settings.actions.iter()
+                    .filter(|a| a.pattern.is_empty())
+                    .map(|a| format!("/{}", a.name))
+                    .collect();
 
-            // Find all matches
-            let partial_lower = partial.to_lowercase();
-            let mut matches: Vec<String> = internal_commands.iter()
-                .filter(|cmd| cmd.to_lowercase().starts_with(&partial_lower))
-                .map(|s| s.to_string())
-                .collect();
-            matches.extend(manual_actions.iter()
-                .filter(|cmd| cmd.to_lowercase().starts_with(&partial_lower))
-                .cloned());
+                // Find all matches
+                let partial_lower = partial.to_lowercase();
+                let mut m: Vec<String> = internal_commands.iter()
+                    .filter(|cmd| cmd.to_lowercase().starts_with(&partial_lower))
+                    .map(|s| s.to_string())
+                    .collect();
+                m.extend(manual_actions.iter()
+                    .filter(|cmd| cmd.to_lowercase().starts_with(&partial_lower))
+                    .cloned());
+                m.sort();
+                m.dedup();
+                m
+            };
 
             if !matches.is_empty() {
-                // Sort matches alphabetically
-                matches.sort();
-                matches.dedup();
-
                 // Find current match index if we're already on a completed command
                 let current_idx = matches.iter().position(|m| m.eq_ignore_ascii_case(partial));
 
@@ -19488,7 +19523,7 @@ fn handle_key_event(key: KeyEvent, app: &mut App) -> KeyAction {
             app.needs_output_redraw = true;
             return KeyAction::None;
         } else if app.current_world().paused {
-            // At bottom and paused with pending lines - release one screenful
+            // At bottom and paused with pending lines - release screenful minus 2 lines
             let batch_size = (app.output_height as usize).saturating_sub(2);
             let world_idx = app.current_world_index;
             let pending_before = app.worlds[world_idx].pending_lines.len();
@@ -19650,15 +19685,8 @@ fn handle_key_event(key: KeyEvent, app: &mut App) -> KeyAction {
             KeyAction::None
         }
 
-        // Submit
+        // Submit - Enter does NOT release pending (only Tab/PageDown do)
         (_, KeyCode::Enter) => {
-            // If paused, release all pending and submit
-            if app.current_world().paused {
-                let world_idx = app.current_world_index;
-                app.current_world_mut().release_all_pending();
-                // Broadcast updated pending count to GUI clients
-                app.ws_broadcast(WsMessage::PendingLinesUpdate { world_index: world_idx, count: 0 });
-            }
             let input = app.input.take_input();
             // Allow empty input to be sent if connected (some MUDs use empty lines)
             if !input.is_empty() || app.current_world().connected {
@@ -20475,12 +20503,13 @@ async fn handle_command(cmd: &str, app: &mut App, event_tx: mpsc::Sender<AppEven
                                 }
 
                                 // Send auto-login if configured (for Connect type)
+                                // Requires BOTH username AND password to be set
                                 let skip_login = app.current_world().skip_auto_login;
                                 app.current_world_mut().skip_auto_login = false;
                                 let user = app.current_world().settings.user.clone();
                                 let password = app.current_world().settings.password.clone();
                                 let auto_connect_type = app.current_world().settings.auto_connect_type;
-                                if !skip_login && !user.is_empty() && auto_connect_type == AutoConnectType::Connect {
+                                if !skip_login && !user.is_empty() && !password.is_empty() && auto_connect_type == AutoConnectType::Connect {
                                     let tx = cmd_tx.clone();
                                     tokio::spawn(async move {
                                         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
@@ -20721,13 +20750,14 @@ async fn handle_command(cmd: &str, app: &mut App, event_tx: mpsc::Sender<AppEven
 
                     // Send "connect <user> <password>" if configured and auto_connect_type is Connect
                     // Skip if skip_auto_login flag is set (from /worlds -l)
+                    // Requires BOTH username AND password to be set
                     let skip_login = app.current_world().skip_auto_login;
                     // Reset flag so future reconnects will try auto-login again
                     app.current_world_mut().skip_auto_login = false;
                     let user = app.current_world().settings.user.clone();
                     let password = app.current_world().settings.password.clone();
                     let auto_connect_type = app.current_world().settings.auto_connect_type;
-                    if !skip_login && !user.is_empty() && auto_connect_type == AutoConnectType::Connect {
+                    if !skip_login && !user.is_empty() && !password.is_empty() && auto_connect_type == AutoConnectType::Connect {
                         let tx = cmd_tx.clone();
                         tokio::spawn(async move {
                             tokio::time::sleep(Duration::from_millis(500)).await;

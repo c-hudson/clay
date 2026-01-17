@@ -123,8 +123,10 @@ Encoding is configurable per-world in the world settings popup.
 ### Multi-World System
 
 - Each world has independent: output buffer, scroll position, connection, unseen line count
-- `unseen_lines` increments when data arrives on non-current world
-- Switching worlds calls `mark_seen()` to reset counter
+- `unseen_lines` tracks lines that have not been displayed in any output window
+- Lines are only marked as seen when they are actually printed to an output window (console, web, or GUI)
+- The master instance tracks which lines have been viewed via a `last_seen_line` index per world
+- Switching worlds does NOT reset the unseen counter
 
 ### More-Style Pausing
 
@@ -134,9 +136,9 @@ Encoding is configurable per-world in the world settings popup.
 - When pause triggers, scrolls to bottom first to show buffered output, then pauses
 - Also triggered when user scrolls up with PageUp
 - Incoming lines queue to `pending_lines` instead of `output_lines`
-- Tab releases one screenful of pending lines
+- Tab releases one screenful minus 2 lines of pending lines
 - Alt+j releases all pending lines (jump to end)
-- Enter releases all pending and sends command
+- Enter sends command but does NOT release pending lines (only Tab or PageDown releases pending)
 - Scrolling to bottom with PageDown also unpauses
 
 ### SSL/TLS Support
@@ -191,7 +193,7 @@ Configure user, password, and auto login type in world settings. Three modes are
 - **Prompt**: Sends username on first telnet GA prompt, password on second prompt
 - **MOO_prompt**: Like Prompt, but also sends username again on third prompt (for MOO-style login)
 
-Credentials stored per-world. Auto-login only triggers if username is configured.
+Credentials stored per-world. Auto-login only triggers if both username AND password are configured.
 Prompts that are auto-answered are immediately cleared and not displayed in the input area.
 
 ### Telnet Protocol Support
@@ -244,7 +246,7 @@ Prompts that are auto-answered are immediately cleared and not displayed in the 
 - `src/web/style.css` - Web interface CSS styles
 - `src/web/app.js` - Web interface JavaScript client
 - `websockets.readme` - WebSocket protocol documentation
-- `~/.mudclient.dat` - Settings file (created on first save)
+- `~/.clay.dat` - Settings file (created on first save)
 - `/usr/share/dict/words` - System dictionary for spell checking (fallback: american-english, british-english)
 
 ### Controls
@@ -254,7 +256,7 @@ Prompts that are auto-answered are immediately cleared and not displayed in the 
   - "World Switching" setting controls behavior:
     - **Unseen First**: Prioritizes OTHER worlds with unseen output first, then alphabetical
     - **Alphabetical**: Simple alphabetical order by world name
-  - "Unseen output" = lines received while viewing another world
+  - "Unseen output" = lines not yet displayed in any output window (received while viewing another world OR paused due to more-mode)
   - Disconnected worlds without unseen lines are skipped
 - `Alt+w` (or `Escape` then `w`) - Switch to world with activity (priority: oldest pending → unseen output → previous world)
 - `Shift+Up/Down` - Cycle through all worlds that have ever been connected
@@ -267,7 +269,7 @@ Prompts that are auto-answered are immediately cleared and not displayed in the 
 - `Ctrl+P/N` - Previous/Next command history
 - `Ctrl+Q` - Spell suggestions / cycle and replace
 - `Ctrl+A` or `Home/End` - Jump to start/end (Ctrl+A = start only)
-- `Tab` - Command completion (when input starts with `/`)
+- `Tab` - Command completion (when input starts with `/` or `#`); more-mode takes priority if paused
 
 **Output Scrollback:**
 - `PageUp` - Scroll back in history (enables more-pause)
@@ -285,7 +287,7 @@ Prompts that are auto-answered are immediately cleared and not displayed in the 
 - `Ctrl+L` - Redraw screen (filters out client-generated output, keeps only MUD server data)
 - `Ctrl+R` - Hot reload (same as /reload)
 - `/quit` - Exit the client
-- `Enter` - Send command (also releases all pending if paused)
+- `Enter` - Send command
 
 **World Settings Popup (when open):**
 - `Up/Down/Tab` - Navigate between fields (auto-enters edit mode for text fields)
@@ -495,10 +497,10 @@ The client includes automatic crash recovery:
 
 ### Settings Persistence
 
-- Settings automatically loaded from `~/.mudclient.dat` on startup
+- Settings automatically loaded from `~/.clay.dat` on startup
 - Settings automatically saved when closing settings popup (Save button, Enter, or Ctrl+S)
 - File format is INI-like with `[global]` and `[world:name]` sections
-- Hot reload state saved temporarily to `~/.mudclient.reload`
+- Hot reload state saved temporarily to `~/.clay.reload`
 
 ### WebSocket Server
 
@@ -524,10 +526,16 @@ The client includes an embedded WebSocket server that allows remote GUI clients 
 - Password is hashed with SHA-256 before transmission
 
 **Cross-Interface Sync:**
-- When any interface (console, web, or GUI) switches to a world, the unseen count is cleared
-- `MarkWorldSeen` message sent by web/GUI clients when switching worlds
-- `UnseenCleared` message broadcast to all clients to sync activity indicators
-- Console broadcasts `UnseenCleared` when user switches worlds via keyboard
+
+Instead of marking lines as seen when switching worlds, "last seen" is based on the last line index displayed in each viewer's output window:
+
+- Each client (console, web, or GUI) tracks the last line index it displayed to the user for each world
+- Clients send a `LastLineDisplayed` message to the master with `(world, line_index)` when their view updates
+- The master maintains a table of `{world, viewer, last_seen_line}` for tracking
+- The unseen count for a world = total lines minus the maximum `last_seen_line` across all viewers
+- A line is "seen" once ANY viewer has shown it
+- "Unseen" decrements naturally as viewers catch up to the latest output
+- Switching worlds does NOT automatically mark lines as seen - only displaying them does
 
 **Allow List Whitelist:**
 
@@ -827,7 +835,7 @@ Toggle with `F2`:
   - Displayed in cyan before each line
 - **Gagged lines**: Lines hidden by `/gag` action command are also shown with F2
 - Works in console, GUI, and web interfaces
-- Setting persists across sessions in `~/.mudclient.dat`
+- Setting persists across sessions in `~/.clay.dat`
 
 ### Actions
 
