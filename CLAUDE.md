@@ -137,7 +137,7 @@ Encoding is configurable per-world in the world settings popup.
 - Also triggered when user scrolls up with PageUp
 - Incoming lines queue to `pending_lines` instead of `output_lines`
 - Tab releases one screenful minus 2 lines of pending lines
-- Alt+j releases all pending lines (jump to end)
+- Escape+j releases all pending lines (jump to end)
 - Enter sends command but does NOT release pending lines (only Tab or PageDown releases pending)
 - Scrolling to bottom with PageDown also unpauses
 
@@ -275,7 +275,7 @@ Prompts that are auto-answered are immediately cleared and not displayed in the 
 - `PageUp` - Scroll back in history (enables more-pause)
 - `PageDown` - Scroll forward (unpauses if at bottom)
 - `Tab` - Release one screenful of pending lines (when paused); scroll down like PgDn (when viewing history)
-- `Alt+j` (or `Escape` then `j`) - Jump to end, release all pending lines
+- `Escape` then `j` - Jump to end, release all pending lines
 - `Alt+w` (or `Escape` then `w`) - Switch to world with activity (priority: oldest pending → unseen output → previous world)
 - `F4` - Open filter popup to search output
 
@@ -574,7 +574,7 @@ Note: HTTP automatically starts the non-secure WebSocket server if not already r
 - Full MUD client in the browser
 - ANSI color rendering (including 256-color and true color support)
 - Clickable URLs in output (cyan, underlined, opens in new tab)
-- More-mode pausing with Tab/Alt+j
+- More-mode pausing with Tab or Escape+j
 - Command history (Ctrl+P/N)
 - Multiple world support with world switching
 - World selector popup (`/worlds` command)
@@ -596,12 +596,8 @@ Note: HTTP automatically starts the non-secure WebSocket server if not already r
   - Toggle Tags - Show/hide MUD tags (same as F2)
   - Toggle Highlight - Highlight lines matching action patterns (same as F8)
   - Resync - Request full state resync from server
-- Font size buttons (S/M/L) next to hamburger:
-  - **S** (Small, 8px) - Optimized for phone displays
-  - **M** (Medium, 14px) - Default size
-  - **L** (Large, 18px) - Optimized for tablet displays
-- "Clay" title displayed after font buttons
-- Active font button highlighted in cyan
+- Font slider next to hamburger for adjusting text size
+- "Clay" title displayed after font slider
 
 **Mobile Web Interface:**
 - Toolbar uses `position: fixed` to stay visible during scrolling and keyboard display
@@ -614,7 +610,7 @@ Note: HTTP automatically starts the non-secure WebSocket server if not already r
 - Visibility change detection: auto-resync when browser tab becomes visible (handles sleep/wake)
 
 **Mobile Toolbar Layout:**
-- Left side: Menu (hamburger), PgUp, PgDn, Tags (👁)
+- Left side: Menu (hamburger), PgUp, PgDn
 - Right side: ▲ (Previous World), ▼ (Next World)
 - PgUp/PgDn on left for easy scrolling access; world switching on right
 
@@ -622,7 +618,7 @@ Note: HTTP automatically starts the non-secure WebSocket server if not already r
 - `Up/Down` - Switch between active worlds
 - `PageUp/PageDown` - Scroll output history
 - `Tab` - Release one screenful when paused; scroll down one screenful otherwise (like `more`)
-- `Alt+j` - Jump to end, release all pending
+- `Escape+j` - Jump to end, release all pending
 - `Ctrl+P/N` - Command history navigation
 - `Ctrl+U` - Clear input
 - `Ctrl+W` - Delete word before cursor
