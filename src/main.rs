@@ -16006,6 +16006,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                             // Track lines with gagged flag: (line, is_gagged)
                             let mut processed_lines: Vec<(&str, bool)> = Vec::new();
                             let mut commands_to_execute: Vec<String> = Vec::new();
+                            let mut tf_commands_to_execute: Vec<String> = Vec::new();
                             let ends_with_newline = combined_data.ends_with('\n');
                             let lines: Vec<&str> = combined_data.lines().collect();
                             let line_count = lines.len();
@@ -16041,11 +16042,17 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                     has_partial = true;
                                 } else {
                                     let mut is_gagged = false;
+                                    // Check Clay action triggers
                                     if let Some(result) = check_action_triggers(line, &world_name_for_triggers, &actions) {
                                         // Collect commands to execute
                                         commands_to_execute.extend(result.commands);
                                         is_gagged = result.should_gag;
                                     }
+                                    // Check TF triggers
+                                    let tf_result = tf::bridge::process_line(&mut app.tf_engine, line, Some(&world_name_for_triggers));
+                                    commands_to_execute.extend(tf_result.send_commands);
+                                    tf_commands_to_execute.extend(tf_result.clay_commands);
+                                    is_gagged = is_gagged || tf_result.should_gag;
                                     // Only add complete lines with gagged flag
                                     processed_lines.push((line, is_gagged));
                                 }
@@ -16133,10 +16140,21 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                     let _ = tx.try_send(WriteCommand::Text(cmd));
                                 }
                             }
+                            // Execute TF-generated Clay commands (not sent to MUD)
+                            for cmd in tf_commands_to_execute {
+                                // Execute as TF command (starts with #) or Clay command
+                                let _ = app.tf_engine.execute(&cmd);
+                            }
                         }
                     }
                     AppEvent::Disconnected(ref world_name) => {
                         if let Some(world_idx) = app.find_world_index(world_name) {
+                            // Fire TF DISCONNECT hook before cleaning up
+                            let hook_result = tf::bridge::fire_event(&mut app.tf_engine, tf::TfHookEvent::Disconnect);
+                            for cmd in hook_result.clay_commands {
+                                let _ = app.tf_engine.execute(&cmd);
+                            }
+
                             app.worlds[world_idx].connected = false;
                             app.worlds[world_idx].command_tx = None;
                             app.worlds[world_idx].telnet_mode = false;
@@ -16256,10 +16274,16 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                             // Check action triggers on the message
                             let mut is_gagged = false;
                             let mut commands_to_execute: Vec<String> = Vec::new();
+                            let mut tf_commands_to_execute: Vec<String> = Vec::new();
                             if let Some(result) = check_action_triggers(&message, &world_name_for_triggers, &actions) {
                                 commands_to_execute = result.commands;
                                 is_gagged = result.should_gag;
                             }
+                            // Check TF triggers
+                            let tf_result = tf::bridge::process_line(&mut app.tf_engine, &message, Some(&world_name_for_triggers));
+                            commands_to_execute.extend(tf_result.send_commands);
+                            tf_commands_to_execute.extend(tf_result.clay_commands);
+                            is_gagged = is_gagged || tf_result.should_gag;
 
                             let data = format!("{}\n", message);
 
@@ -16289,6 +16313,10 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                 for cmd in commands_to_execute {
                                     let _ = tx.try_send(WriteCommand::Text(cmd));
                                 }
+                            }
+                            // Execute TF-generated Clay commands
+                            for cmd in tf_commands_to_execute {
+                                let _ = app.tf_engine.execute(&cmd);
                             }
                         }
                     }
@@ -17152,6 +17180,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                         // Track lines with gagged flag: (line, is_gagged)
                         let mut processed_lines: Vec<(&str, bool)> = Vec::new();
                         let mut commands_to_execute: Vec<String> = Vec::new();
+                        let mut tf_commands_to_execute: Vec<String> = Vec::new();
                         let ends_with_newline = combined_data.ends_with('\n');
                         let lines: Vec<&str> = combined_data.lines().collect();
                         let line_count = lines.len();
@@ -17187,10 +17216,16 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                 has_partial = true;
                             } else {
                                 let mut is_gagged = false;
+                                // Check Clay action triggers
                                 if let Some(result) = check_action_triggers(line, &world_name_for_triggers, &actions) {
                                     commands_to_execute.extend(result.commands);
                                     is_gagged = result.should_gag;
                                 }
+                                // Check TF triggers
+                                let tf_result = tf::bridge::process_line(&mut app.tf_engine, line, Some(&world_name_for_triggers));
+                                commands_to_execute.extend(tf_result.send_commands);
+                                tf_commands_to_execute.extend(tf_result.clay_commands);
+                                is_gagged = is_gagged || tf_result.should_gag;
                                 // Only add complete lines with gagged flag
                                 processed_lines.push((line, is_gagged));
                             }
@@ -17264,10 +17299,20 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                 let _ = tx.try_send(WriteCommand::Text(cmd));
                             }
                         }
+                        // Execute TF-generated Clay commands
+                        for cmd in tf_commands_to_execute {
+                            let _ = app.tf_engine.execute(&cmd);
+                        }
                     }
                 }
                 AppEvent::Disconnected(ref world_name) => {
                     if let Some(world_idx) = app.find_world_index(world_name) {
+                        // Fire TF DISCONNECT hook before cleaning up
+                        let hook_result = tf::bridge::fire_event(&mut app.tf_engine, tf::TfHookEvent::Disconnect);
+                        for cmd in hook_result.clay_commands {
+                            let _ = app.tf_engine.execute(&cmd);
+                        }
+
                         app.worlds[world_idx].connected = false;
                         app.worlds[world_idx].command_tx = None;
                         app.worlds[world_idx].telnet_mode = false;
@@ -17384,10 +17429,16 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                         // Check action triggers on the message
                         let mut is_gagged = false;
                         let mut commands_to_execute: Vec<String> = Vec::new();
+                        let mut tf_commands_to_execute: Vec<String> = Vec::new();
                         if let Some(result) = check_action_triggers(&message, &world_name_for_triggers, &actions) {
                             commands_to_execute = result.commands;
                             is_gagged = result.should_gag;
                         }
+                        // Check TF triggers
+                        let tf_result = tf::bridge::process_line(&mut app.tf_engine, &message, Some(&world_name_for_triggers));
+                        commands_to_execute.extend(tf_result.send_commands);
+                        tf_commands_to_execute.extend(tf_result.clay_commands);
+                        is_gagged = is_gagged || tf_result.should_gag;
 
                         let data = format!("{}\n", message);
 
@@ -17417,6 +17468,10 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                             for cmd in commands_to_execute {
                                 let _ = tx.try_send(WriteCommand::Text(cmd));
                             }
+                        }
+                        // Execute TF-generated Clay commands
+                        for cmd in tf_commands_to_execute {
+                            let _ = app.tf_engine.execute(&cmd);
                         }
                     }
                 }
@@ -20307,6 +20362,15 @@ async fn handle_command(cmd: &str, app: &mut App, event_tx: mpsc::Sender<AppEven
                                 let (cmd_tx, mut cmd_rx) = mpsc::channel::<WriteCommand>(100);
                                 app.current_world_mut().command_tx = Some(cmd_tx.clone());
 
+                                // Fire TF CONNECT hook
+                                let hook_result = tf::bridge::fire_event(&mut app.tf_engine, tf::TfHookEvent::Connect);
+                                for cmd in hook_result.send_commands {
+                                    let _ = cmd_tx.try_send(WriteCommand::Text(cmd));
+                                }
+                                for cmd in hook_result.clay_commands {
+                                    let _ = app.tf_engine.execute(&cmd);
+                                }
+
                                 // Send auto-login if configured (for Connect type)
                                 let skip_login = app.current_world().skip_auto_login;
                                 app.current_world_mut().skip_auto_login = false;
@@ -20542,6 +20606,15 @@ async fn handle_command(cmd: &str, app: &mut App, event_tx: mpsc::Sender<AppEven
 
                     let (cmd_tx, mut cmd_rx) = mpsc::channel::<WriteCommand>(100);
                     app.current_world_mut().command_tx = Some(cmd_tx.clone());
+
+                    // Fire TF CONNECT hook
+                    let hook_result = tf::bridge::fire_event(&mut app.tf_engine, tf::TfHookEvent::Connect);
+                    for cmd in hook_result.send_commands {
+                        let _ = cmd_tx.try_send(WriteCommand::Text(cmd));
+                    }
+                    for cmd in hook_result.clay_commands {
+                        let _ = app.tf_engine.execute(&cmd);
+                    }
 
                     // Send "connect <user> <password>" if configured and auto_connect_type is Connect
                     // Skip if skip_auto_login flag is set (from /worlds -l)
