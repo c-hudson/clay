@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="utf-8"?>
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+    <!-- Green circle background -->
+    <path
+        android:fillColor="#3fb950"
+        android:pathData="M54,54m-30,0a30,30 0,1 1,60 0a30,30 0,1 1,-60 0"/>
+    <!-- Letter C for Clay -->
+    <path
+        android:fillColor="#0d1117"
+        android:pathData="M54,34c-11.046,0 -20,8.954 -20,20s8.954,20 20,20c5.523,0 10.523,-2.239 14.142,-5.858l-5.657,-5.657c-2.239,2.239 -5.329,3.515 -8.485,3.515c-6.627,0 -12,-5.373 -12,-12s5.373,-12 12,-12c3.156,0 6.246,1.276 8.485,3.515l5.657,-5.657C64.523,36.239 59.523,34 54,34z"/>
+</vector>

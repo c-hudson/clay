@@ -1,0 +1,81 @@
+<?xml version="1.0" encoding="utf-8"?>
+<LinearLayout
+    xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:orientation="vertical"
+    android:padding="16dp"
+    android:background="#0d1117">
+
+    <TextView
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:text="Clay Server Address"
+        android:textSize="16sp"
+        android:textColor="#e6edf3" />
+
+    <EditText
+        android:id="@+id/serverHost"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:hint="hostname or IP address"
+        android:inputType="text"
+        android:layout_marginTop="8dp"
+        android:textColor="#e6edf3"
+        android:textColorHint="#8b949e"
+        android:backgroundTint="#3fb950" />
+
+    <EditText
+        android:id="@+id/serverPort"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:hint="port (e.g., 9001)"
+        android:inputType="number"
+        android:layout_marginTop="8dp"
+        android:textColor="#e6edf3"
+        android:textColorHint="#8b949e"
+        android:backgroundTint="#3fb950" />
+
+    <LinearLayout
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:orientation="horizontal"
+        android:layout_marginTop="16dp"
+        android:gravity="center_vertical">
+
+        <TextView
+            android:layout_width="0dp"
+            android:layout_height="wrap_content"
+            android:layout_weight="1"
+            android:text="Use Secure Connection (HTTPS/WSS)"
+            android:textSize="14sp"
+            android:textColor="#e6edf3" />
+
+        <Switch
+            android:id="@+id/secureSwitch"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:checked="true"
+            android:thumbTint="#3fb950"
+            android:trackTint="#8b949e" />
+
+    </LinearLayout>
+
+    <TextView
+        android:id="@+id/connectionStatus"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="16dp"
+        android:textColor="#f85149"
+        android:visibility="gone" />
+
+    <Button
+        android:id="@+id/saveButton"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:text="Connect"
+        android:layout_marginTop="16dp"
+        android:backgroundTint="#3fb950"
+        android:textColor="#000000" />
+
+</LinearLayout>
