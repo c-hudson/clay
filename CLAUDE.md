@@ -325,6 +325,103 @@ Prompts that are auto-answered are immediately cleared and not displayed in the 
 - `/testmusic` - Play a test ANSI music sequence (C-D-E-F-G) to verify audio works
 - `/quit` - Exit the client
 
+### TF Commands (TinyFugue Compatibility)
+
+Clay includes a TinyFugue compatibility layer using `#` prefix instead of `/`. TF commands work alongside existing Clay commands.
+
+**Variables:**
+- `#set varname value` - Set global variable
+- `#unset varname` - Remove variable
+- `#let varname value` - Set local variable (within macro scope)
+- `#setenv varname` - Export variable to environment
+- `#listvar [pattern]` - List variables matching pattern
+
+**Output:**
+- `#echo message` - Display local message (supports `%{var}` substitution)
+- `#send [-w world] text` - Send text to MUD
+- `#beep` - Terminal bell
+- `#quote text` - Send text without variable substitution
+
+**Expressions:**
+- `#expr expression` - Evaluate and display result
+- `#test expression` - Evaluate as boolean (returns 0 or 1)
+- `#eval expression` - Evaluate and execute result as command
+- Operators: `+ - * / %` (arithmetic), `== != < > <= >=` (comparison), `& | !` (logical), `=~ !~` (regex), `?:` (ternary)
+- Functions: `strlen()`, `substr()`, `strcat()`, `tolower()`, `toupper()`, `rand()`, `time()`, `abs()`, `min()`, `max()`
+
+**Control Flow:**
+- `#if (expr) command` - Single-line conditional
+- `#if (expr) ... #elseif (expr) ... #else ... #endif` - Multi-line conditional
+- `#while (expr) ... #done` - While loop
+- `#for var start end [step] ... #done` - For loop
+- `#break` - Exit loop early
+
+**Macros (Triggers):**
+- `#def [options] name = body` - Define macro
+  - `-t"pattern"` - Trigger pattern (fires when MUD output matches)
+  - `-mtype` - Match type: `simple`, `glob` (default), `regexp`
+  - `-p priority` - Execution priority (higher = first)
+  - `-F` - Fall-through (continue checking other triggers)
+  - `-1` - One-shot (delete after firing once)
+  - `-n count` - Fire only N times
+  - `-ag` - Gag (suppress) matched line
+  - `-ah` - Highlight matched line
+  - `-ab` - Bold
+  - `-au` - Underline
+  - `-E"expr"` - Conditional (only fire if expression is true)
+  - `-c chance` - Probability (0.0-1.0)
+  - `-w world` - Restrict to specific world
+  - `-h event` - Hook event (CONNECT, DISCONNECT, etc.)
+  - `-b"key"` - Key binding
+- `#undef name` - Remove macro
+- `#undefn pattern` - Remove macros matching name pattern
+- `#undeft pattern` - Remove macros matching trigger pattern
+- `#list [pattern]` - List macros
+- `#purge [pattern]` - Remove all macros (or matching pattern)
+
+**Hooks:**
+- `#def -hCONNECT name = command` - Fire on connect
+- `#def -hDISCONNECT name = command` - Fire on disconnect
+- Events: `CONNECT`, `DISCONNECT`, `LOGIN`, `PROMPT`, `SEND`, `ACTIVITY`, `WORLD`, `RESIZE`, `LOAD`, `REDEF`, `BACKGROUND`
+
+**Key Bindings:**
+- `#bind key = command` - Bind key to command
+- `#unbind key` - Remove binding
+- Key names: `F1`-`F12`, `^A`-`^Z` (Ctrl), `@a`-`@z` (Alt), `PgUp`, `PgDn`, `Home`, `End`, `Insert`, `Delete`
+
+**File Operations:**
+- `#load filename` - Load TF script file
+- `#save filename` - Save macros to file
+- `#lcd path` - Change local directory
+
+**Miscellaneous:**
+- `#time` - Display current time
+- `#version` - Show TF compatibility version
+- `#help [topic]` - Show help
+- `#ps` - List background processes
+- `#kill id` - Kill background process
+- `#sh command` - Execute shell command
+- `#recall [pattern]` - Search output history
+
+**Variable Substitution:**
+- `%{varname}` - Variable value
+- `%varname` - Variable value (simple form)
+- `%1` - `%9` - Positional parameters from trigger match
+- `%*` - All positional parameters
+- `%L` - Text left of match
+- `%R` - Text right of match
+- `%%` - Literal percent sign
+
+**Example - Auto-heal trigger:**
+```
+#def -t"Your health: *" -mglob heal_check = #if ({1} < 50) cast heal
+```
+
+**Example - Connect hook:**
+```
+#def -hCONNECT auto_look = look
+```
+
 ### ANSI Music
 
 The client supports ANSI music sequences (BBS-style PC speaker music). When enabled, music sequences are extracted from MUD output and played through the web interface or remote GUI.
