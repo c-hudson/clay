@@ -41,7 +41,7 @@ cargo build --target x86_64-unknown-linux-musl --no-default-features --features 
 
 ## Architecture
 
-MudClient is a terminal-based MUD (Multi-User Dungeon) client built with ratatui/crossterm for TUI and tokio for async networking. Supports multiple simultaneous world connections with SSL/TLS support.
+Clay is a terminal-based MUD (Multi-User Dungeon) client built with ratatui/crossterm for TUI and tokio for async networking. Supports multiple simultaneous world connections with SSL/TLS support.
 
 ### Key Structs
 
@@ -253,13 +253,16 @@ Prompts that are auto-answered are immediately cleared and not displayed in the 
 
 **World Switching:**
 - `Up/Down` - Cycle through active worlds (connected OR with unseen output)
-  - "World Switching" setting controls behavior:
-    - **Unseen First**: Prioritizes OTHER worlds with unseen output first, then alphabetical
-    - **Alphabetical**: Simple alphabetical order by world name
-  - "Unseen output" = lines not yet displayed in any output window (received while viewing another world OR paused due to more-mode)
-  - Disconnected worlds without unseen lines are skipped
-- `Alt+w` (or `Escape` then `w`) - Switch to world with activity (priority: oldest pending → unseen output → previous world)
+- `Escape` then `w` - Switch to world with activity (priority: oldest pending → unseen output → previous world)
 - `Shift+Up/Down` - Cycle through all worlds that have ever been connected
+- Disconnected worlds without unseen lines are skipped from Up/Down cycling
+
+World switching behavior is controlled by the "World Switching" setting:
+
+1. **Unseen First**: If any OTHER world has unseen output, switch to the world that received unseen output first (oldest unseen). Done.
+2. **Alphabetical** (or when no unseen): Switch to the alphabetically next world by name. Wraps from the last world back to the first.
+
+This logic applies to all interfaces (console, web, GUI). Remote clients query the master instance for consistent world switching across all views.
 
 **Input Area:**
 - `Left/Right` or `Ctrl+B/Ctrl+F` - Move cursor
@@ -642,7 +645,7 @@ Note: HTTP automatically starts the non-secure WebSocket server if not already r
 
 ### Remote GUI Client
 
-A graphical client mode that connects to a running MudClient's WebSocket server.
+A graphical client mode that connects to a running Clay's WebSocket server.
 
 **Building:**
 ```bash
@@ -651,12 +654,12 @@ cargo build --features remote-gui    # Requires X11 or Wayland
 
 **Running:**
 ```bash
-./mudclient --remote=hostname:port
+./clay --remote=hostname:port
 ```
 
 **Features:**
 - Graphical window using egui
-- Password prompt on startup
+- Authentication follows allow list and whitelisting rules (same as web interface)
 - World tabs at top showing connection status (● connected, ○ disconnected)
 - Scrollable output area with ANSI color support
 - Clickable URLs in output (underlined, pointer cursor on hover, click to open browser)
@@ -680,7 +683,7 @@ cargo build --features remote-gui    # Requires X11 or Wayland
 The remote GUI client supports keyboard shortcuts similar to the console client:
 
 **World Switching:**
-- `Up/Down` - Cycle through active worlds (when input is empty)
+- `Up/Down` - Cycle through active worlds (follows world switching rules from master)
 - `Shift+Up/Down` - Cycle through all worlds
 
 **Input Area:**

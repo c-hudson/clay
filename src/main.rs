@@ -3756,6 +3756,7 @@ struct World {
     showing_splash: bool,        // True when showing startup splash (for centering)
     needs_redraw: bool,          // True when terminal needs full redraw (after splash clear)
     pending_since: Option<std::time::Instant>, // When pending output first appeared (for Alt-w)
+    first_unseen_at: Option<std::time::Instant>, // When unseen output first arrived (for Unseen First switching)
     owner: Option<String>,       // Username who owns this world (multiuser mode)
     proxy_pid: Option<u32>,      // PID of TLS proxy process (if using TLS proxy)
     proxy_socket_path: Option<std::path::PathBuf>, // Unix socket path for TLS proxy
@@ -3807,6 +3808,7 @@ impl World {
             showing_splash: show_splash,
             needs_redraw: false,
             pending_since: None,
+            first_unseen_at: None,
             owner: None,
             proxy_pid: None,
             proxy_socket_path: None,
@@ -4027,6 +4029,10 @@ impl World {
                 // Track when pending output first appeared
                 if self.pending_lines.is_empty() {
                     self.pending_since = Some(std::time::Instant::now());
+                    // Also track first unseen timestamp
+                    if self.first_unseen_at.is_none() {
+                        self.first_unseen_at = Some(std::time::Instant::now());
+                    }
                 }
                 self.pending_lines.push(new_line);
                 if is_partial {
@@ -4040,6 +4046,10 @@ impl World {
                 // Track when pending output first appeared
                 if self.pending_lines.is_empty() {
                     self.pending_since = Some(std::time::Instant::now());
+                    // Also track first unseen timestamp
+                    if self.first_unseen_at.is_none() {
+                        self.first_unseen_at = Some(std::time::Instant::now());
+                    }
                 }
                 self.pending_lines.push(new_line);
                 if is_partial {
@@ -4052,6 +4062,10 @@ impl World {
                 let visual_lines = visual_line_count(line, output_width as usize);
                 self.lines_since_pause += visual_lines;
                 if !is_current {
+                    // Track when first unseen output arrived
+                    if self.unseen_lines == 0 && self.first_unseen_at.is_none() {
+                        self.first_unseen_at = Some(std::time::Instant::now());
+                    }
                     self.unseen_lines += 1;
                 }
                 if is_partial {
@@ -4080,6 +4094,7 @@ impl World {
 
     fn mark_seen(&mut self) {
         self.unseen_lines = 0;
+        self.first_unseen_at = None;
     }
 
     /// Returns true if this world has activity (unseen lines or pending output)
@@ -4397,6 +4412,7 @@ impl App {
                 connected: w.connected,
                 unseen_lines: w.unseen_lines,
                 pending_lines: w.pending_lines.len(),
+                first_unseen_at: w.first_unseen_at,
             })
             .collect();
 
@@ -4417,6 +4433,7 @@ impl App {
                 connected: w.connected,
                 unseen_lines: w.unseen_lines,
                 pending_lines: w.pending_lines.len(),
+                first_unseen_at: w.first_unseen_at,
             })
             .collect();
 
@@ -8066,6 +8083,20 @@ mod remote_gui {
                                 self.worlds[world_index].unseen_lines = count;
                             }
                         }
+                        WsMessage::CalculatedWorld { index } => {
+                            // Server calculated the next/prev world for us
+                            if let Some(idx) = index {
+                                if idx < self.worlds.len() && idx != self.current_world {
+                                    self.current_world = idx;
+                                    self.worlds[idx].unseen_lines = 0;
+                                    self.scroll_offset = None; // Reset scroll
+                                    // Notify server
+                                    if let Some(ref tx) = self.ws_tx {
+                                        let _ = tx.send(WsMessage::MarkWorldSeen { world_index: idx });
+                                    }
+                                }
+                            }
+                        }
                         WsMessage::ExecuteLocalCommand { command } => {
                             // Server wants us to execute a command locally (from action)
                             let parsed = parse_command(&command);
@@ -9596,32 +9627,15 @@ mod remote_gui {
                                 }
                             }
 
-                            // Up/Down arrow - always cycle active worlds
-                            // Use shared world switching logic
-                            let world_info: Vec<crate::util::WorldSwitchInfo> = self.worlds.iter()
-                                .map(|w| crate::util::WorldSwitchInfo {
-                                    name: w.name.clone(),
-                                    connected: w.connected,
-                                    unseen_lines: w.unseen_lines,
-                                    pending_lines: w.pending_count,
-                                })
-                                .collect();
-
+                            // Up/Down arrow - request world switch from server
+                            // Server calculates using centralized unseen tracking
                             if i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowUp) {
-                                if let Some(prev_idx) = crate::util::calculate_prev_world(
-                                    &world_info,
-                                    self.current_world,
-                                    self.world_switch_mode,
-                                ) {
-                                    switch_world = Some(prev_idx);
+                                if let Some(ref tx) = self.ws_tx {
+                                    let _ = tx.send(WsMessage::CalculatePrevWorld { current_index: self.current_world });
                                 }
                             } else if i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowDown) {
-                                if let Some(next_idx) = crate::util::calculate_next_world(
-                                    &world_info,
-                                    self.current_world,
-                                    self.world_switch_mode,
-                                ) {
-                                    switch_world = Some(next_idx);
+                                if let Some(ref tx) = self.ws_tx {
+                                    let _ = tx.send(WsMessage::CalculateNextWorld { current_index: self.current_world });
                                 }
                             }
                         }
@@ -17007,6 +17021,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                         connected: w.connected,
                                         unseen_lines: w.unseen_lines,
                                         pending_lines: w.pending_lines.len(),
+                                        first_unseen_at: w.first_unseen_at,
                                     })
                                     .collect();
                                 let next_idx = crate::util::calculate_next_world(
@@ -17024,6 +17039,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                         connected: w.connected,
                                         unseen_lines: w.unseen_lines,
                                         pending_lines: w.pending_lines.len(),
+                                        first_unseen_at: w.first_unseen_at,
                                     })
                                     .collect();
                                 let prev_idx = crate::util::calculate_prev_world(
@@ -18018,6 +18034,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                     connected: w.connected,
                                     unseen_lines: w.unseen_lines,
                                     pending_lines: w.pending_lines.len(),
+                                    first_unseen_at: w.first_unseen_at,
                                 })
                                 .collect();
                             let next_idx = crate::util::calculate_next_world(
@@ -18034,6 +18051,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                     connected: w.connected,
                                     unseen_lines: w.unseen_lines,
                                     pending_lines: w.pending_lines.len(),
+                                    first_unseen_at: w.first_unseen_at,
                                 })
                                 .collect();
                             let prev_idx = crate::util::calculate_prev_world(

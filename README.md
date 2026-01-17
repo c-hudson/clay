@@ -170,7 +170,7 @@ Access via browser at `http://localhost:9001` (or `https://` if configured).
 
 ## Configuration
 
-Settings are stored in `~/.mudclient.dat`. Per-world settings include:
+Settings are stored in `~/.clay.dat`. Per-world settings include:
 
 - Hostname, port, SSL toggle
 - Username/password for auto-login

@@ -292,6 +292,7 @@ pub struct WorldSwitchInfo {
     pub connected: bool,
     pub unseen_lines: usize,
     pub pending_lines: usize,
+    pub first_unseen_at: Option<std::time::Instant>,
 }
 
 /// Determine if a world should be included in the cycle list
@@ -331,9 +332,14 @@ pub fn calculate_next_world(
             .collect();
 
         if !unseen_worlds.is_empty() {
-            // Sort alphabetically and go to first
+            // Sort by first_unseen_at (oldest first), then alphabetically as tiebreaker
             unseen_worlds.sort_by(|&a, &b| {
-                worlds[a].name.to_lowercase().cmp(&worlds[b].name.to_lowercase())
+                match (worlds[a].first_unseen_at, worlds[b].first_unseen_at) {
+                    (Some(time_a), Some(time_b)) => time_a.cmp(&time_b),
+                    (Some(_), None) => std::cmp::Ordering::Less,
+                    (None, Some(_)) => std::cmp::Ordering::Greater,
+                    (None, None) => worlds[a].name.to_lowercase().cmp(&worlds[b].name.to_lowercase()),
+                }
             });
             return Some(unseen_worlds[0]);
         }
@@ -390,9 +396,14 @@ pub fn calculate_prev_world(
             .collect();
 
         if !unseen_worlds.is_empty() {
-            // Sort alphabetically and go to first (same behavior as next when unseen first is on)
+            // Sort by first_unseen_at (oldest first), then alphabetically as tiebreaker
             unseen_worlds.sort_by(|&a, &b| {
-                worlds[a].name.to_lowercase().cmp(&worlds[b].name.to_lowercase())
+                match (worlds[a].first_unseen_at, worlds[b].first_unseen_at) {
+                    (Some(time_a), Some(time_b)) => time_a.cmp(&time_b),
+                    (Some(_), None) => std::cmp::Ordering::Less,
+                    (None, Some(_)) => std::cmp::Ordering::Greater,
+                    (None, None) => worlds[a].name.to_lowercase().cmp(&worlds[b].name.to_lowercase()),
+                }
             });
             return Some(unseen_worlds[0]);
         }
