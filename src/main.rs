@@ -16498,6 +16498,70 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                                 // If command starts with /, send back to client for local execution
                                                 if cmd.starts_with('/') {
                                                     app.ws_send_to_client(client_id, WsMessage::ExecuteLocalCommand { command: cmd });
+                                                } else if cmd.starts_with('#') {
+                                                    // TinyFugue command - execute on server
+                                                    match app.tf_engine.execute(&cmd) {
+                                                        tf::TfCommandResult::Success(Some(msg)) => {
+                                                            app.ws_broadcast(WsMessage::ServerData {
+                                                                world_index,
+                                                                data: msg,
+                                                                is_viewed: false,
+                                                                ts: current_timestamp_secs(),
+                                                            });
+                                                        }
+                                                        tf::TfCommandResult::Success(None) => {}
+                                                        tf::TfCommandResult::Error(err) => {
+                                                            app.ws_broadcast(WsMessage::ServerData {
+                                                                world_index,
+                                                                data: format!("%% {}", err),
+                                                                is_viewed: false,
+                                                                ts: current_timestamp_secs(),
+                                                            });
+                                                        }
+                                                        tf::TfCommandResult::SendToMud(text) => {
+                                                            if world_index < app.worlds.len() {
+                                                                if let Some(tx) = &app.worlds[world_index].command_tx {
+                                                                    let _ = tx.try_send(WriteCommand::Text(text));
+                                                                    sent_to_server = true;
+                                                                }
+                                                            }
+                                                        }
+                                                        tf::TfCommandResult::ClayCommand(clay_cmd) => {
+                                                            app.ws_send_to_client(client_id, WsMessage::ExecuteLocalCommand { command: clay_cmd });
+                                                        }
+                                                        tf::TfCommandResult::Recall { pattern, count } => {
+                                                            if world_index < app.worlds.len() {
+                                                                let regex_pattern = wildcard_to_regex(&pattern);
+                                                                if let Ok(re) = regex::Regex::new(&format!("(?i){}", regex_pattern)) {
+                                                                    let matches: Vec<String> = {
+                                                                        let world = &app.worlds[world_index];
+                                                                        let mut m: Vec<String> = Vec::new();
+                                                                        for output_line in world.output_lines.iter().rev() {
+                                                                            let plain = strip_ansi_codes(&output_line.text);
+                                                                            if re.is_match(&plain) {
+                                                                                m.push(output_line.text.clone());
+                                                                                if let Some(limit) = count {
+                                                                                    if m.len() >= limit { break; }
+                                                                                }
+                                                                            }
+                                                                        }
+                                                                        m.reverse();
+                                                                        m
+                                                                    };
+                                                                    let ts = current_timestamp_secs();
+                                                                    if matches.is_empty() {
+                                                                        app.ws_broadcast(WsMessage::ServerData { world_index, data: format!("%% No matches for '{}'", pattern), is_viewed: false, ts });
+                                                                    } else {
+                                                                        app.ws_broadcast(WsMessage::ServerData { world_index, data: format!("%% {} match{} for '{}':", matches.len(), if matches.len() == 1 { "" } else { "es" }, pattern), is_viewed: false, ts });
+                                                                        for m in matches {
+                                                                            app.ws_broadcast(WsMessage::ServerData { world_index, data: m, is_viewed: false, ts });
+                                                                        }
+                                                                    }
+                                                                }
+                                                            }
+                                                        }
+                                                        _ => {}
+                                                    }
                                                 } else if world_index < app.worlds.len() {
                                                     // Plain text - send to MUD server
                                                     if let Some(tx) = &app.worlds[world_index].command_tx {
@@ -17655,6 +17719,70 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                             // If command starts with /, send back to client for local execution
                                             if cmd.starts_with('/') {
                                                 app.ws_send_to_client(client_id, WsMessage::ExecuteLocalCommand { command: cmd });
+                                            } else if cmd.starts_with('#') {
+                                                // TinyFugue command - execute on server
+                                                match app.tf_engine.execute(&cmd) {
+                                                    tf::TfCommandResult::Success(Some(msg)) => {
+                                                        app.ws_broadcast(WsMessage::ServerData {
+                                                            world_index,
+                                                            data: msg,
+                                                            is_viewed: false,
+                                                            ts: current_timestamp_secs(),
+                                                        });
+                                                    }
+                                                    tf::TfCommandResult::Success(None) => {}
+                                                    tf::TfCommandResult::Error(err) => {
+                                                        app.ws_broadcast(WsMessage::ServerData {
+                                                            world_index,
+                                                            data: format!("%% {}", err),
+                                                            is_viewed: false,
+                                                            ts: current_timestamp_secs(),
+                                                        });
+                                                    }
+                                                    tf::TfCommandResult::SendToMud(text) => {
+                                                        if world_index < app.worlds.len() {
+                                                            if let Some(tx) = &app.worlds[world_index].command_tx {
+                                                                let _ = tx.try_send(WriteCommand::Text(text));
+                                                                sent_to_server = true;
+                                                            }
+                                                        }
+                                                    }
+                                                    tf::TfCommandResult::ClayCommand(clay_cmd) => {
+                                                        app.ws_send_to_client(client_id, WsMessage::ExecuteLocalCommand { command: clay_cmd });
+                                                    }
+                                                    tf::TfCommandResult::Recall { pattern, count } => {
+                                                        if world_index < app.worlds.len() {
+                                                            let regex_pattern = wildcard_to_regex(&pattern);
+                                                            if let Ok(re) = regex::Regex::new(&format!("(?i){}", regex_pattern)) {
+                                                                let matches: Vec<String> = {
+                                                                    let world = &app.worlds[world_index];
+                                                                    let mut m: Vec<String> = Vec::new();
+                                                                    for output_line in world.output_lines.iter().rev() {
+                                                                        let plain = strip_ansi_codes(&output_line.text);
+                                                                        if re.is_match(&plain) {
+                                                                            m.push(output_line.text.clone());
+                                                                            if let Some(limit) = count {
+                                                                                if m.len() >= limit { break; }
+                                                                            }
+                                                                        }
+                                                                    }
+                                                                    m.reverse();
+                                                                    m
+                                                                };
+                                                                let ts = current_timestamp_secs();
+                                                                if matches.is_empty() {
+                                                                    app.ws_broadcast(WsMessage::ServerData { world_index, data: format!("%% No matches for '{}'", pattern), is_viewed: false, ts });
+                                                                } else {
+                                                                    app.ws_broadcast(WsMessage::ServerData { world_index, data: format!("%% {} match{} for '{}':", matches.len(), if matches.len() == 1 { "" } else { "es" }, pattern), is_viewed: false, ts });
+                                                                    for m in matches {
+                                                                        app.ws_broadcast(WsMessage::ServerData { world_index, data: m, is_viewed: false, ts });
+                                                                    }
+                                                                }
+                                                            }
+                                                        }
+                                                    }
+                                                    _ => {}
+                                                }
                                             } else if world_index < app.worlds.len() {
                                                 // Plain text - send to MUD server
                                                 if let Some(tx) = &app.worlds[world_index].command_tx {
@@ -21169,6 +21297,57 @@ async fn handle_command(cmd: &str, app: &mut App, event_tx: mpsc::Sender<AppEven
                     // If command starts with /, process it as a client command
                     if cmd_str.starts_with('/') {
                         Box::pin(handle_command(&cmd_str, app, event_tx.clone())).await;
+                    } else if cmd_str.starts_with('#') {
+                        // TinyFugue command
+                        match app.tf_engine.execute(&cmd_str) {
+                            tf::TfCommandResult::Success(Some(msg)) => {
+                                app.add_output(&msg);
+                            }
+                            tf::TfCommandResult::Success(None) => {}
+                            tf::TfCommandResult::Error(err) => {
+                                app.add_output(&format!("%% {}", err));
+                            }
+                            tf::TfCommandResult::SendToMud(text) => {
+                                if let Some(tx) = &app.current_world().command_tx {
+                                    let _ = tx.try_send(WriteCommand::Text(text));
+                                    sent_to_server = true;
+                                } else {
+                                    app.add_output("Not connected. Use /worlds to connect.");
+                                }
+                            }
+                            tf::TfCommandResult::ClayCommand(clay_cmd) => {
+                                Box::pin(handle_command(&clay_cmd, app, event_tx.clone())).await;
+                            }
+                            tf::TfCommandResult::Recall { pattern, count } => {
+                                let regex_pattern = wildcard_to_regex(&pattern);
+                                if let Ok(re) = regex::Regex::new(&format!("(?i){}", regex_pattern)) {
+                                    let matches: Vec<String> = {
+                                        let world = app.current_world();
+                                        let mut m: Vec<String> = Vec::new();
+                                        for output_line in world.output_lines.iter().rev() {
+                                            let plain = strip_ansi_codes(&output_line.text);
+                                            if re.is_match(&plain) {
+                                                m.push(output_line.text.clone());
+                                                if let Some(limit) = count {
+                                                    if m.len() >= limit { break; }
+                                                }
+                                            }
+                                        }
+                                        m.reverse();
+                                        m
+                                    };
+                                    if matches.is_empty() {
+                                        app.add_output(&format!("%% No matches for '{}'", pattern));
+                                    } else {
+                                        app.add_output(&format!("%% {} match{} for '{}':", matches.len(), if matches.len() == 1 { "" } else { "es" }, pattern));
+                                        for m in matches {
+                                            app.add_output(&m);
+                                        }
+                                    }
+                                }
+                            }
+                            _ => {}
+                        }
                     } else {
                         // Plain text - send to server if connected
                         if let Some(tx) = &app.current_world().command_tx {
