@@ -656,8 +656,7 @@ body {
 .actions-list {
     border: 1px solid var(--separator-color);
     background-color: #000;
-    min-height: 150px;
-    max-height: 250px;
+    /* min-height and max-height are set dynamically by JavaScript */
     overflow-y: auto;
     margin-bottom: 10px;
 }

@@ -23556,10 +23556,18 @@ fn render_actions_popup(f: &mut Frame, app: &App) {
             let buttons_width = 48; // "[ Add ]  [ Edit ]  [ Delete ]  [ Cancel ]"
             let content_width = max_action_display.max(buttons_width).max(40);
             let popup_width = ((content_width + 4) as u16).min(area.width.saturating_sub(4));
-            let list_height = 8usize;
+
             // Extra height for filter line (1) + world filter indicator if present (1)
             let extra_lines = if popup.world_filter.is_empty() { 1 } else { 2 };
-            let popup_height = ((list_height + 5 + extra_lines) as u16).min(area.height.saturating_sub(2));
+            // Popup chrome: border (2) + filter line (1) + optional world filter (0-1) + blank line (1) + buttons (1) = 5 + extra_lines
+            let popup_chrome = 5 + extra_lines;
+            // Available height: screen height minus separator bar (1), input area, and margin (2)
+            let max_available_height = area.height.saturating_sub(app.input_height + 3) as usize;
+            // Maximum list height that fits
+            let max_list_height = max_available_height.saturating_sub(popup_chrome);
+            // Dynamic list height: show all actions if they fit, otherwise cap at max
+            let list_height = filtered_indices.len().max(3).min(max_list_height).max(3);
+            let popup_height = ((list_height + popup_chrome) as u16).min(area.height.saturating_sub(2));
 
             let x = area.width.saturating_sub(popup_width) / 2;
             let y = area.height.saturating_sub(popup_height) / 2;

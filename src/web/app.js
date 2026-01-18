@@ -2331,6 +2331,23 @@
         elements.actionsList.innerHTML = '';
         const filteredIndices = getFilteredActionIndices();
 
+        // Dynamically size the list to show all actions without overlapping separator/input
+        // Each item is approximately 26px (padding + content + border)
+        const itemHeight = 26;
+        const minHeight = 80;  // At least show a few items
+        // Calculate available height: window height minus toolbar, separator, input, and popup chrome
+        const separatorHeight = elements.separator ? elements.separator.offsetHeight : 20;
+        const inputHeight = elements.inputContainer ? elements.inputContainer.offsetHeight : 80;
+        const toolbarHeight = elements.toolbar ? elements.toolbar.offsetHeight : 40;
+        const popupChrome = 180; // Approximate space for popup header, filter, buttons, margins
+        const maxAvailable = window.innerHeight - separatorHeight - inputHeight - toolbarHeight - popupChrome;
+        // Height needed to show all filtered items
+        const neededHeight = filteredIndices.length * itemHeight;
+        // Use the smaller of needed or available, but at least minHeight
+        const listHeight = Math.max(minHeight, Math.min(neededHeight, maxAvailable));
+        elements.actionsList.style.maxHeight = listHeight + 'px';
+        elements.actionsList.style.minHeight = minHeight + 'px';
+
         if (actions.length === 0) {
             const div = document.createElement('div');
             div.style.padding = '8px';
