@@ -4,8 +4,17 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Build Commands
 
+**IMPORTANT: Always use the musl debug build. Never use release builds.**
+
 ```bash
-cargo build                          # Build debug (dynamically linked)
+# Default build command (always use this)
+cargo build --target x86_64-unknown-linux-musl --no-default-features --features rustls-backend
+
+# Output: target/x86_64-unknown-linux-musl/debug/clay
+```
+
+Other commands:
+```bash
 cargo build --features remote-gui    # Build with remote GUI client (requires X11/Wayland)
 cargo run                            # Run the client
 cargo run -- --remote=host:port      # Run as remote GUI client
@@ -16,18 +25,13 @@ cargo fmt                            # Format code
 cargo fmt -- --check                 # Check formatting without changes
 ```
 
-### Static/Portable Build (musl)
+### Why musl
 
-For a portable binary that works on any Linux x86_64 system regardless of glibc version:
+The musl build produces a portable binary that works on any Linux x86_64 system regardless of glibc version.
 
 ```bash
 # Install musl target (one-time setup)
 rustup target add x86_64-unknown-linux-musl
-
-# Build static binary with musl and rustls (no OpenSSL dependency)
-cargo build --target x86_64-unknown-linux-musl --no-default-features --features rustls-backend
-
-# Output: target/x86_64-unknown-linux-musl/debug/clay (or release/)
 ```
 
 **Why musl instead of glibc static linking:**
