@@ -3368,7 +3368,9 @@ struct ActionTriggerResult {
 
 /// Convert a wildcard pattern (* and ?) to a regex pattern
 fn wildcard_to_regex(pattern: &str) -> String {
-    let mut regex = String::with_capacity(pattern.len() * 2);
+    // Wildcard patterns must match the entire line (anchored at start and end)
+    let mut regex = String::with_capacity(pattern.len() * 2 + 2);
+    regex.push('^');
     for c in pattern.chars() {
         match c {
             '*' => regex.push_str(".*"),
@@ -3381,6 +3383,7 @@ fn wildcard_to_regex(pattern: &str) -> String {
             _ => regex.push(c),
         }
     }
+    regex.push('$');
     regex
 }
 
