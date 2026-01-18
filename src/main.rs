@@ -2617,9 +2617,9 @@ impl ActionsPopup {
             ActionEditorField::Name => ActionEditorField::World,
             ActionEditorField::World => ActionEditorField::MatchType,
             ActionEditorField::MatchType => ActionEditorField::Pattern,
-            ActionEditorField::Pattern => ActionEditorField::Command,
-            ActionEditorField::Command => ActionEditorField::Enabled,
-            ActionEditorField::Enabled => ActionEditorField::SaveButton,
+            ActionEditorField::Pattern => ActionEditorField::Enabled,
+            ActionEditorField::Enabled => ActionEditorField::Command,
+            ActionEditorField::Command => ActionEditorField::SaveButton,
             ActionEditorField::SaveButton => ActionEditorField::CancelButton,
             ActionEditorField::CancelButton => ActionEditorField::Name,
         };
@@ -2633,9 +2633,9 @@ impl ActionsPopup {
             ActionEditorField::World => ActionEditorField::Name,
             ActionEditorField::MatchType => ActionEditorField::World,
             ActionEditorField::Pattern => ActionEditorField::MatchType,
-            ActionEditorField::Command => ActionEditorField::Pattern,
-            ActionEditorField::Enabled => ActionEditorField::Command,
-            ActionEditorField::SaveButton => ActionEditorField::Enabled,
+            ActionEditorField::Enabled => ActionEditorField::Pattern,
+            ActionEditorField::Command => ActionEditorField::Enabled,
+            ActionEditorField::SaveButton => ActionEditorField::Command,
             ActionEditorField::CancelButton => ActionEditorField::SaveButton,
         };
         self.cursor_pos = self.current_field_text().len();
@@ -21982,12 +21982,22 @@ fn render_output_crossterm(app: &App) {
 
     if viewport_line < app.input_height as usize {
         let chars_before_cursor = app.input.buffer[..app.input.cursor_position].chars().count();
-        let effective_chars = if app.input.viewport_start_line == 0 {
-            chars_before_cursor + prompt_len
+
+        // Calculate cursor column within its logical line
+        let first_line_capacity = input_area_width.saturating_sub(prompt_len);
+        let cursor_col = if cursor_line == 0 {
+            // On first logical line - add prompt offset if viewport shows it
+            if app.input.viewport_start_line == 0 {
+                chars_before_cursor + prompt_len
+            } else {
+                chars_before_cursor
+            }
         } else {
-            chars_before_cursor
+            // On subsequent lines - calculate position within that line
+            let line_start = first_line_capacity + (cursor_line - 1) * input_area_width;
+            chars_before_cursor.saturating_sub(line_start)
         };
-        let cursor_col = effective_chars % input_area_width;
+
         let cursor_x = cursor_col as u16;
         // Calculate visual line within viewport
         // cursor_line() already accounts for prompt, so we just need the viewport offset
@@ -22300,13 +22310,22 @@ fn render_input_area(f: &mut Frame, app: &mut App, area: Rect) {
         let inner_width = area.width.max(1) as usize;
         // Use character count for cursor column, not byte index
         let chars_before_cursor = app.input.buffer[..app.input.cursor_position].chars().count();
-        // Add prompt length offset if on first display line and viewport starts at 0
-        let effective_chars = if app.input.viewport_start_line == 0 {
-            chars_before_cursor + prompt_len
+
+        // Calculate cursor column within its logical line
+        let first_line_capacity = inner_width.saturating_sub(prompt_len);
+        let cursor_col = if cursor_line == 0 {
+            // On first logical line - add prompt offset if viewport shows it
+            if app.input.viewport_start_line == 0 {
+                chars_before_cursor + prompt_len
+            } else {
+                chars_before_cursor
+            }
         } else {
-            chars_before_cursor
+            // On subsequent lines - calculate position within that line
+            let line_start = first_line_capacity + (cursor_line - 1) * inner_width;
+            chars_before_cursor.saturating_sub(line_start)
         };
-        let cursor_col = effective_chars % inner_width;
+
         let cursor_x = area.x + cursor_col as u16;
         // Calculate visual line within viewport
         // cursor_line() already accounts for prompt, so we just need the viewport offset
@@ -23915,6 +23934,14 @@ fn render_actions_popup(f: &mut Frame, app: &App) {
                 ),
             ]));
 
+            // Enabled toggle field
+            let enabled_label_style = if popup.editor_field == ActionEditorField::Enabled { selected_style } else { label_style };
+            let enabled_value = format!("< {} >", if popup.edit_enabled { "Yes" } else { "No" });
+            lines.push(Line::from(vec![
+                Span::styled("Enabled:   ", enabled_label_style),
+                Span::styled(enabled_value, if popup.editor_field == ActionEditorField::Enabled { selected_style } else { value_style }),
+            ]));
+
             // Command field: 5-line mini-editor with viewport scrolling
             lines.push(Line::from(Span::styled("Command:", command_label_style)));
 
@@ -23984,16 +24011,6 @@ fn render_actions_popup(f: &mut Frame, app: &App) {
                     Span::styled("▼ more below", Style::default().fg(Color::DarkGray)),
                 ]));
             }
-
-            lines.push(Line::from(""));
-
-            // Enabled toggle field
-            let enabled_label_style = if popup.editor_field == ActionEditorField::Enabled { selected_style } else { label_style };
-            let enabled_value = format!("< {} >", if popup.edit_enabled { "Yes" } else { "No" });
-            lines.push(Line::from(vec![
-                Span::styled("Enabled:   ", enabled_label_style),
-                Span::styled(enabled_value, if popup.editor_field == ActionEditorField::Enabled { selected_style } else { value_style }),
-            ]));
 
             lines.push(Line::from(""));
 
