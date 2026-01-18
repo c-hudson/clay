@@ -16276,6 +16276,10 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                             }
 
                             // Execute any triggered commands
+                            // Temporarily set current_world to the triggering world so /send
+                            // without -w sends to the world that triggered the action
+                            let saved_current_world = app.current_world_index;
+                            app.current_world_index = world_idx;
                             for cmd in commands_to_execute {
                                 if cmd.starts_with('/') {
                                     // Internal Clay command - execute it
@@ -16298,6 +16302,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                     let _ = tx.try_send(WriteCommand::Text(cmd));
                                 }
                             }
+                            app.current_world_index = saved_current_world;
                             // Execute TF-generated Clay commands (not sent to MUD)
                             for cmd in tf_commands_to_execute {
                                 // Execute as TF command (starts with #) or Clay command
@@ -16467,6 +16472,10 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                             }
 
                             // Execute any triggered commands
+                            // Temporarily set current_world to the triggering world so /send
+                            // without -w sends to the world that triggered the action
+                            let saved_current_world = app.current_world_index;
+                            app.current_world_index = world_idx;
                             for cmd in commands_to_execute {
                                 if cmd.starts_with('/') {
                                     handle_command(&cmd, &mut app, event_tx.clone()).await;
@@ -16486,6 +16495,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                     let _ = tx.try_send(WriteCommand::Text(cmd));
                                 }
                             }
+                            app.current_world_index = saved_current_world;
                             // Execute TF-generated Clay commands
                             for cmd in tf_commands_to_execute {
                                 let _ = app.tf_engine.execute(&cmd);
@@ -17534,6 +17544,10 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                             app.worlds[world_idx].scroll_to_bottom();
                         }
 
+                        // Temporarily set current_world to the triggering world so /send
+                        // without -w sends to the world that triggered the action
+                        let saved_current_world = app.current_world_index;
+                        app.current_world_index = world_idx;
                         for cmd in commands_to_execute {
                             if cmd.starts_with('/') {
                                 handle_command(&cmd, &mut app, event_tx.clone()).await;
@@ -17553,6 +17567,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                 let _ = tx.try_send(WriteCommand::Text(cmd));
                             }
                         }
+                        app.current_world_index = saved_current_world;
                         // Execute TF-generated Clay commands
                         for cmd in tf_commands_to_execute {
                             let _ = app.tf_engine.execute(&cmd);
@@ -17718,6 +17733,10 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                         }
 
                         // Execute any triggered commands
+                        // Temporarily set current_world to the triggering world so /send
+                        // without -w sends to the world that triggered the action
+                        let saved_current_world = app.current_world_index;
+                        app.current_world_index = world_idx;
                         for cmd in commands_to_execute {
                             if cmd.starts_with('/') {
                                 handle_command(&cmd, &mut app, event_tx.clone()).await;
@@ -17737,6 +17756,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                 let _ = tx.try_send(WriteCommand::Text(cmd));
                             }
                         }
+                        app.current_world_index = saved_current_world;
                         // Execute TF-generated Clay commands
                         for cmd in tf_commands_to_execute {
                             let _ = app.tf_engine.execute(&cmd);
