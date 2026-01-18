@@ -17718,8 +17718,22 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                         }
 
                         // Execute any triggered commands
-                        if let Some(tx) = &app.worlds[world_idx].command_tx {
-                            for cmd in commands_to_execute {
+                        for cmd in commands_to_execute {
+                            if cmd.starts_with('/') {
+                                handle_command(&cmd, &mut app, event_tx.clone()).await;
+                            } else if cmd.starts_with('#') {
+                                match app.tf_engine.execute(&cmd) {
+                                    tf::TfCommandResult::SendToMud(text) => {
+                                        if let Some(tx) = &app.worlds[world_idx].command_tx {
+                                            let _ = tx.try_send(WriteCommand::Text(text));
+                                        }
+                                    }
+                                    tf::TfCommandResult::ClayCommand(clay_cmd) => {
+                                        handle_command(&clay_cmd, &mut app, event_tx.clone()).await;
+                                    }
+                                    _ => {}
+                                }
+                            } else if let Some(tx) = &app.worlds[world_idx].command_tx {
                                 let _ = tx.try_send(WriteCommand::Text(cmd));
                             }
                         }
