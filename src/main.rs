@@ -7410,6 +7410,7 @@ mod remote_gui {
         edit_action_match_type: MatchType,
         edit_action_pattern: String,
         edit_action_command: String,
+        edit_action_enabled: bool,
         /// Action error message
         action_error: Option<String>,
         /// Debug text for showing raw ANSI codes
@@ -7579,6 +7580,7 @@ mod remote_gui {
                 edit_action_match_type: MatchType::Regexp,
                 edit_action_pattern: String::new(),
                 edit_action_command: String::new(),
+                edit_action_enabled: true,
                 action_error: None,
                 debug_text: String::new(),
                 transparency: 1.0,
@@ -13631,6 +13633,7 @@ mod remote_gui {
                             self.edit_action_match_type = action.match_type;
                             self.edit_action_pattern = action.pattern.clone();
                             self.edit_action_command = action.command.clone();
+                            self.edit_action_enabled = action.enabled;
                             self.action_error = None;
                             self.popup_state = PopupState::ActionEditor(idx);
                         }
@@ -13641,6 +13644,7 @@ mod remote_gui {
                         self.edit_action_match_type = MatchType::Regexp;
                         self.edit_action_pattern = String::new();
                         self.edit_action_command = String::new();
+                        self.edit_action_enabled = true;
                         self.action_error = None;
                         self.popup_state = PopupState::ActionEditor(usize::MAX); // MAX = new action
                     } else if should_close {
@@ -13968,6 +13972,7 @@ mod remote_gui {
                             pattern: self.edit_action_pattern.clone(),
                             command: self.edit_action_command.clone(),
                             owner: None,
+                            enabled: self.edit_action_enabled,
                         };
                         if edit_idx == usize::MAX {
                             // New action
