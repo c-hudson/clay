@@ -6045,6 +6045,7 @@ fn save_reload_state(app: &App) -> io::Result<()> {
     if !app.settings.websocket_key_file.is_empty() {
         writeln!(file, "websocket_key_file={}", app.settings.websocket_key_file)?;
     }
+    writeln!(file, "tls_proxy_enabled={}", app.settings.tls_proxy_enabled)?;
 
     // Save input history (base64 encode each line to handle special chars)
     writeln!(file, "history_count={}", app.input.history.len())?;
@@ -6519,6 +6520,9 @@ fn load_reload_state(app: &mut App) -> io::Result<bool> {
                     }
                     // Legacy: ignore global encoding, it's now per-world
                     "encoding" => {}
+                    "tls_proxy_enabled" => {
+                        app.settings.tls_proxy_enabled = value == "true";
+                    }
                     "history_count" | "world_count" => {
                         // These are informational, not needed for parsing
                     }
