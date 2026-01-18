@@ -81,6 +81,7 @@
         actionMatchType: document.getElementById('action-match-type'),
         actionPattern: document.getElementById('action-pattern'),
         actionCommand: document.getElementById('action-command'),
+        actionEnabled: document.getElementById('action-enabled'),
         actionError: document.getElementById('action-error'),
         actionSaveBtn: document.getElementById('action-save-btn'),
         actionEditorCancelBtn: document.getElementById('action-editor-cancel-btn'),
@@ -2418,6 +2419,8 @@
                 : '(regex, empty = manual only)';
             elements.actionPattern.value = action.pattern || '';
             elements.actionCommand.value = action.command || '';
+            // Default to true if enabled is not set (for existing actions)
+            elements.actionEnabled.textContent = (action.enabled !== false) ? 'Yes' : 'No';
         } else {
             // New action
             elements.actionEditorTitle.textContent = 'New Action';
@@ -2427,6 +2430,7 @@
             elements.actionPattern.placeholder = '(regex, empty = manual only)';
             elements.actionPattern.value = '';
             elements.actionCommand.value = '';
+            elements.actionEnabled.textContent = 'Yes';  // Default to enabled
         }
         elements.actionError.textContent = '';
         elements.actionName.focus();
@@ -2505,7 +2509,8 @@
             world: elements.actionWorld.value.trim(),
             match_type: elements.actionMatchType.textContent,
             pattern: elements.actionPattern.value,
-            command: elements.actionCommand.value
+            command: elements.actionCommand.value,
+            enabled: elements.actionEnabled.textContent === 'Yes'
         };
 
         if (editingActionIndex < 0) {
@@ -4344,6 +4349,11 @@
                 elements.actionMatchType.textContent = 'Regexp';
                 elements.actionPattern.placeholder = '(regex, empty = manual only)';
             }
+        };
+
+        elements.actionEnabled.onclick = function() {
+            // Toggle between Yes and No
+            elements.actionEnabled.textContent = elements.actionEnabled.textContent === 'Yes' ? 'No' : 'Yes';
         };
 
         // Actions Confirm Delete popup

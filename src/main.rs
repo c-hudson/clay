@@ -2255,6 +2255,7 @@ enum ActionEditorField {
     MatchType,
     Pattern,
     Command,
+    Enabled,
     SaveButton,
     CancelButton,
 }
@@ -2281,6 +2282,7 @@ struct ActionsPopup {
     edit_match_type: MatchType,     // Pattern match type (Regexp or Wildcard)
     edit_pattern: String,
     edit_command: String,
+    edit_enabled: bool,             // Whether action is enabled
     cursor_pos: usize,              // Cursor position in current text field
     edit_scroll_offset: usize,      // Horizontal scroll offset for long text fields
     error_message: Option<String>,  // Validation error message
@@ -2309,6 +2311,7 @@ impl ActionsPopup {
             edit_match_type: MatchType::Regexp,
             edit_pattern: String::new(),
             edit_command: String::new(),
+            edit_enabled: true,
             cursor_pos: 0,
             edit_scroll_offset: 0,
             error_message: None,
@@ -2407,6 +2410,7 @@ impl ActionsPopup {
                 self.edit_match_type = action.match_type;
                 self.edit_pattern = action.pattern.clone();
                 self.edit_command = action.command.clone();
+                self.edit_enabled = action.enabled;
             }
         } else {
             // New action
@@ -2415,6 +2419,7 @@ impl ActionsPopup {
             self.edit_match_type = MatchType::Regexp;
             self.edit_pattern.clear();
             self.edit_command.clear();
+            self.edit_enabled = true;
         }
     }
 
@@ -2462,6 +2467,7 @@ impl ActionsPopup {
             pattern: self.edit_pattern.clone(),
             command: self.edit_command.clone(),
             owner: None,
+            enabled: self.edit_enabled,
         };
 
         if let Some(idx) = self.editing_index {
@@ -2612,7 +2618,8 @@ impl ActionsPopup {
             ActionEditorField::World => ActionEditorField::MatchType,
             ActionEditorField::MatchType => ActionEditorField::Pattern,
             ActionEditorField::Pattern => ActionEditorField::Command,
-            ActionEditorField::Command => ActionEditorField::SaveButton,
+            ActionEditorField::Command => ActionEditorField::Enabled,
+            ActionEditorField::Enabled => ActionEditorField::SaveButton,
             ActionEditorField::SaveButton => ActionEditorField::CancelButton,
             ActionEditorField::CancelButton => ActionEditorField::Name,
         };
@@ -2627,7 +2634,8 @@ impl ActionsPopup {
             ActionEditorField::MatchType => ActionEditorField::World,
             ActionEditorField::Pattern => ActionEditorField::MatchType,
             ActionEditorField::Command => ActionEditorField::Pattern,
-            ActionEditorField::SaveButton => ActionEditorField::Command,
+            ActionEditorField::Enabled => ActionEditorField::Command,
+            ActionEditorField::SaveButton => ActionEditorField::Enabled,
             ActionEditorField::CancelButton => ActionEditorField::SaveButton,
         };
         self.cursor_pos = self.current_field_text().len();
@@ -3028,6 +3036,9 @@ impl User {
     }
 }
 
+/// Helper function for serde default to return true
+fn default_enabled() -> bool { true }
+
 /// User-defined action/trigger
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Action {
@@ -3039,6 +3050,8 @@ pub struct Action {
     pub command: String,        // Command(s) to execute, semicolon-separated
     #[serde(default)]
     pub owner: Option<String>,  // Username who owns this action (multiuser mode)
+    #[serde(default = "default_enabled")]
+    pub enabled: bool,          // If false, action will not fire
 }
 
 impl Action {
@@ -3050,6 +3063,7 @@ impl Action {
             pattern: String::new(),
             command: String::new(),
             owner: None,
+            enabled: true,
         }
     }
 }
@@ -3398,6 +3412,11 @@ fn check_action_triggers(
     let plain_line = strip_ansi_codes(line);
 
     for action in actions {
+        // Skip disabled actions
+        if !action.enabled {
+            continue;
+        }
+
         // Skip actions without patterns (those are manual /name only)
         if action.pattern.is_empty() {
             continue;
@@ -16545,6 +16564,15 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                     Command::ActionCommand { name, args } => {
                                         // Execute action if it exists
                                         if let Some(action) = app.settings.actions.iter().find(|a| a.name.eq_ignore_ascii_case(&name)) {
+                                            // Skip disabled actions
+                                            if !action.enabled {
+                                                app.ws_broadcast(WsMessage::ServerData {
+                                                    world_index,
+                                                    data: format!("%% Action '{}' is disabled.", name),
+                                                    is_viewed: false,
+                                                    ts: current_timestamp_secs(),
+                                                });
+                                            } else {
                                             let commands = split_action_commands(&action.command);
                                             let mut sent_to_server = false;
                                             for cmd in commands {
@@ -16631,6 +16659,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                             }
                                             if sent_to_server {
                                                 app.worlds[world_index].last_send_time = Some(std::time::Instant::now());
+                                            }
                                             }
                                         } else {
                                             app.ws_broadcast(WsMessage::ServerData {
@@ -17804,6 +17833,15 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                 Command::ActionCommand { name, args } => {
                                     // Execute action if it exists
                                     if let Some(action) = app.settings.actions.iter().find(|a| a.name.eq_ignore_ascii_case(&name)) {
+                                        // Skip disabled actions
+                                        if !action.enabled {
+                                            app.ws_broadcast(WsMessage::ServerData {
+                                                world_index,
+                                                data: format!("%% Action '{}' is disabled.", name),
+                                                is_viewed: false,
+                                                ts: current_timestamp_secs(),
+                                            });
+                                        } else {
                                         let commands = split_action_commands(&action.command);
                                         let mut sent_to_server = false;
                                         for cmd in commands {
@@ -17890,6 +17928,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                         }
                                         if sent_to_server {
                                             app.worlds[world_index].last_send_time = Some(std::time::Instant::now());
+                                        }
                                         }
                                     } else {
                                         app.ws_broadcast(WsMessage::ServerData {
@@ -18564,6 +18603,10 @@ fn handle_key_event(key: KeyEvent, app: &mut App) -> KeyAction {
                                 // Left/Right toggle match type
                                 app.actions_popup.edit_match_type = app.actions_popup.edit_match_type.next();
                             }
+                            ActionEditorField::Enabled => {
+                                // Left/Right toggle enabled
+                                app.actions_popup.edit_enabled = !app.actions_popup.edit_enabled;
+                            }
                             ActionEditorField::CancelButton => {
                                 app.actions_popup.editor_field = ActionEditorField::SaveButton;
                             }
@@ -18584,6 +18627,10 @@ fn handle_key_event(key: KeyEvent, app: &mut App) -> KeyAction {
                             ActionEditorField::MatchType => {
                                 // Left/Right toggle match type
                                 app.actions_popup.edit_match_type = app.actions_popup.edit_match_type.next();
+                            }
+                            ActionEditorField::Enabled => {
+                                // Left/Right toggle enabled
+                                app.actions_popup.edit_enabled = !app.actions_popup.edit_enabled;
                             }
                             ActionEditorField::SaveButton => {
                                 app.actions_popup.editor_field = ActionEditorField::CancelButton;
@@ -18634,6 +18681,10 @@ fn handle_key_event(key: KeyEvent, app: &mut App) -> KeyAction {
                                 // Toggle match type
                                 app.actions_popup.edit_match_type = app.actions_popup.edit_match_type.next();
                             }
+                            ActionEditorField::Enabled => {
+                                // Toggle enabled
+                                app.actions_popup.edit_enabled = !app.actions_popup.edit_enabled;
+                            }
                             _ => {
                                 app.actions_popup.next_editor_field();
                             }
@@ -18654,6 +18705,12 @@ fn handle_key_event(key: KeyEvent, app: &mut App) -> KeyAction {
                                 // Space toggles match type
                                 if c == ' ' {
                                     app.actions_popup.edit_match_type = app.actions_popup.edit_match_type.next();
+                                }
+                            }
+                            ActionEditorField::Enabled => {
+                                // Space toggles enabled
+                                if c == ' ' {
+                                    app.actions_popup.edit_enabled = !app.actions_popup.edit_enabled;
                                 }
                             }
                             _ => {}
@@ -21379,6 +21436,10 @@ async fn handle_command(cmd: &str, app: &mut App, event_tx: mpsc::Sender<AppEven
                 .cloned();
 
             if let Some(action) = action_found {
+                // Skip disabled actions
+                if !action.enabled {
+                    app.add_output(&format!("%% Action '{}' is disabled.", name));
+                } else {
                 // Execute the action's commands - process each individually
                 let commands = split_action_commands(&action.command);
                 let mut sent_to_server = false;
@@ -21457,6 +21518,7 @@ async fn handle_command(cmd: &str, app: &mut App, event_tx: mpsc::Sender<AppEven
                 }
                 if sent_to_server {
                     app.current_world_mut().last_send_time = Some(std::time::Instant::now());
+                }
                 }
             } else {
                 app.add_output(&format!("Unknown action: /{}", name));
@@ -21922,12 +21984,9 @@ fn render_output_crossterm(app: &App) {
         };
         let cursor_col = effective_chars % input_area_width;
         let cursor_x = cursor_col as u16;
-        let extra_lines = if app.input.viewport_start_line == 0 {
-            (chars_before_cursor + prompt_len) / input_area_width
-        } else {
-            chars_before_cursor / input_area_width
-        };
-        let cursor_y = input_area_y + (viewport_line + extra_lines - cursor_line) as u16;
+        // Calculate visual line within viewport
+        // cursor_line() already accounts for prompt, so we just need the viewport offset
+        let cursor_y = input_area_y + viewport_line as u16;
         let max_y = input_area_y + app.input_height - 1;
         let _ = stdout.queue(cursor::MoveTo(cursor_x, cursor_y.min(max_y)));
     }
@@ -22244,13 +22303,9 @@ fn render_input_area(f: &mut Frame, app: &mut App, area: Rect) {
         };
         let cursor_col = effective_chars % inner_width;
         let cursor_x = area.x + cursor_col as u16;
-        // Account for potential line wrap due to prompt
-        let extra_lines = if app.input.viewport_start_line == 0 {
-            (chars_before_cursor + prompt_len) / inner_width
-        } else {
-            chars_before_cursor / inner_width
-        };
-        let cursor_y = area.y + (viewport_line + extra_lines - cursor_line) as u16;
+        // Calculate visual line within viewport
+        // cursor_line() already accounts for prompt, so we just need the viewport offset
+        let cursor_y = area.y + viewport_line as u16;
         f.set_cursor_position((cursor_x, cursor_y.min(area.y + area.height - 1)));
     }
 }
@@ -23631,13 +23686,19 @@ fn render_actions_popup(f: &mut Frame, app: &App) {
             let scroll = popup.scroll_offset;
 
             // Calculate scroll offset to keep selection visible
+            // Only adjust if selection is out of the visible range
             let selected_pos = filtered_indices
                 .iter()
                 .position(|&i| i == popup.selected_index)
                 .unwrap_or(0);
-            let scroll_offset = if selected_pos >= list_height {
+            let scroll_offset = if selected_pos < scroll {
+                // Selection above visible area - scroll up to show it at top
+                selected_pos
+            } else if selected_pos >= scroll + list_height {
+                // Selection below visible area - scroll down to show it at bottom
                 selected_pos - list_height + 1
             } else {
+                // Selection is visible - keep current scroll
                 scroll.min(filtered_indices.len().saturating_sub(list_height))
             };
 
@@ -23918,6 +23979,16 @@ fn render_actions_popup(f: &mut Frame, app: &App) {
                     Span::styled("▼ more below", Style::default().fg(Color::DarkGray)),
                 ]));
             }
+
+            lines.push(Line::from(""));
+
+            // Enabled toggle field
+            let enabled_label_style = if popup.editor_field == ActionEditorField::Enabled { selected_style } else { label_style };
+            let enabled_value = format!("< {} >", if popup.edit_enabled { "Yes" } else { "No" });
+            lines.push(Line::from(vec![
+                Span::styled("Enabled:   ", enabled_label_style),
+                Span::styled(enabled_value, if popup.editor_field == ActionEditorField::Enabled { selected_style } else { value_style }),
+            ]));
 
             lines.push(Line::from(""));
 
