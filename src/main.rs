@@ -10450,12 +10450,12 @@ mod remote_gui {
                             let status_text = "           ";
                             ui.label(egui::RichText::new(status_text).monospace());
 
-                            // Underscore padding
-                            ui.label(egui::RichText::new(" ").monospace().color(theme.fg_dim()));
+                            // Connection status ball (green = connected, red = disconnected)
+                            let status_ball = if connected { "🟢" } else { "🔴" };
+                            ui.label(egui::RichText::new(status_ball));
 
                             // World name (bold)
-                            let name_color = if connected { theme.success() } else { theme.fg() };
-                            ui.label(egui::RichText::new(world_name).monospace().strong().color(name_color));
+                            ui.label(egui::RichText::new(world_name).monospace().strong().color(theme.fg()));
 
                             // Tag indicator (only shown when F2 toggled to show tags)
                             if self.show_tags {
@@ -21983,24 +21983,25 @@ fn render_output_crossterm(app: &App) {
     if viewport_line < app.input_height as usize {
         let chars_before_cursor = app.input.buffer[..app.input.cursor_position].chars().count();
 
-        // Calculate cursor column within its logical line
+        // Calculate cursor column - must match cursor_line() logic exactly
         let first_line_capacity = input_area_width.saturating_sub(prompt_len);
-        let cursor_col = if cursor_line == 0 {
-            // On first logical line - add prompt offset if viewport shows it
+        let cursor_col = if first_line_capacity == 0 {
+            // Prompt fills entire line
+            chars_before_cursor % input_area_width
+        } else if chars_before_cursor < first_line_capacity {
+            // On first line - add prompt offset if viewport shows it
             if app.input.viewport_start_line == 0 {
                 chars_before_cursor + prompt_len
             } else {
                 chars_before_cursor
             }
         } else {
-            // On subsequent lines - calculate position within that line
-            let line_start = first_line_capacity + (cursor_line - 1) * input_area_width;
-            chars_before_cursor.saturating_sub(line_start)
+            // Past first line - get remainder within the line
+            (chars_before_cursor - first_line_capacity) % input_area_width
         };
 
         let cursor_x = cursor_col as u16;
         // Calculate visual line within viewport
-        // cursor_line() already accounts for prompt, so we just need the viewport offset
         let cursor_y = input_area_y + viewport_line as u16;
         let max_y = input_area_y + app.input_height - 1;
         let _ = stdout.queue(cursor::MoveTo(cursor_x, cursor_y.min(max_y)));
@@ -22233,6 +22234,11 @@ fn render_separator_bar(f: &mut Frame, app: &App, area: Rect) {
         },
     ));
 
+    // Connection status ball (green = connected, red = disconnected)
+    let is_connected = world.command_tx.is_some();
+    let status_ball = if is_connected { "🟢" } else { "🔴" };
+    spans.push(Span::raw(status_ball));
+
     // World name
     spans.push(Span::styled(
         world_display.clone(),
@@ -22247,8 +22253,10 @@ fn render_separator_bar(f: &mut Frame, app: &App, area: Rect) {
         ));
     }
 
-    // Calculate current position after status, world name, and tag indicator
-    let current_pos = status_str.len() + world_display.len() + tag_indicator.len();
+    // Calculate current position after status, connection ball, world name, and tag indicator
+    // Note: emoji takes 2 character cells in most terminals
+    let status_ball_width = 2;
+    let current_pos = status_str.len() + status_ball_width + world_display.len() + tag_indicator.len();
 
     // Add underscores to reach position 24 (or as close as possible)
     if !activity_str.is_empty() && current_pos < ACTIVITY_POSITION {
@@ -22311,24 +22319,25 @@ fn render_input_area(f: &mut Frame, app: &mut App, area: Rect) {
         // Use character count for cursor column, not byte index
         let chars_before_cursor = app.input.buffer[..app.input.cursor_position].chars().count();
 
-        // Calculate cursor column within its logical line
+        // Calculate cursor column - must match cursor_line() logic exactly
         let first_line_capacity = inner_width.saturating_sub(prompt_len);
-        let cursor_col = if cursor_line == 0 {
-            // On first logical line - add prompt offset if viewport shows it
+        let cursor_col = if first_line_capacity == 0 {
+            // Prompt fills entire line
+            chars_before_cursor % inner_width
+        } else if chars_before_cursor < first_line_capacity {
+            // On first line - add prompt offset if viewport shows it
             if app.input.viewport_start_line == 0 {
                 chars_before_cursor + prompt_len
             } else {
                 chars_before_cursor
             }
         } else {
-            // On subsequent lines - calculate position within that line
-            let line_start = first_line_capacity + (cursor_line - 1) * inner_width;
-            chars_before_cursor.saturating_sub(line_start)
+            // Past first line - get remainder within the line
+            (chars_before_cursor - first_line_capacity) % inner_width
         };
 
         let cursor_x = area.x + cursor_col as u16;
         // Calculate visual line within viewport
-        // cursor_line() already accounts for prompt, so we just need the viewport offset
         let cursor_y = area.y + viewport_line as u16;
         f.set_cursor_position((cursor_x, cursor_y.min(area.y + area.height - 1)));
     }

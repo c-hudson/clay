@@ -19,6 +19,7 @@
         output: document.getElementById('output'),
         outputContainer: document.getElementById('output-container'),
         statusIndicator: document.getElementById('status-indicator'),
+        connectionStatus: document.getElementById('connection-status'),
         worldName: document.getElementById('world-name'),
         activityIndicator: document.getElementById('activity-indicator'),
         separatorFill: document.getElementById('separator-fill'),
@@ -2125,8 +2126,10 @@
         }
 
         if (world && world.name) {
+            elements.connectionStatus.textContent = world.connected ? '🟢' : '🔴';
             elements.worldName.textContent = ' ' + world.name;
         } else {
+            elements.connectionStatus.textContent = '🔴';
             elements.worldName.textContent = '';
         }
 
