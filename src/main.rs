@@ -15388,8 +15388,27 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
 
                 let socket_path = socket_path.unwrap();
 
-                // Reconnect to proxy via Unix socket
-                match tokio::net::UnixStream::connect(&socket_path).await {
+                // Reconnect to proxy via Unix socket with retry logic
+                // Sometimes the proxy needs a moment to be ready after exec()
+                let mut connect_result = None;
+                for attempt in 0..5 {
+                    match tokio::net::UnixStream::connect(&socket_path).await {
+                        Ok(stream) => {
+                            connect_result = Some(Ok(stream));
+                            break;
+                        }
+                        Err(e) => {
+                            if attempt < 4 {
+                                // Wait 50ms before retrying
+                                tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+                            } else {
+                                connect_result = Some(Err(e));
+                            }
+                        }
+                    }
+                }
+
+                match connect_result.unwrap() {
                     Ok(unix_stream) => {
                         let (r, w) = unix_stream.into_split();
                         let mut read_half = StreamReader::Proxy(r);
