@@ -569,6 +569,104 @@
         return { fontPos: fontPosFromPixels(webFontSizeDesktop), mode: 'desktop', device: 'desktop' };
     }
 
+    // Helper to focus input and ensure keyboard shows on mobile
+    function focusInputWithKeyboard() {
+        elements.input.focus();
+        // On Android, sometimes need to set selection to trigger keyboard
+        if (deviceMode === 'mobile') {
+            const len = elements.input.value.length;
+            elements.input.setSelectionRange(len, len);
+        }
+    }
+
+    // Custom dropdown for mobile (replaces native select with styled dropdown)
+    let activeCustomDropdown = null;
+
+    function initCustomDropdowns() {
+        document.querySelectorAll('select.form-select').forEach(select => {
+            // Create wrapper
+            const wrapper = document.createElement('div');
+            wrapper.className = 'custom-dropdown';
+
+            // Create the visible button that shows current value
+            const button = document.createElement('div');
+            button.className = 'custom-dropdown-button';
+            button.textContent = select.options[select.selectedIndex]?.text || '';
+
+            // Create dropdown menu
+            const menu = document.createElement('div');
+            menu.className = 'custom-dropdown-menu';
+
+            // Populate options
+            Array.from(select.options).forEach((option, index) => {
+                const item = document.createElement('div');
+                item.className = 'custom-dropdown-item';
+                if (index === select.selectedIndex) {
+                    item.classList.add('selected');
+                }
+                item.textContent = option.text;
+                item.dataset.value = option.value;
+                item.onclick = (e) => {
+                    e.stopPropagation();
+                    select.value = option.value;
+                    button.textContent = option.text;
+                    menu.querySelectorAll('.custom-dropdown-item').forEach(i => i.classList.remove('selected'));
+                    item.classList.add('selected');
+                    closeCustomDropdown();
+                    // Trigger change event on the original select
+                    select.dispatchEvent(new Event('change'));
+                };
+                menu.appendChild(item);
+            });
+
+            // Insert wrapper and move select inside (hidden)
+            select.parentNode.insertBefore(wrapper, select);
+            wrapper.appendChild(button);
+            wrapper.appendChild(menu);
+            wrapper.appendChild(select);
+            select.style.display = 'none';
+
+            // Toggle dropdown on button click
+            button.onclick = (e) => {
+                e.stopPropagation();
+                if (menu.classList.contains('visible')) {
+                    closeCustomDropdown();
+                } else {
+                    // Close any other open dropdown
+                    closeCustomDropdown();
+                    menu.classList.add('visible');
+                    activeCustomDropdown = menu;
+                }
+            };
+
+            // Store reference for updating
+            select._customButton = button;
+            select._customMenu = menu;
+        });
+
+        // Close dropdown when clicking outside
+        document.addEventListener('click', closeCustomDropdown);
+    }
+
+    function closeCustomDropdown() {
+        if (activeCustomDropdown) {
+            activeCustomDropdown.classList.remove('visible');
+            activeCustomDropdown = null;
+        }
+    }
+
+    // Update custom dropdown when select value changes programmatically
+    function updateCustomDropdown(select) {
+        if (select._customButton) {
+            select._customButton.textContent = select.options[select.selectedIndex]?.text || '';
+            if (select._customMenu) {
+                select._customMenu.querySelectorAll('.custom-dropdown-item').forEach((item, index) => {
+                    item.classList.toggle('selected', index === select.selectedIndex);
+                });
+            }
+        }
+    }
+
     // Setup toolbars based on device mode
     function setupToolbars(mode) {
         deviceMode = mode;
@@ -593,6 +691,13 @@
         const device = detectDeviceType();
         setFontPos(device.fontPos);
         setupToolbars(device.mode);
+
+        // Add mobile class for CSS targeting
+        if (device.mode === 'mobile') {
+            document.body.classList.add('is-mobile');
+            // Create custom dropdowns to replace native selects on mobile
+            initCustomDropdowns();
+        }
 
         setupEventListeners();
         connect();
@@ -2737,7 +2842,7 @@
         setupPopupOpen = false;
         elements.setupModal.className = 'modal';
         elements.setupModal.style.display = 'none';
-        elements.input.focus();
+        focusInputWithKeyboard();
     }
 
     function updateSetupPopupUI() {
@@ -2764,10 +2869,12 @@
         }
         // World switching dropdown
         elements.setupWorldSwitchSelect.value = setupWorldSwitchMode;
+        updateCustomDropdown(elements.setupWorldSwitchSelect);
         // Input height stepper
         elements.setupInputHeightValue.textContent = setupInputHeightValue;
         // Theme dropdown
         elements.setupThemeSelect.value = setupGuiTheme.charAt(0).toUpperCase() + setupGuiTheme.slice(1);
+        updateCustomDropdown(elements.setupThemeSelect);
     }
 
     function saveSetupSettings() {
@@ -2840,7 +2947,7 @@
         webPopupOpen = false;
         elements.webModal.className = 'modal';
         elements.webModal.style.display = 'none';
-        elements.input.focus();
+        focusInputWithKeyboard();
     }
 
     function updateWebPopupUI() {
@@ -3402,13 +3509,16 @@
 
         const autoLogin = world.settings?.auto_login || 'Connect';
         elements.worldEditAutoLoginSelect.value = autoLogin;
+        updateCustomDropdown(elements.worldEditAutoLoginSelect);
 
         const keepAlive = world.settings?.keep_alive_type || 'NOP';
         elements.worldEditKeepAliveSelect.value = keepAlive;
         updateKeepAliveCmdVisibility(keepAlive);
+        updateCustomDropdown(elements.worldEditKeepAliveSelect);
 
         const encoding = world.settings?.encoding || 'UTF-8';
         elements.worldEditEncodingSelect.value = encoding;
+        updateCustomDropdown(elements.worldEditEncodingSelect);
 
         elements.worldEditorModal.className = 'modal visible';
         elements.worldEditorModal.style.display = 'flex';
@@ -3420,7 +3530,7 @@
         worldEditorIndex = -1;
         elements.worldEditorModal.className = 'modal';
         elements.worldEditorModal.style.display = 'none';
-        elements.input.focus();
+        focusInputWithKeyboard();
     }
 
     function updateKeepAliveCmdVisibility(keepAliveType) {
@@ -3657,6 +3767,7 @@
         switch (action) {
             case 'worlds':
                 outputWorldsList();
+                focusInputWithKeyboard();
                 break;
             case 'world-selector':
                 openWorldSelectorPopup();
@@ -3673,16 +3784,16 @@
             case 'toggle-tags':
                 showTags = !showTags;
                 renderOutput();
+                focusInputWithKeyboard();
                 break;
             case 'toggle-highlight':
                 highlightActions = !highlightActions;
                 renderOutput();
+                focusInputWithKeyboard();
                 break;
             case 'resync':
-                // Request full state resync from server
-                if (ws && ws.readyState === WebSocket.OPEN) {
-                    ws.send(JSON.stringify({ type: 'RequestState' }));
-                }
+                // Force a full page reload to get fresh CSS/JS and resync state
+                location.reload(true);
                 break;
             case 'change-password':
                 // Open password change modal (multiuser mode only)
@@ -3750,6 +3861,12 @@
             if (newPos !== currentFontPos) {
                 setFontPos(newPos);
             }
+        }, { passive: false });
+
+        slider.addEventListener('touchend', function(e) {
+            e.preventDefault();
+            e.stopPropagation();
+            focusInputWithKeyboard();
         }, { passive: false });
     }
 
@@ -3849,18 +3966,25 @@
         setupSlider(elements.mobileFontSlider, elements.mobileFontSliderHandle);
 
         // Mobile toolbar buttons
-        elements.mobileMenuBtn.onclick = function(e) {
-            e.stopPropagation();
+        elements.mobileMenuBtn.addEventListener('touchstart', function(e) {
+            // Re-focus input immediately to prevent keyboard from hiding
+            elements.input.focus();
+        }, { passive: true });
+        elements.mobileMenuBtn.addEventListener('touchend', function(e) {
+            e.preventDefault();
             toggleMobileMenu();
-        };
+        }, { passive: false });
 
-        elements.mobileMenuDropdown.onclick = function(e) {
-            e.stopPropagation();
+        elements.mobileMenuDropdown.addEventListener('touchstart', function(e) {
+            elements.input.focus();
+        }, { passive: true });
+        elements.mobileMenuDropdown.addEventListener('touchend', function(e) {
+            e.preventDefault();
             const item = e.target.closest('.dropdown-item');
             if (item) {
                 handleMenuItem(item.dataset.action);
             }
-        };
+        }, { passive: false });
 
         // Track button press timing for long-press detection
         let upBtnTimer = null;
@@ -3871,6 +3995,7 @@
         // Up button - short press: prev world, long press (1s): prev history (triggers immediately at 1s)
         function upBtnStart(e) {
             e.preventDefault();
+            elements.input.focus(); // Keep keyboard visible
             upBtnLongPressed = false;
             upBtnTimer = setTimeout(function() {
                 upBtnLongPressed = true;
@@ -3907,6 +4032,7 @@
         // Down button - short press: next world, long press (1s): next history (triggers immediately at 1s)
         function downBtnStart(e) {
             e.preventDefault();
+            elements.input.focus(); // Keep keyboard visible
             downBtnLongPressed = false;
             downBtnTimer = setTimeout(function() {
                 downBtnLongPressed = true;
@@ -3941,35 +4067,40 @@
         elements.mobileDownBtn.addEventListener('touchstart', downBtnStart, { passive: false });
         elements.mobileDownBtn.addEventListener('touchend', downBtnEnd, { passive: false });
 
-        elements.mobilePgUpBtn.onclick = function(e) {
-            e.preventDefault();
-            e.stopPropagation();
-            // Page up - scroll output
+        // Page up/down buttons
+        function handlePgUp() {
             const container = elements.outputContainer;
             const pageHeight = container.clientHeight * 0.9;
             container.scrollTop = Math.max(0, container.scrollTop - pageHeight);
             updateStatusBar();
-            elements.input.focus();
-        };
-
-        elements.mobilePgDnBtn.onclick = function(e) {
-            e.preventDefault();
-            e.stopPropagation();
-            // Page down - scroll output or release pending lines
+        }
+        function handlePgDn() {
             const container = elements.outputContainer;
             const world = worlds[currentWorldIndex];
-
             if (world && world.pendingLines && world.pendingLines.length > 0) {
-                // Release one screenful of pending lines
                 releasePendingLines(getVisibleLineCount());
             } else {
-                // Just scroll down
                 const pageHeight = container.clientHeight * 0.9;
                 container.scrollTop += pageHeight;
             }
             updateStatusBar();
+        }
+
+        elements.mobilePgUpBtn.addEventListener('touchstart', function(e) {
             elements.input.focus();
-        };
+        }, { passive: true });
+        elements.mobilePgUpBtn.addEventListener('touchend', function(e) {
+            e.preventDefault();
+            handlePgUp();
+        }, { passive: false });
+
+        elements.mobilePgDnBtn.addEventListener('touchstart', function(e) {
+            elements.input.focus();
+        }, { passive: true });
+        elements.mobilePgDnBtn.addEventListener('touchend', function(e) {
+            e.preventDefault();
+            handlePgDn();
+        }, { passive: false });
 
         // Track whether we're at the bottom (for resize handling)
         let wasAtBottomBeforeResize = true;
@@ -4021,36 +4152,86 @@
             if (selection && selection.toString().length > 0) {
                 return;
             }
-            // Don't steal focus from modals or toolbars
+            // Don't steal focus from modals, toolbars, or form elements (like select dropdowns)
             if (!elements.authModal.classList.contains('visible') &&
                 !elements.actionsListModal.classList.contains('visible') &&
                 !elements.worldsModal.classList.contains('visible') &&
                 !elements.worldSelectorModal.classList.contains('visible') &&
+                !elements.setupModal?.classList.contains('visible') &&
+                !elements.worldEditorModal?.classList.contains('visible') &&
+                !elements.webModal?.classList.contains('visible') &&
                 !e.target.closest('#toolbar') &&
-                !e.target.closest('#mobile-toolbar')) {
+                !e.target.closest('#mobile-toolbar') &&
+                !e.target.closest('select')) {
                 elements.input.focus();
             }
         };
 
         // On mobile, keep keyboard visible by refocusing input when it loses focus
         if (deviceMode === 'mobile') {
+            // Helper to check if any modal or menu is open
+            function isAnyModalOpen() {
+                return elements.authModal.classList.contains('visible') ||
+                    elements.actionsListModal.classList.contains('visible') ||
+                    elements.actionsEditorModal.classList.contains('visible') ||
+                    elements.worldsModal.classList.contains('visible') ||
+                    elements.worldSelectorModal.classList.contains('visible') ||
+                    elements.webModal.classList.contains('visible') ||
+                    elements.setupModal.classList.contains('visible') ||
+                    elements.worldEditorModal?.classList.contains('visible') ||
+                    elements.passwordModal?.classList.contains('visible') ||
+                    filterPopupOpen ||
+                    activeCustomDropdown !== null ||
+                    menuOpen ||
+                    mobileMenuOpen;
+            }
+
+            // Global touchend handler - refocus input after any touch interaction
+            document.addEventListener('touchend', function(e) {
+                // Skip if touching interactive elements
+                if (e.target.closest('input, textarea, button, a, select, .custom-dropdown, .dropdown-item, .modal')) {
+                    return;
+                }
+                // Skip if modal is open
+                if (isAnyModalOpen()) {
+                    return;
+                }
+                // Refocus input after a very short delay
+                requestAnimationFrame(function() {
+                    if (!isAnyModalOpen() && document.activeElement !== elements.input) {
+                        focusInputWithKeyboard();
+                    }
+                });
+            }, { passive: true });
+
+            // Blur handler as backup
             elements.input.addEventListener('blur', function() {
-                // Small delay to allow modal opens and other legitimate blur events
-                setTimeout(function() {
-                    // Don't refocus if a modal is open
-                    if (elements.authModal.classList.contains('visible') ||
-                        elements.actionsListModal.classList.contains('visible') ||
-                        elements.actionsEditorModal.classList.contains('visible') ||
-                        elements.worldsModal.classList.contains('visible') ||
-                        elements.worldSelectorModal.classList.contains('visible') ||
-                        elements.webModal.classList.contains('visible') ||
-                        elements.setupModal.classList.contains('visible')) {
+                // Use requestAnimationFrame for fastest possible refocus
+                requestAnimationFrame(function() {
+                    // Don't refocus if a modal is open or interacting with form elements
+                    if (isAnyModalOpen() ||
+                        document.activeElement?.tagName === 'SELECT' ||
+                        document.activeElement?.tagName === 'INPUT' ||
+                        document.activeElement?.tagName === 'TEXTAREA' ||
+                        document.activeElement?.closest('.custom-dropdown')) {
                         return;
                     }
                     // Refocus to keep keyboard visible
-                    elements.input.focus();
-                }, 50);
+                    focusInputWithKeyboard();
+                });
             });
+
+            // Periodic check to ensure input stays focused (every 500ms)
+            setInterval(function() {
+                if (!isAnyModalOpen() &&
+                    document.activeElement !== elements.input &&
+                    document.activeElement?.tagName !== 'SELECT' &&
+                    document.activeElement?.tagName !== 'INPUT' &&
+                    document.activeElement?.tagName !== 'TEXTAREA' &&
+                    !document.activeElement?.closest('.custom-dropdown')) {
+                    focusInputWithKeyboard();
+                }
+            }, 500);
         }
 
         // Scroll event to update status bar (for Hist indicator)

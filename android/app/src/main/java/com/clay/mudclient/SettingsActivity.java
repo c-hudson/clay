@@ -36,9 +36,9 @@ public class SettingsActivity extends AppCompatActivity {
 
         // Load saved settings
         SharedPreferences prefs = getSharedPreferences(PREFS_NAME, MODE_PRIVATE);
-        String savedHost = prefs.getString(KEY_SERVER_HOST, "");
+        String savedHost = prefs.getString(KEY_SERVER_HOST, "192.168.2.6");
         int savedPort = prefs.getInt(KEY_SERVER_PORT, 9000);
-        boolean savedSecure = prefs.getBoolean(KEY_USE_SECURE, true);
+        boolean savedSecure = prefs.getBoolean(KEY_USE_SECURE, false);
 
         serverHostInput.setText(savedHost);
         serverPortInput.setText(savedPort > 0 ? String.valueOf(savedPort) : "");

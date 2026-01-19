@@ -98,9 +98,9 @@ public class MainActivity extends AppCompatActivity {
 
     private void loadWebInterface() {
         SharedPreferences prefs = getSharedPreferences(PREFS_NAME, MODE_PRIVATE);
-        String host = prefs.getString(KEY_SERVER_HOST, "");
+        String host = prefs.getString(KEY_SERVER_HOST, "192.168.2.6");
         int port = prefs.getInt(KEY_SERVER_PORT, 9000);
-        boolean useSecure = prefs.getBoolean(KEY_USE_SECURE, true);
+        boolean useSecure = prefs.getBoolean(KEY_USE_SECURE, false);
 
         String protocol = useSecure ? "https" : "http";
         String url = protocol + "://" + host + ":" + port;

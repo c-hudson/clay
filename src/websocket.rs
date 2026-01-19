@@ -875,15 +875,13 @@ where
                             if is_authed {
                                 let _ = event_tx.send(AppEvent::WsClientMessage(client_id, Box::new(ws_msg))).await;
                             } else {
-                                // Record violation - unauthenticated client trying to send non-auth messages
-                                ban_list.record_violation(&client_ip, "WebSocket: unauthenticated message");
-                                break; // Disconnect the client
+                                // Unauthenticated client trying to send non-auth messages - disconnect but don't ban
+                                break;
                             }
                         }
                     }
                 } else {
-                    // Invalid JSON - record violation
-                    ban_list.record_violation(&client_ip, "WebSocket: invalid JSON");
+                    // Invalid JSON - disconnect but don't ban
                     break;
                 }
             }
@@ -895,13 +893,11 @@ where
                 let _ = data;
             }
             Ok(WsRawMessage::Binary(_)) => {
-                // Binary messages not supported - record violation
-                ban_list.record_violation(&client_ip, "WebSocket: binary message");
+                // Binary messages not supported - disconnect but don't ban
                 break;
             }
             Err(_) => {
-                // Protocol error - record violation
-                ban_list.record_violation(&client_ip, "WebSocket: protocol error");
+                // Protocol error - disconnect but don't ban (could be network issues)
                 break;
             }
             _ => {}

@@ -6951,12 +6951,35 @@ fn spawn_tls_proxy(
 async fn run_tls_proxy_async(host: &str, port: &str, socket_path: &PathBuf) {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::{TcpStream, UnixListener};
+    use std::os::unix::io::AsRawFd;
 
     // Step 1: Connect to the MUD server with TLS
     let tcp_stream = match TcpStream::connect(format!("{}:{}", host, port)).await {
         Ok(s) => s,
         Err(_) => return,
     };
+
+    // Enable TCP keepalive to detect dead connections faster
+    // Settings: start probing after 60s idle, probe every 10s, give up after 6 failed probes
+    // This detects dead connections within ~2 minutes instead of waiting for app-level timeout
+    let fd = tcp_stream.as_raw_fd();
+    unsafe {
+        let enable: libc::c_int = 1;
+        libc::setsockopt(fd, libc::SOL_SOCKET, libc::SO_KEEPALIVE,
+            &enable as *const _ as *const libc::c_void, std::mem::size_of_val(&enable) as libc::socklen_t);
+
+        let idle: libc::c_int = 60; // Start probing after 60 seconds idle
+        libc::setsockopt(fd, libc::IPPROTO_TCP, libc::TCP_KEEPIDLE,
+            &idle as *const _ as *const libc::c_void, std::mem::size_of_val(&idle) as libc::socklen_t);
+
+        let interval: libc::c_int = 10; // Probe every 10 seconds
+        libc::setsockopt(fd, libc::IPPROTO_TCP, libc::TCP_KEEPINTVL,
+            &interval as *const _ as *const libc::c_void, std::mem::size_of_val(&interval) as libc::socklen_t);
+
+        let count: libc::c_int = 6; // Give up after 6 failed probes
+        libc::setsockopt(fd, libc::IPPROTO_TCP, libc::TCP_KEEPCNT,
+            &count as *const _ as *const libc::c_void, std::mem::size_of_val(&count) as libc::socklen_t);
+    }
 
     // Establish TLS connection
     #[cfg(feature = "rustls-backend")]
@@ -9591,6 +9614,11 @@ mod remote_gui {
                 egui::CentralPanel::default()
                     .frame(egui::Frame::none().fill(theme.bg_deep()))
                     .show(ctx, |ui| {
+                    // Guard against first frame with invalid dimensions
+                    let avail = ui.available_size();
+                    if avail.x <= 0.0 || avail.y <= 0.0 || avail.x.is_nan() || avail.y.is_nan() {
+                        return;
+                    }
                     ui.vertical_centered(|ui| {
                         ui.add_space(30.0);
 
@@ -9614,7 +9642,12 @@ mod remote_gui {
 
                         ui.horizontal(|ui| {
                             // Center the horizontal group
-                            let centering_space = ((ui.available_width() - 400.0) / 2.0).max(0.0);
+                            let avail_width = ui.available_width();
+                            let centering_space = if avail_width.is_finite() && avail_width > 0.0 {
+                                ((avail_width - 400.0) / 2.0).max(0.0)
+                            } else {
+                                0.0
+                            };
                             ui.add_space(centering_space);
 
                             // Image on left (30% smaller: 179x125)
@@ -9649,6 +9682,11 @@ mod remote_gui {
                             .rounding(egui::Rounding::same(8.0))
                             .inner_margin(egui::Margin::same(20.0))
                             .show(ui, |ui| {
+                                // Guard against invalid dimensions
+                                let avail = ui.available_size();
+                                if !avail.x.is_finite() || !avail.y.is_finite() || avail.x <= 0.0 || avail.y <= 0.0 {
+                                    return;
+                                }
                                 ui.set_min_width(280.0);
                                 ui.set_max_width(280.0);
 
@@ -9728,15 +9766,9 @@ mod remote_gui {
                                 // Error message
                                 if let Some(ref err) = self.error_message {
                                     ui.add_space(12.0);
-                                    egui::Frame::none()
-                                        .fill(Color32::from_rgba_unmultiplied(248, 113, 113, 25))
-                                        .rounding(egui::Rounding::same(4.0))
-                                        .inner_margin(egui::Margin::same(8.0))
-                                        .show(ui, |ui| {
-                                            ui.label(egui::RichText::new(err)
-                                                .color(theme.error())
-                                                .size(11.0));
-                                        });
+                                    ui.label(egui::RichText::new(err.as_str())
+                                        .color(theme.error())
+                                        .size(12.0));
                                 }
                             });
                     });
@@ -14715,6 +14747,30 @@ async fn connect_multiuser_world(
     match TcpStream::connect(format!("{}:{}", host, port)).await {
         Ok(tcp_stream) => {
             let _ = tcp_stream.set_nodelay(true);
+
+            // Enable TCP keepalive to detect dead connections faster
+            #[cfg(unix)]
+            {
+                use std::os::unix::io::AsRawFd;
+                let fd = tcp_stream.as_raw_fd();
+                unsafe {
+                    let enable: libc::c_int = 1;
+                    libc::setsockopt(fd, libc::SOL_SOCKET, libc::SO_KEEPALIVE,
+                        &enable as *const _ as *const libc::c_void, std::mem::size_of_val(&enable) as libc::socklen_t);
+
+                    let idle: libc::c_int = 60;
+                    libc::setsockopt(fd, libc::IPPROTO_TCP, libc::TCP_KEEPIDLE,
+                        &idle as *const _ as *const libc::c_void, std::mem::size_of_val(&idle) as libc::socklen_t);
+
+                    let interval: libc::c_int = 10;
+                    libc::setsockopt(fd, libc::IPPROTO_TCP, libc::TCP_KEEPINTVL,
+                        &interval as *const _ as *const libc::c_void, std::mem::size_of_val(&interval) as libc::socklen_t);
+
+                    let count: libc::c_int = 6;
+                    libc::setsockopt(fd, libc::IPPROTO_TCP, libc::TCP_KEEPCNT,
+                        &count as *const _ as *const libc::c_void, std::mem::size_of_val(&count) as libc::socklen_t);
+                }
+            }
 
             // Handle SSL if needed
             let (mut read_half, mut write_half): (StreamReader, StreamWriter) = if use_ssl {
@@ -21313,6 +21369,25 @@ async fn handle_command(cmd: &str, app: &mut App, event_tx: mpsc::Sender<AppEven
                     // Store the socket fd for hot reload (before splitting)
                     let socket_fd = tcp_stream.as_raw_fd();
 
+                    // Enable TCP keepalive to detect dead connections faster
+                    unsafe {
+                        let enable: libc::c_int = 1;
+                        libc::setsockopt(socket_fd, libc::SOL_SOCKET, libc::SO_KEEPALIVE,
+                            &enable as *const _ as *const libc::c_void, std::mem::size_of_val(&enable) as libc::socklen_t);
+
+                        let idle: libc::c_int = 60;
+                        libc::setsockopt(socket_fd, libc::IPPROTO_TCP, libc::TCP_KEEPIDLE,
+                            &idle as *const _ as *const libc::c_void, std::mem::size_of_val(&idle) as libc::socklen_t);
+
+                        let interval: libc::c_int = 10;
+                        libc::setsockopt(socket_fd, libc::IPPROTO_TCP, libc::TCP_KEEPINTVL,
+                            &interval as *const _ as *const libc::c_void, std::mem::size_of_val(&interval) as libc::socklen_t);
+
+                        let count: libc::c_int = 6;
+                        libc::setsockopt(socket_fd, libc::IPPROTO_TCP, libc::TCP_KEEPCNT,
+                            &count as *const _ as *const libc::c_void, std::mem::size_of_val(&count) as libc::socklen_t);
+                    }
+
                     // Handle SSL if needed
                     let (mut read_half, mut write_half): (StreamReader, StreamWriter) = if use_ssl {
                         #[cfg(feature = "native-tls-backend")]
@@ -22575,13 +22650,11 @@ fn render_splash_centered<'a>(world: &World, visible_height: usize, area_width: 
 }
 
 fn format_more_count(count: usize) -> String {
+    // Returns exactly 4 characters to make "More: XXXX" or "Hist: XXXX" = 10 chars total
     if count <= 9999 {
         format!("{:>4}", count)
-    } else if count < 100_000 {
-        // 10K, 20K, etc.
-        format!("{:>3}K", count / 1000)
     } else if count < 1_000_000 {
-        // 100K, 200K, etc. - but only 4 chars, so use 99K+ for anything above
+        // 10K, 99K, 100K, 999K etc.
         format!("{:>3}K", (count / 1000).min(999))
     } else {
         "Alot".to_string()
@@ -22596,9 +22669,9 @@ fn render_separator_bar(f: &mut Frame, app: &App, area: Rect) {
     // Build bar components
     let time_str = get_current_time_12hr();
 
-    // Status indicator - always reserve space for "More: XXXX" or "Hist: XXXX" (11 chars)
+    // Status indicator - always reserve space for "More: XXXX" or "Hist: XXXX" (10 chars)
     // Priority: More (when paused) > Hist (when scrolled back) > underscores
-    const STATUS_INDICATOR_LEN: usize = 11;
+    const STATUS_INDICATOR_LEN: usize = 10;
     let (status_str, status_active) = if world.paused && !world.pending_lines.is_empty() {
         // Show More indicator when paused with pending lines
         (format!("More: {}", format_more_count(world.pending_lines.len())), true)
@@ -22696,18 +22769,22 @@ fn render_separator_bar(f: &mut Frame, app: &App, area: Rect) {
     }
 
     // Calculate underscore padding - fill between content and time
-    // Fixed field sizes: status (11) + ball (2) + world name + tag + activity + underscores + time (5)
+    // Fixed field sizes: status (10) + ball (2) + world name + tag + activity + underscores + "_" (1) + time (5)
     let used_len = if activity_str.is_empty() {
         status_str.len() + status_ball_width + world_display.len() + tag_indicator.len()
     } else {
         ACTIVITY_POSITION.max(current_pos) + activity_str.len()
     };
-    let underscore_count = width.saturating_sub(used_len + time_display.len());
+    // Subtract 1 for the fixed underscore before time
+    let underscore_count = width.saturating_sub(used_len + time_display.len() + 1);
 
     spans.push(Span::styled(
         "_".repeat(underscore_count),
         Style::default().fg(theme.fg_dim()),
     ));
+
+    // Underscore separator before time
+    spans.push(Span::styled("_", Style::default().fg(theme.fg_dim())));
 
     // Time on the right (no spaces around it)
     spans.push(Span::styled(time_display, Style::default().fg(theme.fg())));

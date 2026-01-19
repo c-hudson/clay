@@ -79,11 +79,11 @@ On startup, each world displays a colorful ASCII art splash screen with the tagl
 
 ### Separator Bar Components
 
-- Status indicator (leftmost, 11 chars, black text on red background):
+- Status indicator (leftmost, 10 chars, black text on red background):
   - `More: XXXX` - pending lines when paused (priority 1)
   - `Hist: XXXX` - lines scrolled back in history (priority 2)
   - Underscores when neither active (dark gray)
-  - Large numbers formatted as: 9999 → "9999", 10000 → " 10K", 1000000+ → "Alot"
+  - Large numbers formatted as: 9999 → "9999", 10000 → " 10K", 999000 → "999K", 1000000+ → "Alot"
 - World name (bold white)
 - Activity indicator at position 24: `(Activity: X)` or `(Act X)` on narrow screens - count of worlds with unseen output (yellow, hidden if 0)
 - Underscore padding fills remaining space (dark gray)
@@ -602,9 +602,8 @@ Note: HTTP automatically starts the non-secure WebSocket server if not already r
   - Toggle Tags - Show/hide MUD tags (same as F2)
   - Toggle Highlight - Highlight lines matching action patterns (same as F8)
   - Resync - Request full state resync from server
-- Font size buttons (S/M/L) next to hamburger for adjusting text size
-  - Font sizes saved separately for phone, tablet, and desktop
-- "Clay" title displayed after font buttons
+- Font slider next to hamburger for adjusting text size
+- "Clay" title displayed after font slider
 
 **Mobile Web Interface:**
 - Toolbar uses `position: fixed` to stay visible during scrolling and keyboard display
@@ -617,7 +616,7 @@ Note: HTTP automatically starts the non-secure WebSocket server if not already r
 - Visibility change detection: auto-resync when browser tab becomes visible (handles sleep/wake)
 
 **Mobile Toolbar Layout:**
-- Left side: Menu (hamburger), PgUp, PgDn, Tags (👁)
+- Left side: Menu (hamburger), PgUp, PgDn
 - Right side: ▲ (Previous World), ▼ (Next World)
 - PgUp/PgDn on left for easy scrolling access; world switching on right
 
