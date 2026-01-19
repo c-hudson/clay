@@ -9253,11 +9253,6 @@ mod remote_gui {
             }
         }
 
-        /// Check if text contains colored square emoji
-        fn has_colored_squares(text: &str) -> bool {
-            text.chars().any(|c| Self::colored_square_color(c).is_some())
-        }
-
         /// Parse text into segments of plain text, Discord emojis, and colored squares
         fn parse_discord_segments(text: &str) -> Vec<DiscordSegment> {
             use regex::Regex;
@@ -9327,7 +9322,9 @@ mod remote_gui {
 
         /// Check if text contains Discord custom emojis or colored squares
         fn has_discord_emojis(text: &str) -> bool {
-            text.contains("<:") || text.contains("<a:") || Self::has_colored_squares(text)
+            // Only use emoji rendering path for actual Discord custom emojis that need image loading
+            // Colored squares (🟥, 🟩, etc.) render fine in TextEdit and don't need special handling
+            text.contains("<:") || text.contains("<a:")
         }
 
         /// Insert zero-width spaces after break characters in long words (>15 chars)
@@ -10707,8 +10704,12 @@ mod remote_gui {
                             ui.label(egui::RichText::new(status_text).monospace());
 
                             // Connection status ball (green = connected, red = disconnected)
-                            let status_ball = if connected { "🟢" } else { "🔴" };
-                            ui.label(egui::RichText::new(status_ball));
+                            let (status_ball, ball_color) = if connected {
+                                ("●", egui::Color32::from_rgb(0x3f, 0xb9, 0x50)) // Green
+                            } else {
+                                ("●", egui::Color32::from_rgb(0xf8, 0x53, 0x49)) // Red
+                            };
+                            ui.label(egui::RichText::new(status_ball).color(ball_color));
 
                             // World name (bold)
                             ui.label(egui::RichText::new(world_name).monospace().strong().color(theme.fg()));
@@ -10979,7 +10980,10 @@ mod remote_gui {
 
                                 // Use TextEdit with custom layouter for colored text
                                 let mut text_copy = plain_text.clone();
+                                // Use world-specific ID for TextEdit to ensure proper focus handling when switching worlds
+                                let output_text_id = egui::Id::new(format!("output_text_{}", self.current_world));
                                 let response = TextEdit::multiline(&mut text_copy)
+                                    .id(output_text_id)
                                     .font(egui::TextStyle::Monospace)
                                     .desired_width(f32::INFINITY)
                                     .interactive(true)
@@ -10995,9 +10999,10 @@ mod remote_gui {
                                 // Store selection in egui memory on every frame when there is one
                                 // This ensures we have it captured before any click clears it
                                 // Skip storage on secondary click to preserve existing selection
-                                let selection_id = egui::Id::new("output_selection");
-                                let selection_range_id = egui::Id::new("output_selection_range");
-                                let selection_raw_id = egui::Id::new("output_selection_raw");
+                                // Use world-specific selection IDs to avoid conflicts when switching worlds
+                                let selection_id = egui::Id::new(format!("output_selection_{}", self.current_world));
+                                let selection_range_id = egui::Id::new(format!("output_selection_range_{}", self.current_world));
+                                let selection_raw_id = egui::Id::new(format!("output_selection_raw_{}", self.current_world));
                                 let is_secondary_click = response.response.secondary_clicked();
                                 if !is_secondary_click {
                                 if let Some(cursor_range) = response.cursor_range {
@@ -11217,6 +11222,7 @@ mod remote_gui {
                                 // Right-click context menu
                                 let plain_text_for_menu = plain_text.clone();
                                 let debug_request_id = egui::Id::new("debug_text_request");
+
                                 response.response.context_menu(|ui| {
                                     // Get stored selection from egui memory
                                     let stored_selection: Option<String> = ui.ctx().data(|d| d.get_temp(selection_id));
