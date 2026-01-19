@@ -2857,6 +2857,8 @@ struct Settings {
     // Remote GUI font settings
     font_name: String,
     font_size: f32,
+    // Web interface font size (separate from GUI)
+    web_font_size: f32,
     // Web server settings (consolidated)
     web_secure: bool,              // Protocol: true=Secure (https/wss), false=Non-Secure (http/ws)
     http_enabled: bool,            // Enable HTTP/HTTPS web server (name depends on web_secure)
@@ -2887,6 +2889,7 @@ impl Default for Settings {
             gui_transparency: 1.0,
             font_name: String::new(),  // Empty means use system default
             font_size: 14.0,
+            web_font_size: 14.0,       // Web interface font size
             web_secure: false,         // Default to non-secure
             http_enabled: false,
             http_port: 9000,
@@ -4716,6 +4719,7 @@ impl App {
             input_height: self.input_height,
             font_name: self.settings.font_name.clone(),
             font_size: self.settings.font_size,
+            web_font_size: self.settings.web_font_size,
             ws_allow_list: self.settings.websocket_allow_list.clone(),
             web_secure: self.settings.web_secure,
             http_enabled: self.settings.http_enabled,
@@ -5235,6 +5239,7 @@ fn save_settings(app: &App) -> io::Result<()> {
     writeln!(file, "gui_transparency={}", app.settings.gui_transparency)?;
     writeln!(file, "font_name={}", app.settings.font_name)?;
     writeln!(file, "font_size={}", app.settings.font_size)?;
+    writeln!(file, "web_font_size={}", app.settings.web_font_size)?;
     writeln!(file, "web_secure={}", app.settings.web_secure)?;
     writeln!(file, "http_enabled={}", app.settings.http_enabled)?;
     writeln!(file, "http_port={}", app.settings.http_port)?;
@@ -5530,6 +5535,11 @@ fn load_settings(app: &mut App) -> io::Result<()> {
                     "font_size" => {
                         if let Ok(s) = value.parse::<f32>() {
                             app.settings.font_size = s.clamp(8.0, 48.0);
+                        }
+                    }
+                    "web_font_size" => {
+                        if let Ok(s) = value.parse::<f32>() {
+                            app.settings.web_font_size = s.clamp(8.0, 48.0);
                         }
                     }
                     "gui_transparency" => {
@@ -6063,6 +6073,7 @@ fn save_reload_state(app: &App) -> io::Result<()> {
     writeln!(file, "gui_transparency={}", app.settings.gui_transparency)?;
     writeln!(file, "font_name={}", app.settings.font_name)?;
     writeln!(file, "font_size={}", app.settings.font_size)?;
+    writeln!(file, "web_font_size={}", app.settings.web_font_size)?;
     writeln!(file, "web_secure={}", app.settings.web_secure)?;
     writeln!(file, "http_enabled={}", app.settings.http_enabled)?;
     writeln!(file, "http_port={}", app.settings.http_port)?;
@@ -6485,6 +6496,11 @@ fn load_reload_state(app: &mut App) -> io::Result<bool> {
                     "font_size" => {
                         if let Ok(s) = value.parse::<f32>() {
                             app.settings.font_size = s.clamp(8.0, 48.0);
+                        }
+                    }
+                    "web_font_size" => {
+                        if let Ok(s) = value.parse::<f32>() {
+                            app.settings.web_font_size = s.clamp(8.0, 48.0);
                         }
                     }
                     "gui_transparency" => {
@@ -7378,6 +7394,8 @@ mod remote_gui {
         font_name: String,
         /// Font size in points
         font_size: f32,
+        /// Web interface font size (separate from GUI)
+        web_font_size: f32,
         /// Temp field for font editor
         edit_font_name: String,
         /// Temp field for font size editor
@@ -7579,6 +7597,7 @@ mod remote_gui {
                 theme: GuiTheme::Dark,
                 font_name: String::new(),
                 font_size: 14.0,
+                web_font_size: 14.0,
                 edit_font_name: String::new(),
                 edit_font_size: String::from("14.0"),
                 loaded_font_name: String::from("__uninitialized__"),
@@ -7964,6 +7983,7 @@ mod remote_gui {
                             self.theme = GuiTheme::from_name(&settings.gui_theme);
                             self.font_name = settings.font_name;
                             self.font_size = settings.font_size;
+                            self.web_font_size = settings.web_font_size;
                             self.transparency = settings.gui_transparency;
                             self.ws_allow_list = settings.ws_allow_list;
                             self.web_secure = settings.web_secure;
@@ -8100,6 +8120,7 @@ mod remote_gui {
                             self.input_height = input_height;
                             self.font_name = settings.font_name;
                             self.font_size = settings.font_size;
+                            self.web_font_size = settings.web_font_size;
                             self.transparency = settings.gui_transparency;
                             self.ws_allow_list = settings.ws_allow_list;
                             self.web_secure = settings.web_secure;
@@ -8570,6 +8591,7 @@ mod remote_gui {
                     input_height: self.input_height,
                     font_name: self.font_name.clone(),
                     font_size: self.font_size,
+                    web_font_size: self.web_font_size,
                     ws_allow_list: self.ws_allow_list.clone(),
                     web_secure: self.web_secure,
                     http_enabled: self.http_enabled,
@@ -14855,6 +14877,7 @@ fn build_multiuser_initial_state(app: &App, username: &str) -> WsMessage {
         input_height: app.input_height,
         font_name: app.settings.font_name.clone(),
         font_size: app.settings.font_size,
+        web_font_size: app.settings.web_font_size,
         ws_allow_list: app.settings.websocket_allow_list.clone(),
         web_secure: app.settings.web_secure,
         http_enabled: app.settings.http_enabled,
@@ -15113,6 +15136,12 @@ async fn handle_multiuser_ws_message(
 
 #[tokio::main]
 async fn main() -> io::Result<()> {
+    // Check for -v or --version to show version and exit
+    if std::env::args().any(|a| a == "-v" || a == "--version") {
+        println!("{}", get_version_string());
+        return Ok(());
+    }
+
     // Log startup for debugging reload/crash issues
     let is_reload_arg = std::env::args().any(|a| a == "--reload");
     let is_crash_arg = std::env::args().any(|a| a == "--crash");
@@ -17237,7 +17266,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                     });
                                 }
                             }
-                            WsMessage::UpdateGlobalSettings { more_mode_enabled, spell_check_enabled, world_switch_mode, show_tags, ansi_music_enabled, console_theme, gui_theme, gui_transparency, input_height, font_name, font_size, ws_allow_list, web_secure, http_enabled, http_port, ws_enabled, ws_port, ws_cert_file, ws_key_file, tls_proxy_enabled } => {
+                            WsMessage::UpdateGlobalSettings { more_mode_enabled, spell_check_enabled, world_switch_mode, show_tags, ansi_music_enabled, console_theme, gui_theme, gui_transparency, input_height, font_name, font_size, web_font_size, ws_allow_list, web_secure, http_enabled, http_port, ws_enabled, ws_port, ws_cert_file, ws_key_file, tls_proxy_enabled } => {
                                 // Update global settings from remote client
                                 app.settings.more_mode_enabled = more_mode_enabled;
                                 app.settings.spell_check_enabled = spell_check_enabled;
@@ -17253,6 +17282,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                 app.input.visible_height = app.input_height;
                                 app.settings.font_name = font_name;
                                 app.settings.font_size = font_size.clamp(8.0, 48.0);
+                                app.settings.web_font_size = web_font_size.clamp(8.0, 48.0);
                                 app.settings.websocket_allow_list = ws_allow_list.clone();
                                 // Update the running WebSocket server's allow list
                                 if let Some(ref server) = app.ws_server {
@@ -17283,6 +17313,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                     input_height: app.input_height,
                                     font_name: app.settings.font_name.clone(),
                                     font_size: app.settings.font_size,
+                                    web_font_size: app.settings.web_font_size,
                                     ws_allow_list: app.settings.websocket_allow_list.clone(),
                                     web_secure: app.settings.web_secure,
                                     http_enabled: app.settings.http_enabled,
@@ -18383,7 +18414,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                 app.ws_broadcast(WsMessage::WorldSettingsUpdated { world_index, settings: settings_msg, name });
                             }
                         }
-                        WsMessage::UpdateGlobalSettings { more_mode_enabled, spell_check_enabled, world_switch_mode, show_tags, ansi_music_enabled, console_theme, gui_theme, gui_transparency, input_height, font_name, font_size, ws_allow_list, web_secure, http_enabled, http_port, ws_enabled, ws_port, ws_cert_file, ws_key_file, tls_proxy_enabled } => {
+                        WsMessage::UpdateGlobalSettings { more_mode_enabled, spell_check_enabled, world_switch_mode, show_tags, ansi_music_enabled, console_theme, gui_theme, gui_transparency, input_height, font_name, font_size, web_font_size, ws_allow_list, web_secure, http_enabled, http_port, ws_enabled, ws_port, ws_cert_file, ws_key_file, tls_proxy_enabled } => {
                             app.settings.more_mode_enabled = more_mode_enabled;
                             app.settings.spell_check_enabled = spell_check_enabled;
                             app.settings.world_switch_mode = WorldSwitchMode::from_name(&world_switch_mode);
@@ -18396,6 +18427,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                             app.input.visible_height = app.input_height;
                             app.settings.font_name = font_name;
                             app.settings.font_size = font_size.clamp(8.0, 48.0);
+                            app.settings.web_font_size = web_font_size.clamp(8.0, 48.0);
                             app.settings.websocket_allow_list = ws_allow_list.clone();
                             if let Some(ref server) = app.ws_server {
                                 server.update_allow_list(&ws_allow_list);
@@ -18422,6 +18454,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                 input_height: app.input_height,
                                 font_name: app.settings.font_name.clone(),
                                 font_size: app.settings.font_size,
+                                web_font_size: app.settings.web_font_size,
                                 ws_allow_list: app.settings.websocket_allow_list.clone(),
                                 web_secure: app.settings.web_secure,
                                 http_enabled: app.settings.http_enabled,

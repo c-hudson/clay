@@ -358,7 +358,7 @@ body {
     align-items: center;
     background-color: var(--bg-color);
     min-height: 20px;
-    font-size: 14px;
+    font-size: inherit;
     border-top: none;
     border-bottom: none;
     padding: 0 2px;

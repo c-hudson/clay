@@ -280,6 +280,20 @@
     let currentFontPos = 2;  // Default to position 2 (14px)
     const fontSizes = [8.5, 12, 14, 18];
 
+    // Convert pixel size to closest font position
+    function fontPosFromPixels(px) {
+        let closest = 0;
+        let minDiff = Math.abs(fontSizes[0] - px);
+        for (let i = 1; i < fontSizes.length; i++) {
+            const diff = Math.abs(fontSizes[i] - px);
+            if (diff < minDiff) {
+                minDiff = diff;
+                closest = i;
+            }
+        }
+        return closest;
+    }
+
     // Device mode: 'desktop' or 'mobile'
     let deviceMode = 'desktop';
 
@@ -829,6 +843,10 @@
                     if (msg.settings.gui_theme !== undefined) {
                         guiTheme = msg.settings.gui_theme;
                         applyTheme(guiTheme);
+                    }
+                    if (msg.settings.web_font_size !== undefined) {
+                        const pos = fontPosFromPixels(msg.settings.web_font_size);
+                        setFontPos(pos, false);  // Don't send back to server
                     }
                 }
                 renderOutput();
@@ -2634,6 +2652,7 @@
             gui_transparency: 1.0,
             font_name: '',
             font_size: 14.0,
+            web_font_size: fontSizes[currentFontPos],
             ws_allow_list: wsAllowList,
             web_secure: webSecure,
             http_enabled: httpEnabled,
@@ -2714,11 +2733,18 @@
         // Send to server
         send({
             type: 'UpdateGlobalSettings',
-            console_theme: 'dark',
-            gui_theme: 'dark',
+            more_mode_enabled: moreModeEnabled,
+            spell_check_enabled: true,
+            world_switch_mode: worldSwitchMode,
+            show_tags: showTags,
+            ansi_music_enabled: ansiMusicEnabled,
             input_height: inputHeight,
+            console_theme: consoleTheme,
+            gui_theme: guiTheme,
+            gui_transparency: 1.0,
             font_name: '',
             font_size: 14.0,
+            web_font_size: fontSizes[currentFontPos],
             ws_allow_list: wsAllowList,
             web_secure: webSecure,
             http_enabled: httpEnabled,
@@ -2726,7 +2752,8 @@
             ws_enabled: wsEnabled,
             ws_port: wsPort,
             ws_cert_file: wsCertFile,
-            ws_key_file: wsKeyFile
+            ws_key_file: wsKeyFile,
+            tls_proxy_enabled: tlsProxyEnabled
         });
 
         closeWebPopup();
@@ -3573,7 +3600,8 @@
     }
 
     // Set font size by position (0-3)
-    function setFontPos(pos) {
+    // If sendToServer is true (default), save the font size to the server
+    function setFontPos(pos, sendToServer = true) {
         pos = Math.max(0, Math.min(3, pos));
 
         // Check if we were at the bottom before changing size
@@ -3600,6 +3628,34 @@
 
         // Re-render to update line height calculations
         updateStatusBar();
+
+        // Save to server so it persists across sessions
+        if (sendToServer && authenticated) {
+            send({
+                type: 'UpdateGlobalSettings',
+                more_mode_enabled: moreModeEnabled,
+                spell_check_enabled: true,
+                world_switch_mode: worldSwitchMode,
+                show_tags: showTags,
+                ansi_music_enabled: ansiMusicEnabled,
+                input_height: inputHeight,
+                console_theme: consoleTheme,
+                gui_theme: guiTheme,
+                gui_transparency: 1.0,
+                font_name: '',
+                font_size: 14.0,
+                web_font_size: px,
+                ws_allow_list: wsAllowList,
+                web_secure: webSecure,
+                http_enabled: httpEnabled,
+                http_port: httpPort,
+                ws_enabled: wsEnabled,
+                ws_port: wsPort,
+                ws_cert_file: wsCertFile,
+                ws_key_file: wsKeyFile,
+                tls_proxy_enabled: tlsProxyEnabled
+            });
+        }
     }
 
     // Setup event listeners
