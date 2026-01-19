@@ -8,6 +8,15 @@ pub mod websocket;
 pub mod ansi_music;
 pub mod tf;
 
+// Version information
+const VERSION: &str = "1.0.0-alpha";
+const BUILD_HASH: &str = env!("BUILD_HASH");
+
+/// Get the full version string including build hash
+pub fn get_version_string() -> String {
+    format!("Clay v{} (build {})", VERSION, BUILD_HASH)
+}
+
 // Re-export commonly used types from modules
 pub use encoding::{Encoding, Theme, WorldSwitchMode, convert_discord_emojis, is_visually_empty, is_ansi_only_line, strip_non_sgr_sequences};
 pub use telnet::{
@@ -2111,6 +2120,7 @@ impl HelpPopup {
                 "  F8                         Toggle action highlighting",
                 "  Ctrl+L                     Redraw screen",
                 "  Ctrl+R                     Hot reload",
+                "  Ctrl+Z                     Suspend (fg to resume)",
                 "  Ctrl+C (x2)                Quit",
             ],
         }
@@ -3088,6 +3098,8 @@ fn is_internal_command(name: &str) -> bool {
 enum Command {
     /// /help - show help popup
     Help,
+    /// /version - show version info
+    Version,
     /// /quit - exit application
     Quit,
     /// /reload - hot reload binary
@@ -3155,6 +3167,7 @@ fn parse_command(input: &str) -> Command {
 
     match cmd.as_str() {
         "/help" => Command::Help,
+        "/version" => Command::Version,
         "/quit" => Command::Quit,
         "/reload" => Command::Reload,
         "/setup" => Command::Setup,
@@ -3541,7 +3554,12 @@ fn get_app_ptr() -> *mut App {
 
 /// Attempt to restart after a crash
 fn crash_restart() {
-    let crash_count = CRASH_COUNT.load(Ordering::SeqCst);
+    // Read crash count directly from env var, not from atomic
+    // This ensures correct count even if crash happens before atomic is initialized
+    let crash_count = std::env::var(CRASH_COUNT_ENV)
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
     if crash_count >= MAX_CRASH_RESTARTS {
         // Already crashed too many times, don't restart
         eprintln!("Maximum crash restarts ({}) reached, not restarting.", MAX_CRASH_RESTARTS);
@@ -3601,6 +3619,17 @@ fn setup_crash_handler() {
         // Restore terminal first to ensure output is visible
         let _ = disable_raw_mode();
         let _ = execute!(std::io::stdout(), LeaveAlternateScreen);
+
+        // Log crash to debug file (always log crashes regardless of debug setting)
+        let panic_msg = format!("CRASH: {}", panic_info);
+        debug_log(true, &panic_msg);
+
+        // Also log backtrace if available
+        let backtrace = std::backtrace::Backtrace::capture();
+        let bt_str = format!("{}", backtrace);
+        if !bt_str.is_empty() && !bt_str.contains("disabled") {
+            debug_log(true, &format!("BACKTRACE:\n{}", bt_str));
+        }
 
         // Print the panic info using the default handler
         eprintln!("\n\nClay crashed! Attempting to restart...\n");
@@ -5111,13 +5140,6 @@ fn debug_log(debug_enabled: bool, message: &str) {
     }
 }
 
-/// Log keepalive being sent
-fn debug_log_keepalive(debug_enabled: bool, world_name: &str, keepalive_type: &str, data_sent: &str) {
-    // Log the command and its bytes for debugging
-    let bytes: Vec<u8> = data_sent.bytes().collect();
-    debug_log(debug_enabled, &format!("KEEPALIVE world='{}' type={} sent='{}' bytes={:?}", world_name, keepalive_type, data_sent, bytes));
-}
-
 /// Encryption key for password storage (padded to 32 bytes for AES-256)
 const PASSWORD_ENCRYPTION_KEY: &[u8; 32] = b"nonsupersecretpassword#\0\0\0\0\0\0\0\0\0";
 
@@ -6230,13 +6252,17 @@ fn unescape_string(s: &str) -> String {
 }
 
 fn load_reload_state(app: &mut App) -> io::Result<bool> {
+    debug_log(true, "LOAD_STATE: Starting load_reload_state");
     let path = get_reload_state_path();
     if !path.exists() {
+        debug_log(true, "LOAD_STATE: No state file found");
         return Ok(false);
     }
 
+    debug_log(true, &format!("LOAD_STATE: Reading state file: {:?}", path));
     let content = std::fs::read_to_string(&path)?;
     let lines: Vec<&str> = content.lines().collect();
+    debug_log(true, &format!("LOAD_STATE: State file has {} lines", lines.len()));
 
     // Parse the reload state
     let mut current_section = String::new();
@@ -6957,8 +6983,12 @@ fn get_executable_path() -> io::Result<(PathBuf, String)> {
 }
 
 fn exec_reload(app: &App) -> io::Result<()> {
+    debug_log(true, "RELOAD: Starting exec_reload");
+
     // Save the current state
+    debug_log(true, "RELOAD: Saving state...");
     save_reload_state(app)?;
+    debug_log(true, "RELOAD: State saved successfully");
 
     // Collect socket fds that need to survive exec
     let mut fds_to_keep: Vec<RawFd> = Vec::new();
@@ -6968,9 +6998,11 @@ fn exec_reload(app: &App) -> io::Result<()> {
             fds_to_keep.push(fd);
         }
     }
+    debug_log(true, &format!("RELOAD: Keeping {} fds", fds_to_keep.len()));
 
     // Get the executable path with debug info
     let (exe, debug_info) = get_executable_path()?;
+    debug_log(true, &format!("RELOAD: Executable path: {} ({})", exe.display(), debug_info));
 
     // Verify the executable exists
     if !exe.exists() {
@@ -6987,6 +7019,8 @@ fn exec_reload(app: &App) -> io::Result<()> {
         .collect::<Vec<_>>()
         .join(",");
     std::env::set_var(RELOAD_FDS_ENV, &fds_str);
+
+    debug_log(true, &format!("RELOAD: About to exec with fds={}", fds_str));
 
     // Execute the new binary with --reload argument
     use std::os::unix::process::CommandExt;
@@ -8184,6 +8218,14 @@ mod remote_gui {
                                 }
                                 Command::Help => {
                                     self.popup_state = PopupState::Help;
+                                }
+                                Command::Version => {
+                                    let ts = super::current_timestamp_secs();
+                                    if self.current_world < self.worlds.len() {
+                                        self.worlds[self.current_world].output_lines.push(
+                                            TimestampedLine { text: super::get_version_string(), ts }
+                                        );
+                                    }
                                 }
                                 Command::Menu => {
                                     self.popup_state = PopupState::Menu;
@@ -9722,7 +9764,7 @@ mod remote_gui {
                         } else {
                             // Clay / commands: internal commands + manual actions
                             let internal_commands = vec![
-                                "/help", "/disconnect", "/dc", "/send", "/worlds", "/connections",
+                                "/help", "/version", "/disconnect", "/dc", "/send", "/worlds", "/connections",
                                 "/setup", "/web", "/actions", "/keepalive", "/reload", "/quit", "/gag", "/testmusic",
                             ];
 
@@ -10337,6 +10379,14 @@ mod remote_gui {
                                     }
                                     super::Command::Help => {
                                         self.popup_state = PopupState::Help;
+                                    }
+                                    super::Command::Version => {
+                                        let ts = current_timestamp_secs();
+                                        if self.current_world < self.worlds.len() {
+                                            self.worlds[self.current_world].output_lines.push(
+                                                TimestampedLine { text: super::get_version_string(), ts }
+                                            );
+                                        }
                                     }
                                     super::Command::Menu => {
                                         self.popup_state = PopupState::Menu;
@@ -13197,6 +13247,14 @@ mod remote_gui {
                         let parsed = super::parse_command(&cmd);
                         match parsed {
                             super::Command::Help => self.popup_state = PopupState::Help,
+                            super::Command::Version => {
+                                let ts = current_timestamp_secs();
+                                if self.current_world < self.worlds.len() {
+                                    self.worlds[self.current_world].output_lines.push(
+                                        TimestampedLine { text: super::get_version_string(), ts }
+                                    );
+                                }
+                            }
                             super::Command::Setup => self.popup_state = PopupState::Setup,
                             super::Command::Web => self.popup_state = PopupState::Web,
                             super::Command::Actions { .. } => {
@@ -14607,7 +14665,7 @@ async fn connect_multiuser_world(
                             let _ = event_tx_read.send(AppEvent::MultiuserServerData(
                                 world_index,
                                 username_read.clone(),
-                                "Connection closed by server.".as_bytes().to_vec(),
+                                "Connection closed by server.\n".as_bytes().to_vec(),
                             )).await;
                             let _ = event_tx_read.send(AppEvent::MultiuserDisconnected(world_index, username_read.clone())).await;
                             break;
@@ -15055,6 +15113,11 @@ async fn handle_multiuser_ws_message(
 
 #[tokio::main]
 async fn main() -> io::Result<()> {
+    // Log startup for debugging reload/crash issues
+    let is_reload_arg = std::env::args().any(|a| a == "--reload");
+    let is_crash_arg = std::env::args().any(|a| a == "--crash");
+    debug_log(true, &format!("STARTUP: {} (reload={}, crash={})", get_version_string(), is_reload_arg, is_crash_arg));
+
     // Check for --tls-proxy=host:port:socket_path argument for TLS proxy mode
     // This is used internally when spawning TLS proxy processes
     if let Some(proxy_arg) = std::env::args().find(|a| a.starts_with("--tls-proxy=")) {
@@ -15090,12 +15153,13 @@ async fn main() -> io::Result<()> {
         return run_multiuser_server().await;
     }
 
-    // Set up SIGFPE handler to print debug info before crashing
+    // Set up signal handlers for crash debugging
     unsafe {
         extern "C" fn sigfpe_handler(_: libc::c_int) {
             // Restore terminal before printing
             let _ = disable_raw_mode();
             let _ = execute!(std::io::stdout(), LeaveAlternateScreen);
+            debug_log(true, "CRASH: SIGFPE (Floating Point Exception)");
             eprintln!("\n\n=== SIGFPE (Floating Point Exception) detected! ===");
             eprintln!("This is typically caused by division by zero.");
             eprintln!("Please report this bug with the steps to reproduce.");
@@ -15103,11 +15167,52 @@ async fn main() -> io::Result<()> {
             // Try to print a backtrace
             eprintln!("\nBacktrace:");
             let bt = std::backtrace::Backtrace::force_capture();
+            let bt_str = format!("{}", bt);
+            debug_log(true, &format!("BACKTRACE:\n{}", bt_str));
             eprintln!("{}", bt);
 
             std::process::exit(136);  // 128 + 8 (SIGFPE)
         }
         libc::signal(libc::SIGFPE, sigfpe_handler as libc::sighandler_t);
+
+        extern "C" fn sigsegv_handler(_: libc::c_int) {
+            let _ = disable_raw_mode();
+            let _ = execute!(std::io::stdout(), LeaveAlternateScreen);
+            debug_log(true, "CRASH: SIGSEGV (Segmentation Fault)");
+            eprintln!("\n\n=== SIGSEGV (Segmentation Fault) detected! ===");
+            let bt = std::backtrace::Backtrace::force_capture();
+            let bt_str = format!("{}", bt);
+            debug_log(true, &format!("BACKTRACE:\n{}", bt_str));
+            eprintln!("{}", bt);
+            std::process::exit(139);  // 128 + 11 (SIGSEGV)
+        }
+        libc::signal(libc::SIGSEGV, sigsegv_handler as libc::sighandler_t);
+
+        extern "C" fn sigbus_handler(_: libc::c_int) {
+            let _ = disable_raw_mode();
+            let _ = execute!(std::io::stdout(), LeaveAlternateScreen);
+            debug_log(true, "CRASH: SIGBUS (Bus Error)");
+            eprintln!("\n\n=== SIGBUS (Bus Error) detected! ===");
+            let bt = std::backtrace::Backtrace::force_capture();
+            let bt_str = format!("{}", bt);
+            debug_log(true, &format!("BACKTRACE:\n{}", bt_str));
+            eprintln!("{}", bt);
+            std::process::exit(135);  // 128 + 7 (SIGBUS)
+        }
+        libc::signal(libc::SIGBUS, sigbus_handler as libc::sighandler_t);
+
+        extern "C" fn sigabrt_handler(_: libc::c_int) {
+            let _ = disable_raw_mode();
+            let _ = execute!(std::io::stdout(), LeaveAlternateScreen);
+            debug_log(true, "CRASH: SIGABRT (Abort)");
+            eprintln!("\n\n=== SIGABRT (Abort) detected! ===");
+            let bt = std::backtrace::Backtrace::force_capture();
+            let bt_str = format!("{}", bt);
+            debug_log(true, &format!("BACKTRACE:\n{}", bt_str));
+            eprintln!("{}", bt);
+            std::process::exit(134);  // 128 + 6 (SIGABRT)
+        }
+        libc::signal(libc::SIGABRT, sigabrt_handler as libc::sighandler_t);
     }
 
     // Set up crash handler for automatic recovery
@@ -15160,24 +15265,24 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
 
     if should_load_state {
         // Load the reload state
+        debug_log(true, "STARTUP: Loading reload state...");
         match load_reload_state(&mut app) {
             Ok(true) => {
-                if is_crash {
-                    startup_messages.push(format!(
-                        "Crash recovery successful (attempt {}/{})",
-                        crash_count, MAX_CRASH_RESTARTS
-                    ));
-                } else {
+                debug_log(true, "STARTUP: Reload state loaded successfully");
+                // Only show hot reload message, crash recovery is silent when successful
+                if !is_crash {
                     startup_messages.push("Hot reload successful!".to_string());
                 }
             }
             Ok(false) => {
+                debug_log(true, "STARTUP: No reload state found");
                 startup_messages.push("Warning: No reload state found, starting fresh.".to_string());
                 if let Err(e) = load_settings(&mut app) {
                     startup_messages.push(format!("Warning: Could not load settings: {}", e));
                 }
             }
             Err(e) => {
+                debug_log(true, &format!("STARTUP: Failed to load reload state: {}", e));
                 startup_messages.push(format!("Warning: Failed to load reload state: {}", e));
                 if let Err(e) = load_settings(&mut app) {
                     startup_messages.push(format!("Warning: Could not load settings: {}", e));
@@ -15192,12 +15297,15 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
     }
 
     // Ensure we have at least one world (creates initial world only if no worlds loaded)
+    debug_log(true, "STARTUP: Ensuring has world...");
     app.ensure_has_world();
+    debug_log(true, &format!("STARTUP: Have {} worlds", app.worlds.len()));
 
     // After reload, clear pending_lines and pause state on ALL worlds since these
     // are display state that doesn't carry over between sessions
     // Note: unseen_lines IS preserved to maintain activity notifications
     if should_load_state && !app.worlds.is_empty() {
+        debug_log(true, "STARTUP: Clearing pending lines...");
         for world in &mut app.worlds {
             world.pending_lines.clear();
             world.pending_since = None;
@@ -15206,14 +15314,17 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
     }
 
     // Now display any startup messages
+    debug_log(true, "STARTUP: Displaying startup messages...");
     for msg in startup_messages {
         app.add_output(&msg);
     }
 
+    debug_log(true, "STARTUP: Creating event channel...");
     let (event_tx, mut event_rx) = mpsc::channel::<AppEvent>(100);
 
     // If in reload or crash recovery mode, reconstruct connections from saved fds
     if should_load_state {
+        debug_log(true, "STARTUP: Reconstructing connections...");
         // First pass: identify TLS worlds WITHOUT proxy that need to be disconnected
         // TLS worlds WITH proxy will be reconnected via Unix socket
         let mut tls_disconnect_worlds: Vec<usize> = Vec::new();
@@ -15296,7 +15407,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                 let _ = event_tx_read
                                     .send(AppEvent::ServerData(
                                         world_name.clone(),
-                                        "Connection closed by server.".as_bytes().to_vec(),
+                                        "Connection closed by server.\n".as_bytes().to_vec(),
                                     ))
                                     .await;
                                 let _ = event_tx_read.send(AppEvent::Disconnected(world_name.clone())).await;
@@ -15557,28 +15668,21 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
             }
         }
 
+        debug_log(true, "STARTUP: Connection cleanup done, sending keepalives...");
+
         // Send immediate keepalive for all reconnected worlds since we don't know how long they were idle
         for world in &mut app.worlds {
             if world.connected {
                 if let Some(tx) = &world.command_tx {
                     let now = std::time::Instant::now();
 
-                    debug_log(app.settings.debug_enabled, &format!(
-                        "KEEPALIVE_RELOAD world='{}' type={:?} cmd='{}'",
-                        world.name, world.settings.keep_alive_type, world.settings.keep_alive_cmd
-                    ));
-
                     match world.settings.keep_alive_type {
                         KeepAliveType::None => {
                             // Keepalive disabled - do nothing, don't update times
-                            debug_log(app.settings.debug_enabled, &format!(
-                                "KEEPALIVE_RELOAD_SKIP world='{}' - keepalive disabled", world.name
-                            ));
                         }
                         KeepAliveType::Nop => {
                             let nop = vec![TELNET_IAC, TELNET_NOP];
                             let _ = tx.try_send(WriteCommand::Raw(nop));
-                            debug_log_keepalive(app.settings.debug_enabled, &world.name, "NOP", "NOP");
                             world.last_send_time = Some(now);
                             world.last_nop_time = Some(now);
                         }
@@ -15591,7 +15695,6 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                             let cmd = world.settings.keep_alive_cmd
                                 .replace("##rand##", &idler_tag);
                             let _ = tx.try_send(WriteCommand::Text(cmd.clone()));
-                            debug_log_keepalive(app.settings.debug_enabled, &world.name, "Custom", &cmd);
                             world.last_send_time = Some(now);
                             world.last_nop_time = Some(now);
                         }
@@ -15602,7 +15705,6 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                 .as_nanos() % 1000 + 1) as u32;
                             let cmd = format!("help commands ###_idler_message_{}_###", rand_num);
                             let _ = tx.try_send(WriteCommand::Text(cmd.clone()));
-                            debug_log_keepalive(app.settings.debug_enabled, &world.name, "Generic", &cmd);
                             world.last_send_time = Some(now);
                             world.last_nop_time = Some(now);
                         }
@@ -15611,6 +15713,8 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
             }
         }
     }
+
+    debug_log(true, "STARTUP: Keepalives sent, starting servers...");
 
     // Start WebSocket server if enabled (ws:// or wss:// based on web_secure setting)
     if app.settings.ws_enabled && !app.settings.websocket_password.is_empty() {
@@ -15783,11 +15887,23 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
     // Track if we've cleared the crash count after successful user input
     let mut crash_count_cleared = false;
 
+    debug_log(true, "STARTUP: Entering main event loop");
+
+    // Counter for debugging first few loop iterations
+    let mut loop_count: u64 = 0;
+
     loop {
+        loop_count += 1;
+        // Log first 5 iterations to debug early crashes
+        if loop_count <= 5 {
+            debug_log(true, &format!("LOOP: iteration {}", loop_count));
+        }
+
         // Use tokio::select! to efficiently wait for events without busy-polling
         tokio::select! {
             // SIGUSR1 signal - trigger hot reload
             _ = sigusr1.recv() => {
+                debug_log(true, "LOOP: Received SIGUSR1");
                 app.add_output("Received SIGUSR1, performing hot reload...");
                 if handle_command("/reload", &mut app, event_tx.clone()).await {
                     return Ok(());
@@ -15815,6 +15931,22 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                             if handle_command("/reload", &mut app, event_tx.clone()).await {
                                 return Ok(());
                             }
+                        }
+                        KeyAction::Suspend => {
+                            // Restore terminal to normal mode before suspending
+                            disable_raw_mode()?;
+                            execute!(std::io::stdout(), LeaveAlternateScreen)?;
+
+                            // Send SIGTSTP to self to suspend
+                            unsafe {
+                                libc::kill(libc::getpid(), libc::SIGTSTP);
+                            }
+
+                            // When we resume (after fg), re-enter raw mode and redraw
+                            enable_raw_mode()?;
+                            execute!(std::io::stdout(), EnterAlternateScreen)?;
+                            terminal.clear()?;
+                            app.needs_output_redraw = true;
                         }
                         KeyAction::SendCommand(cmd) => {
                             // Clear crash count after first successful user input
@@ -16915,7 +17047,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                         });
                                     }
                                     // UI popup commands - handled client-side, no-op on server
-                                    Command::Help | Command::Menu | Command::Setup | Command::Web | Command::Actions { .. } |
+                                    Command::Help | Command::Version | Command::Menu | Command::Setup | Command::Web | Command::Actions { .. } |
                                     Command::WorldsList | Command::WorldSelector | Command::WorldEdit { .. } => {
                                         // These are handled by the GUI/web interface locally
                                         // No server action needed
@@ -17262,24 +17394,14 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                             if let Some(tx) = &world.command_tx {
                                 let now = std::time::Instant::now();
 
-                                // Log the keepalive type being used
-                                debug_log(app.settings.debug_enabled, &format!(
-                                    "KEEPALIVE_CHECK world='{}' type={:?} cmd='{}'",
-                                    world.name, world.settings.keep_alive_type, world.settings.keep_alive_cmd
-                                ));
-
                                 // Send keepalive based on type
                                 match world.settings.keep_alive_type {
                                     KeepAliveType::None => {
-                                        debug_log(app.settings.debug_enabled, &format!(
-                                            "KEEPALIVE_SKIP world='{}' - keepalive disabled", world.name
-                                        ));
                                         // Don't update times - nothing was sent
                                     }
                                     KeepAliveType::Nop => {
                                         let nop = vec![TELNET_IAC, TELNET_NOP];
                                         let _ = tx.try_send(WriteCommand::Raw(nop));
-                                        debug_log_keepalive(app.settings.debug_enabled, &world.name, "NOP", "NOP");
                                         world.last_send_time = Some(now);
                                         world.last_nop_time = Some(now);
                                     }
@@ -17293,7 +17415,6 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                         let cmd = world.settings.keep_alive_cmd
                                             .replace("##rand##", &idler_tag);
                                         let _ = tx.try_send(WriteCommand::Text(cmd.clone()));
-                                        debug_log_keepalive(app.settings.debug_enabled, &world.name, "Custom", &cmd);
                                         world.last_send_time = Some(now);
                                         world.last_nop_time = Some(now);
                                     }
@@ -17305,7 +17426,6 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                             .as_nanos() % 1000 + 1) as u32;
                                         let cmd = format!("help commands ###_idler_message_{}_###", rand_num);
                                         let _ = tx.try_send(WriteCommand::Text(cmd.clone()));
-                                        debug_log_keepalive(app.settings.debug_enabled, &world.name, "Generic", &cmd);
                                         world.last_send_time = Some(now);
                                         world.last_nop_time = Some(now);
                                     }
@@ -18184,7 +18304,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                     });
                                 }
                                 // UI popup commands - handled client-side, no-op on server
-                                Command::Help | Command::Menu | Command::Setup | Command::Web | Command::Actions { .. } |
+                                Command::Help | Command::Version | Command::Menu | Command::Setup | Command::Web | Command::Actions { .. } |
                                 Command::WorldsList | Command::WorldSelector | Command::WorldEdit { .. } => {
                                     // These are handled by the GUI/web interface locally
                                     // No server action needed
@@ -18384,6 +18504,7 @@ enum KeyAction {
     Connect, // Trigger connection from settings popup
     Redraw,  // Force screen redraw
     Reload,  // Trigger /reload
+    Suspend, // Ctrl+Z to suspend process
     UpdateWebSocket, // Check and update WebSocket server state
     SwitchedWorld(usize), // Console switched to this world, broadcast unseen clear
     None,
@@ -19750,7 +19871,32 @@ fn handle_key_event(key: KeyEvent, app: &mut App) -> KeyAction {
         return KeyAction::None;
     }
 
-    // Handle Tab for command completion when input starts with / or #
+    // Handle Tab - more-mode takes priority over command completion
+    // Check more-mode first: scroll down when viewing history, release pending when at bottom and paused
+    if key.code == KeyCode::Tab && key.modifiers.is_empty() {
+        if !app.current_world().is_at_bottom() {
+            // Viewing history (Hist indicator showing) - scroll down like PgDn
+            app.scroll_output_down();
+            app.needs_output_redraw = true;
+            return KeyAction::None;
+        } else if app.current_world().paused && !app.current_world().pending_lines.is_empty() {
+            // At bottom and paused with pending lines - release screenful minus 2 lines
+            let batch_size = (app.output_height as usize).saturating_sub(2);
+            let world_idx = app.current_world_index;
+            let pending_before = app.worlds[world_idx].pending_lines.len();
+            app.current_world_mut().release_pending(batch_size);
+            let released = pending_before - app.worlds[world_idx].pending_lines.len();
+            // Broadcast release event so other clients sync
+            app.ws_broadcast(WsMessage::PendingReleased { world_index: world_idx, count: released });
+            // Also broadcast updated pending count
+            let pending = app.worlds[world_idx].pending_lines.len();
+            app.ws_broadcast(WsMessage::PendingLinesUpdate { world_index: world_idx, count: pending });
+            app.needs_output_redraw = true;
+            return KeyAction::None;
+        }
+    }
+
+    // Handle Tab for command completion when input starts with / or # (only if not in more-mode)
     let is_command_prefix = app.input.buffer.starts_with('/') || app.input.buffer.starts_with('#');
     if key.code == KeyCode::Tab && key.modifiers.is_empty() && is_command_prefix {
         // Get the current partial command (everything up to first space, or whole buffer)
@@ -19833,30 +19979,6 @@ fn handle_key_event(key: KeyEvent, app: &mut App) -> KeyAction {
         }
     }
 
-    // Handle Tab - scroll down when viewing history, release pending when at bottom and paused
-    if key.code == KeyCode::Tab && key.modifiers.is_empty() {
-        if !app.current_world().is_at_bottom() {
-            // Viewing history (Hist indicator showing) - scroll down like PgDn
-            app.scroll_output_down();
-            app.needs_output_redraw = true;
-            return KeyAction::None;
-        } else if app.current_world().paused {
-            // At bottom and paused with pending lines - release screenful minus 2 lines
-            let batch_size = (app.output_height as usize).saturating_sub(2);
-            let world_idx = app.current_world_index;
-            let pending_before = app.worlds[world_idx].pending_lines.len();
-            app.current_world_mut().release_pending(batch_size);
-            let released = pending_before - app.worlds[world_idx].pending_lines.len();
-            // Broadcast release event so other clients sync
-            app.ws_broadcast(WsMessage::PendingReleased { world_index: world_idx, count: released });
-            // Also broadcast updated pending count
-            let pending_count = app.worlds[world_idx].pending_lines.len();
-            app.ws_broadcast(WsMessage::PendingLinesUpdate { world_index: world_idx, count: pending_count });
-            app.needs_output_redraw = true;
-            return KeyAction::None;
-        }
-    }
-
     // Helper to check if escape was pressed recently (for Escape+key sequences)
     let recent_escape = app.last_escape
         .map(|t| t.elapsed() < Duration::from_millis(500))
@@ -19910,6 +20032,9 @@ fn handle_key_event(key: KeyEvent, app: &mut App) -> KeyAction {
 
         // Ctrl+R to reload
         (KeyModifiers::CONTROL, KeyCode::Char('r')) => KeyAction::Reload,
+
+        // Ctrl+Z to suspend
+        (KeyModifiers::CONTROL, KeyCode::Char('z')) => KeyAction::Suspend,
 
         // F1 to open help popup
         (_, KeyCode::F(1)) => {
@@ -20588,6 +20713,9 @@ async fn handle_command(cmd: &str, app: &mut App, event_tx: mpsc::Sender<AppEven
         Command::Help => {
             app.help_popup.open();
         }
+        Command::Version => {
+            app.add_output(&get_version_string());
+        }
         Command::Menu => {
             app.menu_popup.open();
         }
@@ -20827,13 +20955,13 @@ async fn handle_command(cmd: &str, app: &mut App, event_tx: mpsc::Sender<AppEven
                                 let user = app.current_world().settings.user.clone();
                                 let password = app.current_world().settings.password.clone();
                                 let auto_connect_type = app.current_world().settings.auto_connect_type;
+                                // DEBUG: trace auto-login conditions (proxy path)
+                                debug_log(true, &format!("[proxy] Auto-login check: skip={}, user='{}', pass_len={}, type={}",
+                                    skip_login, user, password.len(), auto_connect_type.name()));
                                 if !skip_login && !user.is_empty() && !password.is_empty() && auto_connect_type == AutoConnectType::Connect {
-                                    let tx = cmd_tx.clone();
-                                    tokio::spawn(async move {
-                                        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-                                        let connect_cmd = format!("connect {} {}", user, password);
-                                        let _ = tx.send(WriteCommand::Text(connect_cmd)).await;
-                                    });
+                                    debug_log(true, "[proxy] Auto-login sending immediately");
+                                    let connect_cmd = format!("connect {} {}", user, password);
+                                    let _ = cmd_tx.send(WriteCommand::Text(connect_cmd)).await;
                                 }
 
                                 // Start reader task with telnet processing
@@ -21075,13 +21203,13 @@ async fn handle_command(cmd: &str, app: &mut App, event_tx: mpsc::Sender<AppEven
                     let user = app.current_world().settings.user.clone();
                     let password = app.current_world().settings.password.clone();
                     let auto_connect_type = app.current_world().settings.auto_connect_type;
+                    // DEBUG: trace auto-login conditions
+                    debug_log(true, &format!("Auto-login check: skip={}, user='{}', pass_len={}, type={}",
+                        skip_login, user, password.len(), auto_connect_type.name()));
                     if !skip_login && !user.is_empty() && !password.is_empty() && auto_connect_type == AutoConnectType::Connect {
-                        let tx = cmd_tx.clone();
-                        tokio::spawn(async move {
-                            tokio::time::sleep(Duration::from_millis(500)).await;
-                            let connect_cmd = format!("connect {} {}", user, password);
-                            let _ = tx.send(WriteCommand::Text(connect_cmd)).await;
-                        });
+                        debug_log(true, "Auto-login sending immediately");
+                        let connect_cmd = format!("connect {} {}", user, password);
+                        let _ = cmd_tx.send(WriteCommand::Text(connect_cmd)).await;
                     }
 
                     // Clone tx for use in reader (for telnet responses)
@@ -21116,7 +21244,7 @@ async fn handle_command(cmd: &str, app: &mut App, event_tx: mpsc::Sender<AppEven
                                     let _ = event_tx_read
                                         .send(AppEvent::ServerData(
                                             world_name.clone(),
-                                            "Connection closed by server.".as_bytes().to_vec(),
+                                            "Connection closed by server.\n".as_bytes().to_vec(),
                                         ))
                                         .await;
                                     let _ =
@@ -22278,8 +22406,9 @@ fn render_separator_bar(f: &mut Frame, app: &App, area: Rect) {
     }
 
     // Calculate underscore padding - fill between content and time
+    // Fixed field sizes: status (11) + ball (2) + world name + tag + activity + underscores + time (5)
     let used_len = if activity_str.is_empty() {
-        status_str.len() + world_display.len() + tag_indicator.len()
+        status_str.len() + status_ball_width + world_display.len() + tag_indicator.len()
     } else {
         ACTIVITY_POSITION.max(current_pos) + activity_str.len()
     };

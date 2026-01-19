@@ -294,6 +294,7 @@ This logic applies to all interfaces (console, web, GUI). Remote clients query t
 - `Ctrl+C` - Press twice within 15 seconds to quit
 - `Ctrl+L` - Redraw screen (filters out client-generated output, keeps only MUD server data)
 - `Ctrl+R` - Hot reload (same as /reload)
+- `Ctrl+Z` - Suspend process (use `fg` to resume)
 - `/quit` - Exit the client
 - `Enter` - Send command
 
