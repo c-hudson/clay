@@ -307,34 +307,70 @@ body {
     white-space: pre-wrap;
     word-wrap: break-word;
     line-height: 1.0;
+    /* Improve block character rendering */
+    font-family: 'DejaVu Sans Mono', 'Consolas', 'Monaco', 'Lucida Console', monospace;
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+    font-variant-ligatures: none;
+    text-rendering: geometricPrecision;
+    letter-spacing: 0;
+}
+
+#output span {
+    /* Ensure no gaps between adjacent spans */
+    margin: 0;
+    padding: 0;
+    border: 0;
+    letter-spacing: 0;
 }
 
 #output .line {
     line-height: 1.0;
     margin: 0;
     padding: 0;
+    /* Ensure block characters touch vertically */
+    display: block;
+    min-height: 1em;
 }
 
-/* ANSI color classes - match terminal colors */
+/* ANSI color classes - Xubuntu Dark color palette */
 .ansi-black { color: #000000; }
-.ansi-red { color: #cd0000; }
-.ansi-green { color: #00cd00; }
-.ansi-yellow { color: #cdcd00; }
-.ansi-blue { color: #0000cd; }
-.ansi-magenta { color: #cd00cd; }
-.ansi-cyan { color: #00cdcd; }
-.ansi-white { color: #c0c0c0; }
-.ansi-bright-black { color: #808080; }
-.ansi-bright-red { color: #ff0000; }
-.ansi-bright-green { color: #00ff00; }
-.ansi-bright-yellow { color: #ffff00; }
-.ansi-bright-blue { color: #0000ff; }
-.ansi-bright-magenta { color: #ff00ff; }
-.ansi-bright-cyan { color: #00ffff; }
+.ansi-red { color: #aa0000; }
+.ansi-green { color: #44aa44; }
+.ansi-yellow { color: #aa5500; }
+.ansi-blue { color: #0039aa; }
+.ansi-magenta { color: #aa22aa; }
+.ansi-cyan { color: #1a92aa; }
+.ansi-white { color: #aaaaaa; }
+.ansi-bright-black { color: #777777; }
+.ansi-bright-red { color: #ff8787; }
+.ansi-bright-green { color: #4ce64c; }
+.ansi-bright-yellow { color: #ded82c; }
+.ansi-bright-blue { color: #295fcc; }
+.ansi-bright-magenta { color: #cc58cc; }
+.ansi-bright-cyan { color: #4ccce6; }
 .ansi-bright-white { color: #ffffff; }
 .ansi-bold { font-weight: bold; }
 .ansi-italic { font-style: italic; }
 .ansi-underline { text-decoration: underline; }
+
+/* ANSI background colors - Xubuntu Dark palette */
+.ansi-bg-black { background-color: #000000; }
+.ansi-bg-red { background-color: #aa0000; }
+.ansi-bg-green { background-color: #44aa44; }
+.ansi-bg-yellow { background-color: #aa5500; }
+.ansi-bg-blue { background-color: #0039aa; }
+.ansi-bg-magenta { background-color: #aa22aa; }
+.ansi-bg-cyan { background-color: #1a92aa; }
+.ansi-bg-white { background-color: #aaaaaa; }
+.ansi-bg-bright-black { background-color: #777777; }
+.ansi-bg-bright-red { background-color: #ff8787; }
+.ansi-bg-bright-green { background-color: #4ce64c; }
+.ansi-bg-bright-yellow { background-color: #ded82c; }
+.ansi-bg-bright-blue { background-color: #295fcc; }
+.ansi-bg-bright-magenta { background-color: #cc58cc; }
+.ansi-bg-bright-cyan { background-color: #4ccce6; }
+.ansi-bg-bright-white { background-color: #ffffff; }
 
 /* Clickable URLs in output */
 .output-link {
@@ -444,6 +480,20 @@ body {
     caret-color: #ffffff;
     resize: none;
     overflow-y: auto;
+    min-height: 3.6em; /* Ensure at least 3 lines visible */
+}
+
+/* Mobile: ensure input area is visible but not too large */
+@media (max-width: 600px) {
+    #input {
+        min-height: 3.2em; /* ~2.5 lines on mobile (was 4.8em which was too big) */
+        font-size: 16px; /* Prevent iOS zoom on focus */
+    }
+
+    #input-container {
+        padding: 4px 8px;
+        flex-shrink: 0; /* Don't let it shrink when keyboard appears */
+    }
 }
 
 #send-btn {

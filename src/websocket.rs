@@ -126,7 +126,9 @@ pub enum WsMessage {
         input_height: u16,
         font_name: String,
         font_size: f32,
-        web_font_size: f32,
+        web_font_size_phone: f32,
+        web_font_size_tablet: f32,
+        web_font_size_desktop: f32,
         ws_allow_list: String,
         web_secure: bool,
         http_enabled: bool,
@@ -233,8 +235,12 @@ pub struct GlobalSettingsMsg {
     pub input_height: u16,
     pub font_name: String,
     pub font_size: f32,
-    #[serde(default = "default_web_font_size")]
-    pub web_font_size: f32,
+    #[serde(default = "default_web_font_size_phone")]
+    pub web_font_size_phone: f32,
+    #[serde(default = "default_web_font_size_tablet")]
+    pub web_font_size_tablet: f32,
+    #[serde(default = "default_web_font_size_desktop")]
+    pub web_font_size_desktop: f32,
     pub ws_allow_list: String,
     pub web_secure: bool,
     pub http_enabled: bool,
@@ -251,8 +257,16 @@ fn default_gui_transparency() -> f32 {
     1.0
 }
 
-fn default_web_font_size() -> f32 {
+fn default_web_font_size_phone() -> f32 {
+    10.0
+}
+
+fn default_web_font_size_tablet() -> f32 {
     14.0
+}
+
+fn default_web_font_size_desktop() -> f32 {
+    18.0
 }
 
 /// Information about a connected WebSocket client

@@ -261,7 +261,7 @@
     let menuSelectedIndex = 0;
     const menuItems = [
         { label: 'Help', command: '/help' },
-        { label: 'Setup', command: '/setup' },
+        { label: 'Settings', command: '/setup' },
         { label: 'Web Settings', command: '/web' },
         { label: 'Actions', command: '/actions' },
         { label: 'World Selector', command: '/worlds' },
@@ -279,6 +279,12 @@
     // Font size state: position 0-3 mapping to [8.5, 12, 14, 18] pixels
     let currentFontPos = 2;  // Default to position 2 (14px)
     const fontSizes = [8.5, 12, 14, 18];
+
+    // Per-device font size tracking (saved separately for phone/tablet/desktop)
+    let deviceType = 'desktop';  // 'phone', 'tablet', or 'desktop'
+    let webFontSizePhone = 10.0;
+    let webFontSizeTablet = 14.0;
+    let webFontSizeDesktop = 18.0;
 
     // Convert pixel size to closest font position
     function fontPosFromPixels(px) {
@@ -325,7 +331,7 @@
         MENU: 'Menu',
         QUIT: 'Quit',
         RELOAD: 'Reload',
-        SETUP: 'Setup',
+        SETUP: 'Settings',
         WEB: 'Web',
         ACTIONS: 'Actions',
         WORLDS_LIST: 'WorldsList',
@@ -543,20 +549,24 @@
     // ============================================================================
 
     // Detect device type and return appropriate font size position (0-3)
+    // Also sets the global deviceType variable ('phone', 'tablet', 'desktop')
     function detectDeviceType() {
         const width = window.innerWidth;
         const hasTouch = 'ontouchstart' in window || navigator.maxTouchPoints > 0;
 
-        // Phone: narrow screen (< 768px) - position 0 (10px)
+        // Phone: narrow screen (< 768px)
         if (width < 768) {
-            return { fontPos: 0, mode: 'mobile' };
+            deviceType = 'phone';
+            return { fontPos: fontPosFromPixels(webFontSizePhone), mode: 'mobile', device: 'phone' };
         }
-        // Tablet: medium screen with touch (768-1024px) - position 2 (14px)
+        // Tablet: medium screen with touch (768-1024px)
         if (width <= 1024 && hasTouch) {
-            return { fontPos: 2, mode: 'mobile' };
+            deviceType = 'tablet';
+            return { fontPos: fontPosFromPixels(webFontSizeTablet), mode: 'mobile', device: 'tablet' };
         }
-        // Desktop: wide screen or no touch - position 3 (18px)
-        return { fontPos: 3, mode: 'desktop' };
+        // Desktop: wide screen or no touch
+        deviceType = 'desktop';
+        return { fontPos: fontPosFromPixels(webFontSizeDesktop), mode: 'desktop', device: 'desktop' };
     }
 
     // Setup toolbars based on device mode
@@ -844,10 +854,21 @@
                         guiTheme = msg.settings.gui_theme;
                         applyTheme(guiTheme);
                     }
-                    if (msg.settings.web_font_size !== undefined) {
-                        const pos = fontPosFromPixels(msg.settings.web_font_size);
-                        setFontPos(pos, false);  // Don't send back to server
+                    // Load per-device font sizes
+                    if (msg.settings.web_font_size_phone !== undefined) {
+                        webFontSizePhone = msg.settings.web_font_size_phone;
                     }
+                    if (msg.settings.web_font_size_tablet !== undefined) {
+                        webFontSizeTablet = msg.settings.web_font_size_tablet;
+                    }
+                    if (msg.settings.web_font_size_desktop !== undefined) {
+                        webFontSizeDesktop = msg.settings.web_font_size_desktop;
+                    }
+                    // Pick the right font size based on current device type
+                    const fontPx = deviceType === 'phone' ? webFontSizePhone :
+                                   deviceType === 'tablet' ? webFontSizeTablet : webFontSizeDesktop;
+                    const pos = fontPosFromPixels(fontPx);
+                    setFontPos(pos, false);  // Don't send back to server
                 }
                 renderOutput();
                 updateStatusBar();
@@ -1705,28 +1726,148 @@
         });
 
         // 256-color palette (first 16 are standard, 16-231 are RGB cube, 232-255 are grayscale)
+        // Uses standard xterm 256-color palette values
         function color256ToRgb(n) {
             if (n < 16) {
-                // Standard colors
+                // Standard 16 colors (same as basic ANSI)
                 const standard = [
-                    [0, 0, 0], [205, 0, 0], [0, 205, 0], [205, 205, 0],
-                    [0, 0, 205], [205, 0, 205], [0, 205, 205], [192, 192, 192],
-                    [128, 128, 128], [255, 0, 0], [0, 255, 0], [255, 255, 0],
-                    [0, 0, 255], [255, 0, 255], [0, 255, 255], [255, 255, 255]
+                    [0, 0, 0], [170, 0, 0], [68, 170, 68], [170, 85, 0],
+                    [0, 57, 170], [170, 34, 170], [26, 146, 170], [170, 170, 170],
+                    [119, 119, 119], [255, 135, 135], [76, 230, 76], [222, 216, 44],
+                    [41, 95, 204], [204, 88, 204], [76, 204, 230], [255, 255, 255]
                 ];
                 return standard[n];
             } else if (n < 232) {
-                // 216 color cube (6x6x6)
+                // 216 color cube (6x6x6) - xterm uses specific values, not linear
+                // The 6 levels are: 0, 95, 135, 175, 215, 255
+                const cubeValues = [0, 95, 135, 175, 215, 255];
                 n -= 16;
-                const r = Math.floor(n / 36) * 51;
-                const g = Math.floor((n % 36) / 6) * 51;
-                const b = (n % 6) * 51;
+                const r = cubeValues[Math.floor(n / 36)];
+                const g = cubeValues[Math.floor((n % 36) / 6)];
+                const b = cubeValues[n % 6];
                 return [r, g, b];
             } else {
-                // Grayscale (24 shades)
+                // Grayscale (24 shades) - starts at 8, increments by 10
                 const gray = (n - 232) * 10 + 8;
                 return [gray, gray, gray];
             }
+        }
+
+        // Color name to RGB mapping (Xubuntu Dark palette)
+        const colorNameToRgb = {
+            'black': [0, 0, 0], 'red': [170, 0, 0], 'green': [68, 170, 68], 'yellow': [170, 85, 0],
+            'blue': [0, 57, 170], 'magenta': [170, 34, 170], 'cyan': [26, 146, 170], 'white': [170, 170, 170],
+            'bright-black': [119, 119, 119], 'bright-red': [255, 135, 135], 'bright-green': [76, 230, 76],
+            'bright-yellow': [222, 216, 44], 'bright-blue': [41, 95, 204], 'bright-magenta': [204, 88, 204],
+            'bright-cyan': [76, 204, 230], 'bright-white': [255, 255, 255]
+        };
+
+        // Get RGB from class name or style
+        function getFgRgb(classes, style) {
+            // Check inline style first
+            const styleMatch = style.match(/color:\s*rgb\((\d+),(\d+),(\d+)\)/);
+            if (styleMatch) return [parseInt(styleMatch[1]), parseInt(styleMatch[2]), parseInt(styleMatch[3])];
+            // Check class names
+            for (const cls of classes) {
+                if (cls.startsWith('ansi-') && !cls.startsWith('ansi-bg-') && !['ansi-bold', 'ansi-italic', 'ansi-underline'].includes(cls)) {
+                    const colorName = cls.replace('ansi-', '');
+                    if (colorNameToRgb[colorName]) return colorNameToRgb[colorName];
+                }
+            }
+            return [230, 237, 243]; // Default text color
+        }
+
+        function getBgRgb(classes, style) {
+            // Check inline style first
+            const styleMatch = style.match(/background-color:\s*rgb\((\d+),(\d+),(\d+)\)/);
+            if (styleMatch) return [parseInt(styleMatch[1]), parseInt(styleMatch[2]), parseInt(styleMatch[3])];
+            // Check class names
+            for (const cls of classes) {
+                if (cls.startsWith('ansi-bg-')) {
+                    const colorName = cls.replace('ansi-bg-', '');
+                    if (colorNameToRgb[colorName]) return colorNameToRgb[colorName];
+                }
+            }
+            return null; // No background
+        }
+
+        // Blend two RGB colors
+        function blendColors(fg, bg, fgWeight) {
+            return [
+                Math.round(fg[0] * fgWeight + bg[0] * (1 - fgWeight)),
+                Math.round(fg[1] * fgWeight + bg[1] * (1 - fgWeight)),
+                Math.round(fg[2] * fgWeight + bg[2] * (1 - fgWeight))
+            ];
+        }
+
+        // Process shade characters - replace with solid blocks using blended colors
+        function processShadeChars(text, classes, fgStyle, bgStyle) {
+            const hasBg = classes.some(c => c.startsWith('ansi-bg-')) || bgStyle;
+            if (!hasBg) return { wasProcessed: false }; // No background, keep as-is
+
+            const shadeChars = /[░▒▓]/;
+            if (!shadeChars.test(text)) return { wasProcessed: false }; // No shade chars
+
+            const fgRgb = getFgRgb(classes, fgStyle);
+            const bgRgb = getBgRgb(classes, bgStyle);
+            if (!bgRgb) return { wasProcessed: false };
+
+            // Pre-calculate blended colors for each shade type
+            const lightBlend = blendColors(fgRgb, bgRgb, 0.25);
+            const mediumBlend = blendColors(fgRgb, bgRgb, 0.5);
+            const darkBlend = blendColors(fgRgb, bgRgb, 0.75);
+
+            // Group consecutive characters by their color
+            let segments = [];
+            let currentSegment = { chars: '', color: null };
+
+            for (const char of text) {
+                let charColor = null;
+                let outputChar = char;
+
+                if (char === '░') {
+                    charColor = `rgb(${lightBlend[0]},${lightBlend[1]},${lightBlend[2]})`;
+                    outputChar = '█';
+                } else if (char === '▒') {
+                    charColor = `rgb(${mediumBlend[0]},${mediumBlend[1]},${mediumBlend[2]})`;
+                    outputChar = '█';
+                } else if (char === '▓') {
+                    charColor = `rgb(${darkBlend[0]},${darkBlend[1]},${darkBlend[2]})`;
+                    outputChar = '█';
+                }
+
+                // Check if we need to start a new segment
+                if (charColor !== currentSegment.color) {
+                    if (currentSegment.chars) {
+                        segments.push({ ...currentSegment });
+                    }
+                    currentSegment = { chars: outputChar, color: charColor };
+                } else {
+                    currentSegment.chars += outputChar;
+                }
+            }
+            if (currentSegment.chars) {
+                segments.push(currentSegment);
+            }
+
+            // Build HTML from segments
+            let html = '';
+            const baseClasses = classes.filter(c => !c.startsWith('ansi-') || c.startsWith('ansi-bg-') || ['ansi-bold', 'ansi-italic', 'ansi-underline'].includes(c));
+
+            for (const seg of segments) {
+                const escapedChars = escapeHtml(seg.chars);
+                if (seg.color) {
+                    // Shade character - use blended color, keep background
+                    html += `<span style="color:${seg.color};${bgStyle}">${escapedChars}</span>`;
+                } else {
+                    // Regular character - use original styling
+                    const cls = classes.length > 0 ? ` class="${classes.join(' ')}"` : '';
+                    const sty = (fgStyle || bgStyle) ? ` style="${fgStyle}${bgStyle}"` : '';
+                    html += `<span${cls}${sty}>${escapedChars}</span>`;
+                }
+            }
+
+            return { processedHtml: html, wasProcessed: true };
         }
 
         // Now parse SGR (color/style) sequences
@@ -1741,13 +1882,22 @@
         while ((match = ansiRegex.exec(text)) !== null) {
             // Add text before this escape sequence
             if (match.index > lastIndex) {
-                const textBefore = escapeHtml(text.substring(lastIndex, match.index));
+                const rawText = text.substring(lastIndex, match.index);
                 const classes = currentClasses.length > 0 ? ` class="${currentClasses.join(' ')}"` : '';
                 const styles = (currentFgStyle || currentBgStyle) ? ` style="${currentFgStyle}${currentBgStyle}"` : '';
-                if (classes || styles) {
-                    result += `<span${classes}${styles}>${textBefore}</span>`;
+
+                // Check for shade characters that need blending
+                const shadeResult = processShadeChars(rawText, currentClasses, currentFgStyle, currentBgStyle);
+                if (shadeResult.wasProcessed) {
+                    // Shade chars were processed, use the pre-built HTML
+                    result += `<span${classes}${styles}>${shadeResult.processedHtml}</span>`;
                 } else {
-                    result += textBefore;
+                    const textBefore = escapeHtml(rawText);
+                    if (classes || styles) {
+                        result += `<span${classes}${styles}>${textBefore}</span>`;
+                    } else {
+                        result += textBefore;
+                    }
                 }
             }
 
@@ -2652,7 +2802,9 @@
             gui_transparency: 1.0,
             font_name: '',
             font_size: 14.0,
-            web_font_size: fontSizes[currentFontPos],
+            web_font_size_phone: webFontSizePhone,
+            web_font_size_tablet: webFontSizeTablet,
+            web_font_size_desktop: webFontSizeDesktop,
             ws_allow_list: wsAllowList,
             web_secure: webSecure,
             http_enabled: httpEnabled,
@@ -2744,7 +2896,9 @@
             gui_transparency: 1.0,
             font_name: '',
             font_size: 14.0,
-            web_font_size: fontSizes[currentFontPos],
+            web_font_size_phone: webFontSizePhone,
+            web_font_size_tablet: webFontSizeTablet,
+            web_font_size_desktop: webFontSizeDesktop,
             ws_allow_list: wsAllowList,
             web_secure: webSecure,
             http_enabled: httpEnabled,
@@ -3610,6 +3764,15 @@
         currentFontPos = pos;
         const px = fontSizes[pos];
 
+        // Update the per-device font size variable
+        if (deviceType === 'phone') {
+            webFontSizePhone = px;
+        } else if (deviceType === 'tablet') {
+            webFontSizeTablet = px;
+        } else {
+            webFontSizeDesktop = px;
+        }
+
         // Update body font size
         document.body.style.fontSize = px + 'px';
 
@@ -3644,7 +3807,9 @@
                 gui_transparency: 1.0,
                 font_name: '',
                 font_size: 14.0,
-                web_font_size: px,
+                web_font_size_phone: webFontSizePhone,
+                web_font_size_tablet: webFontSizeTablet,
+                web_font_size_desktop: webFontSizeDesktop,
                 ws_allow_list: wsAllowList,
                 web_secure: webSecure,
                 http_enabled: httpEnabled,
@@ -3703,7 +3868,7 @@
         let downBtnTimer = null;
         let downBtnLongPressed = false;
 
-        // Up button - short press: prev world, long press (2s): prev history (triggers immediately at 2s)
+        // Up button - short press: prev world, long press (1s): prev history (triggers immediately at 1s)
         function upBtnStart(e) {
             e.preventDefault();
             upBtnLongPressed = false;
@@ -3719,7 +3884,7 @@
                     elements.input.value = commandHistory[historyIndex];
                 }
                 elements.input.focus();
-            }, 2000);
+            }, 1000);
         }
         function upBtnEnd(e) {
             e.preventDefault();
@@ -3739,7 +3904,7 @@
         elements.mobileUpBtn.addEventListener('touchstart', upBtnStart, { passive: false });
         elements.mobileUpBtn.addEventListener('touchend', upBtnEnd, { passive: false });
 
-        // Down button - short press: next world, long press (2s): next history (triggers immediately at 2s)
+        // Down button - short press: next world, long press (1s): next history (triggers immediately at 1s)
         function downBtnStart(e) {
             e.preventDefault();
             downBtnLongPressed = false;
@@ -3756,7 +3921,7 @@
                     }
                 }
                 elements.input.focus();
-            }, 2000);
+            }, 1000);
         }
         function downBtnEnd(e) {
             e.preventDefault();

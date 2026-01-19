@@ -99,7 +99,7 @@ public class MainActivity extends AppCompatActivity {
     private void loadWebInterface() {
         SharedPreferences prefs = getSharedPreferences(PREFS_NAME, MODE_PRIVATE);
         String host = prefs.getString(KEY_SERVER_HOST, "");
-        int port = prefs.getInt(KEY_SERVER_PORT, 9001);
+        int port = prefs.getInt(KEY_SERVER_PORT, 9000);
         boolean useSecure = prefs.getBoolean(KEY_USE_SECURE, true);
 
         String protocol = useSecure ? "https" : "http";

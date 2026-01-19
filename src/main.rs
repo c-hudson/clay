@@ -2181,7 +2181,7 @@ impl MenuItem {
     fn label(&self) -> &'static str {
         match self {
             MenuItem::Help => "Help",
-            MenuItem::Setup => "Setup",
+            MenuItem::Setup => "Settings",
             MenuItem::WebSettings => "Web Settings",
             MenuItem::Actions => "Actions",
             MenuItem::WorldSelector => "World Selector",
@@ -2865,8 +2865,10 @@ struct Settings {
     // Remote GUI font settings
     font_name: String,
     font_size: f32,
-    // Web interface font size (separate from GUI)
-    web_font_size: f32,
+    // Web interface font sizes (separate settings for phone/tablet/desktop)
+    web_font_size_phone: f32,
+    web_font_size_tablet: f32,
+    web_font_size_desktop: f32,
     // Web server settings (consolidated)
     web_secure: bool,              // Protocol: true=Secure (https/wss), false=Non-Secure (http/ws)
     http_enabled: bool,            // Enable HTTP/HTTPS web server (name depends on web_secure)
@@ -2897,7 +2899,10 @@ impl Default for Settings {
             gui_transparency: 1.0,
             font_name: String::new(),  // Empty means use system default
             font_size: 14.0,
-            web_font_size: 14.0,       // Web interface font size
+            // Web interface font sizes (per device type)
+            web_font_size_phone: 10.0,   // Default for phones
+            web_font_size_tablet: 14.0,  // Default for tablets
+            web_font_size_desktop: 18.0, // Default for desktop
             web_secure: false,         // Default to non-secure
             http_enabled: false,
             http_port: 9000,
@@ -4303,6 +4308,9 @@ struct App {
     user_connections: std::collections::HashMap<(usize, String), UserConnection>,
     /// TinyFugue scripting engine
     tf_engine: tf::TfEngine,
+    // PROXY DEBUG: Timestamp when "think proxy" was sent, triggers reload after 2 seconds
+    // TODO: Remove once proxy issues are resolved
+    proxy_debug_reload_at: Option<std::time::Instant>,
 }
 
 impl App {
@@ -4350,6 +4358,7 @@ impl App {
             ban_list: BanList::new(),
             user_connections: std::collections::HashMap::new(),
             tf_engine: tf::TfEngine::new(),
+            proxy_debug_reload_at: None, // PROXY DEBUG: TODO remove
         }
         // Note: No initial world created here - it will be created after load_settings()
         // if no worlds are configured
@@ -4743,7 +4752,9 @@ impl App {
             input_height: self.input_height,
             font_name: self.settings.font_name.clone(),
             font_size: self.settings.font_size,
-            web_font_size: self.settings.web_font_size,
+            web_font_size_phone: self.settings.web_font_size_phone,
+            web_font_size_tablet: self.settings.web_font_size_tablet,
+            web_font_size_desktop: self.settings.web_font_size_desktop,
             ws_allow_list: self.settings.websocket_allow_list.clone(),
             web_secure: self.settings.web_secure,
             http_enabled: self.settings.http_enabled,
@@ -5263,7 +5274,9 @@ fn save_settings(app: &App) -> io::Result<()> {
     writeln!(file, "gui_transparency={}", app.settings.gui_transparency)?;
     writeln!(file, "font_name={}", app.settings.font_name)?;
     writeln!(file, "font_size={}", app.settings.font_size)?;
-    writeln!(file, "web_font_size={}", app.settings.web_font_size)?;
+    writeln!(file, "web_font_size_phone={}", app.settings.web_font_size_phone)?;
+    writeln!(file, "web_font_size_tablet={}", app.settings.web_font_size_tablet)?;
+    writeln!(file, "web_font_size_desktop={}", app.settings.web_font_size_desktop)?;
     writeln!(file, "web_secure={}", app.settings.web_secure)?;
     writeln!(file, "http_enabled={}", app.settings.http_enabled)?;
     writeln!(file, "http_port={}", app.settings.http_port)?;
@@ -5561,9 +5574,28 @@ fn load_settings(app: &mut App) -> io::Result<()> {
                             app.settings.font_size = s.clamp(8.0, 48.0);
                         }
                     }
+                    // Backward compat: old single web_font_size sets all three
                     "web_font_size" => {
                         if let Ok(s) = value.parse::<f32>() {
-                            app.settings.web_font_size = s.clamp(8.0, 48.0);
+                            let clamped = s.clamp(8.0, 48.0);
+                            app.settings.web_font_size_phone = clamped;
+                            app.settings.web_font_size_tablet = clamped;
+                            app.settings.web_font_size_desktop = clamped;
+                        }
+                    }
+                    "web_font_size_phone" => {
+                        if let Ok(s) = value.parse::<f32>() {
+                            app.settings.web_font_size_phone = s.clamp(8.0, 48.0);
+                        }
+                    }
+                    "web_font_size_tablet" => {
+                        if let Ok(s) = value.parse::<f32>() {
+                            app.settings.web_font_size_tablet = s.clamp(8.0, 48.0);
+                        }
+                    }
+                    "web_font_size_desktop" => {
+                        if let Ok(s) = value.parse::<f32>() {
+                            app.settings.web_font_size_desktop = s.clamp(8.0, 48.0);
                         }
                     }
                     "gui_transparency" => {
@@ -6097,7 +6129,9 @@ fn save_reload_state(app: &App) -> io::Result<()> {
     writeln!(file, "gui_transparency={}", app.settings.gui_transparency)?;
     writeln!(file, "font_name={}", app.settings.font_name)?;
     writeln!(file, "font_size={}", app.settings.font_size)?;
-    writeln!(file, "web_font_size={}", app.settings.web_font_size)?;
+    writeln!(file, "web_font_size_phone={}", app.settings.web_font_size_phone)?;
+    writeln!(file, "web_font_size_tablet={}", app.settings.web_font_size_tablet)?;
+    writeln!(file, "web_font_size_desktop={}", app.settings.web_font_size_desktop)?;
     writeln!(file, "web_secure={}", app.settings.web_secure)?;
     writeln!(file, "http_enabled={}", app.settings.http_enabled)?;
     writeln!(file, "http_port={}", app.settings.http_port)?;
@@ -6522,9 +6556,28 @@ fn load_reload_state(app: &mut App) -> io::Result<bool> {
                             app.settings.font_size = s.clamp(8.0, 48.0);
                         }
                     }
+                    // Backward compat: old single web_font_size sets all three
                     "web_font_size" => {
                         if let Ok(s) = value.parse::<f32>() {
-                            app.settings.web_font_size = s.clamp(8.0, 48.0);
+                            let clamped = s.clamp(8.0, 48.0);
+                            app.settings.web_font_size_phone = clamped;
+                            app.settings.web_font_size_tablet = clamped;
+                            app.settings.web_font_size_desktop = clamped;
+                        }
+                    }
+                    "web_font_size_phone" => {
+                        if let Ok(s) = value.parse::<f32>() {
+                            app.settings.web_font_size_phone = s.clamp(8.0, 48.0);
+                        }
+                    }
+                    "web_font_size_tablet" => {
+                        if let Ok(s) = value.parse::<f32>() {
+                            app.settings.web_font_size_tablet = s.clamp(8.0, 48.0);
+                        }
+                    }
+                    "web_font_size_desktop" => {
+                        if let Ok(s) = value.parse::<f32>() {
+                            app.settings.web_font_size_desktop = s.clamp(8.0, 48.0);
                         }
                     }
                     "gui_transparency" => {
@@ -6766,6 +6819,53 @@ fn is_process_alive(pid: u32) -> bool {
         libc::kill(pid as libc::pid_t, 0) == 0
     }
 }
+
+// ============================================================================
+// PROXY DEBUG LOGGING - Temporary code for debugging proxy connection drops
+// TODO: Remove this section once proxy issues are resolved
+// ============================================================================
+
+/// Log the status of all proxy connections to the debug log
+fn log_proxy_debug_status(app: &App, context: &str) {
+    let timestamp = get_unix_timestamp();
+    debug_log(true, &format!("PROXY_DEBUG [{}]: {}", timestamp, context));
+
+    for (idx, world) in app.worlds.iter().enumerate() {
+        if world.is_tls {
+            let connected = if world.connected { "CONNECTED" } else { "DISCONNECTED" };
+            let proxy_status = if let Some(pid) = world.proxy_pid {
+                let alive = if is_process_alive(pid) { "ALIVE" } else { "DEAD" };
+                format!("proxy_pid={} ({})", pid, alive)
+            } else {
+                "NO_PROXY".to_string()
+            };
+            let socket_status = if let Some(ref path) = world.proxy_socket_path {
+                let exists = if path.exists() { "EXISTS" } else { "MISSING" };
+                format!("socket={} ({})", path.display(), exists)
+            } else {
+                "NO_SOCKET".to_string()
+            };
+            let has_tx = if world.command_tx.is_some() { "HAS_TX" } else { "NO_TX" };
+
+            debug_log(true, &format!(
+                "PROXY_DEBUG   [{}] world[{}] '{}': {} | {} | {} | {}",
+                timestamp, idx, world.name, connected, proxy_status, socket_status, has_tx
+            ));
+        }
+    }
+}
+
+/// Get current unix timestamp as string
+fn get_unix_timestamp() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
+// ============================================================================
+// END PROXY DEBUG LOGGING
+// ============================================================================
 
 /// Generate a unique socket path for the TLS proxy
 fn get_proxy_socket_path(world_name: &str) -> PathBuf {
@@ -7418,8 +7518,10 @@ mod remote_gui {
         font_name: String,
         /// Font size in points
         font_size: f32,
-        /// Web interface font size (separate from GUI)
-        web_font_size: f32,
+        /// Web interface font sizes (passed through to web clients)
+        web_font_size_phone: f32,
+        web_font_size_tablet: f32,
+        web_font_size_desktop: f32,
         /// Temp field for font editor
         edit_font_name: String,
         /// Temp field for font size editor
@@ -7621,7 +7723,9 @@ mod remote_gui {
                 theme: GuiTheme::Dark,
                 font_name: String::new(),
                 font_size: 14.0,
-                web_font_size: 14.0,
+                web_font_size_phone: 10.0,
+                web_font_size_tablet: 14.0,
+                web_font_size_desktop: 18.0,
                 edit_font_name: String::new(),
                 edit_font_size: String::from("14.0"),
                 loaded_font_name: String::from("__uninitialized__"),
@@ -8007,7 +8111,9 @@ mod remote_gui {
                             self.theme = GuiTheme::from_name(&settings.gui_theme);
                             self.font_name = settings.font_name;
                             self.font_size = settings.font_size;
-                            self.web_font_size = settings.web_font_size;
+                            self.web_font_size_phone = settings.web_font_size_phone;
+                            self.web_font_size_tablet = settings.web_font_size_tablet;
+                            self.web_font_size_desktop = settings.web_font_size_desktop;
                             self.transparency = settings.gui_transparency;
                             self.ws_allow_list = settings.ws_allow_list;
                             self.web_secure = settings.web_secure;
@@ -8144,7 +8250,9 @@ mod remote_gui {
                             self.input_height = input_height;
                             self.font_name = settings.font_name;
                             self.font_size = settings.font_size;
-                            self.web_font_size = settings.web_font_size;
+                            self.web_font_size_phone = settings.web_font_size_phone;
+                            self.web_font_size_tablet = settings.web_font_size_tablet;
+                            self.web_font_size_desktop = settings.web_font_size_desktop;
                             self.transparency = settings.gui_transparency;
                             self.ws_allow_list = settings.ws_allow_list;
                             self.web_secure = settings.web_secure;
@@ -8616,7 +8724,9 @@ mod remote_gui {
                     input_height: self.input_height,
                     font_name: self.font_name.clone(),
                     font_size: self.font_size,
-                    web_font_size: self.web_font_size,
+                    web_font_size_phone: self.web_font_size_phone,
+                    web_font_size_tablet: self.web_font_size_tablet,
+                    web_font_size_desktop: self.web_font_size_desktop,
                     ws_allow_list: self.ws_allow_list.clone(),
                     web_secure: self.web_secure,
                     http_enabled: self.http_enabled,
@@ -8784,32 +8894,33 @@ mod remote_gui {
         /// Convert 256-color palette index to RGB
         fn color256_to_rgb(n: u8, is_light_theme: bool) -> (u8, u8, u8) {
             match n {
-                // Standard colors (0-7) - classic ANSI
-                0 => (0, 0, 0),         // Black
-                1 => (205, 0, 0),       // Red
-                2 => (0, 205, 0),       // Green
-                3 => if is_light_theme { (160, 140, 0) } else { (205, 205, 0) },  // Yellow
-                4 => (0, 0, 205),       // Blue
-                5 => (205, 0, 205),     // Magenta
-                6 => (0, 205, 205),     // Cyan
-                7 => if is_light_theme { (80, 80, 80) } else { (192, 192, 192) }, // White
-                // High-intensity colors (8-15) - bright ANSI
-                8 => (128, 128, 128),   // Bright Black
-                9 => (255, 0, 0),       // Bright Red
-                10 => (0, 255, 0),      // Bright Green
-                11 => if is_light_theme { (180, 160, 0) } else { (255, 255, 0) }, // Bright Yellow
-                12 => (0, 0, 255),      // Bright Blue
-                13 => (255, 0, 255),    // Bright Magenta
-                14 => (0, 255, 255),    // Bright Cyan
-                15 => if is_light_theme { (40, 40, 40) } else { (255, 255, 255) }, // Bright White
+                // Standard colors (0-7) - Xubuntu Dark palette
+                0 => (0, 0, 0),           // Black #000000
+                1 => (170, 0, 0),         // Red #aa0000
+                2 => (68, 170, 68),       // Green #44aa44
+                3 => if is_light_theme { (128, 64, 0) } else { (170, 85, 0) },  // Yellow #aa5500
+                4 => (0, 57, 170),        // Blue #0039aa
+                5 => (170, 34, 170),      // Magenta #aa22aa
+                6 => (26, 146, 170),      // Cyan #1a92aa
+                7 => if is_light_theme { (80, 80, 80) } else { (170, 170, 170) }, // White #aaaaaa
+                // High-intensity colors (8-15) - Xubuntu Dark palette
+                8 => (119, 119, 119),     // Bright Black #777777
+                9 => (255, 135, 135),     // Bright Red #ff8787
+                10 => (76, 230, 76),      // Bright Green #4ce64c
+                11 => if is_light_theme { (167, 163, 33) } else { (222, 216, 44) }, // Bright Yellow #ded82c
+                12 => (41, 95, 204),      // Bright Blue #295fcc
+                13 => (204, 88, 204),     // Bright Magenta #cc58cc
+                14 => (76, 204, 230),     // Bright Cyan #4ccce6
+                15 => if is_light_theme { (40, 40, 40) } else { (255, 255, 255) }, // Bright White #ffffff
                 // 216 colors (16-231): 6x6x6 color cube
+                // Standard xterm palette uses: 0, 95, 135, 175, 215, 255
                 16..=231 => {
+                    const CUBE_VALUES: [u8; 6] = [0, 95, 135, 175, 215, 255];
                     let n = n - 16;
-                    let r = (n / 36) % 6;
-                    let g = (n / 6) % 6;
-                    let b = n % 6;
-                    // Match web interface: v * 51 gives 0, 51, 102, 153, 204, 255
-                    (r * 51, g * 51, b * 51)
+                    let r = CUBE_VALUES[((n / 36) % 6) as usize];
+                    let g = CUBE_VALUES[((n / 6) % 6) as usize];
+                    let b = CUBE_VALUES[(n % 6) as usize];
+                    (r, g, b)
                 }
                 // Grayscale (232-255): 24 shades
                 232..=255 => {
@@ -8884,44 +8995,44 @@ mod remote_gui {
                             0 => { current_color = default_color; current_bg = egui::Color32::TRANSPARENT; bold = false; }
                             1 => bold = true,
                             22 => bold = false,
-                            // Standard foreground colors (30-37) - classic ANSI colors
-                            30 => current_color = egui::Color32::from_rgb(0, 0, 0),       // Black
-                            31 => current_color = egui::Color32::from_rgb(205, 0, 0),     // Red
-                            32 => current_color = egui::Color32::from_rgb(0, 205, 0),     // Green
+                            // Standard foreground colors (30-37) - Xubuntu Dark palette
+                            30 => current_color = egui::Color32::from_rgb(0, 0, 0),       // Black #000000
+                            31 => current_color = egui::Color32::from_rgb(170, 0, 0),     // Red #aa0000
+                            32 => current_color = egui::Color32::from_rgb(68, 170, 68),   // Green #44aa44
                             33 => current_color = if is_light_theme {
-                                egui::Color32::from_rgb(160, 140, 0)  // Darker gold for light theme
+                                egui::Color32::from_rgb(128, 64, 0)  // Darker orange for light theme
                             } else {
-                                egui::Color32::from_rgb(205, 205, 0)  // Yellow
+                                egui::Color32::from_rgb(170, 85, 0)  // Yellow #aa5500
                             },
                             34 => current_color = if is_light_theme {
-                                egui::Color32::from_rgb(0, 0, 205)       // Blue (standard for light theme)
+                                egui::Color32::from_rgb(0, 43, 128)      // Darker blue for light theme
                             } else {
-                                egui::Color32::from_rgb(26, 26, 230)     // Blue (10% lighter for dark theme)
+                                egui::Color32::from_rgb(0, 57, 170)      // Blue #0039aa
                             },
-                            35 => current_color = egui::Color32::from_rgb(205, 0, 205),   // Magenta
-                            36 => current_color = egui::Color32::from_rgb(0, 205, 205),   // Cyan
+                            35 => current_color = egui::Color32::from_rgb(170, 34, 170),  // Magenta #aa22aa
+                            36 => current_color = egui::Color32::from_rgb(26, 146, 170),  // Cyan #1a92aa
                             37 => current_color = if is_light_theme {
                                 egui::Color32::from_rgb(80, 80, 80)  // Dark gray for light theme
                             } else {
-                                egui::Color32::from_rgb(192, 192, 192)  // White (light gray)
+                                egui::Color32::from_rgb(170, 170, 170)  // White #aaaaaa
                             },
                             39 => current_color = default_color,
-                            // Bright/high-intensity foreground colors (90-97)
-                            90 => current_color = egui::Color32::from_rgb(128, 128, 128), // Bright Black
-                            91 => current_color = egui::Color32::from_rgb(255, 0, 0),     // Bright Red
-                            92 => current_color = egui::Color32::from_rgb(0, 255, 0),     // Bright Green
+                            // Bright/high-intensity foreground colors (90-97) - Xubuntu Dark palette
+                            90 => current_color = egui::Color32::from_rgb(119, 119, 119), // Bright Black #777777
+                            91 => current_color = egui::Color32::from_rgb(255, 135, 135), // Bright Red #ff8787
+                            92 => current_color = egui::Color32::from_rgb(76, 230, 76),   // Bright Green #4ce64c
                             93 => current_color = if is_light_theme {
-                                egui::Color32::from_rgb(180, 160, 0)  // Darker gold for light theme
+                                egui::Color32::from_rgb(167, 163, 33)  // Darker lime for light theme
                             } else {
-                                egui::Color32::from_rgb(255, 255, 0)  // Bright Yellow
+                                egui::Color32::from_rgb(222, 216, 44)  // Bright Yellow #ded82c
                             },
-                            94 => current_color = egui::Color32::from_rgb(0, 0, 255),     // Bright Blue
-                            95 => current_color = egui::Color32::from_rgb(255, 0, 255),   // Bright Magenta
-                            96 => current_color = egui::Color32::from_rgb(0, 255, 255),   // Bright Cyan
+                            94 => current_color = egui::Color32::from_rgb(41, 95, 204),   // Bright Blue #295fcc
+                            95 => current_color = egui::Color32::from_rgb(204, 88, 204),  // Bright Magenta #cc58cc
+                            96 => current_color = egui::Color32::from_rgb(76, 204, 230),  // Bright Cyan #4ccce6
                             97 => current_color = if is_light_theme {
                                 egui::Color32::from_rgb(40, 40, 40)  // Near black for light theme
                             } else {
-                                egui::Color32::from_rgb(255, 255, 255)  // Bright White
+                                egui::Color32::from_rgb(255, 255, 255)  // Bright White #ffffff
                             },
                             // Extended foreground color modes
                             38 => {
@@ -8952,15 +9063,15 @@ mod remote_gui {
                                     }
                                 }
                             }
-                            // Standard background colors (40-47) - classic ANSI colors
-                            40 => current_bg = egui::Color32::from_rgb(0, 0, 0),       // Black
-                            41 => current_bg = egui::Color32::from_rgb(205, 0, 0),     // Red
-                            42 => current_bg = egui::Color32::from_rgb(0, 205, 0),     // Green
-                            43 => current_bg = egui::Color32::from_rgb(205, 205, 0),   // Yellow
-                            44 => current_bg = egui::Color32::from_rgb(0, 0, 205),     // Blue
-                            45 => current_bg = egui::Color32::from_rgb(205, 0, 205),   // Magenta
-                            46 => current_bg = egui::Color32::from_rgb(0, 205, 205),   // Cyan
-                            47 => current_bg = egui::Color32::from_rgb(192, 192, 192), // White (light gray)
+                            // Standard background colors (40-47) - Xubuntu Dark palette
+                            40 => current_bg = egui::Color32::from_rgb(0, 0, 0),       // Black #000000
+                            41 => current_bg = egui::Color32::from_rgb(170, 0, 0),     // Red #aa0000
+                            42 => current_bg = egui::Color32::from_rgb(68, 170, 68),   // Green #44aa44
+                            43 => current_bg = egui::Color32::from_rgb(170, 85, 0),    // Yellow #aa5500
+                            44 => current_bg = egui::Color32::from_rgb(0, 57, 170),    // Blue #0039aa
+                            45 => current_bg = egui::Color32::from_rgb(170, 34, 170),  // Magenta #aa22aa
+                            46 => current_bg = egui::Color32::from_rgb(26, 146, 170),  // Cyan #1a92aa
+                            47 => current_bg = egui::Color32::from_rgb(170, 170, 170), // White #aaaaaa
                             49 => current_bg = egui::Color32::TRANSPARENT,             // Default background
                             // Extended background color modes
                             48 => {
@@ -8991,15 +9102,15 @@ mod remote_gui {
                                     }
                                 }
                             }
-                            // Bright/high-intensity background colors (100-107)
-                            100 => current_bg = egui::Color32::from_rgb(128, 128, 128), // Bright Black
-                            101 => current_bg = egui::Color32::from_rgb(255, 0, 0),     // Bright Red
-                            102 => current_bg = egui::Color32::from_rgb(0, 255, 0),     // Bright Green
-                            103 => current_bg = egui::Color32::from_rgb(255, 255, 0),   // Bright Yellow
-                            104 => current_bg = egui::Color32::from_rgb(0, 0, 255),     // Bright Blue
-                            105 => current_bg = egui::Color32::from_rgb(255, 0, 255),   // Bright Magenta
-                            106 => current_bg = egui::Color32::from_rgb(0, 255, 255),   // Bright Cyan
-                            107 => current_bg = egui::Color32::from_rgb(255, 255, 255), // Bright White
+                            // Bright/high-intensity background colors (100-107) - Xubuntu Dark palette
+                            100 => current_bg = egui::Color32::from_rgb(119, 119, 119), // Bright Black #777777
+                            101 => current_bg = egui::Color32::from_rgb(255, 135, 135), // Bright Red #ff8787
+                            102 => current_bg = egui::Color32::from_rgb(76, 230, 76),   // Bright Green #4ce64c
+                            103 => current_bg = egui::Color32::from_rgb(222, 216, 44),  // Bright Yellow #ded82c
+                            104 => current_bg = egui::Color32::from_rgb(41, 95, 204),   // Bright Blue #295fcc
+                            105 => current_bg = egui::Color32::from_rgb(204, 88, 204),  // Bright Magenta #cc58cc
+                            106 => current_bg = egui::Color32::from_rgb(76, 204, 230),  // Bright Cyan #4ccce6
+                            107 => current_bg = egui::Color32::from_rgb(255, 255, 255), // Bright White #ffffff
                             _ => {}
                         }
                         i += 1;
@@ -9968,7 +10079,7 @@ mod remote_gui {
                                 action = Some("font");
                                 ui.close_menu();
                             }
-                            if ui.button("Setup").clicked() {
+                            if ui.button("Settings").clicked() {
                                 action = Some("setup");
                                 ui.close_menu();
                             }
@@ -13153,7 +13264,7 @@ mod remote_gui {
                                                 .size(11.0).color(theme.fg_secondary()));
                                             ui.label(egui::RichText::new("  World Editor    Edit world connection settings")
                                                 .size(11.0).color(theme.fg_secondary()));
-                                            ui.label(egui::RichText::new("  Setup           Global settings")
+                                            ui.label(egui::RichText::new("  Settings        Global settings")
                                                 .size(11.0).color(theme.fg_secondary()));
                                             ui.label(egui::RichText::new("  Font            Change font family and size")
                                                 .size(11.0).color(theme.fg_secondary()));
@@ -13176,7 +13287,7 @@ mod remote_gui {
                     let mut selected_command: Option<String> = None;
                     let menu_items = [
                         ("Help", "/help"),
-                        ("Setup", "/setup"),
+                        ("Settings", "/setup"),
                         ("Web Settings", "/web"),
                         ("Actions", "/actions"),
                         ("World Selector", "/worlds"),
@@ -14903,7 +15014,9 @@ fn build_multiuser_initial_state(app: &App, username: &str) -> WsMessage {
         input_height: app.input_height,
         font_name: app.settings.font_name.clone(),
         font_size: app.settings.font_size,
-        web_font_size: app.settings.web_font_size,
+        web_font_size_phone: app.settings.web_font_size_phone,
+        web_font_size_tablet: app.settings.web_font_size_tablet,
+        web_font_size_desktop: app.settings.web_font_size_desktop,
         ws_allow_list: app.settings.websocket_allow_list.clone(),
         web_secure: app.settings.web_secure,
         http_enabled: app.settings.http_enabled,
@@ -15724,6 +15837,17 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
         }
 
         debug_log(true, "STARTUP: Connection cleanup done, sending keepalives...");
+
+        // ================================================================
+        // PROXY DEBUG: Log post-reload status of all proxy connections
+        // TODO: Remove this section once proxy issues are resolved
+        // ================================================================
+        if is_reload {
+            log_proxy_debug_status(&app, "POST-RELOAD STATUS (after connection cleanup)");
+        }
+        // ================================================================
+        // END PROXY DEBUG
+        // ================================================================
 
         // Send immediate keepalive for all reconnected worlds since we don't know how long they were idle
         for world in &mut app.worlds {
@@ -17292,7 +17416,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                     });
                                 }
                             }
-                            WsMessage::UpdateGlobalSettings { more_mode_enabled, spell_check_enabled, world_switch_mode, show_tags, ansi_music_enabled, console_theme, gui_theme, gui_transparency, input_height, font_name, font_size, web_font_size, ws_allow_list, web_secure, http_enabled, http_port, ws_enabled, ws_port, ws_cert_file, ws_key_file, tls_proxy_enabled } => {
+                            WsMessage::UpdateGlobalSettings { more_mode_enabled, spell_check_enabled, world_switch_mode, show_tags, ansi_music_enabled, console_theme, gui_theme, gui_transparency, input_height, font_name, font_size, web_font_size_phone, web_font_size_tablet, web_font_size_desktop, ws_allow_list, web_secure, http_enabled, http_port, ws_enabled, ws_port, ws_cert_file, ws_key_file, tls_proxy_enabled } => {
                                 // Update global settings from remote client
                                 app.settings.more_mode_enabled = more_mode_enabled;
                                 app.settings.spell_check_enabled = spell_check_enabled;
@@ -17308,7 +17432,9 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                 app.input.visible_height = app.input_height;
                                 app.settings.font_name = font_name;
                                 app.settings.font_size = font_size.clamp(8.0, 48.0);
-                                app.settings.web_font_size = web_font_size.clamp(8.0, 48.0);
+                                app.settings.web_font_size_phone = web_font_size_phone.clamp(8.0, 48.0);
+                                app.settings.web_font_size_tablet = web_font_size_tablet.clamp(8.0, 48.0);
+                                app.settings.web_font_size_desktop = web_font_size_desktop.clamp(8.0, 48.0);
                                 app.settings.websocket_allow_list = ws_allow_list.clone();
                                 // Update the running WebSocket server's allow list
                                 if let Some(ref server) = app.ws_server {
@@ -17339,7 +17465,9 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                     input_height: app.input_height,
                                     font_name: app.settings.font_name.clone(),
                                     font_size: app.settings.font_size,
-                                    web_font_size: app.settings.web_font_size,
+                                    web_font_size_phone: app.settings.web_font_size_phone,
+                                    web_font_size_tablet: app.settings.web_font_size_tablet,
+                                    web_font_size_desktop: app.settings.web_font_size_desktop,
                                     ws_allow_list: app.settings.websocket_allow_list.clone(),
                                     web_secure: app.settings.web_secure,
                                     http_enabled: app.settings.http_enabled,
@@ -17507,6 +17635,24 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                         }
                     }
                 }
+
+                // ================================================================
+                // PROXY DEBUG: Check if 2 seconds have passed since "think proxy"
+                // TODO: Remove this section once proxy issues are resolved
+                // ================================================================
+                if let Some(start_time) = app.proxy_debug_reload_at {
+                    if start_time.elapsed() >= std::time::Duration::from_secs(2) {
+                        debug_log(true, "PROXY_DEBUG: 2 seconds elapsed, triggering reload");
+                        // Trigger reload command
+                        if handle_command("/reload", &mut app, event_tx.clone()).await {
+                            return Ok(());
+                        }
+                    }
+                }
+                // ================================================================
+                // END PROXY DEBUG
+                // ================================================================
+
                 // Redraw to update the clock display in separator bar
             }
 
@@ -17637,6 +17783,29 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                         // Consider "current" if console OR any web/GUI client is viewing this world
                         let is_current = world_idx == app.current_world_index || app.ws_client_viewing(world_idx);
                         let decoded_data = app.worlds[world_idx].settings.encoding.decode(&bytes);
+
+                        // ================================================================
+                        // PROXY DEBUG: Log output from proxy worlds during debug wait
+                        // TODO: Remove this section once proxy issues are resolved
+                        // ================================================================
+                        if app.proxy_debug_reload_at.is_some() {
+                            let world = &app.worlds[world_idx];
+                            if world.is_tls && world.proxy_pid.is_some() {
+                                // Log the raw data received
+                                let preview: String = decoded_data.chars().take(200).collect();
+                                let preview_escaped = preview.replace('\n', "\\n").replace('\r', "\\r");
+                                debug_log(true, &format!(
+                                    "PROXY_DEBUG: Received from '{}' ({} bytes): {}{}",
+                                    world_name,
+                                    decoded_data.len(),
+                                    preview_escaped,
+                                    if decoded_data.len() > 200 { "..." } else { "" }
+                                ));
+                            }
+                        }
+                        // ================================================================
+                        // END PROXY DEBUG
+                        // ================================================================
 
                         // Extract ANSI music sequences FIRST, before any other processing
                         let (data, music_sequences) = if app.settings.ansi_music_enabled {
@@ -18440,7 +18609,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                 app.ws_broadcast(WsMessage::WorldSettingsUpdated { world_index, settings: settings_msg, name });
                             }
                         }
-                        WsMessage::UpdateGlobalSettings { more_mode_enabled, spell_check_enabled, world_switch_mode, show_tags, ansi_music_enabled, console_theme, gui_theme, gui_transparency, input_height, font_name, font_size, web_font_size, ws_allow_list, web_secure, http_enabled, http_port, ws_enabled, ws_port, ws_cert_file, ws_key_file, tls_proxy_enabled } => {
+                        WsMessage::UpdateGlobalSettings { more_mode_enabled, spell_check_enabled, world_switch_mode, show_tags, ansi_music_enabled, console_theme, gui_theme, gui_transparency, input_height, font_name, font_size, web_font_size_phone, web_font_size_tablet, web_font_size_desktop, ws_allow_list, web_secure, http_enabled, http_port, ws_enabled, ws_port, ws_cert_file, ws_key_file, tls_proxy_enabled } => {
                             app.settings.more_mode_enabled = more_mode_enabled;
                             app.settings.spell_check_enabled = spell_check_enabled;
                             app.settings.world_switch_mode = WorldSwitchMode::from_name(&world_switch_mode);
@@ -18453,7 +18622,9 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                             app.input.visible_height = app.input_height;
                             app.settings.font_name = font_name;
                             app.settings.font_size = font_size.clamp(8.0, 48.0);
-                            app.settings.web_font_size = web_font_size.clamp(8.0, 48.0);
+                            app.settings.web_font_size_phone = web_font_size_phone.clamp(8.0, 48.0);
+                            app.settings.web_font_size_tablet = web_font_size_tablet.clamp(8.0, 48.0);
+                            app.settings.web_font_size_desktop = web_font_size_desktop.clamp(8.0, 48.0);
                             app.settings.websocket_allow_list = ws_allow_list.clone();
                             if let Some(ref server) = app.ws_server {
                                 server.update_allow_list(&ws_allow_list);
@@ -18480,7 +18651,9 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                 input_height: app.input_height,
                                 font_name: app.settings.font_name.clone(),
                                 font_size: app.settings.font_size,
-                                web_font_size: app.settings.web_font_size,
+                                web_font_size_phone: app.settings.web_font_size_phone,
+                                web_font_size_tablet: app.settings.web_font_size_tablet,
+                                web_font_size_desktop: app.settings.web_font_size_desktop,
                                 ws_allow_list: app.settings.websocket_allow_list.clone(),
                                 web_secure: app.settings.web_secure,
                                 http_enabled: app.settings.http_enabled,
@@ -21513,6 +21686,52 @@ async fn handle_command(cmd: &str, app: &mut App, event_tx: mpsc::Sender<AppEven
             }
         }
         Command::Reload => {
+            // ================================================================
+            // PROXY DEBUG: Send "think proxy" and wait 2 seconds before reload
+            // TODO: Remove this section once proxy issues are resolved
+            // ================================================================
+            let has_proxy_connections = app.worlds.iter()
+                .any(|w| w.connected && w.is_tls && w.proxy_pid.is_some());
+
+            if has_proxy_connections && app.proxy_debug_reload_at.is_none() {
+                // Log proxy status before reload
+                log_proxy_debug_status(app, "PRE-RELOAD STATUS");
+
+                // Send "think proxy - [timestamp]" to all proxy-connected worlds
+                let timestamp = get_unix_timestamp();
+                let think_cmd = format!("think proxy - {}", timestamp);
+                debug_log(true, &format!("PROXY_DEBUG: Sending '{}' to proxy worlds", think_cmd));
+
+                for world in &app.worlds {
+                    if world.connected && world.is_tls && world.proxy_pid.is_some() {
+                        if let Some(tx) = &world.command_tx {
+                            let _ = tx.try_send(WriteCommand::Text(think_cmd.clone()));
+                            debug_log(true, &format!("PROXY_DEBUG: Sent to world '{}'", world.name));
+                        }
+                    }
+                }
+
+                // Set the timer - reload will proceed after 2 seconds
+                app.proxy_debug_reload_at = Some(std::time::Instant::now());
+                app.add_output("Proxy debug: waiting 2 seconds to collect output before reload...");
+                debug_log(true, "PROXY_DEBUG: Waiting 2 seconds for server response");
+                return false; // Don't do reload yet
+            }
+
+            // If we're in debug mode, check if 2 seconds have passed
+            if let Some(start_time) = app.proxy_debug_reload_at {
+                if start_time.elapsed() < std::time::Duration::from_secs(2) {
+                    // Still waiting - this shouldn't normally happen since we trigger from event loop
+                    return false;
+                }
+                // 2 seconds passed, clear the flag and log final status
+                app.proxy_debug_reload_at = None;
+                log_proxy_debug_status(app, "RELOAD STARTING (after 2s wait)");
+            }
+            // ================================================================
+            // END PROXY DEBUG
+            // ================================================================
+
             // First check if we can find the executable (handling " (deleted)" suffix)
             let exe_path = match get_executable_path() {
                 Ok((p, _)) => p,
