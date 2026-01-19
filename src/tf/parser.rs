@@ -142,7 +142,22 @@ pub fn execute_command(engine: &mut TfEngine, input: &str) -> TfCommandResult {
         "ps" => builtins::cmd_ps(),
         "kill" => builtins::cmd_kill(args),
 
-        _ => TfCommandResult::UnknownCommand(cmd.to_string()),
+        // Check for user-defined macro with this name
+        _ => {
+            // Look for a macro with this name (case-insensitive)
+            if let Some(macro_def) = engine.macros.iter().find(|m| m.name.eq_ignore_ascii_case(cmd)).cloned() {
+                // Parse arguments for the macro
+                let macro_args: Vec<&str> = if args.is_empty() {
+                    vec![]
+                } else {
+                    args.split_whitespace().collect()
+                };
+                let results = macros::execute_macro(engine, &macro_def, &macro_args, None);
+                aggregate_results(results)
+            } else {
+                TfCommandResult::UnknownCommand(cmd.to_string())
+            }
+        }
     }
 }
 
@@ -904,5 +919,54 @@ mod tests {
             TfCommandResult::Success(Some(msg)) => assert_eq!(msg, "Attack the orc!"),
             _ => panic!("Expected success with substituted message"),
         }
+    }
+
+    #[test]
+    fn test_invoke_macro_by_name() {
+        use super::super::TfMacro;
+
+        let mut engine = TfEngine::new();
+
+        // Define a simple macro
+        engine.macros.push(TfMacro {
+            name: "greet".to_string(),
+            body: "#echo Hello there!".to_string(),
+            ..Default::default()
+        });
+
+        // Invoke it by name
+        let result = execute_command(&mut engine, "#greet");
+        match result {
+            TfCommandResult::Success(Some(msg)) => assert_eq!(msg, "Hello there!"),
+            _ => panic!("Expected success with message, got {:?}", result),
+        }
+    }
+
+    #[test]
+    fn test_invoke_macro_case_insensitive() {
+        use super::super::TfMacro;
+
+        let mut engine = TfEngine::new();
+
+        engine.macros.push(TfMacro {
+            name: "MyMacro".to_string(),
+            body: "#echo Works!".to_string(),
+            ..Default::default()
+        });
+
+        // Should work with different cases
+        let result = execute_command(&mut engine, "#mymacro");
+        assert!(matches!(result, TfCommandResult::Success(Some(_))));
+
+        let result = execute_command(&mut engine, "#MYMACRO");
+        assert!(matches!(result, TfCommandResult::Success(Some(_))));
+    }
+
+    #[test]
+    fn test_unknown_command_when_no_macro() {
+        let mut engine = TfEngine::new();
+
+        let result = execute_command(&mut engine, "#nonexistent");
+        assert!(matches!(result, TfCommandResult::UnknownCommand(_)));
     }
 }

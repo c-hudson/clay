@@ -4598,6 +4598,22 @@ impl App {
         self.needs_output_redraw = true;
     }
 
+    /// Add TF command output (does NOT get %% prefix - treated like server output)
+    fn add_tf_output(&mut self, text: &str) {
+        let is_current = true;
+        let settings = self.settings.clone();
+        let output_height = self.output_height;
+        let output_width = self.output_width;
+        let text_with_newline = if text.ends_with('\n') || text.is_empty() {
+            text.to_string()
+        } else {
+            format!("{}\n", text)
+        };
+        self.current_world_mut()
+            .add_output(&text_with_newline, is_current, &settings, output_height, output_width, false, true);
+        self.needs_output_redraw = true;
+    }
+
     /// Broadcast a message to all authenticated WebSocket clients
     fn ws_broadcast(&self, msg: WsMessage) {
         // Broadcast to secure WebSocket server (wss://)
@@ -16023,24 +16039,24 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                                         };
 
                                                         if matches.is_empty() {
-                                                            app.add_output(&format!("%% No matches for '{}'", pattern));
+                                                            app.add_tf_output(&format!("No matches for '{}'", pattern));
                                                         } else {
-                                                            app.add_output(&format!("%% {} match{} for '{}':",
+                                                            app.add_tf_output(&format!("{} match{} for '{}':",
                                                                 matches.len(),
                                                                 if matches.len() == 1 { "" } else { "es" },
                                                                 pattern));
                                                             for m in &matches {
-                                                                app.add_output(m);
+                                                                app.add_tf_output(m);
                                                             }
                                                         }
                                                     } else {
-                                                        app.add_output(&format!("%% Invalid pattern: {}", pattern));
+                                                        app.add_tf_output(&format!("Invalid pattern: {}", pattern));
                                                     }
                                                 }
                                                 other => {
                                                     // Shouldn't happen but handle other results
                                                     if let tf::TfCommandResult::Error(err) = other {
-                                                        app.add_output(&format!("%% {}", err));
+                                                        app.add_tf_output(&format!("Error: {}", err));
                                                     }
                                                 }
                                             }
@@ -16058,19 +16074,19 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                 // TinyFugue command
                                 match app.tf_engine.execute(&cmd) {
                                     tf::TfCommandResult::Success(Some(msg)) => {
-                                        app.add_output(&msg);
+                                        app.add_tf_output(&msg);
                                     }
                                     tf::TfCommandResult::Success(None) => {
                                         // Silent success
                                     }
                                     tf::TfCommandResult::Error(err) => {
-                                        app.add_output(&format!("%% {}", err));
+                                        app.add_tf_output(&format!("Error: {}", err));
                                     }
                                     tf::TfCommandResult::SendToMud(text) => {
                                         if app.current_world().connected {
                                             if let Some(tx) = &app.current_world().command_tx {
                                                 if tx.send(WriteCommand::Text(text)).await.is_err() {
-                                                    app.add_output("Failed to send command");
+                                                    app.add_tf_output("Failed to send command");
                                                 } else {
                                                     let now = std::time::Instant::now();
                                                     app.current_world_mut().last_send_time = Some(now);
@@ -16766,7 +16782,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                                         tf::TfCommandResult::Error(err) => {
                                                             app.ws_broadcast(WsMessage::ServerData {
                                                                 world_index,
-                                                                data: format!("%% {}", err),
+                                                                data: format!("Error: {}", err),
                                                                 is_viewed: false,
                                                                 ts: current_timestamp_secs(),
                                                             });
@@ -18035,7 +18051,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                                     tf::TfCommandResult::Error(err) => {
                                                         app.ws_broadcast(WsMessage::ServerData {
                                                             world_index,
-                                                            data: format!("%% {}", err),
+                                                            data: format!("Error: {}", err),
                                                             is_viewed: false,
                                                             ts: current_timestamp_secs(),
                                                         });
@@ -21635,11 +21651,11 @@ async fn handle_command(cmd: &str, app: &mut App, event_tx: mpsc::Sender<AppEven
                         // TinyFugue command
                         match app.tf_engine.execute(&cmd_str) {
                             tf::TfCommandResult::Success(Some(msg)) => {
-                                app.add_output(&msg);
+                                app.add_tf_output(&msg);
                             }
                             tf::TfCommandResult::Success(None) => {}
                             tf::TfCommandResult::Error(err) => {
-                                app.add_output(&format!("%% {}", err));
+                                app.add_tf_output(&format!("%% {}", err));
                             }
                             tf::TfCommandResult::SendToMud(text) => {
                                 if let Some(tx) = &app.current_world().command_tx {
