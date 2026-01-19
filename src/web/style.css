@@ -357,18 +357,18 @@ body {
     display: flex;
     align-items: center;
     background-color: var(--bg-color);
-    min-height: 20px;
+    min-height: 1.2em;
     font-size: inherit;
     border-top: none;
     border-bottom: none;
-    padding: 0 2px;
+    padding: 0;
     overflow: hidden;
     max-width: 100%;
     box-sizing: border-box;
 }
 
 #status-indicator {
-    min-width: 88px;
+    min-width: 11ch;
     padding: 0 2px;
     background-color: transparent;
     color: var(--separator-color);
