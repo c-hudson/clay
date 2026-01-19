@@ -9486,6 +9486,16 @@ mod remote_gui {
 
     impl eframe::App for RemoteGuiApp {
         fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+            // Skip rendering until screen has valid dimensions
+            // This prevents NaN panics from egui layout calculations on startup
+            let screen = ctx.screen_rect();
+            if screen.width() <= 0.0 || screen.height() <= 0.0 ||
+               screen.width().is_nan() || screen.height().is_nan() ||
+               !screen.width().is_finite() || !screen.height().is_finite() {
+                ctx.request_repaint();
+                return;
+            }
+
             // Process incoming WebSocket messages
             self.process_messages();
 
@@ -9616,9 +9626,12 @@ mod remote_gui {
                     .show(ctx, |ui| {
                     // Guard against first frame with invalid dimensions
                     let avail = ui.available_size();
-                    if avail.x <= 0.0 || avail.y <= 0.0 || avail.x.is_nan() || avail.y.is_nan() {
+                    if avail.x <= 0.0 || avail.y <= 0.0 || avail.x.is_nan() || avail.y.is_nan() ||
+                       !avail.x.is_finite() || !avail.y.is_finite() {
                         return;
                     }
+                    // Use ScrollArea to handle overflow without NaN panics
+                    egui::ScrollArea::vertical().show(ui, |ui| {
                     ui.vertical_centered(|ui| {
                         ui.add_space(30.0);
 
@@ -9772,6 +9785,7 @@ mod remote_gui {
                                 }
                             });
                     });
+                    }); // ScrollArea
                 });
             } else {
                 // Show main interface with menu bar
