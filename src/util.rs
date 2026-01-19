@@ -462,6 +462,7 @@ pub struct WorldListInfo {
     pub connected: bool,
     pub is_current: bool,
     pub is_ssl: bool,
+    pub is_proxy: bool,
     pub unseen_lines: usize,
     pub last_send_secs: Option<u64>,
     pub last_recv_secs: Option<u64>,
@@ -492,7 +493,7 @@ pub fn format_worlds_list(worlds: &[WorldListInfo]) -> String {
 
     // Build formatted data for each world first to calculate column widths
     struct FormattedWorld {
-        ssl: String,
+        ssh: String,
         current_marker: String,
         name: String,
         unseen: String,
@@ -504,7 +505,11 @@ pub fn format_worlds_list(worlds: &[WorldListInfo]) -> String {
     }
 
     let formatted: Vec<FormattedWorld> = connected_worlds.iter().map(|world| {
-        let ssl = if world.is_ssl { "*".to_string() } else { " ".to_string() };
+        let ssh = if world.is_ssl {
+            if world.is_proxy { "PRX" } else { "SSH" }
+        } else {
+            "   "
+        }.to_string();
         let current_marker = if world.is_current {
             format!("{}*{}", CYAN, RESET)
         } else {
@@ -543,7 +548,7 @@ pub fn format_worlds_list(worlds: &[WorldListInfo]) -> String {
             None => "—".to_string(),
         };
         FormattedWorld {
-            ssl,
+            ssh,
             current_marker,
             name: world.name.clone(),
             unseen,
@@ -567,7 +572,7 @@ pub fn format_worlds_list(worlds: &[WorldListInfo]) -> String {
 
     // Header line with dynamic widths
     lines.push(format!(
-        "   {:name_w$}  {:>unseen_w$}  {:>send_w$}  {:>recv_w$}  {:>last_ak_w$}  {:>next_ak_w$}",
+        "  SSH  {:name_w$}  {:>unseen_w$}  {:>send_w$}  {:>recv_w$}  {:>last_ak_w$}  {:>next_ak_w$}",
         "World", "Unseen", "LastSend", "LastRecv", "LastAK", "NextAK",
         name_w = name_width,
         unseen_w = unseen_width,
@@ -579,8 +584,8 @@ pub fn format_worlds_list(worlds: &[WorldListInfo]) -> String {
 
     for world in &formatted {
         lines.push(format!(
-            "{}{}  {:name_w$}  {:>unseen_w$}  {:>send_w$}  {:>recv_w$}  {:>last_ak_w$}  {:>next_ak_w$}",
-            world.ssl, world.current_marker, world.name, world.unseen,
+            "{} {}  {:name_w$}  {:>unseen_w$}  {:>send_w$}  {:>recv_w$}  {:>last_ak_w$}  {:>next_ak_w$}",
+            world.current_marker, world.ssh, world.name, world.unseen,
             world.last_send, world.last_recv, world.last_ak, world.next_ak,
             name_w = name_width,
             unseen_w = unseen_width + (world.unseen.len() - world.unseen_raw.len()),  // Account for color codes

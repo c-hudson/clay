@@ -1882,8 +1882,14 @@ impl WorldsPopup {
         let connected_info: Vec<_> = worlds.iter().enumerate()
             .filter(|(_, w)| w.connected)
             .map(|(i, w)| {
+                let ssh_status = if w.is_tls {
+                    if w.proxy_pid.is_some() { "PRX" } else { "SSH" }
+                } else {
+                    ""
+                };
                 (
                     if i == current_world_index { "*" } else { " " },
+                    ssh_status.to_string(),
                     w.name.clone(),
                     if w.unseen_lines > 0 { w.unseen_lines.to_string() } else { String::new() },
                     format_elapsed(w.last_user_command_time),
@@ -1899,31 +1905,33 @@ impl WorldsPopup {
             self.lines.push("No worlds connected.".to_string());
         } else {
             // Calculate column widths
-            let name_width = connected_info.iter().map(|(_, n, _, _, _, _, _, _)| n.len()).max().unwrap_or(5).max(5);
-            let unseen_width = connected_info.iter().map(|(_, _, u, _, _, _, _, _)| u.len()).max().unwrap_or(6).max(6);
-            let send_width = connected_info.iter().map(|(_, _, _, s, _, _, _, _)| s.len()).max().unwrap_or(8).max(8);
-            let recv_width = connected_info.iter().map(|(_, _, _, _, r, _, _, _)| r.len()).max().unwrap_or(8).max(8);
-            let ka_width = connected_info.iter().map(|(_, _, _, _, _, k, _, _)| k.len()).max().unwrap_or(9).max(9);
-            let nop_width = connected_info.iter().map(|(_, _, _, _, _, _, n, _)| n.len()).max().unwrap_or(6).max(6);
-            let next_width = connected_info.iter().map(|(_, _, _, _, _, _, _, p)| p.len()).max().unwrap_or(6).max(6);
+            // SSH column is fixed at 3 characters
+            let ssh_width = 3;
+            let name_width = connected_info.iter().map(|(_, _, n, _, _, _, _, _, _)| n.len()).max().unwrap_or(5).max(5);
+            let unseen_width = connected_info.iter().map(|(_, _, _, u, _, _, _, _, _)| u.len()).max().unwrap_or(6).max(6);
+            let send_width = connected_info.iter().map(|(_, _, _, _, s, _, _, _, _)| s.len()).max().unwrap_or(8).max(8);
+            let recv_width = connected_info.iter().map(|(_, _, _, _, _, r, _, _, _)| r.len()).max().unwrap_or(8).max(8);
+            let ka_width = connected_info.iter().map(|(_, _, _, _, _, _, k, _, _)| k.len()).max().unwrap_or(9).max(9);
+            let nop_width = connected_info.iter().map(|(_, _, _, _, _, _, _, n, _)| n.len()).max().unwrap_or(6).max(6);
+            let next_width = connected_info.iter().map(|(_, _, _, _, _, _, _, _, p)| p.len()).max().unwrap_or(6).max(6);
 
             // Calculate combined column widths
             let send_recv_combined_width = connected_info.iter()
-                .map(|(_, _, _, s, r, _, _, _)| format!("{}/{}", s, r).len())
+                .map(|(_, _, _, _, s, r, _, _, _)| format!("{}/{}", s, r).len())
                 .max().unwrap_or(9).max(9);
             let ka_next_combined_width = connected_info.iter()
-                .map(|(_, _, _, _, _, _, lk, nk)| format!("{}/{}", lk, nk).len())
+                .map(|(_, _, _, _, _, _, _, lk, nk)| format!("{}/{}", lk, nk).len())
                 .max().unwrap_or(7).max(7);
 
-            // Calculate total widths for different layouts
+            // Calculate total widths for different layouts (includes SSH column)
             // Layout 1: All columns separate
-            let width_full = 2 + name_width + 2 + unseen_width + 2 + send_width + 2 + recv_width + 2 + ka_width + 2 + nop_width + 2 + next_width;
+            let width_full = 2 + ssh_width + 2 + name_width + 2 + unseen_width + 2 + send_width + 2 + recv_width + 2 + ka_width + 2 + nop_width + 2 + next_width;
             // Layout 2: Combine Send/Recv AND LastKA/NextKA
-            let width_combined_both = 2 + name_width + 2 + unseen_width + 2 + send_recv_combined_width + 2 + ka_width + 2 + ka_next_combined_width;
+            let width_combined_both = 2 + ssh_width + 2 + name_width + 2 + unseen_width + 2 + send_recv_combined_width + 2 + ka_width + 2 + ka_next_combined_width;
             // Layout 3: Remove KeepAlive column
-            let width_no_ka_type = 2 + name_width + 2 + unseen_width + 2 + send_recv_combined_width + 2 + ka_next_combined_width;
+            let width_no_ka_type = 2 + ssh_width + 2 + name_width + 2 + unseen_width + 2 + send_recv_combined_width + 2 + ka_next_combined_width;
             // Layout 4: Remove LastKA/NextKA columns entirely
-            let _width_minimal = 2 + name_width + 2 + unseen_width + 2 + send_recv_combined_width;
+            let _width_minimal = 2 + ssh_width + 2 + name_width + 2 + unseen_width + 2 + send_recv_combined_width;
 
             let available = screen_width as usize;
 
@@ -1943,57 +1951,57 @@ impl WorldsPopup {
                 1 => {
                     // Full layout: all columns separate
                     self.lines.push(format!(
-                        "  {:name_width$}  {:>unseen_width$}  {:>send_width$}  {:>recv_width$}  {:ka_width$}  {:>nop_width$}  {:>next_width$}",
-                        "World", "Unseen", "LastSend", "LastRecv", "KeepAlive", "LastKA", "NextKA",
+                        "  {:ssh_width$}  {:name_width$}  {:>unseen_width$}  {:>send_width$}  {:>recv_width$}  {:ka_width$}  {:>nop_width$}  {:>next_width$}",
+                        "SSH", "World", "Unseen", "LastSend", "LastRecv", "KeepAlive", "LastKA", "NextKA",
                     ));
-                    for (current, name, unseen, send, recv, ka_type, last_ka, next_ka) in &connected_info {
+                    for (current, ssh, name, unseen, send, recv, ka_type, last_ka, next_ka) in &connected_info {
                         self.lines.push(format!(
-                            "{} {:name_width$}  {:>unseen_width$}  {:>send_width$}  {:>recv_width$}  {:ka_width$}  {:>nop_width$}  {:>next_width$}",
-                            current, name, unseen, send, recv, ka_type, last_ka, next_ka,
+                            "{} {:ssh_width$}  {:name_width$}  {:>unseen_width$}  {:>send_width$}  {:>recv_width$}  {:ka_width$}  {:>nop_width$}  {:>next_width$}",
+                            current, ssh, name, unseen, send, recv, ka_type, last_ka, next_ka,
                         ));
                     }
                 }
                 2 => {
                     // Combined Send/Recv and LastKA/NextKA
                     self.lines.push(format!(
-                        "  {:name_width$}  {:>unseen_width$}  {:>send_recv_combined_width$}  {:ka_width$}  {:>ka_next_combined_width$}",
-                        "World", "Unseen", "Send/Recv", "KeepAlive", "KA/Next",
+                        "  {:ssh_width$}  {:name_width$}  {:>unseen_width$}  {:>send_recv_combined_width$}  {:ka_width$}  {:>ka_next_combined_width$}",
+                        "SSH", "World", "Unseen", "Send/Recv", "KeepAlive", "KA/Next",
                     ));
-                    for (current, name, unseen, send, recv, ka_type, last_ka, next_ka) in &connected_info {
+                    for (current, ssh, name, unseen, send, recv, ka_type, last_ka, next_ka) in &connected_info {
                         let sr = format!("{}/{}", send, recv);
                         let kn = format!("{}/{}", last_ka, next_ka);
                         self.lines.push(format!(
-                            "{} {:name_width$}  {:>unseen_width$}  {:>send_recv_combined_width$}  {:ka_width$}  {:>ka_next_combined_width$}",
-                            current, name, unseen, sr, ka_type, kn,
+                            "{} {:ssh_width$}  {:name_width$}  {:>unseen_width$}  {:>send_recv_combined_width$}  {:ka_width$}  {:>ka_next_combined_width$}",
+                            current, ssh, name, unseen, sr, ka_type, kn,
                         ));
                     }
                 }
                 3 => {
                     // Remove KeepAlive type column
                     self.lines.push(format!(
-                        "  {:name_width$}  {:>unseen_width$}  {:>send_recv_combined_width$}  {:>ka_next_combined_width$}",
-                        "World", "Unseen", "Send/Recv", "KA/Next",
+                        "  {:ssh_width$}  {:name_width$}  {:>unseen_width$}  {:>send_recv_combined_width$}  {:>ka_next_combined_width$}",
+                        "SSH", "World", "Unseen", "Send/Recv", "KA/Next",
                     ));
-                    for (current, name, unseen, send, recv, _ka_type, last_ka, next_ka) in &connected_info {
+                    for (current, ssh, name, unseen, send, recv, _ka_type, last_ka, next_ka) in &connected_info {
                         let sr = format!("{}/{}", send, recv);
                         let kn = format!("{}/{}", last_ka, next_ka);
                         self.lines.push(format!(
-                            "{} {:name_width$}  {:>unseen_width$}  {:>send_recv_combined_width$}  {:>ka_next_combined_width$}",
-                            current, name, unseen, sr, kn,
+                            "{} {:ssh_width$}  {:name_width$}  {:>unseen_width$}  {:>send_recv_combined_width$}  {:>ka_next_combined_width$}",
+                            current, ssh, name, unseen, sr, kn,
                         ));
                     }
                 }
                 _ => {
                     // Minimal: Remove KA columns entirely
                     self.lines.push(format!(
-                        "  {:name_width$}  {:>unseen_width$}  {:>send_recv_combined_width$}",
-                        "World", "Unseen", "Send/Recv",
+                        "  {:ssh_width$}  {:name_width$}  {:>unseen_width$}  {:>send_recv_combined_width$}",
+                        "SSH", "World", "Unseen", "Send/Recv",
                     ));
-                    for (current, name, unseen, send, recv, _ka_type, _last_ka, _next_ka) in &connected_info {
+                    for (current, ssh, name, unseen, send, recv, _ka_type, _last_ka, _next_ka) in &connected_info {
                         let sr = format!("{}/{}", send, recv);
                         self.lines.push(format!(
-                            "{} {:name_width$}  {:>unseen_width$}  {:>send_recv_combined_width$}",
-                            current, name, unseen, sr,
+                            "{} {:ssh_width$}  {:name_width$}  {:>unseen_width$}  {:>send_recv_combined_width$}",
+                            current, ssh, name, unseen, sr,
                         ));
                     }
                 }
@@ -8213,6 +8221,7 @@ mod remote_gui {
                                             connected: world.connected,
                                             is_current: idx == self.current_world,
                                             is_ssl: world.settings.use_ssl,
+                                            is_proxy: false,  // GUI doesn't have access to proxy state
                                             unseen_lines: world.unseen_lines,
                                             last_send_secs: world.last_send_secs,
                                             last_recv_secs: world.last_recv_secs,
@@ -10397,6 +10406,7 @@ mod remote_gui {
                                                 connected: world.connected,
                                                 is_current: idx == self.current_world,
                                                 is_ssl: world.settings.use_ssl,
+                                                is_proxy: false,  // GUI doesn't have access to proxy state
                                                 unseen_lines: world.unseen_lines,
                                                 last_send_secs: world.last_send_secs,
                                                 last_recv_secs: world.last_recv_secs,
@@ -20857,7 +20867,8 @@ async fn handle_command(cmd: &str, app: &mut App, event_tx: mpsc::Sender<AppEven
                     name: world.name.clone(),
                     connected: world.connected,
                     is_current: idx == current_idx,
-                    is_ssl: world.settings.use_ssl,
+                    is_ssl: world.is_tls,
+                    is_proxy: world.proxy_pid.is_some(),
                     unseen_lines: world.unseen_lines,
                     last_send_secs: world.last_user_command_time.map(|t| now.duration_since(t).as_secs()),
                     last_recv_secs: world.last_receive_time.map(|t| now.duration_since(t).as_secs()),
