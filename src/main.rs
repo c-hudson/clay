@@ -17551,10 +17551,20 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
             render_output_crossterm(&app);
             app.needs_output_redraw = false;
             // Mark current world as seen since its output was just displayed
-            if app.current_world().unseen_lines > 0 {
+            let has_unseen = app.current_world().unseen_lines > 0;
+            let has_pending = !app.current_world().pending_lines.is_empty();
+            if has_unseen {
                 app.current_world_mut().mark_seen();
                 // Broadcast to WebSocket clients
                 app.ws_broadcast(WsMessage::UnseenCleared { world_index: app.current_world_index });
+            }
+            // If more mode is disabled but world has orphaned pending_lines, release them
+            if has_pending && !app.settings.more_mode_enabled {
+                let world = app.current_world_mut();
+                world.output_lines.append(&mut world.pending_lines);
+                world.pending_since = None;
+                world.paused = false;
+                world.scroll_to_bottom();
             }
         }
 
