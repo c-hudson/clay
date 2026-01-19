@@ -9614,7 +9614,8 @@ mod remote_gui {
 
                         ui.horizontal(|ui| {
                             // Center the horizontal group
-                            ui.add_space((ui.available_width() - 400.0) / 2.0);
+                            let centering_space = ((ui.available_width() - 400.0) / 2.0).max(0.0);
+                            ui.add_space(centering_space);
 
                             // Image on left (30% smaller: 179x125)
                             let splash_image = egui::Image::from_bytes(

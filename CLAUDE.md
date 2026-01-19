@@ -577,7 +577,8 @@ Note: HTTP automatically starts the non-secure WebSocket server if not already r
 
 **Features:**
 - Full MUD client in the browser
-- ANSI color rendering (including 256-color and true color support)
+- ANSI color rendering (Xubuntu Dark palette, 256-color and true color support)
+- Shade character blending (░▒▓ rendered as solid blocks with blended colors)
 - Clickable URLs in output (cyan, underlined, opens in new tab)
 - More-mode pausing with Tab or Escape+j
 - Command history (Ctrl+P/N)
@@ -597,12 +598,13 @@ Note: HTTP automatically starts the non-secure WebSocket server if not already r
   - Worlds List - Opens connected worlds list popup
   - World Selector - Opens world selector popup
   - Actions - Opens actions editor popup
-  - Setup - Opens setup popup
+  - Settings - Opens settings popup
   - Toggle Tags - Show/hide MUD tags (same as F2)
   - Toggle Highlight - Highlight lines matching action patterns (same as F8)
   - Resync - Request full state resync from server
-- Font slider next to hamburger for adjusting text size
-- "Clay" title displayed after font slider
+- Font size buttons (S/M/L) next to hamburger for adjusting text size
+  - Font sizes saved separately for phone, tablet, and desktop
+- "Clay" title displayed after font buttons
 
 **Mobile Web Interface:**
 - Toolbar uses `position: fixed` to stay visible during scrolling and keyboard display
@@ -615,7 +617,7 @@ Note: HTTP automatically starts the non-secure WebSocket server if not already r
 - Visibility change detection: auto-resync when browser tab becomes visible (handles sleep/wake)
 
 **Mobile Toolbar Layout:**
-- Left side: Menu (hamburger), PgUp, PgDn
+- Left side: Menu (hamburger), PgUp, PgDn, Tags (👁)
 - Right side: ▲ (Previous World), ▼ (Next World)
 - PgUp/PgDn on left for easy scrolling access; world switching on right
 
