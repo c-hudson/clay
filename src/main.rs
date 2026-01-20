@@ -3210,6 +3210,10 @@ enum Command {
     Unban { host: String },
     /// /testmusic - play a test ANSI music sequence
     TestMusic,
+    /// /debug - show debug info about world state
+    Debug,
+    /// /dump - dump all scrollback buffers to ~/.clay.dmp.log
+    Dump,
     /// /<action_name> [args] - execute action
     ActionCommand { name: String, args: String },
     /// Not a command (regular text to send to MUD)
@@ -3274,6 +3278,8 @@ fn parse_command(input: &str) -> Command {
             }
         }
         "/testmusic" => Command::TestMusic,
+        "/debug" => Command::Debug,
+        "/dump" => Command::Dump,
         _ => {
             // Check if it's an action command (starts with / but not a known command)
             let action_name = cmd.trim_start_matches('/');
@@ -10382,7 +10388,7 @@ mod remote_gui {
                             // Clay / commands: internal commands + manual actions
                             let internal_commands = vec![
                                 "/help", "/version", "/disconnect", "/dc", "/send", "/worlds", "/connections",
-                                "/setup", "/web", "/actions", "/keepalive", "/reload", "/quit", "/gag", "/testmusic",
+                                "/setup", "/web", "/actions", "/keepalive", "/reload", "/quit", "/gag", "/testmusic", "/debug", "/dump",
                             ];
 
                             // Get manual actions (empty pattern)
@@ -17984,6 +17990,78 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                             ts: current_timestamp_secs(),
                                         });
                                     }
+                                    Command::Debug => {
+                                        let ts = current_timestamp_secs();
+                                        app.ws_broadcast(WsMessage::ServerData { world_index, data: "=== Debug: World State ===".to_string(), is_viewed: false, ts });
+                                        app.ws_broadcast(WsMessage::ServerData { world_index, data: format!("current_world_index: {}", app.current_world_index), is_viewed: false, ts });
+                                        app.ws_broadcast(WsMessage::ServerData { world_index, data: format!("activity_count(): {}", app.activity_count()), is_viewed: false, ts });
+                                        for (i, w) in app.worlds.iter().enumerate() {
+                                            let current = if i == app.current_world_index { " *CURRENT*" } else { "" };
+                                            app.ws_broadcast(WsMessage::ServerData { world_index, data: format!("[{}] {}{}", i, w.name, current), is_viewed: false, ts });
+                                            app.ws_broadcast(WsMessage::ServerData { world_index, data: format!("  unseen_lines: {}, pending: {}, has_activity: {}", w.unseen_lines, w.pending_lines.len(), w.has_activity()), is_viewed: false, ts });
+                                        }
+                                        app.ws_broadcast(WsMessage::ServerData { world_index, data: "=== End Debug ===".to_string(), is_viewed: false, ts });
+                                    }
+                                    Command::Dump => {
+                                        // Dump all scrollback buffers to ~/.clay.dmp.log
+                                        use std::io::Write;
+                                        let ts = current_timestamp_secs();
+
+                                        let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
+                                        let dump_path = format!("{}/.clay.dmp.log", home);
+
+                                        match std::fs::File::create(&dump_path) {
+                                            Ok(mut file) => {
+                                                let mut total_lines = 0;
+                                                for world in app.worlds.iter() {
+                                                    for line in &world.output_lines {
+                                                        let line_ts = line.timestamp
+                                                            .duration_since(std::time::UNIX_EPOCH)
+                                                            .map(|d| d.as_secs())
+                                                            .unwrap_or(0) as libc::time_t;
+                                                        let mut tm: libc::tm = unsafe { std::mem::zeroed() };
+                                                        unsafe { libc::localtime_r(&line_ts, &mut tm); }
+                                                        let datetime = format!(
+                                                            "{:04}-{:02}-{:02} {:02}:{:02}:{:02}",
+                                                            tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday,
+                                                            tm.tm_hour, tm.tm_min, tm.tm_sec
+                                                        );
+                                                        let _ = writeln!(file, "{},{},{}", world.name, datetime, line.text);
+                                                        total_lines += 1;
+                                                    }
+                                                    for line in &world.pending_lines {
+                                                        let line_ts = line.timestamp
+                                                            .duration_since(std::time::UNIX_EPOCH)
+                                                            .map(|d| d.as_secs())
+                                                            .unwrap_or(0) as libc::time_t;
+                                                        let mut tm: libc::tm = unsafe { std::mem::zeroed() };
+                                                        unsafe { libc::localtime_r(&line_ts, &mut tm); }
+                                                        let datetime = format!(
+                                                            "{:04}-{:02}-{:02} {:02}:{:02}:{:02}",
+                                                            tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday,
+                                                            tm.tm_hour, tm.tm_min, tm.tm_sec
+                                                        );
+                                                        let _ = writeln!(file, "{},{},{}", world.name, datetime, line.text);
+                                                        total_lines += 1;
+                                                    }
+                                                }
+                                                app.ws_broadcast(WsMessage::ServerData {
+                                                    world_index,
+                                                    data: format!("Dumped {} lines from {} worlds to {}", total_lines, app.worlds.len(), dump_path),
+                                                    is_viewed: false,
+                                                    ts,
+                                                });
+                                            }
+                                            Err(e) => {
+                                                app.ws_broadcast(WsMessage::ServerData {
+                                                    world_index,
+                                                    data: format!("Failed to create dump file: {}", e),
+                                                    is_viewed: false,
+                                                    ts,
+                                                });
+                                            }
+                                        }
+                                    }
                                     // Commands that should be blocked from remote
                                     Command::Quit | Command::Reload => {
                                         app.ws_broadcast(WsMessage::ServerData {
@@ -19309,6 +19387,78 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                         is_viewed: false,
                                         ts: current_timestamp_secs(),
                                     });
+                                }
+                                Command::Debug => {
+                                    let ts = current_timestamp_secs();
+                                    app.ws_broadcast(WsMessage::ServerData { world_index, data: "=== Debug: World State ===".to_string(), is_viewed: false, ts });
+                                    app.ws_broadcast(WsMessage::ServerData { world_index, data: format!("current_world_index: {}", app.current_world_index), is_viewed: false, ts });
+                                    app.ws_broadcast(WsMessage::ServerData { world_index, data: format!("activity_count(): {}", app.activity_count()), is_viewed: false, ts });
+                                    for (i, w) in app.worlds.iter().enumerate() {
+                                        let current = if i == app.current_world_index { " *CURRENT*" } else { "" };
+                                        app.ws_broadcast(WsMessage::ServerData { world_index, data: format!("[{}] {}{}", i, w.name, current), is_viewed: false, ts });
+                                        app.ws_broadcast(WsMessage::ServerData { world_index, data: format!("  unseen_lines: {}, pending: {}, has_activity: {}", w.unseen_lines, w.pending_lines.len(), w.has_activity()), is_viewed: false, ts });
+                                    }
+                                    app.ws_broadcast(WsMessage::ServerData { world_index, data: "=== End Debug ===".to_string(), is_viewed: false, ts });
+                                }
+                                Command::Dump => {
+                                    // Dump all scrollback buffers to ~/.clay.dmp.log
+                                    use std::io::Write;
+                                    let ts = current_timestamp_secs();
+
+                                    let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
+                                    let dump_path = format!("{}/.clay.dmp.log", home);
+
+                                    match std::fs::File::create(&dump_path) {
+                                        Ok(mut file) => {
+                                            let mut total_lines = 0;
+                                            for world in app.worlds.iter() {
+                                                for line in &world.output_lines {
+                                                    let line_ts = line.timestamp
+                                                        .duration_since(std::time::UNIX_EPOCH)
+                                                        .map(|d| d.as_secs())
+                                                        .unwrap_or(0) as libc::time_t;
+                                                    let mut tm: libc::tm = unsafe { std::mem::zeroed() };
+                                                    unsafe { libc::localtime_r(&line_ts, &mut tm); }
+                                                    let datetime = format!(
+                                                        "{:04}-{:02}-{:02} {:02}:{:02}:{:02}",
+                                                        tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday,
+                                                        tm.tm_hour, tm.tm_min, tm.tm_sec
+                                                    );
+                                                    let _ = writeln!(file, "{},{},{}", world.name, datetime, line.text);
+                                                    total_lines += 1;
+                                                }
+                                                for line in &world.pending_lines {
+                                                    let line_ts = line.timestamp
+                                                        .duration_since(std::time::UNIX_EPOCH)
+                                                        .map(|d| d.as_secs())
+                                                        .unwrap_or(0) as libc::time_t;
+                                                    let mut tm: libc::tm = unsafe { std::mem::zeroed() };
+                                                    unsafe { libc::localtime_r(&line_ts, &mut tm); }
+                                                    let datetime = format!(
+                                                        "{:04}-{:02}-{:02} {:02}:{:02}:{:02}",
+                                                        tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday,
+                                                        tm.tm_hour, tm.tm_min, tm.tm_sec
+                                                    );
+                                                    let _ = writeln!(file, "{},{},{}", world.name, datetime, line.text);
+                                                    total_lines += 1;
+                                                }
+                                            }
+                                            app.ws_broadcast(WsMessage::ServerData {
+                                                world_index,
+                                                data: format!("Dumped {} lines from {} worlds to {}", total_lines, app.worlds.len(), dump_path),
+                                                is_viewed: false,
+                                                ts,
+                                            });
+                                        }
+                                        Err(e) => {
+                                            app.ws_broadcast(WsMessage::ServerData {
+                                                world_index,
+                                                data: format!("Failed to create dump file: {}", e),
+                                                is_viewed: false,
+                                                ts,
+                                            });
+                                        }
+                                    }
                                 }
                                 // Commands that should be blocked from remote
                                 Command::Quit | Command::Reload => {
@@ -20962,7 +21112,7 @@ fn handle_key_event(key: KeyEvent, app: &mut App) -> KeyAction {
                 // Clay / commands: internal commands + manual actions
                 let internal_commands = vec![
                     "/help", "/disconnect", "/dc", "/send", "/worlds", "/connections",
-                    "/setup", "/web", "/actions", "/keepalive", "/reload", "/quit", "/gag", "/testmusic",
+                    "/setup", "/web", "/actions", "/keepalive", "/reload", "/quit", "/gag", "/testmusic", "/debug", "/dump",
                 ];
 
                 // Get manual actions (empty pattern)
@@ -22658,6 +22808,102 @@ async fn handle_command(cmd: &str, app: &mut App, event_tx: mpsc::Sender<AppEven
                 notes: test_notes,
             });
             app.add_output("Playing test music (C-D-E-F-G)...");
+        }
+        Command::Debug => {
+            // Show debug info about all worlds to diagnose activity indicator issues
+            // Collect lines first to avoid borrow checker issues with app.add_output inside loop
+            let mut debug_lines = Vec::new();
+            debug_lines.push("=== Debug: World State ===".to_string());
+            debug_lines.push(format!("current_world_index: {}", app.current_world_index));
+            debug_lines.push(format!("activity_count(): {}", app.activity_count()));
+            debug_lines.push(format!("world_switch_mode: {:?}", app.settings.world_switch_mode));
+            debug_lines.push(String::new());
+            for (i, w) in app.worlds.iter().enumerate() {
+                let current = if i == app.current_world_index { " *CURRENT*" } else { "" };
+                debug_lines.push(format!("[{}] {}{}", i, w.name, current));
+                debug_lines.push(format!("  connected: {}", w.connected));
+                debug_lines.push(format!("  unseen_lines: {}", w.unseen_lines));
+                debug_lines.push(format!("  pending_lines.len(): {}", w.pending_lines.len()));
+                debug_lines.push(format!("  has_activity(): {}", w.has_activity()));
+                debug_lines.push(format!("  output_lines.len(): {}", w.output_lines.len()));
+                debug_lines.push(format!("  paused: {}", w.paused));
+                debug_lines.push(format!("  first_unseen_at: {:?}", w.first_unseen_at));
+                if let Some(pending_since) = w.pending_since {
+                    debug_lines.push(format!("  pending_since: {:?} ago", pending_since.elapsed()));
+                }
+            }
+            debug_lines.push("=== End Debug ===".to_string());
+
+            for line in debug_lines {
+                app.add_output(&line);
+            }
+        }
+        Command::Dump => {
+            // Dump all scrollback buffers to ~/.clay.dmp.log
+            use std::io::Write;
+
+            let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
+            let dump_path = format!("{}/.clay.dmp.log", home);
+
+            match std::fs::File::create(&dump_path) {
+                Ok(mut file) => {
+                    let mut total_lines = 0;
+
+                    // Cycle through all worlds
+                    for world in app.worlds.iter() {
+                        // Write output_lines
+                        for line in &world.output_lines {
+                            // Format timestamp as YYYY-MM-DD HH:MM:SS
+                            let ts = line.timestamp
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .map(|d| d.as_secs())
+                                .unwrap_or(0) as libc::time_t;
+                            let mut tm: libc::tm = unsafe { std::mem::zeroed() };
+                            unsafe { libc::localtime_r(&ts, &mut tm); }
+                            let datetime = format!(
+                                "{:04}-{:02}-{:02} {:02}:{:02}:{:02}",
+                                tm.tm_year + 1900,
+                                tm.tm_mon + 1,
+                                tm.tm_mday,
+                                tm.tm_hour,
+                                tm.tm_min,
+                                tm.tm_sec
+                            );
+
+                            // Write: world_name,datetime,line_text
+                            let _ = writeln!(file, "{},{},{}", world.name, datetime, line.text);
+                            total_lines += 1;
+                        }
+
+                        // Also write pending_lines if any
+                        for line in &world.pending_lines {
+                            let ts = line.timestamp
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .map(|d| d.as_secs())
+                                .unwrap_or(0) as libc::time_t;
+                            let mut tm: libc::tm = unsafe { std::mem::zeroed() };
+                            unsafe { libc::localtime_r(&ts, &mut tm); }
+                            let datetime = format!(
+                                "{:04}-{:02}-{:02} {:02}:{:02}:{:02}",
+                                tm.tm_year + 1900,
+                                tm.tm_mon + 1,
+                                tm.tm_mday,
+                                tm.tm_hour,
+                                tm.tm_min,
+                                tm.tm_sec
+                            );
+
+                            let _ = writeln!(file, "{},{},{}", world.name, datetime, line.text);
+                            total_lines += 1;
+                        }
+                    }
+
+                    app.add_output(&format!("Dumped {} lines from {} worlds to {}", total_lines, app.worlds.len(), dump_path));
+                }
+                Err(e) => {
+                    app.add_output(&format!("Failed to create dump file: {}", e));
+                }
+            }
         }
         Command::ActionCommand { name, args } => {
             // Check if this is an action command (/name)
