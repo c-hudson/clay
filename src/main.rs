@@ -19988,6 +19988,13 @@ fn handle_key_event(key: KeyEvent, app: &mut App) -> KeyAction {
                 app.filter_popup.close();
                 app.needs_output_redraw = true;
             }
+            KeyCode::F(2) => {
+                // F2 toggles show_tags while filter is open
+                app.show_tags = !app.show_tags;
+                let output_lines = app.current_world().output_lines.clone();
+                app.filter_popup.update_filter(&output_lines);
+                app.needs_output_redraw = true;
+            }
             KeyCode::Backspace => {
                 if app.filter_popup.cursor > 0 {
                     app.filter_popup.cursor -= 1;
