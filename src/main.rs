@@ -2092,26 +2092,15 @@ impl FilterPopup {
 }
 
 /// Convert a wildcard filter pattern to regex for F4 filter popup.
-/// Unlike wildcard_to_regex(), this is designed for filter use:
-/// - If pattern starts with *, no ^ anchor (match anywhere from start)
-/// - If pattern ends with *, no $ anchor (match anywhere to end)
-/// - Without leading/trailing *, pattern is anchored to start/end
+/// Always uses "contains" semantics - patterns match anywhere in the line.
 /// Examples:
 ///   "*foo*" matches any line containing "foo"
-///   "foo*" matches lines starting with "foo"
-///   "*foo" matches lines ending with "foo"
-///   "fo?bar" matches lines that are exactly "fo?bar" (? = any single char)
+///   "foo*" matches any line containing "foo" followed by anything
+///   "hel?o" matches any line containing "hello", "helao", etc.
 fn filter_wildcard_to_regex(pattern: &str) -> Option<regex::Regex> {
-    let mut regex = String::with_capacity(pattern.len() * 2 + 2);
+    let mut regex = String::with_capacity(pattern.len() * 2 + 4);
 
-    // Check for leading/trailing wildcards to determine anchoring
-    let starts_with_star = pattern.starts_with('*');
-    let ends_with_star = pattern.ends_with('*');
-
-    // Add start anchor if pattern doesn't start with *
-    if !starts_with_star {
-        regex.push('^');
-    }
+    // No anchoring - always "contains" semantics for filter
 
     for c in pattern.chars() {
         match c {
@@ -2124,11 +2113,6 @@ fn filter_wildcard_to_regex(pattern: &str) -> Option<regex::Regex> {
             }
             _ => regex.push(c),
         }
-    }
-
-    // Add end anchor if pattern doesn't end with *
-    if !ends_with_star {
-        regex.push('$');
     }
 
     regex::RegexBuilder::new(&regex)

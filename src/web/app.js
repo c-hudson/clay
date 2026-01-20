@@ -1717,15 +1717,11 @@
     }
 
     // Convert wildcard filter pattern to regex for F4 filter popup
-    // - If pattern starts with *, no ^ anchor (match anywhere from start)
-    // - If pattern ends with *, no $ anchor (match anywhere to end)
-    // - * matches any sequence, ? matches any single character
+    // Always uses "contains" semantics - patterns match anywhere in the line
+    // * matches any sequence, ? matches any single character
     function filterWildcardToRegex(pattern) {
-        const startsWithStar = pattern.startsWith('*');
-        const endsWithStar = pattern.endsWith('*');
-
         let regex = '';
-        if (!startsWithStar) regex += '^';
+        // No anchoring - always "contains" semantics for filter
 
         for (const c of pattern) {
             if (c === '*') {
@@ -1738,8 +1734,6 @@
                 regex += c;
             }
         }
-
-        if (!endsWithStar) regex += '$';
 
         try {
             return new RegExp(regex, 'i');
