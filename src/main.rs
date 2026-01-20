@@ -3484,6 +3484,144 @@ fn wildcard_to_regex(pattern: &str) -> String {
     regex
 }
 
+/// Execute recall command with options
+/// Returns (matches, header_message) - matches is the list of matching lines
+fn execute_recall(opts: &tf::RecallOptions, output_lines: &[OutputLine]) -> (Vec<String>, Option<String>) {
+    use tf::{RecallMatchStyle, RecallRange};
+
+    // Build regex from pattern based on match style
+    let regex = opts.pattern.as_ref().map(|pattern| {
+        let regex_pattern = match opts.match_style {
+            RecallMatchStyle::Simple => {
+                // Simple: escape everything, just substring match
+                regex::escape(pattern)
+            }
+            RecallMatchStyle::Glob => {
+                // Glob: convert wildcards to regex
+                wildcard_to_regex(pattern)
+            }
+            RecallMatchStyle::Regexp => {
+                // Regexp: use as-is
+                pattern.clone()
+            }
+        };
+        regex::RegexBuilder::new(&regex_pattern)
+            .case_insensitive(true)
+            .build()
+    });
+
+    // Determine line range based on RecallRange
+    let (start_idx, end_idx) = match &opts.range {
+        RecallRange::All => (0, output_lines.len()),
+        RecallRange::Last(n) => {
+            let start = output_lines.len().saturating_sub(*n);
+            (start, output_lines.len())
+        }
+        RecallRange::LastMatching(n) => {
+            // Will be handled specially below - get last n MATCHING lines
+            (0, output_lines.len())
+        }
+        RecallRange::Range(x, y) => {
+            // x and y are 1-based line numbers
+            let start = x.saturating_sub(1).min(output_lines.len());
+            let end = (*y).min(output_lines.len());
+            (start, end)
+        }
+        RecallRange::Previous(n) => {
+            // -y means yth previous line
+            let idx = output_lines.len().saturating_sub(*n);
+            (idx, idx + 1)
+        }
+        RecallRange::After(x) => {
+            // x- means lines after x (1-based)
+            let start = x.saturating_sub(1).min(output_lines.len());
+            (start, output_lines.len())
+        }
+        RecallRange::TimePeriod(secs) => {
+            // Lines within the last `secs` seconds
+            let now = std::time::SystemTime::now();
+            let cutoff = now - std::time::Duration::from_secs_f64(*secs);
+            let start = output_lines.iter().position(|line| line.timestamp >= cutoff).unwrap_or(output_lines.len());
+            (start, output_lines.len())
+        }
+        RecallRange::TimeRange(start_secs, end_secs) => {
+            // Lines between two time periods
+            let now = std::time::SystemTime::now();
+            let start_time = now - std::time::Duration::from_secs_f64(*start_secs);
+            let end_time = now - std::time::Duration::from_secs_f64(*end_secs);
+            let start = output_lines.iter().position(|line| line.timestamp >= start_time).unwrap_or(output_lines.len());
+            let end = output_lines.iter().rposition(|line| line.timestamp <= end_time).map(|i| i + 1).unwrap_or(0);
+            (start, end.max(start))
+        }
+    };
+
+    // Collect matching lines
+    let mut matches: Vec<(usize, String)> = Vec::new();
+    let lines_to_check = &output_lines[start_idx..end_idx];
+
+    for (rel_idx, line) in lines_to_check.iter().enumerate() {
+        let abs_idx = start_idx + rel_idx;
+
+        // Skip gagged lines unless show_gagged is set
+        if line.gagged && !opts.show_gagged {
+            continue;
+        }
+
+        let plain = strip_ansi_codes(&line.text);
+        let is_match = match &regex {
+            Some(Ok(re)) => {
+                let matched = re.is_match(&plain);
+                if opts.inverse_match { !matched } else { matched }
+            }
+            Some(Err(_)) => false, // Invalid regex
+            None => true, // No pattern = match all
+        };
+
+        if is_match {
+            let mut display_line = line.text.clone();
+
+            // Add timestamp if requested
+            if opts.show_timestamps {
+                let ts = line.timestamp.duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0);
+                // Simple timestamp format HH:MM:SS
+                let secs = ts % 60;
+                let mins = (ts / 60) % 60;
+                let hours = (ts / 3600) % 24;
+                let ts_str = format!("{:02}:{:02}:{:02}", hours, mins, secs);
+                display_line = format!("[{}] {}", ts_str, display_line);
+            }
+
+            // Add line number if requested
+            if opts.show_line_numbers {
+                display_line = format!("{}: {}", abs_idx + 1, display_line);
+            }
+
+            matches.push((abs_idx, display_line));
+        }
+    }
+
+    // Handle LastMatching - keep only last N matches
+    if let RecallRange::LastMatching(n) = &opts.range {
+        let skip = matches.len().saturating_sub(*n);
+        matches = matches.into_iter().skip(skip).collect();
+    }
+
+    // TODO: Handle context lines (-A, -B, -C) if needed
+
+    let result: Vec<String> = matches.into_iter().map(|(_, s)| s).collect();
+
+    // Generate header if not quiet
+    let header = if opts.quiet {
+        None
+    } else {
+        Some(format!("================ Recall start ================"))
+    };
+
+    (result, header)
+}
+
 /// Check if a line matches any action triggers
 /// Returns None if no match, Some(result) if matched
 fn check_action_triggers(
@@ -16802,52 +16940,34 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                     if num_part.chars().all(|c| c.is_ascii_digit()) && !num_part.is_empty() {
                                         let pattern = rest[space_pos..].trim();
                                         if !pattern.is_empty() {
-                                            // Convert to #recall -N pattern
-                                            let recall_cmd = format!("#recall -{} {}", num_part, pattern);
+                                            // Convert to #recall /N pattern
+                                            let recall_cmd = format!("#recall /{} {}", num_part, pattern);
                                             match app.tf_engine.execute(&recall_cmd) {
-                                                tf::TfCommandResult::Recall { pattern, count } => {
-                                                    // Handle recall inline
-                                                    let regex_pattern = wildcard_to_regex(&pattern);
-                                                    if let Ok(re) = regex::Regex::new(&format!("(?i){}", regex_pattern)) {
-                                                        let matches: Vec<String> = {
-                                                            let world = app.current_world();
-                                                            let mut m: Vec<String> = Vec::new();
-                                                            for output_line in world.output_lines.iter().rev() {
-                                                                let plain = strip_ansi_codes(&output_line.text);
-                                                                if re.is_match(&plain) {
-                                                                    m.push(output_line.text.clone());
-                                                                    if let Some(limit) = count {
-                                                                        if m.len() >= limit {
-                                                                            break;
-                                                                        }
-                                                                    }
-                                                                }
-                                                            }
-                                                            m.reverse();
-                                                            m
-                                                        };
+                                                tf::TfCommandResult::Recall(opts) => {
+                                                    let output_lines = app.current_world().output_lines.clone();
+                                                    let (matches, header) = execute_recall(&opts, &output_lines);
+                                                    let pattern_str = opts.pattern.as_deref().unwrap_or("*");
 
-                                                        if matches.is_empty() {
-                                                            app.add_tf_output(&format!("No matches for '{}'", pattern));
-                                                        } else {
-                                                            app.add_tf_output(&format!("{} match{} for '{}':",
-                                                                matches.len(),
-                                                                if matches.len() == 1 { "" } else { "es" },
-                                                                pattern));
-                                                            for m in &matches {
-                                                                app.add_tf_output(m);
-                                                            }
+                                                    if !opts.quiet {
+                                                        if let Some(h) = header {
+                                                            app.add_tf_output(&h);
                                                         }
+                                                    }
+                                                    if matches.is_empty() {
+                                                        app.add_tf_output(&format!("No matches for '{}'", pattern_str));
                                                     } else {
-                                                        app.add_tf_output(&format!("Invalid pattern: {}", pattern));
+                                                        for m in &matches {
+                                                            app.add_tf_output(m);
+                                                        }
+                                                    }
+                                                    if !opts.quiet {
+                                                        app.add_tf_output("================= Recall end =================");
                                                     }
                                                 }
-                                                other => {
-                                                    // Shouldn't happen but handle other results
-                                                    if let tf::TfCommandResult::Error(err) = other {
-                                                        app.add_tf_output(&format!("Error: {}", err));
-                                                    }
+                                                tf::TfCommandResult::Error(err) => {
+                                                    app.add_tf_output(&format!("Error: {}", err));
                                                 }
+                                                _ => {}
                                             }
                                             continue;
                                         }
@@ -16892,41 +17012,25 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                             return Ok(());
                                         }
                                     }
-                                    tf::TfCommandResult::Recall { pattern, count } => {
-                                        // Convert glob pattern to regex
-                                        let regex_pattern = wildcard_to_regex(&pattern);
-                                        if let Ok(re) = regex::Regex::new(&format!("(?i){}", regex_pattern)) {
-                                            let matches: Vec<String> = {
-                                                let world = app.current_world();
-                                                let mut m: Vec<String> = Vec::new();
-                                                for output_line in world.output_lines.iter().rev() {
-                                                    let plain = strip_ansi_codes(&output_line.text);
-                                                    if re.is_match(&plain) {
-                                                        m.push(output_line.text.clone());
-                                                        if let Some(limit) = count {
-                                                            if m.len() >= limit {
-                                                                break;
-                                                            }
-                                                        }
-                                                    }
-                                                }
-                                                m.reverse();
-                                                m
-                                            };
+                                    tf::TfCommandResult::Recall(opts) => {
+                                        let output_lines = app.current_world().output_lines.clone();
+                                        let (matches, header) = execute_recall(&opts, &output_lines);
+                                        let pattern_str = opts.pattern.as_deref().unwrap_or("*");
 
-                                            if matches.is_empty() {
-                                                app.add_output(&format!("%% No matches for '{}'", pattern));
-                                            } else {
-                                                app.add_output(&format!("%% {} match{} for '{}':",
-                                                    matches.len(),
-                                                    if matches.len() == 1 { "" } else { "es" },
-                                                    pattern));
-                                                for m in &matches {
-                                                    app.add_output(m);
-                                                }
+                                        if !opts.quiet {
+                                            if let Some(h) = header {
+                                                app.add_output(&h);
                                             }
+                                        }
+                                        if matches.is_empty() {
+                                            app.add_output(&format!("%% No matches for '{}'", pattern_str));
                                         } else {
-                                            app.add_output(&format!("%% Invalid pattern: {}", pattern));
+                                            for m in &matches {
+                                                app.add_output(m);
+                                            }
+                                        }
+                                        if !opts.quiet {
+                                            app.add_output("================= Recall end =================");
                                         }
                                     }
                                     tf::TfCommandResult::NotTfCommand => {
@@ -17603,34 +17707,27 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                                         tf::TfCommandResult::ClayCommand(clay_cmd) => {
                                                             app.ws_send_to_client(client_id, WsMessage::ExecuteLocalCommand { command: clay_cmd });
                                                         }
-                                                        tf::TfCommandResult::Recall { pattern, count } => {
+                                                        tf::TfCommandResult::Recall(opts) => {
                                                             if world_index < app.worlds.len() {
-                                                                let regex_pattern = wildcard_to_regex(&pattern);
-                                                                if let Ok(re) = regex::Regex::new(&format!("(?i){}", regex_pattern)) {
-                                                                    let matches: Vec<String> = {
-                                                                        let world = &app.worlds[world_index];
-                                                                        let mut m: Vec<String> = Vec::new();
-                                                                        for output_line in world.output_lines.iter().rev() {
-                                                                            let plain = strip_ansi_codes(&output_line.text);
-                                                                            if re.is_match(&plain) {
-                                                                                m.push(output_line.text.clone());
-                                                                                if let Some(limit) = count {
-                                                                                    if m.len() >= limit { break; }
-                                                                                }
-                                                                            }
-                                                                        }
-                                                                        m.reverse();
-                                                                        m
-                                                                    };
-                                                                    let ts = current_timestamp_secs();
-                                                                    if matches.is_empty() {
-                                                                        app.ws_broadcast(WsMessage::ServerData { world_index, data: format!("%% No matches for '{}'", pattern), is_viewed: false, ts });
-                                                                    } else {
-                                                                        app.ws_broadcast(WsMessage::ServerData { world_index, data: format!("%% {} match{} for '{}':", matches.len(), if matches.len() == 1 { "" } else { "es" }, pattern), is_viewed: false, ts });
-                                                                        for m in matches {
-                                                                            app.ws_broadcast(WsMessage::ServerData { world_index, data: m, is_viewed: false, ts });
-                                                                        }
+                                                                let output_lines = app.worlds[world_index].output_lines.clone();
+                                                                let (matches, header) = execute_recall(&opts, &output_lines);
+                                                                let pattern_str = opts.pattern.as_deref().unwrap_or("*");
+                                                                let ts = current_timestamp_secs();
+
+                                                                if !opts.quiet {
+                                                                    if let Some(h) = header {
+                                                                        app.ws_broadcast(WsMessage::ServerData { world_index, data: h, is_viewed: false, ts });
                                                                     }
+                                                                }
+                                                                if matches.is_empty() {
+                                                                    app.ws_broadcast(WsMessage::ServerData { world_index, data: format!("%% No matches for '{}'", pattern_str), is_viewed: false, ts });
+                                                                } else {
+                                                                    for m in matches {
+                                                                        app.ws_broadcast(WsMessage::ServerData { world_index, data: m, is_viewed: false, ts });
+                                                                    }
+                                                                }
+                                                                if !opts.quiet {
+                                                                    app.ws_broadcast(WsMessage::ServerData { world_index, data: "================= Recall end =================".to_string(), is_viewed: false, ts });
                                                                 }
                                                             }
                                                         }
@@ -18936,34 +19033,27 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                                     tf::TfCommandResult::ClayCommand(clay_cmd) => {
                                                         app.ws_send_to_client(client_id, WsMessage::ExecuteLocalCommand { command: clay_cmd });
                                                     }
-                                                    tf::TfCommandResult::Recall { pattern, count } => {
+                                                    tf::TfCommandResult::Recall(opts) => {
                                                         if world_index < app.worlds.len() {
-                                                            let regex_pattern = wildcard_to_regex(&pattern);
-                                                            if let Ok(re) = regex::Regex::new(&format!("(?i){}", regex_pattern)) {
-                                                                let matches: Vec<String> = {
-                                                                    let world = &app.worlds[world_index];
-                                                                    let mut m: Vec<String> = Vec::new();
-                                                                    for output_line in world.output_lines.iter().rev() {
-                                                                        let plain = strip_ansi_codes(&output_line.text);
-                                                                        if re.is_match(&plain) {
-                                                                            m.push(output_line.text.clone());
-                                                                            if let Some(limit) = count {
-                                                                                if m.len() >= limit { break; }
-                                                                            }
-                                                                        }
-                                                                    }
-                                                                    m.reverse();
-                                                                    m
-                                                                };
-                                                                let ts = current_timestamp_secs();
-                                                                if matches.is_empty() {
-                                                                    app.ws_broadcast(WsMessage::ServerData { world_index, data: format!("%% No matches for '{}'", pattern), is_viewed: false, ts });
-                                                                } else {
-                                                                    app.ws_broadcast(WsMessage::ServerData { world_index, data: format!("%% {} match{} for '{}':", matches.len(), if matches.len() == 1 { "" } else { "es" }, pattern), is_viewed: false, ts });
-                                                                    for m in matches {
-                                                                        app.ws_broadcast(WsMessage::ServerData { world_index, data: m, is_viewed: false, ts });
-                                                                    }
+                                                            let output_lines = app.worlds[world_index].output_lines.clone();
+                                                            let (matches, header) = execute_recall(&opts, &output_lines);
+                                                            let pattern_str = opts.pattern.as_deref().unwrap_or("*");
+                                                            let ts = current_timestamp_secs();
+
+                                                            if !opts.quiet {
+                                                                if let Some(h) = header {
+                                                                    app.ws_broadcast(WsMessage::ServerData { world_index, data: h, is_viewed: false, ts });
                                                                 }
+                                                            }
+                                                            if matches.is_empty() {
+                                                                app.ws_broadcast(WsMessage::ServerData { world_index, data: format!("%% No matches for '{}'", pattern_str), is_viewed: false, ts });
+                                                            } else {
+                                                                for m in matches {
+                                                                    app.ws_broadcast(WsMessage::ServerData { world_index, data: m, is_viewed: false, ts });
+                                                                }
+                                                            }
+                                                            if !opts.quiet {
+                                                                app.ws_broadcast(WsMessage::ServerData { world_index, data: "================= Recall end =================".to_string(), is_viewed: false, ts });
                                                             }
                                                         }
                                                     }
@@ -22616,32 +22706,25 @@ async fn handle_command(cmd: &str, app: &mut App, event_tx: mpsc::Sender<AppEven
                             tf::TfCommandResult::ClayCommand(clay_cmd) => {
                                 Box::pin(handle_command(&clay_cmd, app, event_tx.clone())).await;
                             }
-                            tf::TfCommandResult::Recall { pattern, count } => {
-                                let regex_pattern = wildcard_to_regex(&pattern);
-                                if let Ok(re) = regex::Regex::new(&format!("(?i){}", regex_pattern)) {
-                                    let matches: Vec<String> = {
-                                        let world = app.current_world();
-                                        let mut m: Vec<String> = Vec::new();
-                                        for output_line in world.output_lines.iter().rev() {
-                                            let plain = strip_ansi_codes(&output_line.text);
-                                            if re.is_match(&plain) {
-                                                m.push(output_line.text.clone());
-                                                if let Some(limit) = count {
-                                                    if m.len() >= limit { break; }
-                                                }
-                                            }
-                                        }
-                                        m.reverse();
-                                        m
-                                    };
-                                    if matches.is_empty() {
-                                        app.add_output(&format!("%% No matches for '{}'", pattern));
-                                    } else {
-                                        app.add_output(&format!("%% {} match{} for '{}':", matches.len(), if matches.len() == 1 { "" } else { "es" }, pattern));
-                                        for m in matches {
-                                            app.add_output(&m);
-                                        }
+                            tf::TfCommandResult::Recall(opts) => {
+                                let output_lines = app.current_world().output_lines.clone();
+                                let (matches, header) = execute_recall(&opts, &output_lines);
+                                let pattern_str = opts.pattern.as_deref().unwrap_or("*");
+
+                                if !opts.quiet {
+                                    if let Some(h) = header {
+                                        app.add_output(&h);
                                     }
+                                }
+                                if matches.is_empty() {
+                                    app.add_output(&format!("%% No matches for '{}'", pattern_str));
+                                } else {
+                                    for m in matches {
+                                        app.add_output(&m);
+                                    }
+                                }
+                                if !opts.quiet {
+                                    app.add_output("================= Recall end =================");
                                 }
                             }
                             _ => {}

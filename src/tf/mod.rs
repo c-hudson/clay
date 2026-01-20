@@ -86,6 +86,70 @@ impl From<String> for TfValue {
     }
 }
 
+/// Matching style for recall pattern
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum RecallMatchStyle {
+    Simple,   // Plain text substring matching
+    #[default]
+    Glob,     // Wildcard matching (* and ?)
+    Regexp,   // Regular expression
+}
+
+/// History source for recall
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum RecallSource {
+    #[default]
+    CurrentWorld,         // -w (default)
+    World(String),        // -wworld
+    Local,                // -l (TF output only)
+    Global,               // -g (all worlds + local)
+    Input,                // -i (input history)
+}
+
+/// Range specification for recall
+#[derive(Debug, Clone, PartialEq)]
+pub enum RecallRange {
+    /// /x - last x matching lines
+    LastMatching(usize),
+    /// x - from last x lines (or time period)
+    Last(usize),
+    /// x-y - lines from x to y
+    Range(usize, usize),
+    /// -y - yth previous line
+    Previous(usize),
+    /// x- - lines after x
+    After(usize),
+    /// Time-based range (seconds from now)
+    TimePeriod(f64),
+    /// Time range (start_secs, end_secs from now)
+    TimeRange(f64, f64),
+    /// All lines (no range specified)
+    All,
+}
+
+impl Default for RecallRange {
+    fn default() -> Self {
+        RecallRange::All
+    }
+}
+
+/// Options for the recall command
+#[derive(Debug, Clone, Default)]
+pub struct RecallOptions {
+    pub source: RecallSource,
+    pub range: RecallRange,
+    pub pattern: Option<String>,
+    pub match_style: RecallMatchStyle,
+    pub inverse_match: bool,        // -v
+    pub quiet: bool,                // -q
+    pub show_timestamps: bool,      // -t
+    pub timestamp_format: Option<String>,  // -t[format]
+    pub show_line_numbers: bool,    // #
+    pub show_gagged: bool,          // -ag
+    pub context_before: usize,      // -Bn
+    pub context_after: usize,       // -An
+}
+
 /// Result of executing a TF command
 #[derive(Debug)]
 pub enum TfCommandResult {
@@ -97,8 +161,8 @@ pub enum TfCommandResult {
     SendToMud(String),
     /// Command maps to a Clay command that should be executed
     ClayCommand(String),
-    /// Recall output history with pattern and optional count limit
-    Recall { pattern: String, count: Option<usize> },
+    /// Recall output history with full options
+    Recall(RecallOptions),
     /// Not a TF command (doesn't start with #)
     NotTfCommand,
     /// Unknown TF command

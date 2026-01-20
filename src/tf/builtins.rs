@@ -8,7 +8,7 @@
 use std::fs;
 use std::path::Path;
 use std::io::{BufRead, BufReader};
-use super::{TfEngine, TfCommandResult};
+use super::{TfEngine, TfCommandResult, RecallOptions, RecallSource, RecallRange, RecallMatchStyle};
 
 /// #beep - Sound the terminal bell
 pub fn cmd_beep() -> TfCommandResult {
@@ -138,36 +138,303 @@ pub fn cmd_quote(args: &str) -> TfCommandResult {
 /// Examples:
 ///   #recall *combat*     - Show all lines matching *combat*
 ///   #recall -10 *combat* - Show last 10 lines matching *combat*
+/// Parse a time string like "1:30" or "1:30:45" into seconds
+fn parse_time_to_seconds(s: &str) -> Option<f64> {
+    let parts: Vec<&str> = s.split(':').collect();
+    match parts.len() {
+        2 => {
+            // hours:minutes
+            let hours: f64 = parts[0].parse().ok()?;
+            let minutes: f64 = parts[1].parse().ok()?;
+            Some(hours * 3600.0 + minutes * 60.0)
+        }
+        3 => {
+            // hours:minutes:seconds
+            let hours: f64 = parts[0].parse().ok()?;
+            let minutes: f64 = parts[1].parse().ok()?;
+            let seconds: f64 = parts[2].parse().ok()?;
+            Some(hours * 3600.0 + minutes * 60.0 + seconds)
+        }
+        _ => None,
+    }
+}
+
+/// Check if a string looks like a time format (contains colon with digits)
+fn looks_like_time(s: &str) -> bool {
+    s.contains(':') && s.chars().all(|c| c.is_ascii_digit() || c == ':' || c == '.')
+}
+
+/// Parse a range value (could be line count, time, or real number)
+fn parse_range_value(s: &str) -> Option<(usize, Option<f64>)> {
+    // Check if it's a time format
+    if looks_like_time(s) {
+        let secs = parse_time_to_seconds(s)?;
+        return Some((0, Some(secs)));
+    }
+    // Check if it's a real number (absolute time)
+    if s.contains('.') {
+        let _time: f64 = s.parse().ok()?;
+        // For now, treat as line count 0 with time
+        return Some((0, Some(0.0))); // TODO: handle absolute time
+    }
+    // Plain integer
+    let n: usize = s.parse().ok()?;
+    Some((n, None))
+}
+
 pub fn cmd_recall(args: &str) -> TfCommandResult {
     let args = args.trim();
 
     if args.is_empty() {
-        return TfCommandResult::Success(Some("Usage: #recall [-count] pattern - Search output history".to_string()));
+        return TfCommandResult::Success(Some(
+            "Usage: /recall [-wworld] [-ligv] [-t[format]] [-aattrs] [-mstyle] [-An] [-Bn] [-Cn] [#]range [pattern]".to_string()
+        ));
     }
 
-    // Parse optional -count prefix
-    let (count, pattern) = if args.starts_with('-') {
-        if let Some(space_pos) = args.find(|c: char| c.is_whitespace()) {
-            let count_str = &args[1..space_pos];
-            if let Ok(n) = count_str.parse::<usize>() {
-                (Some(n), args[space_pos..].trim())
-            } else {
-                // Not a number, treat whole thing as pattern
-                (None, args)
+    let mut opts = RecallOptions::default();
+    let mut remaining = args;
+    let mut saw_hash = false;
+
+    // Parse options (start with -)
+    while !remaining.is_empty() {
+        let trimmed = remaining.trim_start();
+        if trimmed.is_empty() {
+            break;
+        }
+
+        // Check for # (show line numbers) - must be last option before range
+        if trimmed.starts_with('#') && !trimmed.starts_with("#recall") {
+            saw_hash = true;
+            opts.show_line_numbers = true;
+            remaining = &trimmed[1..];
+            break; // # must be last option
+        }
+
+        // Check for options starting with -
+        if !trimmed.starts_with('-') {
+            remaining = trimmed;
+            break;
+        }
+
+        // Find end of this option (space or end)
+        let opt_end = trimmed[1..].find(char::is_whitespace)
+            .map(|i| i + 1)
+            .unwrap_or(trimmed.len());
+        let opt = &trimmed[..opt_end];
+        remaining = &trimmed[opt_end..];
+
+        // Parse the option
+        let opt_chars: Vec<char> = opt[1..].chars().collect();
+        if opt_chars.is_empty() {
+            // Just "-" alone, this is the start of range like "- -4"
+            remaining = trimmed;
+            break;
+        }
+
+        let mut i = 0;
+        while i < opt_chars.len() {
+            match opt_chars[i] {
+                'w' => {
+                    // -w or -wworld
+                    if i + 1 < opt_chars.len() {
+                        let world: String = opt_chars[i+1..].iter().collect();
+                        opts.source = RecallSource::World(world);
+                        i = opt_chars.len();
+                    } else {
+                        opts.source = RecallSource::CurrentWorld;
+                        i += 1;
+                    }
+                }
+                'l' => {
+                    opts.source = RecallSource::Local;
+                    i += 1;
+                }
+                'g' => {
+                    opts.source = RecallSource::Global;
+                    i += 1;
+                }
+                'i' => {
+                    opts.source = RecallSource::Input;
+                    i += 1;
+                }
+                'v' => {
+                    opts.inverse_match = true;
+                    i += 1;
+                }
+                'q' => {
+                    opts.quiet = true;
+                    i += 1;
+                }
+                't' => {
+                    opts.show_timestamps = true;
+                    // Check for optional format
+                    if i + 1 < opt_chars.len() {
+                        let fmt: String = opt_chars[i+1..].iter().collect();
+                        opts.timestamp_format = Some(fmt);
+                        i = opt_chars.len();
+                    } else {
+                        i += 1;
+                    }
+                }
+                'a' => {
+                    // -aattrs - for now just support -ag (show gagged)
+                    if i + 1 < opt_chars.len() && opt_chars[i+1] == 'g' {
+                        opts.show_gagged = true;
+                        i += 2;
+                    } else {
+                        i += 1;
+                    }
+                }
+                'm' => {
+                    // -mstyle
+                    if i + 1 < opt_chars.len() {
+                        let style: String = opt_chars[i+1..].iter().collect();
+                        opts.match_style = match style.to_lowercase().as_str() {
+                            "simple" => RecallMatchStyle::Simple,
+                            "glob" => RecallMatchStyle::Glob,
+                            "regexp" | "regex" => RecallMatchStyle::Regexp,
+                            _ => RecallMatchStyle::Glob,
+                        };
+                        i = opt_chars.len();
+                    } else {
+                        i += 1;
+                    }
+                }
+                'A' => {
+                    // -An context after
+                    let num: String = opt_chars[i+1..].iter().take_while(|c| c.is_ascii_digit()).collect();
+                    if let Ok(n) = num.parse::<usize>() {
+                        opts.context_after = n;
+                        i += 1 + num.len();
+                    } else {
+                        i += 1;
+                    }
+                }
+                'B' => {
+                    // -Bn context before
+                    let num: String = opt_chars[i+1..].iter().take_while(|c| c.is_ascii_digit()).collect();
+                    if let Ok(n) = num.parse::<usize>() {
+                        opts.context_before = n;
+                        i += 1 + num.len();
+                    } else {
+                        i += 1;
+                    }
+                }
+                'C' => {
+                    // -Cn context both
+                    let num: String = opt_chars[i+1..].iter().take_while(|c| c.is_ascii_digit()).collect();
+                    if let Ok(n) = num.parse::<usize>() {
+                        opts.context_before = n;
+                        opts.context_after = n;
+                        i += 1 + num.len();
+                    } else {
+                        i += 1;
+                    }
+                }
+                _ => {
+                    // Unknown option or might be a negative range
+                    // Check if rest looks like a number (negative range like -4)
+                    let rest: String = opt_chars[i..].iter().collect();
+                    if rest.chars().all(|c| c.is_ascii_digit()) {
+                        // This is a negative range, put it back
+                        remaining = trimmed;
+                        break;
+                    }
+                    i += 1;
+                }
             }
-        } else {
-            // No space, might be just "-10" which isn't valid
-            return TfCommandResult::Success(Some("Usage: #recall [-count] pattern - Search output history".to_string()));
+        }
+    }
+
+    // Parse range and pattern
+    let remaining = remaining.trim();
+
+    if remaining.is_empty() {
+        // No range or pattern, recall all
+        opts.range = RecallRange::All;
+        return TfCommandResult::Recall(opts);
+    }
+
+    // Find where range ends and pattern begins
+    // Range formats: /x, x, x-y, -y, x-, or time formats
+    let mut range_end = 0;
+    let chars: Vec<char> = remaining.chars().collect();
+
+    if chars.first() == Some(&'/') {
+        // /x format - last x matching lines
+        let num_str: String = chars[1..].iter().take_while(|c| c.is_ascii_digit()).collect();
+        if let Ok(n) = num_str.parse::<usize>() {
+            opts.range = RecallRange::LastMatching(n);
+            range_end = 1 + num_str.len();
+        }
+    } else if chars.first() == Some(&'-') && chars.len() > 1 {
+        // Could be: - -y (with space) or just part of options we already parsed
+        // Look for the number after the dash
+        let rest: String = chars[1..].iter().collect();
+        let num_str: String = rest.chars().take_while(|c| c.is_ascii_digit() || *c == ':' || *c == '.').collect();
+        if !num_str.is_empty() {
+            if looks_like_time(&num_str) {
+                if let Some(secs) = parse_time_to_seconds(&num_str) {
+                    opts.range = RecallRange::TimePeriod(secs);
+                    range_end = 1 + num_str.len();
+                }
+            } else if let Ok(n) = num_str.parse::<usize>() {
+                opts.range = RecallRange::Previous(n);
+                range_end = 1 + num_str.len();
+            }
         }
     } else {
-        (None, args)
-    };
+        // Parse as: x, x-y, x-, or time
+        let range_str: String = chars.iter().take_while(|c|
+            c.is_ascii_digit() || **c == '-' || **c == ':' || **c == '.'
+        ).collect();
 
-    if pattern.is_empty() {
-        return TfCommandResult::Success(Some("Usage: #recall [-count] pattern - Search output history".to_string()));
+        if !range_str.is_empty() {
+            range_end = range_str.len();
+
+            if range_str.contains('-') && !range_str.starts_with('-') {
+                // x-y or x- format
+                let parts: Vec<&str> = range_str.splitn(2, '-').collect();
+                if parts.len() == 2 {
+                    if parts[1].is_empty() {
+                        // x- format (after x)
+                        if looks_like_time(parts[0]) {
+                            if let Some(secs) = parse_time_to_seconds(parts[0]) {
+                                opts.range = RecallRange::TimeRange(secs, 0.0);
+                            }
+                        } else if let Ok(x) = parts[0].parse::<usize>() {
+                            opts.range = RecallRange::After(x);
+                        }
+                    } else {
+                        // x-y format
+                        if looks_like_time(parts[0]) && looks_like_time(parts[1]) {
+                            if let (Some(start), Some(end)) = (parse_time_to_seconds(parts[0]), parse_time_to_seconds(parts[1])) {
+                                opts.range = RecallRange::TimeRange(start, end);
+                            }
+                        } else if let (Ok(x), Ok(y)) = (parts[0].parse::<usize>(), parts[1].parse::<usize>()) {
+                            opts.range = RecallRange::Range(x, y);
+                        }
+                    }
+                }
+            } else if looks_like_time(&range_str) {
+                // Time period
+                if let Some(secs) = parse_time_to_seconds(&range_str) {
+                    opts.range = RecallRange::TimePeriod(secs);
+                }
+            } else if let Ok(n) = range_str.parse::<usize>() {
+                // Plain number - last n lines
+                opts.range = RecallRange::Last(n);
+            }
+        }
     }
 
-    TfCommandResult::Recall { pattern: pattern.to_string(), count }
+    // Everything after range is the pattern
+    let pattern = remaining[range_end..].trim();
+    if !pattern.is_empty() {
+        opts.pattern = Some(pattern.to_string());
+    }
+
+    TfCommandResult::Recall(opts)
 }
 
 /// #gag pattern - Add a gag pattern (suppress matching output)
