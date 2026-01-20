@@ -7476,6 +7476,14 @@ mod remote_gui {
         }
     }
 
+    /// Wrapper to mimic TextEdit output for custom text rendering
+    struct TextEditOutputWrapper {
+        response: egui::Response,
+        galley: std::sync::Arc<egui::Galley>,
+        cursor_range: Option<egui::text_selection::CursorRange>,
+        galley_pos: egui::Pos2,
+    }
+
     pub struct RemoteGuiApp {
         /// WebSocket URL
         ws_url: String,
@@ -8200,6 +8208,8 @@ mod remote_gui {
                                         world.output_lines.push(TimestampedLine { text, ts });
                                     }
                                 }
+
+                                // Feed data to terminal emulator (include newline for complete lines)
                                 // Note: Don't track unseen_lines locally - server handles centralized tracking
                                 // and will broadcast UnseenUpdate/UnseenCleared when counts change
                             }
@@ -8953,11 +8963,128 @@ mod remote_gui {
             }
         }
 
+        /// Blend two colors with a given weight (0.0 = all bg, 1.0 = all fg)
+        fn blend_colors(fg: egui::Color32, bg: egui::Color32, fg_weight: f32) -> egui::Color32 {
+            let bg_weight = 1.0 - fg_weight;
+            egui::Color32::from_rgb(
+                (fg.r() as f32 * fg_weight + bg.r() as f32 * bg_weight).round() as u8,
+                (fg.g() as f32 * fg_weight + bg.g() as f32 * bg_weight).round() as u8,
+                (fg.b() as f32 * fg_weight + bg.b() as f32 * bg_weight).round() as u8,
+            )
+        }
+
+        /// Append a segment to job, processing shade characters for proper color blending
+        fn append_segment_with_shades(
+            segment: &str,
+            font_id: &egui::FontId,
+            fg_color: egui::Color32,
+            bg_color: egui::Color32,
+            theme_bg: egui::Color32,
+            job: &mut egui::text::LayoutJob,
+        ) {
+            // If no shade characters, just append normally
+            if !segment.chars().any(|c| c == '░' || c == '▒' || c == '▓') {
+                job.append(segment, 0.0, egui::TextFormat {
+                    font_id: font_id.clone(),
+                    color: fg_color,
+                    background: bg_color,
+                    ..Default::default()
+                });
+                return;
+            }
+
+            // Use explicit background if set, otherwise use theme background for blending
+            let blend_bg = if bg_color == egui::Color32::TRANSPARENT {
+                theme_bg
+            } else {
+                bg_color
+            };
+
+            // Process shade characters - group consecutive chars by their type
+            let mut current_run = String::new();
+            let mut current_is_shade: Option<char> = None;
+
+            for c in segment.chars() {
+                let shade_type = match c {
+                    '░' | '▒' | '▓' => Some(c),
+                    _ => None,
+                };
+
+                if shade_type != current_is_shade && !current_run.is_empty() {
+                    // Flush current run
+                    if let Some(shade_char) = current_is_shade {
+                        // Shade run - use blended color for background
+                        // The background rectangles will provide the visual color
+                        let blended_color = match shade_char {
+                            '░' => Self::blend_colors(fg_color, blend_bg, 0.25),
+                            '▒' => Self::blend_colors(fg_color, blend_bg, 0.50),
+                            '▓' => Self::blend_colors(fg_color, blend_bg, 0.75),
+                            _ => fg_color,
+                        };
+                        // Use spaces - the background rectangle painting will provide the color
+                        let spaces: String = current_run.chars().map(|_| ' ').collect();
+                        job.append(&spaces, 0.0, egui::TextFormat {
+                            font_id: font_id.clone(),
+                            color: blended_color,
+                            background: blended_color,
+                            ..Default::default()
+                        });
+                    } else {
+                        // Regular run
+                        job.append(&current_run, 0.0, egui::TextFormat {
+                            font_id: font_id.clone(),
+                            color: fg_color,
+                            background: bg_color,
+                            ..Default::default()
+                        });
+                    }
+                    current_run.clear();
+                }
+
+                current_run.push(c);
+                current_is_shade = shade_type;
+            }
+
+            // Flush final run
+            if !current_run.is_empty() {
+                if let Some(shade_char) = current_is_shade {
+                    let blended_color = match shade_char {
+                        '░' => Self::blend_colors(fg_color, blend_bg, 0.25),
+                        '▒' => Self::blend_colors(fg_color, blend_bg, 0.50),
+                        '▓' => Self::blend_colors(fg_color, blend_bg, 0.75),
+                        _ => fg_color,
+                    };
+                    // Use spaces - the background rectangle painting will provide the color
+                    let spaces: String = current_run.chars().map(|_| ' ').collect();
+                    job.append(&spaces, 0.0, egui::TextFormat {
+                        font_id: font_id.clone(),
+                        color: blended_color,
+                        background: blended_color,
+                        ..Default::default()
+                    });
+                } else {
+                    job.append(&current_run, 0.0, egui::TextFormat {
+                        font_id: font_id.clone(),
+                        color: fg_color,
+                        background: bg_color,
+                        ..Default::default()
+                    });
+                }
+            }
+        }
+
         /// Append ANSI-colored text to an existing LayoutJob
         fn append_ansi_to_job(text: &str, default_color: egui::Color32, font_id: egui::FontId, job: &mut egui::text::LayoutJob, is_light_theme: bool) {
             // Debug: log ANSI sequences and resulting colors
             static DEBUG_COUNT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
             let debug_this = DEBUG_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 5 && text.contains('\x1b');
+
+            // Theme background for shade character blending
+            let theme_bg = if is_light_theme {
+                egui::Color32::from_rgb(255, 255, 255)
+            } else {
+                egui::Color32::from_rgb(13, 17, 23)  // Dark theme background
+            };
 
             let mut current_color = default_color;
             let mut current_bg = egui::Color32::TRANSPARENT;
@@ -8969,13 +9096,7 @@ mod remote_gui {
                 if c == '\x1b' && chars.peek() == Some(&'[') {
                     // Flush current segment
                     if !segment.is_empty() {
-                        // Don't brighten colors for bold - match web behavior
-                        job.append(&segment, 0.0, egui::TextFormat {
-                            font_id: font_id.clone(),
-                            color: current_color,
-                            background: current_bg,
-                            ..Default::default()
-                        });
+                        Self::append_segment_with_shades(&segment, &font_id, current_color, current_bg, theme_bg, job);
                         segment.clear();
                     }
 
@@ -9157,13 +9278,7 @@ mod remote_gui {
 
             // Flush remaining segment
             if !segment.is_empty() {
-                // Don't brighten colors for bold - match web behavior
-                job.append(&segment, 0.0, egui::TextFormat {
-                    font_id: font_id.clone(),
-                    color: current_color,
-                    background: current_bg,
-                    ..Default::default()
-                });
+                Self::append_segment_with_shades(&segment, &font_id, current_color, current_bg, theme_bg, job);
             }
         }
 
@@ -9692,9 +9807,11 @@ mod remote_gui {
                             .rounding(egui::Rounding::same(8.0))
                             .inner_margin(egui::Margin::same(20.0))
                             .show(ui, |ui| {
-                                // Guard against invalid dimensions
+                                // Guard against invalid dimensions and NaN positions
                                 let avail = ui.available_size();
-                                if !avail.x.is_finite() || !avail.y.is_finite() || avail.x <= 0.0 || avail.y <= 0.0 {
+                                let cursor = ui.cursor();
+                                if !avail.x.is_finite() || !avail.y.is_finite() || avail.x <= 0.0 || avail.y <= 0.0 ||
+                                   !cursor.left().is_finite() || !cursor.top().is_finite() {
                                     return;
                                 }
                                 ui.set_min_width(280.0);
@@ -9775,10 +9892,14 @@ mod remote_gui {
 
                                 // Error message
                                 if let Some(ref err) = self.error_message {
-                                    ui.add_space(12.0);
-                                    ui.label(egui::RichText::new(err.as_str())
-                                        .color(theme.error())
-                                        .size(12.0));
+                                    // Guard against NaN positions before adding widgets
+                                    let cursor = ui.cursor();
+                                    if cursor.left().is_finite() && cursor.top().is_finite() {
+                                        ui.add_space(12.0);
+                                        ui.label(egui::RichText::new(err.as_str())
+                                            .color(theme.error())
+                                            .size(12.0));
+                                    }
                                 }
                             });
                     });
@@ -10834,7 +10955,7 @@ mod remote_gui {
                         // Build combined LayoutJob with ANSI colors
                         let default_color = theme.fg();
                         let font_id = egui::FontId::monospace(self.font_size);
-                        let mut combined_job = egui::text::LayoutJob {
+                        let combined_job = egui::text::LayoutJob {
                             wrap: egui::text::TextWrapping {
                                 max_width: ui.available_width(),
                                 ..Default::default()
@@ -10871,13 +10992,15 @@ mod remote_gui {
                             }
                         }).collect();
 
-                        // For non-emoji path, build combined LayoutJob
+                        let is_light_theme = matches!(theme, GuiTheme::Light);
+
+                        // Build combined LayoutJob from display_lines
+                        let mut combined_job = combined_job;
                         if !has_any_discord_emojis {
                             for (i, display_line) in display_lines.iter().enumerate() {
                                 let line_text = convert_discord_emojis(display_line);
                                 // Apply word breaks for long words
                                 let line_text = Self::insert_word_breaks(&line_text);
-                                let is_light_theme = matches!(theme, GuiTheme::Light);
                                 Self::append_ansi_to_job(&line_text, default_color, font_id.clone(), &mut combined_job, is_light_theme);
 
                                 if i < display_lines.len() - 1 {
@@ -10908,7 +11031,7 @@ mod remote_gui {
                             scroll_area = scroll_area.vertical_scroll_offset(delta);
                         }
 
-                        // Clone the job for the layouter closure
+                        // Clone the job for the custom rendering
                         let layout_job = combined_job.clone();
 
                         // Debug: log LayoutJob info
@@ -10948,7 +11071,7 @@ mod remote_gui {
 
                         let scroll_output = scroll_area.show(ui, |ui| {
                                 ui.set_width(ui.available_width());
-                                // Remove vertical spacing between lines for seamless ASCII art
+                                // Remove vertical spacing between widgets
                                 ui.spacing_mut().item_spacing.y = 0.0;
 
                                 // Use different rendering path for Discord emojis
@@ -10978,23 +11101,64 @@ mod remote_gui {
                                     return; // Skip the TextEdit path
                                 }
 
-                                // Use TextEdit with custom layouter for colored text
-                                let mut text_copy = plain_text.clone();
-                                // Use world-specific ID for TextEdit to ensure proper focus handling when switching worlds
-                                let output_text_id = egui::Id::new(format!("output_text_{}", self.current_world));
-                                let response = TextEdit::multiline(&mut text_copy)
-                                    .id(output_text_id)
-                                    .font(egui::TextStyle::Monospace)
-                                    .desired_width(f32::INFINITY)
-                                    .interactive(true)
-                                    .frame(false)
-                                    .text_color_opt(None)
-                                    .layouter(&mut |_ui, _string, wrap_width| {
-                                        let mut job = layout_job.clone();
-                                        job.wrap.max_width = wrap_width;
-                                        _ui.fonts(|f| f.layout_job(job))
-                                    })
-                                    .show(ui);
+                                // Custom rendering: paint backgrounds first, then text
+                                // This ensures backgrounds fill full row height without gaps
+
+                                // Layout the text WITH TRANSPARENT BACKGROUNDS
+                                // We'll paint our own full-height backgrounds using bg_color_map
+                                let mut job = layout_job.clone();
+                                job.wrap.max_width = ui.available_width();
+                                // Clear backgrounds from the job so galley won't paint short backgrounds
+                                for section in &mut job.sections {
+                                    section.format.background = egui::Color32::TRANSPARENT;
+                                }
+                                let galley = ui.fonts(|f| f.layout_job(job));
+
+                                // Allocate space for the galley
+                                let (response, painter) = ui.allocate_painter(
+                                    galley.size(),
+                                    egui::Sense::click_and_drag()
+                                );
+                                let text_pos = response.rect.min;
+
+                                // First pass: paint full-height background rectangles per glyph
+                                let rows = &galley.rows;
+
+                                for (row_idx, row) in rows.iter().enumerate() {
+                                    let row_top = text_pos.y + row.rect.top();
+                                    // Extend to next row's top, or use current bottom for last row
+                                    let row_bottom = if row_idx + 1 < rows.len() {
+                                        text_pos.y + rows[row_idx + 1].rect.top()
+                                    } else {
+                                        text_pos.y + row.rect.bottom()
+                                    };
+
+                                    for glyph in &row.glyphs {
+                                        // Use the glyph's section to get the background color
+                                        let section_idx = glyph.section_index as usize;
+                                        if section_idx < layout_job.sections.len() {
+                                            let bg = layout_job.sections[section_idx].format.background;
+                                            if bg != egui::Color32::TRANSPARENT {
+                                                let glyph_rect = egui::Rect::from_min_max(
+                                                    egui::pos2(text_pos.x + glyph.pos.x, row_top),
+                                                    egui::pos2(text_pos.x + glyph.pos.x + glyph.size().x, row_bottom),
+                                                );
+                                                painter.rect_filled(glyph_rect, 0.0, bg);
+                                            }
+                                        }
+                                    }
+                                }
+
+                                // Second pass: paint the text on top (reusing the same galley)
+                                painter.galley(text_pos, galley.clone(), egui::Color32::WHITE);
+
+                                // Wrap in a struct to match TextEdit response interface
+                                let response = TextEditOutputWrapper {
+                                    response,
+                                    galley,
+                                    cursor_range: None,
+                                    galley_pos: text_pos,
+                                };
 
                                 // Store selection in egui memory on every frame when there is one
                                 // This ensures we have it captured before any click clears it
