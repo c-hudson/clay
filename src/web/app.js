@@ -4370,6 +4370,18 @@
             // Skip if auth modal is visible
             if (elements.authModal.classList.contains('visible')) return;
 
+            // Prevent browser from closing tab on Ctrl+W - must be checked early
+            if (e.key === 'w' && e.ctrlKey) {
+                e.preventDefault();
+                // If input is not focused, focus it
+                // If focused, let the event continue to input's handler for word delete
+                if (document.activeElement !== elements.input) {
+                    elements.input.focus();
+                    return;
+                }
+                // Don't return - let it reach input's keydown handler
+            }
+
             // Prevent browser's quick find (/) and focus input instead
             if (e.key === '/' && document.activeElement !== elements.input &&
                 document.activeElement !== elements.filterInput &&
