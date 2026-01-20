@@ -59,94 +59,88 @@ pub fn execute_command(engine: &mut TfEngine, input: &str) -> TfCommandResult {
         return TfCommandResult::NotTfCommand;
     }
 
-    // Skip the # and get the command name first (before any substitution)
-    let rest = &input[1..].trim_start();
+    // Perform variable substitution before parsing
+    let substituted = engine.substitute_vars(input);
+    let input = substituted.trim();
+
+    // Skip the # and parse the command
+    let rest = &input[1..];
 
     // Handle empty command
     if rest.is_empty() {
         return TfCommandResult::Error("Empty command".to_string());
     }
 
-    // Split into command and arguments (before substitution to check command type)
+    // Split into command and arguments
     let (cmd, args) = split_command(rest);
     let cmd_lower = cmd.to_lowercase();
 
-    // For #def, don't substitute variables in the body - only process backslash continuation
-    // The body should be stored literally; %vars are substituted at execution time
-    let args = if cmd_lower == "def" {
-        // For #def, only handle backslash line continuation, no variable substitution
-        args.replace("\\\n", "").replace("\\ ", " ")
-    } else {
-        // For other commands, perform variable substitution
-        engine.substitute_vars(args)
-    };
-
     match cmd_lower.as_str() {
         // Variable commands
-        "set" => cmd_set(engine, &args),
-        "unset" => cmd_unset(engine, &args),
-        "let" => cmd_let(engine, &args),
-        "setenv" => cmd_setenv(engine, &args),
+        "set" => cmd_set(engine, args),
+        "unset" => cmd_unset(engine, args),
+        "let" => cmd_let(engine, args),
+        "setenv" => cmd_setenv(engine, args),
 
         // Output commands
-        "echo" => cmd_echo(engine, &args),
-        "send" => cmd_send(engine, &args),
+        "echo" => cmd_echo(engine, args),
+        "send" => cmd_send(engine, args),
 
         // Mapped to Clay commands
         "quit" | "exit" => TfCommandResult::ClayCommand("/quit".to_string()),
         "dc" | "disconnect" => TfCommandResult::ClayCommand("/disconnect".to_string()),
-        "world" => cmd_world(&args),
+        "world" => cmd_world(args),
         "listworlds" => TfCommandResult::ClayCommand("/worlds".to_string()),
         "listsockets" | "connections" => TfCommandResult::ClayCommand("/connections".to_string()),
-        "connect" => cmd_connect(&args),
+        "connect" => cmd_connect(args),
 
         // Info commands
-        "help" => cmd_help(&args),
+        "help" => cmd_help(args),
         "version" => cmd_version(),
 
         // Control flow commands
-        "if" => cmd_if(engine, &args),
+        "if" => cmd_if(engine, args),
         "elseif" => TfCommandResult::Error("#elseif outside of #if block".to_string()),
         "else" => TfCommandResult::Error("#else outside of #if block".to_string()),
         "endif" => TfCommandResult::Error("#endif without matching #if".to_string()),
-        "while" => cmd_while(engine, &args),
-        "for" => cmd_for(engine, &args),
+        "while" => cmd_while(engine, args),
+        "for" => cmd_for(engine, args),
         "done" => TfCommandResult::Error("#done without matching #while or #for".to_string()),
         "break" => TfCommandResult::Error("__break__".to_string()), // Special marker
 
         // Macro commands
-        "def" => cmd_def(engine, &args),
-        "undef" => cmd_undef(engine, &args),
-        "undefn" => cmd_undefn(engine, &args),
-        "undeft" => cmd_undeft(engine, &args),
-        "list" => cmd_list(engine, &args),
+        "def" => cmd_def(engine, args),
+        "undef" => cmd_undef(engine, args),
+        "undefn" => cmd_undefn(engine, args),
+        "undeft" => cmd_undeft(engine, args),
+        "list" => cmd_list(engine, args),
         "purge" => cmd_purge(engine),
 
         // Expression commands
-        "expr" => cmd_expr(engine, &args),
-        "eval" => cmd_eval(engine, &args),
-        "test" => cmd_test(engine, &args),
+        "expr" => cmd_expr(engine, args),
+        "eval" => cmd_eval(engine, args),
+        "test" => cmd_test(engine, args),
 
         // Hook and keybinding commands
-        "hook" => cmd_hook(engine, &args),
-        "unhook" => cmd_unhook(engine, &args),
-        "bind" => cmd_bind(engine, &args),
-        "unbind" => cmd_unbind(engine, &args),
+        "hook" => cmd_hook(engine, args),
+        "unhook" => cmd_unhook(engine, args),
+        "bind" => cmd_bind(engine, args),
+        "unbind" => cmd_unbind(engine, args),
 
         // Additional builtins
         "beep" => builtins::cmd_beep(),
-        "time" => builtins::cmd_time(&args),
-        "lcd" => builtins::cmd_lcd(engine, &args),
-        "sh" => builtins::cmd_sh(&args),
-        "quote" => builtins::cmd_quote(&args),
-        "recall" => builtins::cmd_recall(&args),
-        "gag" => builtins::cmd_gag(engine, &args),
-        "ungag" => builtins::cmd_ungag(engine, &args),
-        "load" => builtins::cmd_load(engine, &args),
-        "save" => builtins::cmd_save(engine, &args),
-        "log" => builtins::cmd_log(&args),
+        "time" => builtins::cmd_time(args),
+        "lcd" => builtins::cmd_lcd(engine, args),
+        "sh" => builtins::cmd_sh(args),
+        "quote" => builtins::cmd_quote(args),
+        "recall" => builtins::cmd_recall(args),
+        "gag" => builtins::cmd_gag(engine, args),
+        "ungag" => builtins::cmd_ungag(engine, args),
+        "load" => builtins::cmd_load(engine, args),
+        "save" => builtins::cmd_save(engine, args),
+        "log" => builtins::cmd_log(args),
         "ps" => builtins::cmd_ps(),
-        "kill" => builtins::cmd_kill(&args),
+        "kill" => builtins::cmd_kill(args),
 
         // Check for user-defined macro with this name
         _ => {
@@ -974,27 +968,5 @@ mod tests {
 
         let result = execute_command(&mut engine, "#nonexistent");
         assert!(matches!(result, TfCommandResult::UnknownCommand(_)));
-    }
-
-    #[test]
-    fn test_def_preserves_percent_vars() {
-        // #def should NOT substitute %R, %L, %1, etc. in the body
-        // These should be preserved for substitution at macro execution time
-        let mut engine = TfEngine::new();
-
-        // Define a macro with %R in the body
-        let result = execute_command(&mut engine, "#def random = #echo -- %R");
-        assert!(matches!(result, TfCommandResult::Success(_)));
-
-        // Check that the macro was stored with %R intact
-        let macro_def = engine.macros.iter().find(|m| m.name == "random");
-        assert!(macro_def.is_some(), "Macro 'random' should be defined");
-        let macro_def = macro_def.unwrap();
-        assert_eq!(macro_def.body, "#echo -- %R", "Body should preserve %R literally");
-
-        // Also test %L, %1, %*, etc.
-        execute_command(&mut engine, "#def test2 = #echo %L %R %1 %2 %*");
-        let macro_def = engine.macros.iter().find(|m| m.name == "test2").unwrap();
-        assert_eq!(macro_def.body, "#echo %L %R %1 %2 %*", "Body should preserve all positional params");
     }
 }
