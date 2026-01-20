@@ -1716,6 +1716,50 @@
         return text.replace(/\x1b\[[0-9;]*[a-zA-Z]/g, '');
     }
 
+    // Convert wildcard filter pattern to regex for F4 filter popup
+    // - If pattern starts with *, no ^ anchor (match anywhere from start)
+    // - If pattern ends with *, no $ anchor (match anywhere to end)
+    // - * matches any sequence, ? matches any single character
+    function filterWildcardToRegex(pattern) {
+        const startsWithStar = pattern.startsWith('*');
+        const endsWithStar = pattern.endsWith('*');
+
+        let regex = '';
+        if (!startsWithStar) regex += '^';
+
+        for (const c of pattern) {
+            if (c === '*') {
+                regex += '.*';
+            } else if (c === '?') {
+                regex += '.';
+            } else if ('.+^$|\\()[]{}'.includes(c)) {
+                regex += '\\' + c;
+            } else {
+                regex += c;
+            }
+        }
+
+        if (!endsWithStar) regex += '$';
+
+        try {
+            return new RegExp(regex, 'i');
+        } catch (e) {
+            return null;
+        }
+    }
+
+    // Check if text matches filter pattern (supports wildcards * and ?)
+    function matchesFilter(text, pattern) {
+        const hasWildcards = pattern.includes('*') || pattern.includes('?');
+        if (hasWildcards) {
+            const regex = filterWildcardToRegex(pattern);
+            return regex ? regex.test(text) : false;
+        } else {
+            // Simple case-insensitive substring match
+            return text.toLowerCase().includes(pattern.toLowerCase());
+        }
+    }
+
     // Check if a line matches any action pattern (for F8 highlighting)
     function lineMatchesAction(line, worldName) {
         const plainLine = stripAnsiForFilter(line).toLowerCase();
@@ -1784,9 +1828,10 @@
             const cleanLine = String(rawLine).replace(/[\r\n]+/g, '');
 
             // Filter: skip lines that don't match (case-insensitive)
+            // Filter: skip lines that don't match (supports wildcards * and ?)
             if (filterPopupOpen && filterText.length > 0) {
-                const plainLine = stripAnsiForFilter(cleanLine).toLowerCase();
-                if (!plainLine.includes(filterText.toLowerCase())) {
+                const plainLine = stripAnsiForFilter(cleanLine);
+                if (!matchesFilter(plainLine, filterText)) {
                     continue;
                 }
             }

@@ -2053,21 +2053,88 @@ impl FilterPopup {
         if self.filter_text.is_empty() {
             self.filtered_indices = (0..output_lines.len()).collect();
         } else {
-            let filter_lower = self.filter_text.to_lowercase();
-            self.filtered_indices = output_lines
-                .iter()
-                .enumerate()
-                .filter(|(_, line)| {
-                    // Strip ANSI codes for matching
-                    let plain = strip_ansi_codes(&line.text);
-                    plain.to_lowercase().contains(&filter_lower)
-                })
-                .map(|(i, _)| i)
-                .collect();
+            // Check if pattern has wildcards
+            let has_wildcards = self.filter_text.contains('*') || self.filter_text.contains('?');
+
+            if has_wildcards {
+                // Use wildcard matching with regex
+                if let Some(regex) = filter_wildcard_to_regex(&self.filter_text) {
+                    self.filtered_indices = output_lines
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, line)| {
+                            let plain = strip_ansi_codes(&line.text);
+                            regex.is_match(&plain)
+                        })
+                        .map(|(i, _)| i)
+                        .collect();
+                } else {
+                    // Invalid regex, show no matches
+                    self.filtered_indices.clear();
+                }
+            } else {
+                // Simple substring matching (case-insensitive)
+                let filter_lower = self.filter_text.to_lowercase();
+                self.filtered_indices = output_lines
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, line)| {
+                        let plain = strip_ansi_codes(&line.text);
+                        plain.to_lowercase().contains(&filter_lower)
+                    })
+                    .map(|(i, _)| i)
+                    .collect();
+            }
         }
         // Reset scroll to end (most recent matches)
         self.scroll_offset = self.filtered_indices.len().saturating_sub(1);
     }
+}
+
+/// Convert a wildcard filter pattern to regex for F4 filter popup.
+/// Unlike wildcard_to_regex(), this is designed for filter use:
+/// - If pattern starts with *, no ^ anchor (match anywhere from start)
+/// - If pattern ends with *, no $ anchor (match anywhere to end)
+/// - Without leading/trailing *, pattern is anchored to start/end
+/// Examples:
+///   "*foo*" matches any line containing "foo"
+///   "foo*" matches lines starting with "foo"
+///   "*foo" matches lines ending with "foo"
+///   "fo?bar" matches lines that are exactly "fo?bar" (? = any single char)
+fn filter_wildcard_to_regex(pattern: &str) -> Option<regex::Regex> {
+    let mut regex = String::with_capacity(pattern.len() * 2 + 2);
+
+    // Check for leading/trailing wildcards to determine anchoring
+    let starts_with_star = pattern.starts_with('*');
+    let ends_with_star = pattern.ends_with('*');
+
+    // Add start anchor if pattern doesn't start with *
+    if !starts_with_star {
+        regex.push('^');
+    }
+
+    for c in pattern.chars() {
+        match c {
+            '*' => regex.push_str(".*"),
+            '?' => regex.push('.'),
+            // Escape regex special characters
+            '.' | '+' | '^' | '$' | '|' | '\\' | '(' | ')' | '[' | ']' | '{' | '}' => {
+                regex.push('\\');
+                regex.push(c);
+            }
+            _ => regex.push(c),
+        }
+    }
+
+    // Add end anchor if pattern doesn't end with *
+    if !ends_with_star {
+        regex.push('$');
+    }
+
+    regex::RegexBuilder::new(&regex)
+        .case_insensitive(true)
+        .build()
+        .ok()
 }
 
 struct HelpPopup {
@@ -11046,7 +11113,19 @@ mod remote_gui {
                                 // Apply filter if active (filter on stripped text)
                                 if self.filter_active && !self.filter_text.is_empty() {
                                     let stripped = Self::strip_ansi_for_copy(&line.text);
-                                    stripped.to_lowercase().contains(&self.filter_text.to_lowercase())
+                                    // Check if pattern has wildcards
+                                    let has_wildcards = self.filter_text.contains('*') || self.filter_text.contains('?');
+                                    if has_wildcards {
+                                        // Use wildcard matching
+                                        if let Some(regex) = filter_wildcard_to_regex(&self.filter_text) {
+                                            regex.is_match(&stripped)
+                                        } else {
+                                            false // Invalid regex
+                                        }
+                                    } else {
+                                        // Simple substring match
+                                        stripped.to_lowercase().contains(&self.filter_text.to_lowercase())
+                                    }
                                 } else {
                                     true
                                 }
