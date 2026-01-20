@@ -694,6 +694,30 @@
 
     // Initialize
     function init() {
+        // Capture Ctrl+W at window level to prevent browser from closing tab
+        // Uses capture phase (true) to intercept before any other handlers
+        window.addEventListener('keydown', function(e) {
+            if (e.key === 'w' && e.ctrlKey && !e.altKey && !e.metaKey) {
+                e.preventDefault();
+                e.stopPropagation();
+                // Perform word-delete if input is focused
+                if (document.activeElement === elements.input) {
+                    const input = elements.input;
+                    const pos = input.selectionStart;
+                    const text = input.value;
+                    // Find start of word before cursor
+                    let start = pos;
+                    while (start > 0 && text[start - 1] === ' ') start--;
+                    while (start > 0 && text[start - 1] !== ' ') start--;
+                    input.value = text.substring(0, start) + text.substring(pos);
+                    input.selectionStart = input.selectionEnd = start;
+                } else {
+                    // Focus input if not already focused
+                    elements.input.focus();
+                }
+            }
+        }, true);  // true = capture phase
+
         // Detect device type and configure UI
         const device = detectDeviceType();
         setFontPos(device.fontPos);
@@ -4370,18 +4394,6 @@
             // Skip if auth modal is visible
             if (elements.authModal.classList.contains('visible')) return;
 
-            // Prevent browser from closing tab on Ctrl+W - must be checked early
-            if (e.key === 'w' && e.ctrlKey) {
-                e.preventDefault();
-                // If input is not focused, focus it
-                // If focused, let the event continue to input's handler for word delete
-                if (document.activeElement !== elements.input) {
-                    elements.input.focus();
-                    return;
-                }
-                // Don't return - let it reach input's keydown handler
-            }
-
             // Prevent browser's quick find (/) and focus input instead
             if (e.key === '/' && document.activeElement !== elements.input &&
                 document.activeElement !== elements.filterInput &&
@@ -4746,18 +4758,7 @@
                 // Ctrl+A: Move cursor to beginning of line
                 e.preventDefault();
                 elements.input.selectionStart = elements.input.selectionEnd = 0;
-            } else if (e.key === 'w' && e.ctrlKey) {
-                // Ctrl+W: Delete word before cursor
-                e.preventDefault();
-                const input = elements.input;
-                const pos = input.selectionStart;
-                const text = input.value;
-                // Find start of word before cursor
-                let start = pos;
-                while (start > 0 && text[start - 1] === ' ') start--;
-                while (start > 0 && text[start - 1] !== ' ') start--;
-                input.value = text.substring(0, start) + text.substring(pos);
-                input.selectionStart = input.selectionEnd = start;
+            // Note: Ctrl+W handled by window capture-phase listener in init()
             } else if (e.key === 'l' && e.ctrlKey) {
                 // Ctrl+L: Redraw screen
                 e.preventDefault();
