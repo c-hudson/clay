@@ -6902,6 +6902,13 @@ fn get_proxy_socket_path(world_name: &str) -> PathBuf {
     ))
 }
 
+/// Get the config file path for a TLS proxy (derived from socket path)
+fn get_proxy_config_path(socket_path: &PathBuf) -> PathBuf {
+    let mut config_path = socket_path.clone();
+    config_path.set_extension("conf");
+    config_path
+}
+
 /// Spawn a TLS proxy process for a world connection.
 /// Returns (proxy_pid, socket_path) on success.
 /// The proxy process handles the TLS connection to the MUD server and exposes
@@ -6912,23 +6919,27 @@ fn spawn_tls_proxy(
     port: &str,
 ) -> io::Result<(u32, PathBuf)> {
     use std::process::{Command, Stdio};
+    use std::io::Write;
 
     let socket_path = get_proxy_socket_path(world_name);
+    let config_path = get_proxy_config_path(&socket_path);
 
-    // Remove any existing socket file
+    // Remove any existing socket and config files
     let _ = std::fs::remove_file(&socket_path);
+    let _ = std::fs::remove_file(&config_path);
+
+    // Write connection info to config file (keeps host:port out of process list)
+    {
+        let mut file = std::fs::File::create(&config_path)?;
+        writeln!(file, "{}:{}", host, port)?;
+        writeln!(file, "{}", socket_path.display())?;
+    }
 
     // Get the current executable path
     let exe_path = std::env::current_exe()?;
 
-    // Spawn the proxy as a separate process using --tls-proxy argument
-    // Format: --tls-proxy=host:port:socket_path
-    let proxy_arg = format!(
-        "--tls-proxy={}:{}:{}",
-        host,
-        port,
-        socket_path.display()
-    );
+    // Spawn the proxy with just the config file path (no host:port visible in ps)
+    let proxy_arg = format!("--tls-proxy={}", config_path.display());
 
     let child = Command::new(&exe_path)
         .arg(&proxy_arg)
@@ -12925,42 +12936,7 @@ mod remote_gui {
 
                                     ui.add_space(8.0);
 
-                                    // Input Height
-                                    form_row(ui, "Input Height", &mut |ui| {
-                                        ui.spacing_mut().item_spacing = egui::vec2(4.0, 0.0);
-                                        if ui.add(egui::Button::new(
-                                            egui::RichText::new("-").size(11.0).color(theme.fg_secondary()).family(egui::FontFamily::Monospace))
-                                            .fill(theme.bg_deep())
-                                            .stroke(egui::Stroke::NONE)
-                                            .rounding(egui::Rounding::same(4.0))
-                                            .min_size(egui::vec2(28.0, 24.0))
-                                        ).clicked() && input_height > 1 {
-                                            input_height -= 1;
-                                        }
-                                        ui.add_space(4.0);
-                                        // Number display in a styled box
-                                        let num_rect = ui.allocate_space(egui::vec2(40.0, row_height)).1;
-                                        ui.painter().rect_filled(num_rect, egui::Rounding::same(4.0), theme.bg_deep());
-                                        ui.painter().text(
-                                            num_rect.center(),
-                                            egui::Align2::CENTER_CENTER,
-                                            format!("{}", input_height),
-                                            egui::FontId::monospace(11.0),
-                                            theme.fg()
-                                        );
-                                        ui.add_space(4.0);
-                                        if ui.add(egui::Button::new(
-                                            egui::RichText::new("+").size(11.0).color(theme.fg_secondary()).family(egui::FontFamily::Monospace))
-                                            .fill(theme.bg_deep())
-                                            .stroke(egui::Stroke::NONE)
-                                            .rounding(egui::Rounding::same(4.0))
-                                            .min_size(egui::vec2(28.0, 24.0))
-                                        ).clicked() && input_height < 15 {
-                                            input_height += 1;
-                                        }
-                                    });
-
-                                    // Transparency
+                                    // Transparency (right below theme)
                                     form_row(ui, "Transparency", &mut |ui| {
                                         let slider_width = ui.available_width();
                                         let slider_height = row_height;
@@ -12995,6 +12971,41 @@ mod remote_gui {
                                                     .clamp(0.3, 1.0);
                                                 transparency = new_value;
                                             }
+                                        }
+                                    });
+
+                                    // Input Height
+                                    form_row(ui, "Input Height", &mut |ui| {
+                                        ui.spacing_mut().item_spacing = egui::vec2(4.0, 0.0);
+                                        if ui.add(egui::Button::new(
+                                            egui::RichText::new("-").size(11.0).color(theme.fg_secondary()).family(egui::FontFamily::Monospace))
+                                            .fill(theme.bg_deep())
+                                            .stroke(egui::Stroke::NONE)
+                                            .rounding(egui::Rounding::same(4.0))
+                                            .min_size(egui::vec2(28.0, 24.0))
+                                        ).clicked() && input_height > 1 {
+                                            input_height -= 1;
+                                        }
+                                        ui.add_space(4.0);
+                                        // Number display in a styled box
+                                        let num_rect = ui.allocate_space(egui::vec2(40.0, row_height)).1;
+                                        ui.painter().rect_filled(num_rect, egui::Rounding::same(4.0), theme.bg_deep());
+                                        ui.painter().text(
+                                            num_rect.center(),
+                                            egui::Align2::CENTER_CENTER,
+                                            format!("{}", input_height),
+                                            egui::FontId::monospace(11.0),
+                                            theme.fg()
+                                        );
+                                        ui.add_space(4.0);
+                                        if ui.add(egui::Button::new(
+                                            egui::RichText::new("+").size(11.0).color(theme.fg_secondary()).family(egui::FontFamily::Monospace))
+                                            .fill(theme.bg_deep())
+                                            .stroke(egui::Stroke::NONE)
+                                            .rounding(egui::Rounding::same(4.0))
+                                            .min_size(egui::vec2(28.0, 24.0))
+                                        ).clicked() && input_height < 15 {
+                                            input_height += 1;
                                         }
                                     });
 
@@ -15848,16 +15859,24 @@ async fn main() -> io::Result<()> {
     let is_crash_arg = std::env::args().any(|a| a == "--crash");
     debug_log(true, &format!("STARTUP: {} (reload={}, crash={})", get_version_string(), is_reload_arg, is_crash_arg));
 
-    // Check for --tls-proxy=host:port:socket_path argument for TLS proxy mode
+    // Check for --tls-proxy=config_path argument for TLS proxy mode
     // This is used internally when spawning TLS proxy processes
+    // Config file contains host:port on first line, socket_path on second line
     if let Some(proxy_arg) = std::env::args().find(|a| a.starts_with("--tls-proxy=")) {
-        let params = proxy_arg.strip_prefix("--tls-proxy=").unwrap();
-        let parts: Vec<&str> = params.splitn(3, ':').collect();
-        if parts.len() == 3 {
-            let host = parts[0];
-            let port = parts[1];
-            let socket_path = PathBuf::from(parts[2]);
-            run_tls_proxy_async(host, port, &socket_path).await;
+        let config_path = proxy_arg.strip_prefix("--tls-proxy=").unwrap();
+        if let Ok(contents) = std::fs::read_to_string(config_path) {
+            let lines: Vec<&str> = contents.lines().collect();
+            if lines.len() >= 2 {
+                let host_port: Vec<&str> = lines[0].splitn(2, ':').collect();
+                if host_port.len() == 2 {
+                    let host = host_port[0];
+                    let port = host_port[1];
+                    let socket_path = PathBuf::from(lines[1]);
+                    // Delete the config file now that we've read it (cleanup)
+                    let _ = std::fs::remove_file(config_path);
+                    run_tls_proxy_async(host, port, &socket_path).await;
+                }
+            }
         }
         return Ok(());
     }
