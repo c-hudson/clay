@@ -10927,8 +10927,8 @@ mod remote_gui {
                             let activity_count = worlds_with_activity.len();
 
                             // Status indicator (More/Hist or underscores)
-                            // Status area - spaces instead of underscores when no More/Hist indicator
-                            let status_text = "           ";
+                            // Status area - spaces instead of underscores when no More/Hist indicator (9 chars)
+                            let status_text = "          ";
                             ui.label(egui::RichText::new(status_text).monospace());
 
                             // Connection status ball (green = connected, red = disconnected)
@@ -16093,7 +16093,14 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
             app.worlds[world_idx].connected = false;
             app.worlds[world_idx].command_tx = None;
             app.worlds[world_idx].socket_fd = None;
-            app.worlds[world_idx].output_lines.push(OutputLine::new(tls_msg.to_string()));
+            app.worlds[world_idx].output_lines.push(OutputLine::new_client(tls_msg.to_string()));
+            // If not the current world, set unseen_lines for activity indicator
+            if world_idx != app.current_world_index {
+                if app.worlds[world_idx].unseen_lines == 0 {
+                    app.worlds[world_idx].first_unseen_at = Some(std::time::Instant::now());
+                }
+                app.worlds[world_idx].unseen_lines += 1;
+            }
         }
 
         // Second pass: reconstruct plain TCP connections
@@ -17268,8 +17275,24 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                             }
                             app.worlds[world_idx].prompt.clear();
                             // Show disconnection message
-                            app.worlds[world_idx].output_lines.push(OutputLine::new_client("Disconnected.".to_string()));
-                            // Broadcast to WebSocket clients
+                            let disconnect_msg = OutputLine::new_client("Disconnected.".to_string());
+                            app.worlds[world_idx].output_lines.push(disconnect_msg.clone());
+
+                            // If this is not the current world, increment unseen_lines for activity indicator
+                            if world_idx != app.current_world_index {
+                                if app.worlds[world_idx].unseen_lines == 0 {
+                                    app.worlds[world_idx].first_unseen_at = Some(std::time::Instant::now());
+                                }
+                                app.worlds[world_idx].unseen_lines += 1;
+                            }
+
+                            // Broadcast disconnect message to WebSocket clients
+                            app.ws_broadcast(WsMessage::ServerData {
+                                world_index: world_idx,
+                                data: format!("Disconnected.\n"),
+                                is_viewed: world_idx == app.current_world_index,
+                                ts: disconnect_msg.timestamp.duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs(),
+                            });
                             app.ws_broadcast(WsMessage::WorldDisconnected { world_index: world_idx });
                         }
                     }
@@ -18589,7 +18612,24 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                         }
                         app.worlds[world_idx].prompt.clear();
                         // Show disconnection message
-                        app.worlds[world_idx].output_lines.push(OutputLine::new_client("Disconnected.".to_string()));
+                        let disconnect_msg = OutputLine::new_client("Disconnected.".to_string());
+                        app.worlds[world_idx].output_lines.push(disconnect_msg.clone());
+
+                        // If this is not the current world, increment unseen_lines for activity indicator
+                        if world_idx != app.current_world_index {
+                            if app.worlds[world_idx].unseen_lines == 0 {
+                                app.worlds[world_idx].first_unseen_at = Some(std::time::Instant::now());
+                            }
+                            app.worlds[world_idx].unseen_lines += 1;
+                        }
+
+                        // Broadcast disconnect message to WebSocket clients
+                        app.ws_broadcast(WsMessage::ServerData {
+                            world_index: world_idx,
+                            data: format!("Disconnected.\n"),
+                            is_viewed: world_idx == app.current_world_index,
+                            ts: disconnect_msg.timestamp.duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs(),
+                        });
                         app.ws_broadcast(WsMessage::WorldDisconnected { world_index: world_idx });
                     }
                 }
@@ -23182,12 +23222,12 @@ fn render_splash_centered<'a>(world: &World, visible_height: usize, area_width: 
 }
 
 fn format_more_count(count: usize) -> String {
-    // Returns exactly 4 characters to make "More: XXXX" or "Hist: XXXX" = 10 chars total
+    // Returns exactly 4 characters to make "More XXXX" or "Hist XXXX" = 9 chars total (left-justified)
     if count <= 9999 {
-        format!("{:>4}", count)
+        format!("{:<4}", count)
     } else if count < 1_000_000 {
         // 10K, 99K, 100K, 999K etc.
-        format!("{:>3}K", (count / 1000).min(999))
+        format!("{:<3}K", (count / 1000).min(999))
     } else {
         "Alot".to_string()
     }
@@ -23201,16 +23241,16 @@ fn render_separator_bar(f: &mut Frame, app: &App, area: Rect) {
     // Build bar components
     let time_str = get_current_time_12hr();
 
-    // Status indicator - always reserve space for "More: XXXX" or "Hist: XXXX" (10 chars)
+    // Status indicator - always reserve space for "More XXXX" or "Hist XXXX" (9 chars)
     // Priority: More (when paused) > Hist (when scrolled back) > underscores
-    const STATUS_INDICATOR_LEN: usize = 10;
+    const STATUS_INDICATOR_LEN: usize = 9;
     let (status_str, status_active) = if world.paused && !world.pending_lines.is_empty() {
         // Show More indicator when paused with pending lines
-        (format!("More: {}", format_more_count(world.pending_lines.len())), true)
+        (format!("More {}", format_more_count(world.pending_lines.len())), true)
     } else if !world.is_at_bottom() {
         // Show History indicator when scrolled back
         let lines_back = world.lines_from_bottom();
-        (format!("Hist: {}", format_more_count(lines_back)), true)
+        (format!("Hist {}", format_more_count(lines_back)), true)
     } else {
         // Fill with underscores when nothing to show
         ("_".repeat(STATUS_INDICATOR_LEN), false)
@@ -23301,22 +23341,22 @@ fn render_separator_bar(f: &mut Frame, app: &App, area: Rect) {
     }
 
     // Calculate underscore padding - fill between content and time
-    // Fixed field sizes: status (10) + ball (2) + world name + tag + activity + underscores + "_" (1) + time (5)
+    // Fixed field sizes: status (9) + ball (2) + world name + tag + activity + underscores + "__" (2) + time (5)
     let used_len = if activity_str.is_empty() {
         status_str.len() + status_ball_width + world_display.len() + tag_indicator.len()
     } else {
         ACTIVITY_POSITION.max(current_pos) + activity_str.len()
     };
-    // Subtract 1 for the fixed underscore before time
-    let underscore_count = width.saturating_sub(used_len + time_display.len() + 1);
+    // Subtract 2 for the fixed underscores before time
+    let underscore_count = width.saturating_sub(used_len + time_display.len() + 2);
 
     spans.push(Span::styled(
         "_".repeat(underscore_count),
         Style::default().fg(theme.fg_dim()),
     ));
 
-    // Underscore separator before time
-    spans.push(Span::styled("_", Style::default().fg(theme.fg_dim())));
+    // Underscore separator before time (2 chars for extra spacing)
+    spans.push(Span::styled("__", Style::default().fg(theme.fg_dim())));
 
     // Time on the right (no spaces around it)
     spans.push(Span::styled(time_display, Style::default().fg(theme.fg())));

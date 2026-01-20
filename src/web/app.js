@@ -2458,10 +2458,10 @@
         elements.outputContainer.scrollTop = elements.outputContainer.scrollHeight;
     }
 
-    // Format count for status indicator (matches console behavior)
+    // Format count for status indicator (right-justified, 4 chars like %4s)
     function formatCount(n) {
         if (n >= 1000000) return 'Alot';
-        if (n >= 10000) return ' ' + Math.floor(n / 1000) + 'K';
+        if (n >= 10000) return (' ' + Math.floor(n / 1000) + 'K').slice(-4);
         return n.toString().padStart(4, ' ');
     }
 
@@ -2469,9 +2469,9 @@
     function updateStatusBar() {
         const world = worlds[currentWorldIndex];
 
-        // Status indicator: shows More/Hist when active, underscores when idle
+        // Status indicator: shows More/Hist when active, underscores when idle (9 chars)
         if (paused && pendingLines.length > 0) {
-            elements.statusIndicator.textContent = 'More:' + formatCount(pendingLines.length);
+            elements.statusIndicator.textContent = 'More ' + formatCount(pendingLines.length);
             elements.statusIndicator.className = 'paused';
         } else if (!isAtBottom()) {
             // Calculate lines from bottom
@@ -2479,10 +2479,10 @@
             const fontSize = fontSizes[currentFontPos] || 14;
             const lineHeight = fontSize * 1.2;
             const linesFromBottom = Math.floor((container.scrollHeight - container.scrollTop - container.clientHeight) / lineHeight);
-            elements.statusIndicator.textContent = 'Hist:' + formatCount(linesFromBottom);
+            elements.statusIndicator.textContent = 'Hist ' + formatCount(linesFromBottom);
             elements.statusIndicator.className = 'scrolled';
         } else {
-            elements.statusIndicator.textContent = '___________';
+            elements.statusIndicator.textContent = '__________';
             elements.statusIndicator.className = '';
         }
 
