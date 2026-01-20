@@ -123,6 +123,8 @@ pub enum WsMessage {
         console_theme: String,
         gui_theme: String,
         gui_transparency: f32,
+        #[serde(default)]
+        color_offset_percent: u8,
         input_height: u16,
         font_name: String,
         font_size: f32,
@@ -175,6 +177,8 @@ pub enum WsMessage {
 pub struct TimestampedLine {
     pub text: String,
     pub ts: u64, // seconds since Unix epoch
+    #[serde(default)]
+    pub gagged: bool, // true if line was gagged by an action (only shown with F2/show_tags)
 }
 
 /// World state for WebSocket protocol
@@ -232,6 +236,8 @@ pub struct GlobalSettingsMsg {
     pub gui_theme: String,
     #[serde(default = "default_gui_transparency")]
     pub gui_transparency: f32,
+    #[serde(default)]
+    pub color_offset_percent: u8,
     pub input_height: u16,
     pub font_name: String,
     pub font_size: f32,

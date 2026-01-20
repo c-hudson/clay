@@ -161,6 +161,9 @@
         setupInputHeightValue: document.getElementById('setup-input-height-value'),
         setupHeightMinus: document.getElementById('setup-height-minus'),
         setupHeightPlus: document.getElementById('setup-height-plus'),
+        setupColorOffsetValue: document.getElementById('setup-color-offset-value'),
+        setupColorOffsetMinus: document.getElementById('setup-color-offset-minus'),
+        setupColorOffsetPlus: document.getElementById('setup-color-offset-plus'),
         setupThemeSelect: document.getElementById('setup-theme-select'),
         setupSaveBtn: document.getElementById('setup-save-btn'),
         setupCancelBtn: document.getElementById('setup-cancel-btn'),
@@ -213,6 +216,9 @@
     let showTags = false;
     let highlightActions = false;
 
+    // Color offset percentage (0 = disabled, 1-100 = adjustment percentage)
+    let colorOffsetPercent = 0;
+
     // Command completion state
     let lastCompletionPrefix = '';
     let lastCompletionIndex = -1;
@@ -247,6 +253,7 @@
     let setupMoreMode = true;
     let setupWorldSwitchMode = 'Unseen First';
     let setupShowTags = false;
+    let setupColorOffset = 0;
     let setupAnsiMusic = true;
     let setupTlsProxy = false;
     let setupInputHeightValue = 1;
@@ -959,6 +966,9 @@
                         guiTheme = msg.settings.gui_theme;
                         applyTheme(guiTheme);
                     }
+                    if (msg.settings.color_offset_percent !== undefined) {
+                        colorOffsetPercent = msg.settings.color_offset_percent;
+                    }
                     // Load per-device font sizes
                     if (msg.settings.web_font_size_phone !== undefined) {
                         webFontSizePhone = msg.settings.web_font_size_phone;
@@ -1081,8 +1091,14 @@
             case 'WorldFlushed':
                 // Clear output buffer for this world
                 if (msg.world_index !== undefined && worlds[msg.world_index]) {
-                    worlds[msg.world_index].scrollback = [];
+                    worlds[msg.world_index].output_lines = [];
                     worlds[msg.world_index].pendingCount = 0;
+                    // Clear the cache for this world
+                    if (worldOutputCache[msg.world_index]) {
+                        worldOutputCache[msg.world_index] = [];
+                    }
+                    // Clear any partial line buffer
+                    partialLines[msg.world_index] = '';
                     // If it's the current world, clear the display
                     if (msg.world_index === currentWorldIndex) {
                         elements.output.innerHTML = '';
@@ -1161,6 +1177,13 @@
                     if (msg.settings.gui_theme !== undefined) {
                         guiTheme = msg.settings.gui_theme;
                         applyTheme(guiTheme);
+                    }
+                    if (msg.settings.color_offset_percent !== undefined) {
+                        const oldOffset = colorOffsetPercent;
+                        colorOffsetPercent = msg.settings.color_offset_percent;
+                        if (oldOffset !== colorOffsetPercent) {
+                            renderOutput(); // Re-render with new color offset
+                        }
                     }
                 }
                 break;
@@ -1726,6 +1749,12 @@
             // Handle both old string format and new object format
             const rawLine = typeof lineObj === 'string' ? lineObj : lineObj.text;
             const lineTs = typeof lineObj === 'object' ? lineObj.ts : null;
+            const lineGagged = typeof lineObj === 'object' ? lineObj.gagged : false;
+
+            // Skip gagged lines unless showTags is enabled (F2)
+            if (lineGagged && !showTags) {
+                continue;
+            }
 
             // Strip newlines/carriage returns
             const cleanLine = String(rawLine).replace(/[\r\n]+/g, '');
@@ -1896,6 +1925,48 @@
             return null; // No background
         }
 
+        // Adjust foreground color for contrast when it's too similar to background
+        function adjustFgForContrast(fgRgb, bgRgb, offsetPercent) {
+            if (offsetPercent === 0) return fgRgb;
+
+            // Use theme background if no explicit background
+            const effectiveBg = bgRgb || [13, 17, 23]; // Dark theme background
+
+            // Calculate color distance (simple RGB distance)
+            const dr = Math.abs(fgRgb[0] - effectiveBg[0]);
+            const dg = Math.abs(fgRgb[1] - effectiveBg[1]);
+            const db = Math.abs(fgRgb[2] - effectiveBg[2]);
+            const distance = dr + dg + db;
+
+            // Threshold for "too similar" - scale by color_offset_percent
+            // At 100%, colors within distance 150 are adjusted
+            const threshold = Math.floor((150 * offsetPercent) / 100);
+
+            if (distance >= threshold) return fgRgb; // Colors are different enough
+
+            // Calculate background brightness to determine if bg is light or dark
+            const bgBrightness = Math.floor((effectiveBg[0] + effectiveBg[1] + effectiveBg[2]) / 3);
+            const isBgDark = bgBrightness < 128;
+
+            // Adjustment amount based on color_offset_percent
+            const adjustment = Math.min(offsetPercent * 2, 200); // Max 200 adjustment
+
+            // If background is dark, lighten foreground; if light, darken foreground
+            if (isBgDark) {
+                return [
+                    Math.min(fgRgb[0] + adjustment, 255),
+                    Math.min(fgRgb[1] + adjustment, 255),
+                    Math.min(fgRgb[2] + adjustment, 255)
+                ];
+            } else {
+                return [
+                    Math.max(fgRgb[0] - adjustment, 0),
+                    Math.max(fgRgb[1] - adjustment, 0),
+                    Math.max(fgRgb[2] - adjustment, 0)
+                ];
+            }
+        }
+
         // Blend two RGB colors
         function blendColors(fg, bg, fgWeight) {
             return [
@@ -1988,8 +2059,21 @@
             // Add text before this escape sequence
             if (match.index > lastIndex) {
                 const rawText = text.substring(lastIndex, match.index);
+
+                // Apply color contrast adjustment if enabled
+                let adjustedFgStyle = currentFgStyle;
+                if (colorOffsetPercent > 0) {
+                    const fgRgb = getFgRgb(currentClasses, currentFgStyle);
+                    const bgRgb = getBgRgb(currentClasses, currentBgStyle);
+                    const adjustedFg = adjustFgForContrast(fgRgb, bgRgb, colorOffsetPercent);
+                    // Check if color was actually adjusted
+                    if (adjustedFg[0] !== fgRgb[0] || adjustedFg[1] !== fgRgb[1] || adjustedFg[2] !== fgRgb[2]) {
+                        adjustedFgStyle = `color:rgb(${adjustedFg[0]},${adjustedFg[1]},${adjustedFg[2]});`;
+                    }
+                }
+
                 const classes = currentClasses.length > 0 ? ` class="${currentClasses.join(' ')}"` : '';
-                const styles = (currentFgStyle || currentBgStyle) ? ` style="${currentFgStyle}${currentBgStyle}"` : '';
+                const styles = (adjustedFgStyle || currentBgStyle) ? ` style="${adjustedFgStyle}${currentBgStyle}"` : '';
 
                 // Check for shade characters that need blending
                 const shadeResult = processShadeChars(rawText, currentClasses, currentFgStyle, currentBgStyle);
@@ -2100,8 +2184,21 @@
         // Add remaining text
         if (lastIndex < text.length) {
             const remaining = escapeHtml(text.substring(lastIndex));
+
+            // Apply color contrast adjustment if enabled
+            let adjustedFgStyle = currentFgStyle;
+            if (colorOffsetPercent > 0) {
+                const fgRgb = getFgRgb(currentClasses, currentFgStyle);
+                const bgRgb = getBgRgb(currentClasses, currentBgStyle);
+                const adjustedFg = adjustFgForContrast(fgRgb, bgRgb, colorOffsetPercent);
+                // Check if color was actually adjusted
+                if (adjustedFg[0] !== fgRgb[0] || adjustedFg[1] !== fgRgb[1] || adjustedFg[2] !== fgRgb[2]) {
+                    adjustedFgStyle = `color:rgb(${adjustedFg[0]},${adjustedFg[1]},${adjustedFg[2]});`;
+                }
+            }
+
             const classes = currentClasses.length > 0 ? ` class="${currentClasses.join(' ')}"` : '';
-            const styles = (currentFgStyle || currentBgStyle) ? ` style="${currentFgStyle}${currentBgStyle}"` : '';
+            const styles = (adjustedFgStyle || currentBgStyle) ? ` style="${adjustedFgStyle}${currentBgStyle}"` : '';
             if (classes || styles) {
                 result += `<span${classes}${styles}>${remaining}</span>`;
             } else {
@@ -2270,23 +2367,14 @@
 
         // Convert seconds since epoch to Date
         const date = new Date(ts * 1000);
-        const now = new Date();
 
         const hours = date.getHours().toString().padStart(2, '0');
         const minutes = date.getMinutes().toString().padStart(2, '0');
+        const day = date.getDate().toString().padStart(2, '0');
+        const month = (date.getMonth() + 1).toString().padStart(2, '0');
 
-        // Check if same day
-        const sameDay = date.getDate() === now.getDate() &&
-                        date.getMonth() === now.getMonth() &&
-                        date.getFullYear() === now.getFullYear();
-
-        if (sameDay) {
-            return `${hours}:${minutes}> `;
-        } else {
-            const day = date.getDate().toString().padStart(2, '0');
-            const month = (date.getMonth() + 1).toString().padStart(2, '0');
-            return `${day}/${month} ${hours}:${minutes}> `;
-        }
+        // Always show day/month for debugging ordering issues
+        return `${day}/${month} ${hours}:${minutes}> `;
     }
 
     // Strip MUD tags like [channel:] or [channel(player)] from start of line
@@ -2833,6 +2921,7 @@
         setupTlsProxy = tlsProxyEnabled;
         setupInputHeightValue = inputHeight;
         setupGuiTheme = guiTheme;
+        setupColorOffset = colorOffsetPercent;
         elements.setupModal.className = 'modal visible';
         elements.setupModal.style.display = 'flex';
         updateSetupPopupUI();
@@ -2872,6 +2961,8 @@
         updateCustomDropdown(elements.setupWorldSwitchSelect);
         // Input height stepper
         elements.setupInputHeightValue.textContent = setupInputHeightValue;
+        // Color offset stepper
+        elements.setupColorOffsetValue.textContent = setupColorOffset === 0 ? 'OFF' : setupColorOffset + '%';
         // Theme dropdown
         elements.setupThemeSelect.value = setupGuiTheme.charAt(0).toUpperCase() + setupGuiTheme.slice(1);
         updateCustomDropdown(elements.setupThemeSelect);
@@ -2881,6 +2972,8 @@
         // Read values from UI (stepper value is already tracked)
         if (setupInputHeightValue < 1) setupInputHeightValue = 1;
         if (setupInputHeightValue > 15) setupInputHeightValue = 15;
+        if (setupColorOffset < 0) setupColorOffset = 0;
+        if (setupColorOffset > 100) setupColorOffset = 100;
 
         // Apply locally
         moreModeEnabled = setupMoreMode;
@@ -2889,10 +2982,11 @@
         ansiMusicEnabled = setupAnsiMusic;
         tlsProxyEnabled = setupTlsProxy;
         guiTheme = setupGuiTheme;
+        colorOffsetPercent = setupColorOffset;
         applyTheme(guiTheme);
         setInputHeight(setupInputHeightValue);
 
-        // Re-render output with new show_tags setting
+        // Re-render output with new show_tags and color_offset settings
         renderOutput();
 
         // Send to server
@@ -2907,6 +3001,7 @@
             console_theme: consoleTheme,
             gui_theme: guiTheme,
             gui_transparency: 1.0,
+            color_offset_percent: colorOffsetPercent,
             font_name: '',
             font_size: 14.0,
             web_font_size_phone: webFontSizePhone,
@@ -4555,8 +4650,8 @@
 
         // Keyboard controls (console-style) - input-specific
         elements.input.addEventListener('keydown', function(e) {
-            if (e.key === 'Enter' && !e.shiftKey) {
-                // Send command (also releases all pending)
+            if (e.key === 'Enter') {
+                // Send command (also releases all pending) - both Enter and Shift+Enter
                 e.preventDefault();
                 e.stopPropagation();  // Prevent document-level handler from catching this
                 sendCommand();
@@ -4843,6 +4938,18 @@
         elements.setupHeightPlus.onclick = function() {
             if (setupInputHeightValue < 15) {
                 setupInputHeightValue++;
+                updateSetupPopupUI();
+            }
+        };
+        elements.setupColorOffsetMinus.onclick = function() {
+            if (setupColorOffset > 0) {
+                setupColorOffset = Math.max(0, setupColorOffset - 5);
+                updateSetupPopupUI();
+            }
+        };
+        elements.setupColorOffsetPlus.onclick = function() {
+            if (setupColorOffset < 100) {
+                setupColorOffset = Math.min(100, setupColorOffset + 5);
                 updateSetupPopupUI();
             }
         };

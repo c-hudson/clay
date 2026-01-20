@@ -2862,6 +2862,8 @@ struct Settings {
     theme: Theme,           // Console theme
     gui_theme: Theme,       // GUI theme (separate from console)
     gui_transparency: f32,  // GUI window transparency (0.0-1.0)
+    // Color contrast adjustment for web/GUI (0 = disabled, 1-100 = adjustment percentage)
+    color_offset_percent: u8,
     // Remote GUI font settings
     font_name: String,
     font_size: f32,
@@ -2897,6 +2899,7 @@ impl Default for Settings {
             theme: Theme::Dark,
             gui_theme: Theme::Dark,
             gui_transparency: 1.0,
+            color_offset_percent: 0,   // 0 = disabled, 1-100 = adjustment percentage
             font_name: String::new(),  // Empty means use system default
             font_size: 14.0,
             // Web interface font sizes (per device type)
@@ -3744,7 +3747,7 @@ impl OutputLine {
     }
 
     /// Format timestamp using a pre-computed "now" value for batch rendering
-    fn format_timestamp_with_now(&self, now: &CachedNow) -> String {
+    fn format_timestamp_with_now(&self, _now: &CachedNow) -> String {
         let ts_secs = self.timestamp.duration_since(UNIX_EPOCH).unwrap_or_default().as_secs() as libc::time_t;
 
         let mut ts_tm: libc::tm = unsafe { std::mem::zeroed() };
@@ -3752,14 +3755,8 @@ impl OutputLine {
             libc::localtime_r(&ts_secs, &mut ts_tm);
         }
 
-        // Check if same day (year, day of year match)
-        let same_day = ts_tm.tm_yday == now.yday && ts_tm.tm_year == now.year;
-
-        if same_day {
-            format!("{:02}:{:02}>", ts_tm.tm_hour, ts_tm.tm_min)
-        } else {
-            format!("{:02}/{:02} {:02}:{:02}>", ts_tm.tm_mday, ts_tm.tm_mon + 1, ts_tm.tm_hour, ts_tm.tm_min)
-        }
+        // Always show day/month for debugging ordering issues
+        format!("{:02}/{:02} {:02}:{:02}>", ts_tm.tm_mday, ts_tm.tm_mon + 1, ts_tm.tm_hour, ts_tm.tm_min)
     }
 }
 
@@ -4680,7 +4677,9 @@ impl App {
                 .map(|s| s.text.replace('\r', ""))
                 .collect();
             // Create timestamped versions (add %% prefix and red color for client-generated messages)
-            let output_lines_ts: Vec<TimestampedLine> = world.output_lines.iter()
+            // Combine output_lines and pending_lines, then sort by timestamp to ensure chronological order
+            let mut all_lines: Vec<TimestampedLine> = world.output_lines.iter()
+                .chain(world.pending_lines.iter())
                 .map(|s| {
                     let text = s.text.replace('\r', "");
                     let text = if !s.from_server {
@@ -4691,23 +4690,15 @@ impl App {
                     TimestampedLine {
                         text,
                         ts: s.timestamp.duration_since(UNIX_EPOCH).unwrap_or_default().as_secs(),
+                        gagged: s.gagged,
                     }
                 })
                 .collect();
-            let pending_lines_ts: Vec<TimestampedLine> = world.pending_lines.iter()
-                .map(|s| {
-                    let text = s.text.replace('\r', "");
-                    let text = if !s.from_server {
-                        format!("\x1b[31m%% {}\x1b[0m", text)
-                    } else {
-                        text
-                    };
-                    TimestampedLine {
-                        text,
-                        ts: s.timestamp.duration_since(UNIX_EPOCH).unwrap_or_default().as_secs(),
-                    }
-                })
-                .collect();
+            // Sort by timestamp to ensure chronological order
+            all_lines.sort_by_key(|line| line.ts);
+            // Send all lines as output_lines_ts, pending_lines_ts is empty (clients handle more-mode locally)
+            let output_lines_ts = all_lines;
+            let pending_lines_ts: Vec<TimestampedLine> = Vec::new();
             WorldStateMsg {
                 index: idx,
                 name: world.name.clone(),
@@ -4749,6 +4740,7 @@ impl App {
             console_theme: self.settings.theme.name().to_string(),
             gui_theme: self.settings.gui_theme.name().to_string(),
             gui_transparency: self.settings.gui_transparency,
+            color_offset_percent: self.settings.color_offset_percent,
             input_height: self.input_height,
             font_name: self.settings.font_name.clone(),
             font_size: self.settings.font_size,
@@ -5272,6 +5264,7 @@ fn save_settings(app: &App) -> io::Result<()> {
     writeln!(file, "theme={}", app.settings.theme.name())?;
     writeln!(file, "gui_theme={}", app.settings.gui_theme.name())?;
     writeln!(file, "gui_transparency={}", app.settings.gui_transparency)?;
+    writeln!(file, "color_offset_percent={}", app.settings.color_offset_percent)?;
     writeln!(file, "font_name={}", app.settings.font_name)?;
     writeln!(file, "font_size={}", app.settings.font_size)?;
     writeln!(file, "web_font_size_phone={}", app.settings.web_font_size_phone)?;
@@ -5601,6 +5594,11 @@ fn load_settings(app: &mut App) -> io::Result<()> {
                     "gui_transparency" => {
                         if let Ok(t) = value.parse::<f32>() {
                             app.settings.gui_transparency = t.clamp(0.3, 1.0);
+                        }
+                    }
+                    "color_offset_percent" => {
+                        if let Ok(p) = value.parse::<u8>() {
+                            app.settings.color_offset_percent = p.min(100);
                         }
                     }
                     "web_secure" => {
@@ -6127,6 +6125,7 @@ fn save_reload_state(app: &App) -> io::Result<()> {
     writeln!(file, "theme={}", app.settings.theme.name())?;
     writeln!(file, "gui_theme={}", app.settings.gui_theme.name())?;
     writeln!(file, "gui_transparency={}", app.settings.gui_transparency)?;
+    writeln!(file, "color_offset_percent={}", app.settings.color_offset_percent)?;
     writeln!(file, "font_name={}", app.settings.font_name)?;
     writeln!(file, "font_size={}", app.settings.font_size)?;
     writeln!(file, "web_font_size_phone={}", app.settings.web_font_size_phone)?;
@@ -6585,6 +6584,11 @@ fn load_reload_state(app: &mut App) -> io::Result<bool> {
                             app.settings.gui_transparency = t.clamp(0.3, 1.0);
                         }
                     }
+                    "color_offset_percent" => {
+                        if let Ok(p) = value.parse::<u8>() {
+                            app.settings.color_offset_percent = p.min(100);
+                        }
+                    }
                     "web_secure" => {
                         app.settings.web_secure = value == "true";
                     }
@@ -6817,6 +6821,24 @@ fn is_process_alive(pid: u32) -> bool {
     // Use kill with signal 0 instead - this works for any process we can signal
     unsafe {
         libc::kill(pid as libc::pid_t, 0) == 0
+    }
+}
+
+/// Reap any zombie child processes to prevent defunct processes from accumulating.
+/// This should be called periodically from the main event loop.
+fn reap_zombie_children() {
+    // Call waitpid with -1 (any child) and WNOHANG (don't block) to reap zombies
+    // Keep calling until no more zombies are found
+    unsafe {
+        loop {
+            let mut status: libc::c_int = 0;
+            let result = libc::waitpid(-1, &mut status, libc::WNOHANG);
+            if result <= 0 {
+                // No more zombies to reap (0 = no status available, -1 = error/no children)
+                break;
+            }
+            // Successfully reaped a zombie, continue to check for more
+        }
     }
 }
 
@@ -7628,6 +7650,8 @@ mod remote_gui {
         transparency: f32,
         /// Original transparency when setup popup opened (for cancel/revert)
         original_transparency: Option<f32>,
+        /// Color offset percentage (0 = disabled, 1-100 = adjustment percentage)
+        color_offset_percent: u8,
         /// ANSI music enabled
         ansi_music_enabled: bool,
         /// TLS proxy enabled (for connection preservation over hot reload)
@@ -7638,6 +7662,12 @@ mod remote_gui {
         /// Audio output stream handle for playing sounds
         #[cfg(feature = "rodio")]
         audio_stream_handle: Option<rodio::OutputStreamHandle>,
+        /// Text selection start cursor (character index) per world
+        selection_start: Option<usize>,
+        /// Text selection end cursor (character index) per world - updated during drag
+        selection_end: Option<usize>,
+        /// Whether we're currently dragging a selection
+        selection_dragging: bool,
     }
 
     /// Square wave audio source for ANSI music playback
@@ -7797,12 +7827,16 @@ mod remote_gui {
                 debug_text: String::new(),
                 transparency: 1.0,
                 original_transparency: None,
+                color_offset_percent: 0,
                 ansi_music_enabled: true,
                 tls_proxy_enabled: false,
                 #[cfg(feature = "rodio")]
                 audio_stream: None,
                 #[cfg(feature = "rodio")]
                 audio_stream_handle: None,
+                selection_start: None,
+                selection_end: None,
+                selection_dragging: false,
             }
         }
 
@@ -8100,14 +8134,14 @@ mod remote_gui {
                                     } else {
                                         // Fallback for old protocol: use current time
                                         let now = current_timestamp_secs();
-                                        w.output_lines.into_iter().map(|text| TimestampedLine { text, ts: now }).collect()
+                                        w.output_lines.into_iter().map(|text| TimestampedLine { text, ts: now, gagged: false }).collect()
                                     };
                                     // Append pending lines (server's more mode shouldn't affect clients)
                                     if !w.pending_lines_ts.is_empty() {
                                         lines.extend(w.pending_lines_ts);
                                     } else {
                                         let now = current_timestamp_secs();
-                                        lines.extend(w.pending_lines.into_iter().map(|text| TimestampedLine { text, ts: now }));
+                                        lines.extend(w.pending_lines.into_iter().map(|text| TimestampedLine { text, ts: now, gagged: false }));
                                     }
                                     lines
                                 },
@@ -8146,6 +8180,7 @@ mod remote_gui {
                             self.web_font_size_tablet = settings.web_font_size_tablet;
                             self.web_font_size_desktop = settings.web_font_size_desktop;
                             self.transparency = settings.gui_transparency;
+                            self.color_offset_percent = settings.color_offset_percent;
                             self.ws_allow_list = settings.ws_allow_list;
                             self.web_secure = settings.web_secure;
                             self.http_enabled = settings.http_enabled;
@@ -8205,7 +8240,7 @@ mod remote_gui {
                                         } else {
                                             line.to_string()
                                         };
-                                        world.output_lines.push(TimestampedLine { text, ts });
+                                        world.output_lines.push(TimestampedLine { text, ts, gagged: false });
                                     }
                                 }
 
@@ -8229,6 +8264,7 @@ mod remote_gui {
                             if world_index < self.worlds.len() {
                                 self.worlds[world_index].output_lines.clear();
                                 self.worlds[world_index].pending_count = 0;
+                                self.worlds[world_index].partial_line.clear();
                             }
                         }
                         WsMessage::AnsiMusic { world_index: _, notes } => {
@@ -8287,6 +8323,7 @@ mod remote_gui {
                             self.web_font_size_tablet = settings.web_font_size_tablet;
                             self.web_font_size_desktop = settings.web_font_size_desktop;
                             self.transparency = settings.gui_transparency;
+                            self.color_offset_percent = settings.color_offset_percent;
                             self.ws_allow_list = settings.ws_allow_list;
                             self.web_secure = settings.web_secure;
                             self.http_enabled = settings.http_enabled;
@@ -8377,6 +8414,7 @@ mod remote_gui {
                                             self.worlds[self.current_world].output_lines.push(TimestampedLine {
                                                 text: line.to_string(),
                                                 ts,
+                                                gagged: false,
                                             });
                                         }
                                     }
@@ -8410,7 +8448,7 @@ mod remote_gui {
                                     let ts = super::current_timestamp_secs();
                                     if self.current_world < self.worlds.len() {
                                         self.worlds[self.current_world].output_lines.push(
-                                            TimestampedLine { text: super::get_version_string(), ts }
+                                            TimestampedLine { text: super::get_version_string(), ts, gagged: false }
                                         );
                                     }
                                 }
@@ -8754,6 +8792,7 @@ mod remote_gui {
                     console_theme: self.console_theme.to_string_value(),
                     gui_theme: self.theme.to_string_value(),
                     gui_transparency: self.transparency,
+                    color_offset_percent: self.color_offset_percent,
                     input_height: self.input_height,
                     font_name: self.font_name.clone(),
                     font_size: self.font_size,
@@ -8837,7 +8876,7 @@ mod remote_gui {
         }
 
         /// Format timestamp using cached "now" value for batch rendering
-        fn format_timestamp_gui_cached(ts: u64, now: &GuiCachedNow) -> String {
+        fn format_timestamp_gui_cached(ts: u64, _now: &GuiCachedNow) -> String {
             let ts_secs = ts as libc::time_t;
 
             let mut ts_tm: libc::tm = unsafe { std::mem::zeroed() };
@@ -8845,14 +8884,8 @@ mod remote_gui {
                 libc::localtime_r(&ts_secs, &mut ts_tm);
             }
 
-            // Check if same day (year, day of year match)
-            let same_day = ts_tm.tm_yday == now.yday && ts_tm.tm_year == now.year;
-
-            if same_day {
-                format!("{:02}:{:02}>", ts_tm.tm_hour, ts_tm.tm_min)
-            } else {
-                format!("{:02}/{:02} {:02}:{:02}>", ts_tm.tm_mday, ts_tm.tm_mon + 1, ts_tm.tm_hour, ts_tm.tm_min)
-            }
+            // Always show day/month for debugging ordering issues
+            format!("{:02}/{:02} {:02}:{:02}>", ts_tm.tm_mday, ts_tm.tm_mon + 1, ts_tm.tm_hour, ts_tm.tm_min)
         }
 
         /// Strip MUD tags like [channel:] or [channel(player)] from start of line
@@ -8973,6 +9006,62 @@ mod remote_gui {
             )
         }
 
+        /// Adjust foreground color for contrast when it's too similar to background.
+        /// color_offset_percent: 0 = disabled, 1-100 = threshold and adjustment percentage
+        fn adjust_fg_for_contrast(
+            fg: egui::Color32,
+            bg: egui::Color32,
+            theme_bg: egui::Color32,
+            color_offset_percent: u8,
+        ) -> egui::Color32 {
+            if color_offset_percent == 0 {
+                return fg;
+            }
+
+            // Calculate effective background (use theme_bg if transparent)
+            let effective_bg = if bg == egui::Color32::TRANSPARENT {
+                theme_bg
+            } else {
+                bg
+            };
+
+            // Calculate color distance (simple RGB distance)
+            let dr = (fg.r() as i32 - effective_bg.r() as i32).abs();
+            let dg = (fg.g() as i32 - effective_bg.g() as i32).abs();
+            let db = (fg.b() as i32 - effective_bg.b() as i32).abs();
+            let distance = dr + dg + db;
+
+            // Threshold for "too similar" - scale by color_offset_percent
+            // At 100%, colors within distance 150 are adjusted
+            let threshold = (150 * color_offset_percent as i32) / 100;
+
+            if distance >= threshold {
+                return fg; // Colors are different enough
+            }
+
+            // Calculate background brightness to determine if bg is light or dark
+            let bg_brightness = (effective_bg.r() as u32 + effective_bg.g() as u32 + effective_bg.b() as u32) / 3;
+            let is_bg_dark = bg_brightness < 128;
+
+            // Adjustment amount based on color_offset_percent
+            let adjustment = (color_offset_percent as i32 * 2).min(200); // Max 200 adjustment
+
+            // If background is dark, lighten foreground; if light, darken foreground
+            if is_bg_dark {
+                egui::Color32::from_rgb(
+                    (fg.r() as i32 + adjustment).min(255) as u8,
+                    (fg.g() as i32 + adjustment).min(255) as u8,
+                    (fg.b() as i32 + adjustment).min(255) as u8,
+                )
+            } else {
+                egui::Color32::from_rgb(
+                    (fg.r() as i32 - adjustment).max(0) as u8,
+                    (fg.g() as i32 - adjustment).max(0) as u8,
+                    (fg.b() as i32 - adjustment).max(0) as u8,
+                )
+            }
+        }
+
         /// Append a segment to job, processing shade characters for proper color blending
         fn append_segment_with_shades(
             segment: &str,
@@ -8980,8 +9069,12 @@ mod remote_gui {
             fg_color: egui::Color32,
             bg_color: egui::Color32,
             theme_bg: egui::Color32,
+            color_offset_percent: u8,
             job: &mut egui::text::LayoutJob,
         ) {
+            // Apply color contrast adjustment if enabled
+            let fg_color = Self::adjust_fg_for_contrast(fg_color, bg_color, theme_bg, color_offset_percent);
+
             // If no shade characters, just append normally
             if !segment.chars().any(|c| c == '░' || c == '▒' || c == '▓') {
                 job.append(segment, 0.0, egui::TextFormat {
@@ -9074,7 +9167,7 @@ mod remote_gui {
         }
 
         /// Append ANSI-colored text to an existing LayoutJob
-        fn append_ansi_to_job(text: &str, default_color: egui::Color32, font_id: egui::FontId, job: &mut egui::text::LayoutJob, is_light_theme: bool) {
+        fn append_ansi_to_job(text: &str, default_color: egui::Color32, font_id: egui::FontId, job: &mut egui::text::LayoutJob, is_light_theme: bool, color_offset_percent: u8) {
             // Debug: log ANSI sequences and resulting colors
             static DEBUG_COUNT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
             let debug_this = DEBUG_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 5 && text.contains('\x1b');
@@ -9096,7 +9189,7 @@ mod remote_gui {
                 if c == '\x1b' && chars.peek() == Some(&'[') {
                     // Flush current segment
                     if !segment.is_empty() {
-                        Self::append_segment_with_shades(&segment, &font_id, current_color, current_bg, theme_bg, job);
+                        Self::append_segment_with_shades(&segment, &font_id, current_color, current_bg, theme_bg, color_offset_percent, job);
                         segment.clear();
                     }
 
@@ -9278,7 +9371,7 @@ mod remote_gui {
 
             // Flush remaining segment
             if !segment.is_empty() {
-                Self::append_segment_with_shades(&segment, &font_id, current_color, current_bg, theme_bg, job);
+                Self::append_segment_with_shades(&segment, &font_id, current_color, current_bg, theme_bg, color_offset_percent, job);
             }
         }
 
@@ -9496,6 +9589,7 @@ mod remote_gui {
             font_id: &egui::FontId,
             is_light_theme: bool,
             link_color: egui::Color32,
+            color_offset_percent: u8,
         ) {
             let segments = Self::parse_discord_segments(text);
             let available_width = ui.available_width();
@@ -9518,7 +9612,7 @@ mod remote_gui {
                                     },
                                     ..Default::default()
                                 };
-                                Self::append_ansi_to_job(&txt_with_breaks, default_color, font_id.clone(), &mut job, is_light_theme);
+                                Self::append_ansi_to_job(&txt_with_breaks, default_color, font_id.clone(), &mut job, is_light_theme, color_offset_percent);
                                 let galley = ui.fonts(|f| f.layout_job(job));
                                 ui.label(galley);
                             } else {
@@ -9535,7 +9629,7 @@ mod remote_gui {
                                             },
                                             ..Default::default()
                                         };
-                                        Self::append_ansi_to_job(&before, default_color, font_id.clone(), &mut job, is_light_theme);
+                                        Self::append_ansi_to_job(&before, default_color, font_id.clone(), &mut job, is_light_theme, color_offset_percent);
                                         let galley = ui.fonts(|f| f.layout_job(job));
                                         ui.label(galley);
                                     }
@@ -9566,7 +9660,7 @@ mod remote_gui {
                                         },
                                         ..Default::default()
                                     };
-                                    Self::append_ansi_to_job(&after, default_color, font_id.clone(), &mut job, is_light_theme);
+                                    Self::append_ansi_to_job(&after, default_color, font_id.clone(), &mut job, is_light_theme, color_offset_percent);
                                     let galley = ui.fonts(|f| f.layout_job(job));
                                     ui.label(galley);
                                 }
@@ -10430,6 +10524,7 @@ mod remote_gui {
                                 world.output_lines.push(TimestampedLine {
                                     text: message,
                                     ts: current_timestamp_secs(),
+                                    gagged: false,
                                 });
                             }
                         }
@@ -10648,8 +10743,8 @@ mod remote_gui {
                             state.store(ctx, input_id);
                         }
 
-                        // Send on Enter (without Shift)
-                        if response.has_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter) && !i.modifiers.shift) {
+                        // Send on Enter (with or without Shift)
+                        if response.has_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
                             // Remove all newlines from the command (cursor in middle causes TextEdit to insert newline)
                             let cmd: String = std::mem::take(&mut self.input_buffer)
                                 .chars()
@@ -10697,6 +10792,7 @@ mod remote_gui {
                                                 self.worlds[self.current_world].output_lines.push(TimestampedLine {
                                                     text: line.to_string(),
                                                     ts,
+                                                    gagged: false,
                                                 });
                                             }
                                         }
@@ -10708,7 +10804,7 @@ mod remote_gui {
                                         let ts = current_timestamp_secs();
                                         if self.current_world < self.worlds.len() {
                                             self.worlds[self.current_world].output_lines.push(
-                                                TimestampedLine { text: super::get_version_string(), ts }
+                                                TimestampedLine { text: super::get_version_string(), ts, gagged: false }
                                             );
                                         }
                                     }
@@ -10744,7 +10840,7 @@ mod remote_gui {
                                             let ts = current_timestamp_secs();
                                             if self.current_world < self.worlds.len() {
                                                 self.worlds[self.current_world].output_lines.push(
-                                                    TimestampedLine { text: format!("\x1b[31m%% World '{}' not found.\x1b[0m", name), ts }
+                                                    TimestampedLine { text: format!("\x1b[31m%% World '{}' not found.\x1b[0m", name), ts, gagged: false }
                                                 );
                                             }
                                         }
@@ -10762,7 +10858,7 @@ mod remote_gui {
                                             let ts = current_timestamp_secs();
                                             if self.current_world < self.worlds.len() {
                                                 self.worlds[self.current_world].output_lines.push(
-                                                    TimestampedLine { text: format!("\x1b[31m%% World '{}' not found.\x1b[0m", name), ts }
+                                                    TimestampedLine { text: format!("\x1b[31m%% World '{}' not found.\x1b[0m", name), ts, gagged: false }
                                                 );
                                             }
                                         }
@@ -10856,8 +10952,8 @@ mod remote_gui {
 
                             // Spacer with underscore-style fill
                             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                // Current time (HH:MM) in local timezone
-                                let (hours, mins) = unsafe {
+                                // Current time (H:MM) in 12-hour format
+                                let (hours_24, mins) = unsafe {
                                     let mut now: libc::time_t = 0;
                                     libc::time(&mut now);
                                     let tm = libc::localtime(&now);
@@ -10866,6 +10962,14 @@ mod remote_gui {
                                     } else {
                                         ((*tm).tm_hour as u32, (*tm).tm_min as u32)
                                     }
+                                };
+                                // Convert to 12-hour format
+                                let hours = if hours_24 == 0 {
+                                    12
+                                } else if hours_24 <= 12 {
+                                    hours_24
+                                } else {
+                                    hours_24 - 12
                                 };
                                 ui.label(egui::RichText::new(format!("{}:{:02}", hours, mins))
                                     .monospace().color(theme.accent()));
@@ -10924,6 +11028,10 @@ mod remote_gui {
                         // Keep original lines with ANSI for coloring
                         let colored_lines: Vec<&TimestampedLine> = world.output_lines.iter()
                             .filter(|line| {
+                                // Skip gagged lines unless show_tags is enabled (F2)
+                                if line.gagged && !self.show_tags {
+                                    return false;
+                                }
                                 // Apply filter if active (filter on stripped text)
                                 if self.filter_active && !self.filter_text.is_empty() {
                                     let stripped = Self::strip_ansi_for_copy(&line.text);
@@ -11001,7 +11109,7 @@ mod remote_gui {
                                 let line_text = convert_discord_emojis(display_line);
                                 // Apply word breaks for long words
                                 let line_text = Self::insert_word_breaks(&line_text);
-                                Self::append_ansi_to_job(&line_text, default_color, font_id.clone(), &mut combined_job, is_light_theme);
+                                Self::append_ansi_to_job(&line_text, default_color, font_id.clone(), &mut combined_job, is_light_theme, self.color_offset_percent);
 
                                 if i < display_lines.len() - 1 {
                                     combined_job.append("\n", 0.0, egui::TextFormat {
@@ -11068,6 +11176,7 @@ mod remote_gui {
                         let emoji_is_light = matches!(theme, GuiTheme::Light);
                         let emoji_link_color = theme.link();
                         let emoji_plain_text = plain_text.clone();
+                        let emoji_color_offset = self.color_offset_percent;
 
                         let scroll_output = scroll_area.show(ui, |ui| {
                                 ui.set_width(ui.available_width());
@@ -11085,6 +11194,7 @@ mod remote_gui {
                                             &emoji_font_id,
                                             emoji_is_light,
                                             emoji_link_color,
+                                            emoji_color_offset,
                                         );
                                     }
 
@@ -11115,11 +11225,47 @@ mod remote_gui {
                                 let galley = ui.fonts(|f| f.layout_job(job));
 
                                 // Allocate space for the galley
-                                let (response, painter) = ui.allocate_painter(
+                                let (alloc_response, painter) = ui.allocate_painter(
                                     galley.size(),
                                     egui::Sense::click_and_drag()
                                 );
-                                let text_pos = response.rect.min;
+                                let text_pos = alloc_response.rect.min;
+
+                                // Handle text selection with mouse
+                                let pointer_pos = ui.input(|i| i.pointer.interact_pos());
+
+                                // Handle selection start on primary click
+                                if alloc_response.drag_started_by(egui::PointerButton::Primary) {
+                                    if let Some(pos) = pointer_pos {
+                                        let relative_pos = pos - text_pos;
+                                        let cursor = galley.cursor_from_pos(relative_pos);
+                                        // Subtract 1 so clicking on a character includes it in selection
+                                        let idx = cursor.ccursor.index.saturating_sub(1);
+                                        self.selection_start = Some(idx);
+                                        self.selection_end = Some(cursor.ccursor.index);
+                                        self.selection_dragging = true;
+                                    }
+                                }
+
+                                // Clear selection on single click without drag
+                                if alloc_response.clicked_by(egui::PointerButton::Primary) && !self.selection_dragging {
+                                    self.selection_start = None;
+                                    self.selection_end = None;
+                                }
+
+                                // Handle selection update during drag
+                                if self.selection_dragging && alloc_response.dragged_by(egui::PointerButton::Primary) {
+                                    if let Some(pos) = pointer_pos {
+                                        let relative_pos = pos - text_pos;
+                                        let cursor = galley.cursor_from_pos(relative_pos);
+                                        self.selection_end = Some(cursor.ccursor.index);
+                                    }
+                                }
+
+                                // Handle selection end on release
+                                if alloc_response.drag_stopped_by(egui::PointerButton::Primary) {
+                                    self.selection_dragging = false;
+                                }
 
                                 // First pass: paint full-height background rectangles per glyph
                                 let rows = &galley.rows;
@@ -11149,14 +11295,86 @@ mod remote_gui {
                                     }
                                 }
 
-                                // Second pass: paint the text on top (reusing the same galley)
+                                // Paint selection highlighting using galley's cursor positioning
+                                let selection_color = egui::Color32::from_rgba_unmultiplied(100, 100, 255, 100);
+                                if let (Some(sel_start), Some(sel_end)) = (self.selection_start, self.selection_end) {
+                                    let (start, end) = if sel_start <= sel_end {
+                                        (sel_start, sel_end)
+                                    } else {
+                                        (sel_end, sel_start)
+                                    };
+
+                                    if start != end {
+                                        // Get cursors for selection bounds
+                                        let start_cursor = galley.from_ccursor(egui::text::CCursor::new(start));
+                                        let end_cursor = galley.from_ccursor(egui::text::CCursor::new(end));
+
+                                        // Paint selection row by row
+                                        let start_row = start_cursor.rcursor.row;
+                                        let end_row = end_cursor.rcursor.row;
+
+                                        for row_idx in start_row..=end_row {
+                                            if row_idx >= rows.len() {
+                                                break;
+                                            }
+                                            let row = &rows[row_idx];
+                                            let row_top = text_pos.y + row.rect.top();
+                                            let row_bottom = if row_idx + 1 < rows.len() {
+                                                text_pos.y + rows[row_idx + 1].rect.top()
+                                            } else {
+                                                text_pos.y + row.rect.bottom()
+                                            };
+
+                                            // Determine x bounds for this row
+                                            let start_x = if row_idx == start_row {
+                                                let pos = galley.pos_from_cursor(&start_cursor);
+                                                text_pos.x + pos.min.x
+                                            } else {
+                                                text_pos.x + row.rect.left()
+                                            };
+
+                                            let end_x = if row_idx == end_row {
+                                                let pos = galley.pos_from_cursor(&end_cursor);
+                                                text_pos.x + pos.min.x
+                                            } else {
+                                                text_pos.x + row.rect.right()
+                                            };
+
+                                            if end_x > start_x {
+                                                let sel_rect = egui::Rect::from_min_max(
+                                                    egui::pos2(start_x, row_top),
+                                                    egui::pos2(end_x, row_bottom),
+                                                );
+                                                painter.rect_filled(sel_rect, 0.0, selection_color);
+                                            }
+                                        }
+                                    }
+                                }
+
+                                // Paint the text on top
                                 painter.galley(text_pos, galley.clone(), egui::Color32::WHITE);
+
+                                // Build cursor_range if we have a selection
+                                let cursor_range = if let (Some(sel_start), Some(sel_end)) = (self.selection_start, self.selection_end) {
+                                    if sel_start != sel_end {
+                                        let primary_ccursor = egui::text::CCursor::new(sel_start);
+                                        let secondary_ccursor = egui::text::CCursor::new(sel_end);
+                                        Some(egui::text_selection::CursorRange {
+                                            primary: galley.from_ccursor(primary_ccursor),
+                                            secondary: galley.from_ccursor(secondary_ccursor),
+                                        })
+                                    } else {
+                                        None
+                                    }
+                                } else {
+                                    None
+                                };
 
                                 // Wrap in a struct to match TextEdit response interface
                                 let response = TextEditOutputWrapper {
-                                    response,
+                                    response: alloc_response,
                                     galley,
-                                    cursor_range: None,
+                                    cursor_range,
                                     galley_pos: text_pos,
                                 };
 
@@ -12467,6 +12685,9 @@ mod remote_gui {
                     let mut input_height = self.input_height;
                     let mut gui_theme = self.theme;
                     let mut transparency = self.transparency;
+                    let mut color_offset = self.color_offset_percent;
+                    let mut color_offset_dec = false;
+                    let mut color_offset_inc = false;
                     let mut should_close = false;
                     let mut should_save = false;
                     let mut should_cancel = false;
@@ -12475,7 +12696,7 @@ mod remote_gui {
                         egui::ViewportId::from_hash_of("setup_window"),
                         egui::ViewportBuilder::default()
                             .with_title("Settings")
-                            .with_inner_size([420.0, 340.0]),
+                            .with_inner_size([560.0, 380.0]),
                         |ctx, _class| {
                             // Apply popup styling - remove all default strokes
                             ctx.style_mut(|style| {
@@ -12777,80 +12998,130 @@ mod remote_gui {
                                         }
                                     });
 
+                                    // Color Offset (0 = off, 5-100 = percentage)
+                                    ui.horizontal(|ui| {
+                                        ui.spacing_mut().item_spacing = egui::vec2(0.0, 0.0);
+                                        ui.set_height(row_height);
+                                        ui.allocate_ui_with_layout(
+                                            egui::vec2(label_width, row_height),
+                                            egui::Layout::right_to_left(egui::Align::Center),
+                                            |ui| {
+                                                ui.label(egui::RichText::new("COLOR OFFSET")
+                                                    .size(10.0)
+                                                    .color(theme.fg_muted()));
+                                            }
+                                        );
+                                        ui.add_space(label_spacing);
+                                        ui.spacing_mut().item_spacing = egui::vec2(4.0, 0.0);
+                                        if ui.add(egui::Button::new(
+                                            egui::RichText::new("-").size(11.0).color(theme.fg_secondary()).family(egui::FontFamily::Monospace))
+                                            .fill(theme.bg_deep())
+                                            .stroke(egui::Stroke::NONE)
+                                            .rounding(egui::Rounding::same(4.0))
+                                            .min_size(egui::vec2(28.0, 24.0))
+                                        ).clicked() {
+                                            color_offset_dec = true;
+                                        }
+                                        ui.add_space(4.0);
+                                        // Number display in a styled box
+                                        let num_rect = ui.allocate_space(egui::vec2(56.0, row_height)).1;
+                                        ui.painter().rect_filled(num_rect, egui::Rounding::same(4.0), theme.bg_deep());
+                                        let label = if color_offset == 0 { "OFF".to_string() } else { format!("{}%", color_offset) };
+                                        ui.painter().text(
+                                            num_rect.center(),
+                                            egui::Align2::CENTER_CENTER,
+                                            label,
+                                            egui::FontId::monospace(11.0),
+                                            theme.fg()
+                                        );
+                                        ui.add_space(4.0);
+                                        if ui.add(egui::Button::new(
+                                            egui::RichText::new("+").size(11.0).color(theme.fg_secondary()).family(egui::FontFamily::Monospace))
+                                            .fill(theme.bg_deep())
+                                            .stroke(egui::Stroke::NONE)
+                                            .rounding(egui::Rounding::same(4.0))
+                                            .min_size(egui::vec2(28.0, 24.0))
+                                        ).clicked() {
+                                            color_offset_inc = true;
+                                        }
+                                    });
+                                    ui.add_space(6.0);
+
                                     ui.add_space(8.0);
 
-                                    // More Mode
-                                    form_row(ui, "More Mode", &mut |ui| {
-                                        let switch_width = 44.0;
-                                        let switch_height = 22.0;
-                                        let switch_rect = ui.allocate_space(egui::vec2(switch_width, switch_height)).1;
-                                        let response = ui.interact(switch_rect, ui.id().with("more_mode_toggle"), egui::Sense::click());
-                                        let track_color = if more_mode { theme.accent_dim() } else { theme.bg_deep() };
-                                        ui.painter().rect_filled(switch_rect, egui::Rounding::same(11.0), track_color);
-                                        let knob_x = if more_mode { switch_rect.right() - 11.0 } else { switch_rect.left() + 11.0 };
-                                        let knob_color = if more_mode { theme.accent() } else { theme.fg_muted() };
-                                        ui.painter().circle_filled(egui::pos2(knob_x, switch_rect.center().y), 7.0, knob_color);
-                                        if response.clicked() { more_mode = !more_mode; }
-                                    });
+                                    // Toggle switches in two columns
+                                    let switch_width = 44.0;
+                                    let switch_height = 22.0;
+                                    // Use same label_width as form_row for alignment
+                                    let col_total_width = label_width + label_spacing + switch_width + 16.0;
 
-                                    // Spell Check
-                                    form_row(ui, "Spell Check", &mut |ui| {
-                                        let switch_width = 44.0;
-                                        let switch_height = 22.0;
-                                        let switch_rect = ui.allocate_space(egui::vec2(switch_width, switch_height)).1;
-                                        let response = ui.interact(switch_rect, ui.id().with("spell_check_toggle"), egui::Sense::click());
-                                        let track_color = if spell_check { theme.accent_dim() } else { theme.bg_deep() };
-                                        ui.painter().rect_filled(switch_rect, egui::Rounding::same(11.0), track_color);
-                                        let knob_x = if spell_check { switch_rect.right() - 11.0 } else { switch_rect.left() + 11.0 };
-                                        let knob_color = if spell_check { theme.accent() } else { theme.fg_muted() };
-                                        ui.painter().circle_filled(egui::pos2(knob_x, switch_rect.center().y), 7.0, knob_color);
-                                        if response.clicked() { spell_check = !spell_check; }
-                                    });
+                                    // Helper for toggle column with right-aligned label (same as form_row)
+                                    let toggle_col = |ui: &mut egui::Ui, label: &str, id: &str, enabled: &mut bool| {
+                                        ui.horizontal(|ui| {
+                                            ui.spacing_mut().item_spacing = egui::vec2(0.0, 0.0);
+                                            ui.allocate_ui_with_layout(
+                                                egui::vec2(label_width, row_height),
+                                                egui::Layout::right_to_left(egui::Align::Center),
+                                                |ui| {
+                                                    ui.label(egui::RichText::new(label)
+                                                        .size(10.0)
+                                                        .color(theme.fg_muted()));
+                                                }
+                                            );
+                                            ui.add_space(label_spacing);
+                                            let switch_rect = ui.allocate_space(egui::vec2(switch_width, switch_height)).1;
+                                            let response = ui.interact(switch_rect, ui.id().with(id), egui::Sense::click());
+                                            let track_color = if *enabled { theme.accent_dim() } else { theme.bg_deep() };
+                                            ui.painter().rect_filled(switch_rect, egui::Rounding::same(11.0), track_color);
+                                            let knob_x = if *enabled { switch_rect.right() - 11.0 } else { switch_rect.left() + 11.0 };
+                                            let knob_color = if *enabled { theme.accent() } else { theme.fg_muted() };
+                                            ui.painter().circle_filled(egui::pos2(knob_x, switch_rect.center().y), 7.0, knob_color);
+                                            if response.clicked() { *enabled = !*enabled; }
+                                        });
+                                    };
 
-                                    // Show Tags
-                                    form_row(ui, "Show Tags", &mut |ui| {
-                                        let switch_width = 44.0;
-                                        let switch_height = 22.0;
-                                        let switch_rect = ui.allocate_space(egui::vec2(switch_width, switch_height)).1;
-                                        let response = ui.interact(switch_rect, ui.id().with("show_tags_toggle"), egui::Sense::click());
-                                        let track_color = if show_tags { theme.accent_dim() } else { theme.bg_deep() };
-                                        ui.painter().rect_filled(switch_rect, egui::Rounding::same(11.0), track_color);
-                                        let knob_x = if show_tags { switch_rect.right() - 11.0 } else { switch_rect.left() + 11.0 };
-                                        let knob_color = if show_tags { theme.accent() } else { theme.fg_muted() };
-                                        ui.painter().circle_filled(egui::pos2(knob_x, switch_rect.center().y), 7.0, knob_color);
-                                        if response.clicked() { show_tags = !show_tags; }
+                                    // Row 1: More Mode | Spell Check
+                                    ui.horizontal(|ui| {
+                                        ui.set_height(row_height);
+                                        ui.allocate_ui(egui::vec2(col_total_width, row_height), |ui| {
+                                            toggle_col(ui, "MORE MODE", "more_mode_toggle", &mut more_mode);
+                                        });
+                                        ui.allocate_ui(egui::vec2(col_total_width, row_height), |ui| {
+                                            toggle_col(ui, "SPELL CHECK", "spell_check_toggle", &mut spell_check);
+                                        });
                                     });
+                                    ui.add_space(6.0);
 
-                                    // ANSI Music
-                                    form_row(ui, "ANSI Music", &mut |ui| {
-                                        let switch_width = 44.0;
-                                        let switch_height = 22.0;
-                                        let switch_rect = ui.allocate_space(egui::vec2(switch_width, switch_height)).1;
-                                        let response = ui.interact(switch_rect, ui.id().with("ansi_music_toggle"), egui::Sense::click());
-                                        let track_color = if ansi_music { theme.accent_dim() } else { theme.bg_deep() };
-                                        ui.painter().rect_filled(switch_rect, egui::Rounding::same(11.0), track_color);
-                                        let knob_x = if ansi_music { switch_rect.right() - 11.0 } else { switch_rect.left() + 11.0 };
-                                        let knob_color = if ansi_music { theme.accent() } else { theme.fg_muted() };
-                                        ui.painter().circle_filled(egui::pos2(knob_x, switch_rect.center().y), 7.0, knob_color);
-                                        if response.clicked() { ansi_music = !ansi_music; }
+                                    // Row 2: Show Tags | ANSI Music
+                                    ui.horizontal(|ui| {
+                                        ui.set_height(row_height);
+                                        ui.allocate_ui(egui::vec2(col_total_width, row_height), |ui| {
+                                            toggle_col(ui, "SHOW TAGS", "show_tags_toggle", &mut show_tags);
+                                        });
+                                        ui.allocate_ui(egui::vec2(col_total_width, row_height), |ui| {
+                                            toggle_col(ui, "ANSI MUSIC", "ansi_music_toggle", &mut ansi_music);
+                                        });
                                     });
+                                    ui.add_space(6.0);
 
-                                    // TLS Proxy
-                                    form_row(ui, "TLS Proxy", &mut |ui| {
-                                        let switch_width = 44.0;
-                                        let switch_height = 22.0;
-                                        let switch_rect = ui.allocate_space(egui::vec2(switch_width, switch_height)).1;
-                                        let response = ui.interact(switch_rect, ui.id().with("tls_proxy_toggle"), egui::Sense::click());
-                                        let track_color = if tls_proxy { theme.accent_dim() } else { theme.bg_deep() };
-                                        ui.painter().rect_filled(switch_rect, egui::Rounding::same(11.0), track_color);
-                                        let knob_x = if tls_proxy { switch_rect.right() - 11.0 } else { switch_rect.left() + 11.0 };
-                                        let knob_color = if tls_proxy { theme.accent() } else { theme.fg_muted() };
-                                        ui.painter().circle_filled(egui::pos2(knob_x, switch_rect.center().y), 7.0, knob_color);
-                                        if response.clicked() { tls_proxy = !tls_proxy; }
+                                    // Row 3: TLS Proxy (single item)
+                                    ui.horizontal(|ui| {
+                                        ui.set_height(row_height);
+                                        ui.allocate_ui(egui::vec2(col_total_width, row_height), |ui| {
+                                            toggle_col(ui, "TLS PROXY", "tls_proxy_toggle", &mut tls_proxy);
+                                        });
                                     });
                             });
                         },
                     );
+
+                    // Handle color offset button clicks (flags set inside viewport closure)
+                    if color_offset_dec && color_offset > 0 {
+                        color_offset = color_offset.saturating_sub(5);
+                    }
+                    if color_offset_inc && color_offset < 100 {
+                        color_offset = (color_offset + 5).min(100);
+                    }
 
                     // Apply changes back (live preview for transparency)
                     self.more_mode = more_mode;
@@ -12863,6 +13134,7 @@ mod remote_gui {
                     self.input_height = input_height;
                     self.theme = gui_theme;
                     self.transparency = transparency;
+                    self.color_offset_percent = color_offset;
 
                     if should_save {
                         self.update_global_settings();
@@ -13252,16 +13524,59 @@ mod remote_gui {
                                                 .unwrap_or_else(|| {
                                                     if edit_font_name.is_empty() { "System Default" } else { &edit_font_name }
                                                 });
-                                            egui::ComboBox::from_id_salt("font_family")
-                                                .selected_text(current_label)
-                                                .width(180.0)
-                                                .show_ui(ui, |ui| {
+
+                                            // Custom dropdown (matches world switching style)
+                                            let dropdown_id = ui.id().with("font_family_dropdown");
+                                            let dropdown_width = 180.0;
+                                            let row_height = 24.0;
+
+                                            let (rect, response) = ui.allocate_exact_size(egui::vec2(dropdown_width, row_height), egui::Sense::click());
+
+                                            ui.painter().rect_filled(rect, egui::Rounding::same(4.0), theme.bg_deep());
+
+                                            ui.painter().text(
+                                                egui::pos2(rect.min.x + 12.0, rect.center().y),
+                                                egui::Align2::LEFT_CENTER,
+                                                current_label,
+                                                egui::FontId::monospace(11.0),
+                                                theme.fg()
+                                            );
+
+                                            // Draw chevron
+                                            let chevron_x = rect.max.x - 16.0;
+                                            let chevron_y = rect.center().y;
+                                            let chevron_size = 4.0;
+                                            ui.painter().line_segment(
+                                                [egui::pos2(chevron_x - chevron_size, chevron_y - chevron_size / 2.0),
+                                                 egui::pos2(chevron_x, chevron_y + chevron_size / 2.0)],
+                                                egui::Stroke::new(1.5, theme.fg_muted())
+                                            );
+                                            ui.painter().line_segment(
+                                                [egui::pos2(chevron_x, chevron_y + chevron_size / 2.0),
+                                                 egui::pos2(chevron_x + chevron_size, chevron_y - chevron_size / 2.0)],
+                                                egui::Stroke::new(1.5, theme.fg_muted())
+                                            );
+
+                                            if response.clicked() {
+                                                ui.memory_mut(|mem| mem.toggle_popup(dropdown_id));
+                                            }
+
+                                            egui::popup_below_widget(ui, dropdown_id, &response, egui::PopupCloseBehavior::CloseOnClickOutside, |ui| {
+                                                ui.set_min_width(dropdown_width);
+                                                ui.style_mut().visuals.widgets.inactive.fg_stroke = egui::Stroke::new(1.0, theme.fg());
+                                                ui.style_mut().visuals.widgets.hovered.fg_stroke = egui::Stroke::new(1.0, theme.fg());
+                                                ui.style_mut().visuals.widgets.active.fg_stroke = egui::Stroke::new(1.0, theme.fg());
+                                                egui::ScrollArea::vertical().max_height(200.0).show(ui, |ui| {
                                                     for (value, label) in FONT_FAMILIES {
-                                                        if ui.selectable_value(&mut edit_font_name, value.to_string(), *label).clicked() {
-                                                            // Selection handled by selectable_value
+                                                        let is_selected = *value == edit_font_name;
+                                                        if ui.selectable_label(is_selected,
+                                                            egui::RichText::new(*label).size(11.0).color(theme.fg()).family(egui::FontFamily::Monospace)).clicked() {
+                                                            edit_font_name = value.to_string();
+                                                            ui.memory_mut(|mem| mem.close_popup());
                                                         }
                                                     }
                                                 });
+                                            });
                                             ui.end_row();
 
                                             ui.label(egui::RichText::new("Font size").size(12.0).color(theme.fg_secondary()));
@@ -13627,7 +13942,7 @@ mod remote_gui {
                                 let ts = current_timestamp_secs();
                                 if self.current_world < self.worlds.len() {
                                     self.worlds[self.current_world].output_lines.push(
-                                        TimestampedLine { text: super::get_version_string(), ts }
+                                        TimestampedLine { text: super::get_version_string(), ts, gagged: false }
                                     );
                                 }
                             }
@@ -14773,6 +15088,9 @@ keep_alive_type=Generic
 
     // Main event loop - only handles WebSocket events
     loop {
+        // Reap any zombie child processes (TLS proxies that have exited)
+        reap_zombie_children();
+
         tokio::select! {
             Some(event) = event_rx.recv() => {
                 match event {
@@ -15186,6 +15504,7 @@ fn build_multiuser_initial_state(app: &App, username: &str) -> WsMessage {
                     TimestampedLine {
                         text,
                         ts: s.timestamp.duration_since(UNIX_EPOCH).unwrap_or_default().as_secs(),
+                        gagged: s.gagged,
                     }
                 })
                 .collect();
@@ -15200,6 +15519,7 @@ fn build_multiuser_initial_state(app: &App, username: &str) -> WsMessage {
                     TimestampedLine {
                         text,
                         ts: s.timestamp.duration_since(UNIX_EPOCH).unwrap_or_default().as_secs(),
+                        gagged: s.gagged,
                     }
                 })
                 .collect();
@@ -15252,6 +15572,7 @@ fn build_multiuser_initial_state(app: &App, username: &str) -> WsMessage {
         console_theme: app.settings.theme.name().to_string(),
         gui_theme: app.settings.gui_theme.name().to_string(),
         gui_transparency: app.settings.gui_transparency,
+        color_offset_percent: app.settings.color_offset_percent,
         input_height: app.input_height,
         font_name: app.settings.font_name.clone(),
         font_size: app.settings.font_size,
@@ -16318,6 +16639,10 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
         if loop_count <= 5 {
             debug_log(true, &format!("LOOP: iteration {}", loop_count));
         }
+
+        // Reap any zombie child processes (TLS proxies that have exited)
+        // This is a fast non-blocking call that prevents defunct processes from accumulating
+        reap_zombie_children();
 
         // Use tokio::select! to efficiently wait for events without busy-polling
         tokio::select! {
@@ -17657,7 +17982,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                     });
                                 }
                             }
-                            WsMessage::UpdateGlobalSettings { more_mode_enabled, spell_check_enabled, world_switch_mode, show_tags, ansi_music_enabled, console_theme, gui_theme, gui_transparency, input_height, font_name, font_size, web_font_size_phone, web_font_size_tablet, web_font_size_desktop, ws_allow_list, web_secure, http_enabled, http_port, ws_enabled, ws_port, ws_cert_file, ws_key_file, tls_proxy_enabled } => {
+                            WsMessage::UpdateGlobalSettings { more_mode_enabled, spell_check_enabled, world_switch_mode, show_tags, ansi_music_enabled, console_theme, gui_theme, gui_transparency, color_offset_percent, input_height, font_name, font_size, web_font_size_phone, web_font_size_tablet, web_font_size_desktop, ws_allow_list, web_secure, http_enabled, http_port, ws_enabled, ws_port, ws_cert_file, ws_key_file, tls_proxy_enabled } => {
                                 // Update global settings from remote client
                                 app.settings.more_mode_enabled = more_mode_enabled;
                                 app.settings.spell_check_enabled = spell_check_enabled;
@@ -17669,6 +17994,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                 // GUI theme is stored for sending back to GUI clients
                                 app.settings.gui_theme = Theme::from_name(&gui_theme);
                                 app.settings.gui_transparency = gui_transparency.clamp(0.3, 1.0);
+                                app.settings.color_offset_percent = color_offset_percent.min(100);
                                 app.input_height = input_height.clamp(1, 15);
                                 app.input.visible_height = app.input_height;
                                 app.settings.font_name = font_name;
@@ -17703,6 +18029,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                     console_theme: app.settings.theme.name().to_string(),
                                     gui_theme: app.settings.gui_theme.name().to_string(),
                                     gui_transparency: app.settings.gui_transparency,
+                                    color_offset_percent: app.settings.color_offset_percent,
                                     input_height: app.input_height,
                                     font_name: app.settings.font_name.clone(),
                                     font_size: app.settings.font_size,
@@ -18850,7 +19177,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                 app.ws_broadcast(WsMessage::WorldSettingsUpdated { world_index, settings: settings_msg, name });
                             }
                         }
-                        WsMessage::UpdateGlobalSettings { more_mode_enabled, spell_check_enabled, world_switch_mode, show_tags, ansi_music_enabled, console_theme, gui_theme, gui_transparency, input_height, font_name, font_size, web_font_size_phone, web_font_size_tablet, web_font_size_desktop, ws_allow_list, web_secure, http_enabled, http_port, ws_enabled, ws_port, ws_cert_file, ws_key_file, tls_proxy_enabled } => {
+                        WsMessage::UpdateGlobalSettings { more_mode_enabled, spell_check_enabled, world_switch_mode, show_tags, ansi_music_enabled, console_theme, gui_theme, gui_transparency, color_offset_percent, input_height, font_name, font_size, web_font_size_phone, web_font_size_tablet, web_font_size_desktop, ws_allow_list, web_secure, http_enabled, http_port, ws_enabled, ws_port, ws_cert_file, ws_key_file, tls_proxy_enabled } => {
                             app.settings.more_mode_enabled = more_mode_enabled;
                             app.settings.spell_check_enabled = spell_check_enabled;
                             app.settings.world_switch_mode = WorldSwitchMode::from_name(&world_switch_mode);
@@ -18859,6 +19186,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                             app.settings.theme = Theme::from_name(&console_theme);
                             app.settings.gui_theme = Theme::from_name(&gui_theme);
                             app.settings.gui_transparency = gui_transparency.clamp(0.3, 1.0);
+                            app.settings.color_offset_percent = color_offset_percent.min(100);
                             app.input_height = input_height.clamp(1, 15);
                             app.input.visible_height = app.input_height;
                             app.settings.font_name = font_name;
@@ -18889,6 +19217,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                 console_theme: app.settings.theme.name().to_string(),
                                 gui_theme: app.settings.gui_theme.name().to_string(),
                                 gui_transparency: app.settings.gui_transparency,
+                                color_offset_percent: app.settings.color_offset_percent,
                                 input_height: app.input_height,
                                 font_name: app.settings.font_name.clone(),
                                 font_size: app.settings.font_size,
