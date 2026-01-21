@@ -15327,8 +15327,18 @@ keep_alive_type=Generic
                             let settings = app.worlds[world_index].settings.clone();
                             let world_name = app.worlds[world_index].name.clone();
 
+                            // Check if world has connection settings
+                            if !settings.has_connection_settings() {
+                                if let Some(ws) = &app.ws_server {
+                                    ws.broadcast_to_owner(WsMessage::ServerData {
+                                        world_index,
+                                        data: "No connection settings configured for this world.\n".to_string(),
+                                        is_viewed: true,
+                                        ts: current_timestamp_secs(),
+                                    }, Some(&requesting_username));
+                                }
                             // Create per-user connection
-                            if let Some(cmd_tx) = connect_multiuser_world(
+                            } else if let Some(cmd_tx) = connect_multiuser_world(
                                 world_index,
                                 requesting_username.clone(),
                                 &settings,
@@ -18138,19 +18148,29 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                             WsMessage::ConnectWorld { world_index } => {
                                 // Trigger connection for specified world
                                 if world_index < app.worlds.len() && !app.worlds[world_index].connected {
-                                    // Save current world index, switch to target, connect, then restore
-                                    let prev_index = app.current_world_index;
-                                    app.current_world_index = world_index;
-                                    if handle_command("/connect", &mut app, event_tx.clone()).await {
-                                        // Quit was triggered (shouldn't happen from /connect)
-                                        return Ok(());
-                                    }
-                                    // Broadcast world connected
-                                    let name = app.worlds[world_index].name.clone();
-                                    app.ws_broadcast(WsMessage::WorldConnected { world_index, name });
-                                    // Restore previous world if it wasn't the target
-                                    if prev_index != world_index {
-                                        app.current_world_index = prev_index;
+                                    // Check if world has connection settings
+                                    if !app.worlds[world_index].settings.has_connection_settings() {
+                                        app.ws_broadcast(WsMessage::ServerData {
+                                            world_index,
+                                            data: "No connection settings configured for this world.".to_string(),
+                                            is_viewed: false,
+                                            ts: current_timestamp_secs(),
+                                        });
+                                    } else {
+                                        // Save current world index, switch to target, connect, then restore
+                                        let prev_index = app.current_world_index;
+                                        app.current_world_index = world_index;
+                                        if handle_command("/connect", &mut app, event_tx.clone()).await {
+                                            // Quit was triggered (shouldn't happen from /connect)
+                                            return Ok(());
+                                        }
+                                        // Broadcast world connected
+                                        let name = app.worlds[world_index].name.clone();
+                                        app.ws_broadcast(WsMessage::WorldConnected { world_index, name });
+                                        // Restore previous world if it wasn't the target
+                                        if prev_index != world_index {
+                                            app.current_world_index = prev_index;
+                                        }
                                     }
                                 }
                             }
@@ -25112,29 +25132,13 @@ fn render_actions_popup(f: &mut Frame, app: &App) {
             // Get filtered indices
             let filtered_indices = popup.filtered_indices();
 
-            let max_action_display = popup.actions.iter().map(|a| {
-                let display_len = if a.pattern.is_empty() {
-                    if a.world.is_empty() {
-                        a.name.chars().count() + 3
-                    } else {
-                        a.name.chars().count() + a.world.chars().count() + 6
-                    }
-                } else if a.world.is_empty() {
-                    a.name.chars().count() + 25
-                } else {
-                    a.name.chars().count() + a.world.chars().count() + 25
-                };
-                display_len
-            }).max().unwrap_or(30);
-
-            let buttons_width = 48; // "[ Add ]  [ Edit ]  [ Delete ]  [ Cancel ]"
-            let content_width = max_action_display.max(buttons_width).max(40);
-            let popup_width = ((content_width + 4) as u16).min(area.width.saturating_sub(4));
+            // Use 90% of window width
+            let popup_width = ((area.width as f32 * 0.90) as u16).max(40).min(area.width.saturating_sub(4));
 
             // Extra height for filter line (1) + world filter indicator if present (1)
             let extra_lines = if popup.world_filter.is_empty() { 1 } else { 2 };
-            // Popup chrome: border (2) + filter line (1) + optional world filter (0-1) + blank line (1) + buttons (1) = 5 + extra_lines
-            let popup_chrome = 5 + extra_lines;
+            // Popup chrome: border (2) + filter line (1) + optional world filter (0-1) + blank line (1) + header (1) + buttons (1) = 6 + extra_lines
+            let popup_chrome = 6 + extra_lines;
             // Available height: screen height minus separator bar (1), input area, and margin (2)
             let max_available_height = area.height.saturating_sub(app.input_height + 3) as usize;
             // Maximum list height that fits
@@ -25147,10 +25151,20 @@ fn render_actions_popup(f: &mut Frame, app: &App) {
             let y = area.height.saturating_sub(popup_height) / 2;
             let popup_area = Rect::new(x, y, popup_width, popup_height);
 
+            // Calculate column widths for aligned display
+            // Columns: Name, World, Pattern (all start at same horizontal position with 2 spaces between)
+            let inner_width = popup_width.saturating_sub(4) as usize;
+            let max_name_len = popup.actions.iter().map(|a| a.name.chars().count()).max().unwrap_or(4).max(4);
+            let max_world_len = popup.actions.iter().map(|a| a.world.chars().count()).max().unwrap_or(5).max(5);
+            // Name column width includes marker (2 chars: "> " or "  ")
+            let name_col_width = max_name_len + 2;
+            let world_col_width = max_world_len;
+            // Pattern column gets remaining space minus scrollbar (2) and column separators (4 spaces = 2+2)
+            let pattern_col_width = inner_width.saturating_sub(name_col_width + 2 + world_col_width + 2 + 2);
+
             f.render_widget(ratatui::widgets::Clear, popup_area);
 
             let mut lines: Vec<Line<'static>> = Vec::new();
-            let inner_width = popup_width.saturating_sub(4) as usize;
 
             // Filter line at top
             let filter_label = "Filter: ";
@@ -25183,24 +25197,22 @@ fn render_actions_popup(f: &mut Frame, app: &App) {
 
             lines.push(Line::from(""));
 
-            let scroll = popup.scroll_offset;
+            // Header row - highlighted with column names aligned to data columns
+            let header_style = Style::default().fg(theme.fg()).bg(theme.button_selected_bg()).add_modifier(Modifier::BOLD);
+            let name_header = format!("{:width$}", "Name", width = name_col_width);
+            let world_header = format!("{:width$}", "World", width = world_col_width);
+            let pattern_header = "Pattern";
+            let header_line = format!("{}  {}  {}", name_header, world_header, pattern_header);
+            let header_padding = inner_width.saturating_sub(header_line.chars().count() + 2);
+            lines.push(Line::from(vec![
+                Span::styled(header_line, header_style),
+                Span::styled(" ".repeat(header_padding), header_style),
+                Span::raw("  "),
+            ]));
 
-            // Calculate scroll offset to keep selection visible
-            // Only adjust if selection is out of the visible range
-            let selected_pos = filtered_indices
-                .iter()
-                .position(|&i| i == popup.selected_index)
-                .unwrap_or(0);
-            let scroll_offset = if selected_pos < scroll {
-                // Selection above visible area - scroll up to show it at top
-                selected_pos
-            } else if selected_pos >= scroll + list_height {
-                // Selection below visible area - scroll down to show it at bottom
-                selected_pos - list_height + 1
-            } else {
-                // Selection is visible - keep current scroll
-                scroll.min(filtered_indices.len().saturating_sub(list_height))
-            };
+            // Use scroll_offset directly - scrolling only happens when user tries to move past visible area
+            // (handled in input processing, not here in rendering)
+            let scroll_offset = popup.scroll_offset.min(filtered_indices.len().saturating_sub(list_height));
 
             // Calculate scrollbar position
             let total_items = filtered_indices.len();
@@ -25236,7 +25248,7 @@ fn render_actions_popup(f: &mut Frame, app: &App) {
                     let action_idx = filtered_indices[filtered_pos];
                     let action = &popup.actions[action_idx];
                     let is_selected = action_idx == popup.selected_index;
-                    let marker = if is_selected { ">" } else { " " };
+                    let marker = if is_selected { "> " } else { "  " };
                     let style = if popup.list_field == ActionListField::List && is_selected {
                         selected_style
                     } else if is_selected {
@@ -25245,25 +25257,36 @@ fn render_actions_popup(f: &mut Frame, app: &App) {
                         value_style
                     };
 
-                    let display = if action.pattern.is_empty() {
-                        if action.world.is_empty() {
-                            format!("{} /{}", marker, action.name)
-                        } else {
-                            format!("{} /{} ({})", marker, action.name, action.world)
-                        }
-                    } else if action.world.is_empty() {
-                        format!("{} {} [{}]", marker, action.name, truncate_str(&action.pattern, 20))
+                    // Build aligned columns: marker+name, world, pattern
+                    // Name column (with marker prefix, pad with / for manual actions)
+                    let name_display = if action.pattern.is_empty() {
+                        format!("/{}", action.name)
                     } else {
-                        format!("{} {} ({}) [{}]", marker, action.name, action.world, truncate_str(&action.pattern, 15))
+                        action.name.clone()
+                    };
+                    let name_padded = format!("{}{:width$}", marker, name_display, width = name_col_width - 2);
+
+                    // World column (no parens, just the name or empty)
+                    let world_padded = format!("{:width$}", action.world, width = world_col_width);
+
+                    // Pattern column (truncate with "..." if too long)
+                    let pattern_display = if action.pattern.chars().count() > pattern_col_width {
+                        let truncated: String = action.pattern.chars().take(pattern_col_width.saturating_sub(3)).collect();
+                        format!("{}...", truncated)
+                    } else {
+                        action.pattern.clone()
                     };
 
-                    // Truncate to leave room for scrollbar
+                    // Build the full line with 2 spaces between columns
+                    let full_line = format!("{}  {}  {}", name_padded, world_padded, pattern_display);
+
+                    // Pad to inner_width minus scrollbar space
                     let display_width = inner_width.saturating_sub(2);
-                    let truncated = truncate_str(&display, display_width);
-                    let padding = display_width.saturating_sub(truncated.chars().count());
+                    let line_chars: usize = full_line.chars().count();
+                    let padding = display_width.saturating_sub(line_chars);
 
                     lines.push(Line::from(vec![
-                        Span::styled(truncated, style),
+                        Span::styled(full_line, style),
                         Span::raw(" ".repeat(padding)),
                         Span::styled(format!(" {}", scrollbar_char), Style::default().fg(theme.fg_dim())),
                     ]));
@@ -25279,19 +25302,24 @@ fn render_actions_popup(f: &mut Frame, app: &App) {
 
             lines.push(Line::from(""));
 
-            // Buttons row
+            // Buttons row - right justified
             let add_style = if popup.list_field == ActionListField::AddButton { button_selected_style } else { button_style };
             let edit_style = if popup.list_field == ActionListField::EditButton { button_selected_style } else { button_style };
             let del_style = if popup.list_field == ActionListField::DeleteButton { button_selected_style } else { button_style };
             let cancel_style = if popup.list_field == ActionListField::CancelButton { button_selected_style } else { button_style };
 
+            // Calculate button widths: "[ Add ]" (7) + " " (1) + "[ Edit ]" (8) + " " (1) + "[ Delete ]" (10) + " " (1) + "[ Ok ]" (6) = 34
+            let buttons_width = 34;
+            let buttons_padding = inner_width.saturating_sub(buttons_width);
+
             lines.push(Line::from(vec![
+                Span::raw(" ".repeat(buttons_padding)),
                 Span::styled("[ Add ]", add_style),
-                Span::raw("  "),
+                Span::raw(" "),
                 Span::styled("[ Edit ]", edit_style),
-                Span::raw("  "),
+                Span::raw(" "),
                 Span::styled("[ Delete ]", del_style),
-                Span::raw("  "),
+                Span::raw(" "),
                 Span::styled("[ Ok ]", cancel_style),
             ]));
 

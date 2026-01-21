@@ -2794,6 +2794,23 @@
             return;
         }
 
+        // Add header row
+        const headerDiv = document.createElement('div');
+        headerDiv.className = 'actions-list-header';
+        const nameHeader = document.createElement('span');
+        nameHeader.className = 'action-name';
+        nameHeader.textContent = 'Name';
+        headerDiv.appendChild(nameHeader);
+        const worldHeader = document.createElement('span');
+        worldHeader.className = 'action-world';
+        worldHeader.textContent = 'World';
+        headerDiv.appendChild(worldHeader);
+        const patternHeader = document.createElement('span');
+        patternHeader.className = 'action-pattern';
+        patternHeader.textContent = 'Pattern';
+        headerDiv.appendChild(patternHeader);
+        elements.actionsList.appendChild(headerDiv);
+
         filteredIndices.forEach((index) => {
             const action = actions[index];
             const div = document.createElement('div');
@@ -3581,11 +3598,9 @@
             // Switch to the world first
             switchWorldLocal(selectedWorldIndex);
             // Check if we have settings to connect
-            const hasSettings = world.settings &&
-                world.settings.hostname &&
-                world.settings.hostname.length > 0 &&
-                world.settings.port &&
-                world.settings.port.length > 0;
+            const hostname = world.settings?.hostname || '';
+            const port = world.settings?.port || '';
+            const hasSettings = hostname.length > 0 && port.toString().length > 0;
             if (hasSettings) {
                 // Has hostname/port - connect
                 send({
@@ -3818,17 +3833,18 @@
             switchWorldLocal(worldIndex);
             // If not connected, check if we have settings to connect
             if (!world.connected) {
-                const hasSettings = world.settings &&
-                    world.settings.hostname &&
-                    world.settings.hostname.length > 0 &&
-                    world.settings.port &&
-                    world.settings.port.length > 0;
+                const hostname = world.settings?.hostname || '';
+                const port = world.settings?.port || '';
+                const hasSettings = hostname.length > 0 && port.toString().length > 0;
                 if (hasSettings) {
                     // Has hostname/port - connect
                     send({
                         type: 'ConnectWorld',
                         world_index: worldIndex
                     });
+                } else {
+                    // No settings - show error
+                    appendLine('No connection settings configured for this world.', worldIndex);
                 }
             }
         } else {
