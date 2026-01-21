@@ -124,6 +124,13 @@ Encoding is configurable per-world in the world settings popup.
 - Raw bytes passed via `AppEvent::ServerData(world_idx, Vec<u8>)`, decoded in main loop
 - Control characters filtered during decode (keeps tab, newline, escape for ANSI)
 
+**Colored Square Emoji:**
+- Colored square emoji (🟥🟧🟨🟩🟦🟪🟫⬛⬜) are rendered with proper colors
+- Console: Replaced with ANSI true-color block characters (██) since terminal emoji fonts ignore foreground colors
+- Remote GUI: Rendered as colored rectangles using egui
+- Web: Native emoji rendering (browser handles colors)
+- Implementation: `colorize_square_emojis()` in encoding.rs, `has_colored_squares()` in GUI
+
 ### Multi-World System
 
 - Each world has independent: output buffer, scroll position, connection, unseen line count
@@ -144,7 +151,7 @@ Encoding is configurable per-world in the world settings popup.
 - Tab releases one screenful minus 2 lines of pending lines
 - Escape+j releases all pending lines (jump to end)
 - Enter sends command but does NOT release pending lines (only Tab or PageDown releases pending)
-- Scrolling to bottom with PageDown also unpauses
+- Scrolling to bottom with PageDown also unpauses and releases all pending lines
 
 ### SSL/TLS Support
 
@@ -247,9 +254,12 @@ Prompts that are auto-answered are immediately cleared and not displayed in the 
 ### Files
 
 - `src/main.rs` - Main application
+- `src/encoding.rs` - Character encoding (UTF-8, Latin1, Fansi) and colored emoji handling
 - `src/web/index.html` - Web interface HTML template
 - `src/web/style.css` - Web interface CSS styles
 - `src/web/app.js` - Web interface JavaScript client
+- `clay2.png` - Logo image used in remote GUI login screen and Android app icon
+- `android/app/src/main/res/mipmap-*/` - Android launcher icons (generated from clay2.png)
 - `websockets.readme` - WebSocket protocol documentation
 - `~/.clay.dat` - Settings file (created on first save)
 - `/usr/share/dict/words` - System dictionary for spell checking (fallback: american-english, british-english)
@@ -663,6 +673,7 @@ cargo build --features remote-gui    # Requires X11 or Wayland
 
 **Features:**
 - Graphical window using egui
+- Login screen displays clay2.png logo (200x200) with password entry
 - Authentication follows allow list and whitelisting rules (same as web interface)
 - World tabs at top showing connection status (● connected, ○ disconnected)
 - Scrollable output area with ANSI color support
