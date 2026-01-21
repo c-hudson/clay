@@ -24,6 +24,8 @@
         activityIndicator: document.getElementById('activity-indicator'),
         separatorFill: document.getElementById('separator-fill'),
         statusTime: document.getElementById('status-time'),
+        statusBar: document.getElementById('status-bar'),
+        inputContainer: document.getElementById('input-container'),
         prompt: document.getElementById('prompt'),
         input: document.getElementById('input'),
         sendBtn: document.getElementById('send-btn'),
@@ -2621,11 +2623,28 @@
         elements.authModal.className = 'modal' + (show ? ' visible' : '');
         forceRepaint(elements.authModal);
         if (show) {
+            // Hide all UI elements when showing auth modal
+            elements.output.innerHTML = '';
+            if (elements.toolbar) elements.toolbar.style.display = 'none';
+            if (elements.mobileToolbar) elements.mobileToolbar.style.display = 'none';
+            if (elements.statusBar) elements.statusBar.style.display = 'none';
+            if (elements.inputContainer) elements.inputContainer.style.display = 'none';
+            if (elements.outputContainer) elements.outputContainer.style.display = 'none';
+            // Close any open menus
+            closeMenu();
+            closeMobileMenu();
             elements.authPassword.value = '';
             elements.authError.textContent = '';
             if (elements.authUsername) {
                 elements.authUsername.value = '';
             }
+        } else {
+            // Restore UI elements when hiding auth modal
+            if (elements.toolbar) elements.toolbar.style.display = '';
+            if (elements.mobileToolbar) elements.mobileToolbar.style.display = '';
+            if (elements.statusBar) elements.statusBar.style.display = '';
+            if (elements.inputContainer) elements.inputContainer.style.display = '';
+            if (elements.outputContainer) elements.outputContainer.style.display = '';
         }
     }
 
@@ -3968,6 +3987,20 @@
             case 'resync':
                 // Force a full page reload to get fresh CSS/JS and resync state
                 location.reload(true);
+                break;
+            case 'clay-server':
+                // Disconnect from WebSocket and go to server settings (Android app)
+                if (ws) {
+                    ws.close();
+                    ws = null;
+                }
+                // Call Android interface if available (running in Android WebView)
+                if (typeof Android !== 'undefined' && Android.openServerSettings) {
+                    Android.openServerSettings();
+                } else {
+                    // Fallback for browser: show a message
+                    appendLine('Clay Server settings only available in Android app.', currentWorldIndex);
+                }
                 break;
             case 'change-password':
                 // Open password change modal (multiuser mode only)

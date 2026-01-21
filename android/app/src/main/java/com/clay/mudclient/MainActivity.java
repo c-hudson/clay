@@ -11,12 +11,31 @@ import android.webkit.WebResourceError;
 import android.webkit.WebResourceRequest;
 import android.webkit.WebSettings;
 import android.webkit.WebView;
+import android.webkit.JavascriptInterface;
 import android.webkit.WebViewClient;
 import android.widget.Toast;
 
 import androidx.appcompat.app.AppCompatActivity;
 
 public class MainActivity extends AppCompatActivity {
+    // JavaScript interface for communication between web and Android
+    public class AndroidInterface {
+        @JavascriptInterface
+        public void openServerSettings() {
+            runOnUiThread(() -> {
+                // Clear saved host/port to force settings screen to show
+                SharedPreferences prefs = getSharedPreferences(PREFS_NAME, MODE_PRIVATE);
+                SharedPreferences.Editor editor = prefs.edit();
+                editor.remove(KEY_SERVER_HOST);
+                editor.remove(KEY_SERVER_PORT);
+                editor.apply();
+
+                // Open settings activity
+                openSettings("Change Clay server connection");
+            });
+        }
+    }
+
     private static final String PREFS_NAME = "ClayPrefs";
     private static final String KEY_SERVER_HOST = "serverHost";
     private static final String KEY_SERVER_PORT = "serverPort";
@@ -52,6 +71,9 @@ public class MainActivity extends AppCompatActivity {
         webSettings.setJavaScriptEnabled(true);
         webSettings.setDomStorageEnabled(true);
         webSettings.setMixedContentMode(WebSettings.MIXED_CONTENT_ALWAYS_ALLOW);
+
+        // Add JavaScript interface for Android communication
+        webView.addJavascriptInterface(new AndroidInterface(), "Android");
 
         webView.setWebViewClient(new WebViewClient() {
             @Override
