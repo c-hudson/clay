@@ -10126,51 +10126,12 @@ mod remote_gui {
                     ui.vertical_centered(|ui| {
                         ui.add_space(30.0);
 
-                        // Clay logo image with CLAY block letters to the right
-                        let clay_colors = [
-                            egui::Color32::from_rgb(0xff, 0x87, 0x5f),  // 209
-                            egui::Color32::from_rgb(0xff, 0x87, 0x00),  // 208
-                            egui::Color32::from_rgb(0xff, 0xaf, 0x5f),  // 215
-                            egui::Color32::from_rgb(0xff, 0xaf, 0x87),  // 216
-                            egui::Color32::from_rgb(0xff, 0xaf, 0xaf),  // 217
-                            egui::Color32::from_rgb(0xff, 0xaf, 0xd7),  // 218
-                        ];
-                        let clay_lines = [
-                            " ██████╗██╗      █████╗ ██╗   ██╗",
-                            "██╔════╝██║     ██╔══██╗╚██╗ ██╔╝",
-                            "██║     ██║     ███████║ ╚████╔╝ ",
-                            "██║     ██║     ██╔══██║  ╚██╔╝  ",
-                            "╚██████╗███████╗██║  ██║   ██║   ",
-                            " ╚═════╝╚══════╝╚═╝  ╚═╝   ╚═╝   ",
-                        ];
-
-                        ui.horizontal(|ui| {
-                            // Center the horizontal group
-                            let avail_width = ui.available_width();
-                            let centering_space = if avail_width.is_finite() && avail_width > 0.0 {
-                                ((avail_width - 400.0) / 2.0).max(0.0)
-                            } else {
-                                0.0
-                            };
-                            ui.add_space(centering_space);
-
-                            // Image on left (30% smaller: 179x125)
-                            let splash_image = egui::Image::from_bytes(
-                                "bytes://clay_splash",
-                                include_bytes!("../clay.png"),
-                            ).fit_to_exact_size(egui::vec2(179.0, 125.0));
-                            ui.add(splash_image);
-
-                            ui.add_space(10.0);
-
-                            // CLAY text on right, moved down one line
-                            ui.vertical(|ui| {
-                                ui.label("");  // One line of spacing
-                                for (i, line) in clay_lines.iter().enumerate() {
-                                    ui.label(egui::RichText::new(*line).color(clay_colors[i]).monospace());
-                                }
-                            });
-                        });
+                        // Clay logo image (clay2.png scaled to ~200px wide, preserving aspect ratio)
+                        let splash_image = egui::Image::from_bytes(
+                            "bytes://clay_splash",
+                            include_bytes!("../clay2.png"),
+                        ).fit_to_exact_size(egui::vec2(200.0, 200.0));
+                        ui.add(splash_image);
 
                         let tagline_color = egui::Color32::from_rgb(0xff, 0x87, 0xff);  // 213
                         ui.add_space(10.0);
