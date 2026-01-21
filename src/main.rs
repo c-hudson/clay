@@ -3195,6 +3195,15 @@ impl User {
     }
 }
 
+/// Tracks a WebSocket client's view state for synchronized more-mode
+#[derive(Clone, Debug)]
+pub struct ClientViewState {
+    /// Which world the client is viewing
+    pub world_index: usize,
+    /// Number of visible output lines in the client's display
+    pub visible_lines: usize,
+}
+
 /// Helper function for serde default to return true
 fn default_enabled() -> bool { true }
 
@@ -4378,6 +4387,18 @@ impl World {
                     self.partial_in_pending = true;
                 }
             } else if triggers_pause {
+                // Debug: log when more-mode triggers
+                {
+                    use std::io::Write;
+                    if let Ok(mut f) = std::fs::OpenOptions::new()
+                        .create(true).append(true)
+                        .open("/tmp/clay_more_debug.log")
+                    {
+                        let _ = writeln!(f, "MORE TRIGGERED: output_lines={}, scroll_offset={}, lines_since_pause={}, max_lines={}, line={:?}",
+                            self.output_lines.len(), self.scroll_offset, self.lines_since_pause, max_lines,
+                            line.chars().take(50).collect::<String>());
+                    }
+                }
                 // Scroll to show lines added before pause, then pause
                 self.scroll_to_bottom();
                 self.paused = true;
@@ -4427,7 +4448,19 @@ impl World {
     }
 
     fn scroll_to_bottom(&mut self) {
+        let old_offset = self.scroll_offset;
         self.scroll_offset = self.output_lines.len().saturating_sub(1);
+        // Debug: log scroll changes
+        if old_offset != self.scroll_offset {
+            use std::io::Write;
+            if let Ok(mut f) = std::fs::OpenOptions::new()
+                .create(true).append(true)
+                .open("/tmp/clay_more_debug.log")
+            {
+                let _ = writeln!(f, "SCROLL_TO_BOTTOM: {} -> {}, output_lines={}",
+                    old_offset, self.scroll_offset, self.output_lines.len());
+            }
+        }
     }
 
     fn mark_seen(&mut self) {
@@ -4441,6 +4474,17 @@ impl World {
     }
 
     fn release_pending(&mut self, count: usize) {
+        // Debug: log pending release
+        {
+            use std::io::Write;
+            if let Ok(mut f) = std::fs::OpenOptions::new()
+                .create(true).append(true)
+                .open("/tmp/clay_more_debug.log")
+            {
+                let _ = writeln!(f, "RELEASE_PENDING: count={}, pending_lines={}, output_lines={}, scroll_offset={}",
+                    count, self.pending_lines.len(), self.output_lines.len(), self.scroll_offset);
+            }
+        }
         let to_release: Vec<OutputLine> = self
             .pending_lines
             .drain(..count.min(self.pending_lines.len()))
@@ -4559,9 +4603,9 @@ struct App {
     https_server: Option<HttpsServer>,
     // Track if popup was visible last frame (for terminal clear on transition)
     popup_was_visible: bool,
-    /// Cache of which world each WS client is viewing (for activity indicator)
-    /// Maps client_id -> current_world_index
-    ws_client_worlds: std::collections::HashMap<u64, usize>,
+    /// Cache of each WS client's view state (for activity indicator and more-mode)
+    /// Maps client_id -> ClientViewState (world_index + visible_lines)
+    ws_client_worlds: std::collections::HashMap<u64, ClientViewState>,
     /// True if this is the master client (runs WS server or WS disabled).
     /// Only master should save settings or initiate connections.
     is_master: bool,
@@ -4853,6 +4897,13 @@ impl App {
             .count()
     }
 
+    /// Broadcast current activity count to all WebSocket clients
+    fn broadcast_activity(&self) {
+        self.ws_broadcast(WsMessage::ActivityUpdate {
+            count: self.activity_count(),
+        });
+    }
+
     /// Discard the initial "fake" world if it exists and is not connected.
     /// Called after first successful connection to a real world.
     fn discard_initial_world(&mut self) {
@@ -4904,19 +4955,15 @@ impl App {
 
     /// Broadcast a message to all authenticated WebSocket clients
     fn ws_broadcast(&self, msg: WsMessage) {
-        // Broadcast to secure WebSocket server (wss://)
+        // Broadcast to WebSocket server
         if let Some(ref server) = self.ws_server {
             let clients = server.clients.clone();
-            let msg_clone = msg.clone();
             tokio::spawn(async move {
                 let clients_guard = clients.read().await;
-                if let Ok(json) = serde_json::to_string(&msg_clone) {
-                    for client in clients_guard.values() {
-                        if client.authenticated {
-                            let _ = client.tx.send(msg_clone.clone());
-                        }
+                for client in clients_guard.values() {
+                    if client.authenticated {
+                        let _ = client.tx.send(msg.clone());
                     }
-                    drop(json); // Used to validate serialization works
                 }
             });
         }
@@ -4937,7 +4984,18 @@ impl App {
 
     /// Check if any WS client is currently viewing a specific world
     fn ws_client_viewing(&self, world_index: usize) -> bool {
-        self.ws_client_worlds.values().any(|&w| w == world_index)
+        self.ws_client_worlds.values().any(|v| v.world_index == world_index)
+    }
+
+    /// Get the minimum visible lines among all viewers of a world (for more-mode threshold)
+    /// Returns None if no WS clients are viewing the world (use console output_height)
+    fn min_viewer_lines(&self, world_index: usize) -> Option<usize> {
+        let ws_min = self.ws_client_worlds
+            .values()
+            .filter(|v| v.world_index == world_index && v.visible_lines > 0)
+            .map(|v| v.visible_lines)
+            .min();
+        ws_min
     }
 
     /// Build initial state message for a newly authenticated client
@@ -7570,7 +7628,7 @@ mod remote_gui {
         pub prompt: String,
         pub settings: RemoteWorldSettings,
         pub unseen_lines: usize,
-        pub pending_count: usize,  // Count of pending lines (for pending_first sorting)
+        pub pending_count: usize,  // Server's pending line count (for synchronized more-mode)
         // Timing info (seconds since event, None if never)
         pub last_send_secs: Option<u64>,
         pub last_recv_secs: Option<u64>,
@@ -7959,6 +8017,12 @@ mod remote_gui {
         selection_end: Option<usize>,
         /// Whether we're currently dragging a selection
         selection_dragging: bool,
+        /// Approximate number of lines visible in output area (for more-mode)
+        output_visible_lines: usize,
+        /// Last sent view state (world_index, visible_lines) to avoid redundant messages
+        last_sent_view_state: Option<(usize, usize)>,
+        /// Activity count from server (number of worlds with unseen/pending output)
+        server_activity_count: usize,
     }
 
     /// Square wave audio source for ANSI music playback
@@ -8128,6 +8192,9 @@ mod remote_gui {
                 selection_start: None,
                 selection_end: None,
                 selection_dragging: false,
+                output_visible_lines: 20,  // Default, updated during rendering
+                last_sent_view_state: None,
+                server_activity_count: 0,
             }
         }
 
@@ -8409,7 +8476,7 @@ mod remote_gui {
                             // Track if this is first InitialState or a resync
                             let is_resync = !self.worlds.is_empty();
                             self.worlds = worlds.into_iter().map(|w| {
-                                // Calculate pending count before moving pending_lines
+                                // Calculate pending count (for synchronized more-mode indicator)
                                 let pending_count = if !w.pending_lines_ts.is_empty() {
                                     w.pending_lines_ts.len()
                                 } else {
@@ -8418,23 +8485,16 @@ mod remote_gui {
                                 RemoteWorld {
                                 name: w.name,
                                 connected: w.connected,
-                                // Combine output_lines and pending_lines (each client handles more mode locally)
+                                // For synchronized more-mode: only use output_lines, NOT pending_lines
+                                // Pending lines will be sent as ServerData when released
                                 output_lines: {
-                                    let mut lines = if !w.output_lines_ts.is_empty() {
+                                    if !w.output_lines_ts.is_empty() {
                                         w.output_lines_ts
                                     } else {
                                         // Fallback for old protocol: use current time
                                         let now = current_timestamp_secs();
                                         w.output_lines.into_iter().map(|text| TimestampedLine { text, ts: now, gagged: false }).collect()
-                                    };
-                                    // Append pending lines (server's more mode shouldn't affect clients)
-                                    if !w.pending_lines_ts.is_empty() {
-                                        lines.extend(w.pending_lines_ts);
-                                    } else {
-                                        let now = current_timestamp_secs();
-                                        lines.extend(w.pending_lines.into_iter().map(|text| TimestampedLine { text, ts: now, gagged: false }));
                                     }
-                                    lines
                                 },
                                 prompt: w.prompt,
                                 settings: RemoteWorldSettings {
@@ -8488,6 +8548,14 @@ mod remote_gui {
                             self.ansi_music_enabled = settings.ansi_music_enabled;
                             self.tls_proxy_enabled = settings.tls_proxy_enabled;
                             self.actions = actions;
+                            // Send initial view state for synchronized more-mode
+                            if let Some(ref tx) = self.ws_tx {
+                                let _ = tx.send(WsMessage::UpdateViewState {
+                                    world_index: self.current_world,
+                                    visible_lines: self.output_visible_lines,
+                                });
+                                self.last_sent_view_state = Some((self.current_world, self.output_visible_lines));
+                            }
                         }
                         WsMessage::ServerData { world_index, data, is_viewed: _, ts } => {
                             if world_index < self.worlds.len() {
@@ -8531,11 +8599,11 @@ mod remote_gui {
                                         } else {
                                             line.to_string()
                                         };
+                                        // All lines go to output_lines - server controls more-mode via pending_count
                                         world.output_lines.push(TimestampedLine { text, ts, gagged: false });
                                     }
                                 }
 
-                                // Feed data to terminal emulator (include newline for complete lines)
                                 // Note: Don't track unseen_lines locally - server handles centralized tracking
                                 // and will broadcast UnseenUpdate/UnseenCleared when counts change
                             }
@@ -8658,6 +8726,10 @@ mod remote_gui {
                             if world_index < self.worlds.len() {
                                 self.worlds[world_index].unseen_lines = count;
                             }
+                        }
+                        WsMessage::ActivityUpdate { count } => {
+                            // Server's activity count changed - just display it
+                            self.server_activity_count = count;
                         }
                         WsMessage::CalculatedWorld { index } => {
                             // Server calculated the next/prev world for us
@@ -9656,13 +9728,50 @@ mod remote_gui {
                         }
                     }
                 } else {
-                    segment.push(c);
+                    // Check for colored square emoji and render as colored blocks
+                    if let Some((r, g, b)) = Self::colored_square_rgb(c) {
+                        // Flush current segment first
+                        if !segment.is_empty() {
+                            Self::append_segment_with_shades(&segment, &font_id, current_color, current_bg, theme_bg, color_offset_percent, job);
+                            segment.clear();
+                        }
+                        // Add two block characters with the emoji's color
+                        let square_color = egui::Color32::from_rgb(r, g, b);
+                        job.append(
+                            "██",
+                            0.0,
+                            egui::TextFormat {
+                                font_id: font_id.clone(),
+                                color: square_color,
+                                background: current_bg,
+                                ..Default::default()
+                            },
+                        );
+                    } else {
+                        segment.push(c);
+                    }
                 }
             }
 
             // Flush remaining segment
             if !segment.is_empty() {
                 Self::append_segment_with_shades(&segment, &font_id, current_color, current_bg, theme_bg, color_offset_percent, job);
+            }
+        }
+
+        /// Get the RGB color for a colored square emoji
+        fn colored_square_rgb(c: char) -> Option<(u8, u8, u8)> {
+            match c {
+                '🟥' => Some((0xDD, 0x2E, 0x44)),
+                '🟧' => Some((0xF4, 0x90, 0x0C)),
+                '🟨' => Some((0xFD, 0xCB, 0x58)),
+                '🟩' => Some((0x78, 0xB1, 0x59)),
+                '🟦' => Some((0x55, 0xAC, 0xEE)),
+                '🟪' => Some((0xAA, 0x8E, 0xD6)),
+                '🟫' => Some((0xA0, 0x6A, 0x42)),
+                '⬛' => Some((0x31, 0x37, 0x3D)),
+                '⬜' => Some((0xE6, 0xE7, 0xE8)),
+                _ => None,
             }
         }
 
@@ -9819,16 +9928,12 @@ mod remote_gui {
             segments
         }
 
-        /// Check if text contains Discord custom emojis or colored squares
+        /// Check if text contains Discord custom emojis (not colored squares)
+        /// Colored squares are now handled in the non-emoji path for better selection support
         fn has_discord_emojis(text: &str) -> bool {
-            // Use emoji rendering path for Discord custom emojis OR colored square emoji
-            // Colored squares need special handling to render in their proper colors
-            text.contains("<:") || text.contains("<a:") || Self::has_colored_squares(text)
-        }
-
-        /// Check if text contains any colored square emoji
-        fn has_colored_squares(text: &str) -> bool {
-            text.chars().any(|c| Self::colored_square_color(c).is_some())
+            // Only use emoji rendering path for actual Discord custom emojis
+            // Colored squares are rendered as colored blocks in the LayoutJob path
+            text.contains("<:") || text.contains("<a:")
         }
 
         /// Insert zero-width spaces after break characters in long words (>15 chars)
@@ -9890,16 +9995,17 @@ mod remote_gui {
             let segments = Self::parse_discord_segments(text);
             let available_width = ui.available_width();
 
-            // Use a vertical layout to allow text wrapping
-            ui.horizontal_wrapped(|ui| {
-                ui.spacing_mut().item_spacing.x = 0.0;
-                for segment in segments {
-                    match segment {
-                        DiscordSegment::Text(txt) => {
-                            // Check for URLs in this text segment
-                            let urls = Self::find_urls(&txt);
-                            if urls.is_empty() {
-                                // No URLs, render as normal text with word breaks
+            // Check if this line has Discord emoji or colored squares
+            let has_special = segments.iter().any(|s| matches!(s, DiscordSegment::Emoji { .. } | DiscordSegment::ColoredSquare(_)));
+
+            if has_special {
+                // Use horizontal_wrapped for lines with emoji/colored squares
+                // URL clicking won't work here, but emoji will render correctly
+                ui.horizontal_wrapped(|ui| {
+                    ui.spacing_mut().item_spacing.x = 0.0;
+                    for segment in segments {
+                        match segment {
+                            DiscordSegment::Text(txt) => {
                                 let txt_with_breaks = Self::insert_word_breaks(&txt);
                                 let mut job = egui::text::LayoutJob {
                                     wrap: egui::text::TextWrapping {
@@ -9911,78 +10017,131 @@ mod remote_gui {
                                 Self::append_ansi_to_job(&txt_with_breaks, default_color, font_id.clone(), &mut job, is_light_theme, color_offset_percent);
                                 let galley = ui.fonts(|f| f.layout_job(job));
                                 ui.label(galley);
-                            } else {
-                                // Has URLs, render text and URLs separately
-                                let mut last_end = 0;
-                                for (start, end, url) in urls {
-                                    // Render text before URL
-                                    if start > last_end {
-                                        let before = Self::insert_word_breaks(&txt[last_end..start]);
-                                        let mut job = egui::text::LayoutJob {
-                                            wrap: egui::text::TextWrapping {
-                                                max_width: available_width,
-                                                ..Default::default()
-                                            },
-                                            ..Default::default()
-                                        };
-                                        Self::append_ansi_to_job(&before, default_color, font_id.clone(), &mut job, is_light_theme, color_offset_percent);
-                                        let galley = ui.fonts(|f| f.layout_job(job));
-                                        ui.label(galley);
-                                    }
-                                    // Render URL as clickable link with word breaks for long URLs
-                                    let url_with_breaks = Self::insert_word_breaks(&url);
-                                    let link = egui::Label::new(
-                                        egui::RichText::new(&url_with_breaks)
-                                            .font(font_id.clone())
-                                            .color(link_color)
-                                            .underline()
-                                    ).sense(egui::Sense::click()).wrap();
-                                    let response = ui.add(link);
-                                    if response.clicked() {
-                                        Self::open_url(&url);
-                                    }
-                                    if response.hovered() {
-                                        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
-                                    }
-                                    last_end = end;
-                                }
-                                // Render text after last URL
-                                if last_end < txt.len() {
-                                    let after = Self::insert_word_breaks(&txt[last_end..]);
-                                    let mut job = egui::text::LayoutJob {
-                                        wrap: egui::text::TextWrapping {
-                                            max_width: available_width,
-                                            ..Default::default()
-                                        },
-                                        ..Default::default()
-                                    };
-                                    Self::append_ansi_to_job(&after, default_color, font_id.clone(), &mut job, is_light_theme, color_offset_percent);
-                                    let galley = ui.fonts(|f| f.layout_job(job));
-                                    ui.label(galley);
+                            }
+                            DiscordSegment::Emoji { name, id, animated } => {
+                                let ext = if animated { "gif" } else { "png" };
+                                let url = format!("https://cdn.discordapp.com/emojis/{}.{}", id, ext);
+                                let image = egui::Image::from_uri(&url)
+                                    .fit_to_exact_size(egui::vec2(font_id.size * 1.2, font_id.size * 1.2));
+                                ui.add(image).on_hover_text(format!(":{}:", name));
+                            }
+                            DiscordSegment::ColoredSquare(color) => {
+                                let size = font_id.size * 1.1;
+                                let (rect, _response) = ui.allocate_exact_size(
+                                    egui::vec2(size, size),
+                                    egui::Sense::hover()
+                                );
+                                if ui.is_rect_visible(rect) {
+                                    ui.painter().rect_filled(rect, 2.0, color);
                                 }
                             }
                         }
-                        DiscordSegment::Emoji { name, id, animated } => {
-                            let ext = if animated { "gif" } else { "png" };
-                            let url = format!("https://cdn.discordapp.com/emojis/{}.{}", id, ext);
-                            let image = egui::Image::from_uri(&url)
-                                .fit_to_exact_size(egui::vec2(font_id.size * 1.2, font_id.size * 1.2));
-                            ui.add(image).on_hover_text(format!(":{}:", name));
-                        }
-                        DiscordSegment::ColoredSquare(color) => {
-                            // Draw a colored rectangle for square emoji
-                            let size = font_id.size * 1.1;
-                            let (rect, _response) = ui.allocate_exact_size(
-                                egui::vec2(size, size),
-                                egui::Sense::hover()
-                            );
-                            if ui.is_rect_visible(rect) {
-                                ui.painter().rect_filled(rect, 2.0, color);
+                    }
+                });
+            } else {
+                // No emoji/colored squares - use LayoutJob with clickable URLs
+                let mut job = egui::text::LayoutJob {
+                    wrap: egui::text::TextWrapping {
+                        max_width: available_width,
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                };
+
+                // Track URL positions in the final job text (character indices)
+                let mut url_ranges: Vec<(usize, usize, String)> = Vec::new();
+
+                for segment in &segments {
+                    if let DiscordSegment::Text(txt) = segment {
+                        let urls = Self::find_urls(txt);
+                        if urls.is_empty() {
+                            let txt_with_breaks = Self::insert_word_breaks(txt);
+                            Self::append_ansi_to_job(&txt_with_breaks, default_color, font_id.clone(), &mut job, is_light_theme, color_offset_percent);
+                        } else {
+                            let char_to_byte: Vec<usize> = txt.char_indices().map(|(i, _)| i).collect();
+                            let txt_char_count = char_to_byte.len();
+                            let mut last_end_char = 0;
+
+                            for (start_char, end_char, url) in urls {
+                                if start_char > last_end_char {
+                                    let start_byte = char_to_byte.get(last_end_char).copied().unwrap_or(0);
+                                    let end_byte = char_to_byte.get(start_char).copied().unwrap_or(txt.len());
+                                    let before = Self::insert_word_breaks(&txt[start_byte..end_byte]);
+                                    Self::append_ansi_to_job(&before, default_color, font_id.clone(), &mut job, is_light_theme, color_offset_percent);
+                                }
+
+                                let clean_url = Self::strip_ansi_for_copy(&url);
+                                let url_with_breaks = Self::insert_word_breaks(&clean_url);
+                                let url_start = job.text.chars().count();
+                                job.append(&url_with_breaks, 0.0, egui::TextFormat {
+                                    font_id: font_id.clone(),
+                                    color: link_color,
+                                    underline: egui::Stroke::new(1.0, link_color),
+                                    ..Default::default()
+                                });
+                                let url_end = job.text.chars().count();
+                                let final_url = clean_url.replace('\u{200B}', "");
+                                url_ranges.push((url_start, url_end, final_url));
+
+                                last_end_char = end_char;
+                            }
+
+                            if last_end_char < txt_char_count {
+                                let start_byte = char_to_byte.get(last_end_char).copied().unwrap_or(txt.len());
+                                let after = Self::insert_word_breaks(&txt[start_byte..]);
+                                Self::append_ansi_to_job(&after, default_color, font_id.clone(), &mut job, is_light_theme, color_offset_percent);
                             }
                         }
                     }
                 }
-            });
+
+                let galley = ui.fonts(|f| f.layout_job(job));
+                // Allocate space with click_and_drag to allow text selection
+                let (rect, _response) = ui.allocate_exact_size(galley.size(), egui::Sense::click_and_drag());
+                let text_pos = rect.min;
+
+                // Paint the galley
+                ui.painter().galley(text_pos, galley.clone(), default_color);
+
+                // Check for clicks and hovers using global input state
+                let pointer_pos = ui.input(|i| i.pointer.interact_pos());
+                let hover_pos = ui.input(|i| i.pointer.hover_pos());
+                let primary_clicked = ui.input(|i| i.pointer.primary_clicked());
+
+                // Handle URL clicks - check if click is within our rect
+                if primary_clicked && !url_ranges.is_empty() {
+                    if let Some(pos) = pointer_pos {
+                        if rect.contains(pos) {
+                            let relative_pos = pos - text_pos;
+                            let cursor = galley.cursor_from_pos(relative_pos);
+                            let click_char = cursor.ccursor.index;
+
+                            for (start, end, url) in &url_ranges {
+                                if click_char >= *start && click_char < *end {
+                                    Self::open_url(url);
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // Show pointer cursor when hovering over URLs
+                if let Some(pos) = hover_pos {
+                    if rect.contains(pos) {
+                        let relative_pos = pos - text_pos;
+                        let cursor = galley.cursor_from_pos(relative_pos);
+                        let hover_char = cursor.ccursor.index;
+
+                        for (start, end, _) in &url_ranges {
+                            if hover_char >= *start && hover_char < *end {
+                                ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
         }
     }
 
@@ -10356,14 +10515,17 @@ mod remote_gui {
                                 } else if self.current_world < self.worlds.len()
                                     && self.worlds[self.current_world].pending_count > 0
                                 {
-                                    // Send ReleasePending to server to release one screenful
-                                    // Use 20 as a reasonable default batch size
+                                    // Send ReleasePending to server with this client's visible line count
+                                    // Server will release lines and broadcast to all clients
+                                    let release_count = self.output_visible_lines.saturating_sub(2).max(1);
                                     if let Some(ref tx) = self.ws_tx {
                                         let _ = tx.send(WsMessage::ReleasePending {
                                             world_index: self.current_world,
-                                            count: 20,
+                                            count: release_count,
                                         });
                                     }
+                                    // Scroll to bottom
+                                    self.scroll_offset = None;
                                 } else if self.scroll_offset.is_some() {
                                     // Viewing history - scroll down like PgDn
                                     if let Some(offset) = self.scroll_offset {
@@ -11169,19 +11331,32 @@ mod remote_gui {
                                 .map(|w| w.connected)
                                 .unwrap_or(false);
 
-                            // Collect worlds with activity (unseen output only)
-                            // Note: pending_count is server-side more-mode concept, not meaningful for GUI activity
-                            let worlds_with_activity: Vec<(&str, usize)> = self.worlds.iter()
-                                .enumerate()
-                                .filter(|(i, w)| *i != self.current_world && w.unseen_lines > 0)
-                                .map(|(_, w)| (w.name.as_str(), w.unseen_lines))
-                                .collect();
-                            let activity_count = worlds_with_activity.len();
+                            // Use server's activity count (console broadcasts this value)
+                            let activity_count = self.server_activity_count;
 
-                            // Status indicator (More/Hist or underscores)
-                            // Status area - spaces instead of underscores when no More/Hist indicator (9 chars)
-                            let status_text = "          ";
-                            ui.label(egui::RichText::new(status_text).monospace());
+                            // Status indicator (More/Hist or spaces)
+                            // Get server's pending count for current world (synchronized more-mode)
+                            let server_pending_count = self.worlds.get(self.current_world)
+                                .map(|w| w.pending_count)
+                                .unwrap_or(0);
+
+                            if server_pending_count > 0 {
+                                // Show More: XXXX with black text on red background
+                                let count_str = if server_pending_count >= 10000 {
+                                    format!("{:>4}K", server_pending_count / 1000)
+                                } else {
+                                    format!("{:>4}", server_pending_count)
+                                };
+                                let status_text = format!("More:{}", count_str);
+                                ui.label(egui::RichText::new(status_text)
+                                    .monospace()
+                                    .color(egui::Color32::BLACK)
+                                    .background_color(egui::Color32::from_rgb(0xf8, 0x53, 0x49))); // Red background
+                            } else {
+                                // Status area - spaces when no More indicator
+                                let status_text = "          ";
+                                ui.label(egui::RichText::new(status_text).monospace());
+                            }
 
                             // Connection status ball (green = connected, red = disconnected)
                             let (status_ball, ball_color) = if connected {
@@ -11206,9 +11381,17 @@ mod remote_gui {
                                     .monospace().color(theme.highlight()));
                                 // Show hover popup with list of worlds that have activity
                                 activity_label.on_hover_ui(|ui| {
-                                    ui.label(egui::RichText::new("Worlds with unseen output:").strong());
-                                    for (world_name, unseen) in &worlds_with_activity {
-                                        ui.label(format!("{}: {} unseen", world_name, unseen));
+                                    ui.label(egui::RichText::new("Worlds with activity:").strong());
+                                    for (i, w) in self.worlds.iter().enumerate() {
+                                        if i != self.current_world && (w.unseen_lines > 0 || w.pending_count > 0) {
+                                            if w.pending_count > 0 && w.unseen_lines > 0 {
+                                                ui.label(format!("{}: {} unseen, {} pending", w.name, w.unseen_lines, w.pending_count));
+                                            } else if w.pending_count > 0 {
+                                                ui.label(format!("{}: {} pending", w.name, w.pending_count));
+                                            } else {
+                                                ui.label(format!("{}: {} unseen", w.name, w.unseen_lines));
+                                            }
+                                        }
                                     }
                                 });
                             }
@@ -11396,6 +11579,25 @@ mod remote_gui {
                             }
                         }
 
+                        // Calculate approximate visible lines based on available height and font size
+                        // This is used for more-mode triggering
+                        let line_height = self.font_size * 1.3; // Approximate line height with some spacing
+                        let available_height_for_output = ui.available_height();
+                        let estimated_visible_lines = (available_height_for_output / line_height).max(5.0) as usize;
+                        self.output_visible_lines = estimated_visible_lines;
+
+                        // Send UpdateViewState if view changed (world or visible lines)
+                        let current_state = (self.current_world, self.output_visible_lines);
+                        if self.last_sent_view_state != Some(current_state) {
+                            if let Some(ref tx) = self.ws_tx {
+                                let _ = tx.send(WsMessage::UpdateViewState {
+                                    world_index: self.current_world,
+                                    visible_lines: self.output_visible_lines,
+                                });
+                                self.last_sent_view_state = Some(current_state);
+                            }
+                        }
+
                         // Use a unique ID per world to ensure scroll state is preserved per-world
                         let scroll_id = egui::Id::new(format!("output_scroll_{}", self.current_world));
                         let stick_to_bottom = self.scroll_offset.is_none() && !self.filter_active;
@@ -11474,8 +11676,10 @@ mod remote_gui {
                                     }
 
                                     // Add context menu for copy functionality
+                                    // Use Sense::hover() instead of Sense::click() to avoid capturing primary clicks
+                                    // that should go to the Link widgets for URL clicking
                                     let text_for_copy = emoji_plain_text.clone();
-                                    ui.interact(ui.min_rect(), egui::Id::new("emoji_output_ctx"), egui::Sense::click())
+                                    ui.interact(ui.min_rect(), egui::Id::new("emoji_output_ctx"), egui::Sense::hover())
                                         .context_menu(|ui| {
                                             if ui.button("Copy All").clicked() {
                                                 ui.ctx().copy_text(text_for_copy.clone());
@@ -11508,10 +11712,13 @@ mod remote_gui {
 
                                 // Handle text selection with mouse
                                 let pointer_pos = ui.input(|i| i.pointer.interact_pos());
+                                // Get the position where the press started (not current position)
+                                let press_origin = ui.input(|i| i.pointer.press_origin());
 
                                 // Handle selection start on primary click
                                 if alloc_response.drag_started_by(egui::PointerButton::Primary) {
-                                    if let Some(pos) = pointer_pos {
+                                    // Use press_origin for accurate selection start position
+                                    if let Some(pos) = press_origin {
                                         let relative_pos = pos - text_pos;
                                         let cursor = galley.cursor_from_pos(relative_pos);
                                         // Subtract 1 so clicking on a character includes it in selection
@@ -11540,6 +11747,43 @@ mod remote_gui {
                                 // Handle selection end on release
                                 if alloc_response.drag_stopped_by(egui::PointerButton::Primary) {
                                     self.selection_dragging = false;
+                                }
+
+                                // Find URLs in the galley text for click handling
+                                let galley_text = galley.text();
+                                let url_ranges = Self::find_urls(galley_text);
+
+                                // Handle URL clicks - on single click (not drag), check if clicking on URL
+                                if alloc_response.clicked_by(egui::PointerButton::Primary) {
+                                    if let Some(pos) = pointer_pos {
+                                        let relative_pos = pos - text_pos;
+                                        let cursor = galley.cursor_from_pos(relative_pos);
+                                        let click_char = cursor.ccursor.index;
+
+                                        for (start, end, url) in &url_ranges {
+                                            if click_char >= *start && click_char < *end {
+                                                Self::open_url(url);
+                                                break;
+                                            }
+                                        }
+                                    }
+                                }
+
+                                // Show pointer cursor when hovering over URLs
+                                let hover_pos = ui.input(|i| i.pointer.hover_pos());
+                                if let Some(pos) = hover_pos {
+                                    if alloc_response.rect.contains(pos) {
+                                        let relative_pos = pos - text_pos;
+                                        let cursor = galley.cursor_from_pos(relative_pos);
+                                        let hover_char = cursor.ccursor.index;
+
+                                        for (start, end, _) in &url_ranges {
+                                            if hover_char >= *start && hover_char < *end {
+                                                ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                                                break;
+                                            }
+                                        }
+                                    }
                                 }
 
                                 // First pass: paint full-height background rectangles per glyph
@@ -17421,9 +17665,32 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                             // Add non-gagged output to world
                             if !filtered_data.is_empty() {
                                 let settings = app.settings.clone();
-                                let output_height = app.output_height;
+                                let console_height = app.output_height;
                                 let output_width = app.output_width;
+
+                                // Calculate minimum visible lines among all viewers for synchronized more-mode
+                                // Console counts as a viewer if it's viewing this world
+                                let console_viewing = world_idx == app.current_world_index;
+                                let ws_min = app.min_viewer_lines(world_idx);
+                                let output_height = match (console_viewing, ws_min) {
+                                    (true, Some(ws)) => console_height.min(ws as u16),
+                                    (true, None) => console_height,
+                                    (false, Some(ws)) => ws as u16,
+                                    (false, None) => console_height, // No one viewing, use console as default
+                                };
+
+                                // Track pending count before add_output for synchronized more-mode
+                                let pending_before = app.worlds[world_idx].pending_lines.len();
+                                let output_before = app.worlds[world_idx].output_lines.len();
+
                                 app.worlds[world_idx].add_output(&filtered_data, is_current, &settings, output_height, output_width, true, true);
+
+                                // Calculate what went where
+                                let pending_after = app.worlds[world_idx].pending_lines.len();
+                                let output_after = app.worlds[world_idx].output_lines.len();
+                                let lines_to_output = output_after.saturating_sub(output_before);
+                                let lines_to_pending = pending_after.saturating_sub(pending_before);
+
                                 // Mark output for redraw if this is the current world
                                 if world_idx == app.current_world_index {
                                     app.needs_output_redraw = true;
@@ -17433,15 +17700,36 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                     app.worlds[world_idx].needs_redraw = false;
                                     terminal.clear()?;
                                 }
-                                // Broadcast filtered data to WebSocket clients (music already extracted above)
-                                // Strip carriage returns - some MUDs send \r\n or bare \r
-                                let ws_data = filtered_data.replace('\r', "");
-                                app.ws_broadcast(WsMessage::ServerData {
-                                    world_index: world_idx,
-                                    data: ws_data,
-                                    is_viewed: is_current,
-                                    ts: current_timestamp_secs(),
-                                });
+
+                                // For synchronized more-mode: only broadcast lines that went to output_lines
+                                // Lines that went to pending_lines will be broadcast when released
+                                if lines_to_output > 0 {
+                                    // Get only the lines that went to output_lines
+                                    let output_lines_to_broadcast: Vec<String> = app.worlds[world_idx]
+                                        .output_lines
+                                        .iter()
+                                        .skip(output_before)
+                                        .take(lines_to_output)
+                                        .map(|line| line.text.replace('\r', ""))
+                                        .collect();
+                                    let ws_data = output_lines_to_broadcast.join("\n") + "\n";
+
+                                    app.ws_broadcast(WsMessage::ServerData {
+                                        world_index: world_idx,
+                                        data: ws_data,
+                                        is_viewed: is_current,
+                                        ts: current_timestamp_secs(),
+                                    });
+                                }
+
+                                // Broadcast pending count update if it changed (for synchronized more-mode indicator)
+                                if lines_to_pending > 0 || pending_after != pending_before {
+                                    app.ws_broadcast(WsMessage::PendingLinesUpdate {
+                                        world_index: world_idx,
+                                        count: pending_after,
+                                    });
+                                }
+
                                 // Broadcast updated unseen count so all clients stay in sync
                                 let unseen_count = app.worlds[world_idx].unseen_lines;
                                 if unseen_count > 0 {
@@ -17450,6 +17738,9 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                         count: unseen_count,
                                     });
                                 }
+
+                                // Broadcast activity count to keep all clients in sync
+                                app.broadcast_activity();
                             }
 
                             // Add gagged lines to output (they'll only show with F2)
@@ -17661,16 +17952,68 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                             } else {
                                 // Add non-gagged output normally
                                 let settings = app.settings.clone();
-                                let output_height = app.output_height;
+                                let console_height = app.output_height;
                                 let output_width = app.output_width;
+
+                                // Calculate minimum visible lines among all viewers for synchronized more-mode
+                                let console_viewing = world_idx == app.current_world_index;
+                                let ws_min = app.min_viewer_lines(world_idx);
+                                let output_height = match (console_viewing, ws_min) {
+                                    (true, Some(ws)) => console_height.min(ws as u16),
+                                    (true, None) => console_height,
+                                    (false, Some(ws)) => ws as u16,
+                                    (false, None) => console_height,
+                                };
+
+                                // Track pending count before add_output for synchronized more-mode
+                                let pending_before = app.worlds[world_idx].pending_lines.len();
+                                let output_before = app.worlds[world_idx].output_lines.len();
+
                                 app.worlds[world_idx].add_output(&data, is_current, &settings, output_height, output_width, true, true);
-                                // Broadcast to WebSocket clients (only non-gagged)
-                                app.ws_broadcast(WsMessage::ServerData {
-                                    world_index: world_idx,
-                                    data,
-                                    is_viewed: is_current,
-                                    ts: current_timestamp_secs(),
-                                });
+
+                                // Calculate what went where
+                                let pending_after = app.worlds[world_idx].pending_lines.len();
+                                let output_after = app.worlds[world_idx].output_lines.len();
+                                let lines_to_output = output_after.saturating_sub(output_before);
+                                let lines_to_pending = pending_after.saturating_sub(pending_before);
+
+                                // For synchronized more-mode: only broadcast lines that went to output_lines
+                                if lines_to_output > 0 {
+                                    let output_lines_to_broadcast: Vec<String> = app.worlds[world_idx]
+                                        .output_lines
+                                        .iter()
+                                        .skip(output_before)
+                                        .take(lines_to_output)
+                                        .map(|line| line.text.replace('\r', ""))
+                                        .collect();
+                                    let ws_data = output_lines_to_broadcast.join("\n") + "\n";
+                                    app.ws_broadcast(WsMessage::ServerData {
+                                        world_index: world_idx,
+                                        data: ws_data,
+                                        is_viewed: is_current,
+                                        ts: current_timestamp_secs(),
+                                    });
+                                }
+
+                                // Broadcast pending count update if it changed
+                                if lines_to_pending > 0 || pending_after != pending_before {
+                                    app.ws_broadcast(WsMessage::PendingLinesUpdate {
+                                        world_index: world_idx,
+                                        count: pending_after,
+                                    });
+                                }
+
+                                // Broadcast updated unseen count so all clients stay in sync
+                                let unseen_count = app.worlds[world_idx].unseen_lines;
+                                if unseen_count > 0 {
+                                    app.ws_broadcast(WsMessage::UnseenUpdate {
+                                        world_index: world_idx,
+                                        count: unseen_count,
+                                    });
+                                }
+
+                                // Broadcast activity count to keep all clients in sync
+                                app.broadcast_activity();
                             }
 
                             // Execute any triggered commands
@@ -17718,6 +18061,10 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                 // Client just authenticated - send initial state
                                 let initial_state = app.build_initial_state();
                                 app.ws_send_to_client(client_id, initial_state);
+                                // Also send current activity count
+                                app.ws_send_to_client(client_id, WsMessage::ActivityUpdate {
+                                    count: app.activity_count(),
+                                });
                             }
                             WsMessage::SendCommand { world_index, command } => {
                                 // Use shared command parsing
@@ -18264,7 +18611,12 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                 // A remote client has viewed this world - update their current_world
                                 if world_index < app.worlds.len() {
                                     // Track which world this client is viewing (sync cache)
-                                    app.ws_client_worlds.insert(client_id, world_index);
+                                    // Preserve visible_lines if already known
+                                    let visible_lines = app.ws_client_worlds
+                                        .get(&client_id)
+                                        .map(|v| v.visible_lines)
+                                        .unwrap_or(0);
+                                    app.ws_client_worlds.insert(client_id, ClientViewState { world_index, visible_lines });
                                     // Also update async client info
                                     if let Some(ref server) = app.ws_server {
                                         let clients = server.clients.clone();
@@ -18279,6 +18631,14 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                     app.worlds[world_index].mark_seen();
                                     // Broadcast to all clients so they update their UI
                                     app.ws_broadcast(WsMessage::UnseenCleared { world_index });
+                                    // Broadcast activity count since a world was just marked as seen
+                                    app.broadcast_activity();
+                                }
+                            }
+                            WsMessage::UpdateViewState { world_index, visible_lines } => {
+                                // A remote client is reporting its view state (for more-mode threshold calculation)
+                                if world_index < app.worlds.len() {
+                                    app.ws_client_worlds.insert(client_id, ClientViewState { world_index, visible_lines });
                                 }
                             }
                             WsMessage::ReleasePending { world_index, count } => {
@@ -18288,13 +18648,42 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                     if pending_count > 0 {
                                         // Determine how many lines to release
                                         let to_release = if count == 0 { pending_count } else { count.min(pending_count) };
+
+                                        // Get the lines that will be released (for broadcasting as ServerData)
+                                        let lines_to_broadcast: Vec<String> = app.worlds[world_index]
+                                            .pending_lines
+                                            .iter()
+                                            .take(to_release)
+                                            .map(|line| line.text.replace('\r', ""))
+                                            .collect();
+
                                         // Release the lines on the server
                                         app.worlds[world_index].release_pending(to_release);
-                                        // Broadcast to all clients so they release the same number
+
+                                        // Broadcast the released lines as ServerData so clients can display them
+                                        if !lines_to_broadcast.is_empty() {
+                                            let ws_data = lines_to_broadcast.join("\n") + "\n";
+                                            let is_current = world_index == app.current_world_index;
+                                            app.ws_broadcast(WsMessage::ServerData {
+                                                world_index,
+                                                data: ws_data,
+                                                is_viewed: is_current,
+                                                ts: current_timestamp_secs(),
+                                            });
+                                        }
+
+                                        // Broadcast to all clients so they know how many were released
                                         app.ws_broadcast(WsMessage::PendingReleased { world_index, count: to_release });
                                         // Also update pending count
                                         let new_count = app.worlds[world_index].pending_lines.len();
                                         app.ws_broadcast(WsMessage::PendingLinesUpdate { world_index, count: new_count });
+                                        // Broadcast activity count since pending lines changed
+                                        app.broadcast_activity();
+
+                                        // Update console display
+                                        if world_index == app.current_world_index {
+                                            app.needs_output_redraw = true;
+                                        }
                                     }
                                 }
                             }
@@ -18459,6 +18848,10 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                 // Client requested full state resync - send initial state
                                 let initial_state = app.build_initial_state();
                                 app.ws_send_to_client(client_id, initial_state);
+                                // Also send current activity count
+                                app.ws_send_to_client(client_id, WsMessage::ActivityUpdate {
+                                    count: app.activity_count(),
+                                });
                             }
                             WsMessage::BanListRequest => {
                                 // Send current ban list to client
@@ -18685,6 +19078,8 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                 app.current_world_mut().mark_seen();
                 // Broadcast to WebSocket clients
                 app.ws_broadcast(WsMessage::UnseenCleared { world_index: app.current_world_index });
+                // Broadcast activity count since a world was just marked as seen
+                app.broadcast_activity();
             }
             // If more mode is disabled but world has orphaned pending_lines, release them
             if has_pending && !app.settings.more_mode_enabled {
@@ -18848,9 +19243,31 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
 
                         if !filtered_data.is_empty() {
                             let settings = app.settings.clone();
-                            let output_height = app.output_height;
+                            let console_height = app.output_height;
                             let output_width = app.output_width;
+
+                            // Calculate minimum visible lines among all viewers for synchronized more-mode
+                            let console_viewing = world_idx == app.current_world_index;
+                            let ws_min = app.min_viewer_lines(world_idx);
+                            let output_height = match (console_viewing, ws_min) {
+                                (true, Some(ws)) => console_height.min(ws as u16),
+                                (true, None) => console_height,
+                                (false, Some(ws)) => ws as u16,
+                                (false, None) => console_height,
+                            };
+
+                            // Track pending count before add_output for synchronized more-mode
+                            let pending_before = app.worlds[world_idx].pending_lines.len();
+                            let output_before = app.worlds[world_idx].output_lines.len();
+
                             app.worlds[world_idx].add_output(&filtered_data, is_current, &settings, output_height, output_width, true, true);
+
+                            // Calculate what went where
+                            let pending_after = app.worlds[world_idx].pending_lines.len();
+                            let output_after = app.worlds[world_idx].output_lines.len();
+                            let lines_to_output = output_after.saturating_sub(output_before);
+                            let lines_to_pending = pending_after.saturating_sub(pending_before);
+
                             // Mark output for redraw if this is the current world
                             if world_idx == app.current_world_index {
                                 app.needs_output_redraw = true;
@@ -18859,15 +19276,44 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                 app.worlds[world_idx].needs_redraw = false;
                                 let _ = terminal.clear();
                             }
-                            // Strip carriage returns for WebSocket - some MUDs send \r\n or bare \r
-                            // Music already extracted above
-                            let ws_data = filtered_data.replace('\r', "");
-                            app.ws_broadcast(WsMessage::ServerData {
-                                world_index: world_idx,
-                                data: ws_data,
-                                is_viewed: is_current,
-                                ts: current_timestamp_secs(),
-                            });
+
+                            // For synchronized more-mode: only broadcast lines that went to output_lines
+                            if lines_to_output > 0 {
+                                let output_lines_to_broadcast: Vec<String> = app.worlds[world_idx]
+                                    .output_lines
+                                    .iter()
+                                    .skip(output_before)
+                                    .take(lines_to_output)
+                                    .map(|line| line.text.replace('\r', ""))
+                                    .collect();
+                                let ws_data = output_lines_to_broadcast.join("\n") + "\n";
+                                app.ws_broadcast(WsMessage::ServerData {
+                                    world_index: world_idx,
+                                    data: ws_data,
+                                    is_viewed: is_current,
+                                    ts: current_timestamp_secs(),
+                                });
+                            }
+
+                            // Broadcast pending count update if it changed
+                            if lines_to_pending > 0 || pending_after != pending_before {
+                                app.ws_broadcast(WsMessage::PendingLinesUpdate {
+                                    world_index: world_idx,
+                                    count: pending_after,
+                                });
+                            }
+
+                            // Broadcast updated unseen count so all clients stay in sync
+                            let unseen_count = app.worlds[world_idx].unseen_lines;
+                            if unseen_count > 0 {
+                                app.ws_broadcast(WsMessage::UnseenUpdate {
+                                    world_index: world_idx,
+                                    count: unseen_count,
+                                });
+                            }
+
+                            // Broadcast activity count to keep all clients in sync
+                            app.broadcast_activity();
                         }
 
                         // Add gagged lines to output (they'll only show with F2)
@@ -19126,6 +19572,10 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                         WsMessage::AuthRequest { .. } => {
                             let initial_state = app.build_initial_state();
                             app.ws_send_to_client(client_id, initial_state);
+                            // Also send current activity count
+                            app.ws_send_to_client(client_id, WsMessage::ActivityUpdate {
+                                count: app.activity_count(),
+                            });
                         }
                         WsMessage::SendCommand { world_index, command } => {
                             // Use shared command parsing
@@ -19718,6 +20168,10 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                             // Client requested full state resync - send initial state
                             let initial_state = app.build_initial_state();
                             app.ws_send_to_client(client_id, initial_state);
+                            // Also send current activity count
+                            app.ws_send_to_client(client_id, WsMessage::ActivityUpdate {
+                                count: app.activity_count(),
+                            });
                         }
                         WsMessage::BanListRequest => {
                             // Send current ban list to client
@@ -20641,7 +21095,29 @@ fn handle_key_event(key: KeyEvent, app: &mut App) -> KeyAction {
                     app.input.visible_height = new_input_height;
                     app.show_tags = new_show_tags;
                     if !app.settings.more_mode_enabled {
+                        // Get the lines that will be released (for broadcasting as ServerData)
+                        let lines_to_broadcast: Vec<String> = app.worlds[idx]
+                            .pending_lines
+                            .iter()
+                            .map(|line| line.text.replace('\r', ""))
+                            .collect();
+                        let released = lines_to_broadcast.len();
+
                         app.worlds[idx].release_all_pending();
+
+                        // Broadcast the released lines as ServerData so clients can display them
+                        if !lines_to_broadcast.is_empty() {
+                            let ws_data = lines_to_broadcast.join("\n") + "\n";
+                            app.ws_broadcast(WsMessage::ServerData {
+                                world_index: idx,
+                                data: ws_data,
+                                is_viewed: true,
+                                ts: current_timestamp_secs(),
+                            });
+                            app.ws_broadcast(WsMessage::PendingReleased { world_index: idx, count: released });
+                            app.ws_broadcast(WsMessage::PendingLinesUpdate { world_index: idx, count: 0 });
+                            app.broadcast_activity();
+                        }
                     }
                     app.settings_popup.close();
                     if let Err(e) = save_settings(app) {
@@ -21091,14 +21567,38 @@ fn handle_key_event(key: KeyEvent, app: &mut App) -> KeyAction {
             // At bottom and paused with pending lines - release screenful minus 2 lines
             let batch_size = (app.output_height as usize).saturating_sub(2);
             let world_idx = app.current_world_index;
+
+            // Get the lines that will be released (for broadcasting as ServerData)
+            let to_release = batch_size.min(app.worlds[world_idx].pending_lines.len());
+            let lines_to_broadcast: Vec<String> = app.worlds[world_idx]
+                .pending_lines
+                .iter()
+                .take(to_release)
+                .map(|line| line.text.replace('\r', ""))
+                .collect();
+
             let pending_before = app.worlds[world_idx].pending_lines.len();
             app.current_world_mut().release_pending(batch_size);
             let released = pending_before - app.worlds[world_idx].pending_lines.len();
+
+            // Broadcast the released lines as ServerData so clients can display them
+            if !lines_to_broadcast.is_empty() {
+                let ws_data = lines_to_broadcast.join("\n") + "\n";
+                app.ws_broadcast(WsMessage::ServerData {
+                    world_index: world_idx,
+                    data: ws_data,
+                    is_viewed: true,
+                    ts: current_timestamp_secs(),
+                });
+            }
+
             // Broadcast release event so other clients sync
             app.ws_broadcast(WsMessage::PendingReleased { world_index: world_idx, count: released });
             // Also broadcast updated pending count
             let pending = app.worlds[world_idx].pending_lines.len();
             app.ws_broadcast(WsMessage::PendingLinesUpdate { world_index: world_idx, count: pending });
+            // Broadcast activity count since pending lines changed
+            app.broadcast_activity();
             app.needs_output_redraw = true;
             return KeyAction::None;
         }
@@ -21203,12 +21703,34 @@ fn handle_key_event(key: KeyEvent, app: &mut App) -> KeyAction {
         app.last_escape = None; // Clear escape state
         if app.current_world().paused {
             let world_idx = app.current_world_index;
-            let released = app.worlds[world_idx].pending_lines.len();
+
+            // Get the lines that will be released (for broadcasting as ServerData)
+            let lines_to_broadcast: Vec<String> = app.worlds[world_idx]
+                .pending_lines
+                .iter()
+                .map(|line| line.text.replace('\r', ""))
+                .collect();
+            let released = lines_to_broadcast.len();
+
             app.current_world_mut().release_all_pending();
+
+            // Broadcast the released lines as ServerData so clients can display them
+            if !lines_to_broadcast.is_empty() {
+                let ws_data = lines_to_broadcast.join("\n") + "\n";
+                app.ws_broadcast(WsMessage::ServerData {
+                    world_index: world_idx,
+                    data: ws_data,
+                    is_viewed: true,
+                    ts: current_timestamp_secs(),
+                });
+            }
+
             // Broadcast release event so other clients sync
             app.ws_broadcast(WsMessage::PendingReleased { world_index: world_idx, count: released });
             // Also broadcast updated pending count
             app.ws_broadcast(WsMessage::PendingLinesUpdate { world_index: world_idx, count: 0 });
+            // Broadcast activity count since pending lines changed
+            app.broadcast_activity();
             app.needs_output_redraw = true;
         }
         return KeyAction::None;

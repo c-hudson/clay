@@ -79,6 +79,8 @@ pub enum WsMessage {
     PendingReleased { world_index: usize, count: usize },
     UnseenCleared { world_index: usize },
     UnseenUpdate { world_index: usize, count: usize },
+    /// Broadcast server's activity count (number of worlds with activity)
+    ActivityUpdate { count: usize },
     /// Clear all output for a world (from /flush command)
     WorldFlushed { world_index: usize },
     /// Tell client to execute a command locally (for action commands like /worlds)
@@ -97,6 +99,8 @@ pub enum WsMessage {
     /// Request to release pending lines (count = number to release, 0 = all)
     ReleasePending { world_index: usize, count: usize },
     MarkWorldSeen { world_index: usize },
+    /// Update client's view state (world index and visible lines for more-mode calculation)
+    UpdateViewState { world_index: usize, visible_lines: usize },
     RequestState,  // Request full state resync
 
     // Settings updates (client -> server)

@@ -549,8 +549,10 @@ The client includes an embedded WebSocket server that allows remote GUI clients 
 - Console marks a world as seen when its output is rendered (clears `unseen_lines` to 0)
 - `UnseenCleared` message broadcast to all clients when a world is marked as seen
 - `UnseenUpdate` message sent when a world's unseen count changes
+- `ActivityUpdate` message broadcast when overall activity count changes (console is authoritative)
 - Web/GUI clients send `MarkWorldSeen` when switching to a world
 - All interfaces stay synchronized via these broadcasts
+- Activity indicator shows same count across console, web, and GUI (server broadcasts count, clients display it)
 
 **Allow List Whitelist:**
 

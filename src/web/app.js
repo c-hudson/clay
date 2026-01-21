@@ -202,6 +202,12 @@
     let pendingLines = [];
     let linesSincePause = 0;
 
+    // Synchronized more-mode: track last sent view state to avoid redundant messages
+    let lastSentViewState = null;  // {worldIndex, visibleLines}
+
+    // Server's activity count (number of worlds with unseen/pending output)
+    let serverActivityCount = 0;
+
     // Settings
     let worldSwitchMode = 'Unseen First';  // 'Unseen First' or 'Alphabetical'
 
@@ -745,6 +751,22 @@
         return Math.floor(elements.outputContainer.clientHeight / lineHeight);
     }
 
+    // Send UpdateViewState to server for synchronized more-mode
+    function sendViewStateIfChanged() {
+        const visibleLines = getVisibleLineCount();
+        const newState = { worldIndex: currentWorldIndex, visibleLines };
+        if (!lastSentViewState ||
+            lastSentViewState.worldIndex !== newState.worldIndex ||
+            lastSentViewState.visibleLines !== newState.visibleLines) {
+            send({
+                type: 'UpdateViewState',
+                world_index: currentWorldIndex,
+                visible_lines: visibleLines
+            });
+            lastSentViewState = newState;
+        }
+    }
+
     // Check if scrolled to bottom
     function isAtBottom() {
         const container = elements.outputContainer;
@@ -1013,6 +1035,8 @@
                 }
                 renderOutput();
                 updateStatusBar();
+                // Send initial view state for synchronized more-mode
+                sendViewStateIfChanged();
                 break;
 
             case 'ServerData':
@@ -1246,6 +1270,12 @@
                     worlds[msg.world_index].unseen_lines = msg.count || 0;
                     updateStatusBar();
                 }
+                break;
+
+            case 'ActivityUpdate':
+                // Server's activity count - just display it
+                serverActivityCount = msg.count || 0;
+                updateStatusBar();
                 break;
 
             case 'PendingLinesUpdate':
@@ -1656,6 +1686,8 @@
             }
             // Notify server that this world has been seen (syncs unseen count)
             send({ type: 'MarkWorldSeen', world_index: index });
+            // Update view state for synchronized more-mode
+            sendViewStateIfChanged();
         }
     }
 
@@ -2559,15 +2591,8 @@
             elements.worldName.textContent = '';
         }
 
-        // Activity indicator (worlds with unseen lines only)
-        // Note: pending_count is server-side more-mode concept, not meaningful for web activity
-        let activityCount = 0;
-        worlds.forEach((w, i) => {
-            if (i !== currentWorldIndex && w.unseen_lines > 0) {
-                activityCount++;
-            }
-        });
-        elements.activityIndicator.textContent = activityCount > 0 ? ` (Activity: ${activityCount})` : '';
+        // Activity indicator - use server's count directly (console broadcasts this value)
+        elements.activityIndicator.textContent = serverActivityCount > 0 ? ` (Activity: ${serverActivityCount})` : '';
 
         // Fill remaining space with underscores
         // Calculate how many underscores fit based on container width and font size
@@ -4145,6 +4170,9 @@
                 tls_proxy_enabled: tlsProxyEnabled
             });
         }
+
+        // Update view state for synchronized more-mode (visible lines changed with font size)
+        sendViewStateIfChanged();
     }
 
     // Setup event listeners
@@ -4324,6 +4352,8 @@
                 scrollToBottom();
             }
             updateStatusBar();
+            // Update view state for synchronized more-mode (visible lines may have changed)
+            sendViewStateIfChanged();
         });
 
         // Handle mobile keyboard visibility - keep toolbar at visual viewport top
