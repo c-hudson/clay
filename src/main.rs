@@ -10246,28 +10246,34 @@ mod remote_gui {
                                     }
                                 }
 
-                                ui.add_space(12.0);
+                                ui.add_space(15.0);
 
-                                // Connect button - styled as primary
-                                let button = egui::Button::new(
-                                    egui::RichText::new("CONNECT")
-                                        .color(theme.bg_deep())
-                                        .strong()
-                                        .size(11.0)
-                                )
-                                .fill(theme.accent_dim())
-                                .stroke(egui::Stroke::NONE)
-                                .rounding(egui::Rounding::same(4.0))
-                                .min_size(egui::vec2(f32::INFINITY, 32.0));
+                                // Connect button - styled as primary, right justified
+                                let button_size = egui::vec2(80.0, 32.0);
+                                ui.allocate_ui_with_layout(
+                                    egui::vec2(ui.available_width(), button_size.y),
+                                    egui::Layout::right_to_left(egui::Align::Center),
+                                    |ui| {
+                                        let button = egui::Button::new(
+                                            egui::RichText::new("CONNECT")
+                                                .color(theme.bg_deep())
+                                                .strong()
+                                                .size(11.0)
+                                        )
+                                        .fill(theme.accent_dim())
+                                        .stroke(egui::Stroke::NONE)
+                                        .rounding(egui::Rounding::same(4.0));
 
-                                if ui.add(button).clicked() {
-                                    self.password_submitted = true;
-                                    if self.connected {
-                                        self.send_auth();
-                                    } else {
-                                        self.connect_websocket();
+                                        if ui.add_sized(button_size, button).clicked() {
+                                            self.password_submitted = true;
+                                            if self.connected {
+                                                self.send_auth();
+                                            } else {
+                                                self.connect_websocket();
+                                            }
+                                        }
                                     }
-                                }
+                                );
 
                                 // Error message
                                 if let Some(ref err) = self.error_message {
