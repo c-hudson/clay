@@ -1252,6 +1252,74 @@ impl SettingsPopup {
         }
     }
 
+    /// Move to next non-button field (for Up/Down navigation). Returns false if at edge.
+    fn next_field_only(&mut self) -> bool {
+        if self.selected_field.is_button() {
+            return false;  // Don't move from buttons to fields with Up/Down
+        }
+        let prev = self.selected_field;
+        self.next_field();
+        // If we landed on a button, we're at the edge - revert and return false
+        if self.selected_field.is_button() {
+            self.selected_field = prev;
+            return false;
+        }
+        true
+    }
+
+    /// Move to previous non-button field (for Up/Down navigation). Returns false if at edge.
+    fn prev_field_only(&mut self) -> bool {
+        if self.selected_field.is_button() {
+            return false;  // Don't move from buttons to fields with Up/Down
+        }
+        let prev = self.selected_field;
+        self.prev_field();
+        // If we landed on a button (wrapping around), we're at the edge - revert and return false
+        if self.selected_field.is_button() {
+            self.selected_field = prev;
+            return false;
+        }
+        true
+    }
+
+    /// Move to next button (for Tab navigation, cycling within buttons)
+    fn next_button(&mut self) {
+        if self.setup_mode {
+            self.selected_field = match self.selected_field {
+                SettingsField::SaveSetup => SettingsField::CancelSetup,
+                SettingsField::CancelSetup => SettingsField::SaveSetup,
+                _ => SettingsField::SaveSetup,  // Start at first button
+            };
+        } else {
+            self.selected_field = match self.selected_field {
+                SettingsField::SaveWorld => SettingsField::CancelWorld,
+                SettingsField::CancelWorld => SettingsField::DeleteWorld,
+                SettingsField::DeleteWorld => SettingsField::Connect,
+                SettingsField::Connect => SettingsField::SaveWorld,
+                _ => SettingsField::SaveWorld,  // Start at first button
+            };
+        }
+    }
+
+    /// Move to previous button (for BackTab navigation, cycling within buttons)
+    fn prev_button(&mut self) {
+        if self.setup_mode {
+            self.selected_field = match self.selected_field {
+                SettingsField::SaveSetup => SettingsField::CancelSetup,
+                SettingsField::CancelSetup => SettingsField::SaveSetup,
+                _ => SettingsField::CancelSetup,  // Start at last button
+            };
+        } else {
+            self.selected_field = match self.selected_field {
+                SettingsField::SaveWorld => SettingsField::Connect,
+                SettingsField::CancelWorld => SettingsField::SaveWorld,
+                SettingsField::DeleteWorld => SettingsField::CancelWorld,
+                SettingsField::Connect => SettingsField::DeleteWorld,
+                _ => SettingsField::Connect,  // Start at last button
+            };
+        }
+    }
+
     fn start_edit(&mut self) {
         self.editing = true;
         self.edit_buffer = match self.selected_field {
@@ -1636,6 +1704,7 @@ enum WorldSelectorFocus {
 struct WorldSelectorPopup {
     visible: bool,
     selected_index: usize,
+    scroll_offset: usize,
     filter: String,
     filter_cursor: usize,
     editing_filter: bool,
@@ -1649,6 +1718,7 @@ impl WorldSelectorPopup {
         Self {
             visible: false,
             selected_index: 0,
+            scroll_offset: 0,
             filter: String::new(),
             filter_cursor: 0,
             editing_filter: false,
@@ -1661,6 +1731,7 @@ impl WorldSelectorPopup {
     fn open(&mut self, current_world_index: usize) {
         self.visible = true;
         self.selected_index = current_world_index;
+        self.scroll_offset = 0;
         self.filter.clear();
         self.filter_cursor = 0;
         self.editing_filter = false;
@@ -1676,20 +1747,22 @@ impl WorldSelectorPopup {
     }
 
     fn next_focus(&mut self) {
+        // Tab cycles through buttons only (once you leave List, you stay in buttons)
         self.focus = match self.focus {
             WorldSelectorFocus::List => WorldSelectorFocus::AddButton,
             WorldSelectorFocus::AddButton => WorldSelectorFocus::EditButton,
             WorldSelectorFocus::EditButton => WorldSelectorFocus::DeleteButton,
             WorldSelectorFocus::DeleteButton => WorldSelectorFocus::ConnectButton,
             WorldSelectorFocus::ConnectButton => WorldSelectorFocus::CancelButton,
-            WorldSelectorFocus::CancelButton => WorldSelectorFocus::List,
+            WorldSelectorFocus::CancelButton => WorldSelectorFocus::AddButton,  // Wrap within buttons
         };
     }
 
     fn prev_focus(&mut self) {
+        // BackTab cycles through buttons only (once you leave List, you stay in buttons)
         self.focus = match self.focus {
             WorldSelectorFocus::List => WorldSelectorFocus::CancelButton,
-            WorldSelectorFocus::AddButton => WorldSelectorFocus::List,
+            WorldSelectorFocus::AddButton => WorldSelectorFocus::CancelButton,  // Wrap within buttons
             WorldSelectorFocus::EditButton => WorldSelectorFocus::AddButton,
             WorldSelectorFocus::DeleteButton => WorldSelectorFocus::EditButton,
             WorldSelectorFocus::ConnectButton => WorldSelectorFocus::DeleteButton,
@@ -1716,63 +1789,69 @@ impl WorldSelectorPopup {
         }
     }
 
-    /// Move up in the list. Returns true if at top (should go to buttons).
-    fn move_up(&mut self, worlds: &[World]) -> bool {
+    /// Move up in the list (wraps at top to bottom)
+    fn move_up(&mut self, worlds: &[World], list_height: usize) {
         let indices = self.filtered_indices(worlds);
         if indices.is_empty() {
-            return true;
+            return;
         }
         // Find current position in filtered list
-        if let Some(pos) = indices.iter().position(|&i| i == self.selected_index) {
-            if pos > 0 {
-                self.selected_index = indices[pos - 1];
-                false
-            } else {
-                true // At top, signal to go to buttons
-            }
-        } else if !indices.is_empty() {
-            self.selected_index = indices[0];
-            false
+        let pos = indices.iter().position(|&i| i == self.selected_index).unwrap_or(0);
+        let new_pos = if pos > 0 {
+            pos - 1
         } else {
-            true
+            // Wrap to bottom
+            indices.len() - 1
+        };
+        self.selected_index = indices[new_pos];
+
+        // Adjust scroll_offset only if selection goes above viewport
+        if new_pos < self.scroll_offset {
+            self.scroll_offset = new_pos;
+        }
+        // If we wrapped to bottom, scroll to show it
+        if new_pos >= self.scroll_offset + list_height {
+            self.scroll_offset = new_pos.saturating_sub(list_height - 1);
         }
     }
 
-    /// Move down in the list. Returns true if at bottom (should go to buttons).
-    fn move_down(&mut self, worlds: &[World]) -> bool {
+    /// Move down in the list (wraps at bottom to top)
+    fn move_down(&mut self, worlds: &[World], list_height: usize) {
         let indices = self.filtered_indices(worlds);
         if indices.is_empty() {
-            return true;
+            return;
         }
         // Find current position in filtered list
-        if let Some(pos) = indices.iter().position(|&i| i == self.selected_index) {
-            if pos < indices.len() - 1 {
-                self.selected_index = indices[pos + 1];
-                false
-            } else {
-                true // At bottom, signal to go to buttons
-            }
-        } else if !indices.is_empty() {
-            self.selected_index = indices[0];
-            false
+        let pos = indices.iter().position(|&i| i == self.selected_index).unwrap_or(0);
+        let new_pos = if pos < indices.len() - 1 {
+            pos + 1
         } else {
-            true
+            // Wrap to top
+            0
+        };
+        self.selected_index = indices[new_pos];
+
+        // Adjust scroll_offset only if selection goes below viewport
+        if new_pos >= self.scroll_offset + list_height {
+            self.scroll_offset = new_pos.saturating_sub(list_height - 1);
+        }
+        // If we wrapped to top, scroll to show it
+        if new_pos < self.scroll_offset {
+            self.scroll_offset = new_pos;
         }
     }
 
-    /// Move to the last item in the filtered list
-    fn move_to_last(&mut self, worlds: &[World]) {
+    /// Ensure selection is visible within viewport (used when filter changes)
+    fn ensure_visible(&mut self, worlds: &[World], list_height: usize) {
         let indices = self.filtered_indices(worlds);
-        if !indices.is_empty() {
-            self.selected_index = indices[indices.len() - 1];
+        if indices.is_empty() {
+            return;
         }
-    }
-
-    /// Move to the first item in the filtered list
-    fn move_to_first(&mut self, worlds: &[World]) {
-        let indices = self.filtered_indices(worlds);
-        if !indices.is_empty() {
-            self.selected_index = indices[0];
+        let pos = indices.iter().position(|&i| i == self.selected_index).unwrap_or(0);
+        if pos < self.scroll_offset {
+            self.scroll_offset = pos;
+        } else if pos >= self.scroll_offset + list_height {
+            self.scroll_offset = pos.saturating_sub(list_height - 1);
         }
     }
 
@@ -20468,19 +20547,8 @@ fn handle_key_event(key: KeyEvent, app: &mut App) -> KeyAction {
                     }
                 }
                 KeyCode::Up => {
-                    if app.settings_popup.selected_field.is_button() {
-                        // When on a button, cycle between buttons (same as Left)
-                        app.settings_popup.selected_field = match app.settings_popup.selected_field {
-                            SettingsField::SaveWorld => SettingsField::Connect,
-                            SettingsField::CancelWorld => SettingsField::SaveWorld,
-                            SettingsField::DeleteWorld => SettingsField::CancelWorld,
-                            SettingsField::Connect => SettingsField::DeleteWorld,
-                            SettingsField::SaveSetup => SettingsField::CancelSetup,
-                            SettingsField::CancelSetup => SettingsField::SaveSetup,
-                            other => other,
-                        };
-                    } else {
-                        app.settings_popup.prev_field();
+                    // Up navigates through fields only (not buttons), stops at edge
+                    if app.settings_popup.prev_field_only() {
                         // Auto-start editing if text field
                         if app.settings_popup.selected_field.is_text_field() {
                             app.settings_popup.start_edit();
@@ -20488,19 +20556,8 @@ fn handle_key_event(key: KeyEvent, app: &mut App) -> KeyAction {
                     }
                 }
                 KeyCode::Down => {
-                    if app.settings_popup.selected_field.is_button() {
-                        // When on a button, cycle between buttons (same as Right)
-                        app.settings_popup.selected_field = match app.settings_popup.selected_field {
-                            SettingsField::SaveWorld => SettingsField::CancelWorld,
-                            SettingsField::CancelWorld => SettingsField::DeleteWorld,
-                            SettingsField::DeleteWorld => SettingsField::Connect,
-                            SettingsField::Connect => SettingsField::SaveWorld,
-                            SettingsField::SaveSetup => SettingsField::CancelSetup,
-                            SettingsField::CancelSetup => SettingsField::SaveSetup,
-                            other => other,
-                        };
-                    } else {
-                        app.settings_popup.next_field();
+                    // Down navigates through fields only (not buttons), stops at edge
+                    if app.settings_popup.next_field_only() {
                         // Auto-start editing if text field
                         if app.settings_popup.selected_field.is_text_field() {
                             app.settings_popup.start_edit();
@@ -20508,11 +20565,12 @@ fn handle_key_event(key: KeyEvent, app: &mut App) -> KeyAction {
                     }
                 }
                 KeyCode::Tab => {
-                    app.settings_popup.next_field();
-                    // Auto-start editing if text field
-                    if app.settings_popup.selected_field.is_text_field() {
-                        app.settings_popup.start_edit();
-                    }
+                    // Tab cycles through buttons only
+                    app.settings_popup.next_button();
+                }
+                KeyCode::BackTab => {
+                    // BackTab cycles through buttons in reverse
+                    app.settings_popup.prev_button();
                 }
                 KeyCode::Left => {
                     // Decrement for InputHeight, cycle backwards for Encoding/AutoConnect, or move between buttons
@@ -20885,19 +20943,22 @@ fn handle_key_event(key: KeyEvent, app: &mut App) -> KeyAction {
                     if app.world_selector.filter_cursor > 0 {
                         app.world_selector.filter_cursor -= 1;
                         app.world_selector.filter.remove(app.world_selector.filter_cursor);
-                        // Reset selection to first filtered item
+                        // Reset selection and scroll to first filtered item
                         let indices = app.world_selector.filtered_indices(&app.worlds);
                         if !indices.is_empty() {
                             app.world_selector.selected_index = indices[0];
+                            app.world_selector.scroll_offset = 0;
                         }
                     }
                 }
                 KeyCode::Delete => {
                     if app.world_selector.filter_cursor < app.world_selector.filter.len() {
                         app.world_selector.filter.remove(app.world_selector.filter_cursor);
+                        // Reset selection and scroll to first filtered item
                         let indices = app.world_selector.filtered_indices(&app.worlds);
                         if !indices.is_empty() {
                             app.world_selector.selected_index = indices[0];
+                            app.world_selector.scroll_offset = 0;
                         }
                     }
                 }
@@ -20918,20 +20979,21 @@ fn handle_key_event(key: KeyEvent, app: &mut App) -> KeyAction {
                     app.world_selector.filter_cursor = app.world_selector.filter.len();
                 }
                 KeyCode::Up => {
-                    // In filter mode, just move through list (ignore if at edge)
-                    let _ = app.world_selector.move_up(&app.worlds);
+                    // In filter mode, move through list (wraps at edges)
+                    app.world_selector.move_up(&app.worlds, 10);
                 }
                 KeyCode::Down => {
-                    // In filter mode, just move through list (ignore if at edge)
-                    let _ = app.world_selector.move_down(&app.worlds);
+                    // In filter mode, move through list (wraps at edges)
+                    app.world_selector.move_down(&app.worlds, 10);
                 }
                 KeyCode::Char(c) => {
                     app.world_selector.filter.insert(app.world_selector.filter_cursor, c);
                     app.world_selector.filter_cursor += 1;
-                    // Reset selection to first filtered item
+                    // Reset selection and scroll to first filtered item
                     let indices = app.world_selector.filtered_indices(&app.worlds);
                     if !indices.is_empty() {
                         app.world_selector.selected_index = indices[0];
+                        app.world_selector.scroll_offset = 0;
                     }
                 }
                 _ => {}
@@ -20999,54 +21061,20 @@ fn handle_key_event(key: KeyEvent, app: &mut App) -> KeyAction {
                     }
                 }
                 KeyCode::Up => {
-                    if app.world_selector.focus == WorldSelectorFocus::List {
-                        // Try to move up in list, if at top go to last button
-                        if app.world_selector.move_up(&app.worlds) {
-                            app.world_selector.focus = WorldSelectorFocus::CancelButton;
-                        }
-                    } else if app.world_selector.focus == WorldSelectorFocus::AddButton {
-                        // At first button, go back to last item in list
-                        app.world_selector.focus = WorldSelectorFocus::List;
-                        app.world_selector.move_to_last(&app.worlds);
-                    } else {
-                        // Move to previous button
-                        app.world_selector.prev_focus();
-                    }
+                    // Up always navigates the list (wraps at edges)
+                    app.world_selector.move_up(&app.worlds, 10);
                 }
                 KeyCode::Down => {
-                    if app.world_selector.focus == WorldSelectorFocus::List {
-                        // Try to move down in list, if at bottom go to first button
-                        if app.world_selector.move_down(&app.worlds) {
-                            app.world_selector.focus = WorldSelectorFocus::AddButton;
-                        }
-                    } else if app.world_selector.focus == WorldSelectorFocus::CancelButton {
-                        // At last button, go back to first item in list
-                        app.world_selector.focus = WorldSelectorFocus::List;
-                        app.world_selector.move_to_first(&app.worlds);
-                    } else {
-                        // Move to next button
-                        app.world_selector.next_focus();
-                    }
+                    // Down always navigates the list (wraps at edges)
+                    app.world_selector.move_down(&app.worlds, 10);
                 }
                 KeyCode::Left => {
-                    // Move between buttons
-                    if app.world_selector.focus != WorldSelectorFocus::List {
-                        app.world_selector.prev_focus();
-                        // Skip List when using Left/Right
-                        if app.world_selector.focus == WorldSelectorFocus::List {
-                            app.world_selector.focus = WorldSelectorFocus::CancelButton;
-                        }
-                    }
+                    // Move between buttons (wraps)
+                    app.world_selector.prev_focus();
                 }
                 KeyCode::Right => {
-                    // Move between buttons
-                    if app.world_selector.focus != WorldSelectorFocus::List {
-                        app.world_selector.next_focus();
-                        // Skip List when using Left/Right
-                        if app.world_selector.focus == WorldSelectorFocus::List {
-                            app.world_selector.focus = WorldSelectorFocus::AddButton;
-                        }
-                    }
+                    // Move between buttons (wraps)
+                    app.world_selector.next_focus();
                 }
                 KeyCode::Char('/') => {
                     // Start filter editing
@@ -21059,10 +21087,11 @@ fn handle_key_event(key: KeyEvent, app: &mut App) -> KeyAction {
                         app.world_selector.start_filter_edit();
                         app.world_selector.filter.push(c);
                         app.world_selector.filter_cursor = app.world_selector.filter.len();
-                        // Reset selection to first filtered item
+                        // Reset selection and scroll to first filtered item
                         let indices = app.world_selector.filtered_indices(&app.worlds);
                         if !indices.is_empty() {
                             app.world_selector.selected_index = indices[0];
+                            app.world_selector.scroll_offset = 0;
                         }
                     }
                 }
@@ -24921,18 +24950,8 @@ fn render_world_selector_popup(f: &mut Frame, app: &App) {
     // 7 = borders(2) + filter(1) + blank(1) + header(1) + blank-before-buttons(1) + buttons(1)
     let list_height = popup_height.saturating_sub(7) as usize;
 
-    // Find where selected item is in the filtered list
-    let selected_pos = filtered_indices
-        .iter()
-        .position(|&i| i == selector.selected_index)
-        .unwrap_or(0);
-
-    // Calculate scroll offset to keep selected visible
-    let scroll_offset = if selected_pos >= list_height {
-        selected_pos - list_height + 1
-    } else {
-        0
-    };
+    // Use stored scroll_offset, clamped to valid range
+    let scroll_offset = selector.scroll_offset.min(filtered_indices.len().saturating_sub(list_height));
 
     for &world_idx in filtered_indices.iter().skip(scroll_offset).take(list_height) {
         let world = &app.worlds[world_idx];
