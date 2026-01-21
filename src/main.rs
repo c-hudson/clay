@@ -5310,8 +5310,14 @@ impl App {
         // new_offset is one past the last line counted, so subtract 1
         world.scroll_offset = (new_offset - 1).min(max_scroll);
 
-        // If we've scrolled to bottom, unpause
+        // If we've scrolled to bottom, unpause and release any pending lines
         if world.is_at_bottom() {
+            if !world.pending_lines.is_empty() {
+                world.output_lines.append(&mut world.pending_lines);
+                world.pending_since = None;
+                // Update scroll_offset to the new end after appending
+                world.scroll_offset = world.output_lines.len().saturating_sub(1);
+            }
             world.paused = false;
         }
         // Mark output for redraw
