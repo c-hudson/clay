@@ -534,6 +534,39 @@ pub fn is_ansi_only_line(s: &str) -> bool {
     has_ansi
 }
 
+/// Replace colored square emoji with ANSI-colored block characters for console display
+/// This ensures emoji like 🟩🟨 display in their proper colors in terminals
+/// (Emoji fonts typically ignore ANSI colors, so we use block characters instead)
+pub fn colorize_square_emojis(s: &str) -> String {
+    let mut result = String::with_capacity(s.len() * 2);
+    for c in s.chars() {
+        if let Some((r, g, b)) = colored_square_rgb(c) {
+            // Replace emoji with two colored block characters (emoji are typically 2 cells wide)
+            // Use ANSI true-color (24-bit) foreground code with FULL BLOCK (█)
+            result.push_str(&format!("\x1b[38;2;{};{};{}m██\x1b[0m", r, g, b));
+        } else {
+            result.push(c);
+        }
+    }
+    result
+}
+
+/// Get RGB color for a colored square emoji, if it is one
+fn colored_square_rgb(c: char) -> Option<(u8, u8, u8)> {
+    match c {
+        '🟥' => Some((0xDD, 0x2E, 0x44)), // Red
+        '🟧' => Some((0xF4, 0x90, 0x0C)), // Orange
+        '🟨' => Some((0xFD, 0xCB, 0x58)), // Yellow
+        '🟩' => Some((0x78, 0xB1, 0x59)), // Green
+        '🟦' => Some((0x55, 0xAC, 0xEE)), // Blue
+        '🟪' => Some((0xAA, 0x8E, 0xD6)), // Purple
+        '🟫' => Some((0xA0, 0x6A, 0x42)), // Brown
+        '⬛' => Some((0x31, 0x37, 0x3D)), // Black
+        '⬜' => Some((0xE6, 0xE7, 0xE8)), // White
+        _ => None,
+    }
+}
+
 /// Convert Discord custom emoji tags to Unicode or :name: fallback
 /// Format: <:name:id> or <a:name:id> (animated)
 pub fn convert_discord_emojis(s: &str) -> String {

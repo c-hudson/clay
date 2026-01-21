@@ -18,7 +18,7 @@ pub fn get_version_string() -> String {
 }
 
 // Re-export commonly used types from modules
-pub use encoding::{Encoding, Theme, WorldSwitchMode, convert_discord_emojis, is_visually_empty, is_ansi_only_line, strip_non_sgr_sequences};
+pub use encoding::{Encoding, Theme, WorldSwitchMode, convert_discord_emojis, colorize_square_emojis, is_visually_empty, is_ansi_only_line, strip_non_sgr_sequences};
 pub use telnet::{
     WriteCommand, StreamReader, StreamWriter, AutoConnectType, KeepAliveType,
     process_telnet, find_safe_split_point,
@@ -9815,9 +9815,14 @@ mod remote_gui {
 
         /// Check if text contains Discord custom emojis or colored squares
         fn has_discord_emojis(text: &str) -> bool {
-            // Only use emoji rendering path for actual Discord custom emojis that need image loading
-            // Colored squares (🟥, 🟩, etc.) render fine in TextEdit and don't need special handling
-            text.contains("<:") || text.contains("<a:")
+            // Use emoji rendering path for Discord custom emojis OR colored square emoji
+            // Colored squares need special handling to render in their proper colors
+            text.contains("<:") || text.contains("<a:") || Self::has_colored_squares(text)
+        }
+
+        /// Check if text contains any colored square emoji
+        fn has_colored_squares(text: &str) -> bool {
+            text.chars().any(|c| Self::colored_square_color(c).is_some())
         }
 
         /// Insert zero-width spaces after break characters in long words (>15 chars)
@@ -23273,7 +23278,8 @@ fn render_output_crossterm(app: &App) {
             return vec![("".to_string(), false)];
         }
         // Convert Discord custom emojis to :name: for console display
-        let text = convert_discord_emojis(&line.text);
+        // and colorize square emoji (🟩🟨 etc.) with ANSI codes
+        let text = colorize_square_emojis(&convert_discord_emojis(&line.text));
         // Add "%% " prefix and red color for client-generated messages
         let text = if !line.from_server {
             format!("\x1b[31m%% {}\x1b[0m", text)
@@ -23549,11 +23555,12 @@ fn render_output_area(f: &mut Frame, app: &App, area: Rect) {
         }
 
         // Strip MUD tags if show_tags is disabled, add timestamp if enabled
+        // Also colorize square emoji (🟩🟨 etc.) with ANSI codes
         let display_line = if app.show_tags {
             // Show timestamp + original text when tags are shown
-            format!("\x1b[36m{}\x1b[0m {}", line.format_timestamp(), line.text)
+            colorize_square_emojis(&format!("\x1b[36m{}\x1b[0m {}", line.format_timestamp(), line.text))
         } else {
-            strip_mud_tag(&line.text)
+            colorize_square_emojis(&strip_mud_tag(&line.text))
         };
 
         // Parse ANSI codes and convert to ratatui spans
