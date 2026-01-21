@@ -602,6 +602,7 @@ Note: HTTP automatically starts the non-secure WebSocket server if not already r
   - Toggle Tags - Show/hide MUD tags (same as F2)
   - Toggle Highlight - Highlight lines matching action patterns (same as F8)
   - Resync - Request full state resync from server
+  - Clay Server - Disconnect and open server settings (Android app only)
 - Font slider next to hamburger for adjusting text size
 - "Clay" title displayed after font slider
 
