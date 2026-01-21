@@ -10304,7 +10304,7 @@ mod remote_gui {
                         ui.add(splash_image);
 
                         let tagline_color = egui::Color32::from_rgb(0xff, 0x87, 0xff);  // 213
-                        ui.add_space(10.0);
+                        ui.add_space(5.0);
                         ui.label(egui::RichText::new("A 90dies mud client written today").color(tagline_color).italics());
                         ui.add_space(5.0);
                         ui.label(egui::RichText::new("/help for how to use clay").color(theme.fg_muted()));
