@@ -1773,7 +1773,7 @@ enum WorldSelectorFocus {
     EditButton,
     DeleteButton,
     ConnectButton,
-    CancelButton,
+    OkButton,
 }
 
 struct WorldSelectorPopup {
@@ -1786,6 +1786,7 @@ struct WorldSelectorPopup {
     focus: WorldSelectorFocus,
     confirm_delete: bool,           // True when showing delete confirmation
     confirm_delete_selected: bool,  // True = Yes, False = No
+    list_visible_height: usize,     // Track visible height for viewport scrolling
 }
 
 impl WorldSelectorPopup {
@@ -1800,6 +1801,7 @@ impl WorldSelectorPopup {
             focus: WorldSelectorFocus::List,
             confirm_delete: false,
             confirm_delete_selected: false,
+            list_visible_height: 5,
         }
     }
 
@@ -1828,20 +1830,20 @@ impl WorldSelectorPopup {
             WorldSelectorFocus::AddButton => WorldSelectorFocus::EditButton,
             WorldSelectorFocus::EditButton => WorldSelectorFocus::DeleteButton,
             WorldSelectorFocus::DeleteButton => WorldSelectorFocus::ConnectButton,
-            WorldSelectorFocus::ConnectButton => WorldSelectorFocus::CancelButton,
-            WorldSelectorFocus::CancelButton => WorldSelectorFocus::AddButton,  // Wrap within buttons
+            WorldSelectorFocus::ConnectButton => WorldSelectorFocus::OkButton,
+            WorldSelectorFocus::OkButton => WorldSelectorFocus::AddButton,  // Wrap within buttons
         };
     }
 
     fn prev_focus(&mut self) {
         // BackTab cycles through buttons only (once you leave List, you stay in buttons)
         self.focus = match self.focus {
-            WorldSelectorFocus::List => WorldSelectorFocus::CancelButton,
-            WorldSelectorFocus::AddButton => WorldSelectorFocus::CancelButton,  // Wrap within buttons
+            WorldSelectorFocus::List => WorldSelectorFocus::OkButton,
+            WorldSelectorFocus::AddButton => WorldSelectorFocus::OkButton,  // Wrap within buttons
             WorldSelectorFocus::EditButton => WorldSelectorFocus::AddButton,
             WorldSelectorFocus::DeleteButton => WorldSelectorFocus::EditButton,
             WorldSelectorFocus::ConnectButton => WorldSelectorFocus::DeleteButton,
-            WorldSelectorFocus::CancelButton => WorldSelectorFocus::ConnectButton,
+            WorldSelectorFocus::OkButton => WorldSelectorFocus::ConnectButton,
         };
     }
 
@@ -21773,7 +21775,7 @@ fn handle_key_event(key: KeyEvent, app: &mut App) -> KeyAction {
                                 app.add_output("Cannot delete the last world.\n");
                             }
                         }
-                        WorldSelectorFocus::CancelButton => {
+                        WorldSelectorFocus::OkButton => {
                             // Close without action
                             app.world_selector.close();
                         }
@@ -21781,11 +21783,21 @@ fn handle_key_event(key: KeyEvent, app: &mut App) -> KeyAction {
                 }
                 KeyCode::Up => {
                     // Up always navigates the list (wraps at edges)
-                    app.world_selector.move_up(&app.worlds, 10);
+                    // Calculate list height based on terminal size (same formula as render)
+                    let term_height = crossterm::terminal::size().map(|(_, h)| h).unwrap_or(24);
+                    let filtered_count = app.world_selector.filtered_indices(&app.worlds).len();
+                    let popup_height = ((filtered_count + 8) as u16).min(term_height.saturating_sub(4)).clamp(10, 20);
+                    let list_height = popup_height.saturating_sub(7) as usize;
+                    app.world_selector.move_up(&app.worlds, list_height);
                 }
                 KeyCode::Down => {
                     // Down always navigates the list (wraps at edges)
-                    app.world_selector.move_down(&app.worlds, 10);
+                    // Calculate list height based on terminal size (same formula as render)
+                    let term_height = crossterm::terminal::size().map(|(_, h)| h).unwrap_or(24);
+                    let filtered_count = app.world_selector.filtered_indices(&app.worlds).len();
+                    let popup_height = ((filtered_count + 8) as u16).min(term_height.saturating_sub(4)).clamp(10, 20);
+                    let list_height = popup_height.saturating_sub(7) as usize;
+                    app.world_selector.move_down(&app.worlds, list_height);
                 }
                 KeyCode::Left => {
                     // Move between buttons (wraps)
@@ -21799,6 +21811,26 @@ fn handle_key_event(key: KeyEvent, app: &mut App) -> KeyAction {
                     // Start filter editing
                     app.world_selector.focus = WorldSelectorFocus::List;
                     app.world_selector.start_filter_edit();
+                }
+                KeyCode::Char('a') | KeyCode::Char('A') => {
+                    // Shortcut for Add button
+                    app.world_selector.focus = WorldSelectorFocus::AddButton;
+                }
+                KeyCode::Char('e') | KeyCode::Char('E') => {
+                    // Shortcut for Edit button
+                    app.world_selector.focus = WorldSelectorFocus::EditButton;
+                }
+                KeyCode::Char('d') | KeyCode::Char('D') => {
+                    // Shortcut for Delete button
+                    app.world_selector.focus = WorldSelectorFocus::DeleteButton;
+                }
+                KeyCode::Char('c') | KeyCode::Char('C') => {
+                    // Shortcut for Connect button
+                    app.world_selector.focus = WorldSelectorFocus::ConnectButton;
+                }
+                KeyCode::Char('o') | KeyCode::Char('O') => {
+                    // Shortcut for Ok button
+                    app.world_selector.focus = WorldSelectorFocus::OkButton;
                 }
                 KeyCode::Char(c) => {
                     // Start filter editing with this character (only from List focus)
@@ -25996,46 +26028,39 @@ fn render_world_selector_popup(f: &mut Frame, app: &App) {
     // Blank line before buttons
     lines.push(Line::from(""));
 
-    // Button styles based on focus with background highlight
-    let add_style = if selector.focus == WorldSelectorFocus::AddButton {
-        Style::default().fg(theme.button_selected_fg()).bg(theme.button_selected_bg()).add_modifier(Modifier::BOLD)
-    } else {
-        Style::default().fg(theme.fg())
-    };
-    let edit_style = if selector.focus == WorldSelectorFocus::EditButton {
-        Style::default().fg(theme.button_selected_fg()).bg(theme.button_selected_bg()).add_modifier(Modifier::BOLD)
-    } else {
-        Style::default().fg(theme.fg())
-    };
-    let delete_style = if selector.focus == WorldSelectorFocus::DeleteButton {
-        Style::default().fg(theme.button_selected_fg()).bg(theme.button_selected_bg()).add_modifier(Modifier::BOLD)
-    } else {
-        Style::default().fg(theme.fg())
-    };
-    let connect_style = if selector.focus == WorldSelectorFocus::ConnectButton {
-        Style::default().fg(theme.button_selected_fg()).bg(theme.button_selected_bg()).add_modifier(Modifier::BOLD)
-    } else {
-        Style::default().fg(theme.fg())
-    };
-    let cancel_style = if selector.focus == WorldSelectorFocus::CancelButton {
-        Style::default().fg(theme.button_selected_fg()).bg(theme.button_selected_bg()).add_modifier(Modifier::BOLD)
-    } else {
-        Style::default().fg(theme.fg())
+    // Helper to render a button with highlighted first letter (shortcut key)
+    let make_button = |first: &str, rest: &str, selected: bool| -> Vec<Span<'static>> {
+        let base_style = if selected {
+            Style::default().fg(theme.button_selected_fg()).bg(theme.button_selected_bg()).add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(theme.fg())
+        };
+        let shortcut_style = if selected {
+            Style::default().fg(Color::Black).bg(theme.button_selected_bg()).add_modifier(Modifier::BOLD | Modifier::UNDERLINED)
+        } else {
+            Style::default().fg(Color::Black).bg(Color::White).add_modifier(Modifier::UNDERLINED)
+        };
+        vec![
+            Span::styled("[ ", base_style),
+            Span::styled(first.to_string(), shortcut_style),
+            Span::styled(rest.to_string(), base_style),
+            Span::styled(" ]", base_style),
+        ]
     };
 
-    // Buttons at bottom
-    lines.push(Line::from(vec![
-        Span::styled("[ Add ]", add_style),
-        Span::raw("  "),
-        Span::styled("[ Edit ]", edit_style),
-        Span::raw("  "),
-        Span::styled("[ Delete ]", delete_style),
-        Span::raw("  "),
-        Span::styled("[ Connect ]", connect_style),
-        Span::raw("  "),
-        Span::styled("[ Cancel ]", cancel_style),
-        Span::raw(" "),
-    ]).alignment(Alignment::Right));
+    // Buttons at bottom with highlighted shortcut letters
+    let mut button_spans: Vec<Span<'static>> = Vec::new();
+    button_spans.extend(make_button("A", "dd", selector.focus == WorldSelectorFocus::AddButton));
+    button_spans.push(Span::raw("  "));
+    button_spans.extend(make_button("E", "dit", selector.focus == WorldSelectorFocus::EditButton));
+    button_spans.push(Span::raw("  "));
+    button_spans.extend(make_button("D", "elete", selector.focus == WorldSelectorFocus::DeleteButton));
+    button_spans.push(Span::raw("  "));
+    button_spans.extend(make_button("C", "onnect", selector.focus == WorldSelectorFocus::ConnectButton));
+    button_spans.push(Span::raw("  "));
+    button_spans.extend(make_button("O", "k", selector.focus == WorldSelectorFocus::OkButton));
+    button_spans.push(Span::raw(" "));
+    lines.push(Line::from(button_spans).alignment(Alignment::Right));
 
     let popup_block = Block::default()
         .title(" Select World ")
