@@ -21710,14 +21710,97 @@ fn handle_key_event(key: KeyEvent, app: &mut App) -> KeyAction {
                 }
                 _ => {}
             }
-        } else {
-            // Navigation mode
+        } else if app.world_selector.focus == WorldSelectorFocus::FilterField {
+            // FilterField is focused - typing goes directly to filter, no button shortcuts
             match key.code {
                 KeyCode::Esc => {
                     app.world_selector.close();
                 }
                 KeyCode::Tab => {
-                    // Cycle focus: List -> Edit -> Connect -> Cancel -> List
+                    app.world_selector.next_focus();
+                }
+                KeyCode::BackTab => {
+                    app.world_selector.prev_focus();
+                }
+                KeyCode::Enter => {
+                    // Do nothing special, stay in filter mode
+                }
+                KeyCode::Backspace => {
+                    if app.world_selector.filter_cursor > 0 {
+                        app.world_selector.filter_cursor -= 1;
+                        app.world_selector.filter.remove(app.world_selector.filter_cursor);
+                        // Update filtered results
+                        let indices = app.world_selector.filtered_indices(&app.worlds);
+                        if !indices.is_empty() && !indices.contains(&app.world_selector.selected_index) {
+                            app.world_selector.selected_index = indices[0];
+                            app.world_selector.scroll_offset = 0;
+                        }
+                    }
+                }
+                KeyCode::Delete => {
+                    if app.world_selector.filter_cursor < app.world_selector.filter.len() {
+                        app.world_selector.filter.remove(app.world_selector.filter_cursor);
+                        // Update filtered results
+                        let indices = app.world_selector.filtered_indices(&app.worlds);
+                        if !indices.is_empty() && !indices.contains(&app.world_selector.selected_index) {
+                            app.world_selector.selected_index = indices[0];
+                            app.world_selector.scroll_offset = 0;
+                        }
+                    }
+                }
+                KeyCode::Left => {
+                    if app.world_selector.filter_cursor > 0 {
+                        app.world_selector.filter_cursor -= 1;
+                    }
+                }
+                KeyCode::Right => {
+                    if app.world_selector.filter_cursor < app.world_selector.filter.len() {
+                        app.world_selector.filter_cursor += 1;
+                    }
+                }
+                KeyCode::Home => {
+                    app.world_selector.filter_cursor = 0;
+                }
+                KeyCode::End => {
+                    app.world_selector.filter_cursor = app.world_selector.filter.len();
+                }
+                KeyCode::Up => {
+                    // Navigate list while filter is focused
+                    let term_height = crossterm::terminal::size().map(|(_, h)| h).unwrap_or(24);
+                    let total_worlds = app.worlds.len();
+                    let popup_height = ((total_worlds + 8) as u16).min(term_height.saturating_sub(4)).clamp(10, 20);
+                    let list_height = popup_height.saturating_sub(7) as usize;
+                    app.world_selector.move_up(&app.worlds, list_height);
+                }
+                KeyCode::Down => {
+                    // Navigate list while filter is focused
+                    let term_height = crossterm::terminal::size().map(|(_, h)| h).unwrap_or(24);
+                    let total_worlds = app.worlds.len();
+                    let popup_height = ((total_worlds + 8) as u16).min(term_height.saturating_sub(4)).clamp(10, 20);
+                    let list_height = popup_height.saturating_sub(7) as usize;
+                    app.world_selector.move_down(&app.worlds, list_height);
+                }
+                KeyCode::Char(c) => {
+                    // All characters go to filter - no button shortcuts when filter is focused
+                    app.world_selector.filter.insert(app.world_selector.filter_cursor, c);
+                    app.world_selector.filter_cursor += 1;
+                    // Reset selection to first filtered item
+                    let indices = app.world_selector.filtered_indices(&app.worlds);
+                    if !indices.is_empty() {
+                        app.world_selector.selected_index = indices[0];
+                        app.world_selector.scroll_offset = 0;
+                    }
+                }
+                _ => {}
+            }
+        } else {
+            // Navigation mode (not on FilterField)
+            match key.code {
+                KeyCode::Esc => {
+                    app.world_selector.close();
+                }
+                KeyCode::Tab => {
+                    // Cycle focus through filter and buttons
                     app.world_selector.next_focus();
                 }
                 KeyCode::BackTab => {
@@ -21739,8 +21822,7 @@ fn handle_key_event(key: KeyEvent, app: &mut App) -> KeyAction {
                             }
                         }
                         WorldSelectorFocus::FilterField => {
-                            // Start editing the filter field
-                            app.world_selector.start_filter_edit();
+                            // Should not reach here, handled above
                         }
                         WorldSelectorFocus::AddButton => {
                             // Create new world and open editor
@@ -21805,7 +21887,6 @@ fn handle_key_event(key: KeyEvent, app: &mut App) -> KeyAction {
                 KeyCode::Char('/') => {
                     // Start filter editing
                     app.world_selector.focus = WorldSelectorFocus::FilterField;
-                    app.world_selector.start_filter_edit();
                 }
                 KeyCode::Char('f') | KeyCode::Char('F') => {
                     // Shortcut for Filter field
@@ -21832,10 +21913,9 @@ fn handle_key_event(key: KeyEvent, app: &mut App) -> KeyAction {
                     app.world_selector.focus = WorldSelectorFocus::OkButton;
                 }
                 KeyCode::Char(c) => {
-                    // Start filter editing with this character (from List or FilterField focus)
-                    if matches!(app.world_selector.focus, WorldSelectorFocus::List | WorldSelectorFocus::FilterField) {
+                    // Start filter editing with this character (only from List focus)
+                    if app.world_selector.focus == WorldSelectorFocus::List {
                         app.world_selector.focus = WorldSelectorFocus::FilterField;
-                        app.world_selector.start_filter_edit();
                         app.world_selector.filter.push(c);
                         app.world_selector.filter_cursor = app.world_selector.filter.len();
                         // Reset selection and scroll to first filtered item
