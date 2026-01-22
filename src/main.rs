@@ -4863,6 +4863,9 @@ impl App {
             // Note: mark_seen() is NOT called here - lines are only marked seen when displayed
             // Mark output for redraw since we switched worlds
             self.needs_output_redraw = true;
+            // Broadcast activity count since switching worlds changes which world is "current"
+            // and activity_count() excludes the current world
+            self.broadcast_activity();
         }
     }
 
@@ -8909,6 +8912,13 @@ mod remote_gui {
                             // pending_count update comes via PendingLinesUpdate
                             let _ = world_index; // suppress unused warning
                         }
+                        WsMessage::WorldStateResponse { world_index, pending_count, prompt, scroll_offset: _, recent_lines: _ } => {
+                            // Response to RequestWorldState - update state for the world
+                            if world_index < self.worlds.len() && world_index == self.current_world {
+                                self.worlds[world_index].pending_count = pending_count;
+                                self.worlds[world_index].prompt = prompt;
+                            }
+                        }
                         WsMessage::ActionsUpdated { actions } => {
                             // Update local actions from server
                             self.actions = actions;
@@ -8936,9 +8946,10 @@ mod remote_gui {
                                     self.current_world = idx;
                                     self.worlds[idx].unseen_lines = 0;
                                     self.scroll_offset = None; // Reset scroll
-                                    // Notify server
+                                    // Notify server and request current state
                                     if let Some(ref tx) = self.ws_tx {
                                         let _ = tx.send(WsMessage::MarkWorldSeen { world_index: idx });
+                                        let _ = tx.send(WsMessage::RequestWorldState { world_index: idx });
                                     }
                                 }
                             }
@@ -9095,6 +9106,8 @@ mod remote_gui {
             // GUI switching is local only (same as web interface)
             if let Some(ref tx) = self.ws_tx {
                 let _ = tx.send(WsMessage::MarkWorldSeen { world_index });
+                // Request current state for this world (more indicator, prompt, etc)
+                let _ = tx.send(WsMessage::RequestWorldState { world_index });
             }
         }
 
@@ -10903,9 +10916,10 @@ mod remote_gui {
                             self.current_world = new_world;
                             self.worlds[new_world].unseen_lines = 0;
                             self.scroll_offset = None; // Reset scroll
-                            // Notify server so other clients sync their unseen counts
+                            // Notify server and request current state
                             if let Some(ref tx) = self.ws_tx {
                                 let _ = tx.send(WsMessage::MarkWorldSeen { world_index: new_world });
+                                let _ = tx.send(WsMessage::RequestWorldState { world_index: new_world });
                             }
                         }
                     }
@@ -19134,6 +19148,34 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                     count: app.activity_count(),
                                 });
                             }
+                            WsMessage::RequestWorldState { world_index } => {
+                                // Client switched to a world and needs current state
+                                if world_index < app.worlds.len() {
+                                    let world = &app.worlds[world_index];
+                                    // Build recent lines from output_lines (last 100 lines for context)
+                                    let recent_lines: Vec<TimestampedLine> = world.output_lines
+                                        .iter()
+                                        .rev()
+                                        .take(100)
+                                        .map(|line| TimestampedLine {
+                                            text: line.text.clone(),
+                                            ts: line.timestamp.duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs(),
+                                            gagged: line.gagged,
+                                        })
+                                        .collect::<Vec<_>>()
+                                        .into_iter()
+                                        .rev()
+                                        .collect();
+
+                                    app.ws_send_to_client(client_id, WsMessage::WorldStateResponse {
+                                        world_index,
+                                        pending_count: world.pending_lines.len(),
+                                        prompt: world.prompt.clone(),
+                                        scroll_offset: world.scroll_offset,
+                                        recent_lines,
+                                    });
+                                }
+                            }
                             WsMessage::BanListRequest => {
                                 // Send current ban list to client
                                 let bans = app.ban_list.get_ban_info();
@@ -20480,6 +20522,34 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                             app.ws_send_to_client(client_id, WsMessage::ActivityUpdate {
                                 count: app.activity_count(),
                             });
+                        }
+                        WsMessage::RequestWorldState { world_index } => {
+                            // Client switched to a world and needs current state
+                            if world_index < app.worlds.len() {
+                                let world = &app.worlds[world_index];
+                                // Build recent lines from output_lines (last 100 lines for context)
+                                let recent_lines: Vec<TimestampedLine> = world.output_lines
+                                    .iter()
+                                    .rev()
+                                    .take(100)
+                                    .map(|line| TimestampedLine {
+                                        text: line.text.clone(),
+                                        ts: line.timestamp.duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs(),
+                                        gagged: line.gagged,
+                                    })
+                                    .collect::<Vec<_>>()
+                                    .into_iter()
+                                    .rev()
+                                    .collect();
+
+                                app.ws_send_to_client(client_id, WsMessage::WorldStateResponse {
+                                    world_index,
+                                    pending_count: world.pending_lines.len(),
+                                    prompt: world.prompt.clone(),
+                                    scroll_offset: world.scroll_offset,
+                                    recent_lines,
+                                });
+                            }
                         }
                         WsMessage::BanListRequest => {
                             // Send current ban list to client

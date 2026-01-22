@@ -1319,6 +1319,26 @@
                 // This message can be used for future UI enhancements
                 break;
 
+            case 'WorldStateResponse':
+                // Response to RequestWorldState - update state for the world
+                if (msg.world_index === currentWorldIndex) {
+                    const world = worlds[msg.world_index];
+                    if (world) {
+                        // Update pending count
+                        world.pending_count = msg.pending_count || 0;
+                        // Update prompt
+                        world.prompt = msg.prompt || '';
+                        if (world.prompt) {
+                            elements.prompt.innerHTML = parseAnsi(world.prompt);
+                        } else {
+                            elements.prompt.textContent = '';
+                        }
+                        // Update status bar to show more indicator
+                        updateStatusBar();
+                    }
+                }
+                break;
+
             default:
                 console.log('Unknown message type:', msg.type);
         }
@@ -1351,19 +1371,39 @@
 
     // Release one screenful of pending lines
     function releaseScreenful() {
-        if (!paused || pendingLines.length === 0) return;
+        const world = worlds[currentWorldIndex];
+        const serverPending = world ? (world.pending_count || 0) : 0;
+
+        // Check if there's anything to release (local or server)
+        if (pendingLines.length === 0 && serverPending === 0) return;
 
         const count = Math.max(1, getVisibleLineCount() - 2);
-        // Release locally - server-side more mode is separate from client-side
-        doReleasePending(count);
+
+        // Release local pending lines
+        if (pendingLines.length > 0) {
+            doReleasePending(count);
+        }
+
+        // Also request server to release pending lines
+        if (serverPending > 0) {
+            send({ type: 'ReleasePending', world_index: currentWorldIndex, count: count });
+        }
     }
 
     // Release all pending lines
     function releaseAll() {
-        if (!paused) return;
+        const world = worlds[currentWorldIndex];
+        const serverPending = world ? (world.pending_count || 0) : 0;
 
-        // Release locally - server-side more mode is separate from client-side
-        doReleasePending(0);
+        // Release local pending lines
+        if (pendingLines.length > 0) {
+            doReleasePending(0);
+        }
+
+        // Also request server to release all pending lines
+        if (serverPending > 0) {
+            send({ type: 'ReleasePending', world_index: currentWorldIndex, count: 0 });
+        }
     }
 
     // Actually release pending lines (called when server broadcasts PendingReleased)
@@ -1688,6 +1728,8 @@
             }
             // Notify server that this world has been seen (syncs unseen count)
             send({ type: 'MarkWorldSeen', world_index: index });
+            // Request current state for this world (more indicator, prompt, etc)
+            send({ type: 'RequestWorldState', world_index: index });
             // Update view state for synchronized more-mode
             sendViewStateIfChanged();
         }
@@ -2582,8 +2624,11 @@
         const world = worlds[currentWorldIndex];
 
         // Status indicator: shows More/Hist when active, underscores when idle (9 chars)
-        if (paused && pendingLines.length > 0) {
-            elements.statusIndicator.textContent = 'More ' + formatCount(pendingLines.length);
+        // Check both local pending (client-side more mode) and server pending (synchronized more mode)
+        const serverPending = world ? (world.pending_count || 0) : 0;
+        const totalPending = pendingLines.length + serverPending;
+        if ((paused && pendingLines.length > 0) || serverPending > 0) {
+            elements.statusIndicator.textContent = 'More ' + formatCount(totalPending);
             elements.statusIndicator.className = 'paused';
         } else if (!isAtBottom()) {
             // Calculate lines from bottom
@@ -4764,7 +4809,9 @@
             // Handle navigation keys at document level
             if (e.key === 'Tab' && !e.shiftKey && !e.ctrlKey) {
                 e.preventDefault();
-                if (paused && pendingLines.length > 0) {
+                const world = worlds[currentWorldIndex];
+                const serverPending = world ? (world.pending_count || 0) : 0;
+                if (pendingLines.length > 0 || serverPending > 0) {
                     // Release one screenful of pending lines
                     releaseScreenful();
                 } else {
@@ -4828,7 +4875,9 @@
                     }
                 }
                 // Tab: Release one screenful of pending lines, or scroll down
-                if (paused && pendingLines.length > 0) {
+                const tabWorld = worlds[currentWorldIndex];
+                const tabServerPending = tabWorld ? (tabWorld.pending_count || 0) : 0;
+                if (pendingLines.length > 0 || tabServerPending > 0) {
                     releaseScreenful();
                 } else {
                     // Scroll down one screenful (like more)

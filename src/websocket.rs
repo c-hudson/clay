@@ -104,6 +104,17 @@ pub enum WsMessage {
     /// Update client's output dimensions (for NAWS - report smallest across all instances)
     UpdateDimensions { width: u16, height: u16 },
     RequestState,  // Request full state resync
+    /// Request state for a specific world (client -> server, used when switching worlds)
+    RequestWorldState { world_index: usize },
+    /// Response with current state for a specific world (server -> client)
+    WorldStateResponse {
+        world_index: usize,
+        pending_count: usize,    // Number of pending lines (more-mode)
+        prompt: String,          // Current prompt
+        scroll_offset: usize,    // Current scroll position
+        /// Recent output lines (only lines received since client's last known state)
+        recent_lines: Vec<TimestampedLine>,
+    },
 
     // Settings updates (client -> server)
     UpdateWorldSettings {
