@@ -1550,7 +1550,7 @@ impl WebField {
         }
     }
 
-    /// Get next field without wrapping - returns None if at last field
+    /// Get next field without wrapping - returns None if at last field (excludes buttons)
     fn next_no_wrap(&self, secure: bool) -> Option<Self> {
         match self {
             WebField::Protocol => Some(WebField::HttpEnabled),
@@ -1560,16 +1560,15 @@ impl WebField {
             WebField::WsPort => Some(WebField::WsPassword),
             WebField::WsPassword => Some(WebField::WsAllowList),
             WebField::WsAllowList => {
-                if secure { Some(WebField::WsCertFile) } else { Some(WebField::SaveWeb) }
+                if secure { Some(WebField::WsCertFile) } else { None } // Stop at last field, don't go to buttons
             }
             WebField::WsCertFile => Some(WebField::WsKeyFile),
-            WebField::WsKeyFile => Some(WebField::SaveWeb),
-            WebField::SaveWeb => Some(WebField::CancelWeb),
-            WebField::CancelWeb => None, // At bottom, don't wrap
+            WebField::WsKeyFile => None, // Stop at last field, don't go to buttons
+            WebField::SaveWeb | WebField::CancelWeb => None, // Already on button, stay there
         }
     }
 
-    /// Get previous field without wrapping - returns None if at first field
+    /// Get previous field without wrapping - returns None if at first field (excludes buttons)
     fn prev_no_wrap(&self, secure: bool) -> Option<Self> {
         match self {
             WebField::Protocol => None, // At top, don't wrap
@@ -1581,10 +1580,10 @@ impl WebField {
             WebField::WsAllowList => Some(WebField::WsPassword),
             WebField::WsCertFile => Some(WebField::WsAllowList),
             WebField::WsKeyFile => Some(WebField::WsCertFile),
-            WebField::SaveWeb => {
+            // From buttons, go back to last field
+            WebField::SaveWeb | WebField::CancelWeb => {
                 if secure { Some(WebField::WsKeyFile) } else { Some(WebField::WsAllowList) }
             }
-            WebField::CancelWeb => Some(WebField::SaveWeb),
         }
     }
 }
