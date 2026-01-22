@@ -21438,17 +21438,31 @@ fn handle_key_event(key: KeyEvent, app: &mut App) -> KeyAction {
                 }
                 KeyCode::Up => {
                     app.web_popup.commit_edit();
-                    app.web_popup.prev_field();
-                    if app.web_popup.selected_field.is_text_field() {
-                        app.web_popup.start_edit();
+                    // Navigate up without wrapping
+                    if app.web_popup.prev_field_no_wrap() {
+                        if app.web_popup.selected_field.is_text_field() {
+                            app.web_popup.start_edit();
+                        }
                     }
                 }
-                KeyCode::Down | KeyCode::Enter | KeyCode::Tab => {
+                KeyCode::Down | KeyCode::Enter => {
                     app.web_popup.commit_edit();
-                    app.web_popup.next_field();
-                    if app.web_popup.selected_field.is_text_field() {
-                        app.web_popup.start_edit();
+                    // Navigate down without wrapping
+                    if app.web_popup.next_field_no_wrap() {
+                        if app.web_popup.selected_field.is_text_field() {
+                            app.web_popup.start_edit();
+                        }
                     }
+                }
+                KeyCode::Tab => {
+                    // Tab cycles through buttons only
+                    app.web_popup.commit_edit();
+                    app.web_popup.next_button();
+                }
+                KeyCode::BackTab => {
+                    // Shift+Tab cycles through buttons in reverse
+                    app.web_popup.commit_edit();
+                    app.web_popup.prev_button();
                 }
                 KeyCode::Char(c) => {
                     app.web_popup.edit_buffer.insert(app.web_popup.edit_cursor, c);
