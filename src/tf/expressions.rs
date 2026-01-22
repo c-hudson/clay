@@ -1069,14 +1069,31 @@ impl<'a> Evaluator<'a> {
 }
 
 /// Convert a glob pattern to a regex pattern
+/// Supports \* and \? to match literal asterisk and question mark
 fn glob_to_regex(pattern: &str) -> String {
     let mut result = String::from("^");
 
-    for c in pattern.chars() {
+    let mut chars = pattern.chars().peekable();
+    while let Some(c) = chars.next() {
         match c {
+            '\\' => {
+                // Check for escape sequences
+                match chars.peek() {
+                    Some('*') | Some('?') | Some('\\') => {
+                        // Escaped wildcard or backslash - treat as literal
+                        let escaped = chars.next().unwrap();
+                        result.push('\\');
+                        result.push(escaped);
+                    }
+                    _ => {
+                        // Lone backslash - escape it for regex
+                        result.push_str("\\\\");
+                    }
+                }
+            }
             '*' => result.push_str(".*"),
             '?' => result.push('.'),
-            '.' | '+' | '(' | ')' | '[' | ']' | '{' | '}' | '^' | '$' | '|' | '\\' => {
+            '.' | '+' | '(' | ')' | '[' | ']' | '{' | '}' | '^' | '$' | '|' => {
                 result.push('\\');
                 result.push(c);
             }

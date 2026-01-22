@@ -688,12 +688,14 @@
         if (mode === 'mobile') {
             // Hide desktop toolbar, show mobile toolbar
             elements.toolbar.style.display = 'none';
+            elements.mobileToolbar.style.display = '';  // Clear inline style
             elements.mobileToolbar.classList.add('visible');
             // Remove top padding since no fixed toolbar
             elements.outputContainer.style.paddingTop = '2px';
         } else {
             // Show desktop toolbar, hide mobile toolbar
             elements.toolbar.style.display = 'flex';
+            elements.mobileToolbar.style.display = '';  // Clear inline style
             elements.mobileToolbar.classList.remove('visible');
             // Add padding for fixed toolbar
             elements.outputContainer.style.paddingTop = '40px';
@@ -1753,11 +1755,23 @@
     // Convert wildcard filter pattern to regex for F4 filter popup
     // Always uses "contains" semantics - patterns match anywhere in the line
     // * matches any sequence, ? matches any single character
+    // Supports \* and \? to match literal asterisk and question mark
     function filterWildcardToRegex(pattern) {
         let regex = '';
         // No anchoring - always "contains" semantics for filter
 
-        for (const c of pattern) {
+        let i = 0;
+        while (i < pattern.length) {
+            const c = pattern[i];
+            if (c === '\\' && i + 1 < pattern.length) {
+                const next = pattern[i + 1];
+                if (next === '*' || next === '?' || next === '\\') {
+                    // Escaped wildcard or backslash - treat as literal
+                    regex += '\\' + next;
+                    i += 2;
+                    continue;
+                }
+            }
             if (c === '*') {
                 regex += '.*';
             } else if (c === '?') {
@@ -1767,6 +1781,7 @@
             } else {
                 regex += c;
             }
+            i++;
         }
 
         try {
@@ -2665,8 +2680,8 @@
             }
         } else {
             // Restore UI elements when hiding auth modal
-            if (elements.toolbar) elements.toolbar.style.display = '';
-            if (elements.mobileToolbar) elements.mobileToolbar.style.display = '';
+            // Re-apply toolbar visibility based on device mode
+            setupToolbars(deviceMode);
             if (elements.statusBar) elements.statusBar.style.display = '';
             if (elements.inputContainer) elements.inputContainer.style.display = '';
             if (elements.outputContainer) elements.outputContainer.style.display = '';

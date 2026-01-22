@@ -2172,21 +2172,39 @@ impl FilterPopup {
 
 /// Convert a wildcard filter pattern to regex for F4 filter popup.
 /// Always uses "contains" semantics - patterns match anywhere in the line.
+/// Supports \* and \? to match literal asterisk and question mark.
 /// Examples:
 ///   "*foo*" matches any line containing "foo"
 ///   "foo*" matches any line containing "foo" followed by anything
 ///   "hel?o" matches any line containing "hello", "helao", etc.
+///   "what\?" matches any line containing "what?"
 fn filter_wildcard_to_regex(pattern: &str) -> Option<regex::Regex> {
     let mut regex = String::with_capacity(pattern.len() * 2 + 4);
 
     // No anchoring - always "contains" semantics for filter
 
-    for c in pattern.chars() {
+    let mut chars = pattern.chars().peekable();
+    while let Some(c) = chars.next() {
         match c {
+            '\\' => {
+                // Check for escape sequences
+                match chars.peek() {
+                    Some('*') | Some('?') | Some('\\') => {
+                        // Escaped wildcard or backslash - treat as literal
+                        let escaped = chars.next().unwrap();
+                        regex.push('\\');
+                        regex.push(escaped);
+                    }
+                    _ => {
+                        // Lone backslash - escape it for regex
+                        regex.push_str("\\\\");
+                    }
+                }
+            }
             '*' => regex.push_str(".*"),
             '?' => regex.push('.'),
             // Escape regex special characters
-            '.' | '+' | '^' | '$' | '|' | '\\' | '(' | ')' | '[' | ']' | '{' | '}' => {
+            '.' | '+' | '^' | '$' | '|' | '(' | ')' | '[' | ']' | '{' | '}' => {
                 regex.push('\\');
                 regex.push(c);
             }
@@ -3558,16 +3576,33 @@ struct ActionTriggerResult {
 }
 
 /// Convert a wildcard pattern (* and ?) to a regex pattern
+/// Supports \* and \? to match literal asterisk and question mark
 fn wildcard_to_regex(pattern: &str) -> String {
     // Wildcard patterns must match the entire line (anchored at start and end)
     let mut regex = String::with_capacity(pattern.len() * 2 + 2);
     regex.push('^');
-    for c in pattern.chars() {
+    let mut chars = pattern.chars().peekable();
+    while let Some(c) = chars.next() {
         match c {
+            '\\' => {
+                // Check for escape sequences
+                match chars.peek() {
+                    Some('*') | Some('?') | Some('\\') => {
+                        // Escaped wildcard or backslash - treat as literal
+                        let escaped = chars.next().unwrap();
+                        regex.push('\\');
+                        regex.push(escaped);
+                    }
+                    _ => {
+                        // Lone backslash - escape it for regex
+                        regex.push_str("\\\\");
+                    }
+                }
+            }
             '*' => regex.push_str(".*"),
             '?' => regex.push('.'),
             // Escape regex special characters
-            '.' | '+' | '^' | '$' | '|' | '\\' | '(' | ')' | '[' | ']' | '{' | '}' => {
+            '.' | '+' | '^' | '$' | '|' | '(' | ')' | '[' | ']' | '{' | '}' => {
                 regex.push('\\');
                 regex.push(c);
             }
@@ -4937,7 +4972,7 @@ impl App {
         self.needs_output_redraw = true;
     }
 
-    /// Add TF command output (does NOT get %% prefix - treated like server output)
+    /// Add TF command output (does NOT get % prefix - treated like server output)
     fn add_tf_output(&mut self, text: &str) {
         let is_current = true;
         let settings = self.settings.clone();
@@ -5008,14 +5043,14 @@ impl App {
             let clean_pending: Vec<String> = world.pending_lines.iter()
                 .map(|s| s.text.replace('\r', ""))
                 .collect();
-            // Create timestamped versions (add %% prefix and red color for client-generated messages)
+            // Create timestamped versions (add red % prefix for client-generated messages)
             // Combine output_lines and pending_lines, then sort by timestamp to ensure chronological order
             let mut all_lines: Vec<TimestampedLine> = world.output_lines.iter()
                 .chain(world.pending_lines.iter())
                 .map(|s| {
                     let text = s.text.replace('\r', "");
                     let text = if !s.from_server {
-                        format!("\x1b[31m%% {}\x1b[0m", text)
+                        format!("\x1b[31m%\x1b[0m {}", text)
                     } else {
                         text
                     };
@@ -10310,12 +10345,13 @@ mod remote_gui {
                         ui.label(egui::RichText::new("/help for how to use clay").color(theme.fg_muted()));
                         ui.add_space(20.0);
 
-                        // Login card
-                        egui::Frame::none()
-                            .fill(theme.bg_surface())
-                            .stroke(egui::Stroke::new(1.0, theme.border_subtle()))
-                            .rounding(egui::Rounding::same(8.0))
-                            .inner_margin(egui::Margin::same(20.0))
+                        // Login stripe - full width with top/bottom borders only
+                        let screen_rect = ctx.screen_rect();
+                        let stripe_top = ui.cursor().top();
+
+                        // Content frame (no fill - we paint full-width stripe after)
+                        let _content_response = egui::Frame::none()
+                            .inner_margin(egui::Margin::symmetric(20.0, 20.0))
                             .show(ui, |ui| {
                                 // Guard against invalid dimensions and NaN positions
                                 let avail = ui.available_size();
@@ -10418,6 +10454,20 @@ mod remote_gui {
                                     }
                                 }
                             });
+
+                        // Draw full-width stripe background and top/bottom borders
+                        let stripe_bottom = ui.cursor().top();
+                        let stripe_rect = egui::Rect::from_min_max(
+                            egui::pos2(screen_rect.min.x, stripe_top),
+                            egui::pos2(screen_rect.max.x, stripe_bottom),
+                        );
+                        // Paint full-width background using background order
+                        let bg_layer = egui::LayerId::new(egui::Order::Background, ui.layer_id().id);
+                        ui.ctx().layer_painter(bg_layer).rect_filled(stripe_rect, egui::Rounding::ZERO, theme.bg_surface());
+                        // Draw border lines on top
+                        let border_color = theme.border_subtle();
+                        ui.painter().hline(screen_rect.min.x..=screen_rect.max.x, stripe_top, egui::Stroke::new(1.0, border_color));
+                        ui.painter().hline(screen_rect.min.x..=screen_rect.max.x, stripe_bottom, egui::Stroke::new(1.0, border_color));
                     });
                     }); // ScrollArea
                 });
@@ -11261,11 +11311,11 @@ mod remote_gui {
                                                 self.connect_world(idx);
                                             }
                                         } else {
-                                            // World not found - show error locally (red with %% prefix)
+                                            // World not found - show error locally (red % prefix)
                                             let ts = current_timestamp_secs();
                                             if self.current_world < self.worlds.len() {
                                                 self.worlds[self.current_world].output_lines.push(
-                                                    TimestampedLine { text: format!("\x1b[31m%% World '{}' not found.\x1b[0m", name), ts, gagged: false }
+                                                    TimestampedLine { text: format!("\x1b[31m%\x1b[0m World '{}' not found.", name), ts, gagged: false }
                                                 );
                                             }
                                         }
@@ -11279,11 +11329,11 @@ mod remote_gui {
                                                 self.send_command(idx, cmd);
                                             }
                                         } else {
-                                            // World not found - show error locally (red with %% prefix)
+                                            // World not found - show error locally (red % prefix)
                                             let ts = current_timestamp_secs();
                                             if self.current_world < self.worlds.len() {
                                                 self.worlds[self.current_world].output_lines.push(
-                                                    TimestampedLine { text: format!("\x1b[31m%% World '{}' not found.\x1b[0m", name), ts, gagged: false }
+                                                    TimestampedLine { text: format!("\x1b[31m%\x1b[0m World '{}' not found.", name), ts, gagged: false }
                                                 );
                                             }
                                         }
@@ -15665,7 +15715,7 @@ keep_alive_type=Generic
                                 if let Some(ws) = &app.ws_server {
                                     ws.broadcast_to_owner(WsMessage::ServerData {
                                         world_index,
-                                        data: "\x1b[31m%% Connection failed.\x1b[0m\n".to_string(),
+                                        data: "\x1b[31m%\x1b[0m Connection failed.\n".to_string(),
                                         is_viewed: true,
                                         ts: current_timestamp_secs(),
                                     }, Some(&requesting_username));
@@ -16026,7 +16076,7 @@ fn build_multiuser_initial_state(app: &App, username: &str) -> WsMessage {
                 .map(|s| {
                     let text = s.text.replace('\r', "");
                     let text = if !s.from_server {
-                        format!("\x1b[31m%% {}\x1b[0m", text)
+                        format!("\x1b[31m%\x1b[0m {}", text)
                     } else {
                         text
                     };
@@ -16041,7 +16091,7 @@ fn build_multiuser_initial_state(app: &App, username: &str) -> WsMessage {
                 .map(|s| {
                     let text = s.text.replace('\r', "");
                     let text = if !s.from_server {
-                        format!("\x1b[31m%% {}\x1b[0m", text)
+                        format!("\x1b[31m%\x1b[0m {}", text)
                     } else {
                         text
                     };
@@ -17340,7 +17390,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                             }
                                         }
                                         if matches.is_empty() {
-                                            app.add_output(&format!("%% No matches for '{}'", pattern_str));
+                                            app.add_output(&format!("No matches for '{}'", pattern_str));
                                         } else {
                                             for m in &matches {
                                                 app.add_output(m);
@@ -17355,7 +17405,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                         app.add_output("Internal error: not a TF command");
                                     }
                                     tf::TfCommandResult::UnknownCommand(cmd_name) => {
-                                        app.add_output(&format!("%% Unknown command: #{}", cmd_name));
+                                        app.add_output(&format!("Unknown command: #{}", cmd_name));
                                     }
                                 }
                             } else if app.current_world().connected {
@@ -18079,7 +18129,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                             if !action.enabled {
                                                 app.ws_broadcast(WsMessage::ServerData {
                                                     world_index,
-                                                    data: format!("%% Action '{}' is disabled.", name),
+                                                    data: format!("\x1b[31m%\x1b[0m Action '{}' is disabled.", name),
                                                     is_viewed: false,
                                                     ts: current_timestamp_secs(),
                                                 });
@@ -18140,7 +18190,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                                                     }
                                                                 }
                                                                 if matches.is_empty() {
-                                                                    app.ws_broadcast(WsMessage::ServerData { world_index, data: format!("%% No matches for '{}'", pattern_str), is_viewed: false, ts });
+                                                                    app.ws_broadcast(WsMessage::ServerData { world_index, data: format!("\x1b[31m%\x1b[0m No matches for '{}'", pattern_str), is_viewed: false, ts });
                                                                 } else {
                                                                     for m in matches {
                                                                         app.ws_broadcast(WsMessage::ServerData { world_index, data: m, is_viewed: false, ts });
@@ -19590,7 +19640,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                         if !action.enabled {
                                             app.ws_broadcast(WsMessage::ServerData {
                                                 world_index,
-                                                data: format!("%% Action '{}' is disabled.", name),
+                                                data: format!("\x1b[31m%\x1b[0m Action '{}' is disabled.", name),
                                                 is_viewed: false,
                                                 ts: current_timestamp_secs(),
                                             });
@@ -19651,7 +19701,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                                                 }
                                                             }
                                                             if matches.is_empty() {
-                                                                app.ws_broadcast(WsMessage::ServerData { world_index, data: format!("%% No matches for '{}'", pattern_str), is_viewed: false, ts });
+                                                                app.ws_broadcast(WsMessage::ServerData { world_index, data: format!("\x1b[31m%\x1b[0m No matches for '{}'", pattern_str), is_viewed: false, ts });
                                                             } else {
                                                                 for m in matches {
                                                                     app.ws_broadcast(WsMessage::ServerData { world_index, data: m, is_viewed: false, ts });
@@ -23463,7 +23513,7 @@ async fn handle_command(cmd: &str, app: &mut App, event_tx: mpsc::Sender<AppEven
             if let Some(action) = action_found {
                 // Skip disabled actions
                 if !action.enabled {
-                    app.add_output(&format!("%% Action '{}' is disabled.", name));
+                    app.add_output(&format!("Action '{}' is disabled.", name));
                 } else {
                 // Execute the action's commands - process each individually
                 let commands = split_action_commands(&action.command);
@@ -23488,7 +23538,7 @@ async fn handle_command(cmd: &str, app: &mut App, event_tx: mpsc::Sender<AppEven
                             }
                             tf::TfCommandResult::Success(None) => {}
                             tf::TfCommandResult::Error(err) => {
-                                app.add_tf_output(&format!("%% {}", err));
+                                app.add_tf_output(&format!("\x1b[31m%\x1b[0m {}", err));
                             }
                             tf::TfCommandResult::SendToMud(text) => {
                                 if let Some(tx) = &app.current_world().command_tx {
@@ -23512,7 +23562,7 @@ async fn handle_command(cmd: &str, app: &mut App, event_tx: mpsc::Sender<AppEven
                                     }
                                 }
                                 if matches.is_empty() {
-                                    app.add_output(&format!("%% No matches for '{}'", pattern_str));
+                                    app.add_output(&format!("No matches for '{}'", pattern_str));
                                 } else {
                                     for m in matches {
                                         app.add_output(&m);
@@ -23808,9 +23858,9 @@ fn render_output_crossterm(app: &App) {
         // Convert Discord custom emojis to :name: for console display
         // and colorize square emoji (🟩🟨 etc.) with ANSI codes
         let text = colorize_square_emojis(&convert_discord_emojis(&line.text));
-        // Add "%% " prefix and red color for client-generated messages
+        // Add red "% " prefix for client-generated messages
         let text = if !line.from_server {
-            format!("\x1b[31m%% {}\x1b[0m", text)
+            format!("\x1b[31m%\x1b[0m {}", text)
         } else {
             text
         };

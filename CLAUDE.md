@@ -870,6 +870,7 @@ Actions are automated triggers that match incoming MUD output against patterns a
 - **Regexp**: Pattern is interpreted as a regular expression (e.g., `^You say` matches lines starting with "You say")
 - **Wildcard**: Pattern uses glob-style matching where `*` matches any sequence of characters and `?` matches any single character (e.g., `*tells you*` matches any line containing "tells you")
 - Wildcard patterns automatically escape regex special characters, making them safer for simple text matching
+- Use `\*` and `\?` to match literal asterisk and question mark characters (e.g., `*what\?*` matches lines containing "what?")
 - Toggle match type in the action editor (console: Space/Enter/arrows, web/GUI: click button)
 
 **Commands:**

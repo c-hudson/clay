@@ -303,12 +303,28 @@ fn compile_pattern(pattern: &str, mode: TfMatchMode) -> Result<Option<Regex>, St
 }
 
 /// Convert a glob pattern to a regex pattern
+/// Supports \* and \? to match literal asterisk and question mark
 pub fn glob_to_regex(glob: &str) -> String {
     let mut regex = String::with_capacity(glob.len() * 2);
     let mut chars = glob.chars().peekable();
 
     while let Some(c) = chars.next() {
         match c {
+            '\\' => {
+                // Check for escape sequences
+                match chars.peek() {
+                    Some('*') | Some('?') | Some('\\') => {
+                        // Escaped wildcard or backslash - treat as literal
+                        let escaped = chars.next().unwrap();
+                        regex.push('\\');
+                        regex.push(escaped);
+                    }
+                    _ => {
+                        // Lone backslash - escape it for regex
+                        regex.push_str("\\\\");
+                    }
+                }
+            }
             '*' => regex.push_str("(.*)"),
             '?' => regex.push_str("(.)"),
             '[' => {
@@ -323,7 +339,7 @@ pub fn glob_to_regex(glob: &str) -> String {
                 }
             }
             // Escape regex special characters
-            '.' | '+' | '^' | '$' | '(' | ')' | '{' | '}' | '|' | '\\' => {
+            '.' | '+' | '^' | '$' | '(' | ')' | '{' | '}' | '|' => {
                 regex.push('\\');
                 regex.push(c);
             }
