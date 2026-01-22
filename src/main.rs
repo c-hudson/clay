@@ -1549,6 +1549,44 @@ impl WebField {
             WebField::CancelWeb => WebField::SaveWeb,
         }
     }
+
+    /// Get next field without wrapping - returns None if at last field
+    fn next_no_wrap(&self, secure: bool) -> Option<Self> {
+        match self {
+            WebField::Protocol => Some(WebField::HttpEnabled),
+            WebField::HttpEnabled => Some(WebField::HttpPort),
+            WebField::HttpPort => Some(WebField::WsEnabled),
+            WebField::WsEnabled => Some(WebField::WsPort),
+            WebField::WsPort => Some(WebField::WsPassword),
+            WebField::WsPassword => Some(WebField::WsAllowList),
+            WebField::WsAllowList => {
+                if secure { Some(WebField::WsCertFile) } else { Some(WebField::SaveWeb) }
+            }
+            WebField::WsCertFile => Some(WebField::WsKeyFile),
+            WebField::WsKeyFile => Some(WebField::SaveWeb),
+            WebField::SaveWeb => Some(WebField::CancelWeb),
+            WebField::CancelWeb => None, // At bottom, don't wrap
+        }
+    }
+
+    /// Get previous field without wrapping - returns None if at first field
+    fn prev_no_wrap(&self, secure: bool) -> Option<Self> {
+        match self {
+            WebField::Protocol => None, // At top, don't wrap
+            WebField::HttpEnabled => Some(WebField::Protocol),
+            WebField::HttpPort => Some(WebField::HttpEnabled),
+            WebField::WsEnabled => Some(WebField::HttpPort),
+            WebField::WsPort => Some(WebField::WsEnabled),
+            WebField::WsPassword => Some(WebField::WsPort),
+            WebField::WsAllowList => Some(WebField::WsPassword),
+            WebField::WsCertFile => Some(WebField::WsAllowList),
+            WebField::WsKeyFile => Some(WebField::WsCertFile),
+            WebField::SaveWeb => {
+                if secure { Some(WebField::WsKeyFile) } else { Some(WebField::WsAllowList) }
+            }
+            WebField::CancelWeb => Some(WebField::SaveWeb),
+        }
+    }
 }
 
 struct WebPopup {
@@ -1618,6 +1656,44 @@ impl WebPopup {
 
     fn prev_field(&mut self) {
         self.selected_field = self.selected_field.prev(self.temp_web_secure);
+    }
+
+    /// Move to next field without wrapping - returns true if moved
+    fn next_field_no_wrap(&mut self) -> bool {
+        if let Some(next) = self.selected_field.next_no_wrap(self.temp_web_secure) {
+            self.selected_field = next;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Move to previous field without wrapping - returns true if moved
+    fn prev_field_no_wrap(&mut self) -> bool {
+        if let Some(prev) = self.selected_field.prev_no_wrap(self.temp_web_secure) {
+            self.selected_field = prev;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Cycle between buttons only
+    fn next_button(&mut self) {
+        self.selected_field = match self.selected_field {
+            WebField::SaveWeb => WebField::CancelWeb,
+            WebField::CancelWeb => WebField::SaveWeb,
+            _ => WebField::SaveWeb, // Start at first button
+        };
+    }
+
+    /// Cycle between buttons only (reverse)
+    fn prev_button(&mut self) {
+        self.selected_field = match self.selected_field {
+            WebField::SaveWeb => WebField::CancelWeb,
+            WebField::CancelWeb => WebField::SaveWeb,
+            _ => WebField::CancelWeb, // Start at last button
+        };
     }
 
     fn start_edit(&mut self) {
@@ -2222,6 +2298,7 @@ struct HelpPopup {
     visible: bool,
     scroll_offset: usize,
     lines: Vec<&'static str>,
+    button_selected: bool,
 }
 
 impl HelpPopup {
@@ -2229,6 +2306,7 @@ impl HelpPopup {
         Self {
             visible: false,
             scroll_offset: 0,
+            button_selected: false,
             lines: vec![
                 "Commands:",
                 "  /help                      Show this help",
@@ -2285,10 +2363,12 @@ impl HelpPopup {
     fn open(&mut self) {
         self.visible = true;
         self.scroll_offset = 0;
+        self.button_selected = false;
     }
 
     fn close(&mut self) {
         self.visible = false;
+        self.button_selected = false;
     }
 
     fn scroll_up(&mut self) {
@@ -2437,6 +2517,7 @@ struct ActionsPopup {
     editor_field: ActionEditorField, // Current field in editor view
     confirm_selected: bool,         // Yes (true) or No (false) in confirm dialog
     scroll_offset: usize,           // Scroll offset for action list
+    list_visible_height: usize,     // Number of visible items in list (updated during render)
     // Filter state
     filter: String,                 // Filter text for action list
     filter_cursor: usize,           // Cursor position in filter
@@ -2468,6 +2549,7 @@ impl ActionsPopup {
             editor_field: ActionEditorField::Name,
             confirm_selected: false,
             scroll_offset: 0,
+            list_visible_height: 10, // Default, updated during render
             filter: String::new(),
             filter_cursor: 0,
             filter_editing: false,
@@ -2790,7 +2872,11 @@ impl ActionsPopup {
             ActionEditorField::CancelButton => ActionEditorField::Name,
         };
         self.cursor_pos = self.current_field_text().len();
-        self.edit_scroll_offset = 0; // Reset scroll when switching fields
+        // Scroll to show end of text when cursor is at end
+        // Approximate visible width: popup is 60 chars, field area is ~44 chars, minus indicators = ~40
+        let text_len = self.current_field_text().chars().count();
+        let visible_width = 40;
+        self.edit_scroll_offset = text_len.saturating_sub(visible_width);
     }
 
     fn prev_editor_field(&mut self) {
@@ -2805,7 +2891,10 @@ impl ActionsPopup {
             ActionEditorField::CancelButton => ActionEditorField::SaveButton,
         };
         self.cursor_pos = self.current_field_text().len();
-        self.edit_scroll_offset = 0; // Reset scroll when switching fields
+        // Scroll to show end of text when cursor is at end
+        let text_len = self.current_field_text().chars().count();
+        let visible_width = 40;
+        self.edit_scroll_offset = text_len.saturating_sub(visible_width);
     }
 
     fn select_prev_action(&mut self) {
@@ -2822,9 +2911,10 @@ impl ActionsPopup {
             // Not in filtered list, select last item
             self.selected_index = indices[indices.len() - 1];
         }
-        // Update scroll offset to keep selection visible
+        // Only scroll when selection moves above visible viewport
         if let Some(pos) = indices.iter().position(|&i| i == self.selected_index) {
             if pos < self.scroll_offset {
+                // Selection is above viewport, scroll up by one line
                 self.scroll_offset = pos;
             }
         }
@@ -2844,11 +2934,11 @@ impl ActionsPopup {
             // Not in filtered list, select first item
             self.selected_index = indices[0];
         }
-        // Update scroll offset to keep selection visible (assuming 5 visible items)
-        let visible_items = 5;
+        // Only scroll when selection moves below visible viewport
         if let Some(pos) = indices.iter().position(|&i| i == self.selected_index) {
-            if pos >= self.scroll_offset + visible_items {
-                self.scroll_offset = pos - visible_items + 1;
+            if pos >= self.scroll_offset + self.list_visible_height {
+                // Selection is below viewport, scroll down by one line
+                self.scroll_offset = pos - self.list_visible_height + 1;
             }
         }
     }
@@ -3577,6 +3667,8 @@ struct ActionTriggerResult {
 
 /// Convert a wildcard pattern (* and ?) to a regex pattern
 /// Supports \* and \? to match literal asterisk and question mark
+/// Normalizes quotes: any double quote matches all double quote variants,
+/// any single quote matches all single quote variants
 fn wildcard_to_regex(pattern: &str) -> String {
     // Wildcard patterns must match the entire line (anchored at start and end)
     let mut regex = String::with_capacity(pattern.len() * 2 + 2);
@@ -3601,6 +3693,14 @@ fn wildcard_to_regex(pattern: &str) -> String {
             }
             '*' => regex.push_str(".*"),
             '?' => regex.push('.'),
+            // Normalize double quotes: " (U+0022), " (U+201C), " (U+201D)
+            '"' | '\u{201C}' | '\u{201D}' => {
+                regex.push_str("[\"\u{201C}\u{201D}]");
+            }
+            // Normalize single quotes: ' (U+0027), ' (U+2018), ' (U+2019)
+            '\'' | '\u{2018}' | '\u{2019}' => {
+                regex.push_str("['\u{2018}\u{2019}]");
+            }
             // Escape regex special characters
             '.' | '+' | '^' | '$' | '|' | '(' | ')' | '[' | ']' | '{' | '}' => {
                 regex.push('\\');
@@ -18464,6 +18564,14 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                             app.ws_broadcast(WsMessage::ServerData { world_index, data: format!("[{}] {}{}", i, w.name, current), is_viewed: false, ts });
                                             app.ws_broadcast(WsMessage::ServerData { world_index, data: format!("  unseen_lines: {}, pending: {}, has_activity: {}", w.unseen_lines, w.pending_lines.len(), w.has_activity()), is_viewed: false, ts });
                                         }
+                                        // Debug action patterns
+                                        app.ws_broadcast(WsMessage::ServerData { world_index, data: "=== Actions ===".to_string(), is_viewed: false, ts });
+                                        for (i, action) in app.settings.actions.iter().enumerate() {
+                                            app.ws_broadcast(WsMessage::ServerData { world_index, data: format!("[{}] {} ({})", i, action.name, action.match_type.as_str()), is_viewed: false, ts });
+                                            let pattern_bytes: Vec<String> = action.pattern.bytes().map(|b| format!("{:02x}", b)).collect();
+                                            app.ws_broadcast(WsMessage::ServerData { world_index, data: format!("  pattern: {:?}", action.pattern), is_viewed: false, ts });
+                                            app.ws_broadcast(WsMessage::ServerData { world_index, data: format!("  bytes: {}", pattern_bytes.join(" ")), is_viewed: false, ts });
+                                        }
                                         app.ws_broadcast(WsMessage::ServerData { world_index, data: "=== End Debug ===".to_string(), is_viewed: false, ts });
                                     }
                                     Command::Dump => {
@@ -20336,8 +20444,16 @@ fn handle_key_event(key: KeyEvent, app: &mut App) -> KeyAction {
     // Handle help popup input
     if app.help_popup.visible {
         match key.code {
-            KeyCode::Esc | KeyCode::Enter => {
+            KeyCode::Esc => {
                 app.help_popup.close();
+            }
+            KeyCode::Enter => {
+                // Close popup (Enter always closes, regardless of button state)
+                app.help_popup.close();
+            }
+            KeyCode::Char('o') | KeyCode::Char('O') => {
+                // Shortcut for Ok button - just highlight it, Enter to activate
+                app.help_popup.button_selected = true;
             }
             KeyCode::Up => {
                 app.help_popup.scroll_up();
@@ -20474,7 +20590,7 @@ fn handle_key_event(key: KeyEvent, app: &mut App) -> KeyAction {
                             ActionEditorField::Name | ActionEditorField::World |
                             ActionEditorField::Pattern => {
                                 app.actions_popup.move_cursor_left();
-                                app.actions_popup.adjust_scroll(44); // field_width for 60-char popup
+                                app.actions_popup.adjust_scroll(40); // visible_width = field_width - 4 (for scroll indicators and brackets)
                             }
                             ActionEditorField::Command => {
                                 app.actions_popup.move_cursor_left();
@@ -20499,7 +20615,7 @@ fn handle_key_event(key: KeyEvent, app: &mut App) -> KeyAction {
                             ActionEditorField::Name | ActionEditorField::World |
                             ActionEditorField::Pattern => {
                                 app.actions_popup.move_cursor_right();
-                                app.actions_popup.adjust_scroll(44); // field_width for 60-char popup
+                                app.actions_popup.adjust_scroll(40); // visible_width = field_width - 4 (for scroll indicators and brackets)
                             }
                             ActionEditorField::Command => {
                                 app.actions_popup.move_cursor_right();
@@ -20576,7 +20692,7 @@ fn handle_key_event(key: KeyEvent, app: &mut App) -> KeyAction {
                             ActionEditorField::Name | ActionEditorField::World |
                             ActionEditorField::Pattern => {
                                 app.actions_popup.insert_char(c);
-                                app.actions_popup.adjust_scroll(44); // field_width for 60-char popup
+                                app.actions_popup.adjust_scroll(40); // visible_width = field_width - 4 (for scroll indicators and brackets)
                             }
                             ActionEditorField::Command => {
                                 app.actions_popup.insert_char(c);
@@ -20586,12 +20702,32 @@ fn handle_key_event(key: KeyEvent, app: &mut App) -> KeyAction {
                                 // Space toggles match type
                                 if c == ' ' {
                                     app.actions_popup.edit_match_type = app.actions_popup.edit_match_type.next();
+                                } else if c == 's' || c == 'S' {
+                                    // Shortcut for Save button
+                                    app.actions_popup.editor_field = ActionEditorField::SaveButton;
+                                } else if c == 'c' || c == 'C' {
+                                    // Shortcut for Cancel button
+                                    app.actions_popup.editor_field = ActionEditorField::CancelButton;
                                 }
                             }
                             ActionEditorField::Enabled => {
                                 // Space toggles enabled
                                 if c == ' ' {
                                     app.actions_popup.edit_enabled = !app.actions_popup.edit_enabled;
+                                } else if c == 's' || c == 'S' {
+                                    // Shortcut for Save button
+                                    app.actions_popup.editor_field = ActionEditorField::SaveButton;
+                                } else if c == 'c' || c == 'C' {
+                                    // Shortcut for Cancel button
+                                    app.actions_popup.editor_field = ActionEditorField::CancelButton;
+                                }
+                            }
+                            ActionEditorField::SaveButton | ActionEditorField::CancelButton => {
+                                // Allow shortcuts on button fields
+                                if c == 's' || c == 'S' {
+                                    app.actions_popup.editor_field = ActionEditorField::SaveButton;
+                                } else if c == 'c' || c == 'C' {
+                                    app.actions_popup.editor_field = ActionEditorField::CancelButton;
                                 }
                             }
                             _ => {}
@@ -20653,9 +20789,21 @@ fn handle_key_event(key: KeyEvent, app: &mut App) -> KeyAction {
                             app.actions_popup.filter_cursor = app.actions_popup.filter.len();
                         }
                         KeyCode::Up => {
+                            // Calculate visible list height
+                            let screen_height = (app.output_height + app.input_height + 1) as usize;
+                            let popup_chrome = 8;
+                            let max_list = screen_height.saturating_sub(popup_chrome + 4);
+                            let filtered_count = app.actions_popup.filtered_indices().len();
+                            app.actions_popup.list_visible_height = filtered_count.max(3).min(max_list).max(3);
                             app.actions_popup.select_prev_action();
                         }
                         KeyCode::Down => {
+                            // Calculate visible list height
+                            let screen_height = (app.output_height + app.input_height + 1) as usize;
+                            let popup_chrome = 8;
+                            let max_list = screen_height.saturating_sub(popup_chrome + 4);
+                            let filtered_count = app.actions_popup.filtered_indices().len();
+                            app.actions_popup.list_visible_height = filtered_count.max(3).min(max_list).max(3);
                             app.actions_popup.select_next_action();
                         }
                         KeyCode::Char(c) => {
@@ -20685,6 +20833,12 @@ fn handle_key_event(key: KeyEvent, app: &mut App) -> KeyAction {
                         }
                         KeyCode::Up => {
                             if app.actions_popup.list_field == ActionListField::List {
+                                // Calculate visible list height based on terminal size
+                                let screen_height = (app.output_height + app.input_height + 1) as usize;
+                                let popup_chrome = 8; // border + filter + header + buttons + spacing
+                                let max_list = screen_height.saturating_sub(popup_chrome + 4);
+                                let filtered_count = app.actions_popup.filtered_indices().len();
+                                app.actions_popup.list_visible_height = filtered_count.max(3).min(max_list).max(3);
                                 app.actions_popup.select_prev_action();
                             } else {
                                 app.actions_popup.list_field = ActionListField::List;
@@ -20692,6 +20846,12 @@ fn handle_key_event(key: KeyEvent, app: &mut App) -> KeyAction {
                         }
                         KeyCode::Down => {
                             if app.actions_popup.list_field == ActionListField::List {
+                                // Calculate visible list height based on terminal size
+                                let screen_height = (app.output_height + app.input_height + 1) as usize;
+                                let popup_chrome = 8; // border + filter + header + buttons + spacing
+                                let max_list = screen_height.saturating_sub(popup_chrome + 4);
+                                let filtered_count = app.actions_popup.filtered_indices().len();
+                                app.actions_popup.list_visible_height = filtered_count.max(3).min(max_list).max(3);
                                 app.actions_popup.select_next_action();
                             } else {
                                 app.actions_popup.list_field = ActionListField::List;
@@ -20759,8 +20919,24 @@ fn handle_key_event(key: KeyEvent, app: &mut App) -> KeyAction {
                                 app.actions_popup.start_filter_edit();
                             }
                         }
+                        KeyCode::Char('a') | KeyCode::Char('A') => {
+                            // Shortcut for Add button
+                            app.actions_popup.list_field = ActionListField::AddButton;
+                        }
+                        KeyCode::Char('e') | KeyCode::Char('E') => {
+                            // Shortcut for Edit button
+                            app.actions_popup.list_field = ActionListField::EditButton;
+                        }
+                        KeyCode::Char('d') | KeyCode::Char('D') => {
+                            // Shortcut for Delete button
+                            app.actions_popup.list_field = ActionListField::DeleteButton;
+                        }
+                        KeyCode::Char('o') | KeyCode::Char('O') => {
+                            // Shortcut for Ok button
+                            app.actions_popup.list_field = ActionListField::CancelButton;
+                        }
                         KeyCode::Char(c) => {
-                            // Start filtering when typing in list
+                            // Start filtering when typing in list (only for non-shortcut keys)
                             if app.actions_popup.list_field == ActionListField::List {
                                 app.actions_popup.start_filter_edit();
                                 app.actions_popup.filter.push(c);
@@ -21176,6 +21352,34 @@ fn handle_key_event(key: KeyEvent, app: &mut App) -> KeyAction {
                         app.add_output("Settings saved");
                     }
                 }
+                KeyCode::Char('s') | KeyCode::Char('S') => {
+                    // Shortcut for Save button
+                    if app.settings_popup.setup_mode {
+                        app.settings_popup.selected_field = SettingsField::SaveSetup;
+                    } else {
+                        app.settings_popup.selected_field = SettingsField::SaveWorld;
+                    }
+                }
+                KeyCode::Char('c') | KeyCode::Char('C') => {
+                    // Shortcut for Cancel button
+                    if app.settings_popup.setup_mode {
+                        app.settings_popup.selected_field = SettingsField::CancelSetup;
+                    } else {
+                        app.settings_popup.selected_field = SettingsField::CancelWorld;
+                    }
+                }
+                KeyCode::Char('d') | KeyCode::Char('D') => {
+                    // Shortcut for Delete button (world mode only)
+                    if !app.settings_popup.setup_mode {
+                        app.settings_popup.selected_field = SettingsField::DeleteWorld;
+                    }
+                }
+                KeyCode::Char('o') | KeyCode::Char('O') => {
+                    // Shortcut for Connect button (world mode only, 'O' since 'C' is for Cancel)
+                    if !app.settings_popup.setup_mode {
+                        app.settings_popup.selected_field = SettingsField::Connect;
+                    }
+                }
                 KeyCode::Char(c) => {
                     // Start editing on any character for text fields
                     if app.settings_popup.selected_field.is_text_field() {
@@ -21282,38 +21486,28 @@ fn handle_key_event(key: KeyEvent, app: &mut App) -> KeyAction {
                     }
                 }
                 KeyCode::Up => {
-                    if app.web_popup.selected_field.is_button() {
-                        app.web_popup.selected_field = match app.web_popup.selected_field {
-                            WebField::SaveWeb => WebField::CancelWeb,
-                            WebField::CancelWeb => WebField::SaveWeb,
-                            other => other,
-                        };
-                    } else {
-                        app.web_popup.prev_field();
+                    // Navigate up without wrapping
+                    if app.web_popup.prev_field_no_wrap() {
                         if app.web_popup.selected_field.is_text_field() {
                             app.web_popup.start_edit();
                         }
                     }
                 }
                 KeyCode::Down => {
-                    if app.web_popup.selected_field.is_button() {
-                        app.web_popup.selected_field = match app.web_popup.selected_field {
-                            WebField::SaveWeb => WebField::CancelWeb,
-                            WebField::CancelWeb => WebField::SaveWeb,
-                            other => other,
-                        };
-                    } else {
-                        app.web_popup.next_field();
+                    // Navigate down without wrapping
+                    if app.web_popup.next_field_no_wrap() {
                         if app.web_popup.selected_field.is_text_field() {
                             app.web_popup.start_edit();
                         }
                     }
                 }
                 KeyCode::Tab => {
-                    app.web_popup.next_field();
-                    if app.web_popup.selected_field.is_text_field() {
-                        app.web_popup.start_edit();
-                    }
+                    // Tab cycles through buttons only
+                    app.web_popup.next_button();
+                }
+                KeyCode::BackTab => {
+                    // Shift+Tab cycles through buttons in reverse
+                    app.web_popup.prev_button();
                 }
                 KeyCode::Left | KeyCode::Right => {
                     if app.web_popup.selected_field.is_button() {
@@ -21343,6 +21537,14 @@ fn handle_key_event(key: KeyEvent, app: &mut App) -> KeyAction {
                         app.add_output("Web settings saved");
                     }
                     return KeyAction::UpdateWebSocket;
+                }
+                KeyCode::Char('s') | KeyCode::Char('S') => {
+                    // Shortcut for Save button
+                    app.web_popup.selected_field = WebField::SaveWeb;
+                }
+                KeyCode::Char('c') | KeyCode::Char('C') => {
+                    // Shortcut for Cancel button
+                    app.web_popup.selected_field = WebField::CancelWeb;
                 }
                 KeyCode::Char(c) => {
                     if app.web_popup.selected_field.is_text_field() {
@@ -23431,6 +23633,19 @@ async fn handle_command(cmd: &str, app: &mut App, event_tx: mpsc::Sender<AppEven
                     debug_lines.push(format!("  pending_since: {:?} ago", pending_since.elapsed()));
                 }
             }
+
+            // Debug action patterns
+            debug_lines.push(String::new());
+            debug_lines.push("=== Actions ===".to_string());
+            for (i, action) in app.settings.actions.iter().enumerate() {
+                debug_lines.push(format!("[{}] {} ({})", i, action.name, action.match_type.as_str()));
+                // Show pattern with raw bytes for debugging
+                let pattern_bytes: Vec<String> = action.pattern.bytes()
+                    .map(|b| format!("{:02x}", b))
+                    .collect();
+                debug_lines.push(format!("  pattern: {:?}", action.pattern));
+                debug_lines.push(format!("  bytes: {}", pattern_bytes.join(" ")));
+            }
             debug_lines.push("=== End Debug ===".to_string());
 
             for line in debug_lines {
@@ -24794,10 +25009,29 @@ fn render_settings_popup(f: &mut Frame, app: &App) {
         ])
     };
 
-    // Helper to render a button
-    let render_button = |label: &str, field: SettingsField| -> Span<'static> {
+    // Helper to render a button with highlighted shortcut letter (black on white)
+    // shortcut_pos: 0 = first letter (default), 1+ = that character position
+    let render_button = |label: &str, field: SettingsField, shortcut_pos: usize| -> Vec<Span<'static>> {
         let style = field_style(field);
-        Span::styled(format!("[ {} ]", label), style)
+        let is_selected = field == popup.selected_field;
+        let shortcut_style = if is_selected {
+            Style::default().fg(Color::Black).bg(theme.button_selected_bg()).add_modifier(Modifier::BOLD | Modifier::UNDERLINED)
+        } else {
+            Style::default().fg(Color::Black).bg(Color::White).add_modifier(Modifier::UNDERLINED)
+        };
+
+        let chars: Vec<char> = label.chars().collect();
+        let before: String = chars.iter().take(shortcut_pos).collect();
+        let shortcut_char = chars.get(shortcut_pos).copied().unwrap_or(' ');
+        let after: String = chars.iter().skip(shortcut_pos + 1).collect();
+
+        vec![
+            Span::styled("[ ", style),
+            Span::styled(before, style),
+            Span::styled(shortcut_char.to_string(), shortcut_style),
+            Span::styled(after, style),
+            Span::styled(" ]", style),
+        ]
     };
 
     let (lines, title) = if popup.setup_mode {
@@ -24832,12 +25066,14 @@ fn render_settings_popup(f: &mut Frame, app: &App) {
             ]),
             render_toggle_field("TLS Proxy:", popup.temp_tls_proxy_enabled, SettingsField::TLSProxy, w),
             Line::from(""),
-            Line::from(vec![
-                render_button("Save", SettingsField::SaveSetup),
-                Span::raw("  "),
-                render_button("Cancel", SettingsField::CancelSetup),
-                Span::raw(" "),
-            ]).alignment(Alignment::Right),
+            {
+                let mut spans = Vec::new();
+                spans.extend(render_button("Save", SettingsField::SaveSetup, 0));
+                spans.push(Span::raw("  "));
+                spans.extend(render_button("Cancel", SettingsField::CancelSetup, 0));
+                spans.push(Span::raw(" "));
+                Line::from(spans).alignment(Alignment::Right)
+            },
         ];
         (lines, " Global Settings ")
     } else {
@@ -24921,16 +25157,18 @@ fn render_settings_popup(f: &mut Frame, app: &App) {
         }
 
         lines.push(Line::from(""));
-        lines.push(Line::from(vec![
-            render_button("Save", SettingsField::SaveWorld),
-            Span::raw(" "),
-            render_button("Cancel", SettingsField::CancelWorld),
-            Span::raw(" "),
-            render_button("Delete", SettingsField::DeleteWorld),
-            Span::raw(" "),
-            render_button(connect_text, SettingsField::Connect),
-            Span::raw(" "),
-        ]).alignment(Alignment::Right));
+        {
+            let mut spans = Vec::new();
+            spans.extend(render_button("Save", SettingsField::SaveWorld, 0));
+            spans.push(Span::raw(" "));
+            spans.extend(render_button("Cancel", SettingsField::CancelWorld, 0));
+            spans.push(Span::raw(" "));
+            spans.extend(render_button("Delete", SettingsField::DeleteWorld, 0));
+            spans.push(Span::raw(" "));
+            spans.extend(render_button(connect_text, SettingsField::Connect, 1));
+            spans.push(Span::raw(" "));
+            lines.push(Line::from(spans).alignment(Alignment::Right));
+        }
         (lines, " World Settings ")
     };
 
@@ -25051,10 +25289,23 @@ fn render_web_popup(f: &mut Frame, app: &App) {
         ])
     };
 
-    // Helper to render a button
-    let render_button = |label: &str, field: WebField| -> Span<'static> {
+    // Helper to render a button with highlighted first letter (shortcut key in black on white)
+    let render_button = |label: &str, field: WebField| -> Vec<Span<'static>> {
         let style = field_style(field);
-        Span::styled(format!("[ {} ]", label), style)
+        let is_selected = field == popup.selected_field;
+        let first_char = label.chars().next().unwrap_or(' ');
+        let rest: String = label.chars().skip(1).collect();
+        let shortcut_style = if is_selected {
+            Style::default().fg(Color::Black).bg(theme.button_selected_bg()).add_modifier(Modifier::BOLD | Modifier::UNDERLINED)
+        } else {
+            Style::default().fg(Color::Black).bg(Color::White).add_modifier(Modifier::UNDERLINED)
+        };
+        vec![
+            Span::styled("[ ", style),
+            Span::styled(first_char.to_string(), shortcut_style),
+            Span::styled(rest, style),
+            Span::styled(" ]", style),
+        ]
     };
 
     let w = label_width;
@@ -25099,12 +25350,14 @@ fn render_web_popup(f: &mut Frame, app: &App) {
     }
 
     lines.push(Line::from(""));
-    lines.push(Line::from(vec![
-        render_button("Save", WebField::SaveWeb),
-        Span::raw("  "),
-        render_button("Cancel", WebField::CancelWeb),
-        Span::raw(" "),
-    ]).alignment(Alignment::Right));
+    {
+        let mut spans = Vec::new();
+        spans.extend(render_button("Save", WebField::SaveWeb));
+        spans.push(Span::raw("  "));
+        spans.extend(render_button("Cancel", WebField::CancelWeb));
+        spans.push(Span::raw(" "));
+        lines.push(Line::from(spans).alignment(Alignment::Right));
+    }
 
     // Calculate dynamic size
     let max_content_width = lines.iter().map(|line| {
@@ -25284,6 +25537,36 @@ fn render_filter_popup(f: &mut Frame, app: &App) {
     f.render_widget(popup_text, popup_area);
 }
 
+/// Simple word wrap for help text
+fn simple_word_wrap(text: &str, max_width: usize) -> Vec<String> {
+    if text.chars().count() <= max_width {
+        return vec![text.to_string()];
+    }
+
+    let mut result = Vec::new();
+    let mut current_line = String::new();
+
+    for word in text.split_whitespace() {
+        let current_len = current_line.chars().count();
+        let word_len = word.chars().count();
+
+        if current_len + word_len + 1 <= max_width || current_len == 0 {
+            if !current_line.is_empty() {
+                current_line.push(' ');
+            }
+            current_line.push_str(word);
+        } else {
+            result.push(current_line);
+            current_line = word.to_string();
+        }
+    }
+    if !current_line.is_empty() {
+        result.push(current_line);
+    }
+
+    result
+}
+
 fn render_help_popup(f: &mut Frame, app: &App) {
     if !app.help_popup.visible {
         return;
@@ -25293,8 +25576,8 @@ fn render_help_popup(f: &mut Frame, app: &App) {
     let help = &app.help_popup;
     let theme = app.settings.theme;
 
-    // Centered popup - wider to fit longest help lines
-    let popup_width = 60u16.min(area.width.saturating_sub(4));
+    // Centered popup - 90% of terminal width
+    let popup_width = ((area.width as f32 * 0.9) as u16).min(area.width.saturating_sub(4));
     let popup_height = 20u16.min(area.height.saturating_sub(4)).max(10);
 
     let x = area.width.saturating_sub(popup_width) / 2;
@@ -25307,33 +25590,158 @@ fn render_help_popup(f: &mut Frame, app: &App) {
 
     // Calculate visible height for content (popup height - 2 borders - 1 blank line - 1 button line)
     let visible_height = (popup_height as usize).saturating_sub(4);
+    let inner_width = (popup_width as usize).saturating_sub(4); // -2 for borders, -2 for scrollbar
 
-    // Build lines from help content with scrolling
+    // Word wrap help lines to fit inner_width
+    // Detect two-column format: leading spaces + command/key + multiple spaces + description
+    let wrapped_lines: Vec<String> = help.lines.iter().flat_map(|line| {
+        let line_len = line.chars().count();
+        if line_len <= inner_width || line.is_empty() {
+            return vec![line.to_string()];
+        }
+
+        // Try to find the description column (after multiple consecutive spaces)
+        let chars: Vec<char> = line.chars().collect();
+        let mut desc_start = None;
+        let mut space_count = 0;
+        for (i, &c) in chars.iter().enumerate() {
+            if c == ' ' {
+                space_count += 1;
+                if space_count >= 2 && i + 1 < chars.len() && chars[i + 1] != ' ' {
+                    // Found transition from multiple spaces to non-space
+                    desc_start = Some(i + 1);
+                    break;
+                }
+            } else {
+                space_count = 0;
+            }
+        }
+
+        if let Some(desc_idx) = desc_start {
+            // Two-column format: wrap description keeping left column alignment
+            let left_part: String = chars[..desc_idx].iter().collect();
+            let desc_part: String = chars[desc_idx..].iter().collect();
+            let indent: String = " ".repeat(desc_idx);
+            let desc_width = inner_width.saturating_sub(desc_idx);
+
+            if desc_width < 10 {
+                // Not enough room for description column, just use simple wrap
+                return simple_word_wrap(line, inner_width);
+            }
+
+            let mut result = Vec::new();
+            let words: Vec<&str> = desc_part.split_whitespace().collect();
+            let mut current_line = left_part;
+
+            for word in words {
+                let current_desc_len = current_line.chars().count().saturating_sub(desc_idx);
+                let word_len = word.chars().count();
+
+                if current_desc_len + word_len + 1 <= desc_width || current_desc_len == 0 {
+                    // Fits on current line
+                    if current_desc_len > 0 {
+                        current_line.push(' ');
+                    }
+                    current_line.push_str(word);
+                } else {
+                    // Start new line with indent
+                    result.push(current_line);
+                    current_line = format!("{}{}", indent, word);
+                }
+            }
+            if !current_line.trim().is_empty() {
+                result.push(current_line);
+            }
+            result
+        } else {
+            // Not two-column format, simple wrap
+            simple_word_wrap(line, inner_width)
+        }
+    }).collect();
+
+    let total_items = wrapped_lines.len();
+
+    // Calculate scrollbar characters
+    let scrollbar_chars: Vec<char> = if total_items <= visible_height {
+        // No scrolling needed - show empty track
+        vec!['│'; visible_height]
+    } else {
+        // Calculate thumb size and position
+        let thumb_size = ((visible_height as f64 / total_items as f64) * visible_height as f64).max(1.0) as usize;
+        let thumb_size = thumb_size.max(1).min(visible_height);
+        let scroll_range = total_items.saturating_sub(visible_height);
+        let thumb_pos = if scroll_range > 0 {
+            ((help.scroll_offset as f64 / scroll_range as f64) * (visible_height - thumb_size) as f64) as usize
+        } else {
+            0
+        };
+        let thumb_pos = thumb_pos.min(visible_height - thumb_size);
+
+        (0..visible_height).map(|i| {
+            if i >= thumb_pos && i < thumb_pos + thumb_size {
+                '█' // Thumb
+            } else {
+                '│' // Track
+            }
+        }).collect()
+    };
+
+    // Build lines from wrapped help content with scrolling
     let mut lines: Vec<Line<'static>> = Vec::new();
 
-    for line in help.lines.iter().skip(help.scroll_offset).take(visible_height) {
-        lines.push(Line::from(Span::styled(*line, Style::default().fg(theme.fg()))));
+    for (i, line) in wrapped_lines.iter().skip(help.scroll_offset).take(visible_height).enumerate() {
+        let scrollbar_char = scrollbar_chars.get(i).copied().unwrap_or('│');
+        let line_chars = line.chars().count();
+        let padding = inner_width.saturating_sub(line_chars);
+        lines.push(Line::from(vec![
+            Span::styled(line.clone(), Style::default().fg(theme.fg())),
+            Span::raw(" ".repeat(padding)),
+            Span::styled(format!(" {}", scrollbar_char), Style::default().fg(theme.fg_dim())),
+        ]));
     }
 
-    // Pad if needed
-    while lines.len() < visible_height {
-        lines.push(Line::from(""));
+    // Pad remaining lines with scrollbar
+    for i in lines.len()..visible_height {
+        let scrollbar_char = scrollbar_chars.get(i).copied().unwrap_or('│');
+        lines.push(Line::from(vec![
+            Span::raw(" ".repeat(inner_width)),
+            Span::styled(format!(" {}", scrollbar_char), Style::default().fg(theme.fg_dim())),
+        ]));
     }
 
     // Blank line before button
     lines.push(Line::from(""));
 
-    // OK button (always highlighted since it's the only option)
-    let ok_style = Style::default()
-        .fg(theme.button_selected_fg())
-        .bg(theme.button_selected_bg())
-        .add_modifier(Modifier::BOLD);
+    // Ok button with highlighted shortcut key
+    // When selected (after pressing 'O'), show with selected background
+    let (button_style, shortcut_style) = if help.button_selected {
+        (
+            Style::default()
+                .fg(theme.button_selected_fg())
+                .bg(theme.button_selected_bg())
+                .add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(Color::Black)
+                .bg(theme.button_selected_bg())
+                .add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
+        )
+    } else {
+        (
+            Style::default().fg(theme.fg()),
+            Style::default()
+                .fg(Color::Black)
+                .bg(Color::White)
+                .add_modifier(Modifier::UNDERLINED),
+        )
+    };
     lines.push(Line::from(vec![
-        Span::styled("[ OK ]", ok_style),
+        Span::styled("[ ", button_style),
+        Span::styled("O", shortcut_style),
+        Span::styled("k ]", button_style),
     ]).alignment(Alignment::Center));
 
     let popup_block = Block::default()
-        .title(" Help ")
+        .title(Span::styled(" Help ", Style::default().fg(Color::Black).add_modifier(Modifier::BOLD)))
         .borders(Borders::ALL)
         .border_style(Style::default().fg(theme.popup_border()))
         .style(Style::default().bg(theme.popup_bg()));
@@ -25769,16 +26177,18 @@ fn render_actions_popup(f: &mut Frame, app: &App) {
             lines.push(Line::from(""));
 
             // Header row - highlighted with column names aligned to data columns
-            let header_style = Style::default().fg(theme.fg()).bg(theme.button_selected_bg()).add_modifier(Modifier::BOLD);
-            let name_header = format!("{:width$}", "Name", width = name_col_width);
+            // Add 2-space prefix (not highlighted), then highlighted header content
+            let header_style = Style::default().fg(Color::Black).bg(theme.button_selected_bg()).add_modifier(Modifier::BOLD);
+            let name_header = format!("{:width$}", "Name", width = name_col_width - 2); // -2 because we add prefix separately
             let world_header = format!("{:width$}", "World", width = world_col_width);
             let pattern_header = "Pattern";
             let header_line = format!("{}  {}  {}", name_header, world_header, pattern_header);
-            let header_padding = inner_width.saturating_sub(header_line.chars().count() + 2);
+            let header_padding = inner_width.saturating_sub(header_line.chars().count() + 4); // +4 for prefix and suffix
             lines.push(Line::from(vec![
+                Span::raw("  "), // 2-space prefix (not highlighted)
                 Span::styled(header_line, header_style),
                 Span::styled(" ".repeat(header_padding), header_style),
-                Span::raw("  "),
+                Span::styled("  ", header_style), // 2 extra highlighted chars at end
             ]));
 
             // Use scroll_offset directly - scrolling only happens when user tries to move past visible area
@@ -25873,29 +26283,44 @@ fn render_actions_popup(f: &mut Frame, app: &App) {
 
             lines.push(Line::from(""));
 
-            // Buttons row - right justified
-            let add_style = if popup.list_field == ActionListField::AddButton { button_selected_style } else { button_style };
-            let edit_style = if popup.list_field == ActionListField::EditButton { button_selected_style } else { button_style };
-            let del_style = if popup.list_field == ActionListField::DeleteButton { button_selected_style } else { button_style };
-            let cancel_style = if popup.list_field == ActionListField::CancelButton { button_selected_style } else { button_style };
+            // Buttons row - right justified with first letter highlighted as shortcut
+            let add_selected = popup.list_field == ActionListField::AddButton;
+            let edit_selected = popup.list_field == ActionListField::EditButton;
+            let del_selected = popup.list_field == ActionListField::DeleteButton;
+            let ok_selected = popup.list_field == ActionListField::CancelButton;
+
+            // Helper to create button with highlighted first letter (shortcut key in black on white)
+            let make_button = |first: &str, rest: &str, selected: bool| -> Vec<Span<'static>> {
+                let base_style = if selected { button_selected_style } else { button_style };
+                let shortcut_style = if selected {
+                    Style::default().fg(Color::Black).bg(theme.button_selected_bg()).add_modifier(Modifier::BOLD | Modifier::UNDERLINED)
+                } else {
+                    Style::default().fg(Color::Black).bg(Color::White).add_modifier(Modifier::UNDERLINED)
+                };
+                vec![
+                    Span::styled("[ ", base_style),
+                    Span::styled(first.to_string(), shortcut_style),
+                    Span::styled(rest.to_string(), base_style),
+                    Span::styled(" ]", base_style),
+                ]
+            };
 
             // Calculate button widths: "[ Add ]" (7) + " " (1) + "[ Edit ]" (8) + " " (1) + "[ Delete ]" (10) + " " (1) + "[ Ok ]" (6) = 34
             let buttons_width = 34;
             let buttons_padding = inner_width.saturating_sub(buttons_width);
 
-            lines.push(Line::from(vec![
-                Span::raw(" ".repeat(buttons_padding)),
-                Span::styled("[ Add ]", add_style),
-                Span::raw(" "),
-                Span::styled("[ Edit ]", edit_style),
-                Span::raw(" "),
-                Span::styled("[ Delete ]", del_style),
-                Span::raw(" "),
-                Span::styled("[ Ok ]", cancel_style),
-            ]));
+            let mut button_spans = vec![Span::raw(" ".repeat(buttons_padding))];
+            button_spans.extend(make_button("A", "dd", add_selected));
+            button_spans.push(Span::raw(" "));
+            button_spans.extend(make_button("E", "dit", edit_selected));
+            button_spans.push(Span::raw(" "));
+            button_spans.extend(make_button("D", "elete", del_selected));
+            button_spans.push(Span::raw(" "));
+            button_spans.extend(make_button("O", "k", ok_selected));
+            lines.push(Line::from(button_spans));
 
             let popup_block = Block::default()
-                .title(" Actions ")
+                .title(Span::styled(" Actions ", Style::default().fg(Color::Black).add_modifier(Modifier::BOLD)))
                 .borders(Borders::ALL)
                 .border_style(Style::default().fg(theme.popup_border()))
                 .style(Style::default().bg(theme.popup_bg()));
@@ -26096,19 +26521,35 @@ fn render_actions_popup(f: &mut Frame, app: &App) {
                 lines.push(Line::from(""));
             }
 
-            // Buttons row
-            let save_style = if popup.editor_field == ActionEditorField::SaveButton { button_selected_style } else { button_style };
-            let cancel_style = if popup.editor_field == ActionEditorField::CancelButton { button_selected_style } else { button_style };
+            // Buttons row with highlighted shortcut keys
+            let save_selected = popup.editor_field == ActionEditorField::SaveButton;
+            let cancel_selected = popup.editor_field == ActionEditorField::CancelButton;
 
-            lines.push(Line::from(vec![
-                Span::styled("[ Save ]", save_style),
-                Span::raw("  "),
-                Span::styled("[ Cancel ]", cancel_style),
-            ]));
+            // Helper to create button with highlighted first letter (shortcut key in black on white)
+            let make_editor_button = |first: &str, rest: &str, selected: bool| -> Vec<Span<'static>> {
+                let base_style = if selected { button_selected_style } else { button_style };
+                let shortcut_style = if selected {
+                    Style::default().fg(Color::Black).bg(theme.button_selected_bg()).add_modifier(Modifier::BOLD | Modifier::UNDERLINED)
+                } else {
+                    Style::default().fg(Color::Black).bg(Color::White).add_modifier(Modifier::UNDERLINED)
+                };
+                vec![
+                    Span::styled("[ ", base_style),
+                    Span::styled(first.to_string(), shortcut_style),
+                    Span::styled(rest.to_string(), base_style),
+                    Span::styled(" ]", base_style),
+                ]
+            };
+
+            let mut button_spans = Vec::new();
+            button_spans.extend(make_editor_button("S", "ave", save_selected));
+            button_spans.push(Span::raw("  "));
+            button_spans.extend(make_editor_button("C", "ancel", cancel_selected));
+            lines.push(Line::from(button_spans));
 
             let title = if popup.editing_index.is_some() { " Edit Action " } else { " New Action " };
             let popup_block = Block::default()
-                .title(title)
+                .title(Span::styled(title, Style::default().fg(Color::Black).add_modifier(Modifier::BOLD)))
                 .borders(Borders::ALL)
                 .border_style(Style::default().fg(theme.popup_border()))
                 .style(Style::default().bg(theme.popup_bg()));
@@ -26132,8 +26573,31 @@ fn render_actions_popup(f: &mut Frame, app: &App) {
                 .map(|a| a.name.as_str())
                 .unwrap_or("this action");
 
-            let yes_style = if popup.confirm_selected { button_selected_style } else { button_style };
-            let no_style = if !popup.confirm_selected { button_selected_style } else { button_style };
+            let yes_selected = popup.confirm_selected;
+            let no_selected = !popup.confirm_selected;
+
+            // Helper to create button with highlighted first letter (shortcut key in black on white)
+            let make_confirm_button = |first: &str, rest: &str, selected: bool| -> Vec<Span<'static>> {
+                let base_style = if selected { button_selected_style } else { button_style };
+                let shortcut_style = if selected {
+                    Style::default().fg(Color::Black).bg(theme.button_selected_bg()).add_modifier(Modifier::BOLD | Modifier::UNDERLINED)
+                } else {
+                    Style::default().fg(Color::Black).bg(Color::White).add_modifier(Modifier::UNDERLINED)
+                };
+                vec![
+                    Span::styled("[ ", base_style),
+                    Span::styled(first.to_string(), shortcut_style),
+                    Span::styled(rest.to_string(), base_style),
+                    Span::styled(" ]", base_style),
+                ]
+            };
+
+            let mut yes_spans = make_confirm_button("Y", "es", yes_selected);
+            let mut no_spans = make_confirm_button("N", "o", no_selected);
+            let mut button_spans = Vec::new();
+            button_spans.append(&mut yes_spans);
+            button_spans.push(Span::raw("    "));
+            button_spans.append(&mut no_spans);
 
             let lines = vec![
                 Line::from(""),
@@ -26142,15 +26606,11 @@ fn render_actions_popup(f: &mut Frame, app: &App) {
                     label_style,
                 )),
                 Line::from(""),
-                Line::from(vec![
-                    Span::styled("[ Yes ]", yes_style),
-                    Span::raw("    "),
-                    Span::styled("[ No ]", no_style),
-                ]),
+                Line::from(button_spans),
             ];
 
             let popup_block = Block::default()
-                .title(" Confirm Delete ")
+                .title(Span::styled(" Confirm Delete ", Style::default().fg(Color::Black).add_modifier(Modifier::BOLD)))
                 .borders(Borders::ALL)
                 .border_style(Style::default().fg(theme.popup_border()))
                 .style(Style::default().bg(theme.popup_bg()));

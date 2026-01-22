@@ -309,20 +309,25 @@ This logic applies to all interfaces (console, web, GUI). Remote clients query t
 - `Enter` - Send command
 
 **World Settings Popup (when open):**
-- `Up/Down/Tab` - Navigate between fields (auto-enters edit mode for text fields)
+- `Up/Down` - Navigate between fields (auto-enters edit mode for text fields)
+- `Tab/Shift+Tab` - Cycle through buttons only
 - `Left/Right` - Navigate between buttons (when on button row); also scrolls long text fields
 - `Enter` - Edit text field / Toggle option / Activate button
 - `Space` - Toggle boolean / Cycle options
+- `S` - Select Save button
+- `C` - Select Cancel button
+- `D` - Select Delete button
+- `O` - Select Connect button
 - `Ctrl+S` - Save all settings and close
 - `Esc` - Close popup
 - Text fields: Just start typing to edit (inline editing with horizontal scrolling)
 - Long text fields show `<` and `>` indicators when content extends beyond visible area
-- Buttons: Save, Cancel, Delete, Connect
+- Buttons: Save, Cancel, Delete, Connect (highlighted shortcut letters: S, C, D, O)
 - Popup sizes dynamically based on content
 
 ### Commands
 
-- `/help` - Show help popup with commands and controls (scrollable with arrow keys)
+- `/help` - Show help popup (90% terminal width, scrollable, word-wrapped)
 - `/disconnect` (or `/dc`) - Disconnect current world and close log file
 - `/send [-W] [-w<world>] [-n] <text>` - Send text to world(s)
   - `-w<world>` - Send to specified world (by name)
@@ -820,6 +825,32 @@ Opened with `/web` command:
 - HTTPS port - Port for HTTPS server (default: 9001)
 
 Note: HTTP server automatically starts the non-secure WebSocket server (ws://) if not already running.
+
+**Controls:**
+- `Up/Down` - Navigate between fields (stops at top/bottom, no wrap)
+- `Tab/Shift+Tab` - Cycle through buttons only (Save, Cancel)
+- `Left/Right` - Toggle between Save and Cancel buttons
+- `Enter` - Edit text field / Toggle option / Activate button
+- `Space` - Toggle boolean options
+- `S` - Select Save button
+- `C` - Select Cancel button
+- `Ctrl+S` - Save and close
+- `Esc` - Close popup
+
+### Help Popup
+
+Opened with `F1` or `/help`:
+
+- Displays 90% of terminal width, centered
+- Two-column format with word wrapping that preserves column alignment
+- Scrollable content with scrollbar
+
+**Controls:**
+- `Up/Down` - Scroll one line
+- `PageUp/PageDown` - Scroll multiple lines
+- `O` - Highlight Ok button
+- `Enter` - Close popup
+- `Esc` - Close popup
 
 ### Filter Popup
 
