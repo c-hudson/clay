@@ -21777,20 +21777,20 @@ fn handle_key_event(key: KeyEvent, app: &mut App) -> KeyAction {
                     }
                 }
                 KeyCode::Up => {
-                    // Up always navigates the list (wraps at edges)
+                    // Up navigates the list (stops at top)
                     // Calculate list height based on terminal size (same formula as render)
                     let term_height = crossterm::terminal::size().map(|(_, h)| h).unwrap_or(24);
-                    let filtered_count = app.world_selector.filtered_indices(&app.worlds).len();
-                    let popup_height = ((filtered_count + 8) as u16).min(term_height.saturating_sub(4)).clamp(10, 20);
+                    let total_worlds = app.worlds.len();
+                    let popup_height = ((total_worlds + 8) as u16).min(term_height.saturating_sub(4)).clamp(10, 20);
                     let list_height = popup_height.saturating_sub(7) as usize;
                     app.world_selector.move_up(&app.worlds, list_height);
                 }
                 KeyCode::Down => {
-                    // Down always navigates the list (wraps at edges)
+                    // Down navigates the list (stops at bottom)
                     // Calculate list height based on terminal size (same formula as render)
                     let term_height = crossterm::terminal::size().map(|(_, h)| h).unwrap_or(24);
-                    let filtered_count = app.world_selector.filtered_indices(&app.worlds).len();
-                    let popup_height = ((filtered_count + 8) as u16).min(term_height.saturating_sub(4)).clamp(10, 20);
+                    let total_worlds = app.worlds.len();
+                    let popup_height = ((total_worlds + 8) as u16).min(term_height.saturating_sub(4)).clamp(10, 20);
                     let list_height = popup_height.saturating_sub(7) as usize;
                     app.world_selector.move_down(&app.worlds, list_height);
                 }
@@ -25891,7 +25891,8 @@ fn render_world_selector_popup(f: &mut Frame, app: &App) {
 
     // Add borders (2) and apply screen limits
     let popup_width = ((min_content_width + 2) as u16).min(area.width.saturating_sub(4));
-    let popup_height = ((filtered_indices.len() + 8) as u16).min(area.height.saturating_sub(4)).clamp(10, 20);
+    // Use total world count for height (not filtered count) so window size stays consistent
+    let popup_height = ((app.worlds.len() + 8) as u16).min(area.height.saturating_sub(4)).clamp(10, 20);
 
     let x = area.width.saturating_sub(popup_width) / 2;
     let y = area.height.saturating_sub(popup_height) / 2;
