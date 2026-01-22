@@ -11561,14 +11561,33 @@ mod remote_gui {
                             // Use server's activity count (console broadcasts this value)
                             let activity_count = self.server_activity_count;
 
-                            // Status indicator (More/Hist or spaces)
-                            // Get server's pending count for current world (synchronized more-mode)
+                            // Status indicator (Hist/More or spaces)
+                            // Priority: Hist (when scrolled back) > More (when paused) > spaces
                             let server_pending_count = self.worlds.get(self.current_world)
                                 .map(|w| w.pending_count)
                                 .unwrap_or(0);
 
-                            if server_pending_count > 0 {
-                                // Show More: XXXX with black text on red background
+                            // Check if scrolled back (scroll_offset is Some when not at bottom)
+                            let is_scrolled_back = self.scroll_offset.is_some();
+
+                            if is_scrolled_back {
+                                // Show Hist indicator when scrolled back (takes precedence)
+                                // Calculate approximate lines from bottom based on scroll offset
+                                let lines_back = self.scroll_offset
+                                    .map(|offset| (offset / 20.0).max(1.0) as usize) // Rough estimate
+                                    .unwrap_or(0);
+                                let count_str = if lines_back >= 10000 {
+                                    format!("{:>4}K", lines_back / 1000)
+                                } else {
+                                    format!("{:>4}", lines_back)
+                                };
+                                let status_text = format!("Hist:{}", count_str);
+                                ui.label(egui::RichText::new(status_text)
+                                    .monospace()
+                                    .color(egui::Color32::BLACK)
+                                    .background_color(egui::Color32::from_rgb(0xf8, 0x53, 0x49))); // Red background
+                            } else if server_pending_count > 0 {
+                                // Show More indicator when paused with pending lines
                                 let count_str = if server_pending_count >= 10000 {
                                     format!("{:>4}K", server_pending_count / 1000)
                                 } else {
@@ -11580,7 +11599,7 @@ mod remote_gui {
                                     .color(egui::Color32::BLACK)
                                     .background_color(egui::Color32::from_rgb(0xf8, 0x53, 0x49))); // Red background
                             } else {
-                                // Status area - spaces when no More indicator
+                                // Status area - spaces when no indicator
                                 let status_text = "          ";
                                 ui.label(egui::RichText::new(status_text).monospace());
                             }
@@ -24837,15 +24856,15 @@ fn render_separator_bar(f: &mut Frame, app: &App, area: Rect) {
     let time_str = get_current_time_12hr();
 
     // Status indicator - always reserve space for "More XXXX" or "Hist XXXX" (9 chars)
-    // Priority: More (when paused) > Hist (when scrolled back) > underscores
+    // Priority: Hist (when scrolled back) > More (when paused) > underscores
     const STATUS_INDICATOR_LEN: usize = 9;
-    let (status_str, status_active) = if world.paused && !world.pending_lines.is_empty() {
-        // Show More indicator when paused with pending lines
-        (format!("More {}", format_more_count(world.pending_lines.len())), true)
-    } else if !world.is_at_bottom() {
-        // Show History indicator when scrolled back
+    let (status_str, status_active) = if !world.is_at_bottom() {
+        // Show History indicator when scrolled back (takes precedence over More)
         let lines_back = world.lines_from_bottom();
         (format!("Hist {}", format_more_count(lines_back)), true)
+    } else if world.paused && !world.pending_lines.is_empty() {
+        // Show More indicator when paused with pending lines
+        (format!("More {}", format_more_count(world.pending_lines.len())), true)
     } else {
         // Fill with underscores when nothing to show
         ("_".repeat(STATUS_INDICATOR_LEN), false)

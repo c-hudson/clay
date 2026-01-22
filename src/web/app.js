@@ -2623,21 +2623,22 @@
     function updateStatusBar() {
         const world = worlds[currentWorldIndex];
 
-        // Status indicator: shows More/Hist when active, underscores when idle (9 chars)
-        // Check both local pending (client-side more mode) and server pending (synchronized more mode)
+        // Status indicator: shows Hist/More when active, underscores when idle (9 chars)
+        // Priority: Hist (scrolled back) > More (pending lines) > underscores
         const serverPending = world ? (world.pending_count || 0) : 0;
         const totalPending = pendingLines.length + serverPending;
-        if ((paused && pendingLines.length > 0) || serverPending > 0) {
-            elements.statusIndicator.textContent = 'More ' + formatCount(totalPending);
-            elements.statusIndicator.className = 'paused';
-        } else if (!isAtBottom()) {
-            // Calculate lines from bottom
+        if (!isAtBottom()) {
+            // Show Hist indicator when scrolled back (takes precedence over More)
             const container = elements.outputContainer;
             const fontSize = fontSizes[currentFontPos] || 14;
             const lineHeight = fontSize * 1.2;
             const linesFromBottom = Math.floor((container.scrollHeight - container.scrollTop - container.clientHeight) / lineHeight);
             elements.statusIndicator.textContent = 'Hist ' + formatCount(linesFromBottom);
             elements.statusIndicator.className = 'scrolled';
+        } else if ((paused && pendingLines.length > 0) || serverPending > 0) {
+            // Show More indicator when paused with pending lines
+            elements.statusIndicator.textContent = 'More ' + formatCount(totalPending);
+            elements.statusIndicator.className = 'paused';
         } else {
             elements.statusIndicator.textContent = '__________';
             elements.statusIndicator.className = '';
