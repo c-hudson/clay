@@ -1769,6 +1769,7 @@ impl WebPopup {
 #[derive(Clone, Copy, PartialEq)]
 enum WorldSelectorFocus {
     List,
+    FilterField,
     AddButton,
     EditButton,
     DeleteButton,
@@ -1824,22 +1825,24 @@ impl WorldSelectorPopup {
     }
 
     fn next_focus(&mut self) {
-        // Tab cycles through buttons only (once you leave List, you stay in buttons)
+        // Tab cycles through Filter and buttons
         self.focus = match self.focus {
-            WorldSelectorFocus::List => WorldSelectorFocus::AddButton,
+            WorldSelectorFocus::List => WorldSelectorFocus::FilterField,
+            WorldSelectorFocus::FilterField => WorldSelectorFocus::AddButton,
             WorldSelectorFocus::AddButton => WorldSelectorFocus::EditButton,
             WorldSelectorFocus::EditButton => WorldSelectorFocus::DeleteButton,
             WorldSelectorFocus::DeleteButton => WorldSelectorFocus::ConnectButton,
             WorldSelectorFocus::ConnectButton => WorldSelectorFocus::OkButton,
-            WorldSelectorFocus::OkButton => WorldSelectorFocus::AddButton,  // Wrap within buttons
+            WorldSelectorFocus::OkButton => WorldSelectorFocus::FilterField,  // Wrap to Filter
         };
     }
 
     fn prev_focus(&mut self) {
-        // BackTab cycles through buttons only (once you leave List, you stay in buttons)
+        // BackTab cycles through Filter and buttons
         self.focus = match self.focus {
             WorldSelectorFocus::List => WorldSelectorFocus::OkButton,
-            WorldSelectorFocus::AddButton => WorldSelectorFocus::OkButton,  // Wrap within buttons
+            WorldSelectorFocus::FilterField => WorldSelectorFocus::OkButton,
+            WorldSelectorFocus::AddButton => WorldSelectorFocus::FilterField,
             WorldSelectorFocus::EditButton => WorldSelectorFocus::AddButton,
             WorldSelectorFocus::DeleteButton => WorldSelectorFocus::EditButton,
             WorldSelectorFocus::ConnectButton => WorldSelectorFocus::DeleteButton,
@@ -1874,25 +1877,19 @@ impl WorldSelectorPopup {
         }
         // Find current position in filtered list
         let pos = indices.iter().position(|&i| i == self.selected_index).unwrap_or(0);
-        let new_pos = if pos > 0 {
-            pos - 1
-        } else {
-            // Wrap to bottom
-            indices.len() - 1
-        };
-        self.selected_index = indices[new_pos];
+        // Stop at top, don't wrap
+        if pos > 0 {
+            let new_pos = pos - 1;
+            self.selected_index = indices[new_pos];
 
-        // Adjust scroll_offset only if selection goes above viewport
-        if new_pos < self.scroll_offset {
-            self.scroll_offset = new_pos;
-        }
-        // If we wrapped to bottom, scroll to show it
-        if new_pos >= self.scroll_offset + list_height {
-            self.scroll_offset = new_pos.saturating_sub(list_height - 1);
+            // Adjust scroll_offset only if selection goes above viewport
+            if new_pos < self.scroll_offset {
+                self.scroll_offset = new_pos;
+            }
         }
     }
 
-    /// Move down in the list (wraps at bottom to top)
+    /// Move down in the list (stops at bottom, no wrap)
     fn move_down(&mut self, worlds: &[World], list_height: usize) {
         let indices = self.filtered_indices(worlds);
         if indices.is_empty() {
@@ -1900,21 +1897,15 @@ impl WorldSelectorPopup {
         }
         // Find current position in filtered list
         let pos = indices.iter().position(|&i| i == self.selected_index).unwrap_or(0);
-        let new_pos = if pos < indices.len() - 1 {
-            pos + 1
-        } else {
-            // Wrap to top
-            0
-        };
-        self.selected_index = indices[new_pos];
+        // Stop at bottom, don't wrap
+        if pos < indices.len() - 1 {
+            let new_pos = pos + 1;
+            self.selected_index = indices[new_pos];
 
-        // Adjust scroll_offset only if selection goes below viewport
-        if new_pos >= self.scroll_offset + list_height {
-            self.scroll_offset = new_pos.saturating_sub(list_height - 1);
-        }
-        // If we wrapped to top, scroll to show it
-        if new_pos < self.scroll_offset {
-            self.scroll_offset = new_pos;
+            // Adjust scroll_offset only if selection goes below viewport
+            if new_pos >= self.scroll_offset + list_height {
+                self.scroll_offset = new_pos.saturating_sub(list_height - 1);
+            }
         }
     }
 
@@ -21747,6 +21738,10 @@ fn handle_key_event(key: KeyEvent, app: &mut App) -> KeyAction {
                                 return KeyAction::Connect;
                             }
                         }
+                        WorldSelectorFocus::FilterField => {
+                            // Start editing the filter field
+                            app.world_selector.start_filter_edit();
+                        }
                         WorldSelectorFocus::AddButton => {
                             // Create new world and open editor
                             let new_idx = app.worlds.len();
@@ -21809,8 +21804,12 @@ fn handle_key_event(key: KeyEvent, app: &mut App) -> KeyAction {
                 }
                 KeyCode::Char('/') => {
                     // Start filter editing
-                    app.world_selector.focus = WorldSelectorFocus::List;
+                    app.world_selector.focus = WorldSelectorFocus::FilterField;
                     app.world_selector.start_filter_edit();
+                }
+                KeyCode::Char('f') | KeyCode::Char('F') => {
+                    // Shortcut for Filter field
+                    app.world_selector.focus = WorldSelectorFocus::FilterField;
                 }
                 KeyCode::Char('a') | KeyCode::Char('A') => {
                     // Shortcut for Add button
@@ -21833,8 +21832,9 @@ fn handle_key_event(key: KeyEvent, app: &mut App) -> KeyAction {
                     app.world_selector.focus = WorldSelectorFocus::OkButton;
                 }
                 KeyCode::Char(c) => {
-                    // Start filter editing with this character (only from List focus)
-                    if app.world_selector.focus == WorldSelectorFocus::List {
+                    // Start filter editing with this character (from List or FilterField focus)
+                    if matches!(app.world_selector.focus, WorldSelectorFocus::List | WorldSelectorFocus::FilterField) {
+                        app.world_selector.focus = WorldSelectorFocus::FilterField;
                         app.world_selector.start_filter_edit();
                         app.world_selector.filter.push(c);
                         app.world_selector.filter_cursor = app.world_selector.filter.len();
@@ -25907,24 +25907,37 @@ fn render_world_selector_popup(f: &mut Frame, app: &App) {
     // Build lines
     let mut lines: Vec<Line<'static>> = Vec::new();
 
-    // Filter line at top
-    let filter_label = "Filter: ";
+    // Filter line at top with 'F' highlighted as shortcut
+    let filter_selected = selector.focus == WorldSelectorFocus::FilterField;
+    let f_style = if filter_selected {
+        Style::default().fg(Color::Black).bg(theme.button_selected_bg()).add_modifier(Modifier::BOLD | Modifier::UNDERLINED)
+    } else {
+        Style::default().fg(Color::Black).bg(Color::White).add_modifier(Modifier::UNDERLINED)
+    };
+    let label_style = if filter_selected {
+        Style::default().fg(theme.button_selected_fg()).bg(theme.button_selected_bg()).add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(theme.fg_accent())
+    };
     let filter_display = if selector.editing_filter {
         let mut buf = selector.filter.clone();
         buf.insert(selector.filter_cursor, '|');
         buf
     } else if selector.filter.is_empty() {
-        "(type to filter)".to_string()
+        "(use tab or F to select)".to_string()
     } else {
         selector.filter.clone()
     };
     let filter_style = if selector.editing_filter {
         Style::default().fg(theme.fg_success())
+    } else if filter_selected {
+        Style::default().fg(theme.button_selected_fg()).bg(theme.button_selected_bg())
     } else {
         Style::default().fg(theme.fg_dim())
     };
     lines.push(Line::from(vec![
-        Span::styled(filter_label, Style::default().fg(theme.fg_accent())),
+        Span::styled("F", f_style),
+        Span::styled("ilter: ", label_style),
         Span::styled(filter_display, filter_style),
     ]));
     lines.push(Line::from(""));
