@@ -18,11 +18,20 @@ pub const TELNET_WONT: u8 = 252;
 pub const TELNET_WILL: u8 = 251;
 pub const TELNET_SB: u8 = 250;   // Subnegotiation Begin
 pub const TELNET_GA: u8 = 249;   // Go Ahead (prompt marker)
+pub const TELNET_EOR: u8 = 239;  // End of Record (alternative prompt marker)
 pub const TELNET_SE: u8 = 240;   // Subnegotiation End
 pub const TELNET_NOP: u8 = 241;  // No Operation (keepalive)
 
 // Telnet options
-pub const TELNET_OPT_ECHO: u8 = 1;  // Echo option
+pub const TELNET_OPT_ECHO: u8 = 1;    // Echo option
+pub const TELNET_OPT_SGA: u8 = 3;     // Suppress Go Ahead
+pub const TELNET_OPT_TTYPE: u8 = 24;  // Terminal Type
+pub const TELNET_OPT_EOR: u8 = 25;    // End of Record
+pub const TELNET_OPT_NAWS: u8 = 31;   // Negotiate About Window Size
+
+// TTYPE subnegotiation commands
+pub const TTYPE_IS: u8 = 0;    // Terminal type IS (response)
+pub const TTYPE_SEND: u8 = 1;  // Send terminal type (request)
 
 /// Command types for the writer task
 pub enum WriteCommand {
@@ -88,19 +97,27 @@ impl AsyncWrite for StreamWriter {
     }
 }
 
+/// Result of processing telnet sequences
+pub struct TelnetResult {
+    pub cleaned: Vec<u8>,       // Data with telnet sequences removed
+    pub responses: Vec<u8>,     // Bytes to send back (WILL/WONT/DO/DONT responses)
+    pub telnet_detected: bool,  // True if any telnet IAC sequences were found
+    pub prompt: Option<Vec<u8>>, // Text from last newline to GA/EOR/WONT_ECHO, if found
+    pub wont_echo_seen: bool,   // True if IAC WONT ECHO was received
+    pub naws_requested: bool,   // True if server sent DO NAWS (we responded WILL NAWS)
+    pub ttype_requested: bool,  // True if server sent SB TTYPE SEND (we need to send terminal type)
+}
+
 /// Process telnet sequences in incoming data.
-/// Returns (cleaned_data, telnet_responses, telnet_detected, prompt, wont_echo_seen).
-/// - cleaned_data: data with telnet sequences removed (prompt text excluded if GA found)
-/// - telnet_responses: bytes to send back (WONT/DONT responses)
-/// - telnet_detected: true if any telnet IAC sequences were found
-/// - prompt: text from last newline to GA/WONT_ECHO, if found
-/// - wont_echo_seen: true if IAC WONT ECHO was received (prompt may follow)
-pub fn process_telnet(data: &[u8]) -> (Vec<u8>, Vec<u8>, bool, Option<Vec<u8>>, bool) {
+/// Returns TelnetResult with cleaned data and negotiation info.
+pub fn process_telnet(data: &[u8]) -> TelnetResult {
     let mut cleaned = Vec::with_capacity(data.len());
     let mut responses = Vec::new();
     let mut telnet_detected = false;
     let mut prompt: Option<Vec<u8>> = None;
     let mut wont_echo_seen = false;
+    let mut naws_requested = false;
+    let mut ttype_requested = false;
     let mut i = 0;
 
     while i < data.len() {
@@ -121,13 +138,32 @@ pub fn process_telnet(data: &[u8]) -> (Vec<u8>, Vec<u8>, bool, Option<Vec<u8>>, 
                         break; // Incomplete sequence
                     }
                     let option = data[i + 2];
-                    // Respond with DONT for WILL, WONT for DO
+                    // Respond based on option
                     match cmd {
                         TELNET_WILL => {
-                            responses.extend_from_slice(&[TELNET_IAC, TELNET_DONT, option]);
+                            // Server wants to enable an option - we accept some
+                            if option == TELNET_OPT_SGA || option == TELNET_OPT_EOR {
+                                // Accept Suppress Go Ahead and End of Record
+                                responses.extend_from_slice(&[TELNET_IAC, TELNET_DO, option]);
+                            } else {
+                                responses.extend_from_slice(&[TELNET_IAC, TELNET_DONT, option]);
+                            }
                         }
                         TELNET_DO => {
-                            responses.extend_from_slice(&[TELNET_IAC, TELNET_WONT, option]);
+                            // Server wants us to enable an option
+                            if option == TELNET_OPT_NAWS {
+                                // Accept NAWS - we'll send window size
+                                responses.extend_from_slice(&[TELNET_IAC, TELNET_WILL, option]);
+                                naws_requested = true;
+                            } else if option == TELNET_OPT_TTYPE {
+                                // Accept TTYPE - server will send subnegotiation to request type
+                                responses.extend_from_slice(&[TELNET_IAC, TELNET_WILL, option]);
+                            } else if option == TELNET_OPT_EOR {
+                                // Accept EOR - we'll handle IAC EOR as prompt marker
+                                responses.extend_from_slice(&[TELNET_IAC, TELNET_WILL, option]);
+                            } else {
+                                responses.extend_from_slice(&[TELNET_IAC, TELNET_WONT, option]);
+                            }
                         }
                         TELNET_WONT if option == TELNET_OPT_ECHO => {
                             // WONT ECHO often precedes login/password prompts
@@ -139,18 +175,26 @@ pub fn process_telnet(data: &[u8]) -> (Vec<u8>, Vec<u8>, bool, Option<Vec<u8>>, 
                     i += 3;
                 }
                 TELNET_SB => {
-                    // Skip subnegotiation until SE
+                    // Subnegotiation - parse the content
+                    let sb_start = i + 2;
                     i += 2;
+                    // Find IAC SE that ends subnegotiation
                     while i < data.len() {
                         if data[i] == TELNET_IAC && i + 1 < data.len() && data[i + 1] == TELNET_SE {
+                            // Found end of subnegotiation
+                            let sb_data = &data[sb_start..i];
+                            // Check for TTYPE SEND request
+                            if sb_data.len() >= 2 && sb_data[0] == TELNET_OPT_TTYPE && sb_data[1] == TTYPE_SEND {
+                                ttype_requested = true;
+                            }
                             i += 2;
                             break;
                         }
                         i += 1;
                     }
                 }
-                TELNET_GA => {
-                    // Go Ahead - extract prompt (text from last newline to here)
+                TELNET_GA | TELNET_EOR => {
+                    // Go Ahead or End of Record - extract prompt (text from last newline to here)
                     // Find last newline in cleaned data
                     let last_newline = cleaned.iter().rposition(|&b| b == b'\n');
                     let prompt_start = last_newline.map(|p| p + 1).unwrap_or(0);
@@ -188,7 +232,33 @@ pub fn process_telnet(data: &[u8]) -> (Vec<u8>, Vec<u8>, bool, Option<Vec<u8>>, 
         }
     }
 
-    (cleaned, responses, telnet_detected, prompt, wont_echo_seen)
+    TelnetResult {
+        cleaned,
+        responses,
+        telnet_detected,
+        prompt,
+        wont_echo_seen,
+        naws_requested,
+        ttype_requested,
+    }
+}
+
+/// Build a TTYPE IS subnegotiation response with the given terminal type
+pub fn build_ttype_response(terminal_type: &str) -> Vec<u8> {
+    let mut msg = vec![TELNET_IAC, TELNET_SB, TELNET_OPT_TTYPE, TTYPE_IS];
+    msg.extend_from_slice(terminal_type.as_bytes());
+    msg.extend_from_slice(&[TELNET_IAC, TELNET_SE]);
+    msg
+}
+
+/// Build a NAWS subnegotiation message with the given dimensions
+pub fn build_naws_subnegotiation(width: u16, height: u16) -> Vec<u8> {
+    vec![
+        TELNET_IAC, TELNET_SB, TELNET_OPT_NAWS,
+        (width >> 8) as u8, (width & 0xFF) as u8,   // Width high byte, low byte
+        (height >> 8) as u8, (height & 0xFF) as u8, // Height high byte, low byte
+        TELNET_IAC, TELNET_SE,
+    ]
 }
 
 /// Check if there's an incomplete ANSI escape sequence or telnet sequence at the end.

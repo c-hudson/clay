@@ -211,7 +211,6 @@ Prompts that are auto-answered are immediately cleared and not displayed in the 
 ### Telnet Protocol Support
 
 - Automatic telnet negotiation handling
-- Responds with WONT for DO requests, DONT for WILL requests
 - Strips telnet sequences from displayed output
 - Detects telnet mode when IAC sequences are received
 - Configurable keepalive sent every 5 minutes if telnet mode and no data sent:
@@ -220,9 +219,28 @@ Prompts that are auto-answered are immediately cleared and not displayed in the 
   - **Generic**: Sends "help commands ##_idler_message_<rand>_###" (works on most MUDs)
 - Timing fields (last_send_time, last_receive_time) initialized on connect and after /reload for proper NOP tracking
 
-### Telnet GA Prompt Detection
+**Supported Telnet Options:**
 
-- When telnet GA (Go Ahead, IAC GA) is received, the text from the last newline to GA is identified as a prompt
+| Option | Code | Description |
+|--------|------|-------------|
+| SGA (Suppress Go Ahead) | 3 | Accepts server's WILL SGA with DO SGA |
+| TTYPE (Terminal Type) | 24 | Reports terminal type from TERM env var (default: "ANSI") |
+| EOR (End of Record) | 25 | Alternative prompt marker, treated same as GA |
+| NAWS (Window Size) | 31 | Reports minimum output dimensions across all connected clients |
+
+**NAWS Behavior:**
+- Sends smallest width × height across console + all web/GUI clients
+- Updates sent when terminal resizes or client dimensions change
+- Dimensions tracked per-world, reset on disconnect
+
+**TTYPE Behavior:**
+- Responds to SB TTYPE SEND with SB TTYPE IS <terminal>
+- Uses TERM environment variable (e.g., "xterm-256color")
+- Falls back to "ANSI" if TERM is not set
+
+### Telnet Prompt Detection (GA/EOR)
+
+- When telnet GA (Go Ahead, IAC GA) or EOR (End of Record, IAC EOR) is received, the text from the last newline is identified as a prompt
 - The prompt is stored per-world and displayed at the start of the input area (styled in cyan)
 - The prompt is NOT shown in the output area, only in the input area
 - When the user sends a command, the prompt is cleared

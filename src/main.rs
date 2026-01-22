@@ -21,8 +21,8 @@ pub fn get_version_string() -> String {
 pub use encoding::{Encoding, Theme, WorldSwitchMode, convert_discord_emojis, colorize_square_emojis, is_visually_empty, is_ansi_only_line, strip_non_sgr_sequences};
 pub use telnet::{
     WriteCommand, StreamReader, StreamWriter, AutoConnectType, KeepAliveType,
-    process_telnet, find_safe_split_point,
-    TELNET_IAC, TELNET_NOP, TELNET_GA,
+    process_telnet, find_safe_split_point, build_naws_subnegotiation, build_ttype_response, TelnetResult,
+    TELNET_IAC, TELNET_NOP, TELNET_GA, TELNET_OPT_NAWS,
 };
 pub use spell::{SpellChecker, SpellState};
 pub use input::InputArea;
@@ -3302,6 +3302,8 @@ pub struct ClientViewState {
     pub world_index: usize,
     /// Number of visible output lines in the client's display
     pub visible_lines: usize,
+    /// Client's output area dimensions (width, height) for NAWS
+    pub dimensions: Option<(u16, u16)>,
 }
 
 /// Helper function for serde default to return true
@@ -4234,6 +4236,8 @@ struct World {
     owner: Option<String>,       // Username who owns this world (multiuser mode)
     proxy_pid: Option<u32>,      // PID of TLS proxy process (if using TLS proxy)
     proxy_socket_path: Option<std::path::PathBuf>, // Unix socket path for TLS proxy
+    naws_enabled: bool,          // True if NAWS telnet option was negotiated
+    naws_sent_size: Option<(u16, u16)>, // Last sent window size (width, height) to avoid duplicates
 }
 
 impl World {
@@ -4286,6 +4290,8 @@ impl World {
             owner: None,
             proxy_pid: None,
             proxy_socket_path: None,
+            naws_enabled: false,
+            naws_sent_size: None,
         }
     }
 
@@ -4905,6 +4911,69 @@ impl App {
         false
     }
 
+    /// Calculate minimum output dimensions across all connected instances (console + web clients)
+    /// Returns (width, height) or None if no instances are connected
+    fn get_minimum_dimensions(&self) -> Option<(u16, u16)> {
+        let mut min_width: Option<u16> = None;
+        let mut min_height: Option<u16> = None;
+
+        // Console dimensions (always present)
+        if self.output_width > 0 && self.output_height > 0 {
+            min_width = Some(self.output_width);
+            min_height = Some(self.output_height);
+        }
+
+        // WebSocket client dimensions
+        for state in self.ws_client_worlds.values() {
+            if let Some((w, h)) = state.dimensions {
+                if w > 0 && h > 0 {
+                    min_width = Some(min_width.map_or(w, |mw| mw.min(w)));
+                    min_height = Some(min_height.map_or(h, |mh| mh.min(h)));
+                }
+            }
+        }
+
+        match (min_width, min_height) {
+            (Some(w), Some(h)) => Some((w, h)),
+            _ => None,
+        }
+    }
+
+    /// Send NAWS subnegotiation to a world if dimensions changed
+    /// Returns true if NAWS was sent
+    fn send_naws_if_changed(&mut self, world_index: usize) -> bool {
+        if world_index >= self.worlds.len() {
+            return false;
+        }
+
+        let world = &self.worlds[world_index];
+        if !world.naws_enabled || !world.connected {
+            return false;
+        }
+
+        if let Some((width, height)) = self.get_minimum_dimensions() {
+            // Check if dimensions changed
+            if self.worlds[world_index].naws_sent_size != Some((width, height)) {
+                // Send NAWS subnegotiation
+                if let Some(ref tx) = self.worlds[world_index].command_tx {
+                    let naws_msg = build_naws_subnegotiation(width, height);
+                    let _ = tx.try_send(WriteCommand::Raw(naws_msg));
+                    self.worlds[world_index].naws_sent_size = Some((width, height));
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    /// Send NAWS updates to all connected worlds that have NAWS enabled
+    fn send_naws_to_all_worlds(&mut self) {
+        let world_count = self.worlds.len();
+        for idx in 0..world_count {
+            self.send_naws_if_changed(idx);
+        }
+    }
+
     /// Get sorted list of world indices for cycling (alphabetically by name, case-insensitive)
     fn get_sorted_world_indices(&self) -> Vec<usize> {
         let mut indices: Vec<usize> = (0..self.worlds.len()).collect();
@@ -5516,6 +5585,8 @@ pub enum AppEvent {
     TelnetDetected(String),       // world_name - telnet negotiation detected
     Prompt(String, Vec<u8>),      // world_name, prompt bytes (from telnet GA)
     WontEchoSeen(String),         // world_name - IAC WONT ECHO detected (for timeout-based prompts)
+    NawsRequested(String),        // world_name - server sent DO NAWS (we should send window size)
+    TtypeRequested(String),       // world_name - server sent SB TTYPE SEND (we should send terminal type)
     SystemMessage(String),       // message to display in current world's output
     // WebSocket events
     WsClientConnected(u64),                    // client_id
@@ -16037,18 +16108,18 @@ async fn connect_multiuser_world(
                         Ok(0) => {
                             // Connection closed
                             if !line_buffer.is_empty() {
-                                let (cleaned, responses, detected, prompt, _wont_echo) = process_telnet(&line_buffer);
-                                if !responses.is_empty() {
-                                    let _ = telnet_tx.send(WriteCommand::Raw(responses)).await;
+                                let result = process_telnet(&line_buffer);
+                                if !result.responses.is_empty() {
+                                    let _ = telnet_tx.send(WriteCommand::Raw(result.responses)).await;
                                 }
-                                if detected {
+                                if result.telnet_detected {
                                     let _ = event_tx_read.send(AppEvent::MultiuserTelnetDetected(world_index, username_read.clone())).await;
                                 }
-                                if let Some(prompt_bytes) = prompt {
+                                if let Some(prompt_bytes) = result.prompt {
                                     let _ = event_tx_read.send(AppEvent::MultiuserPrompt(world_index, username_read.clone(), prompt_bytes)).await;
                                 }
-                                if !cleaned.is_empty() {
-                                    let _ = event_tx_read.send(AppEvent::MultiuserServerData(world_index, username_read.clone(), cleaned)).await;
+                                if !result.cleaned.is_empty() {
+                                    let _ = event_tx_read.send(AppEvent::MultiuserServerData(world_index, username_read.clone(), result.cleaned)).await;
                                 }
                             }
                             let _ = event_tx_read.send(AppEvent::MultiuserServerData(
@@ -16071,18 +16142,18 @@ async fn connect_multiuser_world(
                             };
 
                             if !to_send.is_empty() {
-                                let (cleaned, responses, detected, prompt, _wont_echo) = process_telnet(&to_send);
-                                if !responses.is_empty() {
-                                    let _ = telnet_tx.send(WriteCommand::Raw(responses)).await;
+                                let result = process_telnet(&to_send);
+                                if !result.responses.is_empty() {
+                                    let _ = telnet_tx.send(WriteCommand::Raw(result.responses)).await;
                                 }
-                                if detected {
+                                if result.telnet_detected {
                                     let _ = event_tx_read.send(AppEvent::MultiuserTelnetDetected(world_index, username_read.clone())).await;
                                 }
-                                if let Some(prompt_bytes) = prompt {
+                                if let Some(prompt_bytes) = result.prompt {
                                     let _ = event_tx_read.send(AppEvent::MultiuserPrompt(world_index, username_read.clone(), prompt_bytes)).await;
                                 }
-                                if !cleaned.is_empty() {
-                                    let _ = event_tx_read.send(AppEvent::MultiuserServerData(world_index, username_read.clone(), cleaned)).await;
+                                if !result.cleaned.is_empty() {
+                                    let _ = event_tx_read.send(AppEvent::MultiuserServerData(world_index, username_read.clone(), result.cleaned)).await;
                                 }
                             }
                         }
@@ -16804,20 +16875,20 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                             Ok(0) => {
                                 // Send any remaining buffered data
                                 if !line_buffer.is_empty() {
-                                    let (cleaned, responses, detected, prompt, _wont_echo) = process_telnet(&line_buffer);
-                                    if !responses.is_empty() {
-                                        let _ = telnet_tx.send(WriteCommand::Raw(responses)).await;
+                                    let result = process_telnet(&line_buffer);
+                                    if !result.responses.is_empty() {
+                                        let _ = telnet_tx.send(WriteCommand::Raw(result.responses)).await;
                                     }
-                                    if detected {
+                                    if result.telnet_detected {
                                         let _ = event_tx_read.send(AppEvent::TelnetDetected(world_name.clone())).await;
                                     }
                                     // Send prompt FIRST for immediate auto-login response
-                                    if let Some(prompt_bytes) = prompt {
+                                    if let Some(prompt_bytes) = result.prompt {
                                         let _ = event_tx_read.send(AppEvent::Prompt(world_name.clone(), prompt_bytes)).await;
                                     }
                                     // Send remaining data
-                                    if !cleaned.is_empty() {
-                                        let _ = event_tx_read.send(AppEvent::ServerData(world_name.clone(), cleaned)).await;
+                                    if !result.cleaned.is_empty() {
+                                        let _ = event_tx_read.send(AppEvent::ServerData(world_name.clone(), result.cleaned)).await;
                                     }
                                 }
                                 let _ = event_tx_read
@@ -16848,31 +16919,45 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
 
                                 if !to_send.is_empty() {
                                     // Process telnet sequences
-                                    let (cleaned, responses, detected, prompt, _wont_echo) = process_telnet(&to_send);
+                                    let result = process_telnet(&to_send);
 
                                     // Send telnet responses if any
-                                    if !responses.is_empty() {
-                                        let _ = telnet_tx.send(WriteCommand::Raw(responses)).await;
+                                    if !result.responses.is_empty() {
+                                        let _ = telnet_tx.send(WriteCommand::Raw(result.responses)).await;
                                     }
 
                                     // Notify if telnet detected
-                                    if detected {
+                                    if result.telnet_detected {
                                         let _ = event_tx_read
                                             .send(AppEvent::TelnetDetected(world_name.clone()))
                                             .await;
                                     }
 
-                                    // Send prompt FIRST if detected via telnet GA
-                                    if let Some(prompt_bytes) = prompt {
+                                    // Notify if NAWS was requested (server sent DO NAWS)
+                                    if result.naws_requested {
+                                        let _ = event_tx_read
+                                            .send(AppEvent::NawsRequested(world_name.clone()))
+                                            .await;
+                                    }
+
+                                    // Notify if TTYPE was requested (server sent SB TTYPE SEND)
+                                    if result.ttype_requested {
+                                        let _ = event_tx_read
+                                            .send(AppEvent::TtypeRequested(world_name.clone()))
+                                            .await;
+                                    }
+
+                                    // Send prompt FIRST if detected via telnet GA/EOR
+                                    if let Some(prompt_bytes) = result.prompt {
                                         let _ = event_tx_read
                                             .send(AppEvent::Prompt(world_name.clone(), prompt_bytes))
                                             .await;
                                     }
 
                                     // Send cleaned data to main loop
-                                    if !cleaned.is_empty()
+                                    if !result.cleaned.is_empty()
                                         && event_tx_read
-                                            .send(AppEvent::ServerData(world_name.clone(), cleaned))
+                                            .send(AppEvent::ServerData(world_name.clone(), result.cleaned))
                                             .await
                                             .is_err()
                                     {
@@ -16984,18 +17069,18 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                 match tokio::io::AsyncReadExt::read(&mut read_half, &mut buf).await {
                                     Ok(0) => {
                                         if !line_buffer.is_empty() {
-                                            let (cleaned, responses, detected, prompt, _) = process_telnet(&line_buffer);
-                                            if !responses.is_empty() {
-                                                let _ = telnet_tx.send(WriteCommand::Raw(responses)).await;
+                                            let result = process_telnet(&line_buffer);
+                                            if !result.responses.is_empty() {
+                                                let _ = telnet_tx.send(WriteCommand::Raw(result.responses)).await;
                                             }
-                                            if detected {
+                                            if result.telnet_detected {
                                                 let _ = event_tx_read.send(AppEvent::TelnetDetected(world_name.clone())).await;
                                             }
-                                            if let Some(prompt_bytes) = prompt {
+                                            if let Some(prompt_bytes) = result.prompt {
                                                 let _ = event_tx_read.send(AppEvent::Prompt(world_name.clone(), prompt_bytes)).await;
                                             }
-                                            if !cleaned.is_empty() {
-                                                let _ = event_tx_read.send(AppEvent::ServerData(world_name.clone(), cleaned)).await;
+                                            if !result.cleaned.is_empty() {
+                                                let _ = event_tx_read.send(AppEvent::ServerData(world_name.clone(), result.cleaned)).await;
                                             }
                                         }
                                         let _ = event_tx_read.send(AppEvent::Disconnected(world_name.clone())).await;
@@ -17012,18 +17097,24 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                             Vec::new()
                                         };
                                         if !to_send.is_empty() {
-                                            let (cleaned, responses, detected, prompt, _) = process_telnet(&to_send);
-                                            if !responses.is_empty() {
-                                                let _ = telnet_tx.send(WriteCommand::Raw(responses)).await;
+                                            let result = process_telnet(&to_send);
+                                            if !result.responses.is_empty() {
+                                                let _ = telnet_tx.send(WriteCommand::Raw(result.responses)).await;
                                             }
-                                            if detected {
+                                            if result.telnet_detected {
                                                 let _ = event_tx_read.send(AppEvent::TelnetDetected(world_name.clone())).await;
                                             }
-                                            if let Some(prompt_bytes) = prompt {
+                                            if result.naws_requested {
+                                                let _ = event_tx_read.send(AppEvent::NawsRequested(world_name.clone())).await;
+                                            }
+                                            if result.ttype_requested {
+                                                let _ = event_tx_read.send(AppEvent::TtypeRequested(world_name.clone())).await;
+                                            }
+                                            if let Some(prompt_bytes) = result.prompt {
                                                 let _ = event_tx_read.send(AppEvent::Prompt(world_name.clone(), prompt_bytes)).await;
                                             }
-                                            if !cleaned.is_empty() {
-                                                let _ = event_tx_read.send(AppEvent::ServerData(world_name.clone(), cleaned)).await;
+                                            if !result.cleaned.is_empty() {
+                                                let _ = event_tx_read.send(AppEvent::ServerData(world_name.clone(), result.cleaned)).await;
                                             }
                                         }
                                     }
@@ -17941,6 +18032,9 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                             app.worlds[world_idx].command_tx = None;
                             app.worlds[world_idx].telnet_mode = false;
                             app.worlds[world_idx].socket_fd = None;
+                            // Reset NAWS state for next connection
+                            app.worlds[world_idx].naws_enabled = false;
+                            app.worlds[world_idx].naws_sent_size = None;
                             // If there's a prompt, display it as output before clearing
                             if !app.worlds[world_idx].prompt.is_empty() {
                                 let prompt_text = app.worlds[world_idx].prompt.trim().to_string();
@@ -17980,6 +18074,25 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                         if let Some(world_idx) = app.find_world_index(world_name) {
                             if !app.worlds[world_idx].uses_wont_echo_prompt {
                                 app.worlds[world_idx].uses_wont_echo_prompt = true;
+                            }
+                        }
+                    }
+                    AppEvent::NawsRequested(ref world_name) => {
+                        if let Some(world_idx) = app.find_world_index(world_name) {
+                            // Mark NAWS as enabled for this world
+                            app.worlds[world_idx].naws_enabled = true;
+                            // Send initial window size
+                            app.send_naws_if_changed(world_idx);
+                        }
+                    }
+                    AppEvent::TtypeRequested(ref world_name) => {
+                        if let Some(world_idx) = app.find_world_index(world_name) {
+                            // Send terminal type response
+                            // Use TERM environment variable if set, otherwise default to "ANSI"
+                            let term_type = std::env::var("TERM").unwrap_or_else(|_| "ANSI".to_string());
+                            if let Some(ref tx) = app.worlds[world_idx].command_tx {
+                                let ttype_response = build_ttype_response(&term_type);
+                                let _ = tx.try_send(WriteCommand::Raw(ttype_response));
                             }
                         }
                     }
@@ -18195,7 +18308,12 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                     }
                     AppEvent::WsClientDisconnected(client_id) => {
                         // Client disconnected - remove from ws_client_worlds cache
+                        let had_dimensions = app.ws_client_worlds.get(&client_id).and_then(|s| s.dimensions).is_some();
                         app.ws_client_worlds.remove(&client_id);
+                        // If client had dimensions, recalculate minimum and send NAWS updates
+                        if had_dimensions {
+                            app.send_naws_to_all_worlds();
+                        }
                     }
                     AppEvent::WsClientMessage(client_id, msg) => {
                         match *msg {
@@ -18766,7 +18884,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                         .get(&client_id)
                                         .map(|v| v.visible_lines)
                                         .unwrap_or(0);
-                                    app.ws_client_worlds.insert(client_id, ClientViewState { world_index, visible_lines });
+                                    app.ws_client_worlds.insert(client_id, ClientViewState { world_index, visible_lines, dimensions: None });
                                     // Also update async client info
                                     if let Some(ref server) = app.ws_server {
                                         let clients = server.clients.clone();
@@ -18788,7 +18906,20 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                             WsMessage::UpdateViewState { world_index, visible_lines } => {
                                 // A remote client is reporting its view state (for more-mode threshold calculation)
                                 if world_index < app.worlds.len() {
-                                    app.ws_client_worlds.insert(client_id, ClientViewState { world_index, visible_lines });
+                                    // Preserve existing dimensions when updating view state
+                                    let dimensions = app.ws_client_worlds.get(&client_id).and_then(|s| s.dimensions);
+                                    app.ws_client_worlds.insert(client_id, ClientViewState { world_index, visible_lines, dimensions });
+                                }
+                            }
+                            WsMessage::UpdateDimensions { width, height } => {
+                                // A remote client is reporting its output dimensions (for NAWS)
+                                if let Some(state) = app.ws_client_worlds.get_mut(&client_id) {
+                                    let old_dims = state.dimensions;
+                                    state.dimensions = Some((width, height));
+                                    // If dimensions changed, send NAWS updates to all worlds
+                                    if old_dims != Some((width, height)) {
+                                        app.send_naws_to_all_worlds();
+                                    }
                                 }
                             }
                             WsMessage::ReleasePending { world_index, count } => {
@@ -19516,6 +19647,9 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                         app.worlds[world_idx].command_tx = None;
                         app.worlds[world_idx].telnet_mode = false;
                         app.worlds[world_idx].socket_fd = None;
+                        // Reset NAWS state for next connection
+                        app.worlds[world_idx].naws_enabled = false;
+                        app.worlds[world_idx].naws_sent_size = None;
                         // If there's a prompt, display it as output before clearing
                         if !app.worlds[world_idx].prompt.is_empty() {
                             let prompt_text = app.worlds[world_idx].prompt.trim().to_string();
@@ -19555,6 +19689,25 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                     if let Some(world_idx) = app.find_world_index(world_name) {
                         if !app.worlds[world_idx].uses_wont_echo_prompt {
                             app.worlds[world_idx].uses_wont_echo_prompt = true;
+                        }
+                    }
+                }
+                AppEvent::NawsRequested(ref world_name) => {
+                    if let Some(world_idx) = app.find_world_index(world_name) {
+                        // Mark NAWS as enabled for this world
+                        app.worlds[world_idx].naws_enabled = true;
+                        // Send initial window size
+                        app.send_naws_if_changed(world_idx);
+                    }
+                }
+                AppEvent::TtypeRequested(ref world_name) => {
+                    if let Some(world_idx) = app.find_world_index(world_name) {
+                        // Send terminal type response
+                        // Use TERM environment variable if set, otherwise default to "ANSI"
+                        let term_type = std::env::var("TERM").unwrap_or_else(|_| "ANSI".to_string());
+                        if let Some(ref tx) = app.worlds[world_idx].command_tx {
+                            let ttype_response = build_ttype_response(&term_type);
+                            let _ = tx.try_send(WriteCommand::Raw(ttype_response));
                         }
                     }
                 }
@@ -19714,7 +19867,12 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                 AppEvent::WsClientConnected(_) => {}
                 AppEvent::WsClientDisconnected(client_id) => {
                     // Client disconnected - remove from ws_client_worlds cache
+                    let had_dimensions = app.ws_client_worlds.get(&client_id).and_then(|s| s.dimensions).is_some();
                     app.ws_client_worlds.remove(&client_id);
+                    // If client had dimensions, recalculate minimum and send NAWS updates
+                    if had_dimensions {
+                        app.send_naws_to_all_worlds();
+                    }
                 }
                 AppEvent::WsClientMessage(client_id, msg) => {
                     // Handle simple messages in drain loop
@@ -21765,7 +21923,8 @@ fn handle_key_event(key: KeyEvent, app: &mut App) -> KeyAction {
                     app.world_selector.filter_cursor = app.world_selector.filter.len();
                 }
                 KeyCode::Up => {
-                    // Navigate list while filter is focused
+                    // Navigate list and switch focus to List (re-enables button shortcuts)
+                    app.world_selector.focus = WorldSelectorFocus::List;
                     let term_height = crossterm::terminal::size().map(|(_, h)| h).unwrap_or(24);
                     let total_worlds = app.worlds.len();
                     let popup_height = ((total_worlds + 8) as u16).min(term_height.saturating_sub(4)).clamp(10, 20);
@@ -21773,7 +21932,8 @@ fn handle_key_event(key: KeyEvent, app: &mut App) -> KeyAction {
                     app.world_selector.move_up(&app.worlds, list_height);
                 }
                 KeyCode::Down => {
-                    // Navigate list while filter is focused
+                    // Navigate list and switch focus to List (re-enables button shortcuts)
+                    app.world_selector.focus = WorldSelectorFocus::List;
                     let term_height = crossterm::terminal::size().map(|(_, h)| h).unwrap_or(24);
                     let total_worlds = app.worlds.len();
                     let popup_height = ((total_worlds + 8) as u16).min(term_height.saturating_sub(4)).clamp(10, 20);
@@ -23084,18 +23244,18 @@ async fn handle_command(cmd: &str, app: &mut App, event_tx: mpsc::Sender<AppEven
                                             Ok(0) => {
                                                 // Send any remaining buffered data
                                                 if !line_buffer.is_empty() {
-                                                    let (cleaned, responses, detected, prompt, _) = process_telnet(&line_buffer);
-                                                    if !responses.is_empty() {
-                                                        let _ = telnet_tx.send(WriteCommand::Raw(responses)).await;
+                                                    let result = process_telnet(&line_buffer);
+                                                    if !result.responses.is_empty() {
+                                                        let _ = telnet_tx.send(WriteCommand::Raw(result.responses)).await;
                                                     }
-                                                    if detected {
+                                                    if result.telnet_detected {
                                                         let _ = event_tx_read.send(AppEvent::TelnetDetected(read_world_name.clone())).await;
                                                     }
-                                                    if let Some(prompt_bytes) = prompt {
+                                                    if let Some(prompt_bytes) = result.prompt {
                                                         let _ = event_tx_read.send(AppEvent::Prompt(read_world_name.clone(), prompt_bytes)).await;
                                                     }
-                                                    if !cleaned.is_empty() {
-                                                        let _ = event_tx_read.send(AppEvent::ServerData(read_world_name.clone(), cleaned)).await;
+                                                    if !result.cleaned.is_empty() {
+                                                        let _ = event_tx_read.send(AppEvent::ServerData(read_world_name.clone(), result.cleaned)).await;
                                                     }
                                                 }
                                                 let _ = event_tx_read.send(AppEvent::Disconnected(read_world_name.clone())).await;
@@ -23112,18 +23272,24 @@ async fn handle_command(cmd: &str, app: &mut App, event_tx: mpsc::Sender<AppEven
                                                     Vec::new()
                                                 };
                                                 if !to_send.is_empty() {
-                                                    let (cleaned, responses, detected, prompt, _) = process_telnet(&to_send);
-                                                    if !responses.is_empty() {
-                                                        let _ = telnet_tx.send(WriteCommand::Raw(responses)).await;
+                                                    let result = process_telnet(&to_send);
+                                                    if !result.responses.is_empty() {
+                                                        let _ = telnet_tx.send(WriteCommand::Raw(result.responses)).await;
                                                     }
-                                                    if detected {
+                                                    if result.telnet_detected {
                                                         let _ = event_tx_read.send(AppEvent::TelnetDetected(read_world_name.clone())).await;
                                                     }
-                                                    if let Some(prompt_bytes) = prompt {
+                                                    if result.naws_requested {
+                                                        let _ = event_tx_read.send(AppEvent::NawsRequested(read_world_name.clone())).await;
+                                                    }
+                                                    if result.ttype_requested {
+                                                        let _ = event_tx_read.send(AppEvent::TtypeRequested(read_world_name.clone())).await;
+                                                    }
+                                                    if let Some(prompt_bytes) = result.prompt {
                                                         let _ = event_tx_read.send(AppEvent::Prompt(read_world_name.clone(), prompt_bytes)).await;
                                                     }
-                                                    if !cleaned.is_empty() {
-                                                        let _ = event_tx_read.send(AppEvent::ServerData(read_world_name.clone(), cleaned)).await;
+                                                    if !result.cleaned.is_empty() {
+                                                        let _ = event_tx_read.send(AppEvent::ServerData(read_world_name.clone(), result.cleaned)).await;
                                                     }
                                                 }
                                             }
@@ -23352,20 +23518,20 @@ async fn handle_command(cmd: &str, app: &mut App, event_tx: mpsc::Sender<AppEven
                                 Ok(0) => {
                                     // Send any remaining buffered data
                                     if !line_buffer.is_empty() {
-                                        let (cleaned, responses, detected, prompt, _wont_echo) = process_telnet(&line_buffer);
-                                        if !responses.is_empty() {
-                                            let _ = telnet_tx.send(WriteCommand::Raw(responses)).await;
+                                        let result = process_telnet(&line_buffer);
+                                        if !result.responses.is_empty() {
+                                            let _ = telnet_tx.send(WriteCommand::Raw(result.responses)).await;
                                         }
-                                        if detected {
+                                        if result.telnet_detected {
                                             let _ = event_tx_read.send(AppEvent::TelnetDetected(world_name.clone())).await;
                                         }
                                         // Send prompt FIRST for immediate auto-login response
-                                        if let Some(prompt_bytes) = prompt {
+                                        if let Some(prompt_bytes) = result.prompt {
                                             let _ = event_tx_read.send(AppEvent::Prompt(world_name.clone(), prompt_bytes)).await;
                                         }
                                         // Send remaining data
-                                        if !cleaned.is_empty() {
-                                            let _ = event_tx_read.send(AppEvent::ServerData(world_name.clone(), cleaned)).await;
+                                        if !result.cleaned.is_empty() {
+                                            let _ = event_tx_read.send(AppEvent::ServerData(world_name.clone(), result.cleaned)).await;
                                         }
                                     }
                                     let _ = event_tx_read
@@ -23397,38 +23563,52 @@ async fn handle_command(cmd: &str, app: &mut App, event_tx: mpsc::Sender<AppEven
 
                                     if !to_send.is_empty() {
                                         // Process telnet sequences
-                                        let (cleaned, responses, detected, prompt, wont_echo) = process_telnet(&to_send);
+                                        let result = process_telnet(&to_send);
 
                                         // Send telnet responses if any
-                                        if !responses.is_empty() {
-                                            let _ = telnet_tx.send(WriteCommand::Raw(responses)).await;
+                                        if !result.responses.is_empty() {
+                                            let _ = telnet_tx.send(WriteCommand::Raw(result.responses)).await;
                                         }
 
                                         // Notify if telnet detected
-                                        if detected {
+                                        if result.telnet_detected {
                                             let _ = event_tx_read
                                                 .send(AppEvent::TelnetDetected(world_name.clone()))
                                                 .await;
                                         }
 
+                                        // Notify if NAWS was requested (server sent DO NAWS)
+                                        if result.naws_requested {
+                                            let _ = event_tx_read
+                                                .send(AppEvent::NawsRequested(world_name.clone()))
+                                                .await;
+                                        }
+
+                                        // Notify if TTYPE was requested (server sent SB TTYPE SEND)
+                                        if result.ttype_requested {
+                                            let _ = event_tx_read
+                                                .send(AppEvent::TtypeRequested(world_name.clone()))
+                                                .await;
+                                        }
+
                                         // Notify if WONT ECHO seen (for timeout-based prompt detection)
-                                        if wont_echo {
+                                        if result.wont_echo_seen {
                                             let _ = event_tx_read
                                                 .send(AppEvent::WontEchoSeen(world_name.clone()))
                                                 .await;
                                         }
 
-                                        // Send prompt FIRST if detected via telnet GA
-                                        if let Some(prompt_bytes) = prompt {
+                                        // Send prompt FIRST if detected via telnet GA/EOR
+                                        if let Some(prompt_bytes) = result.prompt {
                                             let _ = event_tx_read
                                                 .send(AppEvent::Prompt(world_name.clone(), prompt_bytes))
                                                 .await;
                                         }
 
                                         // Send cleaned data to main loop
-                                        if !cleaned.is_empty()
+                                        if !result.cleaned.is_empty()
                                             && event_tx_read
-                                                .send(AppEvent::ServerData(world_name.clone(), cleaned))
+                                                .send(AppEvent::ServerData(world_name.clone(), result.cleaned))
                                                 .await
                                                 .is_err()
                                         {
@@ -23959,11 +24139,16 @@ fn ui(f: &mut Frame, app: &mut App) {
     let new_output_height = output_height.max(1);
     let new_output_width = f.area().width.max(1);
     // Mark output for redraw if dimensions changed (terminal resize)
-    if new_output_height != app.output_height || new_output_width != app.output_width {
+    let dimensions_changed = new_output_height != app.output_height || new_output_width != app.output_width;
+    if dimensions_changed {
         app.needs_output_redraw = true;
     }
     app.output_height = new_output_height;
     app.output_width = new_output_width;
+    // Send NAWS updates if terminal was resized
+    if dimensions_changed {
+        app.send_naws_to_all_worlds();
+    }
 
     let chunks = Layout::default()
         .direction(Direction::Vertical)

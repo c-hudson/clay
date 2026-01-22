@@ -101,6 +101,8 @@ pub enum WsMessage {
     MarkWorldSeen { world_index: usize },
     /// Update client's view state (world index and visible lines for more-mode calculation)
     UpdateViewState { world_index: usize, visible_lines: usize },
+    /// Update client's output dimensions (for NAWS - report smallest across all instances)
+    UpdateDimensions { width: u16, height: u16 },
     RequestState,  // Request full state resync
 
     // Settings updates (client -> server)
