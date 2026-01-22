@@ -4836,12 +4836,12 @@
                     linesSincePause = 0;
                     updateStatusBar();
                 }
-            } else if (e.key === 'ArrowUp' && !e.ctrlKey && document.activeElement !== elements.input) {
+            } else if (e.key === 'ArrowUp' && !e.ctrlKey && !e.shiftKey && !e.altKey && document.activeElement !== elements.input) {
                 // Up: Switch to previous active world (request from server)
                 e.preventDefault();
                 requestPrevWorld();
                 elements.input.focus();
-            } else if (e.key === 'ArrowDown' && !e.ctrlKey && document.activeElement !== elements.input) {
+            } else if (e.key === 'ArrowDown' && !e.ctrlKey && !e.shiftKey && !e.altKey && document.activeElement !== elements.input) {
                 // Down: Switch to next active world (request from server)
                 e.preventDefault();
                 requestNextWorld();
@@ -4889,24 +4889,26 @@
                 e.preventDefault();
                 releaseAll();
                 scrollToBottom();
-            } else if (e.key === 'ArrowUp' && e.ctrlKey) {
-                // Ctrl+Up: Increase input height
+            } else if (e.key === 'ArrowUp' && e.altKey) {
+                // Alt+Up: Increase input height
                 e.preventDefault();
                 if (inputHeight < 15) {
                     setInputHeight(inputHeight + 1);
                 }
-            } else if (e.key === 'ArrowDown' && e.ctrlKey) {
-                // Ctrl+Down: Decrease input height
+            } else if (e.key === 'ArrowDown' && e.altKey) {
+                // Alt+Down: Decrease input height
                 e.preventDefault();
                 if (inputHeight > 1) {
                     setInputHeight(inputHeight - 1);
                 }
-            } else if (e.key === 'ArrowUp' && !e.ctrlKey) {
+            } else if (e.key === 'ArrowUp' && !e.ctrlKey && !e.shiftKey && !e.altKey) {
                 // Up: Switch to previous active world (request from server)
+                // Ctrl+Up lets browser handle cursor movement in multi-line input
                 e.preventDefault();
                 requestPrevWorld();
-            } else if (e.key === 'ArrowDown' && !e.ctrlKey) {
+            } else if (e.key === 'ArrowDown' && !e.ctrlKey && !e.shiftKey && !e.altKey) {
                 // Down: Switch to next active world (request from server)
+                // Ctrl+Down lets browser handle cursor movement in multi-line input
                 e.preventDefault();
                 requestNextWorld();
             } else if (e.key === 'p' && e.ctrlKey) {

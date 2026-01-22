@@ -7017,9 +7017,10 @@ fn load_reload_state(app: &mut App) -> io::Result<bool> {
         }
 
         // Handle output/pending lines without trimming to preserve leading spaces
+        // Skip empty lines (blank line separators between [output:] and [pending:] sections)
         if current_section == "output" {
             if let Some(idx) = output_world_idx {
-                if idx < temp_worlds.len() {
+                if idx < temp_worlds.len() && !line.is_empty() {
                     temp_worlds[idx].output_lines.push(parse_timestamped_line(line));
                 }
             }
@@ -7027,7 +7028,7 @@ fn load_reload_state(app: &mut App) -> io::Result<bool> {
         }
         if current_section == "pending" {
             if let Some(idx) = pending_world_idx {
-                if idx < temp_worlds.len() {
+                if idx < temp_worlds.len() && !line.is_empty() {
                     temp_worlds[idx].pending_lines.push(parse_timestamped_line(line));
                 }
             }
@@ -10685,12 +10686,6 @@ mod remote_gui {
                             } else if i.consume_key(egui::Modifiers::CTRL, egui::Key::N) {
                                 // Ctrl+N - next command history
                                 history_action = Some(1);
-                            } else if i.consume_key(egui::Modifiers::CTRL, egui::Key::ArrowUp) {
-                                // Ctrl+Up - resize input smaller
-                                resize_input = -1;
-                            } else if i.consume_key(egui::Modifiers::CTRL, egui::Key::ArrowDown) {
-                                // Ctrl+Down - resize input larger
-                                resize_input = 1;
                             } else if i.consume_key(egui::Modifiers::CTRL, egui::Key::W) {
                                 // Ctrl+W - delete word before cursor
                                 delete_word = true;
@@ -10701,22 +10696,16 @@ mod remote_gui {
                                 // Ctrl+A - move cursor to beginning of line
                                 cursor_home = true;
                             }
-                        } else if i.modifiers.shift {
-                            // Shift+Up/Down - cycle through all worlds
-                            if i.consume_key(egui::Modifiers::SHIFT, egui::Key::ArrowUp) {
-                                if !self.worlds.is_empty() {
-                                    let prev = if self.current_world == 0 {
-                                        self.worlds.len() - 1
-                                    } else {
-                                        self.current_world - 1
-                                    };
-                                    switch_world = Some(prev);
-                                }
-                            } else if i.consume_key(egui::Modifiers::SHIFT, egui::Key::ArrowDown)
-                                && !self.worlds.is_empty() {
-                                    let next = (self.current_world + 1) % self.worlds.len();
-                                    switch_world = Some(next);
-                                }
+                        } else if i.modifiers.alt {
+                            // Alt+Up/Down - resize input area
+                            if i.consume_key(egui::Modifiers::ALT, egui::Key::ArrowUp) {
+                                resize_input = -1;
+                            } else if i.consume_key(egui::Modifiers::ALT, egui::Key::ArrowDown) {
+                                resize_input = 1;
+                            }
+                        } else if i.modifiers.ctrl {
+                            // Ctrl+Up/Down - let egui TextEdit handle cursor movement in multi-line input
+                            // (Don't consume these keys so they pass through to the input widget)
                         } else {
                             // Non-modified keys - consume to prevent widgets from handling
                             if i.consume_key(egui::Modifiers::NONE, egui::Key::PageUp) {
@@ -16807,6 +16796,19 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
         if let Err(e) = load_settings(&mut app) {
             startup_messages.push(format!("Warning: Could not load settings: {}", e));
         }
+        // On fresh start, clear all runtime state that was persisted for reload
+        // These values are meaningless without active connections
+        for world in &mut app.worlds {
+            world.connected = false;
+            world.command_tx = None;
+            world.socket_fd = None;
+            world.pending_lines.clear();
+            world.pending_since = None;
+            world.paused = false;
+            world.unseen_lines = 0;
+            world.first_unseen_at = None;
+            world.lines_since_pause = 0;
+        }
     }
 
     // Ensure we have at least one world (creates initial world only if no worlds loaded)
@@ -16814,17 +16816,9 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
     app.ensure_has_world();
     debug_log(true, &format!("STARTUP: Have {} worlds", app.worlds.len()));
 
-    // After reload, clear pending_lines and pause state on ALL worlds since these
-    // are display state that doesn't carry over between sessions
-    // Note: unseen_lines IS preserved to maintain activity notifications
-    if should_load_state && !app.worlds.is_empty() {
-        debug_log(true, "STARTUP: Clearing pending lines...");
-        for world in &mut app.worlds {
-            world.pending_lines.clear();
-            world.pending_since = None;
-            world.paused = false;
-        }
-    }
+    // Note: pending_lines and paused state are preserved across reload
+    // so that more-mode continues seamlessly. Disconnected worlds have their
+    // pending_lines cleared in the cleanup pass below (line ~17205).
 
     // Now display any startup messages
     debug_log(true, "STARTUP: Displaying startup messages...");
@@ -17199,12 +17193,25 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                 world.output_lines
                     .push(OutputLine::new("Connection was not restored during reload. Use /worlds to reconnect.".to_string()));
             }
-            // Clear pending_lines for disconnected worlds - they're only meaningful for active connections
-            // Note: unseen_lines is preserved so user still sees activity indicator for unread output
+
+            // For ALL worlds: flush pending_lines to output_lines so content isn't lost,
+            // then clear more-mode state. This prevents stale activity indicators after reload.
+            if !world.pending_lines.is_empty() {
+                world.output_lines.append(&mut world.pending_lines);
+                // Update scroll_offset to include the newly appended lines
+                world.scroll_offset = world.output_lines.len().saturating_sub(1);
+            } else if world.scroll_offset >= world.output_lines.len() {
+                // Only adjust if scroll_offset is past the end (shouldn't happen, but be safe)
+                world.scroll_offset = world.output_lines.len().saturating_sub(1);
+            }
+            world.pending_since = None;
+            world.paused = false;
+
+            // Clear unseen_lines for disconnected worlds only
+            // (connected worlds may have received new output during reload)
             if !world.connected {
-                world.pending_lines.clear();
-                world.pending_since = None;
-                world.paused = false;
+                world.unseen_lines = 0;
+                world.first_unseen_at = None;
             }
         }
 
@@ -20613,6 +20620,7 @@ enum KeyAction {
 }
 
 fn handle_key_event(key: KeyEvent, app: &mut App) -> KeyAction {
+
     // Handle confirm dialog first (highest priority)
     if app.confirm_dialog.visible {
         match key.code {
@@ -22369,6 +22377,26 @@ fn handle_key_event(key: KeyEvent, app: &mut App) -> KeyAction {
         return KeyAction::None;
     }
 
+    // Ctrl+Up/Down - move cursor up/down in multi-line input
+    if key.code == KeyCode::Up && key.modifiers.contains(KeyModifiers::CONTROL) && !key.modifiers.contains(KeyModifiers::ALT) {
+        app.input.move_cursor_up();
+        return KeyAction::None;
+    }
+    if key.code == KeyCode::Down && key.modifiers.contains(KeyModifiers::CONTROL) && !key.modifiers.contains(KeyModifiers::ALT) {
+        app.input.move_cursor_down();
+        return KeyAction::None;
+    }
+
+    // Alt+Up/Down - resize input area
+    if key.code == KeyCode::Up && key.modifiers.contains(KeyModifiers::ALT) {
+        app.increase_input_height();
+        return KeyAction::None;
+    }
+    if key.code == KeyCode::Down && key.modifiers.contains(KeyModifiers::ALT) {
+        app.decrease_input_height();
+        return KeyAction::None;
+    }
+
     match (key.modifiers, key.code) {
         (KeyModifiers::CONTROL, KeyCode::Char('c')) => {
             // Check if we pressed Ctrl+C within the last 15 seconds
@@ -22426,26 +22454,6 @@ fn handle_key_event(key: KeyEvent, app: &mut App) -> KeyAction {
         }
         (KeyModifiers::NONE, KeyCode::Down) => {
             app.next_world();
-            KeyAction::SwitchedWorld(app.current_world_index)
-        }
-
-        // Resize input area
-        (KeyModifiers::CONTROL, KeyCode::Up) => {
-            app.increase_input_height();
-            KeyAction::None
-        }
-        (KeyModifiers::CONTROL, KeyCode::Down) => {
-            app.decrease_input_height();
-            KeyAction::None
-        }
-
-        // Switch worlds (all that have been connected)
-        (KeyModifiers::SHIFT, KeyCode::Up) => {
-            app.prev_world_all();
-            KeyAction::SwitchedWorld(app.current_world_index)
-        }
-        (KeyModifiers::SHIFT, KeyCode::Down) => {
-            app.next_world_all();
             KeyAction::SwitchedWorld(app.current_world_index)
         }
 

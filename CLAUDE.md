@@ -299,7 +299,8 @@ This logic applies to all interfaces (console, web, GUI). Remote clients query t
 
 **Input Area:**
 - `Left/Right` or `Ctrl+B/Ctrl+F` - Move cursor
-- `Ctrl+Up/Down` - Resize input area (1-15 lines)
+- `Ctrl+Up/Down` - Move cursor up/down in multi-line input
+- `Alt+Up/Down` - Resize input area (1-15 lines)
 - `Ctrl+U` - Clear input
 - `Ctrl+W` - Delete word before cursor
 - `Ctrl+P/N` - Previous/Next command history
@@ -665,7 +666,7 @@ Note: HTTP automatically starts the non-secure WebSocket server if not already r
 - `Ctrl+U` - Clear input
 - `Ctrl+W` - Delete word before cursor
 - `Ctrl+A` - Move cursor to beginning of line
-- `Ctrl+Up/Down` - Resize input area
+- `Alt+Up/Down` - Resize input area
 - `F2` - Toggle MUD tag display (show/hide tags and timestamps)
 - `F4` - Open filter popup to search output
 - `F8` - Toggle action pattern highlighting
@@ -731,7 +732,8 @@ The remote GUI client supports keyboard shortcuts similar to the console client:
 - `Ctrl+W` - Delete word before cursor
 - `Ctrl+A` - Move cursor to beginning of line
 - `Ctrl+P/N` - Previous/Next command history
-- `Ctrl+Up/Down` - Resize input area (1-15 lines)
+- `Ctrl+Up/Down` - Move cursor up/down in multi-line input
+- `Alt+Up/Down` - Resize input area (1-15 lines)
 - `Enter` - Send command
 
 **Output Scrollback:**

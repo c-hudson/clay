@@ -210,6 +210,114 @@ impl InputArea {
         self.adjust_viewport();
     }
 
+    /// Get the column position within the current line (0-indexed, in characters)
+    fn cursor_column(&self) -> usize {
+        if self.width == 0 {
+            return 0;
+        }
+        let chars_before = self.buffer[..self.cursor_position].chars().count();
+        let width = self.width as usize;
+        let first_line_capacity = width.saturating_sub(self.prompt_len);
+
+        if first_line_capacity == 0 {
+            // Prompt fills entire first line
+            chars_before % width
+        } else if chars_before < first_line_capacity {
+            // Still on first line
+            chars_before
+        } else {
+            // Past first line
+            let remaining_chars = chars_before - first_line_capacity;
+            remaining_chars % width
+        }
+    }
+
+    /// Move cursor up one line, maintaining column position if possible
+    pub fn move_cursor_up(&mut self) {
+        let current_line = self.cursor_line();
+        if current_line == 0 {
+            // Already on first line, move to start
+            self.cursor_position = 0;
+            self.adjust_viewport();
+            return;
+        }
+
+        let current_col = self.cursor_column();
+        let width = self.width as usize;
+        let first_line_capacity = width.saturating_sub(self.prompt_len);
+
+        // Calculate target character position
+        let target_char_pos = if current_line == 1 {
+            // Moving to first line (which has prompt)
+            current_col.min(first_line_capacity.saturating_sub(1))
+        } else {
+            // Moving to a non-first line
+            let chars_before_target_line = if current_line == 1 {
+                0
+            } else {
+                first_line_capacity + (current_line - 2) * width
+            };
+            chars_before_target_line + current_col.min(width - 1)
+        };
+
+        // Convert character position to byte position
+        let mut byte_pos = 0;
+        for (i, c) in self.buffer.chars().enumerate() {
+            if i >= target_char_pos {
+                break;
+            }
+            byte_pos += c.len_utf8();
+        }
+        self.cursor_position = byte_pos.min(self.buffer.len());
+        self.adjust_viewport();
+    }
+
+    /// Move cursor down one line, maintaining column position if possible
+    pub fn move_cursor_down(&mut self) {
+        let current_line = self.cursor_line();
+        let current_col = self.cursor_column();
+        let width = self.width as usize;
+        let first_line_capacity = width.saturating_sub(self.prompt_len);
+        let total_chars = self.buffer.chars().count();
+
+        // Calculate total lines
+        let total_lines = if first_line_capacity == 0 {
+            1 + (total_chars + width - 1) / width
+        } else if total_chars <= first_line_capacity {
+            1
+        } else {
+            1 + (total_chars - first_line_capacity + width - 1) / width
+        };
+
+        if current_line >= total_lines.saturating_sub(1) {
+            // Already on last line, move to end
+            self.cursor_position = self.buffer.len();
+            self.adjust_viewport();
+            return;
+        }
+
+        // Calculate target character position on next line
+        let target_char_pos = if current_line == 0 {
+            // Moving from first line to second line
+            first_line_capacity + current_col.min(width - 1)
+        } else {
+            // Moving from non-first line to next line
+            let chars_before_next_line = first_line_capacity + current_line * width;
+            chars_before_next_line + current_col.min(width - 1)
+        };
+
+        // Convert character position to byte position, clamping to buffer length
+        let mut byte_pos = 0;
+        for (i, c) in self.buffer.chars().enumerate() {
+            if i >= target_char_pos {
+                break;
+            }
+            byte_pos += c.len_utf8();
+        }
+        self.cursor_position = byte_pos.min(self.buffer.len());
+        self.adjust_viewport();
+    }
+
     /// Check if a character at the given position should be part of a word.
     /// Includes alphabetic characters and apostrophes between alphabetic characters.
     fn is_word_char(chars: &[char], pos: usize) -> bool {
