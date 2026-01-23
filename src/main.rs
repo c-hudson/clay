@@ -18,7 +18,7 @@ pub fn get_version_string() -> String {
 }
 
 // Re-export commonly used types from modules
-pub use encoding::{Encoding, Theme, WorldSwitchMode, convert_discord_emojis, colorize_square_emojis, is_visually_empty, is_ansi_only_line, strip_non_sgr_sequences};
+pub use encoding::{Encoding, Theme, WorldSwitchMode, convert_discord_emojis, colorize_square_emojis, is_visually_empty, is_ansi_only_line, has_background_color, strip_non_sgr_sequences};
 pub use telnet::{
     WriteCommand, StreamReader, StreamWriter, AutoConnectType, KeepAliveType,
     process_telnet, find_safe_split_point, build_naws_subnegotiation, build_ttype_response, TelnetResult,
@@ -24473,8 +24473,9 @@ fn render_output_crossterm(app: &App) {
         if is_ansi_only_line(&line.text) {
             return Vec::new();
         }
-        // For legitimate blank lines (empty or whitespace-only), render as blank line
-        if is_visually_empty(&line.text) {
+        // For legitimate blank lines (empty or whitespace-only without background colors), render as blank line
+        // Lines with background colors (like ANSI art) should preserve their ANSI codes
+        if is_visually_empty(&line.text) && !has_background_color(&line.text) {
             return vec![("".to_string(), false)];
         }
         // Convert Discord custom emojis to :name: for console display
@@ -24748,8 +24749,9 @@ fn render_output_area(f: &mut Frame, app: &App, area: Rect) {
         if is_ansi_only_line(&line.text) {
             continue;
         }
-        // For legitimate blank lines (empty or whitespace), render as blank line
-        if is_visually_empty(&line.text) {
+        // For legitimate blank lines (empty or whitespace without background colors), render as blank line
+        // Lines with background colors (like ANSI art) should preserve their ANSI codes
+        if is_visually_empty(&line.text) && !has_background_color(&line.text) {
             lines.push(Line::from(""));
             continue;
         }
@@ -27731,6 +27733,71 @@ mod tests {
         assert!(!is_visually_empty("\x1b[31mhello\x1b[0m"));
         assert!(!is_visually_empty("a"));
         assert!(!is_visually_empty("\x1b[0m.\x1b[0m"));
+    }
+
+    #[test]
+    fn test_has_background_color() {
+        use super::has_background_color;
+
+        // No background color
+        assert!(!has_background_color(""));
+        assert!(!has_background_color("hello"));
+        assert!(!has_background_color("\x1b[31mred text\x1b[0m"));
+        assert!(!has_background_color("\x1b[1;32mbold green\x1b[0m"));
+
+        // Standard background colors (40-47)
+        assert!(has_background_color("\x1b[40m"));
+        assert!(has_background_color("\x1b[44mblue bg\x1b[0m"));
+        assert!(has_background_color("\x1b[47m   \x1b[0m"));
+
+        // Bright background colors (100-107)
+        assert!(has_background_color("\x1b[100m"));
+        assert!(has_background_color("\x1b[104m"));
+        assert!(has_background_color("\x1b[107m"));
+
+        // 256-color background (48;5;N)
+        assert!(has_background_color("\x1b[48;5;15m"));
+        assert!(has_background_color("\x1b[48;5;15m   \x1b[0m"));
+        assert!(has_background_color("\x1b[48;5;255mwhite\x1b[0m"));
+
+        // True color background (48;2;R;G;B)
+        assert!(has_background_color("\x1b[48;2;255;255;255m"));
+        assert!(has_background_color("\x1b[48;2;0;0;0mblack\x1b[0m"));
+
+        // Combined foreground and background
+        assert!(has_background_color("\x1b[31;44mred on blue\x1b[0m"));
+        assert!(has_background_color("\x1b[38;5;15;48;5;0m"));
+
+        // Whitespace with background color (ANSI art case)
+        assert!(has_background_color("\x1b[48;5;15m                    \x1b[0m"));
+    }
+
+    #[test]
+    fn test_is_ansi_only_line() {
+        use super::is_ansi_only_line;
+
+        // Empty string is NOT ANSI-only (it's just empty)
+        assert!(!is_ansi_only_line(""));
+
+        // Whitespace-only is NOT ANSI-only
+        assert!(!is_ansi_only_line("   "));
+
+        // Pure ANSI codes without content (garbage that should be filtered)
+        assert!(is_ansi_only_line("\x1b[0m"));
+        assert!(is_ansi_only_line("\x1b[H\x1b[J"));  // Cursor control garbage
+        assert!(is_ansi_only_line("\x1b[31m\x1b[0m"));  // Color codes only
+        assert!(is_ansi_only_line("\x1b[0m   \x1b[31m"));  // ANSI + whitespace only (no bg color)
+
+        // Lines with visible content should NOT be filtered
+        assert!(!is_ansi_only_line("hello"));
+        assert!(!is_ansi_only_line("\x1b[31mhello\x1b[0m"));
+
+        // CRITICAL: Lines with background colors should NOT be filtered even if no visible text
+        // This is the ANSI art case - white background with spaces
+        assert!(!is_ansi_only_line("\x1b[48;5;15m                    \x1b[0m"));
+        assert!(!is_ansi_only_line("\x1b[44m   \x1b[0m"));  // Standard blue bg
+        assert!(!is_ansi_only_line("\x1b[100m\x1b[0m"));  // Bright background
+        assert!(!is_ansi_only_line("\x1b[48;2;255;255;255m  \x1b[0m"));  // True color bg
     }
 
     #[test]

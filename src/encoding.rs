@@ -511,8 +511,8 @@ pub fn is_visually_empty(s: &str) -> bool {
 }
 
 /// Check if a line contains ANSI codes but no visible content.
-/// Returns true for lines that should be filtered (ANSI-only garbage).
-/// Returns false for legitimate blank lines (empty or whitespace-only) and lines with content.
+/// Returns true for lines that should be filtered (ANSI-only garbage like cursor control).
+/// Returns false for legitimate blank lines, lines with content, or lines with background colors.
 pub fn is_ansi_only_line(s: &str) -> bool {
     let mut has_ansi = false;
     let mut in_escape = false;
@@ -531,7 +531,53 @@ pub fn is_ansi_only_line(s: &str) -> bool {
         }
     }
     // Only filter if it had ANSI codes but no visible content
-    has_ansi
+    // BUT don't filter lines with background colors - those are visually meaningful
+    has_ansi && !has_background_color(s)
+}
+
+/// Check if a line has ANSI background color codes.
+/// Returns true if the line contains background color sequences like:
+/// - [48;5;Nm (256-color background)
+/// - [48;2;R;G;Bm (true color background)
+/// - [4Xm where X is 0-7 (standard 8-color background)
+/// - [10Xm where X is 0-7 (bright background)
+pub fn has_background_color(s: &str) -> bool {
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\x1b' {
+            if chars.next() == Some('[') {
+                // Collect the CSI parameters until we hit 'm' or non-numeric
+                let mut params = String::new();
+                while let Some(&ch) = chars.peek() {
+                    if ch == 'm' {
+                        chars.next();
+                        break;
+                    } else if ch.is_ascii_digit() || ch == ';' {
+                        params.push(ch);
+                        chars.next();
+                    } else {
+                        // Not a color code
+                        break;
+                    }
+                }
+                // Check for background color codes in parameters
+                for param in params.split(';') {
+                    // Standard background colors: 40-47
+                    // Bright background colors: 100-107
+                    if let Ok(n) = param.parse::<u32>() {
+                        if (40..=47).contains(&n) || (100..=107).contains(&n) {
+                            return true;
+                        }
+                    }
+                    // 48;5;N or 48;2;R;G;B
+                    if param == "48" {
+                        return true;
+                    }
+                }
+            }
+        }
+    }
+    false
 }
 
 /// Replace colored square emoji with ANSI-colored block characters for console display
