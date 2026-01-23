@@ -322,6 +322,9 @@
     let audioContext = null;
     let ansiMusicEnabled = true;  // Will be synced from server settings
     let tlsProxyEnabled = false;  // TLS proxy for connection preservation over hot reload
+    let tempConvertEnabled = false;  // Temperature conversion (32F -> 32F(0C))
+    let prevInputLen = 0;  // Track previous input length for temp conversion
+    let skipTempConversion = null;  // Temperature to skip re-converting (after user undid conversion)
 
     // ============================================================================
     // Theme Application
@@ -432,6 +435,90 @@
     function resetCompletion() {
         lastCompletionPrefix = '';
         lastCompletionIndex = -1;
+    }
+
+    // Check for temperature patterns and convert them
+    // Patterns: 32F, 32f, 100C, 100c, 32°F, 32.5F, -10C, etc.
+    // When detected, inserts conversion in parentheses: "32F " -> "32F(0C) "
+    function checkTempConversion() {
+        if (!tempConvertEnabled) return;
+
+        const input = elements.input.value;
+        if (!input || input.length === 0) {
+            prevInputLen = 0;
+            return;
+        }
+
+        // Don't convert when user is deleting - allows undoing conversion
+        if (input.length <= prevInputLen) {
+            prevInputLen = input.length;
+            return;
+        }
+        prevInputLen = input.length;
+
+        // Only check when cursor is at the end
+        if (elements.input.selectionStart !== input.length) return;
+
+        const lastChar = input[input.length - 1];
+        // Only trigger on separator characters
+        if (!/[\s.,!?;:\)\]\}]/.test(lastChar)) {
+            // Non-separator typed - clear skip so next temperature can convert
+            skipTempConversion = null;
+            return;
+        }
+
+        // Pattern: optional minus, digits, optional decimal+digits, optional °, F or C
+        // Look for temp pattern just before the separator
+        const match = input.slice(0, -1).match(/(-?\d+\.?\d*)(°?[FfCc])$/);
+        if (!match) return;
+
+        // Make sure it's not part of a word (check char before the number)
+        const numStart = input.length - 1 - match[0].length;
+        if (numStart > 0) {
+            const prevChar = input[numStart - 1];
+            if (/[a-zA-Z0-9_]/.test(prevChar)) return;
+        }
+
+        // Build the full temperature string (e.g., "21F", "-5.5°C")
+        const tempStr = match[0];
+
+        // Check if this temperature was already converted and undone - skip if so
+        if (skipTempConversion === tempStr) {
+            return;
+        }
+
+        const tempValue = parseFloat(match[1]);
+        const unit = match[2].toUpperCase().replace('°', '');
+        if (isNaN(tempValue)) return;
+
+        let converted, convertedUnit;
+        if (unit === 'F') {
+            // Fahrenheit to Celsius
+            converted = (tempValue - 32) * 5 / 9;
+            convertedUnit = 'C';
+        } else {
+            // Celsius to Fahrenheit
+            converted = tempValue * 9 / 5 + 32;
+            convertedUnit = 'F';
+        }
+
+        // Format the conversion - integer if whole, else one decimal
+        // No space before the parenthesis - the separator the user typed goes after
+        const convertedStr = Math.abs(converted - Math.round(converted)) < 0.05
+            ? `(${Math.round(converted)}${convertedUnit})`
+            : `(${converted.toFixed(1)}${convertedUnit})`;
+
+        // Remember this temperature so we don't re-convert if user undoes it
+        skipTempConversion = tempStr;
+
+        // Insert conversion before the separator
+        const beforeSep = input.slice(0, -1);
+        const sep = lastChar;
+        elements.input.value = beforeSep + convertedStr + sep;
+        // Update prevInputLen to reflect new length after conversion
+        prevInputLen = elements.input.value.length;
+        // Move cursor to end
+        elements.input.selectionStart = elements.input.selectionEnd = elements.input.value.length;
     }
 
     // Parse a command string and return command object
@@ -981,6 +1068,9 @@
                     if (msg.settings.tls_proxy_enabled !== undefined) {
                         tlsProxyEnabled = msg.settings.tls_proxy_enabled;
                     }
+                    if (msg.settings.temp_convert_enabled !== undefined) {
+                        tempConvertEnabled = msg.settings.temp_convert_enabled;
+                    }
                     // Web settings
                     if (msg.settings.web_secure !== undefined) {
                         webSecure = msg.settings.web_secure;
@@ -1194,6 +1284,9 @@
                     }
                     if (msg.settings.tls_proxy_enabled !== undefined) {
                         tlsProxyEnabled = msg.settings.tls_proxy_enabled;
+                    }
+                    if (msg.settings.temp_convert_enabled !== undefined) {
+                        tempConvertEnabled = msg.settings.temp_convert_enabled;
                     }
                     if (msg.settings.world_switch_mode !== undefined) {
                         worldSwitchMode = msg.settings.world_switch_mode;
@@ -3179,6 +3272,7 @@
             type: 'UpdateGlobalSettings',
             more_mode_enabled: moreModeEnabled,
             spell_check_enabled: true,
+            temp_convert_enabled: tempConvertEnabled,
             world_switch_mode: worldSwitchMode,
             show_tags: showTags,
             ansi_music_enabled: ansiMusicEnabled,
@@ -3274,6 +3368,7 @@
             type: 'UpdateGlobalSettings',
             more_mode_enabled: moreModeEnabled,
             spell_check_enabled: true,
+            temp_convert_enabled: tempConvertEnabled,
             world_switch_mode: worldSwitchMode,
             show_tags: showTags,
             ansi_music_enabled: ansiMusicEnabled,
@@ -4967,8 +5062,10 @@
         });
 
         // Reset command completion state when input changes (typing, not Tab)
+        // Also check for temperature conversion
         elements.input.addEventListener('input', function() {
             resetCompletion();
+            checkTempConversion();
         });
 
         // Auth submit

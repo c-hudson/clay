@@ -897,6 +897,7 @@ enum SettingsField {
     // Global settings (setup menu)
     MoreMode,
     SpellCheck,
+    TempConvert,
     WorldSwitching,
     Debug,
     ShowTags,
@@ -1055,7 +1056,8 @@ impl SettingsField {
     fn next_setup(&self) -> Self {
         match self {
             SettingsField::MoreMode => SettingsField::SpellCheck,
-            SettingsField::SpellCheck => SettingsField::WorldSwitching,
+            SettingsField::SpellCheck => SettingsField::TempConvert,
+            SettingsField::TempConvert => SettingsField::WorldSwitching,
             SettingsField::WorldSwitching => SettingsField::Debug,
             SettingsField::Debug => SettingsField::ShowTags,
             SettingsField::ShowTags => SettingsField::InputHeight,
@@ -1074,7 +1076,8 @@ impl SettingsField {
         match self {
             SettingsField::MoreMode => SettingsField::CancelSetup,
             SettingsField::SpellCheck => SettingsField::MoreMode,
-            SettingsField::WorldSwitching => SettingsField::SpellCheck,
+            SettingsField::TempConvert => SettingsField::SpellCheck,
+            SettingsField::WorldSwitching => SettingsField::TempConvert,
             SettingsField::Debug => SettingsField::WorldSwitching,
             SettingsField::ShowTags => SettingsField::Debug,
             SettingsField::InputHeight => SettingsField::ShowTags,
@@ -1123,6 +1126,7 @@ struct SettingsPopup {
     // Temp values for global settings
     temp_more_mode: bool,
     temp_spell_check: bool,
+    temp_temp_convert: bool,
     temp_world_switch_mode: WorldSwitchMode,
     temp_debug_enabled: bool,
     temp_show_tags: bool,
@@ -1164,6 +1168,7 @@ impl SettingsPopup {
             temp_discord_dm_user: String::new(),
             temp_more_mode: true,
             temp_spell_check: true,
+            temp_temp_convert: false,
             temp_world_switch_mode: WorldSwitchMode::UnseenFirst,
             temp_debug_enabled: false,
             temp_show_tags: false,
@@ -1206,6 +1211,7 @@ impl SettingsPopup {
         // Load from global settings
         self.temp_more_mode = settings.more_mode_enabled;
         self.temp_spell_check = settings.spell_check_enabled;
+        self.temp_temp_convert = settings.temp_convert_enabled;
         self.temp_world_switch_mode = settings.world_switch_mode;
         self.temp_show_tags = show_tags;
         self.temp_input_height = input_height;
@@ -1220,6 +1226,7 @@ impl SettingsPopup {
         // Load from global settings only
         self.temp_more_mode = settings.more_mode_enabled;
         self.temp_spell_check = settings.spell_check_enabled;
+        self.temp_temp_convert = settings.temp_convert_enabled;
         self.temp_world_switch_mode = settings.world_switch_mode;
         self.temp_debug_enabled = settings.debug_enabled;
         self.temp_show_tags = show_tags;
@@ -1391,6 +1398,7 @@ impl SettingsPopup {
             SettingsField::LogFile => self.temp_log_enabled = !self.temp_log_enabled,
             SettingsField::MoreMode => self.temp_more_mode = !self.temp_more_mode,
             SettingsField::SpellCheck => self.temp_spell_check = !self.temp_spell_check,
+            SettingsField::TempConvert => self.temp_temp_convert = !self.temp_temp_convert,
             SettingsField::WorldSwitching => self.temp_world_switch_mode = self.temp_world_switch_mode.next(),
             SettingsField::Debug => self.temp_debug_enabled = !self.temp_debug_enabled,
             SettingsField::ShowTags => self.temp_show_tags = !self.temp_show_tags,
@@ -1428,6 +1436,7 @@ impl SettingsPopup {
         // Apply global settings
         settings.more_mode_enabled = self.temp_more_mode;
         settings.spell_check_enabled = self.temp_spell_check;
+        settings.temp_convert_enabled = self.temp_temp_convert;
         settings.world_switch_mode = self.temp_world_switch_mode;
         settings.theme = self.temp_theme;
         // Apply world-specific settings (only in world mode)
@@ -1462,6 +1471,7 @@ impl SettingsPopup {
         // Apply only global settings (for setup mode)
         settings.more_mode_enabled = self.temp_more_mode;
         settings.spell_check_enabled = self.temp_spell_check;
+        settings.temp_convert_enabled = self.temp_temp_convert;
         settings.world_switch_mode = self.temp_world_switch_mode;
         settings.debug_enabled = self.temp_debug_enabled;
         settings.theme = self.temp_theme;
@@ -3086,6 +3096,7 @@ impl ActionsPopup {
 struct Settings {
     more_mode_enabled: bool,
     spell_check_enabled: bool,
+    temp_convert_enabled: bool,  // Temperature conversion (e.g., 32F -> 32F (0C))
     world_switch_mode: WorldSwitchMode,
     debug_enabled: bool,    // Debug logging to clay.debug.log
     ansi_music_enabled: bool, // Enable ANSI music playback (web/GUI only)
@@ -3123,6 +3134,7 @@ impl Default for Settings {
         Self {
             more_mode_enabled: true,
             spell_check_enabled: true,
+            temp_convert_enabled: false,  // Disabled by default
             world_switch_mode: WorldSwitchMode::UnseenFirst,
             debug_enabled: false,
             ansi_music_enabled: true,  // ANSI music enabled by default
@@ -4709,6 +4721,7 @@ struct App {
     spell_checker: SpellChecker,
     spell_state: SpellState,
     last_input_was_delete: bool, // Track if last input action was backspace/delete (for spell check)
+    skip_temp_conversion: Option<String>, // Temperature to skip re-converting (after user undid conversion)
     cached_misspelled: Vec<(usize, usize)>, // Cached misspelled word ranges (char positions)
     suggestion_message: Option<String>,
     settings: Settings,
@@ -4774,6 +4787,7 @@ impl App {
             spell_checker: SpellChecker::new(),
             spell_state: SpellState::new(),
             last_input_was_delete: false,
+            skip_temp_conversion: None,
             cached_misspelled: Vec::new(),
             suggestion_message: None,
             settings: Settings::default(),
@@ -5264,6 +5278,7 @@ impl App {
         let settings = GlobalSettingsMsg {
             more_mode_enabled: self.settings.more_mode_enabled,
             spell_check_enabled: self.settings.spell_check_enabled,
+            temp_convert_enabled: self.settings.temp_convert_enabled,
             world_switch_mode: self.settings.world_switch_mode.name().to_string(),
             debug_enabled: self.settings.debug_enabled,
             show_tags: self.show_tags,
@@ -5394,6 +5409,139 @@ impl App {
                 self.suggestion_message = None;
             }
         }
+    }
+
+    /// Check for temperature patterns and convert them when followed by a separator.
+    /// Patterns: 32F, 32f, 100C, 100c, 32°F, 32.5F, -10C, etc.
+    /// When detected, inserts conversion in parentheses: "32F " -> "32F (0C) "
+    fn check_temp_conversion(&mut self) {
+        if !self.settings.temp_convert_enabled {
+            return;
+        }
+
+        // Don't convert when user is deleting (backspace/delete) - allows undoing conversion
+        if self.last_input_was_delete {
+            return;
+        }
+
+        let chars: Vec<char> = self.input.buffer.chars().collect();
+        if chars.is_empty() {
+            return;
+        }
+
+        // Only check when cursor is at the end (just typed a character)
+        let cursor_char_pos = self.input.buffer[..self.input.cursor_position].chars().count();
+        if cursor_char_pos != chars.len() {
+            return;
+        }
+
+        // Check if we just typed a separator after a temperature
+        let last_char = chars[chars.len() - 1];
+        if !last_char.is_whitespace() && !matches!(last_char, '.' | ',' | '!' | '?' | ';' | ':' | ')' | ']' | '}') {
+            return;
+        }
+
+        // Look backwards for a temperature pattern before the separator
+        // Pattern: optional minus, digits, optional decimal+digits, optional °, F or C
+        let mut end = chars.len() - 1; // Position of the separator
+        if end == 0 {
+            return;
+        }
+
+        // Find the F/C unit character
+        let unit_pos = end - 1;
+        let unit_char = chars[unit_pos].to_ascii_uppercase();
+        if unit_char != 'F' && unit_char != 'C' {
+            return;
+        }
+
+        // Check for optional degree symbol before the unit
+        let mut num_end = unit_pos;
+        if num_end > 0 && chars[num_end - 1] == '°' {
+            num_end -= 1;
+        }
+
+        // Find the start of the number (digits, optional decimal, optional leading minus)
+        let mut num_start = num_end;
+        let mut found_digit = false;
+        let mut found_decimal = false;
+
+        while num_start > 0 {
+            let c = chars[num_start - 1];
+            if c.is_ascii_digit() {
+                found_digit = true;
+                num_start -= 1;
+            } else if c == '.' && !found_decimal {
+                found_decimal = true;
+                num_start -= 1;
+            } else if c == '-' && num_start == num_end - (if found_decimal { 2 } else { 1 }) + 1 {
+                // Only allow minus at the very start of the number
+                num_start -= 1;
+                break;
+            } else {
+                break;
+            }
+        }
+
+        // Check we have at least one digit
+        if !found_digit {
+            return;
+        }
+
+        // Make sure the character before the number isn't part of the "word"
+        // (e.g., "abc32F" shouldn't trigger, but "test 32F" should)
+        if num_start > 0 {
+            let prev_char = chars[num_start - 1];
+            if prev_char.is_alphanumeric() || prev_char == '_' {
+                return;
+            }
+        }
+
+        // Build the full temperature string (e.g., "21F", "-5.5°C")
+        let temp_str: String = chars[num_start..=unit_pos].iter().collect();
+
+        // Check if this temperature was already converted and undone - skip if so
+        if let Some(ref skip) = self.skip_temp_conversion {
+            if skip == &temp_str {
+                return;
+            }
+        }
+
+        // Parse the number
+        let num_str: String = chars[num_start..num_end].iter().collect();
+        let temp: f64 = match num_str.parse() {
+            Ok(t) => t,
+            Err(_) => return,
+        };
+
+        // Convert temperature
+        let (converted, converted_unit) = if unit_char == 'F' {
+            // Fahrenheit to Celsius: (F - 32) * 5/9
+            ((temp - 32.0) * 5.0 / 9.0, 'C')
+        } else {
+            // Celsius to Fahrenheit: C * 9/5 + 32
+            (temp * 9.0 / 5.0 + 32.0, 'F')
+        };
+
+        // Format the conversion - use integer if whole number, else one decimal
+        // No space before the parenthesis - the separator the user typed goes after
+        let converted_str = if (converted - converted.round()).abs() < 0.05 {
+            format!("({:.0}{})", converted, converted_unit)
+        } else {
+            format!("({:.1}{})", converted, converted_unit)
+        };
+
+        // Remember this temperature so we don't re-convert if user undoes it
+        self.skip_temp_conversion = Some(temp_str);
+
+        // Insert the conversion before the separator
+        // Build new buffer: [before separator] + conversion + [separator]
+        let before_sep: String = chars[..end].iter().collect();
+        let sep: String = chars[end..].iter().collect();
+        self.input.buffer = format!("{}{}{}", before_sep, converted_str, sep);
+
+        // Move cursor to after the conversion and separator
+        self.input.cursor_position = self.input.buffer.len();
     }
 
     fn find_misspelled_words(&mut self) -> Vec<(usize, usize)> {
@@ -5796,6 +5944,7 @@ fn save_settings(app: &App) -> io::Result<()> {
     writeln!(file, "[global]")?;
     writeln!(file, "more_mode={}", app.settings.more_mode_enabled)?;
     writeln!(file, "spell_check={}", app.settings.spell_check_enabled)?;
+    writeln!(file, "temp_convert={}", app.settings.temp_convert_enabled)?;
     writeln!(file, "world_switch_mode={}", app.settings.world_switch_mode.name())?;
     writeln!(file, "debug_enabled={}", app.settings.debug_enabled)?;
     writeln!(file, "ansi_music_enabled={}", app.settings.ansi_music_enabled)?;
@@ -6068,6 +6217,9 @@ fn load_settings(app: &mut App) -> io::Result<()> {
                     }
                     "spell_check" => {
                         app.settings.spell_check_enabled = value == "true";
+                    }
+                    "temp_convert" => {
+                        app.settings.temp_convert_enabled = value == "true";
                     }
                     "pending_first" => {
                         // Backward compatibility: pending_first=true -> UnseenFirst
@@ -6657,6 +6809,7 @@ fn save_reload_state(app: &App) -> io::Result<()> {
     writeln!(file, "input_height={}", app.input_height)?;
     writeln!(file, "more_mode={}", app.settings.more_mode_enabled)?;
     writeln!(file, "spell_check={}", app.settings.spell_check_enabled)?;
+    writeln!(file, "temp_convert={}", app.settings.temp_convert_enabled)?;
     writeln!(file, "world_switch_mode={}", app.settings.world_switch_mode.name())?;
     writeln!(file, "debug_enabled={}", app.settings.debug_enabled)?;
     writeln!(file, "ansi_music_enabled={}", app.settings.ansi_music_enabled)?;
@@ -7060,6 +7213,9 @@ fn load_reload_state(app: &mut App) -> io::Result<bool> {
                     }
                     "spell_check" => {
                         app.settings.spell_check_enabled = value == "true";
+                    }
+                    "temp_convert" => {
+                        app.settings.temp_convert_enabled = value == "true";
                     }
                     "pending_first" => {
                         // Backward compatibility: pending_first=true -> UnseenFirst
@@ -8074,6 +8230,10 @@ mod remote_gui {
         current_world: usize,
         /// Input buffer for commands
         input_buffer: String,
+        /// Previous input buffer length (for detecting deletes vs inserts)
+        prev_input_len: usize,
+        /// Temperature to skip re-converting (after user undid conversion)
+        skip_temp_conversion: Option<String>,
         /// Command completion state - last partial command that was completed
         completion_prefix: String,
         /// Command completion state - index of last match used
@@ -8150,6 +8310,8 @@ mod remote_gui {
         more_mode: bool,
         /// Spell check enabled
         spell_check_enabled: bool,
+        /// Temperature conversion enabled
+        temp_convert_enabled: bool,
         /// Filter text for output
         filter_text: String,
         /// Whether filter popup is open
@@ -8312,6 +8474,8 @@ mod remote_gui {
                 worlds: Vec::new(),
                 current_world: 0,
                 input_buffer: String::new(),
+                prev_input_len: 0,
+                skip_temp_conversion: None,
                 completion_prefix: String::new(),
                 completion_index: 0,
                 ws_tx: None,
@@ -8356,6 +8520,7 @@ mod remote_gui {
                 highlight_actions: false,
                 more_mode: true,
                 spell_check_enabled: true,
+                temp_convert_enabled: false,
                 filter_text: String::new(),
                 filter_active: false,
                 ws_allow_list: String::new(),
@@ -8746,6 +8911,7 @@ mod remote_gui {
                             self.debug_enabled = settings.debug_enabled;
                             self.more_mode = settings.more_mode_enabled;
                             self.spell_check_enabled = settings.spell_check_enabled;
+                            self.temp_convert_enabled = settings.temp_convert_enabled;
                             self.show_tags = settings.show_tags;
                             self.ansi_music_enabled = settings.ansi_music_enabled;
                             self.tls_proxy_enabled = settings.tls_proxy_enabled;
@@ -8897,6 +9063,7 @@ mod remote_gui {
                             self.debug_enabled = settings.debug_enabled;
                             self.more_mode = settings.more_mode_enabled;
                             self.spell_check_enabled = settings.spell_check_enabled;
+                            self.temp_convert_enabled = settings.temp_convert_enabled;
                             self.show_tags = settings.show_tags;
                             self.ansi_music_enabled = settings.ansi_music_enabled;
                             self.tls_proxy_enabled = settings.tls_proxy_enabled;
@@ -9195,6 +9362,137 @@ mod remote_gui {
             misspelled
         }
 
+        /// Check for temperature patterns and convert them when followed by a separator.
+        /// Patterns: 32F, 32f, 100C, 100c, 32°F, 32.5F, -10C, etc.
+        /// When detected, inserts conversion in parentheses: "32F " -> "32F(0C) "
+        fn check_temp_conversion(&mut self) {
+            if !self.temp_convert_enabled {
+                return;
+            }
+
+            let current_len = self.input_buffer.len();
+            // Don't convert when user is deleting - allows undoing conversion
+            if current_len <= self.prev_input_len {
+                self.prev_input_len = current_len;
+                return;
+            }
+            self.prev_input_len = current_len;
+
+            let chars: Vec<char> = self.input_buffer.chars().collect();
+            if chars.is_empty() {
+                return;
+            }
+
+            // Check if we just typed a separator after a temperature
+            let last_char = chars[chars.len() - 1];
+            if !last_char.is_whitespace() && !matches!(last_char, '.' | ',' | '!' | '?' | ';' | ':' | ')' | ']' | '}') {
+                // Non-separator typed - clear skip so next temperature can convert
+                self.skip_temp_conversion = None;
+                return;
+            }
+
+            // Look backwards for a temperature pattern before the separator
+            // Pattern: optional minus, digits, optional decimal+digits, optional °, F or C
+            let end = chars.len() - 1; // Position of the separator
+            if end == 0 {
+                return;
+            }
+
+            // Find the F/C unit character
+            let unit_pos = end - 1;
+            let unit_char = chars[unit_pos].to_ascii_uppercase();
+            if unit_char != 'F' && unit_char != 'C' {
+                return;
+            }
+
+            // Check for optional degree symbol before the unit
+            let mut num_end = unit_pos;
+            if num_end > 0 && chars[num_end - 1] == '°' {
+                num_end -= 1;
+            }
+
+            // Find the start of the number (digits, optional decimal, optional leading minus)
+            let mut num_start = num_end;
+            let mut found_digit = false;
+            let mut found_decimal = false;
+
+            while num_start > 0 {
+                let c = chars[num_start - 1];
+                if c.is_ascii_digit() {
+                    found_digit = true;
+                    num_start -= 1;
+                } else if c == '.' && !found_decimal {
+                    found_decimal = true;
+                    num_start -= 1;
+                } else if c == '-' && num_start == num_end - (if found_decimal { 2 } else { 1 }) + 1 {
+                    // Only allow minus at the very start of the number
+                    num_start -= 1;
+                    break;
+                } else {
+                    break;
+                }
+            }
+
+            // Check we have at least one digit
+            if !found_digit {
+                return;
+            }
+
+            // Make sure the character before the number isn't part of the "word"
+            // (e.g., "abc32F" shouldn't trigger, but "test 32F" should)
+            if num_start > 0 {
+                let prev_char = chars[num_start - 1];
+                if prev_char.is_alphanumeric() || prev_char == '_' {
+                    return;
+                }
+            }
+
+            // Build the full temperature string (e.g., "21F", "-5.5°C")
+            let temp_str: String = chars[num_start..=unit_pos].iter().collect();
+
+            // Check if this temperature was already converted and undone - skip if so
+            if let Some(ref skip) = self.skip_temp_conversion {
+                if skip == &temp_str {
+                    return;
+                }
+            }
+
+            // Parse the number
+            let num_str: String = chars[num_start..num_end].iter().collect();
+            let temp: f64 = match num_str.parse() {
+                Ok(t) => t,
+                Err(_) => return,
+            };
+
+            // Convert temperature
+            let (converted, converted_unit) = if unit_char == 'F' {
+                // Fahrenheit to Celsius: (F - 32) * 5/9
+                ((temp - 32.0) * 5.0 / 9.0, 'C')
+            } else {
+                // Celsius to Fahrenheit: C * 9/5 + 32
+                (temp * 9.0 / 5.0 + 32.0, 'F')
+            };
+
+            // Format the conversion - use integer if whole number, else one decimal
+            // No space before the parenthesis - the separator the user typed goes after
+            let converted_str = if (converted - converted.round()).abs() < 0.05 {
+                format!("({:.0}{})", converted, converted_unit)
+            } else {
+                format!("({:.1}{})", converted, converted_unit)
+            };
+
+            // Remember this temperature so we don't re-convert if user undoes it
+            self.skip_temp_conversion = Some(temp_str);
+
+            // Insert the conversion before the separator
+            // Build new buffer: [before separator] + conversion + [separator]
+            let before_sep: String = chars[..end].iter().collect();
+            let sep: String = chars[end..].iter().collect();
+            self.input_buffer = format!("{}{}{}", before_sep, converted_str, sep);
+            // Update prev_input_len to reflect new length after conversion
+            self.prev_input_len = self.input_buffer.len();
+        }
+
         /// Get the word at or before the cursor position
         fn current_word(&self) -> Option<(usize, usize, String)> {
             let chars: Vec<char> = self.input_buffer.chars().collect();
@@ -9361,6 +9659,7 @@ mod remote_gui {
                 let _ = tx.send(WsMessage::UpdateGlobalSettings {
                     more_mode_enabled: self.more_mode,
                     spell_check_enabled: self.spell_check_enabled,
+                    temp_convert_enabled: self.temp_convert_enabled,
                     world_switch_mode: self.world_switch_mode.name().to_string(),
                     show_tags: self.show_tags,
                     ansi_music_enabled: self.ansi_music_enabled,
@@ -10330,7 +10629,9 @@ mod remote_gui {
 
                             for (start, end, url) in &url_ranges {
                                 if click_char >= *start && click_char < *end {
-                                    Self::open_url(url);
+                                    // Strip zero-width spaces that were inserted for word breaking
+                                    let clean_url = url.replace('\u{200B}', "");
+                                    Self::open_url(&clean_url);
                                     break;
                                 }
                             }
@@ -10497,14 +10798,6 @@ mod remote_gui {
                 egui::CentralPanel::default()
                     .frame(egui::Frame::none().fill(theme.bg_deep()))
                     .show(ctx, |ui| {
-                    // Guard against first frame with invalid dimensions
-                    let avail = ui.available_size();
-                    if avail.x <= 0.0 || avail.y <= 0.0 || avail.x.is_nan() || avail.y.is_nan() ||
-                       !avail.x.is_finite() || !avail.y.is_finite() {
-                        return;
-                    }
-                    // Use ScrollArea to handle overflow without NaN panics
-                    egui::ScrollArea::vertical().show(ui, |ui| {
                     ui.vertical_centered(|ui| {
                         ui.add_space(30.0);
 
@@ -10522,42 +10815,31 @@ mod remote_gui {
                         ui.label(egui::RichText::new("/help for how to use clay").color(theme.fg_muted()));
                         ui.add_space(20.0);
 
-                        // Login stripe - full width with top/bottom borders only
-                        let screen_rect = ctx.screen_rect();
-                        let stripe_top = ui.cursor().top();
+                        // Auto-connect on first frame to check if allow list grants access
+                        if !self.auto_connect_attempted && !self.connected {
+                            self.auto_connect_attempted = true;
+                            self.connect_websocket();
+                        }
 
-                        // Content frame (no fill - we paint full-width stripe after)
-                        let _content_response = egui::Frame::none()
-                            .inner_margin(egui::Margin::symmetric(20.0, 20.0))
+                        // Check if we're still waiting for allow list response (500ms timeout)
+                        let allow_list_timeout = std::time::Duration::from_millis(500);
+                        let still_checking_allow_list = self.connected
+                            && !self.authenticated
+                            && !self.password_submitted
+                            && self.connect_time.is_some_and(|t| t.elapsed() < allow_list_timeout);
+
+                        // Login card with Frame
+                        egui::Frame::none()
+                            .fill(theme.bg_surface())
+                            .stroke(egui::Stroke::new(1.0, theme.border_subtle()))
+                            .rounding(egui::Rounding::same(8.0))
+                            .inner_margin(egui::Margin::same(20.0))
                             .show(ui, |ui| {
-                                // Guard against invalid dimensions and NaN positions
-                                let avail = ui.available_size();
-                                let cursor = ui.cursor();
-                                if !avail.x.is_finite() || !avail.y.is_finite() || avail.x <= 0.0 || avail.y <= 0.0 ||
-                                   !cursor.left().is_finite() || !cursor.top().is_finite() {
-                                    return;
-                                }
-                                ui.set_min_width(280.0);
-                                ui.set_max_width(280.0);
-
                                 // Server address
                                 ui.label(egui::RichText::new(format!("Connecting to {}", self.ws_url))
                                     .color(theme.fg_muted())
                                     .size(11.0));
                                 ui.add_space(16.0);
-
-                                // Auto-connect on first frame to check if allow list grants access
-                                if !self.auto_connect_attempted && !self.connected {
-                                    self.auto_connect_attempted = true;
-                                    self.connect_websocket();
-                                }
-
-                                // Check if we're still waiting for allow list response (500ms timeout)
-                                let allow_list_timeout = std::time::Duration::from_millis(500);
-                                let still_checking_allow_list = self.connected
-                                    && !self.authenticated
-                                    && !self.password_submitted
-                                    && self.connect_time.is_some_and(|t| t.elapsed() < allow_list_timeout);
 
                                 // Show connection status or password prompt
                                 if still_checking_allow_list {
@@ -10568,16 +10850,22 @@ mod remote_gui {
                                     ctx.request_repaint();
                                 }
 
-                                // Password label
-                                ui.label(egui::RichText::new("PASSWORD")
-                                    .color(theme.fg_muted())
-                                    .size(10.0));
+                                // Password label - left justified with field
+                                ui.allocate_ui_with_layout(
+                                    egui::vec2(280.0, 14.0),
+                                    egui::Layout::left_to_right(egui::Align::Center),
+                                    |ui| {
+                                        ui.label(egui::RichText::new("PASSWORD")
+                                            .color(theme.fg_muted())
+                                            .size(10.0));
+                                    }
+                                );
                                 ui.add_space(4.0);
 
                                 // Password input with custom styling
                                 let password_edit = TextEdit::singleline(&mut self.password)
                                     .password(true)
-                                    .desired_width(f32::INFINITY)
+                                    .desired_width(280.0)
                                     .margin(egui::Margin::symmetric(12.0, 8.0));
                                 let response = ui.add(password_edit);
 
@@ -10592,10 +10880,10 @@ mod remote_gui {
 
                                 ui.add_space(15.0);
 
-                                // Connect button - styled as primary, right justified
+                                // Connect button - styled as primary, right justified with password field
                                 let button_size = egui::vec2(80.0, 32.0);
                                 ui.allocate_ui_with_layout(
-                                    egui::vec2(ui.available_width(), button_size.y),
+                                    egui::vec2(280.0, button_size.y),
                                     egui::Layout::right_to_left(egui::Align::Center),
                                     |ui| {
                                         let button = egui::Button::new(
@@ -10621,32 +10909,13 @@ mod remote_gui {
 
                                 // Error message
                                 if let Some(ref err) = self.error_message {
-                                    // Guard against NaN positions before adding widgets
-                                    let cursor = ui.cursor();
-                                    if cursor.left().is_finite() && cursor.top().is_finite() {
-                                        ui.add_space(12.0);
-                                        ui.label(egui::RichText::new(err.as_str())
-                                            .color(theme.error())
-                                            .size(12.0));
-                                    }
+                                    ui.add_space(12.0);
+                                    ui.label(egui::RichText::new(err.as_str())
+                                        .color(theme.error())
+                                        .size(12.0));
                                 }
                             });
-
-                        // Draw full-width stripe background and top/bottom borders
-                        let stripe_bottom = ui.cursor().top();
-                        let stripe_rect = egui::Rect::from_min_max(
-                            egui::pos2(screen_rect.min.x, stripe_top),
-                            egui::pos2(screen_rect.max.x, stripe_bottom),
-                        );
-                        // Paint full-width background using background order
-                        let bg_layer = egui::LayerId::new(egui::Order::Background, ui.layer_id().id);
-                        ui.ctx().layer_painter(bg_layer).rect_filled(stripe_rect, egui::Rounding::ZERO, theme.bg_surface());
-                        // Draw border lines on top
-                        let border_color = theme.border_subtle();
-                        ui.painter().hline(screen_rect.min.x..=screen_rect.max.x, stripe_top, egui::Stroke::new(1.0, border_color));
-                        ui.painter().hline(screen_rect.min.x..=screen_rect.max.x, stripe_bottom, egui::Stroke::new(1.0, border_color));
                     });
-                    }); // ScrollArea
                 });
             } else {
                 // Show main interface with menu bar
@@ -11302,6 +11571,11 @@ mod remote_gui {
                         });
 
                         let response = scroll_output.inner;
+
+                        // Check for temperature conversion when input changes
+                        if response.changed() {
+                            self.check_temp_conversion();
+                        }
 
                         // Calculate cursor position and scroll to it if needed
                         if response.has_focus() {
@@ -11997,7 +12271,9 @@ mod remote_gui {
 
                                         for (start, end, url) in &url_ranges {
                                             if click_char >= *start && click_char < *end {
-                                                Self::open_url(url);
+                                                // Strip zero-width spaces that were inserted for word breaking
+                                                let clean_url = url.replace('\u{200B}', "");
+                                                Self::open_url(&clean_url);
                                                 break;
                                             }
                                         }
@@ -13431,6 +13707,7 @@ mod remote_gui {
                     // Copy state for editing in viewport
                     let mut more_mode = self.more_mode;
                     let mut spell_check = self.spell_check_enabled;
+                    let mut temp_convert = self.temp_convert_enabled;
                     let mut world_switch = self.world_switch_mode;
                     let debug_enabled = self.debug_enabled;
                     let mut show_tags = self.show_tags;
@@ -13858,11 +14135,14 @@ mod remote_gui {
                                     });
                                     ui.add_space(6.0);
 
-                                    // Row 3: TLS Proxy (single item)
+                                    // Row 3: TLS Proxy | Temp Convert
                                     ui.horizontal(|ui| {
                                         ui.set_height(row_height);
                                         ui.allocate_ui(egui::vec2(col_total_width, row_height), |ui| {
                                             toggle_col(ui, "TLS PROXY", "tls_proxy_toggle", &mut tls_proxy);
+                                        });
+                                        ui.allocate_ui(egui::vec2(col_total_width, row_height), |ui| {
+                                            toggle_col(ui, "TEMP CONVERT", "temp_convert_toggle", &mut temp_convert);
                                         });
                                     });
                             });
@@ -13880,6 +14160,7 @@ mod remote_gui {
                     // Apply changes back (live preview for transparency)
                     self.more_mode = more_mode;
                     self.spell_check_enabled = spell_check;
+                    self.temp_convert_enabled = temp_convert;
                     self.world_switch_mode = world_switch;
                     self.debug_enabled = debug_enabled;
                     self.show_tags = show_tags;
@@ -16329,6 +16610,7 @@ fn build_multiuser_initial_state(app: &App, username: &str) -> WsMessage {
     let settings = GlobalSettingsMsg {
         more_mode_enabled: app.settings.more_mode_enabled,
         spell_check_enabled: app.settings.spell_check_enabled,
+        temp_convert_enabled: app.settings.temp_convert_enabled,
         world_switch_mode: app.settings.world_switch_mode.name().to_string(),
         debug_enabled: app.settings.debug_enabled,
         show_tags: app.show_tags,
@@ -17806,6 +18088,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                         KeyAction::None => {}
                     }
                     app.check_word_ended();
+                    app.check_temp_conversion();
                 }
             }
 
@@ -19049,10 +19332,11 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                     });
                                 }
                             }
-                            WsMessage::UpdateGlobalSettings { more_mode_enabled, spell_check_enabled, world_switch_mode, show_tags, ansi_music_enabled, console_theme, gui_theme, gui_transparency, color_offset_percent, input_height, font_name, font_size, web_font_size_phone, web_font_size_tablet, web_font_size_desktop, ws_allow_list, web_secure, http_enabled, http_port, ws_enabled, ws_port, ws_cert_file, ws_key_file, tls_proxy_enabled } => {
+                            WsMessage::UpdateGlobalSettings { more_mode_enabled, spell_check_enabled, temp_convert_enabled, world_switch_mode, show_tags, ansi_music_enabled, console_theme, gui_theme, gui_transparency, color_offset_percent, input_height, font_name, font_size, web_font_size_phone, web_font_size_tablet, web_font_size_desktop, ws_allow_list, web_secure, http_enabled, http_port, ws_enabled, ws_port, ws_cert_file, ws_key_file, tls_proxy_enabled } => {
                                 // Update global settings from remote client
                                 app.settings.more_mode_enabled = more_mode_enabled;
                                 app.settings.spell_check_enabled = spell_check_enabled;
+                                app.settings.temp_convert_enabled = temp_convert_enabled;
                                 app.settings.world_switch_mode = WorldSwitchMode::from_name(&world_switch_mode);
                                 app.show_tags = show_tags;
                                 app.settings.ansi_music_enabled = ansi_music_enabled;
@@ -19089,6 +19373,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                 let settings_msg = GlobalSettingsMsg {
                                     more_mode_enabled: app.settings.more_mode_enabled,
                                     spell_check_enabled: app.settings.spell_check_enabled,
+                                    temp_convert_enabled: app.settings.temp_convert_enabled,
                                     world_switch_mode: app.settings.world_switch_mode.name().to_string(),
                                     debug_enabled: app.settings.debug_enabled,
                                     show_tags: app.show_tags,
@@ -20442,9 +20727,10 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                 app.ws_broadcast(WsMessage::WorldSettingsUpdated { world_index, settings: settings_msg, name });
                             }
                         }
-                        WsMessage::UpdateGlobalSettings { more_mode_enabled, spell_check_enabled, world_switch_mode, show_tags, ansi_music_enabled, console_theme, gui_theme, gui_transparency, color_offset_percent, input_height, font_name, font_size, web_font_size_phone, web_font_size_tablet, web_font_size_desktop, ws_allow_list, web_secure, http_enabled, http_port, ws_enabled, ws_port, ws_cert_file, ws_key_file, tls_proxy_enabled } => {
+                        WsMessage::UpdateGlobalSettings { more_mode_enabled, spell_check_enabled, temp_convert_enabled, world_switch_mode, show_tags, ansi_music_enabled, console_theme, gui_theme, gui_transparency, color_offset_percent, input_height, font_name, font_size, web_font_size_phone, web_font_size_tablet, web_font_size_desktop, ws_allow_list, web_secure, http_enabled, http_port, ws_enabled, ws_port, ws_cert_file, ws_key_file, tls_proxy_enabled } => {
                             app.settings.more_mode_enabled = more_mode_enabled;
                             app.settings.spell_check_enabled = spell_check_enabled;
+                            app.settings.temp_convert_enabled = temp_convert_enabled;
                             app.settings.world_switch_mode = WorldSwitchMode::from_name(&world_switch_mode);
                             app.show_tags = show_tags;
                             app.settings.ansi_music_enabled = ansi_music_enabled;
@@ -20475,6 +20761,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                             let settings_msg = GlobalSettingsMsg {
                                 more_mode_enabled: app.settings.more_mode_enabled,
                                 spell_check_enabled: app.settings.spell_check_enabled,
+                                temp_convert_enabled: app.settings.temp_convert_enabled,
                                 world_switch_mode: app.settings.world_switch_mode.name().to_string(),
                                 debug_enabled: app.settings.debug_enabled,
                                 show_tags: app.show_tags,
@@ -22549,6 +22836,10 @@ fn handle_key_event(key: KeyEvent, app: &mut App) -> KeyAction {
         (_, KeyCode::Char(c)) => {
             if !c.is_alphabetic() && app.spell_state.showing_suggestions {
                 app.spell_state.reset();
+            }
+            // Clear skip_temp_conversion when typing non-separator (starting new word)
+            if !c.is_whitespace() && !matches!(c, '.' | ',' | '!' | '?' | ';' | ':' | ')' | ']' | '}') {
+                app.skip_temp_conversion = None;
             }
             app.input.insert_char(c);
             app.last_input_was_delete = false;
@@ -25622,6 +25913,7 @@ fn render_settings_popup(f: &mut Frame, app: &App) {
             Line::from(""),
             render_toggle_field("More mode:", popup.temp_more_mode, SettingsField::MoreMode, w),
             render_toggle_field("Spell check:", popup.temp_spell_check, SettingsField::SpellCheck, w),
+            render_toggle_field("Temp convert:", popup.temp_temp_convert, SettingsField::TempConvert, w),
             Line::from(vec![
                 Span::styled(
                     format!("  {:<w$}", "World Switching:"),

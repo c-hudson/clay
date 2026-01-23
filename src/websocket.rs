@@ -134,6 +134,8 @@ pub enum WsMessage {
     UpdateGlobalSettings {
         more_mode_enabled: bool,
         spell_check_enabled: bool,
+        #[serde(default)]
+        temp_convert_enabled: bool,
         world_switch_mode: String,
         show_tags: bool,
         ansi_music_enabled: bool,
@@ -245,6 +247,8 @@ pub struct WorldSettingsMsg {
 pub struct GlobalSettingsMsg {
     pub more_mode_enabled: bool,
     pub spell_check_enabled: bool,
+    #[serde(default)]
+    pub temp_convert_enabled: bool,
     pub world_switch_mode: String,
     pub debug_enabled: bool,
     pub show_tags: bool,
