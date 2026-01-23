@@ -580,6 +580,74 @@ pub fn has_background_color(s: &str) -> bool {
     false
 }
 
+/// Wrap URLs with OSC 8 hyperlink escape sequences for terminal clickability.
+/// This makes URLs clickable in terminals that support OSC 8 (xfce4-terminal, gnome-terminal, etc.)
+/// and ensures the full URL is accessible even when the visible text wraps across lines.
+/// Format: \x1b]8;;URL\x07VISIBLE_TEXT\x1b]8;;\x07 (using BEL terminator for compatibility)
+pub fn wrap_urls_with_osc8(s: &str) -> String {
+    // Quick check - if no "http" in string, return as-is
+    if !s.contains("http") {
+        return s.to_string();
+    }
+
+    let mut result = String::with_capacity(s.len() * 2);
+    let chars: Vec<char> = s.chars().collect();
+    let mut i = 0;
+
+    while i < chars.len() {
+        // Check for URL start (http:// or https://)
+        let remaining: String = chars[i..].iter().collect();
+        if remaining.starts_with("http://") || remaining.starts_with("https://") {
+            // Find the end of the URL (whitespace, quotes, or certain punctuation at end)
+            let url_start = i;
+            let mut url_end = i;
+
+            // URL can contain most characters, ends at whitespace or certain delimiters
+            while url_end < chars.len() {
+                let c = chars[url_end];
+                // End URL at whitespace or common text delimiters
+                if c.is_whitespace() || c == '"' || c == '\'' || c == '<' || c == '>'
+                   || c == '[' || c == ']' || c == '(' || c == ')' || c == '{' || c == '}' {
+                    break;
+                }
+                url_end += 1;
+            }
+
+            // Strip trailing punctuation that's likely not part of the URL
+            while url_end > url_start {
+                let c = chars[url_end - 1];
+                if c == '.' || c == ',' || c == ';' || c == ':' || c == '!' || c == '?' {
+                    url_end -= 1;
+                } else {
+                    break;
+                }
+            }
+
+            if url_end > url_start {
+                let url: String = chars[url_start..url_end].iter().collect();
+                // Clean URL for OSC 8 parameter - strip zero-width spaces that may have
+                // been inserted for word breaking
+                let clean_url = url.replace('\u{200B}', "");
+                // OSC 8 format: \x1b]8;;URL\x07VISIBLE_TEXT\x1b]8;;\x07
+                // Using BEL (0x07) as terminator for better terminal compatibility
+                // URL parameter uses clean URL, visible text preserves original (may have ZWSP for breaking)
+                result.push_str("\x1b]8;;");
+                result.push_str(&clean_url);
+                result.push('\x07');
+                result.push_str(&url);
+                result.push_str("\x1b]8;;\x07");
+                i = url_end;
+                continue;
+            }
+        }
+
+        result.push(chars[i]);
+        i += 1;
+    }
+
+    result
+}
+
 /// Replace colored square emoji with ANSI-colored block characters for console display
 /// This ensures emoji like 🟩🟨 display in their proper colors in terminals
 /// (Emoji fonts typically ignore ANSI colors, so we use block characters instead)

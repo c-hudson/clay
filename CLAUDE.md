@@ -84,7 +84,9 @@ On startup, each world displays a colorful ASCII art splash screen with the tagl
   - `Hist: XXXX` - lines scrolled back in history (priority 2)
   - Underscores when neither active (dark gray)
   - Large numbers formatted as: 9999 → "9999", 10000 → " 10K", 999000 → "999K", 1000000+ → "Alot"
-- World name (bold white)
+- Connection indicator and world name (only shown when connected):
+  - Green ball (🟢) followed by world name (bold white)
+  - When disconnected, this area is filled with underscores instead
 - Activity indicator at position 24: `(Activity: X)` or `(Act X)` on narrow screens - count of worlds with unseen output (yellow, hidden if 0)
 - Underscore padding fills remaining space (dark gray)
 - Current time HH:MM format (right, cyan, no AM/PM)
@@ -130,6 +132,13 @@ Encoding is configurable per-world in the world settings popup.
 - Remote GUI: Rendered as colored rectangles using egui
 - Web: Native emoji rendering (browser handles colors)
 - Implementation: `colorize_square_emojis()` in encoding.rs, `has_colored_squares()` in GUI
+
+**Display Width Handling:**
+- Input area uses unicode display width for cursor positioning and line breaking
+- Zero-width characters (U+200B, etc.) are handled correctly - they take no visual space
+- Wide characters (CJK, emoji) are handled correctly - they take 2 columns
+- Helper functions in `src/input.rs`: `display_width()`, `display_width_chars()`, `chars_for_display_width()`
+- Ensures cursor position matches visual text position even with mixed-width characters
 
 ### Multi-World System
 

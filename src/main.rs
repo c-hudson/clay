@@ -18,14 +18,14 @@ pub fn get_version_string() -> String {
 }
 
 // Re-export commonly used types from modules
-pub use encoding::{Encoding, Theme, WorldSwitchMode, convert_discord_emojis, colorize_square_emojis, is_visually_empty, is_ansi_only_line, has_background_color, strip_non_sgr_sequences};
+pub use encoding::{Encoding, Theme, WorldSwitchMode, convert_discord_emojis, colorize_square_emojis, is_visually_empty, is_ansi_only_line, has_background_color, strip_non_sgr_sequences, wrap_urls_with_osc8};
 pub use telnet::{
     WriteCommand, StreamReader, StreamWriter, AutoConnectType, KeepAliveType,
     process_telnet, find_safe_split_point, build_naws_subnegotiation, build_ttype_response, TelnetResult,
     TELNET_IAC, TELNET_NOP, TELNET_GA, TELNET_OPT_NAWS,
 };
 pub use spell::{SpellChecker, SpellState};
-pub use input::InputArea;
+pub use input::{InputArea, display_width, display_width_chars, chars_for_display_width};
 pub use util::{get_binary_name, strip_ansi_codes, visual_line_count, get_current_time_12hr, strip_mud_tag, truncate_str, convert_temperatures, parse_discord_timestamps};
 pub use websocket::{
     WsMessage, WorldStateMsg, WorldSettingsMsg, GlobalSettingsMsg, TimestampedLine,
@@ -24310,19 +24310,58 @@ fn render_output_crossterm(app: &App) {
     let visible_height = (app.output_height as usize).max(1);
     let term_width = (app.output_width as usize).max(1);
 
-    // Calculate visible width of a string (excluding ANSI escape sequences)
+    // Calculate visible width of a string (excluding ANSI escape sequences including OSC 8)
     fn visible_width(s: &str) -> usize {
         let mut width = 0;
-        let mut in_escape = false;
-        for c in s.chars() {
-            if c == '\x1b' {
-                in_escape = true;
-            } else if in_escape {
+        let mut in_csi = false;   // CSI sequence: \x1b[...
+        let mut in_osc = false;   // OSC sequence: \x1b]...
+        let chars: Vec<char> = s.chars().collect();
+        let mut i = 0;
+        while i < chars.len() {
+            let c = chars[i];
+            // Handle CSI/OSC continuations first, before checking for new ESC
+            if in_csi {
                 if c.is_alphabetic() || c == '~' {
-                    in_escape = false;
+                    in_csi = false;
                 }
+                i += 1;
+                continue;
+            } else if in_osc {
+                // OSC ends with BEL or ST (\x1b\\)
+                if c == '\x07' {
+                    in_osc = false;
+                    i += 1;
+                    continue;
+                } else if c == '\x1b' && i + 1 < chars.len() && chars[i + 1] == '\\' {
+                    in_osc = false;
+                    i += 2;
+                    continue;
+                }
+                i += 1;
+                continue;
+            } else if c == '\x1b' {
+                // Start of new escape sequence
+                if i + 1 < chars.len() {
+                    let next = chars[i + 1];
+                    if next == '[' {
+                        in_csi = true;
+                        i += 2;
+                        continue;
+                    } else if next == ']' {
+                        in_osc = true;
+                        i += 2;
+                        continue;
+                    } else if next == '\\' {
+                        // ST terminator (standalone)
+                        i += 2;
+                        continue;
+                    }
+                }
+                i += 1;
+                continue;
             } else {
                 width += unicode_width::UnicodeWidthChar::width(c).unwrap_or(0);
+                i += 1;
             }
         }
         width
@@ -24343,29 +24382,59 @@ fn render_output_crossterm(app: &App) {
         let mut result = Vec::new();
         let mut current_line = String::new();
         let mut current_width = 0;
-        let mut in_escape = false;
+        let mut in_csi = false;      // CSI sequence: \x1b[...
+        let mut in_osc = false;      // OSC sequence: \x1b]...
         let mut escape_seq = String::new();
         let mut active_codes: Vec<String> = Vec::new();
+        let mut active_hyperlink: Option<String> = None;  // Track active OSC 8 hyperlink URL
 
         // Track last word boundary (space) for wrapping - byte position instead of string clone
         let mut last_space_byte_pos: usize = 0;
         let mut last_space_width = 0;
         let mut last_space_codes: Vec<String> = Vec::new();  // small vec, ok to clone
+        let mut last_space_hyperlink: Option<String> = None;
         let mut has_space_on_line = false;
 
         // Track break opportunities within long words (for BREAK_CHARS)
         let mut last_break_byte_pos: usize = 0;
         let mut last_break_width = 0;
         let mut last_break_codes: Vec<String> = Vec::new();
+        let mut last_break_hyperlink: Option<String> = None;
 
-        for c in line.chars() {
-            if c == '\x1b' {
-                in_escape = true;
+        // Helper to build line prefix (color codes + hyperlink)
+        // Using BEL (0x07) as OSC terminator for better terminal compatibility
+        let build_prefix = |codes: &[String], hyperlink: &Option<String>| -> String {
+            let mut prefix = codes.join("");
+            if let Some(url) = hyperlink {
+                prefix.push_str("\x1b]8;;");
+                prefix.push_str(url);
+                prefix.push('\x07');
+            }
+            prefix
+        };
+
+        // Helper to build line suffix (close hyperlink + reset colors)
+        let build_suffix = |hyperlink: &Option<String>| -> String {
+            let mut suffix = String::new();
+            if hyperlink.is_some() {
+                suffix.push_str("\x1b]8;;\x07");
+            }
+            suffix.push_str("\x1b[0m");
+            suffix
+        };
+
+        let chars: Vec<char> = line.chars().collect();
+        let mut i = 0;
+
+        while i < chars.len() {
+            let c = chars[i];
+
+            // Handle CSI/OSC continuations first, before checking for new ESC
+            if in_csi {
                 escape_seq.push(c);
-            } else if in_escape {
-                escape_seq.push(c);
+                // CSI ends with alphabetic char or ~
                 if c.is_alphabetic() || c == '~' {
-                    in_escape = false;
+                    in_csi = false;
                     current_line.push_str(&escape_seq);
                     if c == 'm' {
                         if escape_seq == "\x1b[0m" || escape_seq == "\x1b[m" {
@@ -24376,6 +24445,78 @@ fn render_output_crossterm(app: &App) {
                     }
                     escape_seq.clear();
                 }
+                i += 1;
+                continue;
+            } else if in_osc {
+                // OSC ends with BEL (\x07) or ST (\x1b\\)
+                if c == '\x07' {
+                    escape_seq.push(c);
+                    in_osc = false;
+                    // Check if this is an OSC 8 hyperlink
+                    if escape_seq.starts_with("\x1b]8;;") {
+                        let url = &escape_seq[5..escape_seq.len()-1];
+                        if url.is_empty() {
+                            active_hyperlink = None;
+                        } else {
+                            active_hyperlink = Some(url.to_string());
+                        }
+                    }
+                    current_line.push_str(&escape_seq);
+                    escape_seq.clear();
+                    i += 1;
+                    continue;
+                } else if c == '\x1b' && i + 1 < chars.len() && chars[i + 1] == '\\' {
+                    // ST terminator
+                    escape_seq.push(c);
+                    escape_seq.push('\\');
+                    in_osc = false;
+                    // Check if this is an OSC 8 hyperlink
+                    if escape_seq.starts_with("\x1b]8;;") {
+                        let url = &escape_seq[5..escape_seq.len()-2];
+                        if url.is_empty() {
+                            active_hyperlink = None;
+                        } else {
+                            active_hyperlink = Some(url.to_string());
+                        }
+                    }
+                    current_line.push_str(&escape_seq);
+                    escape_seq.clear();
+                    i += 2;
+                    continue;
+                } else {
+                    escape_seq.push(c);
+                    i += 1;
+                    continue;
+                }
+            } else if c == '\x1b' {
+                escape_seq.push(c);
+                // Check next char to determine sequence type
+                if i + 1 < chars.len() {
+                    let next = chars[i + 1];
+                    if next == '[' {
+                        in_csi = true;
+                        escape_seq.push(next);
+                        i += 2;
+                        continue;
+                    } else if next == ']' {
+                        in_osc = true;
+                        escape_seq.push(next);
+                        i += 2;
+                        continue;
+                    } else if next == '\\' {
+                        // ST (String Terminator) - standalone, pass through
+                        escape_seq.push(next);
+                        current_line.push_str(&escape_seq);
+                        escape_seq.clear();
+                        i += 2;
+                        continue;
+                    }
+                }
+                // Lone ESC or unknown sequence
+                current_line.push(c);
+                escape_seq.clear();
+                i += 1;
+                continue;
             } else {
                 let char_width = unicode_width::UnicodeWidthChar::width(c).unwrap_or(0);
 
@@ -24385,29 +24526,29 @@ fn render_output_crossterm(app: &App) {
                     if last_break_width > last_space_width {
                         // Break at period/hyphen/etc within the current word
                         let mut break_line = current_line[..last_break_byte_pos].to_string();
-                        break_line.push_str("\x1b[0m");
+                        break_line.push_str(&build_suffix(&last_break_hyperlink));
                         result.push(break_line);
 
-                        let codes_prefix: String = last_break_codes.join("");
+                        let prefix = build_prefix(&last_break_codes, &last_break_hyperlink);
                         let remainder = &current_line[last_break_byte_pos..];
-                        current_line = codes_prefix + remainder;
+                        current_line = prefix + remainder;
                         current_width -= last_break_width;
                     } else if has_space_on_line && last_space_width > 0 {
                         // Break at word boundary - emit up to and including the space
                         let mut break_line = current_line[..last_space_byte_pos].to_string();
-                        break_line.push_str("\x1b[0m");
+                        break_line.push_str(&build_suffix(&last_space_hyperlink));
                         result.push(break_line);
 
                         // Start new line with content after the space
-                        let codes_prefix: String = last_space_codes.join("");
+                        let prefix = build_prefix(&last_space_codes, &last_space_hyperlink);
                         let remainder = &current_line[last_space_byte_pos..];
-                        current_line = codes_prefix + remainder;
+                        current_line = prefix + remainder;
                         current_width -= last_space_width;
                     } else {
                         // No break point at all - hard wrap at current position
-                        current_line.push_str("\x1b[0m");
+                        current_line.push_str(&build_suffix(&active_hyperlink));
                         result.push(current_line);
-                        current_line = active_codes.join("");
+                        current_line = build_prefix(&active_codes, &active_hyperlink);
                         current_width = 0;
                     }
 
@@ -24416,9 +24557,11 @@ fn render_output_crossterm(app: &App) {
                     last_space_byte_pos = 0;
                     last_space_width = 0;
                     last_space_codes.clear();
+                    last_space_hyperlink = None;
                     last_break_byte_pos = 0;
                     last_break_width = 0;
                     last_break_codes.clear();
+                    last_break_hyperlink = None;
                 }
 
                 // Add the character
@@ -24431,6 +24574,7 @@ fn render_output_crossterm(app: &App) {
                     last_space_byte_pos = current_line.len();
                     last_space_width = current_width;
                     last_space_codes = active_codes.clone();  // small vec
+                    last_space_hyperlink = active_hyperlink.clone();
                     has_space_on_line = true;
                     // Reset break char tracking since we have a new word
                     last_break_byte_pos = 0;
@@ -24440,11 +24584,16 @@ fn render_output_crossterm(app: &App) {
                     last_break_byte_pos = current_line.len();
                     last_break_width = current_width;
                     last_break_codes = active_codes.clone();
+                    last_break_hyperlink = active_hyperlink.clone();
                 }
+
+                i += 1;
             }
         }
 
         if !current_line.is_empty() || result.is_empty() {
+            // Add suffix to close any active hyperlink and reset colors
+            current_line.push_str(&build_suffix(&active_hyperlink));
             result.push(current_line);
         }
 
@@ -24496,7 +24645,9 @@ fn render_output_crossterm(app: &App) {
             strip_mud_tag(&text)
         };
         let expanded = processed.replace('\t', "        ");
-        wrap_ansi_line(&expanded, term_width)
+        // Wrap URLs with OSC 8 hyperlink sequences for terminal clickability
+        let with_links = wrap_urls_with_osc8(&expanded);
+        wrap_ansi_line(&with_links, term_width)
             .into_iter()
             .map(|s| (s, highlight))
             .collect()
@@ -24668,23 +24819,24 @@ fn render_output_crossterm(app: &App) {
     let input_area_width = term_width.max(1);
 
     if viewport_line < app.input_height as usize {
-        let chars_before_cursor = app.input.buffer[..app.input.cursor_position].chars().count();
+        // Use display width for cursor positioning (handles zero-width chars)
+        let width_before_cursor = display_width(&app.input.buffer[..app.input.cursor_position]);
 
         // Calculate cursor column - must match cursor_line() logic exactly
         let first_line_capacity = input_area_width.saturating_sub(prompt_len);
         let cursor_col = if first_line_capacity == 0 {
             // Prompt fills entire line
-            chars_before_cursor % input_area_width
-        } else if chars_before_cursor < first_line_capacity {
+            width_before_cursor % input_area_width
+        } else if width_before_cursor < first_line_capacity {
             // On first line - add prompt offset if viewport shows it
             if app.input.viewport_start_line == 0 {
-                chars_before_cursor + prompt_len
+                width_before_cursor + prompt_len
             } else {
-                chars_before_cursor
+                width_before_cursor
             }
         } else {
             // Past first line - get remainder within the line
-            (chars_before_cursor - first_line_capacity) % input_area_width
+            (width_before_cursor - first_line_capacity) % input_area_width
         };
 
         let cursor_x = cursor_col as u16;
@@ -24921,29 +25073,32 @@ fn render_separator_bar(f: &mut Frame, app: &App, area: Rect) {
         },
     ));
 
-    // Connection status ball (green = connected, red = disconnected)
+    // Only show connection ball, world name, and tag indicator when connected
     let is_connected = world.command_tx.is_some();
-    let status_ball = if is_connected { "🟢" } else { "🔴" };
-    spans.push(Span::raw(status_ball));
+    let current_pos = if is_connected {
+        // Connection status ball (green when connected)
+        spans.push(Span::raw("🟢"));
 
-    // World name
-    spans.push(Span::styled(
-        world_display.clone(),
-        Style::default().fg(theme.fg()),
-    ));
-
-    // Tag indicator (cyan, like prompt)
-    if !tag_indicator.is_empty() {
+        // World name
         spans.push(Span::styled(
-            tag_indicator.to_string(),
-            Style::default().fg(theme.fg_accent()),
+            world_display.clone(),
+            Style::default().fg(theme.fg()),
         ));
-    }
 
-    // Calculate current position after status, connection ball, world name, and tag indicator
-    // Note: emoji takes 2 character cells in most terminals
-    let status_ball_width = 2;
-    let current_pos = status_str.len() + status_ball_width + world_display.len() + tag_indicator.len();
+        // Tag indicator (cyan, like prompt)
+        if !tag_indicator.is_empty() {
+            spans.push(Span::styled(
+                tag_indicator.to_string(),
+                Style::default().fg(theme.fg_accent()),
+            ));
+        }
+
+        // Calculate position: status + ball (2 chars) + world name + tag indicator
+        status_str.len() + 2 + world_display.len() + tag_indicator.len()
+    } else {
+        // When disconnected, just show underscores (no ball, no world name)
+        status_str.len()
+    };
 
     // Add underscores to reach position 24 (or as close as possible)
     if !activity_str.is_empty() && current_pos < ACTIVITY_POSITION {
@@ -24965,9 +25120,8 @@ fn render_separator_bar(f: &mut Frame, app: &App, area: Rect) {
     }
 
     // Calculate underscore padding - fill between content and time
-    // Fixed field sizes: status (9) + ball (2) + world name + tag + activity + underscores + "__" (2) + time (5)
     let used_len = if activity_str.is_empty() {
-        status_str.len() + status_ball_width + world_display.len() + tag_indicator.len()
+        current_pos
     } else {
         ACTIVITY_POSITION.max(current_pos) + activity_str.len()
     };
@@ -25008,24 +25162,24 @@ fn render_input_area(f: &mut Frame, app: &mut App, area: Rect) {
 
     if viewport_line < app.input_height as usize {
         let inner_width = area.width.max(1) as usize;
-        // Use character count for cursor column, not byte index
-        let chars_before_cursor = app.input.buffer[..app.input.cursor_position].chars().count();
+        // Use display width for cursor positioning (handles zero-width chars)
+        let width_before_cursor = display_width(&app.input.buffer[..app.input.cursor_position]);
 
         // Calculate cursor column - must match cursor_line() logic exactly
         let first_line_capacity = inner_width.saturating_sub(prompt_len);
         let cursor_col = if first_line_capacity == 0 {
             // Prompt fills entire line
-            chars_before_cursor % inner_width
-        } else if chars_before_cursor < first_line_capacity {
+            width_before_cursor % inner_width
+        } else if width_before_cursor < first_line_capacity {
             // On first line - add prompt offset if viewport shows it
             if app.input.viewport_start_line == 0 {
-                chars_before_cursor + prompt_len
+                width_before_cursor + prompt_len
             } else {
-                chars_before_cursor
+                width_before_cursor
             }
         } else {
             // Past first line - get remainder within the line
-            (chars_before_cursor - first_line_capacity) % inner_width
+            (width_before_cursor - first_line_capacity) % inner_width
         };
 
         let cursor_x = area.x + cursor_col as u16;
@@ -25096,7 +25250,8 @@ fn render_input(app: &mut App, width: usize, prompt: &str) -> Text<'static> {
 
         if remaining_width > 0 && !chars.is_empty() {
             // Add user input to the same line as prompt
-            let input_chars_on_first_line = remaining_width.min(chars.len());
+            // Use display width to determine how many chars fit
+            let (input_chars_on_first_line, _) = chars_for_display_width(&chars, remaining_width);
             let first_input: String = chars[..input_chars_on_first_line].iter().collect();
 
             // Get the last line (which has the prompt) and append user input
@@ -25138,7 +25293,9 @@ fn render_input(app: &mut App, width: usize, prompt: &str) -> Text<'static> {
             // Now handle remaining input on subsequent lines
             let mut char_pos = input_chars_on_first_line;
             while char_pos < chars.len() && lines.len() < app.input_height as usize {
-                let line_end = (char_pos + width).min(chars.len());
+                // Use display width to determine how many chars fit on this line
+                let (chars_on_line, _) = chars_for_display_width(&chars[char_pos..], width);
+                let line_end = char_pos + chars_on_line;
                 let mut spans: Vec<Span<'static>> = Vec::new();
                 let mut current_pos = char_pos;
 
@@ -25185,7 +25342,9 @@ fn render_input(app: &mut App, width: usize, prompt: &str) -> Text<'static> {
             // Prompt fills the line exactly, user input starts on next line
             let mut char_pos = 0;
             while char_pos < chars.len() && lines.len() < app.input_height as usize {
-                let line_end = (char_pos + width).min(chars.len());
+                // Use display width to determine how many chars fit on this line
+                let (chars_on_line, _) = chars_for_display_width(&chars[char_pos..], width);
+                let line_end = char_pos + chars_on_line;
                 let text: String = chars[char_pos..line_end].iter().collect();
                 lines.push(Line::from(text));
                 char_pos = line_end;
@@ -25195,7 +25354,9 @@ fn render_input(app: &mut App, width: usize, prompt: &str) -> Text<'static> {
         // No prompt, just render user input
         let mut char_pos = 0;
         while char_pos < chars.len() && lines.len() < app.input_height as usize {
-            let line_end = (char_pos + width).min(chars.len());
+            // Use display width to determine how many chars fit on this line
+            let (chars_on_line, _) = chars_for_display_width(&chars[char_pos..], width);
+            let line_end = char_pos + chars_on_line;
             let mut spans: Vec<Span<'static>> = Vec::new();
             let mut current_pos = char_pos;
 
@@ -25240,10 +25401,21 @@ fn render_input(app: &mut App, width: usize, prompt: &str) -> Text<'static> {
         }
     } else {
         // Scrolled down, don't show prompt
-        let start_char = app.input.viewport_start_line * width;
+        // Calculate start_char by iterating through lines to find correct starting position
+        // This accounts for variable chars-per-line due to display width differences
+        let mut start_char = 0;
+        for _ in 0..app.input.viewport_start_line {
+            if start_char >= chars.len() {
+                break;
+            }
+            let (chars_on_line, _) = chars_for_display_width(&chars[start_char..], width);
+            start_char += chars_on_line.max(1); // Ensure progress even with weird chars
+        }
         let mut char_pos = start_char;
         while char_pos < chars.len() && lines.len() < app.input_height as usize {
-            let line_end = (char_pos + width).min(chars.len());
+            // Use display width to determine how many chars fit on this line
+            let (chars_on_line, _) = chars_for_display_width(&chars[char_pos..], width);
+            let line_end = char_pos + chars_on_line;
             let mut spans: Vec<Span<'static>> = Vec::new();
             let mut current_pos = char_pos;
 
@@ -27798,6 +27970,51 @@ mod tests {
         assert!(!is_ansi_only_line("\x1b[44m   \x1b[0m"));  // Standard blue bg
         assert!(!is_ansi_only_line("\x1b[100m\x1b[0m"));  // Bright background
         assert!(!is_ansi_only_line("\x1b[48;2;255;255;255m  \x1b[0m"));  // True color bg
+    }
+
+    #[test]
+    fn test_wrap_urls_with_osc8() {
+        use super::wrap_urls_with_osc8;
+
+        // No URLs - return unchanged
+        assert_eq!(wrap_urls_with_osc8("hello world"), "hello world");
+        assert_eq!(wrap_urls_with_osc8("no links here"), "no links here");
+
+        // Simple HTTP URL - using BEL (0x07) as terminator
+        let result = wrap_urls_with_osc8("check http://example.com please");
+        assert!(result.contains("\x1b]8;;http://example.com\x07"));
+        assert!(result.contains("http://example.com\x1b]8;;\x07"));
+
+        // HTTPS URL
+        let result = wrap_urls_with_osc8("visit https://example.com/path");
+        assert!(result.contains("\x1b]8;;https://example.com/path\x07"));
+
+        // URL with query parameters
+        let result = wrap_urls_with_osc8("link: https://example.com/page?foo=bar&baz=qux");
+        assert!(result.contains("foo=bar&baz=qux"));
+
+        // URL followed by punctuation (should not include trailing punctuation)
+        let result = wrap_urls_with_osc8("See https://example.com.");
+        assert!(result.contains("\x1b]8;;https://example.com\x07"));
+        assert!(!result.contains("\x1b]8;;https://example.com.\x07"));
+
+        // URL in quotes
+        let result = wrap_urls_with_osc8("Nina says, \"https://tenor.com/view/test\"");
+        assert!(result.contains("\x1b]8;;https://tenor.com/view/test\x07"));
+
+        // Multiple URLs
+        let result = wrap_urls_with_osc8("http://a.com and https://b.com");
+        assert!(result.contains("\x1b]8;;http://a.com\x07"));
+        assert!(result.contains("\x1b]8;;https://b.com\x07"));
+
+        // URL with zero-width spaces (U+200B) should have them stripped from OSC 8 URL parameter
+        // but preserved in visible text for word breaking
+        let url_with_zwsp = "https://example.com/\u{200B}path/\u{200B}to/\u{200B}page";
+        let result = wrap_urls_with_osc8(url_with_zwsp);
+        // OSC 8 URL parameter should have clean URL without ZWSP
+        assert!(result.contains("\x1b]8;;https://example.com/path/to/page\x07"));
+        // Visible text should preserve ZWSP for word breaking
+        assert!(result.contains("/\u{200B}path/\u{200B}to/\u{200B}page"));
     }
 
     #[test]

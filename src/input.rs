@@ -1,3 +1,29 @@
+use unicode_width::UnicodeWidthChar;
+
+/// Calculate display width of a string (handles zero-width characters and wide chars)
+pub fn display_width(s: &str) -> usize {
+    s.chars().map(|c| UnicodeWidthChar::width(c).unwrap_or(0)).sum()
+}
+
+/// Calculate display width of a char slice
+pub fn display_width_chars(chars: &[char]) -> usize {
+    chars.iter().map(|c| UnicodeWidthChar::width(*c).unwrap_or(0)).sum()
+}
+
+/// Find the character index where display width reaches or exceeds the target width.
+/// Returns (char_index, actual_display_width_up_to_that_point)
+pub fn chars_for_display_width(chars: &[char], target_width: usize) -> (usize, usize) {
+    let mut width = 0;
+    for (i, c) in chars.iter().enumerate() {
+        let char_width = UnicodeWidthChar::width(*c).unwrap_or(0);
+        if width + char_width > target_width {
+            return (i, width);
+        }
+        width += char_width;
+    }
+    (chars.len(), width)
+}
+
 pub struct InputArea {
     pub buffer: String,
     pub cursor_position: usize,
@@ -35,8 +61,8 @@ impl InputArea {
         if self.width == 0 {
             return 0;
         }
-        // Count characters before cursor, not bytes
-        let chars_before = self.buffer[..self.cursor_position].chars().count();
+        // Use display width instead of character count (handles zero-width chars)
+        let width_before = display_width(&self.buffer[..self.cursor_position]);
         let width = self.width as usize;
 
         // Account for prompt taking up space on the first line
@@ -46,14 +72,14 @@ impl InputArea {
         if first_line_capacity == 0 {
             // Prompt fills entire first line, so all input is on subsequent lines
             // Add 1 for the prompt line, then calculate remaining lines
-            1 + chars_before / width
-        } else if chars_before < first_line_capacity {
+            1 + width_before / width
+        } else if width_before < first_line_capacity {
             // Still on first line
             0
         } else {
-            // Past first line: subtract first line chars, then divide by width
-            let remaining_chars = chars_before - first_line_capacity;
-            1 + remaining_chars / width
+            // Past first line: subtract first line display width, then divide by width
+            let remaining_width = width_before - first_line_capacity;
+            1 + remaining_width / width
         }
     }
 
@@ -210,25 +236,25 @@ impl InputArea {
         self.adjust_viewport();
     }
 
-    /// Get the column position within the current line (0-indexed, in characters)
+    /// Get the column position within the current line (0-indexed, in display width)
     fn cursor_column(&self) -> usize {
         if self.width == 0 {
             return 0;
         }
-        let chars_before = self.buffer[..self.cursor_position].chars().count();
+        let width_before = display_width(&self.buffer[..self.cursor_position]);
         let width = self.width as usize;
         let first_line_capacity = width.saturating_sub(self.prompt_len);
 
         if first_line_capacity == 0 {
             // Prompt fills entire first line
-            chars_before % width
-        } else if chars_before < first_line_capacity {
+            width_before % width
+        } else if width_before < first_line_capacity {
             // Still on first line
-            chars_before
+            width_before
         } else {
             // Past first line
-            let remaining_chars = chars_before - first_line_capacity;
-            remaining_chars % width
+            let remaining_width = width_before - first_line_capacity;
+            remaining_width % width
         }
     }
 
