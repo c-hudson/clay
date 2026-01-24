@@ -9044,6 +9044,8 @@ mod remote_gui {
         last_sent_view_state: Option<(usize, usize)>,
         /// Activity count from server (number of worlds with unseen/pending output)
         server_activity_count: usize,
+        /// Unified popup state for new popup system
+        unified_popup: Option<crate::popup::PopupState>,
     }
 
     /// Square wave audio source for ANSI music playback
@@ -9219,6 +9221,7 @@ mod remote_gui {
                 output_visible_lines: 20,  // Default, updated during rendering
                 last_sent_view_state: None,
                 server_activity_count: 0,
+                unified_popup: None,
             }
         }
 
@@ -9265,6 +9268,34 @@ mod remote_gui {
         #[cfg(not(feature = "rodio"))]
         fn play_ansi_music(&mut self, _notes: &[crate::ansi_music::MusicNote]) {
             // Audio playback disabled - rodio feature not enabled
+        }
+
+        /// Convert GuiTheme to GuiPopupTheme for unified popup rendering
+        fn get_popup_theme(&self) -> crate::popup::gui_renderer::GuiPopupTheme {
+            let theme = self.theme;
+            crate::popup::gui_renderer::GuiPopupTheme::from_colors(
+                theme.bg_elevated(),
+                theme.bg_surface(),
+                theme.bg_deep(),
+                theme.bg_hover(),
+                theme.fg(),
+                theme.fg_secondary(),
+                theme.fg_muted(),
+                theme.accent(),
+                theme.accent_dim(),
+                theme.border_medium(),
+                theme.error(),
+            )
+        }
+
+        /// Open a unified popup with the given definition
+        fn open_unified_popup(&mut self, def: crate::popup::PopupDefinition) {
+            self.unified_popup = Some(crate::popup::PopupState::new(def));
+        }
+
+        /// Close the unified popup
+        fn close_unified_popup(&mut self) {
+            self.unified_popup = None;
         }
 
         /// Try to find a system font file by name

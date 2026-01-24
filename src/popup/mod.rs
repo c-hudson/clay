@@ -6,6 +6,9 @@
 pub mod console_renderer;
 pub mod definitions;
 
+#[cfg(feature = "remote-gui")]
+pub mod gui_renderer;
+
 use std::collections::HashMap;
 
 // ============================================================================
