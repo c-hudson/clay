@@ -441,8 +441,8 @@
     // Patterns: 32F, 32f, 100C, 100c, 32°F, 32.5F, -10C, etc.
     // When detected, inserts conversion in parentheses: "32F " -> "32F(0C) "
     function checkTempConversion() {
-        // Only convert when both enabled AND show_tags mode is active (F2)
-        if (!tempConvertEnabled || !showTags) return;
+        // Only convert when enabled
+        if (!tempConvertEnabled) return;
 
         const input = elements.input.value;
         if (!input || input.length === 0) {
@@ -2073,7 +2073,7 @@
         const tsPrefix = showTags && ts ? `<span class="timestamp">${formatTimestamp(ts)}</span>` : '';
 
         const strippedText = showTags ? cleanText : stripMudTag(cleanText);
-        const displayText = showTags ? convertTemperatures(strippedText) : strippedText;
+        const displayText = showTags && tempConvertEnabled ? convertTemperatures(strippedText) : strippedText;
         const html = tsPrefix + convertDiscordEmojis(linkifyUrls(parseAnsi(insertWordBreaks(displayText))));
 
         // Append to output with a <br> prefix (if not first line)

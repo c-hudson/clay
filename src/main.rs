@@ -4063,8 +4063,8 @@ impl App {
     /// Patterns: 32F, 32f, 100C, 100c, 32°F, 32.5F, -10C, etc.
     /// When detected, inserts conversion in parentheses: "32F " -> "32F (0C) "
     fn check_temp_conversion(&mut self) {
-        // Only convert temperatures when both enabled AND show_tags mode is active (F2)
-        if !self.settings.temp_convert_enabled || !self.show_tags {
+        // Only convert temperatures when enabled
+        if !self.settings.temp_convert_enabled {
             return;
         }
 
@@ -8109,8 +8109,8 @@ mod remote_gui {
         /// Patterns: 32F, 32f, 100C, 100c, 32°F, 32.5F, -10C, etc.
         /// When detected, inserts conversion in parentheses: "32F " -> "32F(0C) "
         fn check_temp_conversion(&mut self) {
-            // Only convert temperatures when both enabled AND show_tags mode is active (F2)
-            if !self.temp_convert_enabled || !self.show_tags {
+            // Only convert temperatures when enabled
+            if !self.temp_convert_enabled {
                 return;
             }
 
