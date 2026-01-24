@@ -56,8 +56,7 @@ Clay is a terminal-based MUD (Multi-User Dungeon) client built with ratatui/cros
 - **SpellChecker**: System dictionary-based spell checking with Levenshtein-distance suggestions (uses /usr/share/dict/words)
 - **Settings**: Global preferences (more_mode_enabled, spell_check_enabled, world_switch_mode, websocket_enabled, websocket_port, websocket_password, https_enabled, https_port)
 - **WebSocketServer**: Embedded WebSocket server for remote GUI clients
-- **SettingsPopup**: Modal dialog for editing world and global settings with inline text editing and horizontal scrolling for long text fields
-- **ConfirmDialog**: Modal confirmation dialog for destructive actions (e.g., delete world)
+- **PopupManager**: Unified popup system for all modal dialogs (world editor, setup, web settings, help, world selector, actions, confirmations)
 - **FilterPopup**: Modal filter popup for searching/filtering output text (F4)
 - **Encoding**: Character encoding enum (Utf8, Latin1, Fansi) with decode method
 - **StreamReader/StreamWriter**: Wrapper enums supporting both plain TCP and TLS streams
@@ -336,22 +335,17 @@ This logic applies to all interfaces (console, web, GUI). Remote clients query t
 - `/quit` - Exit the client
 - `Enter` - Send command
 
-**World Settings Popup (when open):**
+**Popup Controls (unified popup system):**
 - `Up/Down` - Navigate between fields (auto-enters edit mode for text fields)
 - `Tab/Shift+Tab` - Cycle through buttons only
-- `Left/Right` - Navigate between buttons (when on button row); also scrolls long text fields
+- `Left/Right` - Navigate between buttons (when on button row); change select/toggle values
 - `Enter` - Edit text field / Toggle option / Activate button
 - `Space` - Toggle boolean / Cycle options
-- `S` - Select Save button
-- `C` - Select Cancel button
-- `D` - Select Delete button
-- `O` - Select Connect button
-- `Ctrl+S` - Save all settings and close
-- `Esc` - Close popup
-- Text fields: Just start typing to edit (inline editing with horizontal scrolling)
-- Long text fields show `<` and `>` indicators when content extends beyond visible area
-- Buttons: Save, Cancel, Delete, Connect (highlighted shortcut letters: S, C, D, O)
-- Popup sizes dynamically based on content
+- `S/C/D/O` - Shortcut keys for Save/Cancel/Delete/Connect buttons (when available)
+- `Esc` - Close popup or cancel text edit
+- Text fields: Just start typing to edit (inline editing with cursor)
+- Buttons have highlighted shortcut letters
+- Popups size dynamically based on content
 
 ### Commands
 
@@ -362,7 +356,7 @@ This logic applies to all interfaces (console, web, GUI). Remote clients query t
   - `-W` - Send to all connected worlds
   - `-n` - Send without end-of-line marker (CR/LF)
   - No flags: Send to current world
-- `/setup` - Open Global Settings popup (more mode, spell check, pending first, show tags, input height)
+- `/setup` - Open Global Settings popup (more mode, spell check, temp convert, world switching, show tags, input height, themes, TLS proxy)
 - `/web` - Open Web Settings popup (HTTP/HTTPS servers, WebSocket settings, TLS configuration)
 - `/worlds` - Open World Selector popup (list all worlds, filter, connect or edit)
 - `/worlds <name>` - Connect to world if exists (opens editor if no hostname/port configured), otherwise create and open editor
@@ -798,9 +792,9 @@ Opened with `/worlds` command (no arguments):
 - Connect - Switch to and connect selected world
 - Cancel - Close popup
 
-### World Settings Popup Fields
+### World Editor Popup
 
-Opened with `/worlds -e` command:
+Opened with `/worlds -e` command (uses unified popup system):
 
 **Per-World Settings:**
 - World name - Display name for this world
@@ -818,11 +812,13 @@ Opened with `/worlds -e` command:
 **Global Settings (via /setup):**
 - More mode - Enable/disable more-style pausing
 - Spell check - Enable/disable spell checking
+- Temp convert - Enable/disable temperature conversion in input (requires F2/show_tags mode)
 - World Switching - World cycling behavior (Unseen First, Alphabetical)
 - Show tags - Show/hide MUD tags at start of lines (default: hidden)
 - Input height - Default input area height (1-15 lines)
 - Console Theme - Theme for console interface (dark, light)
 - GUI Theme - Theme for remote GUI client (dark, light)
+- TLS Proxy - Enable TLS proxy for preserving TLS connections across hot reload
 
 **Actions (right-aligned buttons):**
 - Save - Save settings and close popup
@@ -910,6 +906,7 @@ Toggle with `F2`:
   - Format: `DD/MM HH:MM>` for lines from previous days
   - Displayed in cyan before each line
 - **Gagged lines**: Lines hidden by `/gag` action command are also shown with F2
+- **Temperature conversion**: When enabled in `/setup`, temperatures typed in input are auto-converted (e.g., "32F " → "32F(0C) "). Only active when F2/show_tags mode is on.
 - Works in console, GUI, and web interfaces
 - Setting persists across sessions in `~/.clay.dat`
 
