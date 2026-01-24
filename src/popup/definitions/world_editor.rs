@@ -16,7 +16,7 @@ pub const WORLD_FIELD_PORT: FieldId = FieldId(11);
 pub const WORLD_FIELD_USER: FieldId = FieldId(12);
 pub const WORLD_FIELD_PASSWORD: FieldId = FieldId(13);
 pub const WORLD_FIELD_USE_SSL: FieldId = FieldId(14);
-pub const WORLD_FIELD_LOG_FILE: FieldId = FieldId(15);
+pub const WORLD_FIELD_LOG_ENABLED: FieldId = FieldId(15);
 pub const WORLD_FIELD_ENCODING: FieldId = FieldId(16);
 pub const WORLD_FIELD_AUTO_CONNECT: FieldId = FieldId(17);
 pub const WORLD_FIELD_KEEP_ALIVE: FieldId = FieldId(18);
@@ -111,7 +111,7 @@ pub struct WorldSettings {
     pub user: String,
     pub password: String,
     pub use_ssl: bool,
-    pub log_file: String,
+    pub log_enabled: bool,
     pub encoding: String,
     pub auto_connect: String,
     pub keep_alive: String,
@@ -187,7 +187,7 @@ pub fn create_world_editor_popup(settings: &WorldSettings) -> PopupDefinition {
         .with_field(Field::new(
             WORLD_FIELD_PASSWORD,
             "Password",
-            FieldKind::password(&settings.password),
+            FieldKind::text(&settings.password),
         ))
         .with_field(Field::new(
             WORLD_FIELD_USE_SSL,
@@ -195,9 +195,9 @@ pub fn create_world_editor_popup(settings: &WorldSettings) -> PopupDefinition {
             FieldKind::toggle(settings.use_ssl),
         ))
         .with_field(Field::new(
-            WORLD_FIELD_LOG_FILE,
+            WORLD_FIELD_LOG_ENABLED,
             "Log File",
-            FieldKind::text(&settings.log_file),
+            FieldKind::toggle(settings.log_enabled),
         ))
         .with_field(Field::new(
             WORLD_FIELD_ENCODING,
@@ -283,7 +283,7 @@ pub fn update_field_visibility(def: &mut PopupDefinition, world_type: WorldType,
     // MUD fields
     let mud_fields = [
         WORLD_FIELD_HOSTNAME, WORLD_FIELD_PORT, WORLD_FIELD_USER, WORLD_FIELD_PASSWORD,
-        WORLD_FIELD_USE_SSL, WORLD_FIELD_LOG_FILE, WORLD_FIELD_ENCODING,
+        WORLD_FIELD_USE_SSL, WORLD_FIELD_LOG_ENABLED, WORLD_FIELD_ENCODING,
         WORLD_FIELD_AUTO_CONNECT, WORLD_FIELD_KEEP_ALIVE,
     ];
 
@@ -311,7 +311,7 @@ pub fn update_field_visibility(def: &mut PopupDefinition, world_type: WorldType,
     }
 
     // Log file visible for all types
-    if let Some(field) = def.get_field_mut(WORLD_FIELD_LOG_FILE) {
+    if let Some(field) = def.get_field_mut(WORLD_FIELD_LOG_ENABLED) {
         field.visible = true;
     }
 

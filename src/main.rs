@@ -864,624 +864,6 @@ async fn start_http_server(
     Ok(())
 }
 
-
-#[derive(Clone, Copy, PartialEq)]
-enum SettingsField {
-    // World-specific fields
-    WorldName,
-    WorldType,      // Mud, Slack, or Discord
-    // MUD-specific fields
-    Hostname,
-    Port,
-    User,
-    Password,
-    UseSsl,
-    LogFile,
-    Encoding,
-    AutoConnect,
-    KeepAlive,
-    KeepAliveCmd,
-    // Slack-specific fields
-    SlackToken,
-    SlackChannel,
-    SlackWorkspace,
-    // Discord-specific fields
-    DiscordToken,
-    DiscordGuild,
-    DiscordChannel,
-    DiscordDmUser,
-    // Buttons
-    Connect,
-    SaveWorld,
-    CancelWorld,
-    DeleteWorld,
-    // Global settings (setup menu)
-    MoreMode,
-    SpellCheck,
-    TempConvert,
-    WorldSwitching,
-    Debug,
-    ShowTags,
-    InputHeight,
-    GuiTheme,       // GUI theme
-    TLSProxy,       // TLS proxy for connection preservation over hot reload
-    SaveSetup,
-    CancelSetup,
-}
-
-impl SettingsField {
-    fn is_text_field(&self) -> bool {
-        matches!(
-            self,
-            SettingsField::WorldName
-                | SettingsField::Hostname
-                | SettingsField::Port
-                | SettingsField::User
-                | SettingsField::Password
-                | SettingsField::KeepAliveCmd
-                | SettingsField::SlackToken
-                | SettingsField::SlackChannel
-                | SettingsField::SlackWorkspace
-                | SettingsField::DiscordToken
-                | SettingsField::DiscordGuild
-                | SettingsField::DiscordChannel
-                | SettingsField::DiscordDmUser
-        )
-    }
-
-    fn is_button(&self) -> bool {
-        matches!(self, SettingsField::Connect | SettingsField::SaveWorld | SettingsField::CancelWorld | SettingsField::DeleteWorld | SettingsField::SaveSetup | SettingsField::CancelSetup)
-    }
-
-    /// Next field for world settings popup
-    /// world_type determines which fields are visible
-    /// skip_keep_alive_cmd is true if keep_alive_type is not Custom
-    fn next_world(&self, world_type: &WorldType, skip_keep_alive_cmd: bool) -> Self {
-        match world_type {
-            WorldType::Mud => match self {
-                SettingsField::WorldName => SettingsField::WorldType,
-                SettingsField::WorldType => SettingsField::Hostname,
-                SettingsField::Hostname => SettingsField::Port,
-                SettingsField::Port => SettingsField::User,
-                SettingsField::User => SettingsField::Password,
-                SettingsField::Password => SettingsField::UseSsl,
-                SettingsField::UseSsl => SettingsField::LogFile,
-                SettingsField::LogFile => SettingsField::Encoding,
-                SettingsField::Encoding => SettingsField::AutoConnect,
-                SettingsField::AutoConnect => SettingsField::KeepAlive,
-                SettingsField::KeepAlive => {
-                    if skip_keep_alive_cmd {
-                        SettingsField::SaveWorld
-                    } else {
-                        SettingsField::KeepAliveCmd
-                    }
-                }
-                SettingsField::KeepAliveCmd => SettingsField::SaveWorld,
-                SettingsField::SaveWorld => SettingsField::CancelWorld,
-                SettingsField::CancelWorld => SettingsField::DeleteWorld,
-                SettingsField::DeleteWorld => SettingsField::Connect,
-                SettingsField::Connect => SettingsField::WorldName,
-                _ => SettingsField::WorldName,
-            },
-            WorldType::Slack => match self {
-                SettingsField::WorldName => SettingsField::WorldType,
-                SettingsField::WorldType => SettingsField::SlackToken,
-                SettingsField::SlackToken => SettingsField::SlackChannel,
-                SettingsField::SlackChannel => SettingsField::SlackWorkspace,
-                SettingsField::SlackWorkspace => SettingsField::LogFile,
-                SettingsField::LogFile => SettingsField::SaveWorld,
-                SettingsField::SaveWorld => SettingsField::CancelWorld,
-                SettingsField::CancelWorld => SettingsField::DeleteWorld,
-                SettingsField::DeleteWorld => SettingsField::Connect,
-                SettingsField::Connect => SettingsField::WorldName,
-                _ => SettingsField::WorldName,
-            },
-            WorldType::Discord => match self {
-                SettingsField::WorldName => SettingsField::WorldType,
-                SettingsField::WorldType => SettingsField::DiscordToken,
-                SettingsField::DiscordToken => SettingsField::DiscordGuild,
-                SettingsField::DiscordGuild => SettingsField::DiscordChannel,
-                SettingsField::DiscordChannel => SettingsField::DiscordDmUser,
-                SettingsField::DiscordDmUser => SettingsField::LogFile,
-                SettingsField::LogFile => SettingsField::SaveWorld,
-                SettingsField::SaveWorld => SettingsField::CancelWorld,
-                SettingsField::CancelWorld => SettingsField::DeleteWorld,
-                SettingsField::DeleteWorld => SettingsField::Connect,
-                SettingsField::Connect => SettingsField::WorldName,
-                _ => SettingsField::WorldName,
-            },
-        }
-    }
-
-    /// Previous field for world settings popup
-    /// world_type determines which fields are visible
-    /// skip_keep_alive_cmd is true if keep_alive_type is not Custom
-    fn prev_world(&self, world_type: &WorldType, skip_keep_alive_cmd: bool) -> Self {
-        match world_type {
-            WorldType::Mud => match self {
-                SettingsField::WorldName => SettingsField::Connect,
-                SettingsField::WorldType => SettingsField::WorldName,
-                SettingsField::Hostname => SettingsField::WorldType,
-                SettingsField::Port => SettingsField::Hostname,
-                SettingsField::User => SettingsField::Port,
-                SettingsField::Password => SettingsField::User,
-                SettingsField::UseSsl => SettingsField::Password,
-                SettingsField::LogFile => SettingsField::UseSsl,
-                SettingsField::Encoding => SettingsField::LogFile,
-                SettingsField::AutoConnect => SettingsField::Encoding,
-                SettingsField::KeepAlive => SettingsField::AutoConnect,
-                SettingsField::KeepAliveCmd => SettingsField::KeepAlive,
-                SettingsField::SaveWorld => {
-                    if skip_keep_alive_cmd {
-                        SettingsField::KeepAlive
-                    } else {
-                        SettingsField::KeepAliveCmd
-                    }
-                }
-                SettingsField::CancelWorld => SettingsField::SaveWorld,
-                SettingsField::DeleteWorld => SettingsField::CancelWorld,
-                SettingsField::Connect => SettingsField::DeleteWorld,
-                _ => SettingsField::Connect,
-            },
-            WorldType::Slack => match self {
-                SettingsField::WorldName => SettingsField::Connect,
-                SettingsField::WorldType => SettingsField::WorldName,
-                SettingsField::SlackToken => SettingsField::WorldType,
-                SettingsField::SlackChannel => SettingsField::SlackToken,
-                SettingsField::SlackWorkspace => SettingsField::SlackChannel,
-                SettingsField::LogFile => SettingsField::SlackWorkspace,
-                SettingsField::SaveWorld => SettingsField::LogFile,
-                SettingsField::CancelWorld => SettingsField::SaveWorld,
-                SettingsField::DeleteWorld => SettingsField::CancelWorld,
-                SettingsField::Connect => SettingsField::DeleteWorld,
-                _ => SettingsField::Connect,
-            },
-            WorldType::Discord => match self {
-                SettingsField::WorldName => SettingsField::Connect,
-                SettingsField::WorldType => SettingsField::WorldName,
-                SettingsField::DiscordToken => SettingsField::WorldType,
-                SettingsField::DiscordGuild => SettingsField::DiscordToken,
-                SettingsField::DiscordChannel => SettingsField::DiscordGuild,
-                SettingsField::DiscordDmUser => SettingsField::DiscordChannel,
-                SettingsField::LogFile => SettingsField::DiscordDmUser,
-                SettingsField::SaveWorld => SettingsField::LogFile,
-                SettingsField::CancelWorld => SettingsField::SaveWorld,
-                SettingsField::DeleteWorld => SettingsField::CancelWorld,
-                SettingsField::Connect => SettingsField::DeleteWorld,
-                _ => SettingsField::Connect,
-            },
-        }
-    }
-
-    /// Next field for setup (global) menu
-    fn next_setup(&self) -> Self {
-        match self {
-            SettingsField::MoreMode => SettingsField::SpellCheck,
-            SettingsField::SpellCheck => SettingsField::TempConvert,
-            SettingsField::TempConvert => SettingsField::WorldSwitching,
-            SettingsField::WorldSwitching => SettingsField::Debug,
-            SettingsField::Debug => SettingsField::ShowTags,
-            SettingsField::ShowTags => SettingsField::InputHeight,
-            SettingsField::InputHeight => SettingsField::GuiTheme,
-            SettingsField::GuiTheme => SettingsField::TLSProxy,
-            SettingsField::TLSProxy => SettingsField::SaveSetup,
-            SettingsField::SaveSetup => SettingsField::CancelSetup,
-            SettingsField::CancelSetup => SettingsField::MoreMode,
-            // World fields wrap to global fields
-            _ => SettingsField::MoreMode,
-        }
-    }
-
-    /// Previous field for setup (global) menu
-    fn prev_setup(&self) -> Self {
-        match self {
-            SettingsField::MoreMode => SettingsField::CancelSetup,
-            SettingsField::SpellCheck => SettingsField::MoreMode,
-            SettingsField::TempConvert => SettingsField::SpellCheck,
-            SettingsField::WorldSwitching => SettingsField::TempConvert,
-            SettingsField::Debug => SettingsField::WorldSwitching,
-            SettingsField::ShowTags => SettingsField::Debug,
-            SettingsField::InputHeight => SettingsField::ShowTags,
-            SettingsField::GuiTheme => SettingsField::InputHeight,
-            SettingsField::TLSProxy => SettingsField::GuiTheme,
-            SettingsField::SaveSetup => SettingsField::TLSProxy,
-            SettingsField::CancelSetup => SettingsField::SaveSetup,
-            // World fields wrap to global fields
-            _ => SettingsField::CancelSetup,
-        }
-    }
-}
-
-struct SettingsPopup {
-    visible: bool,
-    selected_field: SettingsField,
-    editing: bool,
-    edit_buffer: String,
-    edit_cursor: usize,
-    edit_scroll_offset: usize, // Horizontal scroll offset for long text fields
-    setup_mode: bool, // True for /setup (global only), false for /worlds (all settings)
-    editing_world_index: Option<usize>, // Which world is being edited (None for setup mode)
-    // Temp values for world-specific fields
-    temp_world_name: String,
-    temp_world_type: WorldType,
-    // MUD settings
-    temp_hostname: String,
-    temp_port: String,
-    temp_user: String,
-    temp_password: String,
-    temp_use_ssl: bool,
-    temp_log_enabled: bool,
-    temp_encoding: Encoding,
-    temp_auto_connect_type: AutoConnectType,
-    temp_keep_alive_type: KeepAliveType,
-    temp_keep_alive_cmd: String,
-    // Slack settings
-    temp_slack_token: String,
-    temp_slack_channel: String,
-    temp_slack_workspace: String,
-    // Discord settings
-    temp_discord_token: String,
-    temp_discord_guild: String,
-    temp_discord_channel: String,
-    temp_discord_dm_user: String,
-    // Temp values for global settings
-    temp_more_mode: bool,
-    temp_spell_check: bool,
-    temp_temp_convert: bool,
-    temp_world_switch_mode: WorldSwitchMode,
-    temp_debug_enabled: bool,
-    temp_show_tags: bool,
-    temp_input_height: u16,
-    temp_theme: Theme,
-    temp_gui_theme: Theme,
-    temp_tls_proxy_enabled: bool,
-}
-
-impl SettingsPopup {
-    fn new() -> Self {
-        Self {
-            visible: false,
-            selected_field: SettingsField::WorldName,
-            editing: false,
-            edit_buffer: String::new(),
-            edit_cursor: 0,
-            edit_scroll_offset: 0,
-            setup_mode: false,
-            editing_world_index: None,
-            temp_world_name: String::new(),
-            temp_world_type: WorldType::Mud,
-            temp_hostname: String::new(),
-            temp_port: String::new(),
-            temp_user: String::new(),
-            temp_password: String::new(),
-            temp_use_ssl: false,
-            temp_log_enabled: false,
-            temp_encoding: Encoding::Utf8,
-            temp_auto_connect_type: AutoConnectType::Connect,
-            temp_keep_alive_type: KeepAliveType::Nop,
-            temp_keep_alive_cmd: String::new(),
-            temp_slack_token: String::new(),
-            temp_slack_channel: String::new(),
-            temp_slack_workspace: String::new(),
-            temp_discord_token: String::new(),
-            temp_discord_guild: String::new(),
-            temp_discord_channel: String::new(),
-            temp_discord_dm_user: String::new(),
-            temp_more_mode: true,
-            temp_spell_check: true,
-            temp_temp_convert: false,
-            temp_world_switch_mode: WorldSwitchMode::UnseenFirst,
-            temp_debug_enabled: false,
-            temp_show_tags: false,
-            temp_input_height: 3,
-            temp_theme: Theme::Dark,
-            temp_gui_theme: Theme::Dark,
-            temp_tls_proxy_enabled: false,
-        }
-    }
-
-    fn open(&mut self, settings: &Settings, world: &World, world_index: usize, input_height: u16, show_tags: bool) {
-        self.visible = true;
-        self.setup_mode = false;
-        self.editing_world_index = Some(world_index);
-        self.selected_field = SettingsField::WorldName;
-        self.editing = false;
-        // Load from world settings
-        self.temp_world_name = world.name.clone();
-        self.temp_world_type = world.settings.world_type.clone();
-        // MUD settings
-        self.temp_hostname = world.settings.hostname.clone();
-        self.temp_port = world.settings.port.clone();
-        self.temp_user = world.settings.user.clone();
-        self.temp_password = world.settings.password.clone();
-        self.temp_use_ssl = world.settings.use_ssl;
-        self.temp_log_enabled = world.settings.log_enabled;
-        self.temp_encoding = world.settings.encoding;
-        self.temp_auto_connect_type = world.settings.auto_connect_type;
-        self.temp_keep_alive_type = world.settings.keep_alive_type;
-        self.temp_keep_alive_cmd = world.settings.keep_alive_cmd.clone();
-        // Slack settings
-        self.temp_slack_token = world.settings.slack_token.clone();
-        self.temp_slack_channel = world.settings.slack_channel.clone();
-        self.temp_slack_workspace = world.settings.slack_workspace.clone();
-        // Discord settings
-        self.temp_discord_token = world.settings.discord_token.clone();
-        self.temp_discord_guild = world.settings.discord_guild.clone();
-        self.temp_discord_channel = world.settings.discord_channel.clone();
-        self.temp_discord_dm_user = world.settings.discord_dm_user.clone();
-        // Load from global settings
-        self.temp_more_mode = settings.more_mode_enabled;
-        self.temp_spell_check = settings.spell_check_enabled;
-        self.temp_temp_convert = settings.temp_convert_enabled;
-        self.temp_world_switch_mode = settings.world_switch_mode;
-        self.temp_show_tags = show_tags;
-        self.temp_input_height = input_height;
-    }
-
-    fn open_setup(&mut self, settings: &Settings, input_height: u16, show_tags: bool) {
-        self.visible = true;
-        self.setup_mode = true;
-        self.editing_world_index = None;
-        self.selected_field = SettingsField::MoreMode;
-        self.editing = false;
-        // Load from global settings only
-        self.temp_more_mode = settings.more_mode_enabled;
-        self.temp_spell_check = settings.spell_check_enabled;
-        self.temp_temp_convert = settings.temp_convert_enabled;
-        self.temp_world_switch_mode = settings.world_switch_mode;
-        self.temp_debug_enabled = settings.debug_enabled;
-        self.temp_show_tags = show_tags;
-        self.temp_input_height = input_height;
-        self.temp_theme = settings.theme;
-        self.temp_gui_theme = settings.gui_theme;
-        self.temp_tls_proxy_enabled = settings.tls_proxy_enabled;
-    }
-
-    fn close(&mut self) {
-        self.visible = false;
-        self.editing = false;
-    }
-
-    fn next_field(&mut self) {
-        if self.setup_mode {
-            self.selected_field = self.selected_field.next_setup();
-        } else {
-            let skip_cmd = self.temp_keep_alive_type != KeepAliveType::Custom;
-            self.selected_field = self.selected_field.next_world(&self.temp_world_type, skip_cmd);
-        }
-    }
-
-    fn prev_field(&mut self) {
-        if self.setup_mode {
-            self.selected_field = self.selected_field.prev_setup();
-        } else {
-            let skip_cmd = self.temp_keep_alive_type != KeepAliveType::Custom;
-            self.selected_field = self.selected_field.prev_world(&self.temp_world_type, skip_cmd);
-        }
-    }
-
-    /// Move to next non-button field (for Up/Down navigation). Returns false if at edge.
-    fn next_field_only(&mut self) -> bool {
-        if self.selected_field.is_button() {
-            return false;  // Don't move from buttons to fields with Up/Down
-        }
-        let prev = self.selected_field;
-        self.next_field();
-        // If we landed on a button, we're at the edge - revert and return false
-        if self.selected_field.is_button() {
-            self.selected_field = prev;
-            return false;
-        }
-        true
-    }
-
-    /// Move to previous non-button field (for Up/Down navigation). Returns false if at edge.
-    fn prev_field_only(&mut self) -> bool {
-        if self.selected_field.is_button() {
-            return false;  // Don't move from buttons to fields with Up/Down
-        }
-        let prev = self.selected_field;
-        self.prev_field();
-        // If we landed on a button (wrapping around), we're at the edge - revert and return false
-        if self.selected_field.is_button() {
-            self.selected_field = prev;
-            return false;
-        }
-        true
-    }
-
-    /// Move to next button (for Tab navigation, cycling within buttons)
-    fn next_button(&mut self) {
-        if self.setup_mode {
-            self.selected_field = match self.selected_field {
-                SettingsField::SaveSetup => SettingsField::CancelSetup,
-                SettingsField::CancelSetup => SettingsField::SaveSetup,
-                _ => SettingsField::SaveSetup,  // Start at first button
-            };
-        } else {
-            self.selected_field = match self.selected_field {
-                SettingsField::SaveWorld => SettingsField::CancelWorld,
-                SettingsField::CancelWorld => SettingsField::DeleteWorld,
-                SettingsField::DeleteWorld => SettingsField::Connect,
-                SettingsField::Connect => SettingsField::SaveWorld,
-                _ => SettingsField::SaveWorld,  // Start at first button
-            };
-        }
-    }
-
-    /// Move to previous button (for BackTab navigation, cycling within buttons)
-    fn prev_button(&mut self) {
-        if self.setup_mode {
-            self.selected_field = match self.selected_field {
-                SettingsField::SaveSetup => SettingsField::CancelSetup,
-                SettingsField::CancelSetup => SettingsField::SaveSetup,
-                _ => SettingsField::CancelSetup,  // Start at last button
-            };
-        } else {
-            self.selected_field = match self.selected_field {
-                SettingsField::SaveWorld => SettingsField::Connect,
-                SettingsField::CancelWorld => SettingsField::SaveWorld,
-                SettingsField::DeleteWorld => SettingsField::CancelWorld,
-                SettingsField::Connect => SettingsField::DeleteWorld,
-                _ => SettingsField::Connect,  // Start at last button
-            };
-        }
-    }
-
-    fn start_edit(&mut self) {
-        self.editing = true;
-        self.edit_buffer = match self.selected_field {
-            SettingsField::WorldName => self.temp_world_name.clone(),
-            SettingsField::Hostname => self.temp_hostname.clone(),
-            SettingsField::Port => self.temp_port.clone(),
-            SettingsField::User => self.temp_user.clone(),
-            SettingsField::Password => self.temp_password.clone(),
-            SettingsField::KeepAliveCmd => self.temp_keep_alive_cmd.clone(),
-            SettingsField::SlackToken => self.temp_slack_token.clone(),
-            SettingsField::SlackChannel => self.temp_slack_channel.clone(),
-            SettingsField::SlackWorkspace => self.temp_slack_workspace.clone(),
-            SettingsField::DiscordToken => self.temp_discord_token.clone(),
-            SettingsField::DiscordGuild => self.temp_discord_guild.clone(),
-            SettingsField::DiscordChannel => self.temp_discord_channel.clone(),
-            SettingsField::DiscordDmUser => self.temp_discord_dm_user.clone(),
-            _ => String::new(),
-        };
-        self.edit_cursor = self.edit_buffer.len();
-        self.edit_scroll_offset = 0; // Reset scroll when starting edit
-    }
-
-    /// Adjust scroll offset to keep cursor visible within given visible width
-    fn adjust_scroll(&mut self, visible_width: usize) {
-        if visible_width == 0 {
-            return;
-        }
-        // Keep cursor visible with some margin
-        let margin = 2.min(visible_width / 4);
-        if self.edit_cursor < self.edit_scroll_offset + margin {
-            // Cursor is before visible area, scroll left
-            self.edit_scroll_offset = self.edit_cursor.saturating_sub(margin);
-        } else if self.edit_cursor >= self.edit_scroll_offset + visible_width - margin {
-            // Cursor is after visible area, scroll right
-            self.edit_scroll_offset = self.edit_cursor.saturating_sub(visible_width - margin - 1);
-        }
-    }
-
-    fn commit_edit(&mut self) {
-        match self.selected_field {
-            SettingsField::WorldName => self.temp_world_name = self.edit_buffer.clone(),
-            SettingsField::Hostname => self.temp_hostname = self.edit_buffer.clone(),
-            SettingsField::Port => self.temp_port = self.edit_buffer.clone(),
-            SettingsField::User => self.temp_user = self.edit_buffer.clone(),
-            SettingsField::Password => self.temp_password = self.edit_buffer.clone(),
-            SettingsField::KeepAliveCmd => self.temp_keep_alive_cmd = self.edit_buffer.clone(),
-            SettingsField::SlackToken => self.temp_slack_token = self.edit_buffer.clone(),
-            SettingsField::SlackChannel => self.temp_slack_channel = self.edit_buffer.clone(),
-            SettingsField::SlackWorkspace => self.temp_slack_workspace = self.edit_buffer.clone(),
-            SettingsField::DiscordToken => self.temp_discord_token = self.edit_buffer.clone(),
-            SettingsField::DiscordGuild => self.temp_discord_guild = self.edit_buffer.clone(),
-            SettingsField::DiscordChannel => self.temp_discord_channel = self.edit_buffer.clone(),
-            SettingsField::DiscordDmUser => self.temp_discord_dm_user = self.edit_buffer.clone(),
-            _ => {}
-        }
-        self.editing = false;
-    }
-
-    fn cancel_edit(&mut self) {
-        self.editing = false;
-    }
-
-    fn toggle_or_cycle(&mut self) {
-        match self.selected_field {
-            SettingsField::WorldType => {
-                self.temp_world_type = self.temp_world_type.cycle_next();
-            }
-            SettingsField::UseSsl => self.temp_use_ssl = !self.temp_use_ssl,
-            SettingsField::LogFile => self.temp_log_enabled = !self.temp_log_enabled,
-            SettingsField::MoreMode => self.temp_more_mode = !self.temp_more_mode,
-            SettingsField::SpellCheck => self.temp_spell_check = !self.temp_spell_check,
-            SettingsField::TempConvert => self.temp_temp_convert = !self.temp_temp_convert,
-            SettingsField::WorldSwitching => self.temp_world_switch_mode = self.temp_world_switch_mode.next(),
-            SettingsField::Debug => self.temp_debug_enabled = !self.temp_debug_enabled,
-            SettingsField::ShowTags => self.temp_show_tags = !self.temp_show_tags,
-            SettingsField::InputHeight => {
-                // Cycle through 1-15
-                self.temp_input_height = if self.temp_input_height >= 15 {
-                    1
-                } else {
-                    self.temp_input_height + 1
-                };
-            }
-            SettingsField::GuiTheme => {
-                self.temp_gui_theme = self.temp_gui_theme.next();
-            }
-            SettingsField::TLSProxy => self.temp_tls_proxy_enabled = !self.temp_tls_proxy_enabled,
-            SettingsField::Encoding => {
-                self.temp_encoding = match self.temp_encoding {
-                    Encoding::Utf8 => Encoding::Latin1,
-                    Encoding::Latin1 => Encoding::Fansi,
-                    Encoding::Fansi => Encoding::Utf8,
-                };
-            }
-            SettingsField::AutoConnect => {
-                self.temp_auto_connect_type = self.temp_auto_connect_type.next();
-            }
-            SettingsField::KeepAlive => {
-                self.temp_keep_alive_type = self.temp_keep_alive_type.next();
-            }
-            _ => {}
-        }
-    }
-
-    /// Apply settings and return (input_height, show_tags)
-    fn apply(&self, settings: &mut Settings, world: &mut World) -> (u16, bool) {
-        // Apply global settings
-        settings.more_mode_enabled = self.temp_more_mode;
-        settings.spell_check_enabled = self.temp_spell_check;
-        settings.temp_convert_enabled = self.temp_temp_convert;
-        settings.world_switch_mode = self.temp_world_switch_mode;
-        settings.theme = self.temp_theme;
-        // Apply world-specific settings (only in world mode)
-        if !self.setup_mode {
-            world.name = self.temp_world_name.clone();
-            world.settings.world_type = self.temp_world_type.clone();
-            // MUD settings
-            world.settings.hostname = self.temp_hostname.clone();
-            world.settings.port = self.temp_port.clone();
-            world.settings.user = self.temp_user.clone();
-            world.settings.password = self.temp_password.clone();
-            world.settings.use_ssl = self.temp_use_ssl;
-            world.settings.log_enabled = self.temp_log_enabled;
-            world.settings.encoding = self.temp_encoding;
-            world.settings.auto_connect_type = self.temp_auto_connect_type;
-            world.settings.keep_alive_type = self.temp_keep_alive_type;
-            world.settings.keep_alive_cmd = self.temp_keep_alive_cmd.clone();
-            // Slack settings
-            world.settings.slack_token = self.temp_slack_token.clone();
-            world.settings.slack_channel = self.temp_slack_channel.clone();
-            world.settings.slack_workspace = self.temp_slack_workspace.clone();
-            // Discord settings
-            world.settings.discord_token = self.temp_discord_token.clone();
-            world.settings.discord_guild = self.temp_discord_guild.clone();
-            world.settings.discord_channel = self.temp_discord_channel.clone();
-            world.settings.discord_dm_user = self.temp_discord_dm_user.clone();
-        }
-        (self.temp_input_height, self.temp_show_tags)
-    }
-
-    fn apply_global(&self, settings: &mut Settings) -> (u16, bool) {
-        // Apply only global settings (for setup mode)
-        settings.more_mode_enabled = self.temp_more_mode;
-        settings.spell_check_enabled = self.temp_spell_check;
-        settings.temp_convert_enabled = self.temp_temp_convert;
-        settings.world_switch_mode = self.temp_world_switch_mode;
-        settings.debug_enabled = self.temp_debug_enabled;
-        settings.theme = self.temp_theme;
-        settings.gui_theme = self.temp_gui_theme;
-        settings.tls_proxy_enabled = self.temp_tls_proxy_enabled;
-        (self.temp_input_height, self.temp_show_tags)
-    }
-}
-
 // ============================================================================
 // Web Settings Popup (/web command)
 // ============================================================================
@@ -3282,7 +2664,6 @@ struct App {
     cached_misspelled: Vec<(usize, usize)>, // Cached misspelled word ranges (char positions)
     suggestion_message: Option<String>,
     settings: Settings,
-    settings_popup: SettingsPopup,
     confirm_dialog: ConfirmDialog,
     filter_popup: FilterPopup,
     /// New unified popup manager (gradual migration from old popup types)
@@ -3346,7 +2727,6 @@ impl App {
             cached_misspelled: Vec::new(),
             suggestion_message: None,
             settings: Settings::default(),
-            settings_popup: SettingsPopup::new(),
             confirm_dialog: ConfirmDialog::new(),
             filter_popup: FilterPopup::new(),
             popup_manager: popup::PopupManager::new(),
@@ -3559,6 +2939,63 @@ impl App {
         // Select first field
         if let Some(state) = self.popup_manager.current_mut() {
             state.select_field(WEB_FIELD_PROTOCOL);
+        }
+    }
+
+    /// Open the world editor popup for a specific world
+    fn open_world_editor_popup_new(&mut self, world_index: usize) {
+        use popup::definitions::world_editor::{
+            create_world_editor_popup, WorldSettings as PopupWorldSettings, WORLD_FIELD_NAME,
+        };
+
+        let world = &self.worlds[world_index];
+
+        // Map auto_connect type to lowercase value for popup
+        let auto_connect = match world.settings.auto_connect_type {
+            AutoConnectType::Connect => "connect",
+            AutoConnectType::Prompt => "prompt",
+            AutoConnectType::MooPrompt => "moo_prompt",
+        };
+
+        // Map keep_alive type to lowercase value for popup
+        let keep_alive = match world.settings.keep_alive_type {
+            KeepAliveType::None => "none",
+            KeepAliveType::Nop => "nop",
+            KeepAliveType::Custom => "custom",
+            KeepAliveType::Generic => "generic",
+        };
+
+        let settings = PopupWorldSettings {
+            name: world.name.clone(),
+            world_type: world.settings.world_type.name().to_string(),
+            hostname: world.settings.hostname.clone(),
+            port: world.settings.port.clone(),
+            user: world.settings.user.clone(),
+            password: world.settings.password.clone(),
+            use_ssl: world.settings.use_ssl,
+            log_enabled: world.settings.log_enabled,
+            encoding: world.settings.encoding.name().to_string(),
+            auto_connect: auto_connect.to_string(),
+            keep_alive: keep_alive.to_string(),
+            keep_alive_cmd: world.settings.keep_alive_cmd.clone(),
+            slack_token: world.settings.slack_token.clone(),
+            slack_channel: world.settings.slack_channel.clone(),
+            slack_workspace: world.settings.slack_workspace.clone(),
+            discord_token: world.settings.discord_token.clone(),
+            discord_guild: world.settings.discord_guild.clone(),
+            discord_channel: world.settings.discord_channel.clone(),
+            discord_dm_user: world.settings.discord_dm_user.clone(),
+        };
+
+        let def = create_world_editor_popup(&settings);
+        self.popup_manager.open(def);
+
+        // Store world index in popup custom state and select first field
+        if let Some(state) = self.popup_manager.current_mut() {
+            state.set_custom("world_index", world_index.to_string());
+            state.select_field(WORLD_FIELD_NAME);
+            // Auto-start editing on the name field
+            state.start_edit();
         }
     }
 
@@ -15938,11 +15375,6 @@ fn handle_remote_client_key(
 ) -> bool {
     use KeyCode::*;
 
-    // Check if any popup is visible - handle popup input first
-    if app.settings_popup.visible {
-        handle_remote_settings_popup_key(app, key);
-        return false;
-    }
     // New unified popup system - handles help popup and others
     if app.has_new_popup() {
         match handle_new_popup_key(app, key) {
@@ -15975,6 +15407,15 @@ fn handle_remote_client_key(
             }
             NewPopupAction::ActionEditorSave { .. } => {
                 // Action editor save - remote client doesn't handle locally
+            }
+            NewPopupAction::WorldEditorSaved(_) => {
+                // World editor save - remote client doesn't handle locally
+            }
+            NewPopupAction::WorldEditorDelete(_) => {
+                // World editor delete - remote client doesn't handle locally
+            }
+            NewPopupAction::WorldEditorConnect(_) => {
+                // World editor connect - remote client doesn't handle locally
             }
             NewPopupAction::None => {}
         }
@@ -16124,7 +15565,7 @@ fn handle_remote_client_key(
                         }
                     }
                     Command::WorldEdit { ref name } => {
-                        // /worlds -e [name] - open world editor
+                        // /worlds -e [name] - open world editor using new popup
                         let idx = if let Some(ref n) = name {
                             app.worlds.iter().position(|w| w.name.eq_ignore_ascii_case(n))
                                 .unwrap_or(app.current_world_index)
@@ -16132,13 +15573,7 @@ fn handle_remote_client_key(
                             app.current_world_index
                         };
                         if idx < app.worlds.len() {
-                            app.settings_popup.open(
-                                &app.settings,
-                                &app.worlds[idx],
-                                idx,
-                                app.input_height,
-                                app.show_tags,
-                            );
+                            app.open_world_editor_popup_new(idx);
                         }
                     }
                     Command::Actions { world } => {
@@ -16211,129 +15646,6 @@ fn handle_remote_client_key(
     false
 }
 
-/// Handle settings popup input for remote client
-fn handle_remote_settings_popup_key(app: &mut App, key: KeyEvent) {
-    use KeyCode::*;
-
-    if app.settings_popup.editing {
-        // Text editing mode
-        match key.code {
-            Esc => {
-                app.settings_popup.cancel_edit();
-                app.settings_popup.close();
-            }
-            Backspace => {
-                if app.settings_popup.edit_cursor > 0 {
-                    app.settings_popup.edit_cursor -= 1;
-                    app.settings_popup.edit_buffer.remove(app.settings_popup.edit_cursor);
-                    app.settings_popup.adjust_scroll(33);
-                }
-            }
-            Delete => {
-                if app.settings_popup.edit_cursor < app.settings_popup.edit_buffer.len() {
-                    app.settings_popup.edit_buffer.remove(app.settings_popup.edit_cursor);
-                }
-            }
-            Left => {
-                if app.settings_popup.edit_cursor > 0 {
-                    app.settings_popup.edit_cursor -= 1;
-                    app.settings_popup.adjust_scroll(33);
-                }
-            }
-            Right => {
-                if app.settings_popup.edit_cursor < app.settings_popup.edit_buffer.len() {
-                    app.settings_popup.edit_cursor += 1;
-                    app.settings_popup.adjust_scroll(33);
-                }
-            }
-            Home => {
-                app.settings_popup.edit_cursor = 0;
-                app.settings_popup.adjust_scroll(33);
-            }
-            End => {
-                app.settings_popup.edit_cursor = app.settings_popup.edit_buffer.len();
-                app.settings_popup.adjust_scroll(33);
-            }
-            Up => {
-                app.settings_popup.commit_edit();
-                app.settings_popup.prev_field();
-                if app.settings_popup.selected_field.is_text_field() {
-                    app.settings_popup.start_edit();
-                }
-            }
-            Down | Enter | Tab => {
-                app.settings_popup.commit_edit();
-                app.settings_popup.next_field();
-                if app.settings_popup.selected_field.is_text_field() {
-                    app.settings_popup.start_edit();
-                }
-            }
-            Char(c) => {
-                app.settings_popup.edit_buffer.insert(app.settings_popup.edit_cursor, c);
-                app.settings_popup.edit_cursor += 1;
-                app.settings_popup.adjust_scroll(33);
-            }
-            _ => {}
-        }
-    } else {
-        // Navigation mode
-        match key.code {
-            Esc => {
-                app.settings_popup.close();
-            }
-            Enter => {
-                if app.settings_popup.selected_field.is_text_field() {
-                    app.settings_popup.start_edit();
-                } else if app.settings_popup.selected_field.is_button() {
-                    match app.settings_popup.selected_field {
-                        SettingsField::SaveSetup | SettingsField::SaveWorld => {
-                            // Apply and close (simplified - doesn't save to file in remote mode)
-                            if app.settings_popup.setup_mode {
-                                let (new_input_height, new_show_tags) = app.settings_popup.apply_global(&mut app.settings);
-                                app.input_height = new_input_height;
-                                app.show_tags = new_show_tags;
-                            }
-                            app.settings_popup.close();
-                        }
-                        SettingsField::CancelSetup | SettingsField::CancelWorld => {
-                            app.settings_popup.close();
-                        }
-                        _ => {}
-                    }
-                } else {
-                    // Toggle booleans with Enter
-                    app.settings_popup.next_field();
-                }
-            }
-            Up => {
-                app.settings_popup.prev_field();
-                if app.settings_popup.selected_field.is_text_field() {
-                    app.settings_popup.start_edit();
-                }
-            }
-            Down | Tab => {
-                app.settings_popup.next_field();
-                if app.settings_popup.selected_field.is_text_field() {
-                    app.settings_popup.start_edit();
-                }
-            }
-            Char(' ') => {
-                // Space toggles booleans - just move to next field for simplicity
-                app.settings_popup.next_field();
-            }
-            Char(c) => {
-                // Start typing in text fields
-                if app.settings_popup.selected_field.is_text_field() {
-                    app.settings_popup.start_edit();
-                    app.settings_popup.edit_buffer.push(c);
-                    app.settings_popup.edit_cursor = 1;
-                }
-            }
-            _ => {}
-        }
-    }
-}
-
 /// Result from handling a new popup key
 enum NewPopupAction {
     None,
@@ -16357,6 +15669,12 @@ enum NewPopupAction {
     ActionsListFilter,
     /// Action editor saved
     ActionEditorSave { action: Action, editing_index: Option<usize> },
+    /// World editor saved
+    WorldEditorSaved(WorldEditorSettings),
+    /// World editor delete requested
+    WorldEditorDelete(usize),
+    /// World editor connect requested
+    WorldEditorConnect(usize),
 }
 
 /// Settings from the setup popup
@@ -16383,6 +15701,33 @@ struct WebSettings {
     ws_allow_list: String,
     ws_cert_file: String,
     ws_key_file: String,
+}
+
+/// Settings from the world editor popup
+struct WorldEditorSettings {
+    world_index: usize,  // Which world is being edited
+    name: String,
+    world_type: String,
+    // MUD fields
+    hostname: String,
+    port: String,
+    user: String,
+    password: String,
+    use_ssl: bool,
+    log_enabled: bool,
+    encoding: String,
+    auto_connect: String,
+    keep_alive: String,
+    keep_alive_cmd: String,
+    // Slack fields
+    slack_token: String,
+    slack_channel: String,
+    slack_workspace: String,
+    // Discord fields
+    discord_token: String,
+    discord_guild: String,
+    discord_channel: String,
+    discord_dm_user: String,
 }
 
 /// Actions from the world selector popup
@@ -16430,6 +15775,15 @@ fn handle_new_popup_key(app: &mut App, key: KeyEvent) -> NewPopupAction {
         EDITOR_FIELD_PATTERN, EDITOR_FIELD_COMMAND, EDITOR_FIELD_ENABLED,
         EDITOR_BTN_SAVE, EDITOR_BTN_CANCEL,
     };
+    use popup::definitions::world_editor::{
+        WORLD_FIELD_NAME, WORLD_FIELD_TYPE, WORLD_FIELD_HOSTNAME, WORLD_FIELD_PORT,
+        WORLD_FIELD_USER, WORLD_FIELD_PASSWORD, WORLD_FIELD_USE_SSL, WORLD_FIELD_LOG_ENABLED,
+        WORLD_FIELD_ENCODING, WORLD_FIELD_AUTO_CONNECT, WORLD_FIELD_KEEP_ALIVE, WORLD_FIELD_KEEP_ALIVE_CMD,
+        WORLD_FIELD_SLACK_TOKEN, WORLD_FIELD_SLACK_CHANNEL, WORLD_FIELD_SLACK_WORKSPACE,
+        WORLD_FIELD_DISCORD_TOKEN, WORLD_FIELD_DISCORD_GUILD, WORLD_FIELD_DISCORD_CHANNEL, WORLD_FIELD_DISCORD_DM_USER,
+        WORLD_BTN_SAVE, WORLD_BTN_CANCEL, WORLD_BTN_DELETE, WORLD_BTN_CONNECT,
+        WorldType as PopupWorldType, update_field_visibility,
+    };
 
     let popup_id = app.popup_manager.current().map(|s| s.definition.id.clone());
     let is_menu = popup_id == Some(popup::PopupId("menu"));
@@ -16440,6 +15794,7 @@ fn handle_new_popup_key(app: &mut App, key: KeyEvent) -> NewPopupAction {
     let is_connections = popup_id == Some(popup::PopupId("connections"));
     let is_actions_list = popup_id == Some(popup::PopupId("actions_list"));
     let is_action_editor = popup_id == Some(popup::PopupId("action_editor"));
+    let is_world_editor = popup_id == Some(popup::PopupId("world_editor"));
 
     if let Some(state) = app.popup_manager.current_mut() {
         // World selector has special handling
@@ -17202,6 +16557,237 @@ fn handle_new_popup_key(app: &mut App, key: KeyEvent) -> NewPopupAction {
                 }
                 Char('c') | Char('C') if !state.editing => {
                     app.popup_manager.close();
+                }
+                Char(c) => {
+                    if state.editing {
+                        state.insert_char(c);
+                    } else if is_text_field {
+                        state.start_edit();
+                        state.insert_char(c);
+                    }
+                }
+                _ => {}
+            }
+            return NewPopupAction::None;
+        }
+
+        // World editor popup handling
+        if is_world_editor {
+            // Get world index from custom state
+            let world_index: usize = state.get_custom("world_index")
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(0);
+
+            // Helper to extract settings before closing
+            let extract_settings = || -> WorldEditorSettings {
+                WorldEditorSettings {
+                    world_index,
+                    name: state.get_text(WORLD_FIELD_NAME).unwrap_or("").to_string(),
+                    world_type: state.get_selected(WORLD_FIELD_TYPE).unwrap_or("mud").to_string(),
+                    hostname: state.get_text(WORLD_FIELD_HOSTNAME).unwrap_or("").to_string(),
+                    port: state.get_text(WORLD_FIELD_PORT).unwrap_or("").to_string(),
+                    user: state.get_text(WORLD_FIELD_USER).unwrap_or("").to_string(),
+                    password: state.get_text(WORLD_FIELD_PASSWORD).unwrap_or("").to_string(),
+                    use_ssl: state.get_bool(WORLD_FIELD_USE_SSL).unwrap_or(false),
+                    log_enabled: state.get_bool(WORLD_FIELD_LOG_ENABLED).unwrap_or(false),
+                    encoding: state.get_selected(WORLD_FIELD_ENCODING).unwrap_or("utf8").to_string(),
+                    auto_connect: state.get_selected(WORLD_FIELD_AUTO_CONNECT).unwrap_or("connect").to_string(),
+                    keep_alive: state.get_selected(WORLD_FIELD_KEEP_ALIVE).unwrap_or("nop").to_string(),
+                    keep_alive_cmd: state.get_text(WORLD_FIELD_KEEP_ALIVE_CMD).unwrap_or("").to_string(),
+                    slack_token: state.get_text(WORLD_FIELD_SLACK_TOKEN).unwrap_or("").to_string(),
+                    slack_channel: state.get_text(WORLD_FIELD_SLACK_CHANNEL).unwrap_or("").to_string(),
+                    slack_workspace: state.get_text(WORLD_FIELD_SLACK_WORKSPACE).unwrap_or("").to_string(),
+                    discord_token: state.get_text(WORLD_FIELD_DISCORD_TOKEN).unwrap_or("").to_string(),
+                    discord_guild: state.get_text(WORLD_FIELD_DISCORD_GUILD).unwrap_or("").to_string(),
+                    discord_channel: state.get_text(WORLD_FIELD_DISCORD_CHANNEL).unwrap_or("").to_string(),
+                    discord_dm_user: state.get_text(WORLD_FIELD_DISCORD_DM_USER).unwrap_or("").to_string(),
+                }
+            };
+
+            // Check field type
+            let is_text_field = state.selected_field()
+                .map(|f| f.kind.is_text_editable())
+                .unwrap_or(false);
+            let is_toggle = state.selected_field()
+                .map(|f| matches!(&f.kind, popup::FieldKind::Toggle { .. }))
+                .unwrap_or(false);
+            let is_select = state.selected_field()
+                .map(|f| matches!(&f.kind, popup::FieldKind::Select { .. }))
+                .unwrap_or(false);
+
+            // Macro to update visibility when type or keep_alive changes
+            // (We can't use a closure because of borrow conflicts)
+            macro_rules! update_visibility {
+                ($state:expr) => {{
+                    // Extract values first to avoid borrow conflicts
+                    let world_type_str = $state.get_selected(WORLD_FIELD_TYPE).unwrap_or("mud").to_string();
+                    let keep_alive_str = $state.get_selected(WORLD_FIELD_KEEP_ALIVE).unwrap_or("nop").to_string();
+                    update_field_visibility(
+                        &mut $state.definition,
+                        PopupWorldType::from_str(&world_type_str),
+                        keep_alive_str == "custom",
+                    );
+                }};
+            }
+
+            match key.code {
+                Esc => {
+                    if state.editing {
+                        state.cancel_edit();
+                    } else {
+                        app.popup_manager.close();
+                    }
+                }
+                Enter => {
+                    if state.editing {
+                        state.commit_edit();
+                        state.next_field();
+                        // Auto-start editing on text/password fields
+                        if state.selected_field().map(|f| f.kind.is_text_editable()).unwrap_or(false) {
+                            state.start_edit();
+                        }
+                    } else if state.is_on_button() {
+                        if state.is_button_focused(WORLD_BTN_SAVE) {
+                            let settings = extract_settings();
+                            app.popup_manager.close();
+                            return NewPopupAction::WorldEditorSaved(settings);
+                        } else if state.is_button_focused(WORLD_BTN_CANCEL) {
+                            app.popup_manager.close();
+                        } else if state.is_button_focused(WORLD_BTN_DELETE) {
+                            app.popup_manager.close();
+                            return NewPopupAction::WorldEditorDelete(world_index);
+                        } else if state.is_button_focused(WORLD_BTN_CONNECT) {
+                            let settings = extract_settings();
+                            app.popup_manager.close();
+                            // First save, then connect
+                            return NewPopupAction::WorldEditorConnect(world_index);
+                        }
+                    } else if is_toggle {
+                        state.toggle_current();
+                    } else if is_select {
+                        state.toggle_current();
+                        update_visibility!(state);
+                    } else if is_text_field {
+                        state.start_edit();
+                    }
+                }
+                Char(' ') => {
+                    if state.editing {
+                        state.insert_char(' ');
+                    } else if is_toggle {
+                        state.toggle_current();
+                    } else if is_select {
+                        state.toggle_current();
+                        update_visibility!(state);
+                    }
+                }
+                Tab => {
+                    if state.editing {
+                        state.commit_edit();
+                    }
+                    state.cycle_field_buttons();
+                    // Auto-start editing on text/password fields
+                    if state.selected_field().map(|f| f.kind.is_text_editable()).unwrap_or(false) {
+                        state.start_edit();
+                    }
+                }
+                BackTab => {
+                    if state.editing {
+                        state.commit_edit();
+                    }
+                    // Go to previous element
+                    if !state.prev_field() {
+                        state.select_last_field();
+                    }
+                    // Auto-start editing on text/password fields
+                    if state.selected_field().map(|f| f.kind.is_text_editable()).unwrap_or(false) {
+                        state.start_edit();
+                    }
+                }
+                Up => {
+                    if state.editing {
+                        state.commit_edit();
+                    }
+                    if state.is_on_button() {
+                        state.select_last_field();
+                    } else {
+                        state.prev_field();
+                    }
+                    // Auto-start editing on text/password fields
+                    if state.selected_field().map(|f| f.kind.is_text_editable()).unwrap_or(false) {
+                        state.start_edit();
+                    }
+                }
+                Down => {
+                    if state.editing {
+                        state.commit_edit();
+                    }
+                    if state.is_on_button() {
+                        state.select_last_field();
+                    } else if !state.next_field() {
+                        state.select_first_button();
+                    }
+                    // Auto-start editing on text/password fields
+                    if state.selected_field().map(|f| f.kind.is_text_editable()).unwrap_or(false) {
+                        state.start_edit();
+                    }
+                }
+                Left => {
+                    if state.editing {
+                        state.cursor_left();
+                    } else if is_select || is_toggle {
+                        state.decrease_current();
+                        update_visibility!(state);
+                    } else if state.is_on_button() {
+                        state.prev_button();
+                    }
+                }
+                Right => {
+                    if state.editing {
+                        state.cursor_right();
+                    } else if is_select || is_toggle {
+                        state.increase_current();
+                        update_visibility!(state);
+                    } else if state.is_on_button() {
+                        state.next_button();
+                    }
+                }
+                Backspace => {
+                    if state.editing {
+                        state.backspace();
+                    }
+                }
+                Delete => {
+                    if state.editing {
+                        state.delete_char();
+                    }
+                }
+                Home => {
+                    if state.editing {
+                        state.cursor_home();
+                    }
+                }
+                End => {
+                    if state.editing {
+                        state.cursor_end();
+                    }
+                }
+                Char('s') | Char('S') if !state.editing => {
+                    let settings = extract_settings();
+                    app.popup_manager.close();
+                    return NewPopupAction::WorldEditorSaved(settings);
+                }
+                Char('c') | Char('C') if !state.editing => {
+                    app.popup_manager.close();
+                }
+                Char('d') | Char('D') if !state.editing => {
+                    app.popup_manager.close();
+                    return NewPopupAction::WorldEditorDelete(world_index);
+                }
+                Char('o') | Char('O') if !state.editing => {
+                    let settings = extract_settings();
+                    app.popup_manager.close();
+                    return NewPopupAction::WorldEditorConnect(world_index);
                 }
                 Char(c) => {
                     if state.editing {
@@ -21514,8 +21100,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
         }
 
         // Check if any popup is now visible
-        let any_popup_visible = app.settings_popup.visible
-            || app.confirm_dialog.visible
+        let any_popup_visible = app.confirm_dialog.visible
             || app.filter_popup.visible
             || app.has_new_popup();
 
@@ -22784,7 +22369,6 @@ fn handle_key_event(key: KeyEvent, app: &mut App) -> KeyAction {
                     }
                 }
                 app.confirm_dialog.close();
-                app.settings_popup.close();
             }
             KeyCode::Esc => {
                 // Cancel - just close the dialog
@@ -22846,11 +22430,9 @@ fn handle_key_event(key: KeyEvent, app: &mut App) -> KeyAction {
                         }
                     }
                     WorldSelectorAction::Edit(name) => {
-                        // Open world editor
+                        // Open world editor using new popup
                         if let Some(idx) = app.find_world(&name) {
-                            let input_height = app.input_height;
-                            let show_tags = app.show_tags;
-                            app.settings_popup.open(&app.settings, &app.worlds[idx], idx, input_height, show_tags);
+                            app.open_world_editor_popup_new(idx);
                         }
                     }
                     WorldSelectorAction::Delete(name) => {
@@ -22864,14 +22446,12 @@ fn handle_key_event(key: KeyEvent, app: &mut App) -> KeyAction {
                         }
                     }
                     WorldSelectorAction::Add => {
-                        // Create new world and open editor
+                        // Create new world and open editor using new popup
                         let new_name = format!("World {}", app.worlds.len() + 1);
                         let new_world = World::new(&new_name);
                         app.worlds.push(new_world);
                         let idx = app.worlds.len() - 1;
-                        let input_height = app.input_height;
-                        let show_tags = app.show_tags;
-                        app.settings_popup.open(&app.settings, &app.worlds[idx], idx, input_height, show_tags);
+                        app.open_world_editor_popup_new(idx);
                     }
                 }
             }
@@ -23055,6 +22635,75 @@ fn handle_key_event(key: KeyEvent, app: &mut App) -> KeyAction {
                     }
                 }
             }
+            NewPopupAction::WorldEditorSaved(settings) => {
+                let idx = settings.world_index;
+                if idx < app.worlds.len() {
+                    // Update world name
+                    app.worlds[idx].name = settings.name;
+
+                    // Update world type
+                    app.worlds[idx].settings.world_type = WorldType::from_name(&settings.world_type);
+
+                    // Update MUD settings
+                    app.worlds[idx].settings.hostname = settings.hostname;
+                    app.worlds[idx].settings.port = settings.port;
+                    app.worlds[idx].settings.user = settings.user;
+                    app.worlds[idx].settings.password = settings.password;
+                    app.worlds[idx].settings.use_ssl = settings.use_ssl;
+                    app.worlds[idx].settings.log_enabled = settings.log_enabled;
+
+                    // Update encoding
+                    app.worlds[idx].settings.encoding = Encoding::from_name(&settings.encoding);
+
+                    // Update auto connect type
+                    app.worlds[idx].settings.auto_connect_type = match settings.auto_connect.as_str() {
+                        "prompt" => AutoConnectType::Prompt,
+                        "moo_prompt" => AutoConnectType::MooPrompt,
+                        _ => AutoConnectType::Connect,
+                    };
+
+                    // Update keep alive type
+                    app.worlds[idx].settings.keep_alive_type = match settings.keep_alive.as_str() {
+                        "none" => KeepAliveType::None,
+                        "custom" => KeepAliveType::Custom,
+                        "generic" => KeepAliveType::Generic,
+                        _ => KeepAliveType::Nop,
+                    };
+                    app.worlds[idx].settings.keep_alive_cmd = settings.keep_alive_cmd;
+
+                    // Update Slack settings
+                    app.worlds[idx].settings.slack_token = settings.slack_token;
+                    app.worlds[idx].settings.slack_channel = settings.slack_channel;
+                    app.worlds[idx].settings.slack_workspace = settings.slack_workspace;
+
+                    // Update Discord settings
+                    app.worlds[idx].settings.discord_token = settings.discord_token;
+                    app.worlds[idx].settings.discord_guild = settings.discord_guild;
+                    app.worlds[idx].settings.discord_channel = settings.discord_channel;
+                    app.worlds[idx].settings.discord_dm_user = settings.discord_dm_user;
+
+                    app.add_output(&format!("World '{}' saved.", app.worlds[idx].name));
+                    let _ = save_settings(app);
+                }
+            }
+            NewPopupAction::WorldEditorDelete(idx) => {
+                if app.worlds.len() > 1 && idx < app.worlds.len() {
+                    let name = app.worlds[idx].name.clone();
+                    app.open_delete_world_confirm(&name, idx);
+                } else {
+                    app.add_output("Cannot delete the last world.");
+                }
+            }
+            NewPopupAction::WorldEditorConnect(idx) => {
+                if idx < app.worlds.len() {
+                    // First save the settings that were extracted
+                    // Note: The settings were already saved via WorldEditorSaved before this
+                    app.switch_world(idx);
+                    if !app.current_world().connected {
+                        return KeyAction::Connect;
+                    }
+                }
+            }
             NewPopupAction::None => {}
         }
         return KeyAction::None;
@@ -23138,363 +22787,6 @@ fn handle_key_event(key: KeyEvent, app: &mut App) -> KeyAction {
                 app.needs_output_redraw = true;
             }
             _ => {}
-        }
-        return KeyAction::None;
-    }
-
-    // Handle settings popup input
-    if app.settings_popup.visible {
-        if app.settings_popup.editing {
-            // Text editing mode - inline editing
-            match key.code {
-                KeyCode::Esc => {
-                    // Cancel and close popup
-                    app.settings_popup.cancel_edit();
-                    app.settings_popup.close();
-                }
-                KeyCode::Backspace => {
-                    if app.settings_popup.edit_cursor > 0 {
-                        app.settings_popup.edit_cursor -= 1;
-                        app.settings_popup.edit_buffer.remove(app.settings_popup.edit_cursor);
-                        app.settings_popup.adjust_scroll(33);
-                    }
-                }
-                KeyCode::Delete => {
-                    if app.settings_popup.edit_cursor < app.settings_popup.edit_buffer.len() {
-                        app.settings_popup.edit_buffer.remove(app.settings_popup.edit_cursor);
-                    }
-                }
-                KeyCode::Left => {
-                    if app.settings_popup.edit_cursor > 0 {
-                        app.settings_popup.edit_cursor -= 1;
-                        app.settings_popup.adjust_scroll(33);
-                    }
-                }
-                KeyCode::Right => {
-                    if app.settings_popup.edit_cursor < app.settings_popup.edit_buffer.len() {
-                        app.settings_popup.edit_cursor += 1;
-                        app.settings_popup.adjust_scroll(33);
-                    }
-                }
-                KeyCode::Char('b') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                    // Ctrl+B = Left (backward)
-                    if app.settings_popup.edit_cursor > 0 {
-                        app.settings_popup.edit_cursor -= 1;
-                        app.settings_popup.adjust_scroll(33);
-                    }
-                }
-                KeyCode::Char('f') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                    // Ctrl+F = Right (forward)
-                    if app.settings_popup.edit_cursor < app.settings_popup.edit_buffer.len() {
-                        app.settings_popup.edit_cursor += 1;
-                        app.settings_popup.adjust_scroll(33);
-                    }
-                }
-                KeyCode::Home => {
-                    app.settings_popup.edit_cursor = 0;
-                    app.settings_popup.adjust_scroll(33);
-                }
-                KeyCode::End => {
-                    app.settings_popup.edit_cursor = app.settings_popup.edit_buffer.len();
-                    app.settings_popup.adjust_scroll(33);
-                }
-                KeyCode::Up => {
-                    // Commit and move to previous field
-                    app.settings_popup.commit_edit();
-                    app.settings_popup.prev_field();
-                    // Auto-start editing if new field is text
-                    if app.settings_popup.selected_field.is_text_field() {
-                        app.settings_popup.start_edit();
-                    }
-                }
-                KeyCode::Down | KeyCode::Enter | KeyCode::Tab => {
-                    // Commit and move to next field
-                    app.settings_popup.commit_edit();
-                    app.settings_popup.next_field();
-                    // Auto-start editing if new field is text
-                    if app.settings_popup.selected_field.is_text_field() {
-                        app.settings_popup.start_edit();
-                    }
-                }
-                KeyCode::Char(c) => {
-                    app.settings_popup.edit_buffer.insert(app.settings_popup.edit_cursor, c);
-                    app.settings_popup.edit_cursor += 1;
-                    app.settings_popup.adjust_scroll(33);
-                }
-                _ => {}
-            }
-        } else {
-            // Navigation mode
-            match key.code {
-                KeyCode::Esc => {
-                    app.settings_popup.close();
-                }
-                KeyCode::Enter => {
-                    if app.settings_popup.selected_field.is_text_field() {
-                        // Start editing text field
-                        app.settings_popup.start_edit();
-                    } else if app.settings_popup.selected_field.is_button() {
-                        // Handle buttons
-                        match app.settings_popup.selected_field {
-                            SettingsField::Connect => {
-                                // Save settings first (to the world being edited)
-                                let idx = app.settings_popup.editing_world_index.unwrap_or(app.current_world_index);
-                                let (new_input_height, new_show_tags) = app.settings_popup
-                                    .apply(&mut app.settings, &mut app.worlds[idx]);
-                                app.input_height = new_input_height;
-                                app.input.visible_height = new_input_height;
-                                app.show_tags = new_show_tags;
-                                if let Err(e) = save_settings(app) {
-                                    app.add_output(&format!("Warning: Could not save settings: {}", e));
-                                }
-                                app.settings_popup.close();
-                                // Return Connect action if not already connected
-                                if !app.current_world().connected {
-                                    return KeyAction::Connect;
-                                } else {
-                                    app.add_output("Already connected.");
-                                }
-                            }
-                            SettingsField::SaveSetup => {
-                                // Save global settings
-                                let (new_input_height, new_show_tags) = app.settings_popup.apply_global(&mut app.settings);
-                                app.input_height = new_input_height;
-                                app.input.visible_height = new_input_height;
-                                app.show_tags = new_show_tags;
-                                // Log that debug was enabled/disabled
-                                if app.settings.debug_enabled {
-                                    debug_log(true, "Debug logging enabled");
-                                    app.add_output("Debug logging enabled - writing to ~/clay.debug.log");
-                                }
-                                if let Err(e) = save_settings(app) {
-                                    app.add_output(&format!("Warning: Could not save settings: {}", e));
-                                }
-                                app.settings_popup.close();
-                                // Update WebSocket server state based on new settings
-                                return KeyAction::UpdateWebSocket;
-                            }
-                            SettingsField::CancelSetup => {
-                                // Just close without saving
-                                app.settings_popup.close();
-                            }
-                            SettingsField::SaveWorld => {
-                                // Save world settings (to the world being edited)
-                                let idx = app.settings_popup.editing_world_index.unwrap_or(app.current_world_index);
-                                let (new_input_height, new_show_tags) = app.settings_popup
-                                    .apply(&mut app.settings, &mut app.worlds[idx]);
-                                app.input_height = new_input_height;
-                                app.input.visible_height = new_input_height;
-                                app.show_tags = new_show_tags;
-                                if let Err(e) = save_settings(app) {
-                                    app.add_output(&format!("Warning: Could not save settings: {}", e));
-                                }
-                                app.settings_popup.close();
-                            }
-                            SettingsField::CancelWorld => {
-                                // Just close without saving
-                                app.settings_popup.close();
-                            }
-                            SettingsField::DeleteWorld => {
-                                // Show confirmation dialog for the world being edited, not the current world
-                                if let Some(world_index) = app.settings_popup.editing_world_index {
-                                    let world_name = app.worlds[world_index].name.clone();
-                                    app.open_delete_world_confirm(&world_name, world_index);
-                                }
-                            }
-                            _ => {}
-                        }
-                    } else {
-                        // Toggle/cycle for other fields
-                        app.settings_popup.toggle_or_cycle();
-                    }
-                }
-                KeyCode::Up => {
-                    // Up navigates through fields only (not buttons), stops at edge
-                    if app.settings_popup.prev_field_only() {
-                        // Auto-start editing if text field
-                        if app.settings_popup.selected_field.is_text_field() {
-                            app.settings_popup.start_edit();
-                        }
-                    }
-                }
-                KeyCode::Down => {
-                    // Down navigates through fields only (not buttons), stops at edge
-                    if app.settings_popup.next_field_only() {
-                        // Auto-start editing if text field
-                        if app.settings_popup.selected_field.is_text_field() {
-                            app.settings_popup.start_edit();
-                        }
-                    }
-                }
-                KeyCode::Tab => {
-                    // Tab cycles through buttons only
-                    app.settings_popup.next_button();
-                }
-                KeyCode::BackTab => {
-                    // BackTab cycles through buttons in reverse
-                    app.settings_popup.prev_button();
-                }
-                KeyCode::Left => {
-                    // Decrement for InputHeight, cycle backwards for Encoding/AutoConnect, or move between buttons
-                    if app.settings_popup.selected_field == SettingsField::InputHeight {
-                        if app.settings_popup.temp_input_height > 1 {
-                            app.settings_popup.temp_input_height -= 1;
-                        }
-                    } else if app.settings_popup.selected_field == SettingsField::Encoding {
-                        app.settings_popup.temp_encoding = app.settings_popup.temp_encoding.prev();
-                    } else if app.settings_popup.selected_field == SettingsField::AutoConnect {
-                        app.settings_popup.temp_auto_connect_type = app.settings_popup.temp_auto_connect_type.prev();
-                    } else if app.settings_popup.selected_field == SettingsField::KeepAlive {
-                        app.settings_popup.temp_keep_alive_type = app.settings_popup.temp_keep_alive_type.prev();
-                    } else if app.settings_popup.selected_field.is_button() {
-                        // Move to previous button (world settings buttons)
-                        app.settings_popup.selected_field = match app.settings_popup.selected_field {
-                            SettingsField::SaveWorld => SettingsField::Connect,
-                            SettingsField::CancelWorld => SettingsField::SaveWorld,
-                            SettingsField::DeleteWorld => SettingsField::CancelWorld,
-                            SettingsField::Connect => SettingsField::DeleteWorld,
-                            // Setup mode buttons
-                            SettingsField::SaveSetup => SettingsField::CancelSetup,
-                            SettingsField::CancelSetup => SettingsField::SaveSetup,
-                            other => other,
-                        };
-                    }
-                }
-                KeyCode::Right => {
-                    // Increment for InputHeight, cycle forwards for Encoding/AutoConnect, or move between buttons
-                    if app.settings_popup.selected_field == SettingsField::InputHeight {
-                        if app.settings_popup.temp_input_height < 15 {
-                            app.settings_popup.temp_input_height += 1;
-                        }
-                    } else if app.settings_popup.selected_field == SettingsField::Encoding {
-                        app.settings_popup.temp_encoding = app.settings_popup.temp_encoding.next();
-                    } else if app.settings_popup.selected_field == SettingsField::AutoConnect {
-                        app.settings_popup.temp_auto_connect_type = app.settings_popup.temp_auto_connect_type.next();
-                    } else if app.settings_popup.selected_field == SettingsField::KeepAlive {
-                        app.settings_popup.temp_keep_alive_type = app.settings_popup.temp_keep_alive_type.next();
-                    } else if app.settings_popup.selected_field.is_button() {
-                        // Move to next button (world settings buttons)
-                        app.settings_popup.selected_field = match app.settings_popup.selected_field {
-                            SettingsField::SaveWorld => SettingsField::CancelWorld,
-                            SettingsField::CancelWorld => SettingsField::DeleteWorld,
-                            SettingsField::DeleteWorld => SettingsField::Connect,
-                            SettingsField::Connect => SettingsField::SaveWorld,
-                            // Setup mode buttons
-                            SettingsField::SaveSetup => SettingsField::CancelSetup,
-                            SettingsField::CancelSetup => SettingsField::SaveSetup,
-                            other => other,
-                        };
-                    }
-                }
-                KeyCode::Char(' ') => {
-                    if app.settings_popup.selected_field.is_text_field() {
-                        app.settings_popup.start_edit();
-                        // Insert the space
-                        app.settings_popup.edit_buffer.push(' ');
-                        app.settings_popup.edit_cursor += 1;
-                        app.settings_popup.adjust_scroll(33);
-                    } else if app.settings_popup.selected_field.is_button() {
-                        // Handle Connect button with Space too
-                        if app.settings_popup.selected_field == SettingsField::Connect {
-                            let idx = app.settings_popup.editing_world_index.unwrap_or(app.current_world_index);
-                            let (new_input_height, new_show_tags) = app.settings_popup
-                                .apply(&mut app.settings, &mut app.worlds[idx]);
-                            app.input_height = new_input_height;
-                            app.input.visible_height = new_input_height;
-                            app.show_tags = new_show_tags;
-                            if let Err(e) = save_settings(app) {
-                                app.add_output(&format!("Warning: Could not save settings: {}", e));
-                            }
-                            app.settings_popup.close();
-                            if !app.current_world().connected {
-                                return KeyAction::Connect;
-                            } else {
-                                app.add_output("Already connected.");
-                            }
-                        }
-                    } else {
-                        app.settings_popup.toggle_or_cycle();
-                    }
-                }
-                KeyCode::Char('s') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                    // Ctrl+S to save (to the world being edited)
-                    let idx = app.settings_popup.editing_world_index.unwrap_or(app.current_world_index);
-                    let (new_input_height, new_show_tags) = app.settings_popup
-                        .apply(&mut app.settings, &mut app.worlds[idx]);
-                    app.input_height = new_input_height;
-                    app.input.visible_height = new_input_height;
-                    app.show_tags = new_show_tags;
-                    if !app.settings.more_mode_enabled {
-                        // Get the lines that will be released (for broadcasting as ServerData)
-                        let lines_to_broadcast: Vec<String> = app.worlds[idx]
-                            .pending_lines
-                            .iter()
-                            .map(|line| line.text.replace('\r', ""))
-                            .collect();
-                        let released = lines_to_broadcast.len();
-
-                        app.worlds[idx].release_all_pending();
-
-                        // Broadcast the released lines as ServerData so clients can display them
-                        if !lines_to_broadcast.is_empty() {
-                            let ws_data = lines_to_broadcast.join("\n") + "\n";
-                            app.ws_broadcast(WsMessage::ServerData {
-                                world_index: idx,
-                                data: ws_data,
-                                is_viewed: true,
-                                ts: current_timestamp_secs(),
-                            });
-                            app.ws_broadcast(WsMessage::PendingReleased { world_index: idx, count: released });
-                            app.ws_broadcast(WsMessage::PendingLinesUpdate { world_index: idx, count: 0 });
-                            app.broadcast_activity();
-                        }
-                    }
-                    app.settings_popup.close();
-                    if let Err(e) = save_settings(app) {
-                        app.add_output(&format!("Warning: Could not save settings: {}", e));
-                    } else {
-                        app.add_output("Settings saved");
-                    }
-                }
-                KeyCode::Char('s') | KeyCode::Char('S') => {
-                    // Shortcut for Save button
-                    if app.settings_popup.setup_mode {
-                        app.settings_popup.selected_field = SettingsField::SaveSetup;
-                    } else {
-                        app.settings_popup.selected_field = SettingsField::SaveWorld;
-                    }
-                }
-                KeyCode::Char('c') | KeyCode::Char('C') => {
-                    // Shortcut for Cancel button
-                    if app.settings_popup.setup_mode {
-                        app.settings_popup.selected_field = SettingsField::CancelSetup;
-                    } else {
-                        app.settings_popup.selected_field = SettingsField::CancelWorld;
-                    }
-                }
-                KeyCode::Char('d') | KeyCode::Char('D') => {
-                    // Shortcut for Delete button (world mode only)
-                    if !app.settings_popup.setup_mode {
-                        app.settings_popup.selected_field = SettingsField::DeleteWorld;
-                    }
-                }
-                KeyCode::Char('o') | KeyCode::Char('O') => {
-                    // Shortcut for Connect button (world mode only, 'O' since 'C' is for Cancel)
-                    if !app.settings_popup.setup_mode {
-                        app.settings_popup.selected_field = SettingsField::Connect;
-                    }
-                }
-                KeyCode::Char(c) => {
-                    // Start editing on any character for text fields
-                    if app.settings_popup.selected_field.is_text_field() {
-                        app.settings_popup.start_edit();
-                        app.settings_popup.edit_buffer.push(c);
-                        app.settings_popup.edit_cursor += 1;
-                        app.settings_popup.adjust_scroll(33);
-                    }
-                }
-                _ => {}
-            }
         }
         return KeyAction::None;
     }
@@ -24430,9 +23722,7 @@ async fn handle_command(cmd: &str, app: &mut App, event_tx: mpsc::Sender<AppEven
                 // /worlds -e - edit current world
                 app.current_world_index
             };
-            let input_height = app.input_height;
-            let show_tags = app.show_tags;
-            app.settings_popup.open(&app.settings, &app.worlds[idx], idx, input_height, show_tags);
+            app.open_world_editor_popup_new(idx);
         }
         Command::WorldConnectNoLogin { name } => {
             // /worlds -l <name> - connect without auto-login
@@ -25588,7 +24878,6 @@ fn ui(f: &mut Frame, app: &mut App) {
     render_input_area(f, app, input_area);
 
     // Render popups if visible (confirm dialog last so it's on top)
-    render_settings_popup(f, app);
     render_confirm_dialog(f, app);
     render_filter_popup(f, app);
     // New unified popup system - renders on top of old popups
@@ -25602,8 +24891,7 @@ fn render_output_crossterm(app: &App) {
     use crossterm::{cursor, style::Print, QueueableCommand};
 
     // Skip if showing splash screen or any popup is visible (except filter popup)
-    let any_popup_visible = app.settings_popup.visible
-        || app.confirm_dialog.visible
+    let any_popup_visible = app.confirm_dialog.visible
         || app.has_new_popup();
     if app.current_world().showing_splash || any_popup_visible {
         return;
@@ -26171,8 +25459,7 @@ fn render_output_area(f: &mut Frame, app: &App, area: Rect) {
     }
 
     // Check if any popup is visible - ratatui handles output when popups are shown
-    let any_popup_visible = app.settings_popup.visible
-        || app.confirm_dialog.visible
+    let any_popup_visible = app.confirm_dialog.visible
         || app.filter_popup.visible
         || app.has_new_popup();
 
@@ -26768,330 +26055,6 @@ fn render_input(app: &mut App, width: usize, prompt: &str) -> Text<'static> {
     }
 
     Text::from(lines)
-}
-
-fn render_settings_popup(f: &mut Frame, app: &App) {
-    if !app.settings_popup.visible {
-        return;
-    }
-
-    let area = f.area();
-    let popup = &app.settings_popup;
-    let theme = app.settings.theme;
-
-    // Helper to get field style
-    let field_style = |field: SettingsField| -> Style {
-        if field == popup.selected_field {
-            if popup.editing {
-                Style::default()
-                    .fg(theme.fg_success())
-                    .add_modifier(Modifier::BOLD)
-            } else if field.is_button() {
-                // Highlight buttons with background when selected
-                Style::default()
-                    .fg(theme.button_selected_fg())
-                    .bg(theme.button_selected_bg())
-                    .add_modifier(Modifier::BOLD)
-            } else {
-                Style::default()
-                    .fg(theme.fg_highlight())
-                    .add_modifier(Modifier::BOLD)
-            }
-        } else {
-            Style::default().fg(theme.fg())
-        }
-    };
-
-    // Label widths for alignment (longest label + 1 space)
-    // Global: "World Switching:" = 16, so use 17
-    // World: "Auto login:" = 11, so use 12
-    let global_label_width = 17;
-    let world_label_width = 12;
-
-    // Maximum visible width for text field values (for scrolling)
-    let max_field_display_width = 35usize;
-
-    // Helper to render a text field with horizontal scrolling support
-    let render_text_field = |label: &str, value: &str, field: SettingsField, width: usize| -> Line<'static> {
-        let style = field_style(field);
-        let display_value = if field == popup.selected_field && popup.editing {
-            // Show edit buffer with cursor, applying scroll offset
-            let buf = &popup.edit_buffer;
-            let cursor = popup.edit_cursor;
-            let scroll = popup.edit_scroll_offset;
-
-            // Calculate visible portion
-            let visible_width = max_field_display_width.saturating_sub(2); // Leave room for scroll indicators
-            let buf_chars: Vec<char> = buf.chars().collect();
-            let buf_len = buf_chars.len();
-
-            // Build visible text with cursor
-            let start = scroll.min(buf_len);
-            let end = (scroll + visible_width).min(buf_len);
-
-            let mut display = String::new();
-
-            // Left scroll indicator
-            if scroll > 0 {
-                display.push('<');
-            } else {
-                display.push(' ');
-            }
-
-            // Visible text with cursor
-            for (i, &c) in buf_chars.iter().enumerate() {
-                if i == cursor {
-                    display.push('|');
-                }
-                if i >= start && i < end {
-                    display.push(c);
-                }
-            }
-            // Cursor at end
-            if cursor >= buf_len && cursor >= start {
-                display.push('|');
-            }
-
-            // Right scroll indicator
-            if end < buf_len {
-                display.push('>');
-            }
-
-            display
-        } else {
-            // Not editing - show truncated value if needed
-            let val_chars: Vec<char> = value.chars().collect();
-            if val_chars.len() > max_field_display_width {
-                format!("{}...", val_chars[..max_field_display_width - 3].iter().collect::<String>())
-            } else {
-                value.to_string()
-            }
-        };
-        Line::from(vec![
-            Span::styled(format!("  {:<width$}", label), style),
-            Span::styled(format!("[{}]", display_value), style),
-        ])
-    };
-
-    // Helper to render a toggle field
-    let render_toggle_field = |label: &str, value: bool, field: SettingsField, width: usize| -> Line<'static> {
-        let style = field_style(field);
-        let value_str = if value { "on" } else { "off" };
-        Line::from(vec![
-            Span::styled(format!("  {:<width$}", label), style),
-            Span::styled(format!("[{}]", value_str), style),
-        ])
-    };
-
-    // Helper to render input height field
-    let render_height_field = |label: &str, value: u16, field: SettingsField, width: usize| -> Line<'static> {
-        let style = field_style(field);
-        Line::from(vec![
-            Span::styled(format!("  {:<width$}", label), style),
-            Span::styled(format!("[{}]", value), style),
-        ])
-    };
-
-    // Helper to render a button with highlighted shortcut letter (black on white)
-    // shortcut_pos: 0 = first letter (default), 1+ = that character position
-    let render_button = |label: &str, field: SettingsField, shortcut_pos: usize| -> Vec<Span<'static>> {
-        let style = field_style(field);
-        let is_selected = field == popup.selected_field;
-        let shortcut_style = if is_selected {
-            Style::default().fg(Color::Black).bg(theme.button_selected_bg()).add_modifier(Modifier::BOLD | Modifier::UNDERLINED)
-        } else {
-            Style::default().fg(Color::Black).bg(Color::White).add_modifier(Modifier::UNDERLINED)
-        };
-
-        let chars: Vec<char> = label.chars().collect();
-        let before: String = chars.iter().take(shortcut_pos).collect();
-        let shortcut_char = chars.get(shortcut_pos).copied().unwrap_or(' ');
-        let after: String = chars.iter().skip(shortcut_pos + 1).collect();
-
-        vec![
-            Span::styled("[ ", style),
-            Span::styled(before, style),
-            Span::styled(shortcut_char.to_string(), shortcut_style),
-            Span::styled(after, style),
-            Span::styled(" ]", style),
-        ]
-    };
-
-    let (lines, title) = if popup.setup_mode {
-        // Setup mode: only global settings
-        let w = global_label_width;
-        let lines = vec![
-            Line::from(""),
-            render_toggle_field("More mode:", popup.temp_more_mode, SettingsField::MoreMode, w),
-            render_toggle_field("Spell check:", popup.temp_spell_check, SettingsField::SpellCheck, w),
-            render_toggle_field("Temp convert:", popup.temp_temp_convert, SettingsField::TempConvert, w),
-            Line::from(vec![
-                Span::styled(
-                    format!("  {:<w$}", "World Switching:"),
-                    field_style(SettingsField::WorldSwitching),
-                ),
-                Span::styled(
-                    format!("[{}]", popup.temp_world_switch_mode.name()),
-                    field_style(SettingsField::WorldSwitching),
-                ),
-            ]),
-            render_toggle_field("Debug:", popup.temp_debug_enabled, SettingsField::Debug, w),
-            render_toggle_field("Show tags:", popup.temp_show_tags, SettingsField::ShowTags, w),
-            render_height_field("Input height:", popup.temp_input_height, SettingsField::InputHeight, w),
-            Line::from(vec![
-                Span::styled(
-                    format!("  {:<w$}", "GUI Theme:"),
-                    field_style(SettingsField::GuiTheme),
-                ),
-                Span::styled(
-                    format!("[{}]", popup.temp_gui_theme.name()),
-                    field_style(SettingsField::GuiTheme),
-                ),
-            ]),
-            render_toggle_field("TLS Proxy:", popup.temp_tls_proxy_enabled, SettingsField::TLSProxy, w),
-            Line::from(""),
-            {
-                let mut spans = Vec::new();
-                spans.extend(render_button("Save", SettingsField::SaveSetup, 0));
-                spans.push(Span::raw("  "));
-                spans.extend(render_button("Cancel", SettingsField::CancelSetup, 0));
-                spans.push(Span::raw(" "));
-                Line::from(spans).alignment(Alignment::Right)
-            },
-        ];
-        (lines, " Global Settings ")
-    } else {
-        // World mode: all settings
-        let w = world_label_width;
-        let connect_text = "Connect";
-
-        let mut lines = vec![
-            Line::from(""),
-            render_text_field("World:", &popup.temp_world_name, SettingsField::WorldName, w),
-            // World type selector
-            Line::from(vec![
-                Span::styled(
-                    format!("  {:<w$}", "Type:"),
-                    field_style(SettingsField::WorldType),
-                ),
-                Span::styled(
-                    format!("[{}]", popup.temp_world_type.name()),
-                    field_style(SettingsField::WorldType),
-                ),
-            ]),
-        ];
-
-        // Add type-specific fields
-        match popup.temp_world_type {
-            WorldType::Mud => {
-                lines.push(render_text_field("Hostname:", &popup.temp_hostname, SettingsField::Hostname, w));
-                lines.push(render_text_field("Port:", &popup.temp_port, SettingsField::Port, w));
-                lines.push(render_text_field("User:", &popup.temp_user, SettingsField::User, w));
-                lines.push(render_text_field("Password:", &popup.temp_password, SettingsField::Password, w));
-                lines.push(render_toggle_field("Use SSL:", popup.temp_use_ssl, SettingsField::UseSsl, w));
-                lines.push(render_toggle_field("Logging:", popup.temp_log_enabled, SettingsField::LogFile, w));
-                lines.push(Line::from(vec![
-                    Span::styled(
-                        format!("  {:<w$}", "Encoding:"),
-                        field_style(SettingsField::Encoding),
-                    ),
-                    Span::styled(
-                        format!("[{}]", popup.temp_encoding.name()),
-                        field_style(SettingsField::Encoding),
-                    ),
-                ]));
-                lines.push(Line::from(vec![
-                    Span::styled(
-                        format!("  {:<w$}", "Auto login:"),
-                        field_style(SettingsField::AutoConnect),
-                    ),
-                    Span::styled(
-                        format!("[{}]", popup.temp_auto_connect_type.name()),
-                        field_style(SettingsField::AutoConnect),
-                    ),
-                ]));
-                lines.push(Line::from(vec![
-                    Span::styled(
-                        format!("  {:<w$}", "Keep-Alive:"),
-                        field_style(SettingsField::KeepAlive),
-                    ),
-                    Span::styled(
-                        format!("[{}]", popup.temp_keep_alive_type.name()),
-                        field_style(SettingsField::KeepAlive),
-                    ),
-                ]));
-                // Conditionally add Keep-Alive CMD field only when Custom is selected
-                if popup.temp_keep_alive_type == KeepAliveType::Custom {
-                    lines.push(render_text_field("Keep-Alive CMD:", &popup.temp_keep_alive_cmd, SettingsField::KeepAliveCmd, w));
-                }
-            }
-            WorldType::Slack => {
-                lines.push(render_text_field("Token:", &popup.temp_slack_token, SettingsField::SlackToken, w));
-                lines.push(render_text_field("Channel:", &popup.temp_slack_channel, SettingsField::SlackChannel, w));
-                lines.push(render_text_field("Workspace:", &popup.temp_slack_workspace, SettingsField::SlackWorkspace, w));
-                lines.push(render_toggle_field("Logging:", popup.temp_log_enabled, SettingsField::LogFile, w));
-            }
-            WorldType::Discord => {
-                lines.push(render_text_field("Token:", &popup.temp_discord_token, SettingsField::DiscordToken, w));
-                lines.push(render_text_field("Guild:", &popup.temp_discord_guild, SettingsField::DiscordGuild, w));
-                lines.push(render_text_field("Channel:", &popup.temp_discord_channel, SettingsField::DiscordChannel, w));
-                lines.push(render_text_field("DM User:", &popup.temp_discord_dm_user, SettingsField::DiscordDmUser, w));
-                lines.push(render_toggle_field("Logging:", popup.temp_log_enabled, SettingsField::LogFile, w));
-            }
-        }
-
-        lines.push(Line::from(""));
-        {
-            let mut spans = Vec::new();
-            spans.extend(render_button("Save", SettingsField::SaveWorld, 0));
-            spans.push(Span::raw(" "));
-            spans.extend(render_button("Cancel", SettingsField::CancelWorld, 0));
-            spans.push(Span::raw(" "));
-            spans.extend(render_button("Delete", SettingsField::DeleteWorld, 0));
-            spans.push(Span::raw(" "));
-            spans.extend(render_button(connect_text, SettingsField::Connect, 1));
-            spans.push(Span::raw(" "));
-            lines.push(Line::from(spans).alignment(Alignment::Right));
-        }
-        (lines, " World Settings ")
-    };
-
-    // Calculate dynamic width based on content
-    // Find the maximum line width by summing span widths
-    let max_content_width = lines.iter().map(|line| {
-        line.spans.iter().map(|span| span.content.chars().count()).sum::<usize>()
-    }).max().unwrap_or(20);
-
-    // Add borders (2) and some padding (2)
-    let popup_width = ((max_content_width + 4) as u16).min(area.width.saturating_sub(2));
-
-    // Calculate required height for all content + borders
-    let required_height = (lines.len() + 2) as u16; // +2 for borders
-    // Use full terminal height minus 1 for margin if content doesn't fit
-    let max_available_height = area.height.saturating_sub(1);
-    let popup_height = required_height.min(max_available_height);
-
-    let x = area.width.saturating_sub(popup_width) / 2;
-    let y = if popup_height >= area.height {
-        0 // Start at top if popup fills screen
-    } else {
-        area.height.saturating_sub(popup_height) / 2
-    };
-
-    let popup_area = Rect::new(x, y, popup_width, popup_height);
-
-    // Clear the background
-    f.render_widget(ratatui::widgets::Clear, popup_area);
-
-    let popup_block = Block::default()
-        .title(title)
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(theme.popup_border()))
-        .style(Style::default().bg(theme.popup_bg()));
-
-    let popup_text = Paragraph::new(lines).block(popup_block);
-
-    f.render_widget(popup_text, popup_area);
 }
 
 fn render_confirm_dialog(f: &mut Frame, app: &App) {
