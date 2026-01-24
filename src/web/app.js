@@ -2019,7 +2019,7 @@
             const tsPrefix = showTags && lineTs ? `<span class="timestamp">${formatTimestamp(lineTs)}</span>` : '';
 
             const strippedText = showTags ? cleanLine : stripMudTag(cleanLine);
-            const displayText = showTags ? convertTemperatures(strippedText) : strippedText;
+            const displayText = showTags && tempConvertEnabled ? convertTemperatures(strippedText) : strippedText;
             let html = tsPrefix + convertDiscordEmojis(linkifyUrls(parseAnsi(insertWordBreaks(displayText))));
 
             // Apply action highlighting if enabled
@@ -2045,16 +2045,16 @@
             worldOutputCache[worldIndex] = [];
         }
         const strippedText = showTags ? text : stripMudTag(text);
-        const displayText = showTags ? convertTemperatures(strippedText) : strippedText;
+        const displayText = showTags && tempConvertEnabled ? convertTemperatures(strippedText) : strippedText;
         const html = convertDiscordEmojis(linkifyUrls(parseAnsi(insertWordBreaks(displayText))));
         worldOutputCache[worldIndex][lineIndex] = { html, showTags };
         return html;
     }
 
-    // Append a client-generated message (with %% prefix and red color)
+    // Append a client-generated message (with ✨ prefix)
     function appendLine(text, worldIndex) {
         const ts = Math.floor(Date.now() / 1000);
-        const clientText = `\x1b[31m%% ${text}\x1b[0m`;
+        const clientText = `✨ ${text}`;
         if (worldIndex >= 0 && worldIndex < worlds.length) {
             const lineIndex = worlds[worldIndex].output_lines.length;
             worlds[worldIndex].output_lines.push({ text: clientText, ts: ts });

@@ -3851,7 +3851,7 @@ impl App {
                 .map(|s| {
                     let text = s.text.replace('\r', "");
                     let text = if !s.from_server {
-                        format!("\x1b[31m%\x1b[0m {}", text)
+                        format!("✨ {}", text)
                     } else {
                         text
                     };
@@ -10493,7 +10493,7 @@ mod remote_gui {
                                             let ts = current_timestamp_secs();
                                             if self.current_world < self.worlds.len() {
                                                 self.worlds[self.current_world].output_lines.push(
-                                                    TimestampedLine { text: format!("\x1b[31m%\x1b[0m World '{}' not found.", name), ts, gagged: false }
+                                                    TimestampedLine { text: format!("✨ World '{}' not found.", name), ts, gagged: false }
                                                 );
                                             }
                                         }
@@ -10511,7 +10511,7 @@ mod remote_gui {
                                             let ts = current_timestamp_secs();
                                             if self.current_world < self.worlds.len() {
                                                 self.worlds[self.current_world].output_lines.push(
-                                                    TimestampedLine { text: format!("\x1b[31m%\x1b[0m World '{}' not found.", name), ts, gagged: false }
+                                                    TimestampedLine { text: format!("✨ World '{}' not found.", name), ts, gagged: false }
                                                 );
                                             }
                                         }
@@ -10779,9 +10779,13 @@ mod remote_gui {
                                 let stripped = Self::strip_ansi_for_copy(&line.text);
                                 if self.show_tags {
                                     // Add timestamp prefix when showing tags
-                                    // Also convert temperatures
+                                    // Convert temperatures only if enabled
                                     let ts_prefix = Self::format_timestamp_gui_cached(line.ts, &cached_now);
-                                    let with_temps = convert_temperatures(&stripped);
+                                    let with_temps = if self.temp_convert_enabled {
+                                        convert_temperatures(&stripped)
+                                    } else {
+                                        stripped.clone()
+                                    };
                                     format!("{} {}", ts_prefix, with_temps)
                                 } else {
                                     // Strip MUD tags like [channel:] or [channel(player)]
@@ -10813,8 +10817,12 @@ mod remote_gui {
                         let display_lines: Vec<String> = colored_lines.iter().map(|line| {
                             let base_line = if self.show_tags {
                                 let ts_prefix = Self::format_timestamp_gui_cached(line.ts, &cached_now);
-                                // Also convert temperatures when showing tags
-                                let with_temps = convert_temperatures(&line.text);
+                                // Convert temperatures only if enabled
+                                let with_temps = if self.temp_convert_enabled {
+                                    convert_temperatures(&line.text)
+                                } else {
+                                    line.text.clone()
+                                };
                                 format!("\x1b[36m{}\x1b[0m {}", ts_prefix, with_temps)
                             } else {
                                 Self::strip_mud_tags_ansi(&line.text)
@@ -17418,7 +17426,7 @@ keep_alive_type=Generic
                                 if let Some(ws) = &app.ws_server {
                                     ws.broadcast_to_owner(WsMessage::ServerData {
                                         world_index,
-                                        data: "\x1b[31m%\x1b[0m Connection failed.\n".to_string(),
+                                        data: "✨ Connection failed.\n".to_string(),
                                         is_viewed: true,
                                         ts: current_timestamp_secs(),
                                     }, Some(&requesting_username));
@@ -17997,7 +18005,7 @@ fn build_multiuser_initial_state(app: &App, username: &str) -> WsMessage {
                 .map(|s| {
                     let text = s.text.replace('\r', "");
                     let text = if !s.from_server {
-                        format!("\x1b[31m%\x1b[0m {}", text)
+                        format!("✨ {}", text)
                     } else {
                         text
                     };
@@ -18012,7 +18020,7 @@ fn build_multiuser_initial_state(app: &App, username: &str) -> WsMessage {
                 .map(|s| {
                     let text = s.text.replace('\r', "");
                     let text = if !s.from_server {
-                        format!("\x1b[31m%\x1b[0m {}", text)
+                        format!("✨ {}", text)
                     } else {
                         text
                     };
@@ -19777,7 +19785,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                             if !action.enabled {
                                                 app.ws_broadcast(WsMessage::ServerData {
                                                     world_index,
-                                                    data: format!("\x1b[31m%\x1b[0m Action '{}' is disabled.", name),
+                                                    data: format!("✨ Action '{}' is disabled.", name),
                                                     is_viewed: false,
                                                     ts: current_timestamp_secs(),
                                                 });
@@ -19838,7 +19846,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                                                     }
                                                                 }
                                                                 if matches.is_empty() {
-                                                                    app.ws_broadcast(WsMessage::ServerData { world_index, data: format!("\x1b[31m%\x1b[0m No matches for '{}'", pattern_str), is_viewed: false, ts });
+                                                                    app.ws_broadcast(WsMessage::ServerData { world_index, data: format!("✨ No matches for '{}'", pattern_str), is_viewed: false, ts });
                                                                 } else {
                                                                     for m in matches {
                                                                         app.ws_broadcast(WsMessage::ServerData { world_index, data: m, is_viewed: false, ts });
@@ -21360,7 +21368,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                         if !action.enabled {
                                             app.ws_broadcast(WsMessage::ServerData {
                                                 world_index,
-                                                data: format!("\x1b[31m%\x1b[0m Action '{}' is disabled.", name),
+                                                data: format!("✨ Action '{}' is disabled.", name),
                                                 is_viewed: false,
                                                 ts: current_timestamp_secs(),
                                             });
@@ -21421,7 +21429,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                                                 }
                                                             }
                                                             if matches.is_empty() {
-                                                                app.ws_broadcast(WsMessage::ServerData { world_index, data: format!("\x1b[31m%\x1b[0m No matches for '{}'", pattern_str), is_viewed: false, ts });
+                                                                app.ws_broadcast(WsMessage::ServerData { world_index, data: format!("✨ No matches for '{}'", pattern_str), is_viewed: false, ts });
                                                             } else {
                                                                 for m in matches {
                                                                     app.ws_broadcast(WsMessage::ServerData { world_index, data: m, is_viewed: false, ts });
@@ -24422,7 +24430,7 @@ async fn handle_command(cmd: &str, app: &mut App, event_tx: mpsc::Sender<AppEven
                             }
                             tf::TfCommandResult::Success(None) => {}
                             tf::TfCommandResult::Error(err) => {
-                                app.add_tf_output(&format!("\x1b[31m%\x1b[0m {}", err));
+                                app.add_tf_output(&format!("✨ {}", err));
                             }
                             tf::TfCommandResult::SendToMud(text) => {
                                 if let Some(tx) = &app.current_world().command_tx {
@@ -24862,6 +24870,7 @@ fn render_output_crossterm(app: &App) {
     let mut first_line_idx: usize = 0;
 
     let show_tags = app.show_tags;
+    let temp_convert_enabled = app.settings.temp_convert_enabled;
     let highlight_actions = app.highlight_actions;
     let world_name = &world.name;
     let actions = &app.settings.actions;
@@ -24886,16 +24895,20 @@ fn render_output_crossterm(app: &App) {
         // Convert Discord custom emojis to :name: for console display
         // and colorize square emoji (🟩🟨 etc.) with ANSI codes
         let text = colorize_square_emojis(&convert_discord_emojis(&line.text));
-        // Add red "% " prefix for client-generated messages
+        // Add ✨ prefix for client-generated messages
         let text = if !line.from_server {
-            format!("\x1b[31m%\x1b[0m {}", text)
+            format!("✨ {}", text)
         } else {
             text
         };
         let processed = if show_tags {
             // Show timestamp + original text when tags are shown
-            // Also convert temperatures (32C -> 32C (90F), etc.)
-            let text_with_temps = convert_temperatures(&text);
+            // Convert temperatures only if both show_tags AND temp_convert are enabled
+            let text_with_temps = if temp_convert_enabled {
+                convert_temperatures(&text)
+            } else {
+                text.clone()
+            };
             format!("\x1b[36m{}\x1b[0m {}", line.format_timestamp_with_now(cached_now), text_with_temps)
         } else {
             strip_mud_tag(&text)
