@@ -4910,6 +4910,34 @@ impl App {
         None
     }
 
+    /// Open a confirm dialog for deleting a world
+    fn open_delete_world_confirm(&mut self, world_name: &str, world_index: usize) {
+        use popup::definitions::confirm::{create_delete_world_dialog, CONFIRM_BTN_NO};
+        let mut def = create_delete_world_dialog(world_name);
+        // Store the world index in custom_data for retrieval on confirm
+        def.custom_data.insert("world_index".to_string(), world_index.to_string());
+        self.popup_manager.open(def);
+        // Select No by default for safety
+        if let Some(state) = self.popup_manager.current_mut() {
+            state.select_button(CONFIRM_BTN_NO);
+        }
+    }
+
+    /// Check if current popup is a confirm dialog and get which button is selected
+    fn get_confirm_result(&self) -> Option<bool> {
+        use popup::definitions::confirm::{CONFIRM_BTN_YES, CONFIRM_BTN_NO};
+        if let Some(state) = self.popup_manager.current() {
+            if state.definition.id.0.starts_with("delete_") {
+                if state.is_button_focused(CONFIRM_BTN_YES) {
+                    return Some(true);
+                } else if state.is_button_focused(CONFIRM_BTN_NO) {
+                    return Some(false);
+                }
+            }
+        }
+        None
+    }
+
     /// Send a command to the MUD (routes through WebSocket if remote client)
     fn send_to_mud(&mut self, world_index: usize, command: &str) {
         if let Some(ref tx) = self.ws_client_tx {
@@ -16765,9 +16793,14 @@ fn handle_remote_client_key(
     }
     // New unified popup system - handles help popup and others
     if app.has_new_popup() {
-        if let Some(_cmd) = handle_new_popup_key(app, key) {
-            // Menu command selected - remote client doesn't execute commands locally
-            // The command would need to be sent to the server
+        match handle_new_popup_key(app, key) {
+            NewPopupAction::Command(_cmd) => {
+                // Menu command selected - remote client doesn't execute commands locally
+            }
+            NewPopupAction::Confirm(_data) => {
+                // Confirm action - remote client doesn't handle locally
+            }
+            NewPopupAction::None => {}
         }
         return false;
     }
@@ -17158,13 +17191,24 @@ fn handle_remote_settings_popup_key(app: &mut App, key: KeyEvent) {
     }
 }
 
+/// Result from handling a new popup key
+enum NewPopupAction {
+    None,
+    /// Execute a command (from menu selection)
+    Command(String),
+    /// Confirm action with custom_data from the popup
+    Confirm(std::collections::HashMap<String, String>),
+}
+
 /// Handle input for new unified popup system
-fn handle_new_popup_key(app: &mut App, key: KeyEvent) -> Option<String> {
+fn handle_new_popup_key(app: &mut App, key: KeyEvent) -> NewPopupAction {
     use crossterm::event::KeyCode::*;
     use popup::definitions::help::HELP_BTN_OK;
+    use popup::definitions::confirm::{CONFIRM_BTN_YES, CONFIRM_BTN_NO};
 
     let popup_id = app.popup_manager.current().map(|s| s.definition.id.clone());
     let is_menu = popup_id == Some(popup::PopupId("menu"));
+    let is_confirm = popup_id.as_ref().map(|id| id.0.starts_with("delete_")).unwrap_or(false);
 
     if let Some(state) = app.popup_manager.current_mut() {
         match key.code {
@@ -17178,24 +17222,40 @@ fn handle_new_popup_key(app: &mut App, key: KeyEvent) -> Option<String> {
                     if let Some(item) = state.get_selected_list_item() {
                         let cmd = item.id.clone();
                         app.popup_manager.close();
-                        return Some(cmd);
+                        return NewPopupAction::Command(cmd);
+                    }
+                } else if is_confirm {
+                    // For confirm dialog, check which button is selected
+                    if state.is_button_focused(CONFIRM_BTN_YES) {
+                        let data = state.definition.custom_data.clone();
+                        app.popup_manager.close();
+                        return NewPopupAction::Confirm(data);
                     }
                 }
-                // For help popup, Enter always closes
+                // For other popups, Enter closes
                 app.popup_manager.close();
             }
-            Up => {
+            Up | Down | Left | Right | Tab => {
                 if is_menu {
-                    state.list_select_up();
+                    if matches!(key.code, Up) {
+                        state.list_select_up();
+                    } else {
+                        state.list_select_down();
+                    }
+                } else if is_confirm {
+                    // Toggle between Yes and No
+                    if state.is_button_focused(CONFIRM_BTN_YES) {
+                        state.select_button(CONFIRM_BTN_NO);
+                    } else {
+                        state.select_button(CONFIRM_BTN_YES);
+                    }
                 } else {
-                    state.scroll_up(1);
-                }
-            }
-            Down => {
-                if is_menu {
-                    state.list_select_down();
-                } else {
-                    state.scroll_down(1);
+                    // Scrollable content
+                    if matches!(key.code, Up) {
+                        state.scroll_up(1);
+                    } else {
+                        state.scroll_down(1);
+                    }
                 }
             }
             PageUp => {
@@ -17203,6 +17263,18 @@ fn handle_new_popup_key(app: &mut App, key: KeyEvent) -> Option<String> {
             }
             PageDown => {
                 state.scroll_down(5);
+            }
+            Char('y') | Char('Y') => {
+                if is_confirm {
+                    let data = state.definition.custom_data.clone();
+                    app.popup_manager.close();
+                    return NewPopupAction::Confirm(data);
+                }
+            }
+            Char('n') | Char('N') => {
+                if is_confirm {
+                    app.popup_manager.close();
+                }
             }
             Char('o') | Char('O') => {
                 // Shortcut for OK button (help popup)
@@ -17215,7 +17287,7 @@ fn handle_new_popup_key(app: &mut App, key: KeyEvent) -> Option<String> {
             _ => {}
         }
     }
-    None
+    NewPopupAction::None
 }
 
 /// Handle web popup input for remote client
@@ -22857,9 +22929,29 @@ fn handle_key_event(key: KeyEvent, app: &mut App) -> KeyAction {
 
     // Handle new unified popup system (help popup and others)
     if app.has_new_popup() {
-        if let Some(cmd) = handle_new_popup_key(app, key) {
-            // Menu command selected - execute it
-            return KeyAction::SendCommand(cmd);
+        match handle_new_popup_key(app, key) {
+            NewPopupAction::Command(cmd) => {
+                // Menu command selected - execute it
+                return KeyAction::SendCommand(cmd);
+            }
+            NewPopupAction::Confirm(data) => {
+                // Handle confirmed action
+                if let Some(world_index_str) = data.get("world_index") {
+                    if let Ok(world_index) = world_index_str.parse::<usize>() {
+                        // Delete the world
+                        if app.worlds.len() > 1 && world_index < app.worlds.len() {
+                            let world_name = app.worlds[world_index].name.clone();
+                            app.worlds.remove(world_index);
+                            // Adjust current_world_index if needed
+                            if app.current_world_index >= app.worlds.len() {
+                                app.current_world_index = app.worlds.len().saturating_sub(1);
+                            }
+                            app.add_output(&format!("World '{}' deleted.", world_name));
+                        }
+                    }
+                }
+            }
+            NewPopupAction::None => {}
         }
         return KeyAction::None;
     }
@@ -23617,7 +23709,7 @@ fn handle_key_event(key: KeyEvent, app: &mut App) -> KeyAction {
                                 // Show confirmation dialog for the world being edited, not the current world
                                 if let Some(world_index) = app.settings_popup.editing_world_index {
                                     let world_name = app.worlds[world_index].name.clone();
-                                    app.confirm_dialog.show_delete_world(&world_name, world_index);
+                                    app.open_delete_world_confirm(&world_name, world_index);
                                 }
                             }
                             _ => {}

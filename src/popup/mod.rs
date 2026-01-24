@@ -516,6 +516,8 @@ pub struct PopupDefinition {
     pub fields: Vec<Field>,
     pub buttons: Vec<Button>,
     pub layout: PopupLayout,
+    /// Custom key-value data for app-specific context (e.g., world index for delete confirm)
+    pub custom_data: std::collections::HashMap<String, String>,
 }
 
 impl PopupDefinition {
@@ -526,6 +528,7 @@ impl PopupDefinition {
             fields: Vec::new(),
             buttons: Vec::new(),
             layout: PopupLayout::default(),
+            custom_data: std::collections::HashMap::new(),
         }
     }
 
@@ -845,6 +848,11 @@ impl PopupState {
     /// Check if currently on a button
     pub fn is_on_button(&self) -> bool {
         matches!(self.selected, ElementSelection::Button(_))
+    }
+
+    /// Check if a specific button is focused
+    pub fn is_button_focused(&self, id: ButtonId) -> bool {
+        matches!(&self.selected, ElementSelection::Button(selected_id) if *selected_id == id)
     }
 
     // ========================================================================
