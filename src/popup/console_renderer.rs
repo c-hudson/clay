@@ -410,6 +410,7 @@ fn render_field(
 /// Render a labeled field (label: value)
 /// When selected, only the value area is highlighted (not the label)
 /// If shortcut is provided, that character in the label is underlined
+#[allow(clippy::too_many_arguments)]
 fn render_labeled_field_with_shortcut(
     f: &mut Frame,
     label: &str,
@@ -491,6 +492,7 @@ fn render_labeled_field(
 }
 
 /// Render a list field with optional headers, aligned columns, and scrollbar
+#[allow(clippy::too_many_arguments)]
 fn render_list_field(
     f: &mut Frame,
     items: &[super::ListItem],
@@ -745,7 +747,7 @@ fn render_buttons(f: &mut Frame, state: &PopupState, area: Rect, theme: Theme) {
             let shortcut_lower = shortcut.to_ascii_lowercase();
             let shortcut_upper = shortcut.to_ascii_uppercase();
 
-            if let Some(pos) = button.label.find(|c: char| c == shortcut_lower || c == shortcut_upper) {
+            if let Some(pos) = button.label.find([shortcut_lower, shortcut_upper]) {
                 let (before, rest) = button.label.split_at(pos);
                 let (shortcut_char, after) = rest.split_at(1);
 

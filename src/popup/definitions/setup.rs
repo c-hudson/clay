@@ -39,6 +39,7 @@ pub fn theme_options() -> Vec<SelectOption> {
 }
 
 /// Create the setup popup definition with current values
+#[allow(clippy::too_many_arguments)]
 pub fn create_setup_popup(
     more_mode: bool,
     spell_check: bool,

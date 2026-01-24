@@ -23,6 +23,7 @@ certs/
 
 # Local scripts
 copy.sh
+sync-clay-builds.sh
 
 # Reference files
 dog-paw-svgrepo-com.svg

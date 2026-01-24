@@ -108,6 +108,7 @@ pub enum RecallSource {
 
 /// Range specification for recall
 #[derive(Debug, Clone, PartialEq)]
+#[derive(Default)]
 pub enum RecallRange {
     /// /x - last x matching lines
     LastMatching(usize),
@@ -124,14 +125,10 @@ pub enum RecallRange {
     /// Time range (start_secs, end_secs from now)
     TimeRange(f64, f64),
     /// All lines (no range specified)
+    #[default]
     All,
 }
 
-impl Default for RecallRange {
-    fn default() -> Self {
-        RecallRange::All
-    }
-}
 
 /// Options for the recall command
 #[derive(Debug, Clone, Default)]

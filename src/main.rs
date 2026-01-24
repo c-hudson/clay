@@ -38,7 +38,7 @@ use std::collections::{HashMap, HashSet};
 use std::io::{self, stdout, BufRead, Write as IoWrite};
 use std::os::unix::io::{AsRawFd, FromRawFd, RawFd};
 use std::os::unix::fs::PermissionsExt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicPtr, AtomicU32, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -879,7 +879,6 @@ struct ConfirmDialog {
 #[derive(Clone, Copy, PartialEq)]
 enum ConfirmAction {
     None,
-    DeleteWorld(usize), // world index to delete
 }
 
 impl ConfirmDialog {
@@ -890,13 +889,6 @@ impl ConfirmDialog {
             yes_selected: false,
             action: ConfirmAction::None,
         }
-    }
-
-    fn show_delete_world(&mut self, world_name: &str, world_index: usize) {
-        self.visible = true;
-        self.message = format!("Delete world '{}'?", world_name);
-        self.yes_selected = false; // Default to No for safety
-        self.action = ConfirmAction::DeleteWorld(world_index);
     }
 
     fn close(&mut self) {
@@ -1127,13 +1119,6 @@ impl WorldType {
         }
     }
 
-    fn cycle_next(&self) -> Self {
-        match self {
-            WorldType::Mud => WorldType::Slack,
-            WorldType::Slack => WorldType::Discord,
-            WorldType::Discord => WorldType::Mud,
-        }
-    }
 }
 
 #[derive(Clone)]
@@ -1206,13 +1191,6 @@ pub enum MatchType {
 }
 
 impl MatchType {
-    fn next(self) -> Self {
-        match self {
-            MatchType::Regexp => MatchType::Wildcard,
-            MatchType::Wildcard => MatchType::Regexp,
-        }
-    }
-
     fn as_str(self) -> &'static str {
         match self {
             MatchType::Regexp => "Regexp",
@@ -1220,7 +1198,7 @@ impl MatchType {
         }
     }
 
-    fn from_str(s: &str) -> Self {
+    fn parse(s: &str) -> Self {
         match s.to_lowercase().as_str() {
             "wildcard" => MatchType::Wildcard,
             _ => MatchType::Regexp,
@@ -1285,16 +1263,6 @@ impl Action {
             enabled: true,
         }
     }
-}
-
-/// List of internal commands that cannot be overridden by actions
-const INTERNAL_COMMANDS: &[&str] = &[
-    "help", "disconnect", "dc", "setup", "worlds", "connections", "l",
-    "keepalive", "reload", "quit", "actions", "gag", "web", "send",
-];
-
-fn is_internal_command(name: &str) -> bool {
-    INTERNAL_COMMANDS.contains(&name.to_lowercase().as_str())
 }
 
 // ============================================================================
@@ -1689,7 +1657,7 @@ fn execute_recall(opts: &tf::RecallOptions, output_lines: &[OutputLine]) -> (Vec
             let start = output_lines.len().saturating_sub(*n);
             (start, output_lines.len())
         }
-        RecallRange::LastMatching(n) => {
+        RecallRange::LastMatching(_n) => {
             // Will be handled specially below - get last n MATCHING lines
             (0, output_lines.len())
         }
@@ -1788,7 +1756,7 @@ fn execute_recall(opts: &tf::RecallOptions, output_lines: &[OutputLine]) -> (Vec
     let header = if opts.quiet {
         None
     } else {
-        Some(format!("================ Recall start ================"))
+        Some("================ Recall start ================".to_string())
     };
 
     (result, header)
@@ -2123,27 +2091,11 @@ impl OutputLine {
 
 /// Cached "now" time for batch timestamp formatting
 /// Computing localtime_r once per frame instead of once per line
-struct CachedNow {
-    year: i32,
-    yday: i32,
-}
+struct CachedNow;
 
 impl CachedNow {
     fn new() -> Self {
-        let now_secs = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs() as libc::time_t;
-
-        let mut now_tm: libc::tm = unsafe { std::mem::zeroed() };
-        unsafe {
-            libc::localtime_r(&now_secs, &mut now_tm);
-        }
-
-        Self {
-            year: now_tm.tm_year,
-            yday: now_tm.tm_yday,
-        }
+        Self
     }
 }
 
@@ -2795,11 +2747,6 @@ impl App {
         &mut self.worlds[idx]
     }
 
-    /// Check if this app is running as a remote client (--console mode)
-    fn is_remote_client(&self) -> bool {
-        self.ws_client_tx.is_some()
-    }
-
     /// Check if a new-style popup is currently visible
     fn has_new_popup(&self) -> bool {
         self.popup_manager.current().map(|s| s.visible).unwrap_or(false)
@@ -2822,16 +2769,6 @@ impl App {
         self.popup_manager.open(create_menu_popup());
     }
 
-    /// Get the currently selected menu item command (if menu popup is active)
-    fn get_selected_menu_command(&self) -> Option<String> {
-        if let Some(state) = self.popup_manager.current() {
-            if state.definition.id == popup::PopupId("menu") {
-                return state.get_selected_list_item().map(|item| item.id.clone());
-            }
-        }
-        None
-    }
-
     /// Open a confirm dialog for deleting a world
     fn open_delete_world_confirm(&mut self, world_name: &str, world_index: usize) {
         use popup::definitions::confirm::{create_delete_world_dialog, CONFIRM_BTN_NO};
@@ -2843,21 +2780,6 @@ impl App {
         if let Some(state) = self.popup_manager.current_mut() {
             state.select_button(CONFIRM_BTN_NO);
         }
-    }
-
-    /// Check if current popup is a confirm dialog and get which button is selected
-    fn get_confirm_result(&self) -> Option<bool> {
-        use popup::definitions::confirm::{CONFIRM_BTN_YES, CONFIRM_BTN_NO};
-        if let Some(state) = self.popup_manager.current() {
-            if state.definition.id.0.starts_with("delete_") {
-                if state.is_button_focused(CONFIRM_BTN_YES) {
-                    return Some(true);
-                } else if state.is_button_focused(CONFIRM_BTN_NO) {
-                    return Some(false);
-                }
-            }
-        }
-        None
     }
 
     /// Open the world selector popup using the new unified popup system
@@ -3159,18 +3081,6 @@ impl App {
         self.popup_manager.push(def);
     }
 
-    /// Send a command to the MUD (routes through WebSocket if remote client)
-    fn send_to_mud(&mut self, world_index: usize, command: &str) {
-        if let Some(ref tx) = self.ws_client_tx {
-            // Remote client mode - send through WebSocket
-            let _ = tx.send(WsMessage::SendCommand {
-                world_index,
-                command: command.to_string(),
-            });
-        }
-        // Note: In normal mode, command_tx is used directly in run_app()
-    }
-
     /// Handle incoming WebSocket message when running as remote client
     fn handle_remote_ws_message(&mut self, msg: WsMessage) {
         match msg {
@@ -3365,15 +3275,13 @@ impl App {
                         let _ = writeln!(f, "DEBUG: Adding splash screen to world {} (was empty and not connected)", world.name);
                     }
                     world.output_lines = splash_lines.into_iter()
-                        .map(|text| OutputLine::new(text))
+                        .map(OutputLine::new)
                         .collect();
                     world.showing_splash = true;
                     world.scroll_offset = world.output_lines.len().saturating_sub(1);
-                } else {
-                    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open("/tmp/clay-debug.log") {
-                        let _ = writeln!(f, "DEBUG: NOT adding splash - output_lines.len()={}, connected={}",
-                            world.output_lines.len(), world.connected);
-                    }
+                } else if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open("/tmp/clay-debug.log") {
+                    let _ = writeln!(f, "DEBUG: NOT adding splash - output_lines.len()={}, connected={}",
+                        world.output_lines.len(), world.connected);
                 }
             }
         }
@@ -3518,18 +3426,6 @@ impl App {
         }
     }
 
-    /// Get sorted list of world indices for cycling (alphabetically by name, case-insensitive)
-    fn get_sorted_world_indices(&self) -> Vec<usize> {
-        let mut indices: Vec<usize> = (0..self.worlds.len()).collect();
-        indices.sort_by(|&a, &b| {
-            self.worlds[a]
-                .name
-                .to_lowercase()
-                .cmp(&self.worlds[b].name.to_lowercase())
-        });
-        indices
-    }
-
     fn next_world(&mut self) {
         // Build world info for shared function
         let world_info: Vec<crate::util::WorldSwitchInfo> = self.worlds.iter()
@@ -3570,50 +3466,6 @@ impl App {
         ) {
             self.switch_world(prev_idx);
         }
-    }
-
-    fn next_world_all(&mut self) {
-        // Cycle through all worlds that have ever been connected (alphabetically)
-        let sorted = self.get_sorted_world_indices();
-        if sorted.is_empty() {
-            return;
-        }
-        let current_pos = sorted.iter().position(|&i| i == self.current_world_index).unwrap_or(0);
-        let len = sorted.len();
-
-        for i in 1..=len {
-            let sorted_idx = (current_pos + i) % len;
-            let world_idx = sorted[sorted_idx];
-            if self.worlds[world_idx].was_connected {
-                self.switch_world(world_idx);
-                return;
-            }
-        }
-        // No worlds that were connected, stay on current
-    }
-
-    fn prev_world_all(&mut self) {
-        // Cycle through all worlds that have ever been connected (alphabetically)
-        let sorted = self.get_sorted_world_indices();
-        if sorted.is_empty() {
-            return;
-        }
-        let current_pos = sorted.iter().position(|&i| i == self.current_world_index).unwrap_or(0);
-        let len = sorted.len();
-
-        for i in 1..=len {
-            let sorted_idx = if current_pos >= i {
-                current_pos - i
-            } else {
-                len - (i - current_pos)
-            };
-            let world_idx = sorted[sorted_idx];
-            if self.worlds[world_idx].was_connected {
-                self.switch_world(world_idx);
-                return;
-            }
-        }
-        // No worlds that were connected, stay on current
     }
 
     fn find_world(&self, name: &str) -> Option<usize> {
@@ -4211,7 +4063,8 @@ impl App {
     /// Patterns: 32F, 32f, 100C, 100c, 32°F, 32.5F, -10C, etc.
     /// When detected, inserts conversion in parentheses: "32F " -> "32F (0C) "
     fn check_temp_conversion(&mut self) {
-        if !self.settings.temp_convert_enabled {
+        // Only convert temperatures when both enabled AND show_tags mode is active (F2)
+        if !self.settings.temp_convert_enabled || !self.show_tags {
             return;
         }
 
@@ -4239,7 +4092,7 @@ impl App {
 
         // Look backwards for a temperature pattern before the separator
         // Pattern: optional minus, digits, optional decimal+digits, optional °, F or C
-        let mut end = chars.len() - 1; // Position of the separator
+        let end = chars.len() - 1; // Position of the separator
         if end == 0 {
             return;
         }
@@ -4999,7 +4852,7 @@ fn load_settings(app: &mut App) -> io::Result<()> {
                     match key {
                         "name" => action.name = value.to_string(),
                         "world" => action.world = value.to_string(),
-                        "match_type" => action.match_type = MatchType::from_str(value),
+                        "match_type" => action.match_type = MatchType::parse(value),
                         "pattern" => action.pattern = unescape_action_value(value),
                         "command" => action.command = unescape_action_value(value),
                         _ => {}
@@ -5405,7 +5258,7 @@ fn load_multiuser_settings(app: &mut App) -> io::Result<()> {
                     match key {
                         "name" => action.name = value.to_string(),
                         "world" => action.world = value.to_string(),
-                        "match_type" => action.match_type = MatchType::from_str(value),
+                        "match_type" => action.match_type = MatchType::parse(value),
                         "pattern" => action.pattern = unescape_action_value(value),
                         "command" => action.command = unescape_action_value(value),
                         _ => {}
@@ -6240,7 +6093,7 @@ fn load_reload_state(app: &mut App) -> io::Result<bool> {
                         match key {
                             "name" => action.name = value.to_string(),
                             "world" => action.world = value.to_string(),
-                            "match_type" => action.match_type = MatchType::from_str(value),
+                            "match_type" => action.match_type = MatchType::parse(value),
                             "pattern" => action.pattern = unescape_action_value(value),
                             "command" => action.command = unescape_action_value(value),
                             _ => {}
@@ -6395,8 +6248,8 @@ fn get_proxy_socket_path(world_name: &str) -> PathBuf {
 }
 
 /// Get the config file path for a TLS proxy (derived from socket path)
-fn get_proxy_config_path(socket_path: &PathBuf) -> PathBuf {
-    let mut config_path = socket_path.clone();
+fn get_proxy_config_path(socket_path: &Path) -> PathBuf {
+    let mut config_path = socket_path.to_path_buf();
     config_path.set_extension("conf");
     config_path
 }
@@ -8256,7 +8109,8 @@ mod remote_gui {
         /// Patterns: 32F, 32f, 100C, 100c, 32°F, 32.5F, -10C, etc.
         /// When detected, inserts conversion in parentheses: "32F " -> "32F(0C) "
         fn check_temp_conversion(&mut self) {
-            if !self.temp_convert_enabled {
+            // Only convert temperatures when both enabled AND show_tags mode is active (F2)
+            if !self.temp_convert_enabled || !self.show_tags {
                 return;
             }
 
@@ -15207,17 +15061,15 @@ async fn run_console_client(addr: &str) -> io::Result<()> {
             msg = ws_read.next() => {
                 match msg {
                     Some(Ok(Message::Text(text))) => {
-                        if let Ok(ws_msg) = serde_json::from_str::<WsMessage>(&text) {
-                            if let WsMessage::AuthResponse { success, error, .. } = ws_msg {
-                                if !success {
-                                    disable_raw_mode()?;
-                                    println!();
-                                    eprintln!("Authentication failed: {}", error.unwrap_or_default());
-                                    return Ok(());
-                                }
-                                // Auth success - continue to wait for InitialState
-                                break;
+                        if let Ok(WsMessage::AuthResponse { success, error, .. }) = serde_json::from_str::<WsMessage>(&text) {
+                            if !success {
+                                disable_raw_mode()?;
+                                println!();
+                                eprintln!("Authentication failed: {}", error.unwrap_or_default());
+                                return Ok(());
                             }
+                            // Auth success - continue to wait for InitialState
+                            break;
                         }
                     }
                     Some(Ok(Message::Close(_))) | None => {
@@ -15670,7 +15522,7 @@ enum NewPopupAction {
     /// Action editor saved
     ActionEditorSave { action: Action, editing_index: Option<usize> },
     /// World editor saved
-    WorldEditorSaved(WorldEditorSettings),
+    WorldEditorSaved(Box<WorldEditorSettings>),
     /// World editor delete requested
     WorldEditorDelete(usize),
     /// World editor connect requested
@@ -16476,9 +16328,7 @@ fn handle_new_popup_key(app: &mut App, key: KeyEvent) -> NewPopupAction {
                         } else if state.is_button_focused(EDITOR_BTN_CANCEL) {
                             app.popup_manager.close();
                         }
-                    } else if is_toggle {
-                        state.toggle_current();
-                    } else if is_select {
+                    } else if is_toggle || is_select {
                         state.toggle_current();
                     } else if is_text_field {
                         state.start_edit();
@@ -16624,7 +16474,7 @@ fn handle_new_popup_key(app: &mut App, key: KeyEvent) -> NewPopupAction {
                     let keep_alive_str = $state.get_selected(WORLD_FIELD_KEEP_ALIVE).unwrap_or("nop").to_string();
                     update_field_visibility(
                         &mut $state.definition,
-                        PopupWorldType::from_str(&world_type_str),
+                        PopupWorldType::parse(&world_type_str),
                         keep_alive_str == "custom",
                     );
                 }};
@@ -16650,14 +16500,14 @@ fn handle_new_popup_key(app: &mut App, key: KeyEvent) -> NewPopupAction {
                         if state.is_button_focused(WORLD_BTN_SAVE) {
                             let settings = extract_settings();
                             app.popup_manager.close();
-                            return NewPopupAction::WorldEditorSaved(settings);
+                            return NewPopupAction::WorldEditorSaved(Box::new(settings));
                         } else if state.is_button_focused(WORLD_BTN_CANCEL) {
                             app.popup_manager.close();
                         } else if state.is_button_focused(WORLD_BTN_DELETE) {
                             app.popup_manager.close();
                             return NewPopupAction::WorldEditorDelete(world_index);
                         } else if state.is_button_focused(WORLD_BTN_CONNECT) {
-                            let settings = extract_settings();
+                            let _settings = extract_settings();
                             app.popup_manager.close();
                             // First save, then connect
                             return NewPopupAction::WorldEditorConnect(world_index);
@@ -16775,7 +16625,7 @@ fn handle_new_popup_key(app: &mut App, key: KeyEvent) -> NewPopupAction {
                 Char('s') | Char('S') if !state.editing => {
                     let settings = extract_settings();
                     app.popup_manager.close();
-                    return NewPopupAction::WorldEditorSaved(settings);
+                    return NewPopupAction::WorldEditorSaved(Box::new(settings));
                 }
                 Char('c') | Char('C') if !state.editing => {
                     app.popup_manager.close();
@@ -16785,7 +16635,7 @@ fn handle_new_popup_key(app: &mut App, key: KeyEvent) -> NewPopupAction {
                     return NewPopupAction::WorldEditorDelete(world_index);
                 }
                 Char('o') | Char('O') if !state.editing => {
-                    let settings = extract_settings();
+                    let _settings = extract_settings();
                     app.popup_manager.close();
                     return NewPopupAction::WorldEditorConnect(world_index);
                 }
@@ -17096,13 +16946,10 @@ async fn run_daemon_server() -> io::Result<()> {
                                     }
                                 } else if cmd.starts_with('#') {
                                     // TF command
-                                    match app.tf_engine.execute(&cmd) {
-                                        tf::TfCommandResult::SendToMud(text) => {
-                                            if let Some(tx) = &app.worlds[world_idx].command_tx {
-                                                let _ = tx.try_send(WriteCommand::Text(text));
-                                            }
+                                    if let tf::TfCommandResult::SendToMud(text) = app.tf_engine.execute(&cmd) {
+                                        if let Some(tx) = &app.worlds[world_idx].command_tx {
+                                            let _ = tx.try_send(WriteCommand::Text(text));
                                         }
-                                        _ => {}
                                     }
                                 } else if let Some(tx) = &app.worlds[world_idx].command_tx {
                                     // Plain text - send to MUD
@@ -19549,160 +19396,6 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                 app.add_output("Not connected. Use /worlds to connect.");
                             }
                         }
-                        KeyAction::UpdateWebSocket => {
-                            // Check if we need to start or stop the WebSocket server
-                            let ws_enabled = app.settings.ws_enabled;
-                            let has_password = !app.settings.websocket_password.is_empty();
-                            let is_running = app.ws_server.is_some();
-
-                            if ws_enabled && has_password && !is_running {
-                                // Start the server
-                                let mut server = WebSocketServer::new(
-                                    &app.settings.websocket_password,
-                                    app.settings.ws_port,
-                                    &app.settings.websocket_allow_list,
-                                    app.settings.websocket_whitelisted_host.clone(),
-                                    app.multiuser_mode,
-                                    app.ban_list.clone(),
-                                );
-
-                                // Configure TLS if secure mode enabled
-                                #[cfg(feature = "native-tls-backend")]
-                                let tls_configured = if app.settings.web_secure
-                                    && !app.settings.websocket_cert_file.is_empty()
-                                    && !app.settings.websocket_key_file.is_empty()
-                                {
-                                    match server.configure_tls(&app.settings.websocket_cert_file, &app.settings.websocket_key_file) {
-                                        Ok(()) => true,
-                                        Err(e) => {
-                                            app.add_output(&format!("Warning: Failed to configure TLS: {}", e));
-                                            false
-                                        }
-                                    }
-                                } else {
-                                    false
-                                };
-                                #[cfg(feature = "rustls-backend")]
-                                let tls_configured = if app.settings.web_secure
-                                    && !app.settings.websocket_cert_file.is_empty()
-                                    && !app.settings.websocket_key_file.is_empty()
-                                {
-                                    match server.configure_tls(&app.settings.websocket_cert_file, &app.settings.websocket_key_file) {
-                                        Ok(()) => true,
-                                        Err(e) => {
-                                            app.add_output(&format!("Warning: Failed to configure TLS: {}", e));
-                                            false
-                                        }
-                                    }
-                                } else {
-                                    false
-                                };
-
-                                if let Err(e) = start_websocket_server(&mut server, event_tx.clone()).await {
-                                    // Don't show error if port is in use (likely another clay instance)
-                                    let err_str = e.to_string();
-                                    if !err_str.contains("Address in use") && !err_str.contains("address already in use") {
-                                        app.add_output(&format!("Warning: Failed to start WebSocket server: {}", e));
-                                    }
-                                } else {
-                                    let protocol = if tls_configured { "wss" } else { "ws" };
-                                    app.add_output(&format!("WebSocket server started on port {} ({})", app.settings.ws_port, protocol));
-                                    app.ws_server = Some(server);
-                                }
-                            } else if (!ws_enabled || !has_password) && is_running {
-                                // Stop the server
-                                if let Some(ref mut server) = app.ws_server {
-                                    server.stop();
-                                }
-                                app.ws_server = None;
-                                app.add_output("WebSocket server stopped.");
-                            }
-
-                            // Check if we need to start or stop the HTTP/HTTPS server
-                            {
-                                let http_enabled = app.settings.http_enabled;
-                                let http_running = app.http_server.is_some();
-                                let https_running = app.https_server.is_some();
-                                let has_cert = !app.settings.websocket_cert_file.is_empty()
-                                    && !app.settings.websocket_key_file.is_empty();
-                                let web_secure = app.settings.web_secure;
-
-                                if http_enabled && web_secure && has_cert && !https_running {
-                                    // Stop HTTP if running, start HTTPS
-                                    if http_running {
-                                        app.http_server = None;
-                                    }
-                                    #[cfg(feature = "native-tls-backend")]
-                                    {
-                                        let mut https_server = HttpsServer::new(app.settings.http_port);
-                                        match start_https_server(
-                                            &mut https_server,
-                                            &app.settings.websocket_cert_file,
-                                            &app.settings.websocket_key_file,
-                                            app.settings.ws_port,
-                                            true,
-                                        ).await {
-                                            Ok(()) => {
-                                                app.add_output(&format!("HTTPS web interface started on port {} (wss://localhost:{})", app.settings.http_port, app.settings.ws_port));
-                                                app.https_server = Some(https_server);
-                                            }
-                                            Err(e) => {
-                                                app.add_output(&format!("Warning: Failed to start HTTPS server: {}", e));
-                                            }
-                                        }
-                                    }
-                                    #[cfg(feature = "rustls-backend")]
-                                    {
-                                        let mut https_server = HttpsServer::new(app.settings.http_port);
-                                        match start_https_server(
-                                            &mut https_server,
-                                            &app.settings.websocket_cert_file,
-                                            &app.settings.websocket_key_file,
-                                            app.settings.ws_port,
-                                            true,
-                                        ).await {
-                                            Ok(()) => {
-                                                app.add_output(&format!("HTTPS web interface started on port {} (wss://localhost:{})", app.settings.http_port, app.settings.ws_port));
-                                                app.https_server = Some(https_server);
-                                            }
-                                            Err(e) => {
-                                                app.add_output(&format!("Warning: Failed to start HTTPS server: {}", e));
-                                            }
-                                        }
-                                    }
-                                } else if http_enabled && !web_secure && !http_running {
-                                    // Stop HTTPS if running, start HTTP
-                                    if https_running {
-                                        app.https_server = None;
-                                    }
-                                    let mut http_server = HttpServer::new(app.settings.http_port);
-                                    match start_http_server(
-                                        &mut http_server,
-                                        app.settings.ws_port,
-                                        false,
-                                        app.ban_list.clone(),
-                                    ).await {
-                                        Ok(()) => {
-                                            app.add_output(&format!("HTTP web interface started on port {} (ws://localhost:{})", app.settings.http_port, app.settings.ws_port));
-                                            app.http_server = Some(http_server);
-                                        }
-                                        Err(e) => {
-                                            app.add_output(&format!("Warning: Failed to start HTTP server: {}", e));
-                                        }
-                                    }
-                                } else if !http_enabled && (http_running || https_running) {
-                                    // Stop both servers
-                                    if http_running {
-                                        app.http_server = None;
-                                        app.add_output("HTTP web interface stopped.");
-                                    }
-                                    if https_running {
-                                        app.https_server = None;
-                                        app.add_output("HTTPS web interface stopped.");
-                                    }
-                                }
-                            }
-                        }
                         KeyAction::SwitchedWorld(_world_index) => {
                             // UnseenCleared is now broadcast by switch_world() itself
                         }
@@ -19801,7 +19494,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                             // Broadcast disconnect message to WebSocket clients
                             app.ws_broadcast(WsMessage::ServerData {
                                 world_index: world_idx,
-                                data: format!("Disconnected.\n"),
+                                data: "Disconnected.\n".to_string(),
                                 is_viewed: world_idx == app.current_world_index,
                                 ts: disconnect_msg.timestamp.duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs(),
                             });
@@ -21440,7 +21133,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                         // Broadcast disconnect message to WebSocket clients
                         app.ws_broadcast(WsMessage::ServerData {
                             world_index: world_idx,
-                            data: format!("Disconnected.\n"),
+                            data: "Disconnected.\n".to_string(),
                             is_viewed: world_idx == app.current_world_index,
                             ts: disconnect_msg.timestamp.duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs(),
                         });
@@ -22317,7 +22010,6 @@ enum KeyAction {
     Redraw,  // Force screen redraw
     Reload,  // Trigger /reload
     Suspend, // Ctrl+Z to suspend process
-    UpdateWebSocket, // Check and update WebSocket server state
     SwitchedWorld(usize), // Console switched to this world, broadcast unseen clear
     None,
 }
@@ -22338,36 +22030,7 @@ fn handle_key_event(key: KeyEvent, app: &mut App) -> KeyAction {
                 app.confirm_dialog.yes_selected = false;
             }
             KeyCode::Enter => {
-                if app.confirm_dialog.yes_selected {
-                    // Execute the action
-                    match app.confirm_dialog.action {
-                        ConfirmAction::DeleteWorld(world_index) => {
-                            // Delete the world
-                            if app.worlds.len() > 1 {
-                                // Save the world name before deletion
-                                let world_name = app.worlds[world_index].name.clone();
-                                // Disconnect if connected
-                                app.worlds[world_index].connected = false;
-                                app.worlds[world_index].command_tx = None;
-                                app.worlds.remove(world_index);
-                                // Adjust current world index
-                                if app.current_world_index >= app.worlds.len() {
-                                    app.current_world_index = app.worlds.len() - 1;
-                                }
-                                app.add_output("");
-                                app.add_output(&format!("World '{}' deleted.", world_name));
-                                app.add_output("");
-                                // Save settings to persist deletion
-                                let _ = save_settings(app);
-                            } else {
-                                app.add_output("");
-                                app.add_output("Cannot delete the last world.");
-                                app.add_output("");
-                            }
-                        }
-                        ConfirmAction::None => {}
-                    }
-                }
+                // ConfirmAction::None is the only variant now
                 app.confirm_dialog.close();
             }
             KeyCode::Esc => {
@@ -22565,7 +22228,7 @@ fn handle_key_event(key: KeyEvent, app: &mut App) -> KeyAction {
                         if let popup::FieldKind::List { items, selected_index, scroll_offset, .. } = &mut field.kind {
                             let old_len = items.len();
                             // Rebuild items with indices
-                            *items = filtered.iter().enumerate().filter_map(|(_, info)| {
+                            *items = filtered.iter().filter_map(|info| {
                                 // Find original index
                                 app.settings.actions.iter().position(|a| a.name == info.name).map(|orig_idx| {
                                     let status = if info.enabled { "[✓]" } else { "[ ]" };
@@ -26156,36 +25819,6 @@ fn render_filter_popup(f: &mut Frame, app: &App) {
     let popup_text = Paragraph::new(lines).block(popup_block);
 
     f.render_widget(popup_text, popup_area);
-}
-
-/// Simple word wrap for help text
-fn simple_word_wrap(text: &str, max_width: usize) -> Vec<String> {
-    if text.chars().count() <= max_width {
-        return vec![text.to_string()];
-    }
-
-    let mut result = Vec::new();
-    let mut current_line = String::new();
-
-    for word in text.split_whitespace() {
-        let current_len = current_line.chars().count();
-        let word_len = word.chars().count();
-
-        if current_len + word_len + 1 <= max_width || current_len == 0 {
-            if !current_line.is_empty() {
-                current_line.push(' ');
-            }
-            current_line.push_str(word);
-        } else {
-            result.push(current_line);
-            current_line = word.to_string();
-        }
-    }
-    if !current_line.is_empty() {
-        result.push(current_line);
-    }
-
-    result
 }
 
 /// Render new unified popup system

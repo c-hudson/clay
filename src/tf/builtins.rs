@@ -164,24 +164,6 @@ fn looks_like_time(s: &str) -> bool {
     s.contains(':') && s.chars().all(|c| c.is_ascii_digit() || c == ':' || c == '.')
 }
 
-/// Parse a range value (could be line count, time, or real number)
-fn parse_range_value(s: &str) -> Option<(usize, Option<f64>)> {
-    // Check if it's a time format
-    if looks_like_time(s) {
-        let secs = parse_time_to_seconds(s)?;
-        return Some((0, Some(secs)));
-    }
-    // Check if it's a real number (absolute time)
-    if s.contains('.') {
-        let _time: f64 = s.parse().ok()?;
-        // For now, treat as line count 0 with time
-        return Some((0, Some(0.0))); // TODO: handle absolute time
-    }
-    // Plain integer
-    let n: usize = s.parse().ok()?;
-    Some((n, None))
-}
-
 pub fn cmd_recall(args: &str) -> TfCommandResult {
     let args = args.trim();
 
@@ -193,7 +175,7 @@ pub fn cmd_recall(args: &str) -> TfCommandResult {
 
     let mut opts = RecallOptions::default();
     let mut remaining = args;
-    let mut saw_hash = false;
+    let mut _saw_hash = false;
 
     // Parse options (start with -)
     while !remaining.is_empty() {
@@ -204,7 +186,7 @@ pub fn cmd_recall(args: &str) -> TfCommandResult {
 
         // Check for # (show line numbers) - must be last option before range
         if trimmed.starts_with('#') && !trimmed.starts_with("#recall") {
-            saw_hash = true;
+            _saw_hash = true;
             opts.show_line_numbers = true;
             remaining = &trimmed[1..];
             break; // # must be last option

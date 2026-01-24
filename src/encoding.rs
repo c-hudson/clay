@@ -559,8 +559,8 @@ pub fn is_ansi_only_line(s: &str) -> bool {
 pub fn has_background_color(s: &str) -> bool {
     let mut chars = s.chars().peekable();
     while let Some(c) = chars.next() {
-        if c == '\x1b' {
-            if chars.next() == Some('[') {
+        if c == '\x1b'
+            && chars.next() == Some('[') {
                 // Collect the CSI parameters until we hit 'm' or non-numeric
                 let mut params = String::new();
                 while let Some(&ch) = chars.peek() {
@@ -590,7 +590,6 @@ pub fn has_background_color(s: &str) -> bool {
                     }
                 }
             }
-        }
     }
     false
 }

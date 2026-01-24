@@ -441,7 +441,8 @@
     // Patterns: 32F, 32f, 100C, 100c, 32°F, 32.5F, -10C, etc.
     // When detected, inserts conversion in parentheses: "32F " -> "32F(0C) "
     function checkTempConversion() {
-        if (!tempConvertEnabled) return;
+        // Only convert when both enabled AND show_tags mode is active (F2)
+        if (!tempConvertEnabled || !showTags) return;
 
         const input = elements.input.value;
         if (!input || input.length === 0) {

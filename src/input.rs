@@ -308,11 +308,11 @@ impl InputArea {
 
         // Calculate total lines
         let total_lines = if first_line_capacity == 0 {
-            1 + (total_chars + width - 1) / width
+            1 + total_chars.div_ceil(width)
         } else if total_chars <= first_line_capacity {
             1
         } else {
-            1 + (total_chars - first_line_capacity + width - 1) / width
+            1 + (total_chars - first_line_capacity).div_ceil(width)
         };
 
         if current_line >= total_lines.saturating_sub(1) {

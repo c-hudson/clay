@@ -31,6 +31,7 @@ pub fn protocol_options() -> Vec<SelectOption> {
 }
 
 /// Create the web settings popup definition with current values
+#[allow(clippy::too_many_arguments)]
 pub fn create_web_popup(
     web_secure: bool,
     http_enabled: bool,

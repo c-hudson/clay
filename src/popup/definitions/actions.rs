@@ -54,7 +54,7 @@ pub enum MatchType {
 }
 
 impl MatchType {
-    pub fn from_str(s: &str) -> Self {
+    pub fn parse(s: &str) -> Self {
         match s.to_lowercase().as_str() {
             "wildcard" => MatchType::Wildcard,
             _ => MatchType::Regexp,

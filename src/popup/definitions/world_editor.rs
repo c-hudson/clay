@@ -46,7 +46,7 @@ pub enum WorldType {
 }
 
 impl WorldType {
-    pub fn from_str(s: &str) -> Self {
+    pub fn parse(s: &str) -> Self {
         match s.to_lowercase().as_str() {
             "slack" => WorldType::Slack,
             "discord" => WorldType::Discord,
@@ -129,7 +129,7 @@ pub struct WorldSettings {
 
 /// Create the world editor popup definition with current values
 pub fn create_world_editor_popup(settings: &WorldSettings) -> PopupDefinition {
-    let world_type = WorldType::from_str(&settings.world_type);
+    let world_type = WorldType::parse(&settings.world_type);
     let world_type_idx = match world_type {
         WorldType::Mud => 0,
         WorldType::Slack => 1,
