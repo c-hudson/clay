@@ -5,6 +5,7 @@
 
 pub mod actions;
 pub mod confirm;
+pub mod connections;
 pub mod filter;
 pub mod help;
 pub mod menu;
@@ -15,6 +16,7 @@ pub mod world_selector;
 
 pub use actions::*;
 pub use confirm::*;
+pub use connections::*;
 pub use filter::*;
 pub use help::*;
 pub use menu::*;

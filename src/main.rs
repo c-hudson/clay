@@ -1980,199 +1980,6 @@ impl ConfirmDialog {
     }
 }
 
-/// Popup to display connected worlds status (from /connections command)
-struct WorldsPopup {
-    visible: bool,
-    lines: Vec<String>,
-}
-
-impl WorldsPopup {
-    fn new() -> Self {
-        Self {
-            visible: false,
-            lines: Vec::new(),
-        }
-    }
-
-    #[allow(dead_code)]
-    fn show(&mut self, worlds: &[World], current_world_index: usize, screen_width: u16) {
-        self.visible = true;
-        self.lines.clear();
-
-        // Helper to format elapsed time
-        fn format_elapsed(instant: Option<std::time::Instant>) -> String {
-            match instant {
-                None => "-".to_string(),
-                Some(t) => {
-                    let secs = t.elapsed().as_secs();
-                    if secs < 60 {
-                        format!("{}s", secs)
-                    } else if secs < 3600 {
-                        format!("{}m", secs / 60)
-                    } else if secs < 86400 {
-                        format!("{}h", secs / 3600)
-                    } else {
-                        format!("{}d", secs / 86400)
-                    }
-                }
-            }
-        }
-
-        // Helper to format time until next NOP
-        fn format_next_nop(last_send_time: Option<std::time::Instant>, last_receive_time: Option<std::time::Instant>) -> String {
-            const KEEPALIVE_SECS: u64 = 5 * 60;
-            let last_activity = match (last_send_time, last_receive_time) {
-                (Some(s), Some(r)) => Some(s.max(r)),
-                (Some(s), None) => Some(s),
-                (None, Some(r)) => Some(r),
-                (None, None) => None,
-            };
-            let elapsed = last_activity.map(|t| t.elapsed().as_secs()).unwrap_or(KEEPALIVE_SECS);
-            let remaining = KEEPALIVE_SECS.saturating_sub(elapsed);
-            if remaining < 60 {
-                format!("{}s", remaining)
-            } else {
-                format!("{}m", remaining / 60)
-            }
-        }
-
-        // Collect connected world info
-        let connected_info: Vec<_> = worlds.iter().enumerate()
-            .filter(|(_, w)| w.connected)
-            .map(|(i, w)| {
-                let ssh_status = if w.is_tls {
-                    if w.proxy_pid.is_some() { "PRX" } else { "SSH" }
-                } else {
-                    ""
-                };
-                (
-                    if i == current_world_index { "*" } else { " " },
-                    ssh_status.to_string(),
-                    w.name.clone(),
-                    if w.unseen_lines > 0 { w.unseen_lines.to_string() } else { String::new() },
-                    format_elapsed(w.last_user_command_time),
-                    format_elapsed(w.last_receive_time),
-                    w.settings.keep_alive_type.name().to_string(),
-                    format_elapsed(w.last_nop_time),
-                    format_next_nop(w.last_send_time, w.last_receive_time),
-                )
-            })
-            .collect();
-
-        if connected_info.is_empty() {
-            self.lines.push("No worlds connected.".to_string());
-        } else {
-            // Calculate column widths
-            // SSH column is fixed at 3 characters
-            let ssh_width = 3;
-            let name_width = connected_info.iter().map(|(_, _, n, _, _, _, _, _, _)| n.len()).max().unwrap_or(5).max(5);
-            let unseen_width = connected_info.iter().map(|(_, _, _, u, _, _, _, _, _)| u.len()).max().unwrap_or(6).max(6);
-            let send_width = connected_info.iter().map(|(_, _, _, _, s, _, _, _, _)| s.len()).max().unwrap_or(8).max(8);
-            let recv_width = connected_info.iter().map(|(_, _, _, _, _, r, _, _, _)| r.len()).max().unwrap_or(8).max(8);
-            let ka_width = connected_info.iter().map(|(_, _, _, _, _, _, k, _, _)| k.len()).max().unwrap_or(9).max(9);
-            let nop_width = connected_info.iter().map(|(_, _, _, _, _, _, _, n, _)| n.len()).max().unwrap_or(6).max(6);
-            let next_width = connected_info.iter().map(|(_, _, _, _, _, _, _, _, p)| p.len()).max().unwrap_or(6).max(6);
-
-            // Calculate combined column widths
-            let send_recv_combined_width = connected_info.iter()
-                .map(|(_, _, _, _, s, r, _, _, _)| format!("{}/{}", s, r).len())
-                .max().unwrap_or(9).max(9);
-            let ka_next_combined_width = connected_info.iter()
-                .map(|(_, _, _, _, _, _, _, lk, nk)| format!("{}/{}", lk, nk).len())
-                .max().unwrap_or(7).max(7);
-
-            // Calculate total widths for different layouts (includes SSH column)
-            // Layout 1: All columns separate
-            let width_full = 2 + ssh_width + 2 + name_width + 2 + unseen_width + 2 + send_width + 2 + recv_width + 2 + ka_width + 2 + nop_width + 2 + next_width;
-            // Layout 2: Combine Send/Recv AND LastKA/NextKA
-            let width_combined_both = 2 + ssh_width + 2 + name_width + 2 + unseen_width + 2 + send_recv_combined_width + 2 + ka_width + 2 + ka_next_combined_width;
-            // Layout 3: Remove KeepAlive column
-            let width_no_ka_type = 2 + ssh_width + 2 + name_width + 2 + unseen_width + 2 + send_recv_combined_width + 2 + ka_next_combined_width;
-            // Layout 4: Remove LastKA/NextKA columns entirely
-            let _width_minimal = 2 + ssh_width + 2 + name_width + 2 + unseen_width + 2 + send_recv_combined_width;
-
-            let available = screen_width as usize;
-
-            // Determine which layout to use
-            let layout = if available >= width_full {
-                1  // Full layout
-            } else if available >= width_combined_both {
-                2  // Combined Send/Recv and LastKA/NextKA
-            } else if available >= width_no_ka_type {
-                3  // Remove KeepAlive type column
-            } else {
-                4  // Remove KA columns entirely (or fallback to minimal)
-            };
-
-            // Generate header and data based on layout
-            match layout {
-                1 => {
-                    // Full layout: all columns separate
-                    self.lines.push(format!(
-                        "  {:ssh_width$}  {:name_width$}  {:>unseen_width$}  {:>send_width$}  {:>recv_width$}  {:ka_width$}  {:>nop_width$}  {:>next_width$}",
-                        "SSH", "World", "Unseen", "LastSend", "LastRecv", "KeepAlive", "LastKA", "NextKA",
-                    ));
-                    for (current, ssh, name, unseen, send, recv, ka_type, last_ka, next_ka) in &connected_info {
-                        self.lines.push(format!(
-                            "{} {:ssh_width$}  {:name_width$}  {:>unseen_width$}  {:>send_width$}  {:>recv_width$}  {:ka_width$}  {:>nop_width$}  {:>next_width$}",
-                            current, ssh, name, unseen, send, recv, ka_type, last_ka, next_ka,
-                        ));
-                    }
-                }
-                2 => {
-                    // Combined Send/Recv and LastKA/NextKA
-                    self.lines.push(format!(
-                        "  {:ssh_width$}  {:name_width$}  {:>unseen_width$}  {:>send_recv_combined_width$}  {:ka_width$}  {:>ka_next_combined_width$}",
-                        "SSH", "World", "Unseen", "Send/Recv", "KeepAlive", "KA/Next",
-                    ));
-                    for (current, ssh, name, unseen, send, recv, ka_type, last_ka, next_ka) in &connected_info {
-                        let sr = format!("{}/{}", send, recv);
-                        let kn = format!("{}/{}", last_ka, next_ka);
-                        self.lines.push(format!(
-                            "{} {:ssh_width$}  {:name_width$}  {:>unseen_width$}  {:>send_recv_combined_width$}  {:ka_width$}  {:>ka_next_combined_width$}",
-                            current, ssh, name, unseen, sr, ka_type, kn,
-                        ));
-                    }
-                }
-                3 => {
-                    // Remove KeepAlive type column
-                    self.lines.push(format!(
-                        "  {:ssh_width$}  {:name_width$}  {:>unseen_width$}  {:>send_recv_combined_width$}  {:>ka_next_combined_width$}",
-                        "SSH", "World", "Unseen", "Send/Recv", "KA/Next",
-                    ));
-                    for (current, ssh, name, unseen, send, recv, _ka_type, last_ka, next_ka) in &connected_info {
-                        let sr = format!("{}/{}", send, recv);
-                        let kn = format!("{}/{}", last_ka, next_ka);
-                        self.lines.push(format!(
-                            "{} {:ssh_width$}  {:name_width$}  {:>unseen_width$}  {:>send_recv_combined_width$}  {:>ka_next_combined_width$}",
-                            current, ssh, name, unseen, sr, kn,
-                        ));
-                    }
-                }
-                _ => {
-                    // Minimal: Remove KA columns entirely
-                    self.lines.push(format!(
-                        "  {:ssh_width$}  {:name_width$}  {:>unseen_width$}  {:>send_recv_combined_width$}",
-                        "SSH", "World", "Unseen", "Send/Recv",
-                    ));
-                    for (current, ssh, name, unseen, send, recv, _ka_type, _last_ka, _next_ka) in &connected_info {
-                        let sr = format!("{}/{}", send, recv);
-                        self.lines.push(format!(
-                            "{} {:ssh_width$}  {:name_width$}  {:>unseen_width$}  {:>send_recv_combined_width$}",
-                            current, ssh, name, unseen, sr,
-                        ));
-                    }
-                }
-            }
-        }
-    }
-
-    fn close(&mut self) {
-        self.visible = false;
-        self.lines.clear();
-    }
-}
-
 struct FilterPopup {
     visible: bool,
     filter_text: String,
@@ -2475,621 +2282,6 @@ impl MenuPopup {
 
     fn selected_item(&self) -> MenuItem {
         MenuItem::all()[self.selected]
-    }
-}
-
-/// Which view the actions popup is showing
-#[derive(Clone, Copy, PartialEq)]
-enum ActionsView {
-    List,           // List of actions with Add/Edit/Delete/Cancel
-    Editor,         // Editing a single action
-    ConfirmDelete,  // Confirming deletion
-}
-
-/// Which field in the action list view is focused
-#[derive(Clone, Copy, PartialEq)]
-enum ActionListField {
-    List,           // Action list (selecting which action)
-    AddButton,
-    EditButton,
-    DeleteButton,
-    CancelButton,
-}
-
-/// Which field in the action editor is focused
-#[derive(Clone, Copy, PartialEq)]
-enum ActionEditorField {
-    Name,
-    World,
-    MatchType,
-    Pattern,
-    Command,
-    Enabled,
-    SaveButton,
-    CancelButton,
-}
-
-/// Popup for editing actions/triggers
-struct ActionsPopup {
-    visible: bool,
-    view: ActionsView,              // Current view mode
-    actions: Vec<Action>,           // Working copy of actions
-    selected_index: usize,          // Currently selected action in list
-    editing_index: Option<usize>,   // Index being edited (None = new action)
-    list_field: ActionListField,    // Current field in list view
-    editor_field: ActionEditorField, // Current field in editor view
-    confirm_selected: bool,         // Yes (true) or No (false) in confirm dialog
-    scroll_offset: usize,           // Scroll offset for action list
-    list_visible_height: usize,     // Number of visible items in list (updated during render)
-    // Filter state
-    filter: String,                 // Filter text for action list
-    filter_cursor: usize,           // Cursor position in filter
-    filter_editing: bool,           // True when actively editing filter
-    world_filter: String,           // Pre-set world filter from /actions <world>
-    // Editing state for current action
-    edit_name: String,
-    edit_world: String,
-    edit_match_type: MatchType,     // Pattern match type (Regexp or Wildcard)
-    edit_pattern: String,
-    edit_command: String,
-    edit_enabled: bool,             // Whether action is enabled
-    cursor_pos: usize,              // Cursor position in current text field
-    edit_scroll_offset: usize,      // Horizontal scroll offset for long text fields
-    error_message: Option<String>,  // Validation error message
-    command_expanded: bool,         // Whether command field is expanded to show all lines
-    command_scroll_row: usize,      // Vertical scroll offset for command mini-editor (first visible row)
-}
-
-impl ActionsPopup {
-    fn new() -> Self {
-        Self {
-            visible: false,
-            view: ActionsView::List,
-            actions: Vec::new(),
-            selected_index: 0,
-            editing_index: None,
-            list_field: ActionListField::List,
-            editor_field: ActionEditorField::Name,
-            confirm_selected: false,
-            scroll_offset: 0,
-            list_visible_height: 10, // Default, updated during render
-            filter: String::new(),
-            filter_cursor: 0,
-            filter_editing: false,
-            world_filter: String::new(),
-            edit_name: String::new(),
-            edit_world: String::new(),
-            edit_match_type: MatchType::Regexp,
-            edit_pattern: String::new(),
-            edit_command: String::new(),
-            edit_enabled: true,
-            cursor_pos: 0,
-            edit_scroll_offset: 0,
-            error_message: None,
-            command_expanded: false,
-            command_scroll_row: 0,
-        }
-    }
-
-    fn open(&mut self, actions: &[Action]) {
-        self.visible = true;
-        self.view = ActionsView::List;
-        self.actions = actions.to_vec();
-        self.selected_index = 0;
-        self.editing_index = None;
-        self.list_field = ActionListField::List;
-        self.scroll_offset = 0;
-        self.filter.clear();
-        self.filter_cursor = 0;
-        self.filter_editing = false;
-        self.world_filter.clear();
-        self.error_message = None;
-        self.command_expanded = false;
-    }
-
-    fn open_with_world_filter(&mut self, actions: &[Action], world: &str) {
-        self.open(actions);
-        self.world_filter = world.to_string();
-        // Select first matching action
-        let indices = self.filtered_indices();
-        if !indices.is_empty() {
-            self.selected_index = indices[0];
-        }
-    }
-
-    fn close(&mut self) {
-        self.visible = false;
-        self.view = ActionsView::List;
-        self.filter.clear();
-        self.filter_cursor = 0;
-        self.filter_editing = false;
-        self.world_filter.clear();
-        self.error_message = None;
-    }
-
-    /// Get indices of actions matching the filter
-    fn filtered_indices(&self) -> Vec<usize> {
-        let filter_lower = self.filter.to_lowercase();
-        let world_filter_lower = self.world_filter.to_lowercase();
-
-        self.actions.iter().enumerate()
-            .filter(|(_, action)| {
-                // World filter (from /actions <world>)
-                if !world_filter_lower.is_empty()
-                    && !action.world.to_lowercase().contains(&world_filter_lower)
-                {
-                    return false;
-                }
-                // Text filter (from filter input)
-                if !filter_lower.is_empty() {
-                    let name_match = action.name.to_lowercase().contains(&filter_lower);
-                    let world_match = action.world.to_lowercase().contains(&filter_lower);
-                    let pattern_match = action.pattern.to_lowercase().contains(&filter_lower);
-                    if !name_match && !world_match && !pattern_match {
-                        return false;
-                    }
-                }
-                true
-            })
-            .map(|(i, _)| i)
-            .collect()
-    }
-
-    fn start_filter_edit(&mut self) {
-        self.filter_editing = true;
-        self.list_field = ActionListField::List;
-    }
-
-    fn stop_filter_edit(&mut self) {
-        self.filter_editing = false;
-    }
-
-    fn open_editor(&mut self, index: Option<usize>) {
-        self.view = ActionsView::Editor;
-        self.editing_index = index;
-        self.editor_field = ActionEditorField::Name;
-        self.error_message = None;
-        self.cursor_pos = 0;
-        self.edit_scroll_offset = 0;
-        self.command_expanded = false;
-        self.command_scroll_row = 0;
-
-        if let Some(idx) = index {
-            if let Some(action) = self.actions.get(idx) {
-                self.edit_name = action.name.clone();
-                self.edit_world = action.world.clone();
-                self.edit_match_type = action.match_type;
-                self.edit_pattern = action.pattern.clone();
-                self.edit_command = action.command.clone();
-                self.edit_enabled = action.enabled;
-            }
-        } else {
-            // New action
-            self.edit_name.clear();
-            self.edit_world.clear();
-            self.edit_match_type = MatchType::Regexp;
-            self.edit_pattern.clear();
-            self.edit_command.clear();
-            self.edit_enabled = true;
-        }
-    }
-
-    fn close_editor(&mut self) {
-        self.view = ActionsView::List;
-        self.error_message = None;
-    }
-
-    fn open_confirm_delete(&mut self) {
-        if self.selected_index < self.actions.len() {
-            self.view = ActionsView::ConfirmDelete;
-            self.confirm_selected = false; // Default to No
-        }
-    }
-
-    fn close_confirm_delete(&mut self) {
-        self.view = ActionsView::List;
-    }
-
-    fn save_current_action(&mut self) -> bool {
-        // Validate name
-        let name = self.edit_name.trim();
-        if name.is_empty() {
-            self.error_message = Some("Name is required".to_string());
-            return false;
-        }
-        if is_internal_command(name) {
-            self.error_message = Some(format!("'{}' is a reserved command name", name));
-            return false;
-        }
-        // Check for duplicate names (excluding current action if editing)
-        let editing_idx = self.editing_index;
-        for (i, action) in self.actions.iter().enumerate() {
-            if Some(i) != editing_idx && action.name.eq_ignore_ascii_case(name) {
-                self.error_message = Some(format!("Action '{}' already exists", name));
-                return false;
-            }
-        }
-
-        // Update or create action
-        let action = Action {
-            name: name.to_string(),
-            world: self.edit_world.trim().to_string(),
-            match_type: self.edit_match_type,
-            pattern: self.edit_pattern.clone(),
-            command: self.edit_command.clone(),
-            owner: None,
-            enabled: self.edit_enabled,
-        };
-
-        if let Some(idx) = self.editing_index {
-            // Update existing
-            if idx < self.actions.len() {
-                self.actions[idx] = action;
-            }
-        } else {
-            // New action
-            self.actions.push(action);
-            self.selected_index = self.actions.len() - 1;
-        }
-
-        self.error_message = None;
-        true
-    }
-
-    fn delete_selected_action(&mut self) {
-        if self.selected_index < self.actions.len() && !self.actions.is_empty() {
-            self.actions.remove(self.selected_index);
-            if self.selected_index >= self.actions.len() && !self.actions.is_empty() {
-                self.selected_index = self.actions.len() - 1;
-            }
-        }
-    }
-
-    fn current_field_text(&self) -> &str {
-        match self.editor_field {
-            ActionEditorField::Name => &self.edit_name,
-            ActionEditorField::World => &self.edit_world,
-            ActionEditorField::Pattern => &self.edit_pattern,
-            ActionEditorField::Command => &self.edit_command,
-            _ => "",
-        }
-    }
-
-    fn insert_char(&mut self, c: char) {
-        let cursor = self.cursor_pos;
-        let text = match self.editor_field {
-            ActionEditorField::Name => &mut self.edit_name,
-            ActionEditorField::World => &mut self.edit_world,
-            ActionEditorField::Pattern => &mut self.edit_pattern,
-            ActionEditorField::Command => &mut self.edit_command,
-            _ => return,
-        };
-        if cursor <= text.len() {
-            text.insert(cursor, c);
-            self.cursor_pos += c.len_utf8();
-        }
-    }
-
-    fn delete_char(&mut self) {
-        let cursor = self.cursor_pos;
-        if cursor == 0 {
-            return;
-        }
-        let text = match self.editor_field {
-            ActionEditorField::Name => &mut self.edit_name,
-            ActionEditorField::World => &mut self.edit_world,
-            ActionEditorField::Pattern => &mut self.edit_pattern,
-            ActionEditorField::Command => &mut self.edit_command,
-            _ => return,
-        };
-        // Find the character boundary before cursor
-        let mut new_pos = cursor - 1;
-        while new_pos > 0 && !text.is_char_boundary(new_pos) {
-            new_pos -= 1;
-        }
-        text.remove(new_pos);
-        self.cursor_pos = new_pos;
-    }
-
-    fn move_cursor_left(&mut self) {
-        if self.cursor_pos > 0 {
-            let text = self.current_field_text();
-            let mut new_pos = self.cursor_pos - 1;
-            while new_pos > 0 && !text.is_char_boundary(new_pos) {
-                new_pos -= 1;
-            }
-            self.cursor_pos = new_pos;
-        }
-    }
-
-    fn move_cursor_right(&mut self) {
-        let text = self.current_field_text();
-        if self.cursor_pos < text.len() {
-            let mut new_pos = self.cursor_pos + 1;
-            while new_pos < text.len() && !text.is_char_boundary(new_pos) {
-                new_pos += 1;
-            }
-            self.cursor_pos = new_pos;
-        }
-    }
-
-    fn move_cursor_home(&mut self) {
-        self.cursor_pos = 0;
-    }
-
-    fn move_cursor_end(&mut self) {
-        self.cursor_pos = self.current_field_text().len();
-    }
-
-    /// Adjust scroll offset to keep cursor visible within given visible width
-    fn adjust_scroll(&mut self, visible_width: usize) {
-        if visible_width == 0 {
-            return;
-        }
-        // Convert cursor byte position to character position
-        let text = self.current_field_text();
-        let cursor_char_pos = text[..self.cursor_pos.min(text.len())].chars().count();
-
-        // Keep cursor visible with some margin
-        let margin = 2.min(visible_width / 4);
-        if cursor_char_pos < self.edit_scroll_offset + margin {
-            // Cursor is before visible area, scroll left
-            self.edit_scroll_offset = cursor_char_pos.saturating_sub(margin);
-        } else if cursor_char_pos >= self.edit_scroll_offset + visible_width - margin {
-            // Cursor is after visible area, scroll right
-            self.edit_scroll_offset = cursor_char_pos.saturating_sub(visible_width - margin - 1);
-        }
-    }
-
-    // List view field navigation
-    fn next_list_field(&mut self) {
-        self.list_field = match self.list_field {
-            ActionListField::List => ActionListField::AddButton,
-            ActionListField::AddButton => ActionListField::EditButton,
-            ActionListField::EditButton => ActionListField::DeleteButton,
-            ActionListField::DeleteButton => ActionListField::CancelButton,
-            ActionListField::CancelButton => ActionListField::List,
-        };
-    }
-
-    fn prev_list_field(&mut self) {
-        self.list_field = match self.list_field {
-            ActionListField::List => ActionListField::CancelButton,
-            ActionListField::AddButton => ActionListField::List,
-            ActionListField::EditButton => ActionListField::AddButton,
-            ActionListField::DeleteButton => ActionListField::EditButton,
-            ActionListField::CancelButton => ActionListField::DeleteButton,
-        };
-    }
-
-    // Editor view field navigation
-    fn next_editor_field(&mut self) {
-        self.editor_field = match self.editor_field {
-            ActionEditorField::Name => ActionEditorField::World,
-            ActionEditorField::World => ActionEditorField::MatchType,
-            ActionEditorField::MatchType => ActionEditorField::Pattern,
-            ActionEditorField::Pattern => ActionEditorField::Enabled,
-            ActionEditorField::Enabled => ActionEditorField::Command,
-            ActionEditorField::Command => ActionEditorField::SaveButton,
-            ActionEditorField::SaveButton => ActionEditorField::CancelButton,
-            ActionEditorField::CancelButton => ActionEditorField::Name,
-        };
-        self.cursor_pos = self.current_field_text().len();
-        // Scroll to show end of text when cursor is at end
-        // Approximate visible width: popup is 60 chars, field area is ~44 chars, minus indicators = ~40
-        let text_len = self.current_field_text().chars().count();
-        let visible_width = 40;
-        self.edit_scroll_offset = text_len.saturating_sub(visible_width);
-    }
-
-    fn prev_editor_field(&mut self) {
-        self.editor_field = match self.editor_field {
-            ActionEditorField::Name => ActionEditorField::CancelButton,
-            ActionEditorField::World => ActionEditorField::Name,
-            ActionEditorField::MatchType => ActionEditorField::World,
-            ActionEditorField::Pattern => ActionEditorField::MatchType,
-            ActionEditorField::Enabled => ActionEditorField::Pattern,
-            ActionEditorField::Command => ActionEditorField::Enabled,
-            ActionEditorField::SaveButton => ActionEditorField::Command,
-            ActionEditorField::CancelButton => ActionEditorField::SaveButton,
-        };
-        self.cursor_pos = self.current_field_text().len();
-        // Scroll to show end of text when cursor is at end
-        let text_len = self.current_field_text().chars().count();
-        let visible_width = 40;
-        self.edit_scroll_offset = text_len.saturating_sub(visible_width);
-    }
-
-    fn select_prev_action(&mut self) {
-        let indices = self.filtered_indices();
-        if indices.is_empty() {
-            return;
-        }
-        // Find current position in filtered list
-        if let Some(pos) = indices.iter().position(|&i| i == self.selected_index) {
-            if pos > 0 {
-                self.selected_index = indices[pos - 1];
-            }
-        } else if !indices.is_empty() {
-            // Not in filtered list, select last item
-            self.selected_index = indices[indices.len() - 1];
-        }
-        // Only scroll when selection moves above visible viewport
-        if let Some(pos) = indices.iter().position(|&i| i == self.selected_index) {
-            if pos < self.scroll_offset {
-                // Selection is above viewport, scroll up by one line
-                self.scroll_offset = pos;
-            }
-        }
-    }
-
-    fn select_next_action(&mut self) {
-        let indices = self.filtered_indices();
-        if indices.is_empty() {
-            return;
-        }
-        // Find current position in filtered list
-        if let Some(pos) = indices.iter().position(|&i| i == self.selected_index) {
-            if pos + 1 < indices.len() {
-                self.selected_index = indices[pos + 1];
-            }
-        } else if !indices.is_empty() {
-            // Not in filtered list, select first item
-            self.selected_index = indices[0];
-        }
-        // Only scroll when selection moves below visible viewport
-        if let Some(pos) = indices.iter().position(|&i| i == self.selected_index) {
-            if pos >= self.scroll_offset + self.list_visible_height {
-                // Selection is below viewport, scroll down by one line
-                self.scroll_offset = pos - self.list_visible_height + 1;
-            }
-        }
-    }
-
-    /// Wrap command text into lines of given width
-    fn wrap_command_lines(&self, width: usize) -> Vec<String> {
-        if width == 0 {
-            return vec![self.edit_command.clone()];
-        }
-        let mut lines = Vec::new();
-        let mut current_line = String::new();
-        let mut char_count = 0;
-
-        for c in self.edit_command.chars() {
-            if c == '\n' {
-                lines.push(current_line);
-                current_line = String::new();
-                char_count = 0;
-            } else {
-                current_line.push(c);
-                char_count += 1;
-                if char_count >= width {
-                    lines.push(current_line);
-                    current_line = String::new();
-                    char_count = 0;
-                }
-            }
-        }
-        lines.push(current_line);
-        lines
-    }
-
-    /// Get row and column from cursor position in wrapped command text
-    fn get_command_cursor_row_col(&self, width: usize) -> (usize, usize) {
-        if width == 0 {
-            return (0, self.cursor_pos);
-        }
-        let mut row = 0;
-        let mut col = 0;
-        let mut byte_pos = 0;
-
-        for c in self.edit_command.chars() {
-            if byte_pos >= self.cursor_pos {
-                break;
-            }
-            if c == '\n' {
-                row += 1;
-                col = 0;
-            } else {
-                col += 1;
-                if col >= width {
-                    row += 1;
-                    col = 0;
-                }
-            }
-            byte_pos += c.len_utf8();
-        }
-        (row, col)
-    }
-
-    /// Adjust command scroll to keep cursor visible (5 visible rows)
-    fn adjust_command_scroll(&mut self, width: usize) {
-        let (row, _col) = self.get_command_cursor_row_col(width);
-        let visible_rows = 5;
-
-        if row < self.command_scroll_row {
-            self.command_scroll_row = row;
-        } else if row >= self.command_scroll_row + visible_rows {
-            self.command_scroll_row = row - visible_rows + 1;
-        }
-    }
-
-    /// Move cursor up one row in wrapped command text
-    fn move_command_cursor_up(&mut self, width: usize) {
-        if width == 0 {
-            return;
-        }
-        let (row, col) = self.get_command_cursor_row_col(width);
-        if row == 0 {
-            return; // Already at top
-        }
-
-        // Find position at same column in previous row
-        let lines = self.wrap_command_lines(width);
-        let target_row = row - 1;
-        let target_col = col.min(lines.get(target_row).map(|l| l.chars().count()).unwrap_or(0));
-
-        // Calculate byte position
-        let mut byte_pos = 0;
-        let mut current_row = 0;
-        let mut current_col = 0;
-
-        for c in self.edit_command.chars() {
-            if current_row == target_row && current_col == target_col {
-                break;
-            }
-            if c == '\n' {
-                current_row += 1;
-                current_col = 0;
-            } else {
-                current_col += 1;
-                if current_col >= width {
-                    current_row += 1;
-                    current_col = 0;
-                }
-            }
-            byte_pos += c.len_utf8();
-        }
-        self.cursor_pos = byte_pos;
-    }
-
-    /// Move cursor down one row in wrapped command text
-    fn move_command_cursor_down(&mut self, width: usize) {
-        if width == 0 {
-            return;
-        }
-        let (row, col) = self.get_command_cursor_row_col(width);
-        let lines = self.wrap_command_lines(width);
-        if row >= lines.len() - 1 {
-            return; // Already at bottom
-        }
-
-        // Find position at same column in next row
-        let target_row = row + 1;
-        let target_col = col.min(lines.get(target_row).map(|l| l.chars().count()).unwrap_or(0));
-
-        // Calculate byte position
-        let mut byte_pos = 0;
-        let mut current_row = 0;
-        let mut current_col = 0;
-
-        for c in self.edit_command.chars() {
-            if current_row == target_row && current_col == target_col {
-                break;
-            }
-            if c == '\n' {
-                current_row += 1;
-                current_col = 0;
-            } else {
-                current_col += 1;
-                if current_col >= width {
-                    current_row += 1;
-                    current_col = 0;
-                }
-            }
-            byte_pos += c.len_utf8();
-        }
-        self.cursor_pos = byte_pos.min(self.edit_command.len());
     }
 }
 
@@ -4731,11 +3923,9 @@ struct App {
     settings_popup: SettingsPopup,
     world_selector: WorldSelectorPopup,
     confirm_dialog: ConfirmDialog,
-    worlds_popup: WorldsPopup,
     filter_popup: FilterPopup,
     help_popup: HelpPopup,
     menu_popup: MenuPopup,
-    actions_popup: ActionsPopup,
     web_popup: WebPopup,
     /// New unified popup manager (gradual migration from old popup types)
     popup_manager: popup::PopupManager,
@@ -4801,11 +3991,9 @@ impl App {
             settings_popup: SettingsPopup::new(),
             world_selector: WorldSelectorPopup::new(),
             confirm_dialog: ConfirmDialog::new(),
-            worlds_popup: WorldsPopup::new(),
             filter_popup: FilterPopup::new(),
             help_popup: HelpPopup::new(),
             menu_popup: MenuPopup::new(),
-            actions_popup: ActionsPopup::new(),
             web_popup: WebPopup::new(),
             popup_manager: popup::PopupManager::new(),
             last_ctrl_c: None,
@@ -5018,6 +4206,166 @@ impl App {
         if let Some(state) = self.popup_manager.current_mut() {
             state.select_field(WEB_FIELD_PROTOCOL);
         }
+    }
+
+    /// Open the connections popup showing connected worlds status
+    fn open_connections_popup_new(&mut self) {
+        use popup::definitions::connections::{
+            create_connections_popup, format_elapsed, format_next_nop, ConnectionInfo,
+        };
+
+        let now = std::time::Instant::now();
+        let connections: Vec<ConnectionInfo> = self.worlds.iter().enumerate().map(|(i, w)| {
+            let last_send_secs = w.last_user_command_time.map(|t| now.duration_since(t).as_secs());
+            let last_recv_secs = w.last_receive_time.map(|t| now.duration_since(t).as_secs());
+            let last_nop_secs = w.last_nop_time.map(|t| now.duration_since(t).as_secs());
+
+            ConnectionInfo {
+                name: w.name.clone(),
+                is_current: i == self.current_world_index,
+                is_connected: w.connected,
+                is_ssl: w.is_tls,
+                is_proxy: w.proxy_pid.is_some(),
+                unseen_lines: w.unseen_lines,
+                last_send: format_elapsed(last_send_secs),
+                last_recv: format_elapsed(last_recv_secs),
+                ka_next: format!("{}/{}", format_elapsed(last_nop_secs), format_next_nop(last_send_secs, last_recv_secs)),
+            }
+        }).collect();
+
+        let connected_count = connections.iter().filter(|c| c.is_connected).count();
+        let visible_height = 10.min(connected_count.max(1));
+        let def = create_connections_popup(&connections, visible_height);
+        self.popup_manager.open(def);
+    }
+
+    /// Open the actions list popup
+    fn open_actions_list_popup(&mut self) {
+        self.open_actions_list_popup_with_filter("");
+    }
+
+    /// Open the actions list popup with optional world filter
+    fn open_actions_list_popup_with_filter(&mut self, world_filter: &str) {
+        use popup::definitions::actions::ACTIONS_FIELD_LIST;
+
+        // Build items with indices for the popup
+        let items: Vec<popup::ListItem> = self.settings.actions.iter().enumerate()
+            .filter(|(_, a)| {
+                if world_filter.is_empty() {
+                    true
+                } else {
+                    a.world.to_lowercase().contains(&world_filter.to_lowercase())
+                }
+            })
+            .map(|(idx, a)| {
+                let status = if a.enabled { "[✓]" } else { "[ ]" };
+                let world_part = if a.world.is_empty() {
+                    String::new()
+                } else {
+                    format!("({})", a.world)
+                };
+                let pattern_preview = if a.pattern.len() > 30 {
+                    format!("{}...", &a.pattern[..27])
+                } else {
+                    a.pattern.clone()
+                };
+                popup::ListItem {
+                    id: idx.to_string(),  // Store original index as ID
+                    columns: vec![
+                        format!("{} {}", status, a.name),
+                        world_part,
+                        pattern_preview,
+                    ],
+                    style: popup::ListItemStyle {
+                        is_disabled: !a.enabled,
+                        ..Default::default()
+                    },
+                }
+            })
+            .collect();
+
+        let visible_height = 10.min(items.len().max(3));
+
+        // Create the popup with the filtered actions
+        let def = popup::PopupDefinition::new(popup::PopupId("actions_list"), "Actions")
+            .with_field(popup::Field::new(
+                popup::definitions::actions::ACTIONS_FIELD_FILTER,
+                "Filter",
+                popup::FieldKind::text_with_placeholder("", "Type to filter..."),
+            ))
+            .with_field(popup::Field::new(
+                ACTIONS_FIELD_LIST,
+                "",
+                popup::FieldKind::list(items, visible_height),
+            ))
+            .with_button(popup::Button::new(popup::definitions::actions::ACTIONS_BTN_ADD, "Add").with_shortcut('A'))
+            .with_button(popup::Button::new(popup::definitions::actions::ACTIONS_BTN_EDIT, "Edit").with_shortcut('E'))
+            .with_button(popup::Button::new(popup::definitions::actions::ACTIONS_BTN_DELETE, "Delete").danger().with_shortcut('D'))
+            .with_button(popup::Button::new(popup::definitions::actions::ACTIONS_BTN_CANCEL, "Cancel").with_shortcut('C'))
+            .with_layout(popup::PopupLayout {
+                label_width: 8,
+                min_width: 70,
+                max_width_percent: 85,
+                center_horizontal: true,
+                center_vertical: true,
+                modal: true,
+                buttons_right_align: false,
+                blank_line_before_list: false,
+            });
+
+        self.popup_manager.open(def);
+
+        // Select the list field
+        if let Some(state) = self.popup_manager.current_mut() {
+            state.select_field(ACTIONS_FIELD_LIST);
+        }
+    }
+
+    /// Open the action editor popup
+    fn open_action_editor_popup(&mut self, editing_index: Option<usize>) {
+        use popup::definitions::actions::{
+            create_action_editor_popup, ActionSettings,
+            EDITOR_FIELD_NAME,
+        };
+
+        let settings = if let Some(idx) = editing_index {
+            if idx < self.settings.actions.len() {
+                let action = &self.settings.actions[idx];
+                ActionSettings {
+                    name: action.name.clone(),
+                    world: action.world.clone(),
+                    match_type: action.match_type.as_str().to_string(),
+                    pattern: action.pattern.clone(),
+                    command: action.command.clone(),
+                    enabled: action.enabled,
+                }
+            } else {
+                ActionSettings::default()
+            }
+        } else {
+            ActionSettings::default()
+        };
+
+        let is_new = editing_index.is_none();
+        let def = create_action_editor_popup(&settings, is_new);
+
+        self.popup_manager.open(def);
+
+        // Store editing index in custom state
+        if let Some(state) = self.popup_manager.current_mut() {
+            if let Some(idx) = editing_index {
+                state.set_custom("editing_index", idx.to_string());
+            }
+            state.select_field(EDITOR_FIELD_NAME);
+        }
+    }
+
+    /// Open delete action confirmation dialog
+    fn open_delete_action_confirm(&mut self, name: &str, index: usize) {
+        use popup::definitions::confirm::create_delete_action_dialog;
+        let mut def = create_delete_action_dialog(name);
+        def.custom_data.insert("action_index".to_string(), index.to_string());
+        self.popup_manager.push(def);
     }
 
     /// Send a command to the MUD (routes through WebSocket if remote client)
@@ -8650,6 +7998,8 @@ mod remote_gui {
         pub last_nop_secs: Option<u64>,
         // Partial line handling (for lines split across multiple WebSocket messages)
         pub partial_line: String,
+        // Whether to show centered splash screen
+        pub showing_splash: bool,
     }
 
     /// Which popup is currently open
@@ -9570,6 +8920,7 @@ mod remote_gui {
                                 last_recv_secs: w.last_recv_secs,
                                 last_nop_secs: w.last_nop_secs,
                                 partial_line: String::new(),
+                                showing_splash: w.showing_splash,
                             }}).collect();
                             // On first InitialState, use server's world index
                             // On resync, preserve current world (bounded by new world count)
@@ -9616,6 +8967,12 @@ mod remote_gui {
                         WsMessage::ServerData { world_index, data, is_viewed: _, ts } => {
                             if world_index < self.worlds.len() {
                                 let world = &mut self.worlds[world_index];
+
+                                // Clear splash screen when real server data arrives
+                                if world.showing_splash {
+                                    world.showing_splash = false;
+                                    world.output_lines.clear();
+                                }
 
                                 // Combine with any partial line from previous message
                                 let combined = if world.partial_line.is_empty() {
@@ -12664,6 +12021,32 @@ mod remote_gui {
                         .stroke(egui::Stroke::NONE))
                     .show(ctx, |ui| {
                     if let Some(world) = self.worlds.get(self.current_world) {
+                        // Check if showing splash screen - render centered image instead of output
+                        if world.showing_splash {
+                            // Center the splash content vertically and horizontally
+                            ui.vertical_centered(|ui| {
+                                let available_height = ui.available_height();
+                                // Calculate vertical centering (image ~200px + text ~60px)
+                                let content_height = 280.0;
+                                let top_padding = (available_height - content_height).max(0.0) / 2.0;
+                                ui.add_space(top_padding);
+
+                                // Clay logo image
+                                let splash_image = egui::Image::from_bytes(
+                                    "bytes://clay_splash",
+                                    include_bytes!("../clay2.png"),
+                                ).fit_to_exact_size(egui::vec2(200.0, 200.0));
+                                ui.add(splash_image);
+
+                                let tagline_color = egui::Color32::from_rgb(0xff, 0x87, 0xff);  // 213
+                                ui.add_space(5.0);
+                                ui.label(egui::RichText::new("A 90dies mud client written today").color(tagline_color).italics());
+                                ui.add_space(5.0);
+                                ui.label(egui::RichText::new("/help for how to use clay").color(theme.fg_muted()));
+                            });
+                            return;  // Skip regular output rendering
+                        }
+
                         // Cache "now" for timestamp formatting - compute once per frame
                         let cached_now = GuiCachedNow::new();
 
@@ -16620,11 +16003,20 @@ mod remote_gui {
 
     /// Run the remote GUI client
     pub fn run(addr: &str, runtime: tokio::runtime::Handle) -> io::Result<()> {
+        // Check for display server availability
+        let has_display = std::env::var("DISPLAY").map(|v| !v.is_empty()).unwrap_or(false)
+            || std::env::var("WAYLAND_DISPLAY").map(|v| !v.is_empty()).unwrap_or(false);
+        if !has_display {
+            return Err(io::Error::other(
+                "No display server found. Set DISPLAY (X11) or WAYLAND_DISPLAY environment variable."
+            ));
+        }
+
         let options = eframe::NativeOptions {
             viewport: egui::ViewportBuilder::default()
                 .with_inner_size([800.0, 600.0])
-                .with_title("Clay Mud Client")
-                .with_transparent(true),
+                .with_title("Clay Mud Client"),
+            hardware_acceleration: eframe::HardwareAcceleration::Preferred,
             ..Default::default()
         };
 
@@ -16925,6 +16317,18 @@ fn handle_remote_client_key(
             NewPopupAction::WebSaved(_settings) => {
                 // Web settings saved - remote client doesn't handle locally
             }
+            NewPopupAction::ConnectionsClose => {
+                // Connections popup closed - no action needed
+            }
+            NewPopupAction::ActionsList(_action) => {
+                // Actions list action - remote client doesn't handle locally
+            }
+            NewPopupAction::ActionsListFilter => {
+                // Filter changed - remote client doesn't handle locally
+            }
+            NewPopupAction::ActionEditorSave { .. } => {
+                // Action editor save - remote client doesn't handle locally
+            }
             NewPopupAction::None => {}
         }
         return false;
@@ -16954,21 +16358,6 @@ fn handle_remote_client_key(
         handle_remote_filter_popup_key(app, key);
         return false;
     }
-    if app.actions_popup.visible {
-        // Actions popup - Escape closes it
-        if key.code == Esc {
-            app.actions_popup.visible = false;
-        }
-        return false;
-    }
-    if app.worlds_popup.visible {
-        // Worlds popup - Escape closes it
-        if key.code == Esc {
-            app.worlds_popup.visible = false;
-        }
-        return false;
-    }
-
     match (key.modifiers, key.code) {
         (KeyModifiers::CONTROL, Char('u')) => {
             app.input.clear();
@@ -17089,9 +16478,8 @@ fn handle_remote_client_key(
                         app.open_world_selector_new();
                     }
                     Command::WorldsList => {
-                        // WorldsPopup uses show(), not open()
-                        // Just mark visible for now - full implementation would need screen width
-                        app.worlds_popup.visible = true;
+                        // Use the new unified popup system
+                        app.open_connections_popup_new();
                     }
                     Command::WorldSwitch { ref name } | Command::WorldConnectNoLogin { ref name } => {
                         // /worlds <name> - switch to world if it exists
@@ -17127,8 +16515,12 @@ fn handle_remote_client_key(
                             );
                         }
                     }
-                    Command::Actions { .. } => {
-                        app.actions_popup.open(&app.settings.actions);
+                    Command::Actions { world } => {
+                        if let Some(world_name) = world {
+                            app.open_actions_list_popup_with_filter(&world_name);
+                        } else {
+                            app.open_actions_list_popup();
+                        }
                     }
                     Command::Connect { .. } => {
                         let _ = ws_tx.send(WsMessage::ConnectWorld {
@@ -17331,6 +16723,14 @@ enum NewPopupAction {
     SetupSaved(SetupSettings),
     /// Web settings saved
     WebSaved(WebSettings),
+    /// Connections popup closed (just close, no action needed)
+    ConnectionsClose,
+    /// Actions list action (Add, Edit, Delete)
+    ActionsList(ActionsListAction),
+    /// Actions list filter changed
+    ActionsListFilter,
+    /// Action editor saved
+    ActionEditorSave { action: Action, editing_index: Option<usize> },
 }
 
 /// Settings from the setup popup
@@ -17367,6 +16767,13 @@ enum WorldSelectorAction {
     Add,                  // Add new world
 }
 
+/// Actions from the actions list popup
+enum ActionsListAction {
+    Add,                  // Add new action
+    Edit(usize),          // Edit action at index
+    Delete(usize),        // Delete action at index
+}
+
 /// Handle input for new unified popup system
 fn handle_new_popup_key(app: &mut App, key: KeyEvent) -> NewPopupAction {
     use crossterm::event::KeyCode::*;
@@ -17390,6 +16797,13 @@ fn handle_new_popup_key(app: &mut App, key: KeyEvent) -> NewPopupAction {
         WEB_FIELD_WS_ALLOW_LIST, WEB_FIELD_WS_CERT_FILE, WEB_FIELD_WS_KEY_FILE,
         WEB_BTN_SAVE, WEB_BTN_CANCEL, update_tls_visibility,
     };
+    use popup::definitions::actions::{
+        ACTIONS_FIELD_FILTER, ACTIONS_FIELD_LIST,
+        ACTIONS_BTN_ADD, ACTIONS_BTN_EDIT, ACTIONS_BTN_DELETE, ACTIONS_BTN_CANCEL,
+        EDITOR_FIELD_NAME, EDITOR_FIELD_WORLD, EDITOR_FIELD_MATCH_TYPE,
+        EDITOR_FIELD_PATTERN, EDITOR_FIELD_COMMAND, EDITOR_FIELD_ENABLED,
+        EDITOR_BTN_SAVE, EDITOR_BTN_CANCEL,
+    };
 
     let popup_id = app.popup_manager.current().map(|s| s.definition.id.clone());
     let is_menu = popup_id == Some(popup::PopupId("menu"));
@@ -17397,6 +16811,9 @@ fn handle_new_popup_key(app: &mut App, key: KeyEvent) -> NewPopupAction {
     let is_world_selector = popup_id == Some(popup::PopupId("world_selector"));
     let is_setup = popup_id == Some(popup::PopupId("setup"));
     let is_web = popup_id == Some(popup::PopupId("web"));
+    let is_connections = popup_id == Some(popup::PopupId("connections"));
+    let is_actions_list = popup_id == Some(popup::PopupId("actions_list"));
+    let is_action_editor = popup_id == Some(popup::PopupId("action_editor"));
 
     if let Some(state) = app.popup_manager.current_mut() {
         // World selector has special handling
@@ -17847,6 +17264,323 @@ fn handle_new_popup_key(app: &mut App, key: KeyEvent) -> NewPopupAction {
                         state.insert_char(c);
                     } else if is_text_field {
                         // Start editing and insert character
+                        state.start_edit();
+                        state.insert_char(c);
+                    }
+                }
+                _ => {}
+            }
+            return NewPopupAction::None;
+        }
+
+        // Connections popup handling (simple - just close on any key)
+        if is_connections {
+            match key.code {
+                Esc | Enter | Char(' ') => {
+                    app.popup_manager.close();
+                    return NewPopupAction::ConnectionsClose;
+                }
+                Char('o') | Char('O') => {
+                    // OK shortcut
+                    app.popup_manager.close();
+                    return NewPopupAction::ConnectionsClose;
+                }
+                _ => {}
+            }
+            return NewPopupAction::None;
+        }
+
+        // Actions list popup handling
+        if is_actions_list {
+            // Get selected action index before any state mutations
+            let get_selected_index = || {
+                if let Some(field) = state.field(ACTIONS_FIELD_LIST) {
+                    if let popup::FieldKind::List { items, selected_index, .. } = &field.kind {
+                        if !items.is_empty() && *selected_index < items.len() {
+                            // Parse the action index from the item id (which is just the index as string)
+                            return items.get(*selected_index).and_then(|item| item.id.parse::<usize>().ok());
+                        }
+                    }
+                }
+                None
+            };
+
+            // Check if we're editing the filter field
+            let is_editing_filter = state.editing && state.is_field_selected(ACTIONS_FIELD_FILTER);
+
+            // When editing filter, handle text input
+            if is_editing_filter {
+                match key.code {
+                    Esc => {
+                        state.commit_edit();
+                        return NewPopupAction::ActionsListFilter;
+                    }
+                    Tab => {
+                        state.commit_edit();
+                        state.cycle_field_buttons();
+                        return NewPopupAction::ActionsListFilter;
+                    }
+                    Enter => {
+                        state.commit_edit();
+                        return NewPopupAction::ActionsListFilter;
+                    }
+                    Backspace => {
+                        state.backspace();
+                        return NewPopupAction::ActionsListFilter;
+                    }
+                    Delete => {
+                        state.delete_char();
+                        return NewPopupAction::ActionsListFilter;
+                    }
+                    Left => {
+                        state.cursor_left();
+                    }
+                    Right => {
+                        state.cursor_right();
+                    }
+                    Home => {
+                        state.cursor_home();
+                    }
+                    End => {
+                        state.cursor_end();
+                    }
+                    Char(c) => {
+                        state.insert_char(c);
+                        return NewPopupAction::ActionsListFilter;
+                    }
+                    _ => {}
+                }
+                return NewPopupAction::None;
+            }
+
+            // Not editing - handle normal navigation and shortcuts
+            match key.code {
+                Esc => {
+                    app.popup_manager.close();
+                }
+                Enter => {
+                    if state.is_on_button() {
+                        if state.is_button_focused(ACTIONS_BTN_ADD) {
+                            app.popup_manager.close();
+                            return NewPopupAction::ActionsList(ActionsListAction::Add);
+                        } else if state.is_button_focused(ACTIONS_BTN_EDIT) {
+                            if let Some(idx) = get_selected_index() {
+                                app.popup_manager.close();
+                                return NewPopupAction::ActionsList(ActionsListAction::Edit(idx));
+                            }
+                        } else if state.is_button_focused(ACTIONS_BTN_DELETE) {
+                            if let Some(idx) = get_selected_index() {
+                                app.popup_manager.close();
+                                return NewPopupAction::ActionsList(ActionsListAction::Delete(idx));
+                            }
+                        } else if state.is_button_focused(ACTIONS_BTN_CANCEL) {
+                            app.popup_manager.close();
+                        }
+                    } else if state.is_field_selected(ACTIONS_FIELD_FILTER) {
+                        // Start editing filter field
+                        state.start_edit();
+                    } else {
+                        // On list - edit selected action
+                        if let Some(idx) = get_selected_index() {
+                            app.popup_manager.close();
+                            return NewPopupAction::ActionsList(ActionsListAction::Edit(idx));
+                        }
+                    }
+                }
+                Up => {
+                    state.list_select_up();
+                }
+                Down => {
+                    state.list_select_down();
+                }
+                Tab => {
+                    state.cycle_field_buttons();
+                }
+                BackTab => {
+                    state.cycle_field_buttons();
+                }
+                Char(c) => {
+                    // Check if filter field is selected - start editing
+                    if state.is_field_selected(ACTIONS_FIELD_FILTER) {
+                        state.start_edit();
+                        state.insert_char(c);
+                        return NewPopupAction::ActionsListFilter;
+                    }
+                    // Otherwise handle shortcuts
+                    match c {
+                        'f' | 'F' | '/' => {
+                            state.select_field(ACTIONS_FIELD_FILTER);
+                            state.start_edit();
+                        }
+                        'a' | 'A' => {
+                            app.popup_manager.close();
+                            return NewPopupAction::ActionsList(ActionsListAction::Add);
+                        }
+                        'e' | 'E' => {
+                            if let Some(idx) = get_selected_index() {
+                                app.popup_manager.close();
+                                return NewPopupAction::ActionsList(ActionsListAction::Edit(idx));
+                            }
+                        }
+                        'd' | 'D' => {
+                            if let Some(idx) = get_selected_index() {
+                                app.popup_manager.close();
+                                return NewPopupAction::ActionsList(ActionsListAction::Delete(idx));
+                            }
+                        }
+                        'c' | 'C' => {
+                            app.popup_manager.close();
+                        }
+                        _ => {}
+                    }
+                }
+                _ => {}
+            }
+            return NewPopupAction::None;
+        }
+
+        // Action editor popup handling
+        if is_action_editor {
+            let is_text_field = state.selected_field()
+                .map(|f| f.kind.is_text_editable())
+                .unwrap_or(false);
+            let is_toggle = state.selected_field()
+                .map(|f| matches!(&f.kind, popup::FieldKind::Toggle { .. }))
+                .unwrap_or(false);
+            let is_select = state.selected_field()
+                .map(|f| matches!(&f.kind, popup::FieldKind::Select { .. }))
+                .unwrap_or(false);
+
+            match key.code {
+                Esc => {
+                    if state.editing {
+                        state.cancel_edit();
+                    } else {
+                        app.popup_manager.close();
+                    }
+                }
+                Enter => {
+                    if state.editing {
+                        state.commit_edit();
+                        state.next_field();
+                    } else if state.is_on_button() {
+                        if state.is_button_focused(EDITOR_BTN_SAVE) {
+                            // Extract action data and save
+                            let name = state.get_text(EDITOR_FIELD_NAME).unwrap_or("").to_string();
+                            let world = state.get_text(EDITOR_FIELD_WORLD).unwrap_or("").to_string();
+                            let match_type_str = state.get_selected(EDITOR_FIELD_MATCH_TYPE).unwrap_or("regexp");
+                            let pattern = state.get_text(EDITOR_FIELD_PATTERN).unwrap_or("").to_string();
+                            let command = state.get_text(EDITOR_FIELD_COMMAND).unwrap_or("").to_string();
+                            let enabled = state.get_bool(EDITOR_FIELD_ENABLED).unwrap_or(true);
+                            let editing_index = state.get_custom("editing_index").and_then(|s| s.parse::<usize>().ok());
+
+                            let match_type = if match_type_str == "wildcard" {
+                                MatchType::Wildcard
+                            } else {
+                                MatchType::Regexp
+                            };
+
+                            let action = Action {
+                                name,
+                                world,
+                                match_type,
+                                pattern,
+                                command,
+                                owner: None,
+                                enabled,
+                            };
+
+                            app.popup_manager.close();
+                            return NewPopupAction::ActionEditorSave { action, editing_index };
+                        } else if state.is_button_focused(EDITOR_BTN_CANCEL) {
+                            app.popup_manager.close();
+                        }
+                    } else if is_toggle {
+                        state.toggle_current();
+                    } else if is_select {
+                        state.toggle_current();
+                    } else if is_text_field {
+                        state.start_edit();
+                    }
+                }
+                Tab => {
+                    if state.editing {
+                        state.commit_edit();
+                    }
+                    state.cycle_field_buttons();
+                }
+                BackTab => {
+                    if state.editing {
+                        state.commit_edit();
+                    }
+                    // Go to previous element
+                    if !state.prev_field() {
+                        state.select_last_field();
+                    }
+                }
+                Up => {
+                    if state.editing {
+                        state.commit_edit();
+                    }
+                    state.prev_field();
+                }
+                Down => {
+                    if state.editing {
+                        state.commit_edit();
+                    }
+                    if !state.next_field() {
+                        state.select_first_button();
+                    }
+                }
+                Left => {
+                    if state.editing {
+                        state.cursor_left();
+                    } else if is_select || is_toggle {
+                        state.decrease_current();
+                    } else if state.is_on_button() {
+                        state.prev_button();
+                    }
+                }
+                Right => {
+                    if state.editing {
+                        state.cursor_right();
+                    } else if is_select || is_toggle {
+                        state.increase_current();
+                    } else if state.is_on_button() {
+                        state.next_button();
+                    }
+                }
+                Backspace => {
+                    if state.editing {
+                        state.backspace();
+                    }
+                }
+                Delete => {
+                    if state.editing {
+                        state.delete_char();
+                    }
+                }
+                Home => {
+                    if state.editing {
+                        state.cursor_home();
+                    }
+                }
+                End => {
+                    if state.editing {
+                        state.cursor_end();
+                    }
+                }
+                Char('s') | Char('S') if !state.editing => {
+                    // Save shortcut
+                    state.select_button(EDITOR_BTN_SAVE);
+                }
+                Char('c') | Char('C') if !state.editing => {
+                    app.popup_manager.close();
+                }
+                Char(c) => {
+                    if state.editing {
+                        state.insert_char(c);
+                    } else if is_text_field {
                         state.start_edit();
                         state.insert_char(c);
                     }
@@ -22277,11 +22011,9 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
         let any_popup_visible = app.settings_popup.visible
             || app.world_selector.visible
             || app.confirm_dialog.visible
-            || app.worlds_popup.visible
             || app.filter_popup.visible
             || app.help_popup.visible
             || app.menu_popup.visible
-            || app.actions_popup.visible
             || app.web_popup.visible
             || app.has_new_popup();
 
@@ -23561,17 +23293,6 @@ fn handle_key_event(key: KeyEvent, app: &mut App) -> KeyAction {
         return KeyAction::None;
     }
 
-    // Handle worlds popup input (simple OK dialog)
-    if app.worlds_popup.visible {
-        match key.code {
-            KeyCode::Esc | KeyCode::Enter | KeyCode::Char(' ') => {
-                app.worlds_popup.close();
-            }
-            _ => {}
-        }
-        return KeyAction::None;
-    }
-
     // Handle new unified popup system (help popup and others)
     if app.has_new_popup() {
         match handle_new_popup_key(app, key) {
@@ -23592,6 +23313,17 @@ fn handle_key_event(key: KeyEvent, app: &mut App) -> KeyAction {
                                 app.current_world_index = app.worlds.len().saturating_sub(1);
                             }
                             app.add_output(&format!("World '{}' deleted.", world_name));
+                        }
+                    }
+                } else if let Some(action_index_str) = data.get("action_index") {
+                    if let Ok(action_index) = action_index_str.parse::<usize>() {
+                        // Delete the action
+                        if action_index < app.settings.actions.len() {
+                            let action_name = app.settings.actions[action_index].name.clone();
+                            app.settings.actions.remove(action_index);
+                            app.add_output(&format!("Action '{}' deleted.", action_name));
+                            // Reopen actions list to show updated list
+                            app.open_actions_list_popup();
                         }
                     }
                 }
@@ -23700,6 +23432,127 @@ fn handle_key_event(key: KeyEvent, app: &mut App) -> KeyAction {
                 app.settings.websocket_key_file = settings.ws_key_file;
                 // Settings will be saved when app state is persisted
             }
+            NewPopupAction::ConnectionsClose => {
+                // Nothing to do, popup is already closed
+            }
+            NewPopupAction::ActionsList(action) => {
+                match action {
+                    ActionsListAction::Add => {
+                        // Open action editor for new action
+                        app.open_action_editor_popup(None);
+                    }
+                    ActionsListAction::Edit(idx) => {
+                        // Open action editor for existing action
+                        if idx < app.settings.actions.len() {
+                            app.open_action_editor_popup(Some(idx));
+                        }
+                    }
+                    ActionsListAction::Delete(idx) => {
+                        // Open confirmation dialog for delete
+                        if idx < app.settings.actions.len() {
+                            let name = app.settings.actions[idx].name.clone();
+                            app.open_delete_action_confirm(&name, idx);
+                        }
+                    }
+                }
+            }
+            NewPopupAction::ActionsListFilter => {
+                // Filter changed - update the actions list
+                use popup::definitions::actions::{ActionInfo, filter_actions, ACTIONS_FIELD_FILTER};
+                if let Some(state) = app.popup_manager.current_mut() {
+                    // Use edit_buffer if currently editing, otherwise use field value
+                    let filter_text = if state.editing && state.is_field_selected(ACTIONS_FIELD_FILTER) {
+                        state.edit_buffer.clone()
+                    } else {
+                        state.get_text(ACTIONS_FIELD_FILTER).unwrap_or("").to_string()
+                    };
+                    // Build action info list
+                    let all_actions: Vec<ActionInfo> = app.settings.actions
+                        .iter()
+                        .map(|a| ActionInfo {
+                            name: a.name.clone(),
+                            world: a.world.clone(),
+                            pattern: a.pattern.clone(),
+                            enabled: a.enabled,
+                        })
+                        .collect();
+                    // Apply filter
+                    let filtered = filter_actions(&all_actions, &filter_text);
+                    // Update the list in the popup state
+                    if let Some(field) = state.field_mut(popup::definitions::actions::ACTIONS_FIELD_LIST) {
+                        if let popup::FieldKind::List { items, selected_index, scroll_offset, .. } = &mut field.kind {
+                            let old_len = items.len();
+                            // Rebuild items with indices
+                            *items = filtered.iter().enumerate().filter_map(|(_, info)| {
+                                // Find original index
+                                app.settings.actions.iter().position(|a| a.name == info.name).map(|orig_idx| {
+                                    let status = if info.enabled { "[✓]" } else { "[ ]" };
+                                    let world_part = if info.world.is_empty() {
+                                        String::new()
+                                    } else {
+                                        format!("({})", info.world)
+                                    };
+                                    let pattern_preview = if info.pattern.len() > 30 {
+                                        format!("{}...", &info.pattern[..27])
+                                    } else {
+                                        info.pattern.clone()
+                                    };
+                                    popup::ListItem {
+                                        id: orig_idx.to_string(),  // Store original index as ID
+                                        columns: vec![
+                                            format!("{} {}", status, info.name),
+                                            world_part,
+                                            pattern_preview,
+                                        ],
+                                        style: popup::ListItemStyle {
+                                            is_disabled: !info.enabled,
+                                            ..Default::default()
+                                        },
+                                    }
+                                })
+                            }).collect();
+                            // Reset selection if list changed significantly
+                            if items.is_empty() {
+                                *selected_index = 0;
+                                *scroll_offset = 0;
+                            } else if *selected_index >= items.len() {
+                                *selected_index = items.len().saturating_sub(1);
+                            }
+                            if old_len != items.len() {
+                                *scroll_offset = 0;
+                            }
+                        }
+                    }
+                }
+            }
+            NewPopupAction::ActionEditorSave { action, editing_index } => {
+                // Validate action
+                if action.name.trim().is_empty() {
+                    app.add_output("Action name cannot be empty.");
+                } else {
+                    // Check for duplicate names (case-insensitive)
+                    let name_lower = action.name.to_lowercase();
+                    let is_duplicate = app.settings.actions.iter().enumerate().any(|(i, a)| {
+                        a.name.to_lowercase() == name_lower && Some(i) != editing_index
+                    });
+                    if is_duplicate {
+                        app.add_output(&format!("An action named '{}' already exists.", action.name));
+                    } else {
+                        // Save the action
+                        if let Some(idx) = editing_index {
+                            if idx < app.settings.actions.len() {
+                                app.settings.actions[idx] = action.clone();
+                                app.add_output(&format!("Action '{}' updated.", action.name));
+                            }
+                        } else {
+                            app.settings.actions.push(action.clone());
+                            app.add_output(&format!("Action '{}' created.", action.name));
+                        }
+                        // Reopen actions list to show updated list
+                        app.open_actions_list_popup();
+                    }
+                }
+            }
             NewPopupAction::None => {}
         }
         return KeyAction::None;
@@ -23763,460 +23616,6 @@ fn handle_key_event(key: KeyEvent, app: &mut App) -> KeyAction {
                 return KeyAction::SendCommand(item.command().to_string());
             }
             _ => {}
-        }
-        return KeyAction::None;
-    }
-
-    // Handle actions popup input (split into List, Editor, and ConfirmDelete views)
-    if app.actions_popup.visible {
-        match app.actions_popup.view {
-            ActionsView::ConfirmDelete => {
-                // Confirm delete dialog
-                match key.code {
-                    KeyCode::Esc => {
-                        app.actions_popup.close_confirm_delete();
-                    }
-                    KeyCode::Left | KeyCode::Right | KeyCode::Tab => {
-                        app.actions_popup.confirm_selected = !app.actions_popup.confirm_selected;
-                    }
-                    KeyCode::Char('y') | KeyCode::Char('Y') => {
-                        // Delete and return to list
-                        app.actions_popup.delete_selected_action();
-                        app.settings.actions = app.actions_popup.actions.clone();
-                        let _ = save_settings(app);
-                        app.ws_broadcast(WsMessage::ActionsUpdated {
-                            actions: app.settings.actions.clone(),
-                        });
-                        app.actions_popup.close_confirm_delete();
-                    }
-                    KeyCode::Char('n') | KeyCode::Char('N') => {
-                        app.actions_popup.close_confirm_delete();
-                    }
-                    KeyCode::Enter => {
-                        if app.actions_popup.confirm_selected {
-                            // Yes - delete
-                            app.actions_popup.delete_selected_action();
-                            app.settings.actions = app.actions_popup.actions.clone();
-                            let _ = save_settings(app);
-                            app.ws_broadcast(WsMessage::ActionsUpdated {
-                                actions: app.settings.actions.clone(),
-                            });
-                        }
-                        app.actions_popup.close_confirm_delete();
-                    }
-                    _ => {}
-                }
-            }
-            ActionsView::Editor => {
-                // Editor view
-                match key.code {
-                    KeyCode::Esc => {
-                        app.actions_popup.close_editor();
-                    }
-                    KeyCode::Tab => {
-                        if key.modifiers.contains(KeyModifiers::SHIFT) {
-                            app.actions_popup.prev_editor_field();
-                        } else {
-                            app.actions_popup.next_editor_field();
-                        }
-                    }
-                    KeyCode::Up => {
-                        if app.actions_popup.editor_field == ActionEditorField::Command {
-                            // In command field: move cursor up if not on first row
-                            let (row, _) = app.actions_popup.get_command_cursor_row_col(44);
-                            if row > 0 {
-                                app.actions_popup.move_command_cursor_up(44);
-                                app.actions_popup.adjust_command_scroll(44);
-                            } else {
-                                app.actions_popup.prev_editor_field();
-                            }
-                        } else {
-                            app.actions_popup.prev_editor_field();
-                        }
-                    }
-                    KeyCode::Down => {
-                        if app.actions_popup.editor_field == ActionEditorField::Command {
-                            // In command field: move cursor down if not on last row
-                            let lines = app.actions_popup.wrap_command_lines(44);
-                            let (row, _) = app.actions_popup.get_command_cursor_row_col(44);
-                            if row < lines.len().saturating_sub(1) {
-                                app.actions_popup.move_command_cursor_down(44);
-                                app.actions_popup.adjust_command_scroll(44);
-                            } else {
-                                app.actions_popup.next_editor_field();
-                            }
-                        } else {
-                            app.actions_popup.next_editor_field();
-                        }
-                    }
-                    KeyCode::Left => {
-                        match app.actions_popup.editor_field {
-                            ActionEditorField::Name | ActionEditorField::World |
-                            ActionEditorField::Pattern => {
-                                app.actions_popup.move_cursor_left();
-                                app.actions_popup.adjust_scroll(40); // visible_width = field_width - 4 (for scroll indicators and brackets)
-                            }
-                            ActionEditorField::Command => {
-                                app.actions_popup.move_cursor_left();
-                                app.actions_popup.adjust_command_scroll(44);
-                            }
-                            ActionEditorField::MatchType => {
-                                // Left/Right toggle match type
-                                app.actions_popup.edit_match_type = app.actions_popup.edit_match_type.next();
-                            }
-                            ActionEditorField::Enabled => {
-                                // Left/Right toggle enabled
-                                app.actions_popup.edit_enabled = !app.actions_popup.edit_enabled;
-                            }
-                            ActionEditorField::CancelButton => {
-                                app.actions_popup.editor_field = ActionEditorField::SaveButton;
-                            }
-                            _ => {}
-                        }
-                    }
-                    KeyCode::Right => {
-                        match app.actions_popup.editor_field {
-                            ActionEditorField::Name | ActionEditorField::World |
-                            ActionEditorField::Pattern => {
-                                app.actions_popup.move_cursor_right();
-                                app.actions_popup.adjust_scroll(40); // visible_width = field_width - 4 (for scroll indicators and brackets)
-                            }
-                            ActionEditorField::Command => {
-                                app.actions_popup.move_cursor_right();
-                                app.actions_popup.adjust_command_scroll(44);
-                            }
-                            ActionEditorField::MatchType => {
-                                // Left/Right toggle match type
-                                app.actions_popup.edit_match_type = app.actions_popup.edit_match_type.next();
-                            }
-                            ActionEditorField::Enabled => {
-                                // Left/Right toggle enabled
-                                app.actions_popup.edit_enabled = !app.actions_popup.edit_enabled;
-                            }
-                            ActionEditorField::SaveButton => {
-                                app.actions_popup.editor_field = ActionEditorField::CancelButton;
-                            }
-                            _ => {}
-                        }
-                    }
-                    KeyCode::Home => {
-                        app.actions_popup.move_cursor_home();
-                        if app.actions_popup.editor_field == ActionEditorField::Command {
-                            app.actions_popup.adjust_command_scroll(44);
-                        } else {
-                            app.actions_popup.adjust_scroll(44);
-                        }
-                    }
-                    KeyCode::End => {
-                        app.actions_popup.move_cursor_end();
-                        if app.actions_popup.editor_field == ActionEditorField::Command {
-                            app.actions_popup.adjust_command_scroll(44);
-                        } else {
-                            app.actions_popup.adjust_scroll(44);
-                        }
-                    }
-                    KeyCode::Backspace => {
-                        app.actions_popup.delete_char();
-                        if app.actions_popup.editor_field == ActionEditorField::Command {
-                            app.actions_popup.adjust_command_scroll(44);
-                        } else {
-                            app.actions_popup.adjust_scroll(44);
-                        }
-                    }
-                    KeyCode::Enter => {
-                        match app.actions_popup.editor_field {
-                            ActionEditorField::SaveButton => {
-                                if app.actions_popup.save_current_action() {
-                                    app.settings.actions = app.actions_popup.actions.clone();
-                                    let _ = save_settings(app);
-                                    app.ws_broadcast(WsMessage::ActionsUpdated {
-                                        actions: app.settings.actions.clone(),
-                                    });
-                                    app.actions_popup.close_editor();
-                                }
-                            }
-                            ActionEditorField::CancelButton => {
-                                app.actions_popup.close_editor();
-                            }
-                            ActionEditorField::MatchType => {
-                                // Toggle match type
-                                app.actions_popup.edit_match_type = app.actions_popup.edit_match_type.next();
-                            }
-                            ActionEditorField::Enabled => {
-                                // Toggle enabled
-                                app.actions_popup.edit_enabled = !app.actions_popup.edit_enabled;
-                            }
-                            _ => {
-                                app.actions_popup.next_editor_field();
-                            }
-                        }
-                    }
-                    KeyCode::Char(c) => {
-                        match app.actions_popup.editor_field {
-                            ActionEditorField::Name | ActionEditorField::World |
-                            ActionEditorField::Pattern => {
-                                app.actions_popup.insert_char(c);
-                                app.actions_popup.adjust_scroll(40); // visible_width = field_width - 4 (for scroll indicators and brackets)
-                            }
-                            ActionEditorField::Command => {
-                                app.actions_popup.insert_char(c);
-                                app.actions_popup.adjust_command_scroll(44);
-                            }
-                            ActionEditorField::MatchType => {
-                                // Space toggles match type
-                                if c == ' ' {
-                                    app.actions_popup.edit_match_type = app.actions_popup.edit_match_type.next();
-                                } else if c == 's' || c == 'S' {
-                                    // Shortcut for Save button
-                                    app.actions_popup.editor_field = ActionEditorField::SaveButton;
-                                } else if c == 'c' || c == 'C' {
-                                    // Shortcut for Cancel button
-                                    app.actions_popup.editor_field = ActionEditorField::CancelButton;
-                                }
-                            }
-                            ActionEditorField::Enabled => {
-                                // Space toggles enabled
-                                if c == ' ' {
-                                    app.actions_popup.edit_enabled = !app.actions_popup.edit_enabled;
-                                } else if c == 's' || c == 'S' {
-                                    // Shortcut for Save button
-                                    app.actions_popup.editor_field = ActionEditorField::SaveButton;
-                                } else if c == 'c' || c == 'C' {
-                                    // Shortcut for Cancel button
-                                    app.actions_popup.editor_field = ActionEditorField::CancelButton;
-                                }
-                            }
-                            ActionEditorField::SaveButton | ActionEditorField::CancelButton => {
-                                // Allow shortcuts on button fields
-                                if c == 's' || c == 'S' {
-                                    app.actions_popup.editor_field = ActionEditorField::SaveButton;
-                                } else if c == 'c' || c == 'C' {
-                                    app.actions_popup.editor_field = ActionEditorField::CancelButton;
-                                }
-                            }
-                            _ => {}
-                        }
-                    }
-                    _ => {}
-                }
-            }
-            ActionsView::List => {
-                // Check if we're in filter editing mode
-                if app.actions_popup.filter_editing {
-                    match key.code {
-                        KeyCode::Esc => {
-                            // Exit filter mode, clear filter
-                            app.actions_popup.filter.clear();
-                            app.actions_popup.filter_cursor = 0;
-                            app.actions_popup.stop_filter_edit();
-                        }
-                        KeyCode::Enter => {
-                            // Exit filter mode, keep filter
-                            app.actions_popup.stop_filter_edit();
-                        }
-                        KeyCode::Backspace => {
-                            if app.actions_popup.filter_cursor > 0 {
-                                app.actions_popup.filter_cursor -= 1;
-                                app.actions_popup.filter.remove(app.actions_popup.filter_cursor);
-                                // Reset selection to first filtered item
-                                let indices = app.actions_popup.filtered_indices();
-                                if !indices.is_empty() {
-                                    app.actions_popup.selected_index = indices[0];
-                                    app.actions_popup.scroll_offset = 0;
-                                }
-                            }
-                        }
-                        KeyCode::Delete => {
-                            if app.actions_popup.filter_cursor < app.actions_popup.filter.len() {
-                                app.actions_popup.filter.remove(app.actions_popup.filter_cursor);
-                                let indices = app.actions_popup.filtered_indices();
-                                if !indices.is_empty() {
-                                    app.actions_popup.selected_index = indices[0];
-                                    app.actions_popup.scroll_offset = 0;
-                                }
-                            }
-                        }
-                        KeyCode::Left => {
-                            if app.actions_popup.filter_cursor > 0 {
-                                app.actions_popup.filter_cursor -= 1;
-                            }
-                        }
-                        KeyCode::Right => {
-                            if app.actions_popup.filter_cursor < app.actions_popup.filter.len() {
-                                app.actions_popup.filter_cursor += 1;
-                            }
-                        }
-                        KeyCode::Home => {
-                            app.actions_popup.filter_cursor = 0;
-                        }
-                        KeyCode::End => {
-                            app.actions_popup.filter_cursor = app.actions_popup.filter.len();
-                        }
-                        KeyCode::Up => {
-                            // Calculate visible list height
-                            let screen_height = (app.output_height + app.input_height + 1) as usize;
-                            let popup_chrome = 8;
-                            let max_list = screen_height.saturating_sub(popup_chrome + 4);
-                            let filtered_count = app.actions_popup.filtered_indices().len();
-                            app.actions_popup.list_visible_height = filtered_count.max(3).min(max_list).max(3);
-                            app.actions_popup.select_prev_action();
-                        }
-                        KeyCode::Down => {
-                            // Calculate visible list height
-                            let screen_height = (app.output_height + app.input_height + 1) as usize;
-                            let popup_chrome = 8;
-                            let max_list = screen_height.saturating_sub(popup_chrome + 4);
-                            let filtered_count = app.actions_popup.filtered_indices().len();
-                            app.actions_popup.list_visible_height = filtered_count.max(3).min(max_list).max(3);
-                            app.actions_popup.select_next_action();
-                        }
-                        KeyCode::Char(c) => {
-                            app.actions_popup.filter.insert(app.actions_popup.filter_cursor, c);
-                            app.actions_popup.filter_cursor += 1;
-                            // Reset selection to first filtered item
-                            let indices = app.actions_popup.filtered_indices();
-                            if !indices.is_empty() {
-                                app.actions_popup.selected_index = indices[0];
-                                app.actions_popup.scroll_offset = 0;
-                            }
-                        }
-                        _ => {}
-                    }
-                } else {
-                    // Normal list navigation
-                    match key.code {
-                        KeyCode::Esc => {
-                            app.actions_popup.close();
-                        }
-                        KeyCode::Tab => {
-                            if key.modifiers.contains(KeyModifiers::SHIFT) {
-                                app.actions_popup.prev_list_field();
-                            } else {
-                                app.actions_popup.next_list_field();
-                            }
-                        }
-                        KeyCode::Up => {
-                            if app.actions_popup.list_field == ActionListField::List {
-                                // Calculate visible list height based on terminal size
-                                let screen_height = (app.output_height + app.input_height + 1) as usize;
-                                let popup_chrome = 8; // border + filter + header + buttons + spacing
-                                let max_list = screen_height.saturating_sub(popup_chrome + 4);
-                                let filtered_count = app.actions_popup.filtered_indices().len();
-                                app.actions_popup.list_visible_height = filtered_count.max(3).min(max_list).max(3);
-                                app.actions_popup.select_prev_action();
-                            } else {
-                                app.actions_popup.list_field = ActionListField::List;
-                            }
-                        }
-                        KeyCode::Down => {
-                            if app.actions_popup.list_field == ActionListField::List {
-                                // Calculate visible list height based on terminal size
-                                let screen_height = (app.output_height + app.input_height + 1) as usize;
-                                let popup_chrome = 8; // border + filter + header + buttons + spacing
-                                let max_list = screen_height.saturating_sub(popup_chrome + 4);
-                                let filtered_count = app.actions_popup.filtered_indices().len();
-                                app.actions_popup.list_visible_height = filtered_count.max(3).min(max_list).max(3);
-                                app.actions_popup.select_next_action();
-                            } else {
-                                app.actions_popup.list_field = ActionListField::List;
-                            }
-                        }
-                        KeyCode::Left => {
-                            match app.actions_popup.list_field {
-                                ActionListField::EditButton => {
-                                    app.actions_popup.list_field = ActionListField::AddButton;
-                                }
-                                ActionListField::DeleteButton => {
-                                    app.actions_popup.list_field = ActionListField::EditButton;
-                                }
-                                ActionListField::CancelButton => {
-                                    app.actions_popup.list_field = ActionListField::DeleteButton;
-                                }
-                                _ => {}
-                            }
-                        }
-                        KeyCode::Right => {
-                            match app.actions_popup.list_field {
-                                ActionListField::AddButton => {
-                                    app.actions_popup.list_field = ActionListField::EditButton;
-                                }
-                                ActionListField::EditButton => {
-                                    app.actions_popup.list_field = ActionListField::DeleteButton;
-                                }
-                                ActionListField::DeleteButton => {
-                                    app.actions_popup.list_field = ActionListField::CancelButton;
-                                }
-                                _ => {}
-                            }
-                        }
-                        KeyCode::Enter => {
-                            match app.actions_popup.list_field {
-                                ActionListField::List => {
-                                    // Edit selected action
-                                    let indices = app.actions_popup.filtered_indices();
-                                    if !indices.is_empty() {
-                                        let idx = app.actions_popup.selected_index;
-                                        app.actions_popup.open_editor(Some(idx));
-                                    }
-                                }
-                                ActionListField::AddButton => {
-                                    app.actions_popup.open_editor(None);
-                                }
-                                ActionListField::EditButton => {
-                                    let indices = app.actions_popup.filtered_indices();
-                                    if !indices.is_empty() {
-                                        let idx = app.actions_popup.selected_index;
-                                        app.actions_popup.open_editor(Some(idx));
-                                    }
-                                }
-                                ActionListField::DeleteButton => {
-                                    app.actions_popup.open_confirm_delete();
-                                }
-                                ActionListField::CancelButton => {
-                                    app.actions_popup.close();
-                                }
-                            }
-                        }
-                        KeyCode::Char('/') => {
-                            // Start filter editing
-                            if app.actions_popup.list_field == ActionListField::List {
-                                app.actions_popup.start_filter_edit();
-                            }
-                        }
-                        KeyCode::Char('a') | KeyCode::Char('A') => {
-                            // Shortcut for Add button
-                            app.actions_popup.list_field = ActionListField::AddButton;
-                        }
-                        KeyCode::Char('e') | KeyCode::Char('E') => {
-                            // Shortcut for Edit button
-                            app.actions_popup.list_field = ActionListField::EditButton;
-                        }
-                        KeyCode::Char('d') | KeyCode::Char('D') => {
-                            // Shortcut for Delete button
-                            app.actions_popup.list_field = ActionListField::DeleteButton;
-                        }
-                        KeyCode::Char('o') | KeyCode::Char('O') => {
-                            // Shortcut for Ok button
-                            app.actions_popup.list_field = ActionListField::CancelButton;
-                        }
-                        KeyCode::Char(c) => {
-                            // Start filtering when typing in list (only for non-shortcut keys)
-                            if app.actions_popup.list_field == ActionListField::List {
-                                app.actions_popup.start_filter_edit();
-                                app.actions_popup.filter.push(c);
-                                app.actions_popup.filter_cursor = app.actions_popup.filter.len();
-                                // Reset selection to first filtered item
-                                let indices = app.actions_popup.filtered_indices();
-                                if !indices.is_empty() {
-                                    app.actions_popup.selected_index = indices[0];
-                                    app.actions_popup.scroll_offset = 0;
-                                }
-                            }
-                        }
-                        _ => {}
-                    }
-                }
-            }
         }
         return KeyAction::None;
     }
@@ -26228,9 +25627,9 @@ async fn handle_command(cmd: &str, app: &mut App, event_tx: mpsc::Sender<AppEven
         }
         Command::Actions { world } => {
             if let Some(world_name) = world {
-                app.actions_popup.open_with_world_filter(&app.settings.actions, &world_name);
+                app.open_actions_list_popup_with_filter(&world_name);
             } else {
-                app.actions_popup.open(&app.settings.actions);
+                app.open_actions_list_popup();
             }
         }
         Command::Connect { host: arg_host, port: arg_port, ssl: arg_ssl } => {
@@ -27299,11 +26698,9 @@ fn ui(f: &mut Frame, app: &mut App) {
     render_web_popup(f, app);
     render_world_selector_popup(f, app);
     render_confirm_dialog(f, app);
-    render_worlds_popup(f, app);
     render_filter_popup(f, app);
     render_help_popup(f, app);
     render_menu_popup(f, app);
-    render_actions_popup(f, app);
     // New unified popup system - renders on top of old popups
     render_new_popup(f, app);
 }
@@ -27318,10 +26715,8 @@ fn render_output_crossterm(app: &App) {
     let any_popup_visible = app.settings_popup.visible
         || app.world_selector.visible
         || app.confirm_dialog.visible
-        || app.worlds_popup.visible
         || app.help_popup.visible
         || app.menu_popup.visible
-        || app.actions_popup.visible
         || app.web_popup.visible
         || app.has_new_popup();
     if app.current_world().showing_splash || any_popup_visible {
@@ -27893,11 +27288,9 @@ fn render_output_area(f: &mut Frame, app: &App, area: Rect) {
     let any_popup_visible = app.settings_popup.visible
         || app.world_selector.visible
         || app.confirm_dialog.visible
-        || app.worlds_popup.visible
         || app.filter_popup.visible
         || app.help_popup.visible
         || app.menu_popup.visible
-        || app.actions_popup.visible
         || app.web_popup.visible
         || app.has_new_popup();
 
@@ -29058,51 +28451,6 @@ fn render_confirm_dialog(f: &mut Frame, app: &App) {
     f.render_widget(popup_text, popup_area);
 }
 
-fn render_worlds_popup(f: &mut Frame, app: &App) {
-    if !app.worlds_popup.visible {
-        return;
-    }
-
-    let area = f.area();
-    let popup = &app.worlds_popup;
-    let theme = app.settings.theme;
-
-    // Calculate popup size based on content
-    let content_width = popup.lines.iter().map(|l| l.len()).max().unwrap_or(20).max(20);
-    let popup_width = (content_width + 4).min(area.width as usize - 4) as u16;
-    let popup_height = (popup.lines.len() + 4).min(area.height as usize - 2) as u16; // +4 for borders and button
-
-    let x = area.width.saturating_sub(popup_width) / 2;
-    let y = area.height.saturating_sub(popup_height) / 2;
-
-    let popup_area = Rect::new(x, y, popup_width, popup_height);
-
-    // Clear the background
-    f.render_widget(ratatui::widgets::Clear, popup_area);
-
-    // Build content lines
-    let mut lines: Vec<Line> = popup.lines.iter()
-        .map(|l| Line::from(Span::styled(l.clone(), Style::default().fg(theme.fg()))))
-        .collect();
-
-    // Add blank line and OK button
-    lines.push(Line::from(""));
-    lines.push(Line::from(Span::styled(
-        "[ OK ]",
-        Style::default().fg(theme.button_selected_fg()).bg(theme.button_selected_bg()).add_modifier(Modifier::BOLD)
-    )).alignment(Alignment::Center));
-
-    let popup_block = Block::default()
-        .title(" Connected Worlds ")
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(theme.fg()))
-        .style(Style::default().bg(theme.popup_bg()));
-
-    let popup_text = Paragraph::new(lines).block(popup_block);
-
-    f.render_widget(popup_text, popup_area);
-}
-
 fn render_filter_popup(f: &mut Frame, app: &App) {
     if !app.filter_popup.visible {
         return;
@@ -29701,541 +29049,6 @@ fn render_world_selector_popup(f: &mut Frame, app: &App) {
     }
 }
 
-fn render_actions_popup(f: &mut Frame, app: &App) {
-    if !app.actions_popup.visible {
-        return;
-    }
-
-    let area = f.area();
-    let popup = &app.actions_popup;
-    let theme = app.settings.theme;
-
-    // Common styles
-    let label_style = Style::default().fg(theme.fg());
-    let value_style = Style::default().fg(theme.fg());
-    let selected_style = Style::default().fg(theme.button_selected_fg()).bg(theme.button_selected_bg());
-    let button_style = Style::default().fg(theme.fg());
-    let button_selected_style = Style::default()
-        .fg(theme.button_selected_fg())
-        .bg(theme.button_selected_bg())
-        .add_modifier(Modifier::BOLD);
-    let error_style = Style::default().fg(Color::Red);
-
-    match popup.view {
-        ActionsView::List => {
-            // List view - show actions with Add/Edit/Delete/Cancel buttons
-            // Get filtered indices
-            let filtered_indices = popup.filtered_indices();
-
-            // Use 90% of window width
-            let popup_width = ((area.width as f32 * 0.90) as u16).max(40).min(area.width.saturating_sub(4));
-
-            // Extra height for filter line (1) + world filter indicator if present (1)
-            let extra_lines = if popup.world_filter.is_empty() { 1 } else { 2 };
-            // Popup chrome: border (2) + filter line (1) + optional world filter (0-1) + blank line (1) + header (1) + buttons (1) = 6 + extra_lines
-            let popup_chrome = 6 + extra_lines;
-            // Available height: screen height minus separator bar (1), input area, and margin (2)
-            let max_available_height = area.height.saturating_sub(app.input_height + 3) as usize;
-            // Maximum list height that fits
-            let max_list_height = max_available_height.saturating_sub(popup_chrome);
-            // Dynamic list height: show all actions if they fit, otherwise cap at max
-            let list_height = filtered_indices.len().max(3).min(max_list_height).max(3);
-            let popup_height = ((list_height + popup_chrome) as u16).min(area.height.saturating_sub(2));
-
-            let x = area.width.saturating_sub(popup_width) / 2;
-            let y = area.height.saturating_sub(popup_height) / 2;
-            let popup_area = Rect::new(x, y, popup_width, popup_height);
-
-            // Calculate column widths for aligned display
-            // Columns: Name, World, Pattern (all start at same horizontal position with 2 spaces between)
-            let inner_width = popup_width.saturating_sub(4) as usize;
-            let max_name_len = popup.actions.iter().map(|a| a.name.chars().count()).max().unwrap_or(4).max(4);
-            let max_world_len = popup.actions.iter().map(|a| a.world.chars().count()).max().unwrap_or(5).max(5);
-            // Name column width includes marker (2 chars: "> " or "  ")
-            let name_col_width = max_name_len + 2;
-            let world_col_width = max_world_len;
-            // Pattern column gets remaining space minus scrollbar (2) and column separators (4 spaces = 2+2)
-            let pattern_col_width = inner_width.saturating_sub(name_col_width + 2 + world_col_width + 2 + 2);
-
-            f.render_widget(ratatui::widgets::Clear, popup_area);
-
-            let mut lines: Vec<Line<'static>> = Vec::new();
-
-            // Filter line at top
-            let filter_label = "Filter: ";
-            let filter_display = if popup.filter_editing {
-                let mut buf = popup.filter.clone();
-                buf.insert(popup.filter_cursor, '|');
-                buf
-            } else if popup.filter.is_empty() {
-                "(type to filter)".to_string()
-            } else {
-                popup.filter.clone()
-            };
-            let filter_style = if popup.filter_editing {
-                Style::default().fg(theme.fg_success())
-            } else {
-                Style::default().fg(theme.fg_dim())
-            };
-            lines.push(Line::from(vec![
-                Span::styled(filter_label, Style::default().fg(theme.fg_accent())),
-                Span::styled(filter_display, filter_style),
-            ]));
-
-            // World filter indicator if set
-            if !popup.world_filter.is_empty() {
-                lines.push(Line::from(Span::styled(
-                    format!("World: {}", popup.world_filter),
-                    Style::default().fg(theme.fg_accent()),
-                )));
-            }
-
-            lines.push(Line::from(""));
-
-            // Header row - highlighted with column names aligned to data columns
-            // Add 2-space prefix (not highlighted), then highlighted header content
-            let header_style = Style::default().fg(Color::Black).bg(theme.button_selected_bg()).add_modifier(Modifier::BOLD);
-            let name_header = format!("{:width$}", "Name", width = name_col_width - 2); // -2 because we add prefix separately
-            let world_header = format!("{:width$}", "World", width = world_col_width);
-            let pattern_header = "Pattern";
-            let header_line = format!("{}  {}  {}", name_header, world_header, pattern_header);
-            let header_padding = inner_width.saturating_sub(header_line.chars().count() + 4); // +4 for prefix and suffix
-            lines.push(Line::from(vec![
-                Span::raw("  "), // 2-space prefix (not highlighted)
-                Span::styled(header_line, header_style),
-                Span::styled(" ".repeat(header_padding), header_style),
-                Span::styled("  ", header_style), // 2 extra highlighted chars at end
-            ]));
-
-            // Use scroll_offset directly - scrolling only happens when user tries to move past visible area
-            // (handled in input processing, not here in rendering)
-            let scroll_offset = popup.scroll_offset.min(filtered_indices.len().saturating_sub(list_height));
-
-            // Calculate scrollbar position
-            let total_items = filtered_indices.len();
-            let scrollbar_chars: Vec<char> = if total_items <= list_height {
-                // No scrolling needed - show empty track
-                vec!['│'; list_height]
-            } else {
-                // Calculate thumb size and position
-                let thumb_size = ((list_height as f64 / total_items as f64) * list_height as f64).max(1.0) as usize;
-                let thumb_size = thumb_size.max(1).min(list_height);
-                let scroll_range = total_items.saturating_sub(list_height);
-                let thumb_pos = if scroll_range > 0 {
-                    ((scroll_offset as f64 / scroll_range as f64) * (list_height - thumb_size) as f64) as usize
-                } else {
-                    0
-                };
-                let thumb_pos = thumb_pos.min(list_height - thumb_size);
-
-                (0..list_height).map(|i| {
-                    if i >= thumb_pos && i < thumb_pos + thumb_size {
-                        '█' // Thumb
-                    } else {
-                        '│' // Track
-                    }
-                }).collect()
-            };
-
-            for i in 0..list_height {
-                let filtered_pos = scroll_offset + i;
-                let scrollbar_char = scrollbar_chars.get(i).copied().unwrap_or('│');
-
-                if filtered_pos < filtered_indices.len() {
-                    let action_idx = filtered_indices[filtered_pos];
-                    let action = &popup.actions[action_idx];
-                    let is_selected = action_idx == popup.selected_index;
-                    let marker = if is_selected { "> " } else { "  " };
-                    let style = if popup.list_field == ActionListField::List && is_selected {
-                        selected_style
-                    } else if is_selected {
-                        Style::default().fg(theme.fg_accent())
-                    } else {
-                        value_style
-                    };
-
-                    // Build aligned columns: marker+name, world, pattern
-                    // Name column (with marker prefix, pad with / for manual actions)
-                    let name_display = if action.pattern.is_empty() {
-                        format!("/{}", action.name)
-                    } else {
-                        action.name.clone()
-                    };
-                    let name_padded = format!("{}{:width$}", marker, name_display, width = name_col_width - 2);
-
-                    // World column (no parens, just the name or empty)
-                    let world_padded = format!("{:width$}", action.world, width = world_col_width);
-
-                    // Pattern column (truncate with "..." if too long)
-                    let pattern_display = if action.pattern.chars().count() > pattern_col_width {
-                        let truncated: String = action.pattern.chars().take(pattern_col_width.saturating_sub(3)).collect();
-                        format!("{}...", truncated)
-                    } else {
-                        action.pattern.clone()
-                    };
-
-                    // Build the full line with 2 spaces between columns
-                    let full_line = format!("{}  {}  {}", name_padded, world_padded, pattern_display);
-
-                    // Pad to inner_width minus scrollbar space
-                    let display_width = inner_width.saturating_sub(2);
-                    let line_chars: usize = full_line.chars().count();
-                    let padding = display_width.saturating_sub(line_chars);
-
-                    lines.push(Line::from(vec![
-                        Span::styled(full_line, style),
-                        Span::raw(" ".repeat(padding)),
-                        Span::styled(format!(" {}", scrollbar_char), Style::default().fg(theme.fg_dim())),
-                    ]));
-                } else {
-                    // Empty line with scrollbar
-                    let padding = inner_width.saturating_sub(2);
-                    lines.push(Line::from(vec![
-                        Span::raw(" ".repeat(padding)),
-                        Span::styled(format!(" {}", scrollbar_char), Style::default().fg(theme.fg_dim())),
-                    ]));
-                }
-            }
-
-            lines.push(Line::from(""));
-
-            // Buttons row - right justified with first letter highlighted as shortcut
-            let add_selected = popup.list_field == ActionListField::AddButton;
-            let edit_selected = popup.list_field == ActionListField::EditButton;
-            let del_selected = popup.list_field == ActionListField::DeleteButton;
-            let ok_selected = popup.list_field == ActionListField::CancelButton;
-
-            // Helper to create button with highlighted first letter (shortcut key in black on white)
-            let make_button = |first: &str, rest: &str, selected: bool| -> Vec<Span<'static>> {
-                let base_style = if selected { button_selected_style } else { button_style };
-                let shortcut_style = if selected {
-                    Style::default().fg(Color::Black).bg(theme.button_selected_bg()).add_modifier(Modifier::BOLD | Modifier::UNDERLINED)
-                } else {
-                    Style::default().fg(Color::Black).bg(Color::White).add_modifier(Modifier::UNDERLINED)
-                };
-                vec![
-                    Span::styled("[ ", base_style),
-                    Span::styled(first.to_string(), shortcut_style),
-                    Span::styled(rest.to_string(), base_style),
-                    Span::styled(" ]", base_style),
-                ]
-            };
-
-            // Calculate button widths: "[ Add ]" (7) + " " (1) + "[ Edit ]" (8) + " " (1) + "[ Delete ]" (10) + " " (1) + "[ Ok ]" (6) = 34
-            let buttons_width = 34;
-            let buttons_padding = inner_width.saturating_sub(buttons_width);
-
-            let mut button_spans = vec![Span::raw(" ".repeat(buttons_padding))];
-            button_spans.extend(make_button("A", "dd", add_selected));
-            button_spans.push(Span::raw(" "));
-            button_spans.extend(make_button("E", "dit", edit_selected));
-            button_spans.push(Span::raw(" "));
-            button_spans.extend(make_button("D", "elete", del_selected));
-            button_spans.push(Span::raw(" "));
-            button_spans.extend(make_button("O", "k", ok_selected));
-            lines.push(Line::from(button_spans));
-
-            let popup_block = Block::default()
-                .title(Span::styled(" Actions ", Style::default().fg(Color::Black).add_modifier(Modifier::BOLD)))
-                .borders(Borders::ALL)
-                .border_style(Style::default().fg(theme.popup_border()))
-                .style(Style::default().bg(theme.popup_bg()));
-
-            let popup_text = Paragraph::new(lines).block(popup_block);
-            f.render_widget(popup_text, popup_area);
-        }
-
-        ActionsView::Editor => {
-            // Editor view - show name/world/match_type/pattern/command with Save/Cancel
-            let popup_width = 60u16.min(area.width.saturating_sub(4));
-            let popup_height = 20u16.min(area.height.saturating_sub(2));
-
-            let x = area.width.saturating_sub(popup_width) / 2;
-            let y = area.height.saturating_sub(popup_height) / 2;
-            let popup_area = Rect::new(x, y, popup_width, popup_height);
-
-            f.render_widget(ratatui::widgets::Clear, popup_area);
-
-            let mut lines: Vec<Line<'static>> = Vec::new();
-            let inner_width = popup_width.saturating_sub(4) as usize;
-            let field_width = inner_width.saturating_sub(12);
-
-            // Format field with cursor and horizontal scrolling
-            let format_field_scrolled = |value: &str, cursor_byte: usize, is_current: bool, max_len: usize, scroll: usize| -> String {
-                if is_current {
-                    let chars: Vec<char> = value.chars().collect();
-                    let cursor_char_pos = value[..cursor_byte.min(value.len())].chars().count();
-                    let chars_len = chars.len();
-
-                    // Calculate visible portion (leave room for scroll indicators)
-                    let visible_width = max_len.saturating_sub(2);
-                    let start = scroll.min(chars_len);
-                    let end = (scroll + visible_width).min(chars_len);
-
-                    let mut display = String::new();
-
-                    // Left scroll indicator
-                    if scroll > 0 {
-                        display.push('<');
-                    } else {
-                        display.push(' ');
-                    }
-
-                    // Visible text with cursor
-                    for (i, &c) in chars.iter().enumerate() {
-                        if i == cursor_char_pos && i >= start && i < end {
-                            display.push('|');
-                        }
-                        if i >= start && i < end {
-                            display.push(c);
-                        }
-                    }
-                    // Cursor at end
-                    if cursor_char_pos >= chars_len && cursor_char_pos >= start {
-                        display.push('|');
-                    }
-
-                    // Right scroll indicator
-                    if end < chars_len {
-                        display.push('>');
-                    }
-
-                    display
-                } else {
-                    // Not current field - just truncate
-                    truncate_str(value, max_len).to_string()
-                }
-            };
-
-            // Use selected_style for label when field is active, value_style for content
-            let name_label_style = if popup.editor_field == ActionEditorField::Name { selected_style } else { label_style };
-            let world_label_style = if popup.editor_field == ActionEditorField::World { selected_style } else { label_style };
-            let match_type_label_style = if popup.editor_field == ActionEditorField::MatchType { selected_style } else { label_style };
-            let pattern_label_style = if popup.editor_field == ActionEditorField::Pattern { selected_style } else { label_style };
-            let command_label_style = if popup.editor_field == ActionEditorField::Command { selected_style } else { label_style };
-
-            // Get scroll offset only for the current field
-            let scroll = popup.edit_scroll_offset;
-
-            lines.push(Line::from(""));
-
-            lines.push(Line::from(vec![
-                Span::styled("Name:      ", name_label_style),
-                Span::styled(
-                    format!("[{}]", format_field_scrolled(&popup.edit_name, popup.cursor_pos, popup.editor_field == ActionEditorField::Name, field_width.saturating_sub(2), if popup.editor_field == ActionEditorField::Name { scroll } else { 0 })),
-                    value_style,
-                ),
-            ]));
-
-            lines.push(Line::from(vec![
-                Span::styled("World:     ", world_label_style),
-                Span::styled(
-                    format!("[{}]", format_field_scrolled(&popup.edit_world, popup.cursor_pos, popup.editor_field == ActionEditorField::World, field_width.saturating_sub(2), if popup.editor_field == ActionEditorField::World { scroll } else { 0 })),
-                    value_style,
-                ),
-            ]));
-
-            // Match Type toggle field
-            let match_type_value = format!("< {} >", popup.edit_match_type.as_str());
-            lines.push(Line::from(vec![
-                Span::styled("Match Type:", match_type_label_style),
-                Span::styled(match_type_value, if popup.editor_field == ActionEditorField::MatchType { selected_style } else { value_style }),
-            ]));
-
-            lines.push(Line::from(vec![
-                Span::styled("Pattern:   ", pattern_label_style),
-                Span::styled(
-                    format!("[{}]", format_field_scrolled(&popup.edit_pattern, popup.cursor_pos, popup.editor_field == ActionEditorField::Pattern, field_width.saturating_sub(2), if popup.editor_field == ActionEditorField::Pattern { scroll } else { 0 })),
-                    value_style,
-                ),
-            ]));
-
-            // Enabled toggle field
-            let enabled_label_style = if popup.editor_field == ActionEditorField::Enabled { selected_style } else { label_style };
-            let enabled_value = format!("< {} >", if popup.edit_enabled { "Yes" } else { "No" });
-            lines.push(Line::from(vec![
-                Span::styled("Enabled:   ", enabled_label_style),
-                Span::styled(enabled_value, if popup.editor_field == ActionEditorField::Enabled { selected_style } else { value_style }),
-            ]));
-
-            // Command field: 5-line mini-editor with viewport scrolling
-            lines.push(Line::from(Span::styled("Command:", command_label_style)));
-
-            let cmd_width = inner_width.saturating_sub(6); // Leave room for "  [" and "]"
-            let wrapped_lines = popup.wrap_command_lines(cmd_width);
-            let (cursor_row, cursor_col) = popup.get_command_cursor_row_col(cmd_width);
-            let visible_rows = 5;
-            let scroll_row = popup.command_scroll_row;
-            let total_rows = wrapped_lines.len();
-            let is_command_active = popup.editor_field == ActionEditorField::Command;
-
-            // Show up indicator if scrolled down
-            if scroll_row > 0 {
-                lines.push(Line::from(vec![
-                    Span::styled("  ", label_style),
-                    Span::styled("▲ more above", Style::default().fg(Color::DarkGray)),
-                ]));
-            }
-
-            // Render visible rows (3 rows)
-            for row_idx in 0..visible_rows {
-                let actual_row = scroll_row + row_idx;
-                let line_text = wrapped_lines.get(actual_row).cloned().unwrap_or_default();
-
-                // Build display string with cursor if this is the active field
-                let display = if is_command_active && actual_row == cursor_row {
-                    let chars: Vec<char> = line_text.chars().collect();
-                    let mut s = String::new();
-                    for (i, &c) in chars.iter().enumerate() {
-                        if i == cursor_col {
-                            s.push('|');
-                        }
-                        s.push(c);
-                    }
-                    if cursor_col >= chars.len() {
-                        s.push('|');
-                    }
-                    // Pad to fill the width
-                    while s.chars().count() < cmd_width + 1 {
-                        s.push(' ');
-                    }
-                    s
-                } else {
-                    // Not active or not cursor row - just pad the text
-                    let mut s = line_text.clone();
-                    while s.chars().count() < cmd_width {
-                        s.push(' ');
-                    }
-                    s
-                };
-
-                let bracket_left = if row_idx == 0 { "[" } else { " " };
-                let bracket_right = if row_idx == visible_rows - 1 { "]" } else { " " };
-
-                lines.push(Line::from(vec![
-                    Span::styled("  ", label_style),
-                    Span::styled(bracket_left, label_style),
-                    Span::styled(display, value_style),
-                    Span::styled(bracket_right, label_style),
-                ]));
-            }
-
-            // Show down indicator if more rows below
-            if scroll_row + visible_rows < total_rows {
-                lines.push(Line::from(vec![
-                    Span::styled("  ", label_style),
-                    Span::styled("▼ more below", Style::default().fg(Color::DarkGray)),
-                ]));
-            }
-
-            lines.push(Line::from(""));
-
-            // Error message if any
-            if let Some(ref error) = popup.error_message {
-                lines.push(Line::from(Span::styled(error.clone(), error_style)));
-            } else {
-                lines.push(Line::from(""));
-            }
-
-            // Buttons row with highlighted shortcut keys
-            let save_selected = popup.editor_field == ActionEditorField::SaveButton;
-            let cancel_selected = popup.editor_field == ActionEditorField::CancelButton;
-
-            // Helper to create button with highlighted first letter (shortcut key in black on white)
-            let make_editor_button = |first: &str, rest: &str, selected: bool| -> Vec<Span<'static>> {
-                let base_style = if selected { button_selected_style } else { button_style };
-                let shortcut_style = if selected {
-                    Style::default().fg(Color::Black).bg(theme.button_selected_bg()).add_modifier(Modifier::BOLD | Modifier::UNDERLINED)
-                } else {
-                    Style::default().fg(Color::Black).bg(Color::White).add_modifier(Modifier::UNDERLINED)
-                };
-                vec![
-                    Span::styled("[ ", base_style),
-                    Span::styled(first.to_string(), shortcut_style),
-                    Span::styled(rest.to_string(), base_style),
-                    Span::styled(" ]", base_style),
-                ]
-            };
-
-            let mut button_spans = Vec::new();
-            button_spans.extend(make_editor_button("S", "ave", save_selected));
-            button_spans.push(Span::raw("  "));
-            button_spans.extend(make_editor_button("C", "ancel", cancel_selected));
-            lines.push(Line::from(button_spans));
-
-            let title = if popup.editing_index.is_some() { " Edit Action " } else { " New Action " };
-            let popup_block = Block::default()
-                .title(Span::styled(title, Style::default().fg(Color::Black).add_modifier(Modifier::BOLD)))
-                .borders(Borders::ALL)
-                .border_style(Style::default().fg(theme.popup_border()))
-                .style(Style::default().bg(theme.popup_bg()));
-
-            let popup_text = Paragraph::new(lines).block(popup_block);
-            f.render_widget(popup_text, popup_area);
-        }
-
-        ActionsView::ConfirmDelete => {
-            // Confirm delete dialog
-            let popup_width = 40u16.min(area.width.saturating_sub(4));
-            let popup_height = 6u16.min(area.height.saturating_sub(2));
-
-            let x = area.width.saturating_sub(popup_width) / 2;
-            let y = area.height.saturating_sub(popup_height) / 2;
-            let popup_area = Rect::new(x, y, popup_width, popup_height);
-
-            f.render_widget(ratatui::widgets::Clear, popup_area);
-
-            let action_name = popup.actions.get(popup.selected_index)
-                .map(|a| a.name.as_str())
-                .unwrap_or("this action");
-
-            let yes_selected = popup.confirm_selected;
-            let no_selected = !popup.confirm_selected;
-
-            // Helper to create button with highlighted first letter (shortcut key in black on white)
-            let make_confirm_button = |first: &str, rest: &str, selected: bool| -> Vec<Span<'static>> {
-                let base_style = if selected { button_selected_style } else { button_style };
-                let shortcut_style = if selected {
-                    Style::default().fg(Color::Black).bg(theme.button_selected_bg()).add_modifier(Modifier::BOLD | Modifier::UNDERLINED)
-                } else {
-                    Style::default().fg(Color::Black).bg(Color::White).add_modifier(Modifier::UNDERLINED)
-                };
-                vec![
-                    Span::styled("[ ", base_style),
-                    Span::styled(first.to_string(), shortcut_style),
-                    Span::styled(rest.to_string(), base_style),
-                    Span::styled(" ]", base_style),
-                ]
-            };
-
-            let mut yes_spans = make_confirm_button("Y", "es", yes_selected);
-            let mut no_spans = make_confirm_button("N", "o", no_selected);
-            let mut button_spans = Vec::new();
-            button_spans.append(&mut yes_spans);
-            button_spans.push(Span::raw("    "));
-            button_spans.append(&mut no_spans);
-
-            let lines = vec![
-                Line::from(""),
-                Line::from(Span::styled(
-                    format!("Delete '{}'?", truncate_str(action_name, 20)),
-                    label_style,
-                )),
-                Line::from(""),
-                Line::from(button_spans),
-            ];
-
-            let popup_block = Block::default()
-                .title(Span::styled(" Confirm Delete ", Style::default().fg(Color::Black).add_modifier(Modifier::BOLD)))
-                .borders(Borders::ALL)
-                .border_style(Style::default().fg(theme.popup_border()))
-                .style(Style::default().bg(theme.popup_bg()));
-
-            let popup_text = Paragraph::new(lines).block(popup_block);
-            f.render_widget(popup_text, popup_area);
-        }
-    }
-}
 
 /// Render new unified popup system
 fn render_new_popup(f: &mut Frame, app: &App) {
