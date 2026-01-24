@@ -8648,6 +8648,53 @@ mod remote_gui {
             self.unified_popup = None;
         }
 
+        /// Open the actions list popup using unified system
+        fn open_actions_list_unified(&mut self) {
+            use crate::popup::definitions::actions::*;
+
+            let actions: Vec<ActionInfo> = self.actions.iter()
+                .map(|a| ActionInfo {
+                    name: a.name.clone(),
+                    world: a.world.clone(),
+                    pattern: a.pattern.clone(),
+                    enabled: a.enabled,
+                })
+                .collect();
+
+            let visible_height = 10.min(actions.len().max(3));
+            let def = create_actions_list_popup(&actions, visible_height);
+            self.unified_popup = Some(crate::popup::PopupState::new(def));
+        }
+
+        /// Open the connections popup using unified system
+        fn open_connections_unified(&mut self) {
+            use crate::popup::definitions::connections::*;
+
+            let connections: Vec<ConnectionInfo> = self.worlds.iter().enumerate()
+                .map(|(idx, w)| {
+                    let last_send = w.last_send_secs.map(|s| format_elapsed(Some(s))).unwrap_or_else(|| "-".to_string());
+                    let last_recv = w.last_recv_secs.map(|s| format_elapsed(Some(s))).unwrap_or_else(|| "-".to_string());
+                    let ka_next = format_next_nop(w.last_send_secs, w.last_recv_secs);
+
+                    ConnectionInfo {
+                        name: w.name.clone(),
+                        is_current: idx == self.current_world,
+                        is_connected: w.connected,
+                        is_ssl: w.settings.use_ssl,
+                        is_proxy: false,
+                        unseen_lines: w.unseen_lines,
+                        last_send,
+                        last_recv,
+                        ka_next,
+                    }
+                })
+                .collect();
+
+            let visible_height = 10.min(connections.iter().filter(|c| c.is_connected).count().max(3));
+            let def = create_connections_popup(&connections, visible_height);
+            self.unified_popup = Some(crate::popup::PopupState::new(def));
+        }
+
         /// Try to find a system font file by name
         fn find_system_font(font_name: &str) -> Option<Vec<u8>> {
             // Common font directories on Linux
@@ -8864,6 +8911,8 @@ mod remote_gui {
             let mut deferred_connect: Option<usize> = None;
             let mut deferred_edit: Option<usize> = None;
             let mut deferred_music: Vec<crate::ansi_music::MusicNote> = Vec::new();
+            let mut deferred_open_actions = false;
+            let mut deferred_open_connections = false;
 
             if let Some(ref mut rx) = self.ws_rx {
                 while let Ok(msg) = rx.try_recv() {
@@ -9245,8 +9294,7 @@ mod remote_gui {
                                     self.popup_state = PopupState::Setup;
                                 }
                                 Command::Actions { .. } => {
-                                    self.popup_state = PopupState::ActionsList;
-                                    self.actions_selected = 0;
+                                    deferred_open_actions = true;
                                 }
                                 Command::Disconnect => {
                                     // Send disconnect to server (this is safe, won't affect console's world)
@@ -9294,6 +9342,12 @@ mod remote_gui {
             }
             if !deferred_music.is_empty() {
                 self.play_ansi_music(&deferred_music);
+            }
+            if deferred_open_actions {
+                self.open_actions_list_unified();
+            }
+            if deferred_open_connections {
+                self.open_connections_unified();
             }
         }
 
@@ -11440,14 +11494,10 @@ mod remote_gui {
                         self.only_connected_worlds = false;
                     }
                     Some("connected_worlds") => {
-                        self.popup_state = PopupState::ConnectedWorlds;
-                        self.world_list_selected = self.current_world;
-                        self.only_connected_worlds = true;
+                        self.open_connections_unified();
                     }
                     Some("actions") => {
-                        self.popup_state = PopupState::ActionsList;
-                        self.actions_selected = 0;
-                        self.action_error = None;
+                        self.open_actions_list_unified();
                     }
                     Some("edit_current") => self.open_world_editor(self.current_world),
                     Some("setup") => self.popup_state = PopupState::Setup,
@@ -11772,8 +11822,7 @@ mod remote_gui {
                                         self.menu_selected = 0;
                                     }
                                     super::Command::Actions { .. } => {
-                                        self.actions_selected = 0;
-                                        self.popup_state = PopupState::ActionsList;
+                                        self.open_actions_list_unified();
                                     }
                                     super::Command::WorldEdit { name } => {
                                         // Open world editor
@@ -15054,12 +15103,15 @@ mod remote_gui {
                             super::Command::Setup => self.popup_state = PopupState::Setup,
                             super::Command::Web => self.popup_state = PopupState::Web,
                             super::Command::Actions { .. } => {
-                                self.popup_state = PopupState::ActionsList;
-                                self.actions_selected = 0;
+                                self.open_actions_list_unified();
                             }
-                            super::Command::WorldSelector | super::Command::WorldsList => {
+                            super::Command::WorldSelector => {
                                 self.popup_state = PopupState::ConnectedWorlds;
                                 self.world_list_selected = self.current_world;
+                                self.only_connected_worlds = false;
+                            }
+                            super::Command::WorldsList => {
+                                self.open_connections_unified();
                             }
                             _ => close_popup = true,
                         }
@@ -15973,6 +16025,251 @@ mod remote_gui {
                         self.popup_state = PopupState::ActionsList;
                     } else if should_close {
                         self.popup_state = PopupState::ActionsList;
+                    }
+                }
+
+                // Unified popup rendering
+                if let Some(ref mut popup_state) = self.unified_popup {
+                    let popup_title = popup_state.definition.title.clone();
+                    let popup_id_str = popup_state.definition.id.0.to_string();
+                    let mut should_close_unified = false;
+                    let mut clicked_button: Option<crate::popup::ButtonId> = None;
+
+                    // Calculate popup size based on layout
+                    let min_width = popup_state.definition.layout.min_width as f32;
+                    let label_width = popup_state.definition.layout.label_width as f32;
+
+                    ctx.show_viewport_immediate(
+                        egui::ViewportId::from_hash_of(format!("unified_popup_{}", popup_id_str)),
+                        egui::ViewportBuilder::default()
+                            .with_title(format!("{} - Clay MUD Client", popup_title))
+                            .with_inner_size([min_width.max(400.0), 350.0]),
+                        |ctx, _class| {
+                            // Apply popup styling
+                            ctx.style_mut(|style| {
+                                style.visuals.window_fill = theme.bg_elevated();
+                                style.visuals.panel_fill = theme.bg_elevated();
+                                style.visuals.window_stroke = egui::Stroke::NONE;
+                                style.visuals.window_shadow = egui::epaint::Shadow::NONE;
+
+                                let widget_bg = theme.bg_deep();
+                                let widget_rounding = egui::Rounding::same(4.0);
+
+                                style.visuals.widgets.noninteractive.bg_fill = widget_bg;
+                                style.visuals.widgets.inactive.bg_fill = theme.bg_hover();
+                                style.visuals.widgets.hovered.bg_fill = theme.bg_hover();
+                                style.visuals.widgets.active.bg_fill = theme.accent_dim();
+                                style.visuals.widgets.open.bg_fill = theme.bg_hover();
+
+                                for w in [
+                                    &mut style.visuals.widgets.noninteractive,
+                                    &mut style.visuals.widgets.inactive,
+                                    &mut style.visuals.widgets.hovered,
+                                    &mut style.visuals.widgets.active,
+                                    &mut style.visuals.widgets.open,
+                                ] {
+                                    w.bg_stroke = egui::Stroke::NONE;
+                                    w.fg_stroke = egui::Stroke::NONE;
+                                    w.rounding = widget_rounding;
+                                }
+
+                                style.visuals.selection.bg_fill = Color32::from_rgba_unmultiplied(34, 211, 238, 38);
+                                style.visuals.selection.stroke = egui::Stroke::NONE;
+                                style.visuals.extreme_bg_color = widget_bg;
+                            });
+
+                            if ctx.input(|i| i.key_pressed(egui::Key::Escape)) ||
+                               ctx.input(|i| i.viewport().close_requested()) {
+                                should_close_unified = true;
+                            }
+
+                            egui::CentralPanel::default()
+                                .frame(egui::Frame::none()
+                                    .fill(theme.bg_elevated())
+                                    .inner_margin(egui::Margin::same(16.0)))
+                                .show(ctx, |ui| {
+                                    // Create GUI popup theme from current theme
+                                    let gui_theme = crate::popup::gui_renderer::GuiPopupTheme::from_colors(
+                                        theme.bg_elevated(),
+                                        theme.bg_surface(),
+                                        theme.bg_deep(),
+                                        theme.bg_hover(),
+                                        theme.fg(),
+                                        theme.fg_muted(),
+                                        theme.fg_muted(),
+                                        theme.accent(),
+                                        theme.accent_dim(),
+                                        theme.fg_dim(),  // border color
+                                        theme.error(),
+                                    );
+
+                                    let actions = crate::popup::gui_renderer::render_popup_content(
+                                        ui,
+                                        popup_state,
+                                        &gui_theme,
+                                        label_width.max(80.0),
+                                    );
+
+                                    // Store clicked button for processing outside viewport
+                                    if let Some(btn_id) = actions.clicked_button {
+                                        clicked_button = Some(btn_id);
+                                    }
+
+                                    // Apply other actions to state
+                                    crate::popup::gui_renderer::apply_actions(popup_state, actions);
+                                });
+                        },
+                    );
+
+                    // Handle button clicks outside viewport closure
+                    if let Some(btn_id) = clicked_button {
+                        // Check if this is a close/cancel/ok button
+                        let popup_id = self.unified_popup.as_ref().map(|p| p.definition.id.0);
+                        match popup_id {
+                            Some("connections") => {
+                                // Connections popup just closes
+                                should_close_unified = true;
+                            }
+                            Some("actions_list") => {
+                                use crate::popup::definitions::actions::*;
+                                if btn_id == ACTIONS_BTN_CANCEL {
+                                    should_close_unified = true;
+                                } else if btn_id == ACTIONS_BTN_ADD {
+                                    // Open action editor for new action
+                                    let settings = ActionSettings::default();
+                                    let def = create_action_editor_popup(&settings, true);
+                                    self.unified_popup = Some(crate::popup::PopupState::new(def));
+                                } else if btn_id == ACTIONS_BTN_EDIT {
+                                    // Get selected action index from list
+                                    if let Some(ps) = &self.unified_popup {
+                                        if let Some(field) = ps.field(ACTIONS_FIELD_LIST) {
+                                            if let crate::popup::FieldKind::List { selected_index, items, .. } = &field.kind {
+                                                if let Some(item) = items.get(*selected_index) {
+                                                    if let Ok(idx) = item.id.parse::<usize>() {
+                                                        if let Some(action) = self.actions.get(idx) {
+                                                            let settings = ActionSettings {
+                                                                name: action.name.clone(),
+                                                                world: action.world.clone(),
+                                                                match_type: action.match_type.as_str().to_string(),
+                                                                pattern: action.pattern.clone(),
+                                                                command: action.command.clone(),
+                                                                enabled: action.enabled,
+                                                            };
+                                                            self.actions_selected = idx;
+                                                            let def = create_action_editor_popup(&settings, false);
+                                                            self.unified_popup = Some(crate::popup::PopupState::new(def));
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                } else if btn_id == ACTIONS_BTN_DELETE {
+                                    // Get selected action and open confirm dialog
+                                    if let Some(ps) = &self.unified_popup {
+                                        if let Some(field) = ps.field(ACTIONS_FIELD_LIST) {
+                                            if let crate::popup::FieldKind::List { selected_index, items, .. } = &field.kind {
+                                                if let Some(item) = items.get(*selected_index) {
+                                                    if let Ok(idx) = item.id.parse::<usize>() {
+                                                        if let Some(action) = self.actions.get(idx) {
+                                                            let def = crate::popup::definitions::confirm::create_delete_action_dialog(&action.name);
+                                                            self.actions_selected = idx;
+                                                            self.unified_popup = Some(crate::popup::PopupState::new(def));
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            Some("action_editor") => {
+                                use crate::popup::definitions::actions::*;
+                                if btn_id == EDITOR_BTN_CANCEL {
+                                    // Return to actions list
+                                    self.open_actions_list_unified();
+                                } else if btn_id == EDITOR_BTN_SAVE {
+                                    // Save action and return to list
+                                    if let Some(ps) = &self.unified_popup {
+                                        let editing_idx = ps.field(EDITOR_FIELD_NAME)
+                                            .and_then(|_| ps.definition.id.0.strip_prefix("action_editor"))
+                                            .and_then(|s| s.parse::<usize>().ok());
+
+                                        let name = ps.field(EDITOR_FIELD_NAME)
+                                            .and_then(|f| f.kind.get_text())
+                                            .unwrap_or("")
+                                            .to_string();
+                                        let world = ps.field(EDITOR_FIELD_WORLD)
+                                            .and_then(|f| f.kind.get_text())
+                                            .unwrap_or("")
+                                            .to_string();
+                                        let pattern = ps.field(EDITOR_FIELD_PATTERN)
+                                            .and_then(|f| f.kind.get_text())
+                                            .unwrap_or("")
+                                            .to_string();
+                                        let command = ps.field(EDITOR_FIELD_COMMAND)
+                                            .and_then(|f| f.kind.get_text())
+                                            .unwrap_or("")
+                                            .to_string();
+                                        let match_type_idx = ps.field(EDITOR_FIELD_MATCH_TYPE)
+                                            .and_then(|f| if let crate::popup::FieldKind::Select { selected_index, .. } = &f.kind {
+                                                Some(*selected_index)
+                                            } else { None })
+                                            .unwrap_or(0);
+                                        let enabled = ps.field(EDITOR_FIELD_ENABLED)
+                                            .and_then(|f| if let crate::popup::FieldKind::Toggle { value } = &f.kind {
+                                                Some(*value)
+                                            } else { None })
+                                            .unwrap_or(true);
+
+                                        let action = Action {
+                                            name,
+                                            world,
+                                            pattern,
+                                            command,
+                                            match_type: if match_type_idx == 0 { super::MatchType::Regexp } else { super::MatchType::Wildcard },
+                                            enabled,
+                                            owner: None,
+                                        };
+
+                                        if let Some(idx) = editing_idx {
+                                            if idx < self.actions.len() {
+                                                self.actions[idx] = action;
+                                            }
+                                        } else {
+                                            self.actions.push(action);
+                                        }
+
+                                        self.update_actions();
+                                    }
+                                    self.open_actions_list_unified();
+                                }
+                            }
+                            Some("delete_action") => {
+                                use crate::popup::definitions::confirm::*;
+                                if btn_id == CONFIRM_BTN_YES {
+                                    // Delete the action
+                                    if self.actions_selected < self.actions.len() {
+                                        self.actions.remove(self.actions_selected);
+                                        if self.actions_selected >= self.actions.len() && !self.actions.is_empty() {
+                                            self.actions_selected = self.actions.len() - 1;
+                                        }
+                                        self.update_actions();
+                                    }
+                                    self.open_actions_list_unified();
+                                } else if btn_id == CONFIRM_BTN_NO {
+                                    self.open_actions_list_unified();
+                                }
+                            }
+                            _ => {
+                                // Generic close on any button for unknown popups
+                                should_close_unified = true;
+                            }
+                        }
+                    }
+
+                    if should_close_unified {
+                        self.unified_popup = None;
                     }
                 }
 
