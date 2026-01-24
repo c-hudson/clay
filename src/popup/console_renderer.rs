@@ -137,7 +137,10 @@ fn calculate_content_height(state: &PopupState) -> usize {
             FieldKind::Separator => 1,
             FieldKind::Label { text } => text.lines().count().max(1),
             FieldKind::MultilineText { line_count, .. } => *line_count,
-            FieldKind::List { visible_height, .. } => *visible_height,
+            FieldKind::List { items, visible_height, .. } => {
+                // Use actual item count, capped by visible_height
+                items.len().min(*visible_height)
+            }
             _ => 1,
         };
     }
@@ -166,7 +169,10 @@ fn render_popup_content(f: &mut Frame, state: &PopupState, area: Rect, theme: Th
         let field_height = match &field.kind {
             FieldKind::Label { text } => text.lines().count().max(1) as u16,
             FieldKind::MultilineText { line_count, .. } => *line_count as u16,
-            FieldKind::List { visible_height, .. } => *visible_height as u16,
+            FieldKind::List { items, visible_height, .. } => {
+                // Use actual item count, capped by visible_height
+                items.len().min(*visible_height) as u16
+            }
             _ => 1,
         };
 
