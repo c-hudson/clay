@@ -60,7 +60,7 @@ fn calculate_popup_area(area: Rect, layout: &PopupLayout, state: &PopupState) ->
 
     // Calculate height based on content
     let content_height = calculate_content_height(state);
-    let popup_height = (content_height as u16 + 4) // +2 for borders, +2 for padding
+    let popup_height = (content_height as u16 + 2) // +2 for borders only
         .min(area.height.saturating_sub(2))
         .max(5);
 
