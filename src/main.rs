@@ -7,6 +7,7 @@ pub mod util;
 pub mod websocket;
 pub mod ansi_music;
 pub mod tf;
+pub mod popup;
 
 // Version information
 const VERSION: &str = "1.0.0-alpha";

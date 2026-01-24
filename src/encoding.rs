@@ -194,6 +194,14 @@ impl Encoding {
         }
     }
 
+    pub fn from_name(name: &str) -> Self {
+        match name.to_lowercase().as_str() {
+            "latin1" => Encoding::Latin1,
+            "fansi" => Encoding::Fansi,
+            _ => Encoding::Utf8,
+        }
+    }
+
     pub fn next(&self) -> Self {
         match self {
             Encoding::Utf8 => Encoding::Latin1,
@@ -315,6 +323,13 @@ impl Theme {
         match self {
             Theme::Dark => Color::White,
             Theme::Light => Color::Blue,
+        }
+    }
+
+    pub fn selection_bg(&self) -> Color {
+        match self {
+            Theme::Dark => Color::Rgb(40, 40, 60),  // Subtle highlight
+            Theme::Light => Color::Rgb(200, 220, 255),  // Light blue
         }
     }
 }
