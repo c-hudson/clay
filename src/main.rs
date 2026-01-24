@@ -4220,6 +4220,7 @@ struct World {
     unseen_lines: usize,
     paused: bool,
     pending_lines: Vec<OutputLine>,
+    pending_count: usize, // For remote client mode: daemon's pending line count (not in pending_lines)
     lines_since_pause: usize,
     settings: WorldSettings,
     log_handle: Option<std::sync::Arc<std::sync::Mutex<std::fs::File>>>,
@@ -4274,6 +4275,7 @@ impl World {
             unseen_lines: 0,
             paused: false,
             pending_lines: Vec::new(),
+            pending_count: 0,
             lines_since_pause: 0,
             settings: WorldSettings::default(),
             log_handle: None,
@@ -4735,6 +4737,8 @@ struct App {
     menu_popup: MenuPopup,
     actions_popup: ActionsPopup,
     web_popup: WebPopup,
+    /// New unified popup manager (gradual migration from old popup types)
+    popup_manager: popup::PopupManager,
     last_ctrl_c: Option<std::time::Instant>,
     last_escape: Option<std::time::Instant>, // For Escape+key sequences (Alt emulation)
     show_tags: bool, // F2 toggles - false = hide tags (default), true = show tags
@@ -4773,6 +4777,8 @@ struct App {
     // PROXY DEBUG: Timestamp when "think proxy" was sent, triggers reload after 2 seconds
     // TODO: Remove once proxy issues are resolved
     proxy_debug_reload_at: Option<std::time::Instant>,
+    /// Remote client mode: WebSocket transmitter for sending commands to server
+    ws_client_tx: Option<mpsc::UnboundedSender<WsMessage>>,
 }
 
 impl App {
@@ -4801,6 +4807,7 @@ impl App {
             menu_popup: MenuPopup::new(),
             actions_popup: ActionsPopup::new(),
             web_popup: WebPopup::new(),
+            popup_manager: popup::PopupManager::new(),
             last_ctrl_c: None,
             last_escape: None,
             show_tags: false, // Default: hide tags
@@ -4822,6 +4829,7 @@ impl App {
             user_connections: std::collections::HashMap::new(),
             tf_engine: tf::TfEngine::new(),
             proxy_debug_reload_at: None, // PROXY DEBUG: TODO remove
+            ws_client_tx: None, // Set when running as remote client (--console mode)
         }
         // Note: No initial world created here - it will be created after load_settings()
         // if no worlds are configured
@@ -4863,6 +4871,275 @@ impl App {
             self.current_world_index.min(self.worlds.len() - 1)
         };
         &mut self.worlds[idx]
+    }
+
+    /// Check if this app is running as a remote client (--console mode)
+    fn is_remote_client(&self) -> bool {
+        self.ws_client_tx.is_some()
+    }
+
+    /// Check if a new-style popup is currently visible
+    fn has_new_popup(&self) -> bool {
+        self.popup_manager.current().map(|s| s.visible).unwrap_or(false)
+    }
+
+    /// Open the help popup using the new unified popup system
+    fn open_help_popup_new(&mut self) {
+        use popup::definitions::help::create_help_popup;
+        self.popup_manager.open(create_help_popup());
+    }
+
+    /// Close the current new-style popup
+    fn close_new_popup(&mut self) {
+        self.popup_manager.close();
+    }
+
+    /// Open the menu popup using the new unified popup system
+    fn open_menu_popup_new(&mut self) {
+        use popup::definitions::menu::create_menu_popup;
+        self.popup_manager.open(create_menu_popup());
+    }
+
+    /// Get the currently selected menu item command (if menu popup is active)
+    fn get_selected_menu_command(&self) -> Option<String> {
+        if let Some(state) = self.popup_manager.current() {
+            if state.definition.id == popup::PopupId("menu") {
+                return state.get_selected_list_item().map(|item| item.id.clone());
+            }
+        }
+        None
+    }
+
+    /// Send a command to the MUD (routes through WebSocket if remote client)
+    fn send_to_mud(&mut self, world_index: usize, command: &str) {
+        if let Some(ref tx) = self.ws_client_tx {
+            // Remote client mode - send through WebSocket
+            let _ = tx.send(WsMessage::SendCommand {
+                world_index,
+                command: command.to_string(),
+            });
+        }
+        // Note: In normal mode, command_tx is used directly in run_app()
+    }
+
+    /// Handle incoming WebSocket message when running as remote client
+    fn handle_remote_ws_message(&mut self, msg: WsMessage) {
+        match msg {
+            WsMessage::ServerData { world_index, data, .. } => {
+                if let Some(world) = self.worlds.get_mut(world_index) {
+                    // Check if user was at bottom before adding lines
+                    let was_at_bottom = world.is_at_bottom();
+
+                    for line in data.lines() {
+                        world.output_lines.push(OutputLine::new(line.to_string()));
+                    }
+
+                    // Keep scroll at bottom if user was viewing latest output
+                    // For console client, daemon controls more-mode so always scroll if at bottom
+                    // (paused only affects the indicator, not scrolling)
+                    if was_at_bottom {
+                        world.scroll_offset = world.output_lines.len().saturating_sub(1);
+                    }
+
+                    if world_index != self.current_world_index {
+                        world.unseen_lines += data.lines().count();
+                    }
+                    self.needs_output_redraw = true;
+                }
+            }
+            WsMessage::WorldConnected { world_index, .. } => {
+                if let Some(world) = self.worlds.get_mut(world_index) {
+                    world.connected = true;
+                    self.needs_output_redraw = true;
+                }
+            }
+            WsMessage::WorldDisconnected { world_index } => {
+                if let Some(world) = self.worlds.get_mut(world_index) {
+                    world.connected = false;
+                    self.needs_output_redraw = true;
+                }
+            }
+            WsMessage::WorldSwitched { new_index } => {
+                self.current_world_index = new_index;
+                self.needs_output_redraw = true;
+            }
+            WsMessage::PromptUpdate { world_index, prompt } => {
+                if let Some(world) = self.worlds.get_mut(world_index) {
+                    world.prompt = prompt;
+                }
+            }
+            WsMessage::UnseenCleared { world_index } => {
+                if let Some(world) = self.worlds.get_mut(world_index) {
+                    world.unseen_lines = 0;
+                }
+            }
+            WsMessage::UnseenUpdate { world_index, count } => {
+                if let Some(world) = self.worlds.get_mut(world_index) {
+                    world.unseen_lines = count;
+                }
+            }
+            WsMessage::PendingLinesUpdate { world_index, count } => {
+                if let Some(world) = self.worlds.get_mut(world_index) {
+                    // Track pending count from daemon (no actual lines stored client-side)
+                    world.pending_count = count;
+                    world.paused = count > 0;
+                    self.needs_output_redraw = true;
+                }
+            }
+            WsMessage::PendingReleased { world_index, count: _ } => {
+                if let Some(world) = self.worlds.get_mut(world_index) {
+                    // Pending lines released - daemon will send ServerData and PendingLinesUpdate
+                    // Just ensure we scroll to bottom to show new content
+                    world.scroll_to_bottom();
+                    self.needs_output_redraw = true;
+                }
+            }
+            WsMessage::WorldStateResponse { world_index, pending_count, prompt, scroll_offset, recent_lines } => {
+                if let Some(world) = self.worlds.get_mut(world_index) {
+                    world.scroll_offset = scroll_offset;
+                    world.prompt = prompt;
+                    world.pending_count = pending_count;
+                    world.paused = pending_count > 0;
+                    // Append recent lines
+                    for tl in recent_lines {
+                        world.output_lines.push(OutputLine {
+                            text: tl.text,
+                            timestamp: std::time::UNIX_EPOCH + std::time::Duration::from_secs(tl.ts),
+                            from_server: true,
+                            gagged: tl.gagged,
+                        });
+                    }
+                    self.needs_output_redraw = true;
+                }
+            }
+            WsMessage::WorldFlushed { world_index } => {
+                // World's output buffer was cleared (e.g., splash screen replaced with MUD data)
+                if let Some(world) = self.worlds.get_mut(world_index) {
+                    world.output_lines.clear();
+                    world.pending_count = 0;
+                    world.paused = false;
+                    world.scroll_offset = 0;
+                    world.partial_line.clear();
+                    self.needs_output_redraw = true;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Initialize App state from InitialState message (remote client mode)
+    fn init_from_initial_state(
+        &mut self,
+        worlds: Vec<WorldStateMsg>,
+        current_world_index: usize,
+        settings: GlobalSettingsMsg,
+        splash_lines: Vec<String>,
+    ) {
+        // Debug: log what we're receiving to file
+        use std::io::Write;
+        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open("/tmp/clay-debug.log") {
+            let _ = writeln!(f, "DEBUG init_from_initial_state: {} worlds, current_world_index={}, splash_lines={}",
+                worlds.len(), current_world_index, splash_lines.len());
+            for (i, w) in worlds.iter().enumerate() {
+                let _ = writeln!(f, "  World {}: name={}, connected={}, output_lines_ts={}, scroll_offset={}",
+                    i, w.name, w.connected, w.output_lines_ts.len(), w.scroll_offset);
+                // Show first few lines of content for world 0
+                if i == 0 {
+                    let _ = writeln!(f, "    showing_splash={}", w.showing_splash);
+                    for (j, line) in w.output_lines_ts.iter().take(5).enumerate() {
+                        // Truncate safely at char boundary
+                        let preview: String = line.text.chars().take(60).collect();
+                        let _ = writeln!(f, "    Line {}: len={} text={:?}", j, line.text.len(), preview);
+                    }
+                }
+            }
+        }
+
+        self.worlds = worlds.into_iter().map(|w| {
+            let mut world = World::new(&w.name);
+            world.connected = w.connected;
+            let output_lines_count = w.output_lines_ts.len();
+            world.output_lines = w.output_lines_ts.into_iter().map(|tl| {
+                OutputLine {
+                    text: tl.text,
+                    timestamp: std::time::UNIX_EPOCH + std::time::Duration::from_secs(tl.ts),
+                    from_server: true,
+                    gagged: tl.gagged,
+                }
+            }).collect();
+            world.unseen_lines = w.unseen_lines;
+            // Use server's scroll_offset, or set to end of buffer if showing splash
+            world.scroll_offset = if w.showing_splash {
+                output_lines_count.saturating_sub(1)
+            } else {
+                w.scroll_offset
+            };
+            world.pending_lines = w.pending_lines_ts.into_iter().map(|tl| {
+                OutputLine {
+                    text: tl.text,
+                    timestamp: std::time::UNIX_EPOCH + std::time::Duration::from_secs(tl.ts),
+                    from_server: true,
+                    gagged: tl.gagged,
+                }
+            }).collect();
+            world.paused = w.paused;
+            world.prompt = w.prompt;
+            world.showing_splash = w.showing_splash;
+            world.settings = WorldSettings {
+                hostname: w.settings.hostname,
+                port: w.settings.port,
+                user: w.settings.user,
+                password: String::new(), // Don't receive passwords from server
+                use_ssl: w.settings.use_ssl,
+                log_enabled: w.settings.log_enabled,
+                encoding: Encoding::from_name(&w.settings.encoding),
+                auto_connect_type: AutoConnectType::from_name(&w.settings.auto_connect_type),
+                keep_alive_type: KeepAliveType::from_name(&w.settings.keep_alive_type),
+                keep_alive_cmd: w.settings.keep_alive_cmd,
+                ..WorldSettings::default()
+            };
+            world
+        }).collect();
+        self.current_world_index = current_world_index;
+        self.settings.more_mode_enabled = settings.more_mode_enabled;
+        self.settings.spell_check_enabled = settings.spell_check_enabled;
+        self.settings.temp_convert_enabled = settings.temp_convert_enabled;
+        self.show_tags = settings.show_tags;
+        self.input_height = settings.input_height;
+        self.is_master = false; // Remote client is never master
+
+        // If current world has no output, add splash screen
+        if !splash_lines.is_empty() {
+            if let Some(world) = self.worlds.get_mut(current_world_index) {
+                if world.output_lines.is_empty() && !world.connected {
+                    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open("/tmp/clay-debug.log") {
+                        let _ = writeln!(f, "DEBUG: Adding splash screen to world {} (was empty and not connected)", world.name);
+                    }
+                    world.output_lines = splash_lines.into_iter()
+                        .map(|text| OutputLine::new(text))
+                        .collect();
+                    world.showing_splash = true;
+                    world.scroll_offset = world.output_lines.len().saturating_sub(1);
+                } else {
+                    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open("/tmp/clay-debug.log") {
+                        let _ = writeln!(f, "DEBUG: NOT adding splash - output_lines.len()={}, connected={}",
+                            world.output_lines.len(), world.connected);
+                    }
+                }
+            }
+        }
+        // Final state
+        if let Some(world) = self.worlds.get(current_world_index) {
+            if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open("/tmp/clay-debug.log") {
+                let _ = writeln!(f, "DEBUG: Final state - current world has {} output_lines, scroll_offset={}, showing_splash={}",
+                    world.output_lines.len(), world.scroll_offset, world.showing_splash);
+                // Show actual text in the world's output_lines
+                for (j, line) in world.output_lines.iter().take(5).enumerate() {
+                    let preview: String = line.text.chars().take(60).collect();
+                    let _ = writeln!(f, "  App Line {}: len={} text={:?}", j, line.text.len(), preview);
+                }
+            }
+        }
     }
 
     /// Find world index by name (case-insensitive)
@@ -5212,6 +5489,250 @@ impl App {
         ws_min
     }
 
+    /// Process incoming server data - shared logic for both console and daemon modes
+    /// Returns commands that need to be executed (for trigger processing)
+    fn process_server_data(
+        &mut self,
+        world_idx: usize,
+        bytes: &[u8],
+        console_height: u16,
+        console_width: u16,
+        is_daemon_mode: bool,
+    ) -> Vec<String> {
+        self.worlds[world_idx].last_receive_time = Some(std::time::Instant::now());
+
+        // Consider "current" if console OR any web/GUI client is viewing this world
+        let is_current = world_idx == self.current_world_index || self.ws_client_viewing(world_idx);
+        let decoded_data = self.worlds[world_idx].settings.encoding.decode(bytes);
+
+        // Extract ANSI music sequences FIRST, before any other processing
+        let (data, music_sequences) = if self.settings.ansi_music_enabled {
+            ansi_music::extract_music(&decoded_data)
+        } else {
+            (decoded_data, Vec::new())
+        };
+
+        // Broadcast music to WebSocket clients (web/GUI play audio)
+        for notes in music_sequences {
+            self.ws_broadcast(WsMessage::AnsiMusic {
+                world_index: world_idx,
+                notes,
+            });
+        }
+
+        let world_name_for_triggers = self.worlds[world_idx].name.clone();
+        let actions = self.settings.actions.clone();
+
+        // Combine with any partial line from previous data chunk
+        let had_trigger_partial = !self.worlds[world_idx].trigger_partial_line.is_empty();
+        let combined_data = if had_trigger_partial {
+            let mut s = std::mem::take(&mut self.worlds[world_idx].trigger_partial_line);
+            s.push_str(&data);
+            s
+        } else {
+            data.clone()
+        };
+
+        // Process action triggers on complete lines
+        // Track lines with gagged flag: (line, is_gagged)
+        let mut processed_lines: Vec<(&str, bool)> = Vec::new();
+        let mut commands_to_execute: Vec<String> = Vec::new();
+        let mut tf_commands_to_execute: Vec<String> = Vec::new();
+        let ends_with_newline = combined_data.ends_with('\n');
+        let lines: Vec<&str> = combined_data.lines().collect();
+        let line_count = lines.len();
+        let mut has_partial = false;
+        // Use persistent flag to track idler filtering across TCP packets
+        let mut just_filtered_idler = self.worlds[world_idx].just_filtered_idler;
+
+        for (i, line) in lines.iter().enumerate() {
+            let is_last = i == line_count - 1;
+            let is_partial = is_last && !ends_with_newline;
+
+            // Filter out keep-alive idler message lines (only for Custom/Generic keep-alive types)
+            let uses_idler_keepalive = matches!(
+                self.worlds[world_idx].settings.keep_alive_type,
+                KeepAliveType::Custom | KeepAliveType::Generic
+            );
+            if uses_idler_keepalive && line.contains("###_idler_message_") && line.contains("_###") {
+                just_filtered_idler = true;
+                continue;
+            }
+
+            // Filter blank lines that immediately follow an idler message
+            if just_filtered_idler && is_visually_empty(line) {
+                just_filtered_idler = false; // Reset after filtering the blank
+                continue;
+            }
+            just_filtered_idler = false;
+
+            // Check triggers on complete lines only
+            if is_partial {
+                // Store partial line for next chunk - don't process yet
+                self.worlds[world_idx].trigger_partial_line = line.to_string();
+                has_partial = true;
+            } else {
+                let mut is_gagged = false;
+                // Check Clay action triggers
+                if let Some(result) = check_action_triggers(line, &world_name_for_triggers, &actions) {
+                    // Collect commands to execute
+                    commands_to_execute.extend(result.commands);
+                    is_gagged = result.should_gag;
+                }
+                // Check TF triggers
+                let tf_result = tf::bridge::process_line(&mut self.tf_engine, line, Some(&world_name_for_triggers));
+                commands_to_execute.extend(tf_result.send_commands);
+                tf_commands_to_execute.extend(tf_result.clay_commands);
+                is_gagged = is_gagged || tf_result.should_gag;
+                // Only add complete lines with gagged flag
+                processed_lines.push((line, is_gagged));
+            }
+        }
+
+        // Save the idler filter state for next packet
+        self.worlds[world_idx].just_filtered_idler = just_filtered_idler;
+
+        // If we have a partial line and world uses WONT ECHO prompts, start timeout
+        if has_partial && self.worlds[world_idx].prompt.is_empty()
+            && self.worlds[world_idx].uses_wont_echo_prompt {
+            self.worlds[world_idx].wont_echo_time = Some(std::time::Instant::now());
+        }
+
+        // Separate gagged and non-gagged lines
+        let non_gagged_lines: Vec<&str> = processed_lines.iter()
+            .filter(|(_, gagged)| !gagged)
+            .map(|(line, _)| *line)
+            .collect();
+        let gagged_lines: Vec<&str> = processed_lines.iter()
+            .filter(|(_, gagged)| *gagged)
+            .map(|(line, _)| *line)
+            .collect();
+
+        // Rebuild data for non-gagged lines
+        // Add trailing newline if original ended with newline OR if we have a partial
+        // (because a partial means there was a newline before it that we need to preserve)
+        let filtered_data = if non_gagged_lines.is_empty() {
+            String::new()
+        } else {
+            let mut result = non_gagged_lines.join("\n");
+            if ends_with_newline || has_partial {
+                result.push('\n');
+            }
+            result
+        };
+
+        // Add non-gagged output to world
+        if !filtered_data.is_empty() {
+            let settings = self.settings.clone();
+
+            // Calculate minimum visible lines among all viewers for synchronized more-mode
+            // Console counts as a viewer if it's viewing this world (unless daemon mode)
+            let console_viewing = !is_daemon_mode && world_idx == self.current_world_index;
+            let ws_min = self.min_viewer_lines(world_idx);
+            let output_height = match (console_viewing, ws_min) {
+                (true, Some(ws)) => console_height.min(ws as u16),
+                (true, None) => console_height,
+                (false, Some(ws)) => ws as u16,
+                (false, None) => {
+                    // Daemon mode with no viewers - use minimum across all clients
+                    self.ws_client_worlds.values()
+                        .map(|s| s.visible_lines)
+                        .min()
+                        .unwrap_or(24) as u16
+                }
+            };
+
+            // Track pending count before add_output for synchronized more-mode
+            let pending_before = self.worlds[world_idx].pending_lines.len();
+            let output_before = self.worlds[world_idx].output_lines.len();
+            let was_showing_splash = self.worlds[world_idx].showing_splash;
+
+            self.worlds[world_idx].add_output(&filtered_data, is_current, &settings, output_height, console_width, true, true);
+
+            // Check if splash was cleared (output_lines was reset)
+            let splash_was_cleared = was_showing_splash && !self.worlds[world_idx].showing_splash;
+
+            // Calculate what went where
+            let pending_after = self.worlds[world_idx].pending_lines.len();
+            let output_after = self.worlds[world_idx].output_lines.len();
+
+            // If splash was cleared, output_lines was reset, so we need to broadcast ALL output lines
+            // (not just the difference from before)
+            let (lines_to_output, skip_count) = if splash_was_cleared {
+                // Broadcast all output lines since buffer was cleared
+                (output_after, 0)
+            } else {
+                // Normal case: broadcast only newly added lines
+                (output_after.saturating_sub(output_before), output_before)
+            };
+            let lines_to_pending = pending_after.saturating_sub(pending_before);
+
+            // Mark output for redraw if this is the current world
+            if world_idx == self.current_world_index {
+                self.needs_output_redraw = true;
+            }
+
+            // If splash was cleared, tell clients to flush their buffers first
+            if splash_was_cleared {
+                self.ws_broadcast(WsMessage::WorldFlushed { world_index: world_idx });
+            }
+
+            // For synchronized more-mode: only broadcast lines that went to output_lines
+            // Lines that went to pending_lines will be broadcast when released
+            if lines_to_output > 0 {
+                // Get only the lines that went to output_lines
+                let output_lines_to_broadcast: Vec<String> = self.worlds[world_idx]
+                    .output_lines
+                    .iter()
+                    .skip(skip_count)
+                    .take(lines_to_output)
+                    .map(|line| line.text.replace('\r', ""))
+                    .collect();
+                let ws_data = output_lines_to_broadcast.join("\n") + "\n";
+
+                self.ws_broadcast(WsMessage::ServerData {
+                    world_index: world_idx,
+                    data: ws_data,
+                    is_viewed: is_current,
+                    ts: current_timestamp_secs(),
+                });
+            }
+
+            // Broadcast pending count update if it changed (for synchronized more-mode indicator)
+            if lines_to_pending > 0 || pending_after != pending_before {
+                self.ws_broadcast(WsMessage::PendingLinesUpdate {
+                    world_index: world_idx,
+                    count: pending_after,
+                });
+            }
+
+            // Broadcast updated unseen count so all clients stay in sync
+            let unseen_count = self.worlds[world_idx].unseen_lines;
+            if unseen_count > 0 {
+                self.ws_broadcast(WsMessage::UnseenUpdate {
+                    world_index: world_idx,
+                    count: unseen_count,
+                });
+            }
+
+            // Broadcast activity count to keep all clients in sync
+            self.broadcast_activity();
+        }
+
+        // Add gagged lines to output (they'll only show with F2)
+        for line in gagged_lines {
+            self.worlds[world_idx].output_lines.push(OutputLine::new_gagged(line.to_string()));
+        }
+        // Keep scroll at bottom if we added gagged lines
+        if !self.worlds[world_idx].paused {
+            self.worlds[world_idx].scroll_to_bottom();
+        }
+
+        // Merge TF commands into commands_to_execute
+        commands_to_execute.extend(tf_commands_to_execute);
+        commands_to_execute
+    }
+
     /// Build initial state message for a newly authenticated client
     fn build_initial_state(&self) -> WsMessage {
         let worlds: Vec<WorldStateMsg> = self.worlds.iter().enumerate().map(|(idx, world)| {
@@ -5243,6 +5764,7 @@ impl App {
             // Sort by timestamp to ensure chronological order
             all_lines.sort_by_key(|line| line.ts);
             // Send all lines as output_lines_ts, pending_lines_ts is empty (clients handle more-mode locally)
+            let combined_len = all_lines.len();
             let output_lines_ts = all_lines;
             let pending_lines_ts: Vec<TimestampedLine> = Vec::new();
             WorldStateMsg {
@@ -5254,8 +5776,10 @@ impl App {
                 output_lines_ts,
                 pending_lines_ts,
                 prompt: world.prompt.replace('\r', ""),
-                scroll_offset: world.scroll_offset,
-                paused: world.paused,
+                // Set scroll_offset to end of combined lines so client starts at bottom
+                scroll_offset: combined_len.saturating_sub(1),
+                // Client starts unpaused since pending is empty in output_lines_ts
+                paused: false,
                 unseen_lines: world.unseen_lines,
                 settings: WorldSettingsMsg {
                     hostname: world.settings.hostname.clone(),
@@ -5273,6 +5797,7 @@ impl App {
                 last_recv_secs: world.last_receive_time.map(|t| t.elapsed().as_secs()),
                 last_nop_secs: world.last_nop_time.map(|t| t.elapsed().as_secs()),
                 keep_alive_type: world.settings.keep_alive_type.name().to_string(),
+                showing_splash: world.showing_splash,
             }
         }).collect();
 
@@ -5305,12 +5830,33 @@ impl App {
             tls_proxy_enabled: self.settings.tls_proxy_enabled,
         };
 
+        // Debug: log what we're sending to file
+        {
+            use std::io::Write;
+            if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open("/tmp/clay-debug.log") {
+                let _ = writeln!(f, "DEBUG build_initial_state: {} worlds, current_world_index={}", worlds.len(), self.current_world_index);
+                for (i, w) in worlds.iter().enumerate() {
+                    let _ = writeln!(f, "  World {}: name={}, connected={}, output_lines_ts={}, scroll_offset={}",
+                        i, w.name, w.connected, w.output_lines_ts.len(), w.scroll_offset);
+                    // Show first few lines of content for world 0
+                    if i == 0 {
+                        let _ = writeln!(f, "    showing_splash={}", w.showing_splash);
+                        for (j, line) in w.output_lines_ts.iter().take(5).enumerate() {
+                            // Truncate safely at char boundary
+                            let preview: String = line.text.chars().take(60).collect();
+                            let _ = writeln!(f, "    Line {}: len={} text={:?}", j, line.text.len(), preview);
+                        }
+                    }
+                }
+            }
+        }
+
         WsMessage::InitialState {
             worlds,
             settings,
             current_world_index: self.current_world_index,
             actions: self.settings.actions.clone(),
-            splash_lines: Vec::new(),
+            splash_lines: generate_splash_strings(),
         }
     }
 
@@ -10973,9 +11519,8 @@ mod remote_gui {
                             } else if i.consume_key(egui::Modifiers::ALT, egui::Key::ArrowDown) {
                                 resize_input = 1;
                             }
-                        } else if i.modifiers.ctrl {
-                            // Ctrl+Up/Down - let egui TextEdit handle cursor movement in multi-line input
-                            // (Don't consume these keys so they pass through to the input widget)
+                            // Note: Ctrl+Up/Down are handled by first ctrl block, letting egui TextEdit
+                            // handle cursor movement in multi-line input if not consumed
                         } else {
                             // Non-modified keys - consume to prevent widgets from handling
                             if i.consume_key(egui::Modifiers::NONE, egui::Key::PageUp) {
@@ -15962,6 +16507,1307 @@ fn run_remote_gui(addr: &str) -> io::Result<()> {
     remote_gui::run(addr, runtime)
 }
 
+/// Run as console client connecting to remote daemon (--console=host:port)
+/// Uses the same App struct and ui() function as the normal console interface
+async fn run_console_client(addr: &str) -> io::Result<()> {
+    use tokio_tungstenite::{connect_async, tungstenite::Message};
+    use futures::{StreamExt, SinkExt};
+
+    // Parse address - add ws:// prefix if not present
+    let ws_url = if addr.starts_with("ws://") || addr.starts_with("wss://") {
+        addr.to_string()
+    } else {
+        format!("ws://{}", addr)
+    };
+
+    println!("Connecting to {}...", ws_url);
+
+    // Connect to WebSocket server
+    let (ws_stream, _) = match connect_async(&ws_url).await {
+        Ok(result) => result,
+        Err(e) => {
+            eprintln!("Failed to connect to {}: {}", ws_url, e);
+            return Ok(());
+        }
+    };
+
+    let (mut ws_write, mut ws_read) = ws_stream.split();
+
+    // Create a channel for sending messages to the WebSocket
+    let (ws_tx, mut ws_rx) = mpsc::unbounded_channel::<WsMessage>();
+
+    // Spawn task to forward messages to WebSocket
+    let ws_write_handle = tokio::spawn(async move {
+        while let Some(msg) = ws_rx.recv().await {
+            if let Ok(json) = serde_json::to_string(&msg) {
+                if ws_write.send(Message::Text(json.into())).await.is_err() {
+                    break;
+                }
+            }
+        }
+    });
+
+    // Simple password prompt (not in alternate screen)
+    print!("Password? ");
+    let _ = io::stdout().flush();
+
+    // Read password with raw mode for character-by-character input
+    let mut password = String::new();
+    enable_raw_mode()?;
+    let mut event_stream = EventStream::new();
+    loop {
+        tokio::select! {
+            maybe_event = event_stream.next() => {
+                if let Some(Ok(Event::Key(key))) = maybe_event {
+                    match key.code {
+                        KeyCode::Enter => {
+                            disable_raw_mode()?;
+                            println!(); // Move to next line after password
+                            // Send authentication
+                            let password_hash = hash_password(&password);
+                            let _ = ws_tx.send(WsMessage::AuthRequest { password_hash, username: None });
+                            break;
+                        }
+                        KeyCode::Char(c) => {
+                            password.push(c);
+                        }
+                        KeyCode::Backspace => {
+                            password.pop();
+                        }
+                        KeyCode::Esc => {
+                            disable_raw_mode()?;
+                            println!();
+                            return Ok(());
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            msg = ws_read.next() => {
+                match msg {
+                    Some(Ok(Message::Text(text))) => {
+                        if let Ok(ws_msg) = serde_json::from_str::<WsMessage>(&text) {
+                            if let WsMessage::AuthResponse { success, error, .. } = ws_msg {
+                                if !success {
+                                    disable_raw_mode()?;
+                                    println!();
+                                    eprintln!("Authentication failed: {}", error.unwrap_or_default());
+                                    return Ok(());
+                                }
+                                // Auth success - continue to wait for InitialState
+                                break;
+                            }
+                        }
+                    }
+                    Some(Ok(Message::Close(_))) | None => {
+                        disable_raw_mode()?;
+                        println!();
+                        eprintln!("Connection closed");
+                        return Ok(());
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    // Create App struct and set it up for remote client mode
+    let mut app = App::new();
+    app.ws_client_tx = Some(ws_tx.clone());
+    app.is_master = false;
+
+    // Now set up the terminal for the main UI
+    enable_raw_mode()?;
+    let mut stdout = io::stdout();
+    execute!(stdout, EnterAlternateScreen)?;
+    let backend = CrosstermBackend::new(stdout);
+    let mut terminal = Terminal::new(backend)?;
+
+    // Wait for InitialState
+    loop {
+        if let Some(Ok(Message::Text(text))) = ws_read.next().await {
+            if let Ok(ws_msg) = serde_json::from_str::<WsMessage>(&text) {
+                match ws_msg {
+                    WsMessage::AuthResponse { success, error, .. } => {
+                        if !success {
+                            disable_raw_mode()?;
+                            execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
+                            eprintln!("Authentication failed: {}", error.unwrap_or_default());
+                            return Ok(());
+                        }
+                        // Auth success - continue waiting for InitialState
+                    }
+                    WsMessage::InitialState { worlds, current_world_index, settings, splash_lines, .. } => {
+                        // Initialize app state from server
+                        app.init_from_initial_state(worlds, current_world_index, settings, splash_lines);
+                        // Send initial view state for more-mode sync
+                        let (_, height) = crossterm::terminal::size().unwrap_or((80, 24));
+                        let visible_lines = height.saturating_sub(4) as usize; // Account for input area and separator
+                        let _ = ws_tx.send(WsMessage::UpdateViewState {
+                            world_index: current_world_index,
+                            visible_lines,
+                        });
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+        } else {
+            disable_raw_mode()?;
+            execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
+            eprintln!("Connection closed while waiting for initial state");
+            return Ok(());
+        }
+    }
+
+    // Main event loop - use the same ui() function as the normal console
+    app.needs_output_redraw = true;
+    let mut needs_redraw = true;
+
+    loop {
+        // Draw if needed
+        if needs_redraw || app.needs_output_redraw {
+            terminal.draw(|f| ui(f, &mut app))?;
+            // Render output with crossterm (bypasses ratatui's buggy ANSI handling)
+            render_output_crossterm(&app);
+            needs_redraw = false;
+            app.needs_output_redraw = false;
+        }
+
+        tokio::select! {
+            maybe_event = event_stream.next() => {
+                if let Some(Ok(event)) = maybe_event {
+                    match event {
+                        Event::Key(key) => {
+                            // Handle Ctrl+C with double-press to quit
+                            if key.modifiers == KeyModifiers::CONTROL && key.code == KeyCode::Char('c') {
+                                if let Some(last_time) = app.last_ctrl_c {
+                                    if last_time.elapsed() < std::time::Duration::from_secs(15) {
+                                        break; // Second Ctrl+C within 15 seconds - quit
+                                    }
+                                }
+                                // First Ctrl+C or timeout - show message and record time
+                                app.last_ctrl_c = Some(std::time::Instant::now());
+                                let world = app.current_world_mut();
+                                world.showing_splash = false; // Clear splash when adding output
+                                world.output_lines.push(
+                                    OutputLine::new("Press Ctrl+C again within 15 seconds to exit, or use /quit".to_string())
+                                );
+                                // Keep scroll at bottom
+                                world.scroll_offset = world.output_lines.len().saturating_sub(1);
+                                needs_redraw = true;
+                                continue;
+                            }
+
+                            // Handle remote client key events
+                            if handle_remote_client_key(&mut app, key, &ws_tx) {
+                                break; // Quit requested
+                            }
+                            needs_redraw = true;
+                        }
+                        Event::Resize(_, height) => {
+                            // Send updated view state for more-mode sync
+                            let visible_lines = height.saturating_sub(4) as usize;
+                            let _ = ws_tx.send(WsMessage::UpdateViewState {
+                                world_index: app.current_world_index,
+                                visible_lines,
+                            });
+                            needs_redraw = true;
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            msg = ws_read.next() => {
+                match msg {
+                    Some(Ok(Message::Text(text))) => {
+                        if let Ok(ws_msg) = serde_json::from_str::<WsMessage>(&text) {
+                            app.handle_remote_ws_message(ws_msg);
+                            needs_redraw = true;
+                        }
+                    }
+                    Some(Ok(Message::Ping(_))) => {
+                        // Respond to ping - handled by tungstenite automatically
+                    }
+                    Some(Ok(Message::Close(_))) | None => {
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    // Cleanup
+    ws_write_handle.abort();
+    disable_raw_mode()?;
+    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
+    Ok(())
+}
+
+/// Handle key events for remote console client mode
+/// Returns true if quit was requested
+fn handle_remote_client_key(
+    app: &mut App,
+    key: KeyEvent,
+    ws_tx: &mpsc::UnboundedSender<WsMessage>,
+) -> bool {
+    use KeyCode::*;
+
+    // Check if any popup is visible - handle popup input first
+    if app.settings_popup.visible {
+        handle_remote_settings_popup_key(app, key);
+        return false;
+    }
+    if app.web_popup.visible {
+        handle_remote_web_popup_key(app, key);
+        return false;
+    }
+    // New unified popup system - handles help popup and others
+    if app.has_new_popup() {
+        if let Some(_cmd) = handle_new_popup_key(app, key) {
+            // Menu command selected - remote client doesn't execute commands locally
+            // The command would need to be sent to the server
+        }
+        return false;
+    }
+    if app.world_selector.visible {
+        handle_remote_world_selector_key(app, key, ws_tx);
+        return false;
+    }
+    if app.help_popup.visible {
+        // Help popup - Escape or Enter closes it
+        let visible_height = app.output_height.saturating_sub(4) as usize;
+        match key.code {
+            Esc | Enter => app.help_popup.visible = false,
+            Up => app.help_popup.scroll_up(),
+            Down => app.help_popup.scroll_down(visible_height),
+            PageUp => {
+                for _ in 0..10 { app.help_popup.scroll_up(); }
+            }
+            PageDown => {
+                for _ in 0..10 { app.help_popup.scroll_down(visible_height); }
+            }
+            _ => {}
+        }
+        return false;
+    }
+    if app.filter_popup.visible {
+        handle_remote_filter_popup_key(app, key);
+        return false;
+    }
+    if app.actions_popup.visible {
+        // Actions popup - Escape closes it
+        if key.code == Esc {
+            app.actions_popup.visible = false;
+        }
+        return false;
+    }
+    if app.worlds_popup.visible {
+        // Worlds popup - Escape closes it
+        if key.code == Esc {
+            app.worlds_popup.visible = false;
+        }
+        return false;
+    }
+
+    match (key.modifiers, key.code) {
+        (KeyModifiers::CONTROL, Char('u')) => {
+            app.input.clear();
+        }
+        (KeyModifiers::CONTROL, Char('w')) => {
+            app.input.delete_word_before_cursor();
+        }
+        (KeyModifiers::CONTROL, Char('a')) | (_, Home) => {
+            app.input.home();
+        }
+        (_, End) => {
+            app.input.end();
+        }
+        (KeyModifiers::CONTROL, Char('p')) => {
+            app.input.history_prev();
+        }
+        (KeyModifiers::CONTROL, Char('n')) => {
+            app.input.history_next();
+        }
+        (KeyModifiers::CONTROL, Char('b')) | (_, Left) => {
+            app.input.move_cursor_left();
+        }
+        (KeyModifiers::CONTROL, Char('f')) | (_, Right) => {
+            app.input.move_cursor_right();
+        }
+        (KeyModifiers::CONTROL, Up) => {
+            app.input.move_cursor_up();
+        }
+        (KeyModifiers::CONTROL, Down) => {
+            app.input.move_cursor_down();
+        }
+        (KeyModifiers::ALT, Up) => {
+            // Resize input area smaller
+            if app.input_height > 1 {
+                app.input_height -= 1;
+            }
+        }
+        (KeyModifiers::ALT, Down) => {
+            // Resize input area larger
+            if app.input_height < 15 {
+                app.input_height += 1;
+            }
+        }
+        (_, Up) => {
+            // Switch to previous active world
+            if !app.worlds.is_empty() {
+                let new_idx = if app.current_world_index == 0 {
+                    app.worlds.len() - 1
+                } else {
+                    app.current_world_index - 1
+                };
+                app.current_world_index = new_idx;
+                let _ = ws_tx.send(WsMessage::MarkWorldSeen { world_index: new_idx });
+            }
+        }
+        (_, Down) => {
+            // Switch to next active world
+            if !app.worlds.is_empty() {
+                let new_idx = (app.current_world_index + 1) % app.worlds.len();
+                app.current_world_index = new_idx;
+                let _ = ws_tx.send(WsMessage::MarkWorldSeen { world_index: new_idx });
+            }
+        }
+        (_, PageUp) => {
+            let scroll_amount = app.output_height.saturating_sub(2) as usize;
+            app.current_world_mut().scroll_offset = app.current_world().scroll_offset.saturating_add(scroll_amount.max(1));
+            app.needs_output_redraw = true;
+        }
+        (_, PageDown) => {
+            let scroll_amount = app.output_height.saturating_sub(2) as usize;
+            app.current_world_mut().scroll_offset = app.current_world().scroll_offset.saturating_sub(scroll_amount.max(1));
+            app.needs_output_redraw = true;
+        }
+        (_, Tab) => {
+            // Release pending lines or scroll down
+            // Use pending_count for console mode (synced from daemon), pending_lines for daemon mode
+            let has_pending = !app.current_world().pending_lines.is_empty() || app.current_world().pending_count > 0;
+            if app.current_world().paused && has_pending {
+                let _ = ws_tx.send(WsMessage::ReleasePending {
+                    world_index: app.current_world_index,
+                    count: app.output_height.saturating_sub(2) as usize,
+                });
+            } else if app.current_world().scroll_offset > 0 {
+                let scroll_amount = app.output_height.saturating_sub(2) as usize;
+                app.current_world_mut().scroll_offset = app.current_world().scroll_offset.saturating_sub(scroll_amount.max(1));
+                app.needs_output_redraw = true;
+            }
+        }
+        (_, Backspace) => {
+            app.input.delete_char();
+        }
+        (_, Delete) => {
+            app.input.delete_char_forward();
+        }
+        (_, Enter) => {
+            let cmd = app.input.take_input();
+            if cmd.is_empty() {
+                // Send empty command to server (some MUDs use this for "look")
+                let _ = ws_tx.send(WsMessage::SendCommand {
+                    world_index: app.current_world_index,
+                    command: cmd,
+                });
+            } else {
+                // Parse command to handle local commands
+                let parsed = parse_command(&cmd);
+                match parsed {
+                    Command::Quit => return true,
+                    Command::Help => {
+                        app.help_popup.open();
+                    }
+                    Command::Setup => {
+                        app.settings_popup.open_setup(&app.settings, app.input_height, app.show_tags);
+                    }
+                    Command::Web => {
+                        app.web_popup.open(&app.settings);
+                    }
+                    Command::WorldSelector => {
+                        app.world_selector.open(app.current_world_index);
+                    }
+                    Command::WorldsList => {
+                        // WorldsPopup uses show(), not open()
+                        // Just mark visible for now - full implementation would need screen width
+                        app.worlds_popup.visible = true;
+                    }
+                    Command::WorldSwitch { ref name } | Command::WorldConnectNoLogin { ref name } => {
+                        // /worlds <name> - switch to world if it exists
+                        if let Some(idx) = app.worlds.iter().position(|w| w.name.eq_ignore_ascii_case(name)) {
+                            app.current_world_index = idx;
+                            let _ = ws_tx.send(WsMessage::MarkWorldSeen { world_index: idx });
+                            // If not connected, request connection
+                            if !app.worlds[idx].connected {
+                                let _ = ws_tx.send(WsMessage::ConnectWorld { world_index: idx });
+                            }
+                        } else {
+                            // World doesn't exist - could create it, but for now just show message
+                            app.current_world_mut().output_lines.push(
+                                OutputLine::new(format!("World '{}' not found.", name))
+                            );
+                        }
+                    }
+                    Command::WorldEdit { ref name } => {
+                        // /worlds -e [name] - open world editor
+                        let idx = if let Some(ref n) = name {
+                            app.worlds.iter().position(|w| w.name.eq_ignore_ascii_case(n))
+                                .unwrap_or(app.current_world_index)
+                        } else {
+                            app.current_world_index
+                        };
+                        if idx < app.worlds.len() {
+                            app.settings_popup.open(
+                                &app.settings,
+                                &app.worlds[idx],
+                                idx,
+                                app.input_height,
+                                app.show_tags,
+                            );
+                        }
+                    }
+                    Command::Actions { .. } => {
+                        app.actions_popup.open(&app.settings.actions);
+                    }
+                    Command::Connect { .. } => {
+                        let _ = ws_tx.send(WsMessage::ConnectWorld {
+                            world_index: app.current_world_index,
+                        });
+                    }
+                    Command::Disconnect => {
+                        let _ = ws_tx.send(WsMessage::DisconnectWorld {
+                            world_index: app.current_world_index,
+                        });
+                    }
+                    Command::NotACommand { text } => {
+                        // Regular text - send to server
+                        let _ = ws_tx.send(WsMessage::SendCommand {
+                            world_index: app.current_world_index,
+                            command: text,
+                        });
+                    }
+                    _ => {
+                        // Other commands - send to server for processing
+                        let _ = ws_tx.send(WsMessage::SendCommand {
+                            world_index: app.current_world_index,
+                            command: cmd,
+                        });
+                    }
+                }
+            }
+            // Reset lines_since_pause for more-mode
+            app.current_world_mut().lines_since_pause = 0;
+        }
+        (_, KeyCode::F(1)) => {
+            // Toggle help popup (using new unified popup system)
+            if app.has_new_popup() {
+                app.close_new_popup();
+            } else {
+                app.open_help_popup_new();
+            }
+        }
+        (_, KeyCode::F(2)) => {
+            // Toggle show_tags
+            app.show_tags = !app.show_tags;
+            app.needs_output_redraw = true;
+        }
+        (_, KeyCode::F(4)) => {
+            // Toggle filter popup
+            if app.filter_popup.visible {
+                app.filter_popup.visible = false;
+            } else {
+                app.filter_popup.open();
+            }
+        }
+        (_, KeyCode::F(8)) => {
+            // Toggle action highlighting
+            app.highlight_actions = !app.highlight_actions;
+            app.needs_output_redraw = true;
+        }
+        (_, Char(c)) => {
+            app.input.insert_char(c);
+        }
+        _ => {}
+    }
+    false
+}
+
+/// Handle settings popup input for remote client
+fn handle_remote_settings_popup_key(app: &mut App, key: KeyEvent) {
+    use KeyCode::*;
+
+    if app.settings_popup.editing {
+        // Text editing mode
+        match key.code {
+            Esc => {
+                app.settings_popup.cancel_edit();
+                app.settings_popup.close();
+            }
+            Backspace => {
+                if app.settings_popup.edit_cursor > 0 {
+                    app.settings_popup.edit_cursor -= 1;
+                    app.settings_popup.edit_buffer.remove(app.settings_popup.edit_cursor);
+                    app.settings_popup.adjust_scroll(33);
+                }
+            }
+            Delete => {
+                if app.settings_popup.edit_cursor < app.settings_popup.edit_buffer.len() {
+                    app.settings_popup.edit_buffer.remove(app.settings_popup.edit_cursor);
+                }
+            }
+            Left => {
+                if app.settings_popup.edit_cursor > 0 {
+                    app.settings_popup.edit_cursor -= 1;
+                    app.settings_popup.adjust_scroll(33);
+                }
+            }
+            Right => {
+                if app.settings_popup.edit_cursor < app.settings_popup.edit_buffer.len() {
+                    app.settings_popup.edit_cursor += 1;
+                    app.settings_popup.adjust_scroll(33);
+                }
+            }
+            Home => {
+                app.settings_popup.edit_cursor = 0;
+                app.settings_popup.adjust_scroll(33);
+            }
+            End => {
+                app.settings_popup.edit_cursor = app.settings_popup.edit_buffer.len();
+                app.settings_popup.adjust_scroll(33);
+            }
+            Up => {
+                app.settings_popup.commit_edit();
+                app.settings_popup.prev_field();
+                if app.settings_popup.selected_field.is_text_field() {
+                    app.settings_popup.start_edit();
+                }
+            }
+            Down | Enter | Tab => {
+                app.settings_popup.commit_edit();
+                app.settings_popup.next_field();
+                if app.settings_popup.selected_field.is_text_field() {
+                    app.settings_popup.start_edit();
+                }
+            }
+            Char(c) => {
+                app.settings_popup.edit_buffer.insert(app.settings_popup.edit_cursor, c);
+                app.settings_popup.edit_cursor += 1;
+                app.settings_popup.adjust_scroll(33);
+            }
+            _ => {}
+        }
+    } else {
+        // Navigation mode
+        match key.code {
+            Esc => {
+                app.settings_popup.close();
+            }
+            Enter => {
+                if app.settings_popup.selected_field.is_text_field() {
+                    app.settings_popup.start_edit();
+                } else if app.settings_popup.selected_field.is_button() {
+                    match app.settings_popup.selected_field {
+                        SettingsField::SaveSetup | SettingsField::SaveWorld => {
+                            // Apply and close (simplified - doesn't save to file in remote mode)
+                            if app.settings_popup.setup_mode {
+                                let (new_input_height, new_show_tags) = app.settings_popup.apply_global(&mut app.settings);
+                                app.input_height = new_input_height;
+                                app.show_tags = new_show_tags;
+                            }
+                            app.settings_popup.close();
+                        }
+                        SettingsField::CancelSetup | SettingsField::CancelWorld => {
+                            app.settings_popup.close();
+                        }
+                        _ => {}
+                    }
+                } else {
+                    // Toggle booleans with Enter
+                    app.settings_popup.next_field();
+                }
+            }
+            Up => {
+                app.settings_popup.prev_field();
+                if app.settings_popup.selected_field.is_text_field() {
+                    app.settings_popup.start_edit();
+                }
+            }
+            Down | Tab => {
+                app.settings_popup.next_field();
+                if app.settings_popup.selected_field.is_text_field() {
+                    app.settings_popup.start_edit();
+                }
+            }
+            Char(' ') => {
+                // Space toggles booleans - just move to next field for simplicity
+                app.settings_popup.next_field();
+            }
+            Char(c) => {
+                // Start typing in text fields
+                if app.settings_popup.selected_field.is_text_field() {
+                    app.settings_popup.start_edit();
+                    app.settings_popup.edit_buffer.push(c);
+                    app.settings_popup.edit_cursor = 1;
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Handle input for new unified popup system
+fn handle_new_popup_key(app: &mut App, key: KeyEvent) -> Option<String> {
+    use crossterm::event::KeyCode::*;
+    use popup::definitions::help::HELP_BTN_OK;
+
+    let popup_id = app.popup_manager.current().map(|s| s.definition.id.clone());
+    let is_menu = popup_id == Some(popup::PopupId("menu"));
+
+    if let Some(state) = app.popup_manager.current_mut() {
+        match key.code {
+            Esc => {
+                app.popup_manager.close();
+            }
+            Enter => {
+                // Check popup type
+                if is_menu {
+                    // For menu popup, get selected command and close
+                    if let Some(item) = state.get_selected_list_item() {
+                        let cmd = item.id.clone();
+                        app.popup_manager.close();
+                        return Some(cmd);
+                    }
+                }
+                // For help popup, Enter always closes
+                app.popup_manager.close();
+            }
+            Up => {
+                if is_menu {
+                    state.list_select_up();
+                } else {
+                    state.scroll_up(1);
+                }
+            }
+            Down => {
+                if is_menu {
+                    state.list_select_down();
+                } else {
+                    state.scroll_down(1);
+                }
+            }
+            PageUp => {
+                state.scroll_up(5);
+            }
+            PageDown => {
+                state.scroll_down(5);
+            }
+            Char('o') | Char('O') => {
+                // Shortcut for OK button (help popup)
+                state.select_button(HELP_BTN_OK);
+            }
+            Char('c') | Char('C') => {
+                // Cancel shortcut
+                app.popup_manager.close();
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// Handle web popup input for remote client
+fn handle_remote_web_popup_key(app: &mut App, key: KeyEvent) {
+    use KeyCode::*;
+
+    if app.web_popup.editing {
+        // Text editing mode
+        match key.code {
+            Esc => {
+                app.web_popup.cancel_edit();
+                app.web_popup.close();
+            }
+            Backspace => {
+                if app.web_popup.edit_cursor > 0 {
+                    app.web_popup.edit_cursor -= 1;
+                    app.web_popup.edit_buffer.remove(app.web_popup.edit_cursor);
+                }
+            }
+            Left => {
+                if app.web_popup.edit_cursor > 0 {
+                    app.web_popup.edit_cursor -= 1;
+                }
+            }
+            Right => {
+                if app.web_popup.edit_cursor < app.web_popup.edit_buffer.len() {
+                    app.web_popup.edit_cursor += 1;
+                }
+            }
+            Up => {
+                app.web_popup.commit_edit();
+                app.web_popup.prev_field();
+                if app.web_popup.selected_field.is_text_field() {
+                    app.web_popup.start_edit();
+                }
+            }
+            Down | Enter | Tab => {
+                app.web_popup.commit_edit();
+                app.web_popup.next_field();
+                if app.web_popup.selected_field.is_text_field() {
+                    app.web_popup.start_edit();
+                }
+            }
+            Char(c) => {
+                app.web_popup.edit_buffer.insert(app.web_popup.edit_cursor, c);
+                app.web_popup.edit_cursor += 1;
+            }
+            _ => {}
+        }
+    } else {
+        // Navigation mode
+        match key.code {
+            Esc => {
+                app.web_popup.close();
+            }
+            Enter => {
+                if app.web_popup.selected_field.is_text_field() {
+                    app.web_popup.start_edit();
+                } else if app.web_popup.selected_field.is_button() {
+                    app.web_popup.close();
+                } else {
+                    app.web_popup.next_field();
+                }
+            }
+            Up => {
+                app.web_popup.prev_field();
+                if app.web_popup.selected_field.is_text_field() {
+                    app.web_popup.start_edit();
+                }
+            }
+            Down | Tab => {
+                app.web_popup.next_field();
+                if app.web_popup.selected_field.is_text_field() {
+                    app.web_popup.start_edit();
+                }
+            }
+            Char(' ') => {
+                app.web_popup.next_field();
+            }
+            Char(c) => {
+                if app.web_popup.selected_field.is_text_field() {
+                    app.web_popup.start_edit();
+                    app.web_popup.edit_buffer.push(c);
+                    app.web_popup.edit_cursor = 1;
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Handle world selector popup input for remote client
+fn handle_remote_world_selector_key(app: &mut App, key: KeyEvent, ws_tx: &mpsc::UnboundedSender<WsMessage>) {
+    use KeyCode::*;
+
+    match key.code {
+        Esc => {
+            app.world_selector.close();
+        }
+        Enter => {
+            // Switch to selected world
+            let selected = app.world_selector.selected_index;
+            if selected < app.worlds.len() {
+                app.current_world_index = selected;
+                let _ = ws_tx.send(WsMessage::MarkWorldSeen { world_index: selected });
+            }
+            app.world_selector.close();
+        }
+        Up => {
+            if app.world_selector.selected_index > 0 {
+                app.world_selector.selected_index -= 1;
+            }
+        }
+        Down => {
+            if app.world_selector.selected_index < app.worlds.len().saturating_sub(1) {
+                app.world_selector.selected_index += 1;
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Handle filter popup input for remote client
+fn handle_remote_filter_popup_key(app: &mut App, key: KeyEvent) {
+    use KeyCode::*;
+
+    match key.code {
+        Esc | KeyCode::F(4) => {
+            app.filter_popup.close();
+            app.needs_output_redraw = true;
+        }
+        Backspace => {
+            if app.filter_popup.cursor > 0 {
+                app.filter_popup.cursor -= 1;
+                app.filter_popup.filter_text.remove(app.filter_popup.cursor);
+                app.needs_output_redraw = true;
+            }
+        }
+        Delete => {
+            if app.filter_popup.cursor < app.filter_popup.filter_text.len() {
+                app.filter_popup.filter_text.remove(app.filter_popup.cursor);
+                app.needs_output_redraw = true;
+            }
+        }
+        Left => {
+            if app.filter_popup.cursor > 0 {
+                app.filter_popup.cursor -= 1;
+            }
+        }
+        Right => {
+            if app.filter_popup.cursor < app.filter_popup.filter_text.len() {
+                app.filter_popup.cursor += 1;
+            }
+        }
+        Home => {
+            app.filter_popup.cursor = 0;
+        }
+        End => {
+            app.filter_popup.cursor = app.filter_popup.filter_text.len();
+        }
+        Char(c) => {
+            app.filter_popup.filter_text.insert(app.filter_popup.cursor, c);
+            app.filter_popup.cursor += 1;
+            app.needs_output_redraw = true;
+        }
+        _ => {}
+    }
+}
+
+/// Run in daemon mode (-D) - background server for remote connections only
+/// No console UI, just prints listening ports and handles remote clients
+async fn run_daemon_server() -> io::Result<()> {
+    let mut app = App::new();
+
+    // Load settings from normal settings file
+    if let Err(e) = load_settings(&mut app) {
+        eprintln!("Warning: Could not load settings: {}", e);
+    }
+
+    // Ensure at least one world exists
+    app.ensure_has_world();
+
+    let (event_tx, mut event_rx) = mpsc::channel::<AppEvent>(100);
+
+    // Start WebSocket server if enabled
+    if app.settings.ws_enabled && !app.settings.websocket_password.is_empty() {
+        let mut server = WebSocketServer::new(
+            &app.settings.websocket_password,
+            app.settings.ws_port,
+            &app.settings.websocket_allow_list,
+            app.settings.websocket_whitelisted_host.clone(),
+            false, // Not multiuser mode
+            app.ban_list.clone(),
+        );
+
+        // Configure TLS if secure mode enabled
+        #[cfg(feature = "native-tls-backend")]
+        let tls_configured = if app.settings.web_secure
+            && !app.settings.websocket_cert_file.is_empty()
+            && !app.settings.websocket_key_file.is_empty()
+        {
+            match server.configure_tls(&app.settings.websocket_cert_file, &app.settings.websocket_key_file) {
+                Ok(()) => true,
+                Err(e) => {
+                    eprintln!("Warning: Failed to configure TLS: {}", e);
+                    false
+                }
+            }
+        } else {
+            false
+        };
+        #[cfg(feature = "rustls-backend")]
+        let tls_configured = if app.settings.web_secure
+            && !app.settings.websocket_cert_file.is_empty()
+            && !app.settings.websocket_key_file.is_empty()
+        {
+            match server.configure_tls(&app.settings.websocket_cert_file, &app.settings.websocket_key_file) {
+                Ok(()) => true,
+                Err(e) => {
+                    eprintln!("Warning: Failed to configure TLS: {}", e);
+                    false
+                }
+            }
+        } else {
+            false
+        };
+
+        if let Err(e) = start_websocket_server(&mut server, event_tx.clone()).await {
+            eprintln!("Failed to start WebSocket server: {}", e);
+            return Ok(());
+        }
+        let protocol = if tls_configured { "wss" } else { "ws" };
+        println!("WebSocket: {}://0.0.0.0:{}", protocol, app.settings.ws_port);
+        app.ws_server = Some(server);
+    }
+
+    // Start HTTP/HTTPS server if enabled
+    if app.settings.http_enabled {
+        let has_cert = !app.settings.websocket_cert_file.is_empty()
+            && !app.settings.websocket_key_file.is_empty();
+        let web_secure = app.settings.web_secure;
+
+        if web_secure && has_cert {
+            // Start HTTPS
+            #[cfg(any(feature = "native-tls-backend", feature = "rustls-backend"))]
+            {
+                let mut https_server = HttpsServer::new(app.settings.http_port);
+                match start_https_server(
+                    &mut https_server,
+                    &app.settings.websocket_cert_file,
+                    &app.settings.websocket_key_file,
+                    app.settings.ws_port,
+                    true,
+                ).await {
+                    Ok(()) => {
+                        println!("HTTPS: https://0.0.0.0:{}", app.settings.http_port);
+                        app.https_server = Some(https_server);
+                    }
+                    Err(e) => {
+                        eprintln!("Warning: Failed to start HTTPS server: {}", e);
+                    }
+                }
+            }
+        } else {
+            // Start HTTP
+            let mut http_server = HttpServer::new(app.settings.http_port);
+            match start_http_server(&mut http_server, app.settings.ws_port, false, app.ban_list.clone()).await {
+                Ok(()) => {
+                    println!("HTTP: http://0.0.0.0:{}", app.settings.http_port);
+                    app.http_server = Some(http_server);
+                }
+                Err(e) => {
+                    eprintln!("Warning: Failed to start HTTP server: {}", e);
+                }
+            }
+        }
+    }
+
+    // Check if any servers are running
+    if app.ws_server.is_none() && app.http_server.is_none() && app.https_server.is_none() {
+        eprintln!("Error: No servers started. Enable WebSocket or HTTP in settings.");
+        eprintln!("Use /web command to configure, or edit ~/.clay.dat");
+        return Ok(());
+    }
+
+    // Show allow list if configured (helps debug connection rejections)
+    if !app.settings.websocket_allow_list.is_empty() {
+        println!("Allow list: {}", app.settings.websocket_allow_list);
+    }
+
+    println!("Daemon running. Press Ctrl+C to stop.");
+
+    // Main event loop - handles MUD connections and WebSocket messages
+    loop {
+        reap_zombie_children();
+
+        tokio::select! {
+            Some(event) = event_rx.recv() => {
+                match event {
+                    AppEvent::ServerData(ref world_name, bytes) => {
+                        if let Some(world_idx) = app.find_world_index(world_name) {
+                            // Use shared server data processing (same as console mode)
+                            let commands = app.process_server_data(
+                                world_idx,
+                                &bytes,
+                                24, // Default console height for daemon mode
+                                80, // Default console width
+                                true, // is_daemon_mode
+                            );
+
+                            // Execute any triggered commands
+                            let saved_current_world = app.current_world_index;
+                            app.current_world_index = world_idx;
+                            for cmd in commands {
+                                if cmd.starts_with('/') {
+                                    // Internal Clay command - execute it
+                                    let parsed = parse_command(&cmd);
+                                    match parsed {
+                                        Command::Send { text, target_world, .. } => {
+                                            // Handle /send command
+                                            let target_idx = if let Some(ref w) = target_world {
+                                                app.find_world_index(w)
+                                            } else {
+                                                Some(world_idx)
+                                            };
+                                            if let Some(idx) = target_idx {
+                                                if let Some(tx) = &app.worlds[idx].command_tx {
+                                                    let _ = tx.try_send(WriteCommand::Text(text));
+                                                }
+                                            }
+                                        }
+                                        _ => {
+                                            // Other commands - limited support in daemon mode
+                                        }
+                                    }
+                                } else if cmd.starts_with('#') {
+                                    // TF command
+                                    match app.tf_engine.execute(&cmd) {
+                                        tf::TfCommandResult::SendToMud(text) => {
+                                            if let Some(tx) = &app.worlds[world_idx].command_tx {
+                                                let _ = tx.try_send(WriteCommand::Text(text));
+                                            }
+                                        }
+                                        _ => {}
+                                    }
+                                } else if let Some(tx) = &app.worlds[world_idx].command_tx {
+                                    // Plain text - send to MUD
+                                    let _ = tx.try_send(WriteCommand::Text(cmd));
+                                }
+                            }
+                            app.current_world_index = saved_current_world;
+                        }
+                    }
+                    AppEvent::Disconnected(ref world_name) => {
+                        if let Some(world_idx) = app.find_world_index(world_name) {
+                            app.worlds[world_idx].connected = false;
+                            app.worlds[world_idx].command_tx = None;
+
+                            // Broadcast disconnect to clients
+                            app.ws_broadcast(WsMessage::WorldDisconnected { world_index: world_idx });
+                        }
+                    }
+                    AppEvent::WsClientMessage(client_id, msg) => {
+                        // Check if this is an AuthRequest (client just authenticated)
+                        if matches!(*msg, WsMessage::AuthRequest { .. }) {
+                            // Send initial state after successful authentication
+                            let initial_state = app.build_initial_state();
+                            app.ws_send_to_client(client_id, initial_state);
+                        } else {
+                            handle_daemon_ws_message(&mut app, client_id, *msg, &event_tx).await;
+                        }
+                    }
+                    AppEvent::WsClientConnected(_client_id) => {
+                        // Client connected but not yet authenticated - nothing to do
+                    }
+                    AppEvent::WsClientDisconnected(_client_id) => {
+                        // Client disconnected, nothing special to do
+                    }
+                    AppEvent::SystemMessage(msg) => {
+                        // Print system messages (including connection rejections) to console
+                        println!("{}", msg);
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+}
+
+/// Handle WebSocket message in daemon mode
+async fn handle_daemon_ws_message(
+    app: &mut App,
+    client_id: u64,
+    msg: WsMessage,
+    event_tx: &mpsc::Sender<AppEvent>,
+) {
+    match msg {
+        WsMessage::SendCommand { world_index, command } => {
+            if world_index < app.worlds.len() && app.worlds[world_index].connected {
+                if let Some(tx) = &app.worlds[world_index].command_tx {
+                    let _ = tx.send(WriteCommand::Text(command)).await;
+                    app.worlds[world_index].last_send_time = Some(std::time::Instant::now());
+                    app.worlds[world_index].last_user_command_time = Some(std::time::Instant::now());
+                    // Reset more-mode counter when user sends a command
+                    app.worlds[world_index].lines_since_pause = 0;
+                }
+            }
+        }
+        WsMessage::ConnectWorld { world_index } => {
+            if world_index < app.worlds.len() && !app.worlds[world_index].connected {
+                let settings = app.worlds[world_index].settings.clone();
+                let world_name = app.worlds[world_index].name.clone();
+
+                // Check if world has connection settings
+                if !settings.has_connection_settings() {
+                    app.ws_broadcast(WsMessage::ServerData {
+                        world_index,
+                        data: "Configure host/port in world settings.\n".to_string(),
+                        is_viewed: false,
+                        ts: current_timestamp_secs(),
+                    });
+                    return;
+                }
+
+                let ssl_msg = if settings.use_ssl { " with SSL" } else { "" };
+                app.ws_broadcast(WsMessage::ServerData {
+                    world_index,
+                    data: format!("Connecting to {}:{}{}...\n", settings.hostname, settings.port, ssl_msg),
+                    is_viewed: false,
+                    ts: current_timestamp_secs(),
+                });
+
+                // Attempt connection
+                if let Some(cmd_tx) = connect_daemon_world(
+                    world_index,
+                    world_name.clone(),
+                    &settings,
+                    event_tx.clone(),
+                ).await {
+                    // Connection succeeded
+                    app.worlds[world_index].connected = true;
+                    app.worlds[world_index].command_tx = Some(cmd_tx);
+                    app.worlds[world_index].was_connected = true;
+                    let now = std::time::Instant::now();
+                    app.worlds[world_index].last_send_time = Some(now);
+                    app.worlds[world_index].last_receive_time = Some(now);
+
+                    app.ws_broadcast(WsMessage::WorldConnected { world_index, name: world_name });
+                } else {
+                    // Connection failed
+                    app.ws_broadcast(WsMessage::ServerData {
+                        world_index,
+                        data: "Connection failed.\n".to_string(),
+                        is_viewed: false,
+                        ts: current_timestamp_secs(),
+                    });
+                }
+            }
+        }
+        WsMessage::DisconnectWorld { world_index } => {
+            if world_index < app.worlds.len() && app.worlds[world_index].connected {
+                app.worlds[world_index].connected = false;
+                app.worlds[world_index].command_tx = None;
+                app.ws_broadcast(WsMessage::WorldDisconnected { world_index });
+            }
+        }
+        WsMessage::SwitchWorld { world_index } => {
+            if world_index < app.worlds.len() {
+                app.current_world_index = world_index;
+                app.ws_broadcast(WsMessage::WorldSwitched { new_index: world_index });
+            }
+        }
+        WsMessage::UpdateGlobalSettings { more_mode_enabled, spell_check_enabled, temp_convert_enabled, world_switch_mode, show_tags, ansi_music_enabled, console_theme, gui_theme, gui_transparency, color_offset_percent, input_height, font_name, font_size, web_font_size_phone, web_font_size_tablet, web_font_size_desktop, ws_allow_list, web_secure, http_enabled, http_port, ws_enabled, ws_port, ws_cert_file, ws_key_file, tls_proxy_enabled } => {
+            app.settings.more_mode_enabled = more_mode_enabled;
+            app.settings.spell_check_enabled = spell_check_enabled;
+            app.settings.temp_convert_enabled = temp_convert_enabled;
+            app.settings.world_switch_mode = WorldSwitchMode::from_name(&world_switch_mode);
+            app.show_tags = show_tags;
+            app.settings.ansi_music_enabled = ansi_music_enabled;
+            app.input_height = input_height;
+            app.settings.theme = Theme::from_name(&console_theme);
+            app.settings.gui_theme = Theme::from_name(&gui_theme);
+            app.settings.gui_transparency = gui_transparency;
+            app.settings.color_offset_percent = color_offset_percent;
+            app.settings.font_name = font_name;
+            app.settings.font_size = font_size;
+            app.settings.web_font_size_phone = web_font_size_phone;
+            app.settings.web_font_size_tablet = web_font_size_tablet;
+            app.settings.web_font_size_desktop = web_font_size_desktop;
+            app.settings.websocket_allow_list = ws_allow_list;
+            app.settings.web_secure = web_secure;
+            app.settings.http_enabled = http_enabled;
+            app.settings.http_port = http_port;
+            app.settings.ws_enabled = ws_enabled;
+            app.settings.ws_port = ws_port;
+            app.settings.websocket_cert_file = ws_cert_file;
+            app.settings.websocket_key_file = ws_key_file;
+            app.settings.tls_proxy_enabled = tls_proxy_enabled;
+
+            // Save settings
+            let _ = save_settings(app);
+
+            // Broadcast updated settings
+            let settings = GlobalSettingsMsg {
+                more_mode_enabled: app.settings.more_mode_enabled,
+                spell_check_enabled: app.settings.spell_check_enabled,
+                temp_convert_enabled: app.settings.temp_convert_enabled,
+                world_switch_mode: app.settings.world_switch_mode.name().to_string(),
+                debug_enabled: app.settings.debug_enabled,
+                show_tags: app.show_tags,
+                ansi_music_enabled: app.settings.ansi_music_enabled,
+                input_height: app.input_height,
+                console_theme: app.settings.theme.name().to_string(),
+                gui_theme: app.settings.gui_theme.name().to_string(),
+                gui_transparency: app.settings.gui_transparency,
+                color_offset_percent: app.settings.color_offset_percent,
+                font_name: app.settings.font_name.clone(),
+                font_size: app.settings.font_size,
+                web_font_size_phone: app.settings.web_font_size_phone,
+                web_font_size_tablet: app.settings.web_font_size_tablet,
+                web_font_size_desktop: app.settings.web_font_size_desktop,
+                ws_allow_list: app.settings.websocket_allow_list.clone(),
+                web_secure: app.settings.web_secure,
+                http_enabled: app.settings.http_enabled,
+                http_port: app.settings.http_port,
+                ws_enabled: app.settings.ws_enabled,
+                ws_port: app.settings.ws_port,
+                ws_cert_file: app.settings.websocket_cert_file.clone(),
+                ws_key_file: app.settings.websocket_key_file.clone(),
+                tls_proxy_enabled: app.settings.tls_proxy_enabled,
+            };
+            app.ws_broadcast(WsMessage::GlobalSettingsUpdated { settings, input_height: app.input_height });
+        }
+        WsMessage::Ping => {
+            app.ws_send_to_client(client_id, WsMessage::Pong);
+        }
+        WsMessage::UpdateViewState { world_index, visible_lines } => {
+            // Track client's view state for more-mode threshold calculation
+            if world_index < app.worlds.len() {
+                let dimensions = app.ws_client_worlds.get(&client_id).and_then(|s| s.dimensions);
+                app.ws_client_worlds.insert(client_id, ClientViewState { world_index, visible_lines, dimensions });
+            }
+        }
+        WsMessage::MarkWorldSeen { world_index } => {
+            if world_index < app.worlds.len() {
+                app.worlds[world_index].unseen_lines = 0;
+                app.worlds[world_index].first_unseen_at = None;
+                app.ws_broadcast(WsMessage::UnseenCleared { world_index });
+                app.broadcast_activity();
+            }
+        }
+        WsMessage::ReleasePending { world_index, count } => {
+            // Release pending lines for the specified world
+            if world_index < app.worlds.len() {
+                let pending_count = app.worlds[world_index].pending_lines.len();
+                if pending_count > 0 {
+                    let to_release = if count == 0 { pending_count } else { count.min(pending_count) };
+
+                    // Get the lines that will be released (for broadcasting)
+                    let lines_to_broadcast: Vec<String> = app.worlds[world_index]
+                        .pending_lines
+                        .iter()
+                        .take(to_release)
+                        .map(|line| line.text.replace('\r', ""))
+                        .collect();
+
+                    // Release the lines
+                    app.worlds[world_index].release_pending(to_release);
+
+                    // Broadcast the released lines as ServerData
+                    if !lines_to_broadcast.is_empty() {
+                        let ws_data = lines_to_broadcast.join("\n") + "\n";
+                        app.ws_broadcast(WsMessage::ServerData {
+                            world_index,
+                            data: ws_data,
+                            is_viewed: true,
+                            ts: current_timestamp_secs(),
+                        });
+                    }
+
+                    // Broadcast release event and updated pending count
+                    app.ws_broadcast(WsMessage::PendingReleased { world_index, count: to_release });
+                    let new_pending_count = app.worlds[world_index].pending_lines.len();
+                    app.ws_broadcast(WsMessage::PendingLinesUpdate { world_index, count: new_pending_count });
+                    app.broadcast_activity();
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
 /// Run in multiuser server mode - web interface only, no console
 async fn run_multiuser_server() -> io::Result<()> {
     let mut app = App::new();
@@ -16504,6 +18350,224 @@ async fn connect_multiuser_world(
     }
 }
 
+/// Connect a world in daemon mode (non-multiuser)
+/// Returns a command sender if connection succeeds
+async fn connect_daemon_world(
+    _world_index: usize,
+    world_name: String,
+    settings: &WorldSettings,
+    event_tx: mpsc::Sender<AppEvent>,
+) -> Option<mpsc::Sender<WriteCommand>> {
+    use tokio::net::TcpStream;
+    use tokio::io::AsyncReadExt;
+    use bytes::BytesMut;
+
+    let host = &settings.hostname;
+    let port = &settings.port;
+    let use_ssl = settings.use_ssl;
+
+    if host.is_empty() || port.is_empty() {
+        return None;
+    }
+
+    match TcpStream::connect(format!("{}:{}", host, port)).await {
+        Ok(tcp_stream) => {
+            let _ = tcp_stream.set_nodelay(true);
+
+            // Enable TCP keepalive to detect dead connections faster
+            #[cfg(unix)]
+            {
+                use std::os::unix::io::AsRawFd;
+                let fd = tcp_stream.as_raw_fd();
+                unsafe {
+                    let enable: libc::c_int = 1;
+                    libc::setsockopt(fd, libc::SOL_SOCKET, libc::SO_KEEPALIVE,
+                        &enable as *const _ as *const libc::c_void, std::mem::size_of_val(&enable) as libc::socklen_t);
+
+                    let idle: libc::c_int = 60;
+                    libc::setsockopt(fd, libc::IPPROTO_TCP, libc::TCP_KEEPIDLE,
+                        &idle as *const _ as *const libc::c_void, std::mem::size_of_val(&idle) as libc::socklen_t);
+
+                    let interval: libc::c_int = 10;
+                    libc::setsockopt(fd, libc::IPPROTO_TCP, libc::TCP_KEEPINTVL,
+                        &interval as *const _ as *const libc::c_void, std::mem::size_of_val(&interval) as libc::socklen_t);
+
+                    let count: libc::c_int = 6;
+                    libc::setsockopt(fd, libc::IPPROTO_TCP, libc::TCP_KEEPCNT,
+                        &count as *const _ as *const libc::c_void, std::mem::size_of_val(&count) as libc::socklen_t);
+                }
+            }
+
+            // Handle SSL if needed
+            let (mut read_half, mut write_half): (StreamReader, StreamWriter) = if use_ssl {
+                #[cfg(feature = "native-tls-backend")]
+                {
+                    let connector = match native_tls::TlsConnector::builder()
+                        .danger_accept_invalid_certs(true)
+                        .build()
+                    {
+                        Ok(c) => c,
+                        Err(_) => return None,
+                    };
+                    let connector = tokio_native_tls::TlsConnector::from(connector);
+
+                    match connector.connect(host, tcp_stream).await {
+                        Ok(tls_stream) => {
+                            let (r, w) = tokio::io::split(tls_stream);
+                            (StreamReader::Tls(r), StreamWriter::Tls(w))
+                        }
+                        Err(_) => return None,
+                    }
+                }
+
+                #[cfg(feature = "rustls-backend")]
+                {
+                    use std::sync::Arc;
+                    use rustls::RootCertStore;
+                    use tokio_rustls::TlsConnector;
+                    use rustls::pki_types::ServerName;
+
+                    let mut root_store = RootCertStore::empty();
+                    root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+
+                    let config = rustls::ClientConfig::builder()
+                        .dangerous()
+                        .with_custom_certificate_verifier(Arc::new(danger::NoCertificateVerification::new()))
+                        .with_no_client_auth();
+
+                    let connector = TlsConnector::from(Arc::new(config));
+                    let server_name = match ServerName::try_from(host.clone()) {
+                        Ok(sn) => sn,
+                        Err(_) => return None,
+                    };
+
+                    match connector.connect(server_name, tcp_stream).await {
+                        Ok(tls_stream) => {
+                            let (r, w) = tokio::io::split(tls_stream);
+                            (StreamReader::Tls(r), StreamWriter::Tls(w))
+                        }
+                        Err(_) => return None,
+                    }
+                }
+
+                #[cfg(not(any(feature = "native-tls-backend", feature = "rustls-backend")))]
+                {
+                    return None;
+                }
+            } else {
+                let (r, w) = tcp_stream.into_split();
+                (StreamReader::Plain(r), StreamWriter::Plain(w))
+            };
+
+            let (cmd_tx, mut cmd_rx) = mpsc::channel::<WriteCommand>(100);
+
+            // Send auto-login if configured
+            let user = settings.user.clone();
+            let password = settings.password.clone();
+            let auto_connect_type = settings.auto_connect_type;
+            if !user.is_empty() && !password.is_empty() && auto_connect_type == AutoConnectType::Connect {
+                let tx = cmd_tx.clone();
+                tokio::spawn(async move {
+                    tokio::time::sleep(Duration::from_millis(500)).await;
+                    let connect_cmd = format!("connect {} {}", user, password);
+                    let _ = tx.send(WriteCommand::Text(connect_cmd)).await;
+                });
+            }
+
+            // Clone for reader task
+            let telnet_tx = cmd_tx.clone();
+            let event_tx_read = event_tx.clone();
+            let world_name_read = world_name.clone();
+
+            // Spawn reader task
+            tokio::spawn(async move {
+                let mut buffer = BytesMut::with_capacity(4096);
+                buffer.resize(4096, 0);
+                let mut line_buffer: Vec<u8> = Vec::new();
+
+                loop {
+                    match read_half.read(&mut buffer).await {
+                        Ok(0) => {
+                            // Connection closed
+                            if !line_buffer.is_empty() {
+                                let result = process_telnet(&line_buffer);
+                                if !result.responses.is_empty() {
+                                    let _ = telnet_tx.send(WriteCommand::Raw(result.responses)).await;
+                                }
+                                if !result.cleaned.is_empty() {
+                                    let _ = event_tx_read.send(AppEvent::ServerData(world_name_read.clone(), result.cleaned)).await;
+                                }
+                            }
+                            let _ = event_tx_read.send(AppEvent::ServerData(
+                                world_name_read.clone(),
+                                "Connection closed by server.\n".as_bytes().to_vec(),
+                            )).await;
+                            let _ = event_tx_read.send(AppEvent::Disconnected(world_name_read.clone())).await;
+                            break;
+                        }
+                        Ok(n) => {
+                            line_buffer.extend_from_slice(&buffer[..n]);
+                            let split_at = find_safe_split_point(&line_buffer);
+                            let to_send = if split_at > 0 {
+                                line_buffer.drain(..split_at).collect()
+                            } else if !line_buffer.is_empty() {
+                                std::mem::take(&mut line_buffer)
+                            } else {
+                                Vec::new()
+                            };
+
+                            if !to_send.is_empty() {
+                                let result = process_telnet(&to_send);
+                                if !result.responses.is_empty() {
+                                    let _ = telnet_tx.send(WriteCommand::Raw(result.responses)).await;
+                                }
+                                if !result.cleaned.is_empty() {
+                                    let _ = event_tx_read.send(AppEvent::ServerData(world_name_read.clone(), result.cleaned)).await;
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            let msg = format!("Read error: {}", e);
+                            let _ = event_tx_read.send(AppEvent::ServerData(world_name_read.clone(), msg.into_bytes())).await;
+                            let _ = event_tx_read.send(AppEvent::Disconnected(world_name_read.clone())).await;
+                            break;
+                        }
+                    }
+                }
+            });
+
+            // Spawn writer task
+            tokio::spawn(async move {
+                use tokio::io::AsyncWriteExt;
+                while let Some(cmd) = cmd_rx.recv().await {
+                    match cmd {
+                        WriteCommand::Text(text) => {
+                            let bytes = format!("{}\r\n", text).into_bytes();
+                            if write_half.write_all(&bytes).await.is_err() {
+                                break;
+                            }
+                            let _ = write_half.flush().await;
+                        }
+                        WriteCommand::Raw(raw) => {
+                            if write_half.write_all(&raw).await.is_err() {
+                                break;
+                            }
+                            let _ = write_half.flush().await;
+                        }
+                        WriteCommand::Shutdown => {
+                            let _ = write_half.shutdown().await;
+                            break;
+                        }
+                    }
+                }
+            });
+
+            Some(cmd_tx)
+        }
+        Err(_) => None,
+    }
+}
+
 /// Build initial state message for a specific user (multiuser mode)
 /// World definitions are shared, but connection state is per-user
 /// Actions are still filtered per-user
@@ -16598,6 +18662,7 @@ fn build_multiuser_initial_state(app: &App, username: &str) -> WsMessage {
                 last_recv_secs: last_recv.map(|t| t.elapsed().as_secs()),
                 last_nop_secs: None,
                 keep_alive_type: world.settings.keep_alive_type.name().to_string(),
+                showing_splash: world.showing_splash,
             }
         }).collect();
 
@@ -16936,6 +19001,18 @@ async fn main() -> io::Result<()> {
     // Check for --multiuser mode
     if std::env::args().any(|a| a == "--multiuser") {
         return run_multiuser_server().await;
+    }
+
+    // Check for -D (daemon mode) - run as background server only
+    let daemon_mode = std::env::args().any(|a| a == "-D");
+    if daemon_mode {
+        return run_daemon_server().await;
+    }
+
+    // Check for --console=host:port argument for console client mode
+    if let Some(console_arg) = std::env::args().find(|a| a.starts_with("--console=")) {
+        let addr = console_arg.strip_prefix("--console=").unwrap();
+        return run_console_client(addr).await;
     }
 
     // Set up signal handlers for crash debugging
@@ -18098,215 +20175,21 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                 match event {
                     AppEvent::ServerData(ref world_name, bytes) => {
                         if let Some(world_idx) = app.find_world_index(world_name) {
-                            app.worlds[world_idx].last_receive_time = Some(std::time::Instant::now());
-                            // Consider "current" if console OR any web/GUI client is viewing this world
-                            let is_current = world_idx == app.current_world_index || app.ws_client_viewing(world_idx);
-                            let decoded_data = app.worlds[world_idx].settings.encoding.decode(&bytes);
+                            // Use shared server data processing
+                            let console_height = app.output_height;
+                            let console_width = app.output_width;
+                            let commands = app.process_server_data(
+                                world_idx,
+                                &bytes,
+                                console_height,
+                                console_width,
+                                false, // not daemon mode
+                            );
 
-                            // Extract ANSI music sequences FIRST, before any other processing
-                            let (data, music_sequences) = if app.settings.ansi_music_enabled {
-                                ansi_music::extract_music(&decoded_data)
-                            } else {
-                                (decoded_data, Vec::new())
-                            };
-
-                            // Broadcast music to WebSocket clients (web/GUI play audio)
-                            for notes in music_sequences {
-                                app.ws_broadcast(WsMessage::AnsiMusic {
-                                    world_index: world_idx,
-                                    notes,
-                                });
-                            }
-
-                            let world_name_for_triggers = world_name.clone();
-                            let actions = app.settings.actions.clone();
-
-                            // Combine with any partial line from previous data chunk
-                            let had_trigger_partial = !app.worlds[world_idx].trigger_partial_line.is_empty();
-                            let combined_data = if had_trigger_partial {
-                                let mut s = std::mem::take(&mut app.worlds[world_idx].trigger_partial_line);
-                                s.push_str(&data);
-                                s
-                            } else {
-                                data.clone()
-                            };
-
-                            // Process action triggers on complete lines
-                            // Track lines with gagged flag: (line, is_gagged)
-                            let mut processed_lines: Vec<(&str, bool)> = Vec::new();
-                            let mut commands_to_execute: Vec<String> = Vec::new();
-                            let mut tf_commands_to_execute: Vec<String> = Vec::new();
-                            let ends_with_newline = combined_data.ends_with('\n');
-                            let lines: Vec<&str> = combined_data.lines().collect();
-                            let line_count = lines.len();
-                            let mut has_partial = false;
-                            // Use persistent flag to track idler filtering across TCP packets
-                            let mut just_filtered_idler = app.worlds[world_idx].just_filtered_idler;
-
-                            for (i, line) in lines.iter().enumerate() {
-                                let is_last = i == line_count - 1;
-                                let is_partial = is_last && !ends_with_newline;
-
-                                // Filter out keep-alive idler message lines (only for Custom/Generic keep-alive types)
-                                let uses_idler_keepalive = matches!(
-                                    app.worlds[world_idx].settings.keep_alive_type,
-                                    KeepAliveType::Custom | KeepAliveType::Generic
-                                );
-                                if uses_idler_keepalive && line.contains("###_idler_message_") && line.contains("_###") {
-                                    just_filtered_idler = true;
-                                    continue;
-                                }
-
-                                // Filter blank lines that immediately follow an idler message
-                                if just_filtered_idler && is_visually_empty(line) {
-                                    just_filtered_idler = false; // Reset after filtering the blank
-                                    continue;
-                                }
-                                just_filtered_idler = false;
-
-                                // Check triggers on complete lines only
-                                if is_partial {
-                                    // Store partial line for next chunk - don't process yet
-                                    app.worlds[world_idx].trigger_partial_line = line.to_string();
-                                    has_partial = true;
-                                } else {
-                                    let mut is_gagged = false;
-                                    // Check Clay action triggers
-                                    if let Some(result) = check_action_triggers(line, &world_name_for_triggers, &actions) {
-                                        // Collect commands to execute
-                                        commands_to_execute.extend(result.commands);
-                                        is_gagged = result.should_gag;
-                                    }
-                                    // Check TF triggers
-                                    let tf_result = tf::bridge::process_line(&mut app.tf_engine, line, Some(&world_name_for_triggers));
-                                    commands_to_execute.extend(tf_result.send_commands);
-                                    tf_commands_to_execute.extend(tf_result.clay_commands);
-                                    is_gagged = is_gagged || tf_result.should_gag;
-                                    // Only add complete lines with gagged flag
-                                    processed_lines.push((line, is_gagged));
-                                }
-                            }
-
-                            // Save the idler filter state for next packet
-                            app.worlds[world_idx].just_filtered_idler = just_filtered_idler;
-
-                            // If we have a partial line and world uses WONT ECHO prompts, start timeout
-                            if has_partial && app.worlds[world_idx].prompt.is_empty()
-                                && app.worlds[world_idx].uses_wont_echo_prompt {
-                                app.worlds[world_idx].wont_echo_time = Some(std::time::Instant::now());
-                            }
-
-                            // Separate gagged and non-gagged lines
-                            let non_gagged_lines: Vec<&str> = processed_lines.iter()
-                                .filter(|(_, gagged)| !gagged)
-                                .map(|(line, _)| *line)
-                                .collect();
-                            let gagged_lines: Vec<&str> = processed_lines.iter()
-                                .filter(|(_, gagged)| *gagged)
-                                .map(|(line, _)| *line)
-                                .collect();
-
-                            // Rebuild data for non-gagged lines
-                            // Add trailing newline if original ended with newline OR if we have a partial
-                            // (because a partial means there was a newline before it that we need to preserve)
-                            let filtered_data = if non_gagged_lines.is_empty() {
-                                String::new()
-                            } else {
-                                let mut result = non_gagged_lines.join("\n");
-                                if ends_with_newline || has_partial {
-                                    result.push('\n');
-                                }
-                                result
-                            };
-
-                            // Add non-gagged output to world
-                            if !filtered_data.is_empty() {
-                                let settings = app.settings.clone();
-                                let console_height = app.output_height;
-                                let output_width = app.output_width;
-
-                                // Calculate minimum visible lines among all viewers for synchronized more-mode
-                                // Console counts as a viewer if it's viewing this world
-                                let console_viewing = world_idx == app.current_world_index;
-                                let ws_min = app.min_viewer_lines(world_idx);
-                                let output_height = match (console_viewing, ws_min) {
-                                    (true, Some(ws)) => console_height.min(ws as u16),
-                                    (true, None) => console_height,
-                                    (false, Some(ws)) => ws as u16,
-                                    (false, None) => console_height, // No one viewing, use console as default
-                                };
-
-                                // Track pending count before add_output for synchronized more-mode
-                                let pending_before = app.worlds[world_idx].pending_lines.len();
-                                let output_before = app.worlds[world_idx].output_lines.len();
-
-                                app.worlds[world_idx].add_output(&filtered_data, is_current, &settings, output_height, output_width, true, true);
-
-                                // Calculate what went where
-                                let pending_after = app.worlds[world_idx].pending_lines.len();
-                                let output_after = app.worlds[world_idx].output_lines.len();
-                                let lines_to_output = output_after.saturating_sub(output_before);
-                                let lines_to_pending = pending_after.saturating_sub(pending_before);
-
-                                // Mark output for redraw if this is the current world
-                                if world_idx == app.current_world_index {
-                                    app.needs_output_redraw = true;
-                                }
-                                // Check if terminal needs full redraw (after splash clear)
-                                if app.worlds[world_idx].needs_redraw {
-                                    app.worlds[world_idx].needs_redraw = false;
-                                    terminal.clear()?;
-                                }
-
-                                // For synchronized more-mode: only broadcast lines that went to output_lines
-                                // Lines that went to pending_lines will be broadcast when released
-                                if lines_to_output > 0 {
-                                    // Get only the lines that went to output_lines
-                                    let output_lines_to_broadcast: Vec<String> = app.worlds[world_idx]
-                                        .output_lines
-                                        .iter()
-                                        .skip(output_before)
-                                        .take(lines_to_output)
-                                        .map(|line| line.text.replace('\r', ""))
-                                        .collect();
-                                    let ws_data = output_lines_to_broadcast.join("\n") + "\n";
-
-                                    app.ws_broadcast(WsMessage::ServerData {
-                                        world_index: world_idx,
-                                        data: ws_data,
-                                        is_viewed: is_current,
-                                        ts: current_timestamp_secs(),
-                                    });
-                                }
-
-                                // Broadcast pending count update if it changed (for synchronized more-mode indicator)
-                                if lines_to_pending > 0 || pending_after != pending_before {
-                                    app.ws_broadcast(WsMessage::PendingLinesUpdate {
-                                        world_index: world_idx,
-                                        count: pending_after,
-                                    });
-                                }
-
-                                // Broadcast updated unseen count so all clients stay in sync
-                                let unseen_count = app.worlds[world_idx].unseen_lines;
-                                if unseen_count > 0 {
-                                    app.ws_broadcast(WsMessage::UnseenUpdate {
-                                        world_index: world_idx,
-                                        count: unseen_count,
-                                    });
-                                }
-
-                                // Broadcast activity count to keep all clients in sync
-                                app.broadcast_activity();
-                            }
-
-                            // Add gagged lines to output (they'll only show with F2)
-                            for line in gagged_lines {
-                                app.worlds[world_idx].output_lines.push(OutputLine::new_gagged(line.to_string()));
-                            }
-                            // Keep scroll at bottom if we added gagged lines
-                            if !app.worlds[world_idx].paused {
-                                app.worlds[world_idx].scroll_to_bottom();
+                            // Check if terminal needs full redraw (after splash clear)
+                            if app.worlds[world_idx].needs_redraw {
+                                app.worlds[world_idx].needs_redraw = false;
+                                terminal.clear()?;
                             }
 
                             // Execute any triggered commands
@@ -18314,7 +20197,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                             // without -w sends to the world that triggered the action
                             let saved_current_world = app.current_world_index;
                             app.current_world_index = world_idx;
-                            for cmd in commands_to_execute {
+                            for cmd in commands {
                                 if cmd.starts_with('/') {
                                     // Internal Clay command - execute it
                                     handle_command(&cmd, &mut app, event_tx.clone()).await;
@@ -18337,11 +20220,6 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                 }
                             }
                             app.current_world_index = saved_current_world;
-                            // Execute TF-generated Clay commands (not sent to MUD)
-                            for cmd in tf_commands_to_execute {
-                                // Execute as TF command (starts with #) or Clay command
-                                let _ = app.tf_engine.execute(&cmd);
-                            }
                         }
                     }
                     AppEvent::Disconnected(ref world_name) => {
@@ -19687,7 +21565,8 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
             || app.help_popup.visible
             || app.menu_popup.visible
             || app.actions_popup.visible
-            || app.web_popup.visible;
+            || app.web_popup.visible
+            || app.has_new_popup();
 
         // If transitioning from no popup to popup, clear terminal to sync ratatui with terminal state
         if any_popup_visible && !app.popup_was_visible {
@@ -20976,7 +22855,16 @@ fn handle_key_event(key: KeyEvent, app: &mut App) -> KeyAction {
         return KeyAction::None;
     }
 
-    // Handle help popup input
+    // Handle new unified popup system (help popup and others)
+    if app.has_new_popup() {
+        if let Some(cmd) = handle_new_popup_key(app, key) {
+            // Menu command selected - execute it
+            return KeyAction::SendCommand(cmd);
+        }
+        return KeyAction::None;
+    }
+
+    // Handle help popup input (old system - will be removed after migration)
     if app.help_popup.visible {
         match key.code {
             KeyCode::Esc => {
@@ -22708,9 +24596,9 @@ fn handle_key_event(key: KeyEvent, app: &mut App) -> KeyAction {
         // Ctrl+Z to suspend
         (KeyModifiers::CONTROL, KeyCode::Char('z')) => KeyAction::Suspend,
 
-        // F1 to open help popup
+        // F1 to open help popup (using new unified popup system)
         (_, KeyCode::F(1)) => {
-            app.help_popup.open();
+            app.open_help_popup_new();
             KeyAction::None
         }
 
@@ -23373,7 +25261,7 @@ async fn handle_command(cmd: &str, app: &mut App, event_tx: mpsc::Sender<AppEven
             app.add_output(&get_version_string());
         }
         Command::Menu => {
-            app.menu_popup.open();
+            app.open_menu_popup_new();
         }
         Command::Quit => {
             // Kill all TLS proxy processes before quitting
@@ -24575,6 +26463,8 @@ fn ui(f: &mut Frame, app: &mut App) {
     render_help_popup(f, app);
     render_menu_popup(f, app);
     render_actions_popup(f, app);
+    // New unified popup system - renders on top of old popups
+    render_new_popup(f, app);
 }
 
 /// Render output area using raw crossterm (bypasses ratatui's buggy rendering)
@@ -24591,7 +26481,8 @@ fn render_output_crossterm(app: &App) {
         || app.help_popup.visible
         || app.menu_popup.visible
         || app.actions_popup.visible
-        || app.web_popup.visible;
+        || app.web_popup.visible
+        || app.has_new_popup();
     if app.current_world().showing_splash || any_popup_visible {
         return;
     }
@@ -25166,7 +27057,8 @@ fn render_output_area(f: &mut Frame, app: &App, area: Rect) {
         || app.help_popup.visible
         || app.menu_popup.visible
         || app.actions_popup.visible
-        || app.web_popup.visible;
+        || app.web_popup.visible
+        || app.has_new_popup();
 
     // If no popup is visible, raw crossterm will handle output rendering
     // (it provides better ANSI color handling)
@@ -25316,9 +27208,11 @@ fn render_separator_bar(f: &mut Frame, app: &App, area: Rect) {
         // Show History indicator when scrolled back (takes precedence over More)
         let lines_back = world.lines_from_bottom();
         (format!("Hist {}", format_more_count(lines_back)), true)
-    } else if world.paused && !world.pending_lines.is_empty() {
+    } else if world.paused && (!world.pending_lines.is_empty() || world.pending_count > 0) {
         // Show More indicator when paused with pending lines
-        (format!("More {}", format_more_count(world.pending_lines.len())), true)
+        // Use pending_count for console mode (synced from daemon), pending_lines.len() for daemon mode
+        let count = if !world.pending_lines.is_empty() { world.pending_lines.len() } else { world.pending_count };
+        (format!("More {}", format_more_count(count)), true)
     } else {
         // Fill with underscores when nothing to show
         ("_".repeat(STATUS_INDICATOR_LEN), false)
@@ -27499,6 +29393,13 @@ fn render_actions_popup(f: &mut Frame, app: &App) {
             let popup_text = Paragraph::new(lines).block(popup_block);
             f.render_widget(popup_text, popup_area);
         }
+    }
+}
+
+/// Render new unified popup system
+fn render_new_popup(f: &mut Frame, app: &App) {
+    if let Some(state) = app.popup_manager.current() {
+        popup::console_renderer::render_popup(f, state, app.settings.theme);
     }
 }
 
