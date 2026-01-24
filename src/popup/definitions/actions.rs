@@ -134,6 +134,8 @@ pub fn create_actions_list_popup(actions: &[ActionInfo], visible_height: usize) 
             center_horizontal: true,
             center_vertical: true,
             modal: true,
+            buttons_right_align: false,
+            blank_line_before_list: false,
         })
 }
 
@@ -194,6 +196,8 @@ pub fn create_action_editor_popup(settings: &ActionSettings, is_new: bool) -> Po
             center_horizontal: true,
             center_vertical: true,
             modal: true,
+            buttons_right_align: false,
+            blank_line_before_list: false,
         })
 }
 

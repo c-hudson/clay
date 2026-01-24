@@ -90,6 +90,10 @@ pub enum FieldKind {
         selected_index: usize,
         scroll_offset: usize,
         visible_height: usize,
+        /// Column headers (optional)
+        headers: Option<Vec<String>>,
+        /// Fixed column widths (optional, prevents resizing when filtering)
+        column_widths: Option<Vec<usize>>,
     },
     /// Scrollable read-only content (for help, large text display)
     ScrollableContent {
@@ -199,6 +203,32 @@ impl FieldKind {
             selected_index: 0,
             scroll_offset: 0,
             visible_height,
+            headers: None,
+            column_widths: None,
+        }
+    }
+
+    /// Create a list field with column headers
+    pub fn list_with_headers(items: Vec<ListItem>, visible_height: usize, headers: &[&str]) -> Self {
+        Self::List {
+            items,
+            selected_index: 0,
+            scroll_offset: 0,
+            visible_height,
+            headers: Some(headers.iter().map(|s| s.to_string()).collect()),
+            column_widths: None,
+        }
+    }
+
+    /// Create a list field with column headers and fixed column widths
+    pub fn list_with_headers_and_widths(items: Vec<ListItem>, visible_height: usize, headers: &[&str], column_widths: Vec<usize>) -> Self {
+        Self::List {
+            items,
+            selected_index: 0,
+            scroll_offset: 0,
+            visible_height,
+            headers: Some(headers.iter().map(|s| s.to_string()).collect()),
+            column_widths: Some(column_widths),
         }
     }
 
@@ -227,6 +257,11 @@ impl FieldKind {
             Self::MultilineText { value, .. } => Some(value),
             _ => None,
         }
+    }
+
+    /// Check if this is a text-like field (supports text editing)
+    pub fn is_text(&self) -> bool {
+        matches!(self, Self::Text { .. } | Self::MultilineText { .. })
     }
 
     /// Set the string value for text-like fields
@@ -343,6 +378,8 @@ pub struct Field {
     pub kind: FieldKind,
     pub visible: bool,
     pub enabled: bool,
+    /// Keyboard shortcut to select this field (like button shortcuts)
+    pub shortcut: Option<char>,
 }
 
 impl Field {
@@ -353,6 +390,7 @@ impl Field {
             kind,
             visible: true,
             enabled: true,
+            shortcut: None,
         }
     }
 
@@ -364,12 +402,19 @@ impl Field {
             kind,
             visible: false,
             enabled: false,
+            shortcut: None,
         }
     }
 
     /// Create a disabled field
     pub fn disabled(mut self) -> Self {
         self.enabled = false;
+        self
+    }
+
+    /// Add a keyboard shortcut to select this field
+    pub fn with_shortcut(mut self, shortcut: char) -> Self {
+        self.shortcut = Some(shortcut);
         self
     }
 
@@ -456,6 +501,10 @@ pub struct PopupLayout {
     pub center_vertical: bool,
     /// Whether the popup is modal (blocks input to background)
     pub modal: bool,
+    /// Whether to right-align buttons (default: centered)
+    pub buttons_right_align: bool,
+    /// Whether to add a blank line before list fields
+    pub blank_line_before_list: bool,
 }
 
 impl Default for PopupLayout {
@@ -467,6 +516,8 @@ impl Default for PopupLayout {
             center_horizontal: true,
             center_vertical: true,
             modal: true,
+            buttons_right_align: false,
+            blank_line_before_list: false,
         }
     }
 }
@@ -840,6 +891,90 @@ impl PopupState {
         }
     }
 
+    /// Select the last focusable field
+    pub fn select_last_field(&mut self) {
+        let fields = self.definition.focusable_fields();
+        if let Some(id) = fields.last() {
+            self.selected = ElementSelection::Field(*id);
+        }
+    }
+
+    /// Toggle the current field's value (for boolean and select fields)
+    pub fn toggle_current(&mut self) {
+        if let ElementSelection::Field(id) = &self.selected {
+            let id = *id;
+            if let Some(field) = self.definition.get_field_mut(id) {
+                match &mut field.kind {
+                    FieldKind::Toggle { value } => {
+                        *value = !*value;
+                    }
+                    FieldKind::Select { options, selected_index } => {
+                        if !options.is_empty() {
+                            *selected_index = (*selected_index + 1) % options.len();
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    /// Increase the current field's value (number +1 or select next)
+    pub fn increase_current(&mut self) {
+        if let ElementSelection::Field(id) = &self.selected {
+            let id = *id;
+            if let Some(field) = self.definition.get_field_mut(id) {
+                match &mut field.kind {
+                    FieldKind::Number { value, max, .. } => {
+                        if let Some(m) = max {
+                            if *value < *m {
+                                *value += 1;
+                            }
+                        } else {
+                            *value += 1;
+                        }
+                    }
+                    FieldKind::Select { options, selected_index } => {
+                        if !options.is_empty() {
+                            *selected_index = (*selected_index + 1) % options.len();
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    /// Decrease the current field's value (number -1 or select prev)
+    pub fn decrease_current(&mut self) {
+        if let ElementSelection::Field(id) = &self.selected {
+            let id = *id;
+            if let Some(field) = self.definition.get_field_mut(id) {
+                match &mut field.kind {
+                    FieldKind::Number { value, min, .. } => {
+                        if let Some(m) = min {
+                            if *value > *m {
+                                *value -= 1;
+                            }
+                        } else {
+                            *value -= 1;
+                        }
+                    }
+                    FieldKind::Select { options, selected_index } => {
+                        if !options.is_empty() {
+                            if *selected_index == 0 {
+                                *selected_index = options.len() - 1;
+                            } else {
+                                *selected_index -= 1;
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+
     /// Check if currently on a field
     pub fn is_on_field(&self) -> bool {
         matches!(self.selected, ElementSelection::Field(_))
@@ -853,6 +988,92 @@ impl PopupState {
     /// Check if a specific button is focused
     pub fn is_button_focused(&self, id: ButtonId) -> bool {
         matches!(&self.selected, ElementSelection::Button(selected_id) if *selected_id == id)
+    }
+
+    /// Cycle between focusable text fields and buttons (for Tab key)
+    /// Cycles: filter field -> button1 -> button2 -> ... -> buttonN -> filter field
+    /// Returns true if selection changed
+    pub fn cycle_field_buttons(&mut self) -> bool {
+        let buttons = self.definition.enabled_buttons();
+
+        // Find text fields that can be cycled to
+        let text_fields: Vec<FieldId> = self.definition.focusable_fields()
+            .iter()
+            .filter(|id| {
+                self.definition.get_field(**id)
+                    .map(|f| f.kind.is_text_editable())
+                    .unwrap_or(false)
+            })
+            .copied()
+            .collect();
+
+        if text_fields.is_empty() && buttons.is_empty() {
+            return false;
+        }
+
+        match &self.selected {
+            ElementSelection::Field(_) => {
+                // If on any field (including List), go to first button
+                if let Some(btn) = buttons.first() {
+                    self.selected = ElementSelection::Button(*btn);
+                    return true;
+                }
+            }
+            ElementSelection::Button(current_id) => {
+                // If on a button, go to next button, or wrap to first text field
+                if let Some(idx) = buttons.iter().position(|id| id == current_id) {
+                    if idx + 1 < buttons.len() {
+                        // Go to next button
+                        self.selected = ElementSelection::Button(buttons[idx + 1]);
+                        return true;
+                    } else {
+                        // On last button, wrap to first text field
+                        if let Some(field_id) = text_fields.first() {
+                            self.selected = ElementSelection::Field(*field_id);
+                            return true;
+                        }
+                    }
+                }
+            }
+            ElementSelection::None => {
+                // Select first available
+                if let Some(field_id) = text_fields.first() {
+                    self.selected = ElementSelection::Field(*field_id);
+                    return true;
+                } else if let Some(btn) = buttons.first() {
+                    self.selected = ElementSelection::Button(*btn);
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    /// Find and select a field by its shortcut key
+    /// Returns true if a field was selected
+    pub fn select_field_by_shortcut(&mut self, key: char) -> bool {
+        let key_lower = key.to_ascii_lowercase();
+        for field in &self.definition.fields {
+            if field.is_focusable() {
+                if let Some(shortcut) = field.shortcut {
+                    if shortcut.to_ascii_lowercase() == key_lower {
+                        self.selected = ElementSelection::Field(field.id);
+                        return true;
+                    }
+                }
+            }
+        }
+        false
+    }
+
+    /// Check if currently editing a text field
+    pub fn is_editing_text(&self) -> bool {
+        self.editing && self.selected_field().map(|f| f.kind.is_text_editable()).unwrap_or(false)
+    }
+
+    /// Check if a specific field is selected
+    pub fn is_field_selected(&self, id: FieldId) -> bool {
+        matches!(&self.selected, ElementSelection::Field(selected_id) if *selected_id == id)
     }
 
     // ========================================================================
@@ -1116,7 +1337,8 @@ impl PopupState {
 
     /// Move selection up in a list field
     pub fn list_select_up(&mut self) {
-        if let Some(field) = self.selected_field_mut() {
+        // Find the first list field and update its selection
+        for field in &mut self.definition.fields {
             if let FieldKind::List { selected_index, scroll_offset, .. } = &mut field.kind {
                 if *selected_index > 0 {
                     *selected_index -= 1;
@@ -1125,28 +1347,35 @@ impl PopupState {
                         *scroll_offset = *selected_index;
                     }
                 }
+                return;
             }
         }
     }
 
     /// Move selection down in a list field
     pub fn list_select_down(&mut self) {
-        if let Some(field) = self.selected_field_mut() {
-            if let FieldKind::List { items, selected_index, scroll_offset, visible_height } = &mut field.kind {
+        // Find the first list field and update its selection
+        for field in &mut self.definition.fields {
+            if let FieldKind::List { items, selected_index, scroll_offset, visible_height, .. } = &mut field.kind {
                 if *selected_index + 1 < items.len() {
                     *selected_index += 1;
-                    // Scroll to keep selection visible
+                    // Scroll to keep selection visible, but never scroll past last item
                     if *selected_index >= *scroll_offset + *visible_height {
-                        *scroll_offset = selected_index.saturating_sub(*visible_height - 1);
+                        let new_offset = selected_index.saturating_sub(*visible_height - 1);
+                        // Limit scroll so we don't show empty space at bottom
+                        let max_scroll = items.len().saturating_sub(*visible_height);
+                        *scroll_offset = new_offset.min(max_scroll);
                     }
                 }
+                return;
             }
         }
     }
 
     /// Get the currently selected item in a list field
     pub fn get_selected_list_item(&self) -> Option<&ListItem> {
-        if let Some(field) = self.selected_field() {
+        // Find the first list field and get its selected item
+        for field in &self.definition.fields {
             if let FieldKind::List { items, selected_index, .. } = &field.kind {
                 return items.get(*selected_index);
             }

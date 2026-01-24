@@ -268,6 +268,8 @@ pub fn create_world_editor_popup(settings: &WorldSettings) -> PopupDefinition {
             center_horizontal: true,
             center_vertical: true,
             modal: true,
+            buttons_right_align: false,
+            blank_line_before_list: false,
         });
 
     // Set field visibility based on world type

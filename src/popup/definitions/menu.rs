@@ -84,6 +84,8 @@ pub fn create_menu_popup() -> PopupDefinition {
             center_horizontal: true,
             center_vertical: true,
             modal: true,
+            buttons_right_align: false,
+            blank_line_before_list: false,
         })
 }
 

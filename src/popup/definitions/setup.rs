@@ -87,7 +87,7 @@ pub fn create_setup_popup(
         .with_field(Field::new(
             SETUP_FIELD_INPUT_HEIGHT,
             "Input Height",
-            FieldKind::number_range(input_height, 1, 15),
+            FieldKind::number(input_height),
         ))
         .with_field(Field::new(
             SETUP_FIELD_GUI_THEME,
@@ -102,12 +102,14 @@ pub fn create_setup_popup(
         .with_button(Button::new(SETUP_BTN_SAVE, "Save").primary().with_shortcut('S'))
         .with_button(Button::new(SETUP_BTN_CANCEL, "Cancel").with_shortcut('C'))
         .with_layout(PopupLayout {
-            label_width: 16,
+            label_width: 17,
             min_width: 40,
             max_width_percent: 60,
             center_horizontal: true,
             center_vertical: true,
             modal: true,
+            buttons_right_align: true,
+            blank_line_before_list: false,
         })
 }
 

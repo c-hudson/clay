@@ -25,8 +25,8 @@ pub const WEB_BTN_CANCEL: ButtonId = ButtonId(2);
 /// Protocol options
 pub fn protocol_options() -> Vec<SelectOption> {
     vec![
-        SelectOption::new("nonsecure", "Non-Secure (ws://)"),
-        SelectOption::new("secure", "Secure (wss://)"),
+        SelectOption::new("nonsecure", "Non-Secure"),
+        SelectOption::new("secure", "Secure"),
     ]
 }
 
@@ -73,7 +73,7 @@ pub fn create_web_popup(
         .with_field(Field::new(
             WEB_FIELD_WS_PASSWORD,
             "WS Password",
-            FieldKind::password(ws_password),
+            FieldKind::text(ws_password),
         ))
         .with_field(Field::new(
             WEB_FIELD_WS_ALLOW_LIST,
@@ -93,12 +93,14 @@ pub fn create_web_popup(
         .with_button(Button::new(WEB_BTN_SAVE, "Save").primary().with_shortcut('S'))
         .with_button(Button::new(WEB_BTN_CANCEL, "Cancel").with_shortcut('C'))
         .with_layout(PopupLayout {
-            label_width: 14,
+            label_width: 15,
             min_width: 50,
-            max_width_percent: 70,
+            max_width_percent: 90,
             center_horizontal: true,
             center_vertical: true,
             modal: true,
+            buttons_right_align: true,
+            blank_line_before_list: false,
         });
 
     // Hide TLS fields if not secure

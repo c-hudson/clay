@@ -29,15 +29,19 @@ pub struct WorldInfo {
     pub is_current: bool,
 }
 
+/// Column headers for the world list
+pub const WORLD_LIST_HEADERS: &[&str] = &["World", "Hostname", "Port", "User"];
+
 /// Create the world selector popup definition
 pub fn create_world_selector_popup(worlds: &[WorldInfo], visible_height: usize) -> PopupDefinition {
     let items: Vec<ListItem> = worlds
         .iter()
         .map(|w| {
-            // Format: "* WorldName    hostname:port    user"
+            // Columns: World, Hostname, Port, User
             let columns = vec![
                 w.name.clone(),
-                format!("{}:{}", w.hostname, w.port),
+                w.hostname.clone(),
+                w.port.clone(),
                 w.user.clone(),
             ];
 
@@ -53,16 +57,27 @@ pub fn create_world_selector_popup(worlds: &[WorldInfo], visible_height: usize) 
         })
         .collect();
 
+    // Calculate column widths from headers and all items (so they don't change when filtering)
+    let num_columns = WORLD_LIST_HEADERS.len();
+    let mut column_widths: Vec<usize> = WORLD_LIST_HEADERS.iter().map(|h| h.len()).collect();
+    for item in &items {
+        for (i, col) in item.columns.iter().enumerate() {
+            if i < num_columns {
+                column_widths[i] = column_widths[i].max(col.len());
+            }
+        }
+    }
+
     PopupDefinition::new(PopupId("world_selector"), "World Selector")
         .with_field(Field::new(
             SELECTOR_FIELD_FILTER,
             "Filter",
             FieldKind::text_with_placeholder("", "Type to filter..."),
-        ))
+        ).with_shortcut('F'))
         .with_field(Field::new(
             SELECTOR_FIELD_LIST,
             "",
-            FieldKind::list(items, visible_height),
+            FieldKind::list_with_headers_and_widths(items, visible_height, WORLD_LIST_HEADERS, column_widths),
         ))
         .with_button(Button::new(SELECTOR_BTN_ADD, "Add").with_shortcut('A'))
         .with_button(Button::new(SELECTOR_BTN_EDIT, "Edit").with_shortcut('E'))
@@ -72,10 +87,12 @@ pub fn create_world_selector_popup(worlds: &[WorldInfo], visible_height: usize) 
         .with_layout(PopupLayout {
             label_width: 8,
             min_width: 60,
-            max_width_percent: 80,
+            max_width_percent: 90,
             center_horizontal: true,
-            center_vertical: true,
+            center_vertical: false,  // Top-aligned for better content fitting
             modal: true,
+            buttons_right_align: true,
+            blank_line_before_list: true,
         })
 }
 
@@ -100,13 +117,15 @@ pub fn filter_worlds(all_worlds: &[WorldInfo], filter: &str) -> Vec<WorldInfo> {
 /// Update the list field with filtered worlds
 pub fn update_world_list(state: &mut crate::popup::PopupState, worlds: &[WorldInfo]) {
     if let Some(field) = state.field_mut(SELECTOR_FIELD_LIST) {
-        if let FieldKind::List { items, selected_index, scroll_offset, visible_height } = &mut field.kind {
+        if let FieldKind::List { items, selected_index, scroll_offset, .. } = &mut field.kind {
             let new_items: Vec<ListItem> = worlds
                 .iter()
                 .map(|w| {
+                    // Columns: World, Hostname, Port, User
                     let columns = vec![
                         w.name.clone(),
-                        format!("{}:{}", w.hostname, w.port),
+                        w.hostname.clone(),
+                        w.port.clone(),
                         w.user.clone(),
                     ];
 

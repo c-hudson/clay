@@ -35,6 +35,8 @@ pub fn create_confirm_dialog(id: &'static str, title: &str, message: &str) -> Po
             center_horizontal: true,
             center_vertical: true,
             modal: true,
+            buttons_right_align: false,
+            blank_line_before_list: false,
         })
 }
 

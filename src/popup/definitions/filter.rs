@@ -24,6 +24,8 @@ pub fn create_filter_popup() -> PopupDefinition {
             center_horizontal: false,  // Positioned in upper right
             center_vertical: false,
             modal: false,  // Non-modal, shows filtered output behind
+            buttons_right_align: false,
+            blank_line_before_list: false,
         })
 }
 

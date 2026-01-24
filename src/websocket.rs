@@ -223,6 +223,9 @@ pub struct WorldStateMsg {
     pub output_lines_ts: Vec<TimestampedLine>,
     #[serde(default)]
     pub pending_lines_ts: Vec<TimestampedLine>,
+    // Whether splash screen is being shown (for centering)
+    #[serde(default)]
+    pub showing_splash: bool,
 }
 
 /// World settings for WebSocket protocol

@@ -4938,6 +4938,88 @@ impl App {
         None
     }
 
+    /// Open the world selector popup using the new unified popup system
+    fn open_world_selector_new(&mut self) {
+        use popup::definitions::world_selector::{create_world_selector_popup, WorldInfo, SELECTOR_FIELD_LIST};
+
+        let worlds: Vec<WorldInfo> = self.worlds.iter().enumerate().map(|(i, w)| {
+            WorldInfo {
+                name: w.name.clone(),
+                hostname: w.settings.hostname.clone(),
+                port: w.settings.port.to_string(),
+                user: w.settings.user.clone(),
+                is_connected: w.connected,
+                is_current: i == self.current_world_index,
+            }
+        }).collect();
+
+        let visible_height = 10.min(worlds.len().max(3));
+        let def = create_world_selector_popup(&worlds, visible_height);
+        self.popup_manager.open(def);
+
+        // Select current world in the list
+        if let Some(state) = self.popup_manager.current_mut() {
+            state.select_field(SELECTOR_FIELD_LIST);
+            // Set selection to current world
+            if let Some(field) = state.field_mut(SELECTOR_FIELD_LIST) {
+                if let popup::FieldKind::List { selected_index, .. } = &mut field.kind {
+                    *selected_index = self.current_world_index;
+                }
+            }
+        }
+    }
+
+    /// Open the new setup popup for global settings
+    fn open_setup_popup_new(&mut self) {
+        use popup::definitions::setup::{create_setup_popup, SETUP_FIELD_MORE_MODE};
+
+        let world_switching = match self.settings.world_switch_mode {
+            WorldSwitchMode::UnseenFirst => "unseen_first",
+            WorldSwitchMode::Alphabetical => "alphabetical",
+        };
+
+        let def = create_setup_popup(
+            self.settings.more_mode_enabled,
+            self.settings.spell_check_enabled,
+            self.settings.temp_convert_enabled,
+            world_switching,
+            self.settings.debug_enabled,
+            self.show_tags,
+            self.input_height as i64,
+            self.settings.gui_theme.name(),
+            self.settings.tls_proxy_enabled,
+        );
+        self.popup_manager.open(def);
+
+        // Select first field
+        if let Some(state) = self.popup_manager.current_mut() {
+            state.select_field(SETUP_FIELD_MORE_MODE);
+        }
+    }
+
+    /// Open the new web settings popup
+    fn open_web_popup_new(&mut self) {
+        use popup::definitions::web::{create_web_popup, WEB_FIELD_PROTOCOL};
+
+        let def = create_web_popup(
+            self.settings.web_secure,
+            self.settings.http_enabled,
+            &self.settings.http_port.to_string(),
+            self.settings.ws_enabled,
+            &self.settings.ws_port.to_string(),
+            &self.settings.websocket_password,
+            &self.settings.websocket_allow_list,
+            &self.settings.websocket_cert_file,
+            &self.settings.websocket_key_file,
+        );
+        self.popup_manager.open(def);
+
+        // Select first field
+        if let Some(state) = self.popup_manager.current_mut() {
+            state.select_field(WEB_FIELD_PROTOCOL);
+        }
+    }
+
     /// Send a command to the MUD (routes through WebSocket if remote client)
     fn send_to_mud(&mut self, world_index: usize, command: &str) {
         if let Some(ref tx) = self.ws_client_tx {
@@ -16800,6 +16882,18 @@ fn handle_remote_client_key(
             NewPopupAction::Confirm(_data) => {
                 // Confirm action - remote client doesn't handle locally
             }
+            NewPopupAction::WorldSelector(_action) => {
+                // World selector action - remote client doesn't handle locally
+            }
+            NewPopupAction::WorldSelectorFilter => {
+                // Filter changed - remote client doesn't handle locally
+            }
+            NewPopupAction::SetupSaved(_settings) => {
+                // Setup saved - remote client doesn't handle locally
+            }
+            NewPopupAction::WebSaved(_settings) => {
+                // Web settings saved - remote client doesn't handle locally
+            }
             NewPopupAction::None => {}
         }
         return false;
@@ -16955,13 +17049,13 @@ fn handle_remote_client_key(
                         app.help_popup.open();
                     }
                     Command::Setup => {
-                        app.settings_popup.open_setup(&app.settings, app.input_height, app.show_tags);
+                        app.open_setup_popup_new();
                     }
                     Command::Web => {
-                        app.web_popup.open(&app.settings);
+                        app.open_web_popup_new();
                     }
                     Command::WorldSelector => {
-                        app.world_selector.open(app.current_world_index);
+                        app.open_world_selector_new();
                     }
                     Command::WorldsList => {
                         // WorldsPopup uses show(), not open()
@@ -17198,6 +17292,48 @@ enum NewPopupAction {
     Command(String),
     /// Confirm action with custom_data from the popup
     Confirm(std::collections::HashMap<String, String>),
+    /// World selector action
+    WorldSelector(WorldSelectorAction),
+    /// World selector filter changed - need to update the list
+    WorldSelectorFilter,
+    /// Setup (global settings) saved
+    SetupSaved(SetupSettings),
+    /// Web settings saved
+    WebSaved(WebSettings),
+}
+
+/// Settings from the setup popup
+struct SetupSettings {
+    more_mode: bool,
+    spell_check: bool,
+    temp_convert: bool,
+    world_switching: String,
+    debug: bool,
+    show_tags: bool,
+    input_height: i64,
+    gui_theme: String,
+    tls_proxy: bool,
+}
+
+/// Settings from the web popup
+struct WebSettings {
+    web_secure: bool,
+    http_enabled: bool,
+    http_port: String,
+    ws_enabled: bool,
+    ws_port: String,
+    ws_password: String,
+    ws_allow_list: String,
+    ws_cert_file: String,
+    ws_key_file: String,
+}
+
+/// Actions from the world selector popup
+enum WorldSelectorAction {
+    Connect(String),      // Connect to world by name
+    Edit(String),         // Edit world by name
+    Delete(String),       // Delete world by name
+    Add,                  // Add new world
 }
 
 /// Handle input for new unified popup system
@@ -17205,12 +17341,490 @@ fn handle_new_popup_key(app: &mut App, key: KeyEvent) -> NewPopupAction {
     use crossterm::event::KeyCode::*;
     use popup::definitions::help::HELP_BTN_OK;
     use popup::definitions::confirm::{CONFIRM_BTN_YES, CONFIRM_BTN_NO};
+    use popup::ElementSelection;
+    use popup::definitions::world_selector::{
+        SELECTOR_FIELD_FILTER,
+        SELECTOR_BTN_ADD, SELECTOR_BTN_EDIT, SELECTOR_BTN_DELETE,
+        SELECTOR_BTN_CONNECT, SELECTOR_BTN_CANCEL,
+    };
+    use popup::definitions::setup::{
+        SETUP_FIELD_MORE_MODE, SETUP_FIELD_SPELL_CHECK, SETUP_FIELD_TEMP_CONVERT,
+        SETUP_FIELD_WORLD_SWITCHING, SETUP_FIELD_DEBUG, SETUP_FIELD_SHOW_TAGS,
+        SETUP_FIELD_INPUT_HEIGHT, SETUP_FIELD_GUI_THEME, SETUP_FIELD_TLS_PROXY,
+        SETUP_BTN_SAVE, SETUP_BTN_CANCEL,
+    };
+    use popup::definitions::web::{
+        WEB_FIELD_PROTOCOL, WEB_FIELD_HTTP_ENABLED, WEB_FIELD_HTTP_PORT,
+        WEB_FIELD_WS_ENABLED, WEB_FIELD_WS_PORT, WEB_FIELD_WS_PASSWORD,
+        WEB_FIELD_WS_ALLOW_LIST, WEB_FIELD_WS_CERT_FILE, WEB_FIELD_WS_KEY_FILE,
+        WEB_BTN_SAVE, WEB_BTN_CANCEL, update_tls_visibility,
+    };
 
     let popup_id = app.popup_manager.current().map(|s| s.definition.id.clone());
     let is_menu = popup_id == Some(popup::PopupId("menu"));
     let is_confirm = popup_id.as_ref().map(|id| id.0.starts_with("delete_")).unwrap_or(false);
+    let is_world_selector = popup_id == Some(popup::PopupId("world_selector"));
+    let is_setup = popup_id == Some(popup::PopupId("setup"));
+    let is_web = popup_id == Some(popup::PopupId("web"));
 
     if let Some(state) = app.popup_manager.current_mut() {
+        // World selector has special handling
+        if is_world_selector {
+            // Get selected world name before any state mutations
+            let get_selected = || state.get_selected_list_item().map(|item| item.id.clone());
+
+            // Check if we're editing the filter field
+            let is_editing_filter = state.editing && state.is_field_selected(SELECTOR_FIELD_FILTER);
+
+            // When editing filter, handle text input
+            if is_editing_filter {
+                match key.code {
+                    Esc => {
+                        state.commit_edit();
+                        // Apply filter after editing
+                        return NewPopupAction::WorldSelectorFilter;
+                    }
+                    Tab => {
+                        // Tab exits filter field and goes to buttons
+                        state.commit_edit();
+                        state.cycle_field_buttons();
+                        return NewPopupAction::WorldSelectorFilter;
+                    }
+                    Enter => {
+                        state.commit_edit();
+                        // Apply filter and stay in popup
+                        return NewPopupAction::WorldSelectorFilter;
+                    }
+                    Backspace => {
+                        state.backspace();
+                        return NewPopupAction::WorldSelectorFilter;
+                    }
+                    Delete => {
+                        state.delete_char();
+                        return NewPopupAction::WorldSelectorFilter;
+                    }
+                    Left => {
+                        state.cursor_left();
+                    }
+                    Right => {
+                        state.cursor_right();
+                    }
+                    Home => {
+                        state.cursor_home();
+                    }
+                    End => {
+                        state.cursor_end();
+                    }
+                    Char(c) => {
+                        // Insert character into filter
+                        state.insert_char(c);
+                        return NewPopupAction::WorldSelectorFilter;
+                    }
+                    _ => {}
+                }
+                return NewPopupAction::None;
+            }
+
+            // Not editing - handle normal navigation and shortcuts
+            match key.code {
+                Esc => {
+                    app.popup_manager.close();
+                }
+                Enter => {
+                    if state.is_on_button() {
+                        if state.is_button_focused(SELECTOR_BTN_CONNECT) {
+                            if let Some(name) = get_selected() {
+                                app.popup_manager.close();
+                                return NewPopupAction::WorldSelector(WorldSelectorAction::Connect(name));
+                            }
+                        } else if state.is_button_focused(SELECTOR_BTN_EDIT) {
+                            if let Some(name) = get_selected() {
+                                app.popup_manager.close();
+                                return NewPopupAction::WorldSelector(WorldSelectorAction::Edit(name));
+                            }
+                        } else if state.is_button_focused(SELECTOR_BTN_DELETE) {
+                            if let Some(name) = get_selected() {
+                                app.popup_manager.close();
+                                return NewPopupAction::WorldSelector(WorldSelectorAction::Delete(name));
+                            }
+                        } else if state.is_button_focused(SELECTOR_BTN_ADD) {
+                            app.popup_manager.close();
+                            return NewPopupAction::WorldSelector(WorldSelectorAction::Add);
+                        } else if state.is_button_focused(SELECTOR_BTN_CANCEL) {
+                            app.popup_manager.close();
+                        }
+                    } else if state.is_field_selected(SELECTOR_FIELD_FILTER) {
+                        // Start editing filter field
+                        state.start_edit();
+                    } else {
+                        // On list - connect to selected world
+                        if let Some(name) = get_selected() {
+                            app.popup_manager.close();
+                            return NewPopupAction::WorldSelector(WorldSelectorAction::Connect(name));
+                        }
+                    }
+                }
+                Up => {
+                    state.list_select_up();
+                }
+                Down => {
+                    state.list_select_down();
+                }
+                Tab => {
+                    // Cycle between filter field and buttons
+                    state.cycle_field_buttons();
+                }
+                BackTab => {
+                    // Cycle backwards
+                    state.cycle_field_buttons();
+                }
+                Char(c) => {
+                    // Check if filter field is selected - if so, start editing and add char
+                    if state.is_field_selected(SELECTOR_FIELD_FILTER) {
+                        state.start_edit();
+                        state.insert_char(c);
+                        return NewPopupAction::WorldSelectorFilter;
+                    }
+                    // Otherwise handle as shortcuts
+                    match c {
+                        'f' | 'F' => {
+                            // Select filter field and start editing
+                            state.select_field(SELECTOR_FIELD_FILTER);
+                            state.start_edit();
+                        }
+                        'a' | 'A' => {
+                            app.popup_manager.close();
+                            return NewPopupAction::WorldSelector(WorldSelectorAction::Add);
+                        }
+                        'e' | 'E' => {
+                            if let Some(name) = get_selected() {
+                                app.popup_manager.close();
+                                return NewPopupAction::WorldSelector(WorldSelectorAction::Edit(name));
+                            }
+                        }
+                        'd' | 'D' => {
+                            if let Some(name) = get_selected() {
+                                app.popup_manager.close();
+                                return NewPopupAction::WorldSelector(WorldSelectorAction::Delete(name));
+                            }
+                        }
+                        'o' | 'O' => {
+                            if let Some(name) = get_selected() {
+                                app.popup_manager.close();
+                                return NewPopupAction::WorldSelector(WorldSelectorAction::Connect(name));
+                            }
+                        }
+                        'c' | 'C' => {
+                            app.popup_manager.close();
+                        }
+                        _ => {}
+                    }
+                }
+                _ => {}
+            }
+            return NewPopupAction::None;
+        }
+
+        // Setup popup handling
+        if is_setup {
+            // Helper to extract settings before closing
+            let extract_settings = || -> SetupSettings {
+                SetupSettings {
+                    more_mode: state.get_bool(SETUP_FIELD_MORE_MODE).unwrap_or(true),
+                    spell_check: state.get_bool(SETUP_FIELD_SPELL_CHECK).unwrap_or(true),
+                    temp_convert: state.get_bool(SETUP_FIELD_TEMP_CONVERT).unwrap_or(false),
+                    world_switching: state.get_selected(SETUP_FIELD_WORLD_SWITCHING)
+                        .unwrap_or("unseen_first").to_string(),
+                    debug: state.get_bool(SETUP_FIELD_DEBUG).unwrap_or(false),
+                    show_tags: state.get_bool(SETUP_FIELD_SHOW_TAGS).unwrap_or(false),
+                    input_height: state.get_number(SETUP_FIELD_INPUT_HEIGHT).unwrap_or(3),
+                    gui_theme: state.get_selected(SETUP_FIELD_GUI_THEME)
+                        .unwrap_or("dark").to_string(),
+                    tls_proxy: state.get_bool(SETUP_FIELD_TLS_PROXY).unwrap_or(false),
+                }
+            };
+
+            match key.code {
+                Esc => {
+                    app.popup_manager.close();
+                }
+                Enter | Char(' ') => {
+                    if state.is_on_button() {
+                        if state.is_button_focused(SETUP_BTN_SAVE) {
+                            let settings = extract_settings();
+                            app.popup_manager.close();
+                            return NewPopupAction::SetupSaved(settings);
+                        } else if state.is_button_focused(SETUP_BTN_CANCEL) {
+                            app.popup_manager.close();
+                        }
+                    } else {
+                        // Toggle current field
+                        state.toggle_current();
+                    }
+                }
+                Up => {
+                    if state.is_on_button() {
+                        // Go back to last field from button row
+                        state.select_last_field();
+                    } else {
+                        state.prev_field();
+                    }
+                }
+                Down => {
+                    if state.is_on_button() {
+                        // Go back to last field from button row
+                        state.select_last_field();
+                    } else {
+                        // Move to next field (don't go to buttons)
+                        state.next_field();
+                    }
+                }
+                Left => {
+                    // Decrease number or cycle select
+                    state.decrease_current();
+                }
+                Right => {
+                    // Increase number or cycle select
+                    state.increase_current();
+                }
+                Tab => {
+                    if state.is_on_button() {
+                        state.next_button();
+                    } else {
+                        state.select_first_button();
+                    }
+                }
+                BackTab => {
+                    if state.is_on_button() {
+                        state.prev_button();
+                    } else {
+                        state.select_last_field();
+                    }
+                }
+                Char('s') | Char('S') => {
+                    let settings = extract_settings();
+                    app.popup_manager.close();
+                    return NewPopupAction::SetupSaved(settings);
+                }
+                Char('c') | Char('C') => {
+                    app.popup_manager.close();
+                }
+                _ => {}
+            }
+            return NewPopupAction::None;
+        }
+
+        // Web popup handling
+        if is_web {
+            // Helper to extract settings before closing
+            let extract_settings = || -> WebSettings {
+                WebSettings {
+                    web_secure: state.get_selected(WEB_FIELD_PROTOCOL) == Some("secure"),
+                    http_enabled: state.get_bool(WEB_FIELD_HTTP_ENABLED).unwrap_or(false),
+                    http_port: state.get_text(WEB_FIELD_HTTP_PORT).unwrap_or("9000").to_string(),
+                    ws_enabled: state.get_bool(WEB_FIELD_WS_ENABLED).unwrap_or(false),
+                    ws_port: state.get_text(WEB_FIELD_WS_PORT).unwrap_or("9002").to_string(),
+                    ws_password: state.get_text(WEB_FIELD_WS_PASSWORD).unwrap_or("").to_string(),
+                    ws_allow_list: state.get_text(WEB_FIELD_WS_ALLOW_LIST).unwrap_or("").to_string(),
+                    ws_cert_file: state.get_text(WEB_FIELD_WS_CERT_FILE).unwrap_or("").to_string(),
+                    ws_key_file: state.get_text(WEB_FIELD_WS_KEY_FILE).unwrap_or("").to_string(),
+                }
+            };
+
+            // Check if current field is a text field
+            let is_text_field = state.selected_field().map(|f| f.kind.is_text()).unwrap_or(false);
+
+            match key.code {
+                Esc => {
+                    if state.editing {
+                        state.cancel_edit();
+                    } else {
+                        app.popup_manager.close();
+                    }
+                }
+                Enter => {
+                    if state.editing {
+                        state.commit_edit();
+                    } else if state.is_on_button() {
+                        if state.is_button_focused(WEB_BTN_SAVE) {
+                            let settings = extract_settings();
+                            app.popup_manager.close();
+                            return NewPopupAction::WebSaved(settings);
+                        } else if state.is_button_focused(WEB_BTN_CANCEL) {
+                            app.popup_manager.close();
+                        }
+                    } else if is_text_field {
+                        state.start_edit();
+                    } else {
+                        // Toggle current field
+                        state.toggle_current();
+                        // Update TLS visibility when protocol changes
+                        if let ElementSelection::Field(id) = &state.selected {
+                            if *id == WEB_FIELD_PROTOCOL {
+                                update_tls_visibility(state);
+                            }
+                        }
+                    }
+                }
+                Char(' ') => {
+                    if !state.editing {
+                        // Toggle for non-text fields
+                        state.toggle_current();
+                        // Update TLS visibility when protocol changes
+                        if let ElementSelection::Field(id) = &state.selected {
+                            if *id == WEB_FIELD_PROTOCOL {
+                                update_tls_visibility(state);
+                            }
+                        }
+                    } else {
+                        state.insert_char(' ');
+                    }
+                }
+                Up => {
+                    // Commit any current edit before moving
+                    if state.editing {
+                        state.commit_edit();
+                    }
+                    if state.is_on_button() {
+                        // Go back to last field from button row
+                        state.select_last_field();
+                    } else {
+                        state.prev_field();
+                    }
+                    // Auto-start editing if new field is text
+                    if state.selected_field().map(|f| f.kind.is_text()).unwrap_or(false) {
+                        state.start_edit();
+                    }
+                }
+                Down => {
+                    // Commit any current edit before moving
+                    if state.editing {
+                        state.commit_edit();
+                    }
+                    if state.is_on_button() {
+                        // Go back to last field from button row
+                        state.select_last_field();
+                    } else {
+                        // Move to next field (don't go to buttons)
+                        state.next_field();
+                    }
+                    // Auto-start editing if new field is text
+                    if state.selected_field().map(|f| f.kind.is_text()).unwrap_or(false) {
+                        state.start_edit();
+                    }
+                }
+                Left => {
+                    if is_text_field {
+                        // Text field: move cursor (start editing if needed)
+                        if !state.editing {
+                            state.start_edit();
+                        }
+                        state.cursor_left();
+                    } else {
+                        state.decrease_current();
+                        // Update TLS visibility when protocol changes
+                        if let ElementSelection::Field(id) = &state.selected {
+                            if *id == WEB_FIELD_PROTOCOL {
+                                update_tls_visibility(state);
+                            }
+                        }
+                    }
+                }
+                Right => {
+                    if is_text_field {
+                        // Text field: move cursor (start editing if needed)
+                        if !state.editing {
+                            state.start_edit();
+                        }
+                        state.cursor_right();
+                    } else {
+                        state.increase_current();
+                        // Update TLS visibility when protocol changes
+                        if let ElementSelection::Field(id) = &state.selected {
+                            if *id == WEB_FIELD_PROTOCOL {
+                                update_tls_visibility(state);
+                            }
+                        }
+                    }
+                }
+                Tab => {
+                    if state.editing {
+                        state.commit_edit();
+                    }
+                    if state.is_on_button() {
+                        state.next_button();
+                    } else {
+                        state.select_first_button();
+                    }
+                }
+                BackTab => {
+                    if state.editing {
+                        state.commit_edit();
+                    }
+                    if state.is_on_button() {
+                        state.prev_button();
+                    } else {
+                        state.select_last_field();
+                        // Auto-start editing if new field is text
+                        if state.selected_field().map(|f| f.kind.is_text()).unwrap_or(false) {
+                            state.start_edit();
+                        }
+                    }
+                }
+                Backspace => {
+                    if is_text_field {
+                        if !state.editing {
+                            state.start_edit();
+                        }
+                        state.backspace();
+                    }
+                }
+                Delete => {
+                    if is_text_field {
+                        if !state.editing {
+                            state.start_edit();
+                        }
+                        state.delete_char();
+                    }
+                }
+                Home => {
+                    if is_text_field {
+                        if !state.editing {
+                            state.start_edit();
+                        }
+                        state.cursor_home();
+                    }
+                }
+                End => {
+                    if is_text_field {
+                        if !state.editing {
+                            state.start_edit();
+                        }
+                        state.cursor_end();
+                    }
+                }
+                Char('s') | Char('S') if !state.editing => {
+                    let settings = extract_settings();
+                    app.popup_manager.close();
+                    return NewPopupAction::WebSaved(settings);
+                }
+                Char('c') | Char('C') if !state.editing => {
+                    app.popup_manager.close();
+                }
+                Char(c) => {
+                    if state.editing {
+                        state.insert_char(c);
+                    } else if is_text_field {
+                        // Start editing and insert character
+                        state.start_edit();
+                        state.insert_char(c);
+                    }
+                }
+                _ => {}
+            }
+            return NewPopupAction::None;
+        }
+
         match key.code {
             Esc => {
                 app.popup_manager.close();
@@ -22951,6 +23565,110 @@ fn handle_key_event(key: KeyEvent, app: &mut App) -> KeyAction {
                     }
                 }
             }
+            NewPopupAction::WorldSelector(action) => {
+                match action {
+                    WorldSelectorAction::Connect(name) => {
+                        // Find world and connect to it
+                        if let Some(idx) = app.find_world(&name) {
+                            app.switch_world(idx);
+                            if !app.current_world().connected {
+                                if app.current_world().settings.has_connection_settings() {
+                                    return KeyAction::SendCommand("/connect".to_string());
+                                } else {
+                                    app.add_output(&format!("World '{}' has no connection settings.", name));
+                                }
+                            }
+                        }
+                    }
+                    WorldSelectorAction::Edit(name) => {
+                        // Open world editor
+                        if let Some(idx) = app.find_world(&name) {
+                            let input_height = app.input_height;
+                            let show_tags = app.show_tags;
+                            app.settings_popup.open(&app.settings, &app.worlds[idx], idx, input_height, show_tags);
+                        }
+                    }
+                    WorldSelectorAction::Delete(name) => {
+                        // Open confirmation dialog for delete
+                        if let Some(idx) = app.find_world(&name) {
+                            if app.worlds.len() > 1 {
+                                app.open_delete_world_confirm(&name, idx);
+                            } else {
+                                app.add_output("Cannot delete the last world.");
+                            }
+                        }
+                    }
+                    WorldSelectorAction::Add => {
+                        // Create new world and open editor
+                        let new_name = format!("World {}", app.worlds.len() + 1);
+                        let new_world = World::new(&new_name);
+                        app.worlds.push(new_world);
+                        let idx = app.worlds.len() - 1;
+                        let input_height = app.input_height;
+                        let show_tags = app.show_tags;
+                        app.settings_popup.open(&app.settings, &app.worlds[idx], idx, input_height, show_tags);
+                    }
+                }
+            }
+            NewPopupAction::WorldSelectorFilter => {
+                // Filter changed - update the world list
+                use popup::definitions::world_selector::SELECTOR_FIELD_FILTER;
+                if let Some(state) = app.popup_manager.current_mut() {
+                    // Use edit_buffer if currently editing, otherwise use field value
+                    let filter_text = if state.editing && state.is_field_selected(SELECTOR_FIELD_FILTER) {
+                        state.edit_buffer.clone()
+                    } else {
+                        state.get_text(SELECTOR_FIELD_FILTER).unwrap_or("").to_string()
+                    };
+                    // Build world info list
+                    let all_worlds: Vec<popup::definitions::world_selector::WorldInfo> = app.worlds
+                        .iter()
+                        .enumerate()
+                        .map(|(idx, w)| popup::definitions::world_selector::WorldInfo {
+                            name: w.name.clone(),
+                            hostname: w.settings.hostname.clone(),
+                            port: w.settings.port.to_string(),
+                            user: w.settings.user.clone(),
+                            is_connected: w.connected,
+                            is_current: idx == app.current_world_index,
+                        })
+                        .collect();
+                    // Apply filter
+                    let filtered = popup::definitions::world_selector::filter_worlds(&all_worlds, &filter_text);
+                    // Update the list in the popup state
+                    popup::definitions::world_selector::update_world_list(state, &filtered);
+                }
+            }
+            NewPopupAction::SetupSaved(settings) => {
+                // Apply saved settings
+                app.settings.more_mode_enabled = settings.more_mode;
+                app.settings.spell_check_enabled = settings.spell_check;
+                app.settings.temp_convert_enabled = settings.temp_convert;
+                app.settings.world_switch_mode = if settings.world_switching == "unseen_first" {
+                    WorldSwitchMode::UnseenFirst
+                } else {
+                    WorldSwitchMode::Alphabetical
+                };
+                app.settings.debug_enabled = settings.debug;
+                app.show_tags = settings.show_tags;
+                app.input_height = settings.input_height as u16;
+                app.settings.gui_theme = Theme::from_name(&settings.gui_theme);
+                app.settings.tls_proxy_enabled = settings.tls_proxy;
+                // Settings will be saved when app state is persisted
+            }
+            NewPopupAction::WebSaved(settings) => {
+                // Apply saved web settings
+                app.settings.web_secure = settings.web_secure;
+                app.settings.http_enabled = settings.http_enabled;
+                app.settings.http_port = settings.http_port.parse().unwrap_or(9000);
+                app.settings.ws_enabled = settings.ws_enabled;
+                app.settings.ws_port = settings.ws_port.parse().unwrap_or(9002);
+                app.settings.websocket_password = settings.ws_password;
+                app.settings.websocket_allow_list = settings.ws_allow_list;
+                app.settings.websocket_cert_file = settings.ws_cert_file;
+                app.settings.websocket_key_file = settings.ws_key_file;
+                // Settings will be saved when app state is persisted
+            }
             NewPopupAction::None => {}
         }
         return KeyAction::None;
@@ -25369,15 +26087,15 @@ async fn handle_command(cmd: &str, app: &mut App, event_tx: mpsc::Sender<AppEven
         }
         Command::Setup => {
             // Open settings popup for global settings only
-            app.settings_popup.open_setup(&app.settings, app.input_height, app.show_tags);
+            app.open_setup_popup_new();
         }
         Command::Web => {
             // Open web settings popup
-            app.web_popup.open(&app.settings);
+            app.open_web_popup_new();
         }
         Command::WorldSelector => {
             // /worlds (no args) - show world selector popup
-            app.world_selector.open(app.current_world_index);
+            app.open_world_selector_new();
         }
         Command::WorldEdit { name } => {
             // /worlds -e or /worlds -e <name>

@@ -60,8 +60,18 @@ fn calculate_popup_area(area: Rect, layout: &PopupLayout, state: &PopupState) ->
 
     // Calculate height based on content
     let content_height = calculate_content_height(state);
-    let popup_height = (content_height as u16 + 2) // +2 for borders only
-        .min(area.height.saturating_sub(2))
+
+    // For non-centered vertical popups, available space is from line 2 (y=1) to separator bar
+    // Must not overlap input window (separator + input = 3 lines from bottom)
+    let max_height = if layout.center_vertical {
+        area.height.saturating_sub(2)
+    } else {
+        // Available from y=1, leaving 3 lines at bottom (separator + 2 input lines)
+        area.height.saturating_sub(4)
+    };
+
+    let popup_height = (content_height as u16 + 2) // +2 for borders
+        .min(max_height)
         .max(5);
 
     // Calculate position
@@ -72,10 +82,20 @@ fn calculate_popup_area(area: Rect, layout: &PopupLayout, state: &PopupState) ->
         area.width.saturating_sub(popup_width)
     };
 
+    // For vertical positioning:
+    // - center_vertical=true: center in the full area
+    // - center_vertical=false: center between line 2 (y=1) and above input window
     let y = if layout.center_vertical {
         area.height.saturating_sub(popup_height) / 2
     } else {
-        0
+        // Center between y=1 (line 2) and max position (leave 3 lines for separator + input)
+        let min_y = 1u16;
+        let max_y = area.height.saturating_sub(popup_height).saturating_sub(3);
+        if max_y <= min_y {
+            min_y
+        } else {
+            min_y + (max_y - min_y) / 2
+        }
     };
 
     let popup_area = Rect::new(x, y, popup_width, popup_height);
@@ -127,19 +147,34 @@ fn calculate_content_width(state: &PopupState, layout: &PopupLayout) -> usize {
 /// Calculate required content height
 fn calculate_content_height(state: &PopupState) -> usize {
     let mut height = 0;
+    let layout = &state.definition.layout;
 
     for field in &state.definition.fields {
         if !field.visible {
             continue;
         }
 
+        // Add blank line before list if configured
+        if layout.blank_line_before_list {
+            if let FieldKind::List { .. } = &field.kind {
+                height += 1;
+            }
+        }
+
         height += match &field.kind {
             FieldKind::Separator => 1,
             FieldKind::Label { text } => text.lines().count().max(1),
             FieldKind::MultilineText { line_count, .. } => *line_count,
-            FieldKind::List { items, visible_height, .. } => {
-                // Use actual item count, capped by visible_height
-                items.len().min(*visible_height)
+            FieldKind::List { visible_height, headers, .. } => {
+                // Use visible_height (set at popup creation) to maintain consistent size
+                // This prevents the popup from shrinking when filtering
+                let list_height = *visible_height;
+                // Add 1 for header row if headers are present
+                if headers.is_some() {
+                    list_height + 1
+                } else {
+                    list_height
+                }
             }
             _ => 1,
         };
@@ -157,6 +192,7 @@ fn calculate_content_height(state: &PopupState) -> usize {
 fn render_popup_content(f: &mut Frame, state: &PopupState, area: Rect, theme: Theme) {
     let mut y = area.y;
     let available_width = area.width as usize;
+    let layout = &state.definition.layout;
 
     // Render fields
     for field in &state.definition.fields {
@@ -166,12 +202,28 @@ fn render_popup_content(f: &mut Frame, state: &PopupState, area: Rect, theme: Th
 
         let is_selected = matches!(&state.selected, ElementSelection::Field(id) if *id == field.id);
 
+        // Add blank line before list if configured
+        if layout.blank_line_before_list {
+            if let FieldKind::List { .. } = &field.kind {
+                y += 1;
+            }
+        }
+
+        // Calculate remaining height available for this field
+        let remaining_height = (area.y + area.height).saturating_sub(y) as usize;
+        // Reserve space for buttons if present (1 blank line + 1 button row)
+        let button_space = if !state.definition.buttons.is_empty() { 2 } else { 0 };
+        let available_for_field = remaining_height.saturating_sub(button_space);
+
         let field_height = match &field.kind {
             FieldKind::Label { text } => text.lines().count().max(1) as u16,
             FieldKind::MultilineText { line_count, .. } => *line_count as u16,
-            FieldKind::List { items, visible_height, .. } => {
-                // Use actual item count, capped by visible_height
-                items.len().min(*visible_height) as u16
+            FieldKind::List { visible_height, headers, .. } => {
+                // Use visible_height to maintain consistent size (don't shrink when filtering)
+                let header_rows = if headers.is_some() { 1 } else { 0 };
+                let max_items = available_for_field.saturating_sub(header_rows);
+                let list_height = (*visible_height).min(max_items) as u16;
+                list_height + header_rows as u16
             }
             _ => 1,
         };
@@ -234,21 +286,75 @@ fn render_field(
         }
 
         FieldKind::Text { value, masked, placeholder } => {
-            let display_value = if state.editing && is_selected {
-                // Show edit buffer with cursor
-                let mut buf = state.edit_buffer.clone();
-                if *masked {
-                    buf = "*".repeat(buf.len());
-                }
-                // Insert cursor
-                let cursor_pos = state.edit_cursor.min(buf.chars().count());
-                let (before, after): (String, String) = {
-                    let chars: Vec<char> = buf.chars().collect();
-                    let before: String = chars[..cursor_pos].iter().collect();
-                    let after: String = chars[cursor_pos..].iter().collect();
-                    (before, after)
+            // Calculate available width for value area
+            let padding_width = label_width.saturating_sub(field.label.len() + 2);
+            let label_total = padding_width + field.label.len() + 2; // padding + label + ": "
+            let value_area_width = (area.width as usize).saturating_sub(label_total).saturating_sub(1);
+
+            let display_value = if is_selected {
+                // Show cursor when selected (whether editing or not)
+                // Use edit_buffer if editing, otherwise use field value
+                let buf = if state.editing {
+                    if *masked {
+                        "*".repeat(state.edit_buffer.len())
+                    } else {
+                        state.edit_buffer.clone()
+                    }
+                } else if *masked {
+                    "*".repeat(value.len())
+                } else {
+                    value.clone()
                 };
-                format!("{}│{}", before, after)
+                let chars: Vec<char> = buf.chars().collect();
+                // When not editing, put cursor at end
+                let cursor_pos = if state.editing {
+                    state.edit_cursor.min(chars.len())
+                } else {
+                    chars.len()
+                };
+
+                // Calculate viewport scroll to keep cursor visible
+                // Reserve 3 chars for cursor and potential < > indicators
+                let visible_width = value_area_width.saturating_sub(3);
+                let scroll = if visible_width == 0 || cursor_pos <= visible_width {
+                    // Cursor fits from beginning
+                    0
+                } else {
+                    // Keep cursor visible with some margin from right edge
+                    let margin = (visible_width / 4).max(1);
+                    cursor_pos.saturating_sub(visible_width - margin)
+                };
+
+                // Build visible portion with cursor
+                let has_left = scroll > 0;
+                let visible_start = scroll;
+                let visible_end = (scroll + visible_width).min(chars.len());
+                let has_right = visible_end < chars.len();
+
+                let mut result = String::new();
+                if has_left {
+                    result.push('<');
+                }
+
+                // Render visible chars with cursor
+                let visible_cursor = cursor_pos.saturating_sub(scroll);
+                for (i, c) in chars.iter().enumerate().skip(visible_start).take(visible_end - visible_start) {
+                    let idx = i - visible_start;
+                    if idx == visible_cursor {
+                        result.push('│');
+                    }
+                    result.push(*c);
+                }
+                // Cursor at end
+                if visible_cursor >= visible_end - visible_start {
+                    result.push('│');
+                }
+
+                if has_right {
+                    result.push('>');
+                }
+
+                result
             } else if value.is_empty() {
                 placeholder.clone().unwrap_or_default()
             } else if *masked {
@@ -257,7 +363,7 @@ fn render_field(
                 value.clone()
             };
 
-            render_labeled_field(f, &field.label, &display_value, area, label_width, is_selected, theme);
+            render_labeled_field_with_shortcut(f, &field.label, &display_value, area, label_width, is_selected, field.shortcut, theme);
         }
 
         FieldKind::Toggle { value } => {
@@ -268,20 +374,13 @@ fn render_field(
         FieldKind::Select { options, selected_index } => {
             let display_value = options
                 .get(*selected_index)
-                .map(|o| format!("< {} >", o.label))
-                .unwrap_or_else(|| "< - >".to_string());
+                .map(|o| format!("[ {} ]", o.label))
+                .unwrap_or_else(|| "[ - ]".to_string());
             render_labeled_field(f, &field.label, &display_value, area, label_width, is_selected, theme);
         }
 
-        FieldKind::Number { value, min, max } => {
-            let display_value = format!(
-                "< {} >{}",
-                value,
-                match (min, max) {
-                    (Some(lo), Some(hi)) => format!(" ({}-{})", lo, hi),
-                    _ => String::new(),
-                }
-            );
+        FieldKind::Number { value, .. } => {
+            let display_value = format!("[ {} ]", value);
             render_labeled_field(f, &field.label, &display_value, area, label_width, is_selected, theme);
         }
 
@@ -295,8 +394,11 @@ fn render_field(
             f.render_widget(Paragraph::new(lines), area);
         }
 
-        FieldKind::List { items, selected_index, scroll_offset, visible_height } => {
-            render_list_field(f, items, *selected_index, *scroll_offset, *visible_height, area, is_selected, theme);
+        FieldKind::List { items, selected_index, scroll_offset, headers, column_widths, .. } => {
+            // Use actual area height minus header row if present
+            let header_rows = if headers.is_some() { 1 } else { 0 };
+            let actual_visible = (area.height as usize).saturating_sub(header_rows);
+            render_list_field(f, items, *selected_index, *scroll_offset, actual_visible, headers, column_widths, area, is_selected, theme);
         }
 
         FieldKind::ScrollableContent { lines, scroll_offset, visible_height } => {
@@ -306,6 +408,76 @@ fn render_field(
 }
 
 /// Render a labeled field (label: value)
+/// When selected, only the value area is highlighted (not the label)
+/// If shortcut is provided, that character in the label is underlined
+fn render_labeled_field_with_shortcut(
+    f: &mut Frame,
+    label: &str,
+    value: &str,
+    area: Rect,
+    label_width: usize,
+    is_selected: bool,
+    shortcut: Option<char>,
+    theme: Theme,
+) {
+    let label_style = Style::default().fg(theme.fg_dim());
+    let shortcut_style = Style::default().fg(theme.fg_dim()).add_modifier(Modifier::UNDERLINED);
+
+    // Build label spans with optional underlined shortcut
+    let mut label_spans: Vec<Span> = Vec::new();
+
+    // Add padding before label
+    let padding_width = label_width.saturating_sub(label.len() + 2);
+    if padding_width > 0 {
+        label_spans.push(Span::styled(" ".repeat(padding_width), label_style));
+    }
+
+    // Add label with optional shortcut underline
+    if let Some(sc) = shortcut {
+        let sc_lower = sc.to_ascii_lowercase();
+        let mut found = false;
+        for c in label.chars() {
+            if !found && c.to_ascii_lowercase() == sc_lower {
+                label_spans.push(Span::styled(c.to_string(), shortcut_style));
+                found = true;
+            } else {
+                label_spans.push(Span::styled(c.to_string(), label_style));
+            }
+        }
+    } else {
+        label_spans.push(Span::styled(label.to_string(), label_style));
+    }
+
+    // Add colon and space
+    if !label.is_empty() {
+        label_spans.push(Span::styled(": ", label_style));
+    }
+
+    // Calculate label width for value positioning
+    let label_chars: usize = label_spans.iter().map(|s| s.content.chars().count()).sum();
+
+    // Calculate remaining width for value area (one char smaller on right)
+    let value_area_width = (area.width as usize).saturating_sub(label_chars).saturating_sub(1);
+
+    // Pad value to fill the value area
+    let padded_value = format!("{:<width$}", value, width = value_area_width);
+
+    let value_style = if is_selected {
+        Style::default()
+            .fg(theme.fg_accent())
+            .bg(theme.selection_bg())
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(theme.fg())
+    };
+
+    label_spans.push(Span::styled(padded_value, value_style));
+
+    let line = Line::from(label_spans);
+    f.render_widget(Paragraph::new(line), area);
+}
+
+/// Render a labeled field (label: value) - simple version without shortcut
 fn render_labeled_field(
     f: &mut Frame,
     label: &str,
@@ -315,64 +487,137 @@ fn render_labeled_field(
     is_selected: bool,
     theme: Theme,
 ) {
-    let padded_label = if label.is_empty() {
-        String::new()
-    } else {
-        format!("{:>width$}: ", label, width = label_width.saturating_sub(2))
-    };
-
-    let label_style = Style::default().fg(theme.fg_dim());
-    let value_style = if is_selected {
-        Style::default()
-            .fg(theme.fg_accent())
-            .add_modifier(Modifier::BOLD)
-    } else {
-        Style::default().fg(theme.fg())
-    };
-
-    let line = Line::from(vec![
-        Span::styled(padded_label, label_style),
-        Span::styled(value.to_string(), value_style),
-    ]);
-
-    let bg_style = if is_selected {
-        Style::default().bg(theme.selection_bg())
-    } else {
-        Style::default()
-    };
-
-    f.render_widget(Paragraph::new(line).style(bg_style), area);
+    render_labeled_field_with_shortcut(f, label, value, area, label_width, is_selected, None, theme);
 }
 
-/// Render a list field
+/// Render a list field with optional headers, aligned columns, and scrollbar
 fn render_list_field(
     f: &mut Frame,
     items: &[super::ListItem],
     selected_index: usize,
     scroll_offset: usize,
     visible_height: usize,
+    headers: &Option<Vec<String>>,
+    stored_column_widths: &Option<Vec<usize>>,
     area: Rect,
     _is_selected: bool,
     theme: Theme,
 ) {
-    let visible_items = items
+    let prefix_width = 2; // "* " or "  "
+
+    // Reserve space for scrollbar on right
+    let needs_scrollbar = items.len() > visible_height;
+    let scrollbar_width = if needs_scrollbar { 1 } else { 0 };
+    let content_width = area.width.saturating_sub(scrollbar_width as u16) as usize;
+
+    // Use stored column widths if available, otherwise calculate from current items
+    let col_widths: Vec<usize> = if let Some(widths) = stored_column_widths {
+        widths.clone()
+    } else {
+        // Calculate column widths from headers and items
+        let num_columns = headers.as_ref().map(|h| h.len()).unwrap_or_else(|| {
+            items.first().map(|i| i.columns.len()).unwrap_or(1)
+        });
+
+        let mut widths: Vec<usize> = vec![0; num_columns];
+
+        // Consider header widths
+        if let Some(hdrs) = headers {
+            for (i, h) in hdrs.iter().enumerate() {
+                if i < widths.len() {
+                    widths[i] = widths[i].max(h.len());
+                }
+            }
+        }
+
+        // Consider item widths
+        for item in items {
+            for (i, col) in item.columns.iter().enumerate() {
+                if i < widths.len() {
+                    widths[i] = widths[i].max(col.len());
+                }
+            }
+        }
+        widths
+    };
+
+    // Add spacing between columns
+    let col_spacing = 2;
+
+    let mut y = area.y;
+    let header_y = y; // Track where header starts for scrollbar positioning
+
+    // Render header row if present
+    if let Some(hdrs) = headers {
+        let mut header_text = String::new();
+        header_text.push_str(&" ".repeat(prefix_width)); // Align with prefix
+
+        for (i, h) in hdrs.iter().enumerate() {
+            if i < col_widths.len() {
+                header_text.push_str(&format!("{:<width$}", h, width = col_widths[i]));
+                if i < hdrs.len() - 1 {
+                    header_text.push_str(&" ".repeat(col_spacing));
+                }
+            }
+        }
+
+        let header_area = Rect::new(area.x, y, area.width.saturating_sub(scrollbar_width as u16), 1);
+        let header_line = Line::from(Span::styled(
+            truncate_str(&header_text, content_width),
+            Style::default().fg(theme.fg_dim()).add_modifier(Modifier::BOLD),
+        ));
+        f.render_widget(Paragraph::new(header_line), header_area);
+        y += 1;
+    }
+
+    // Calculate remaining height for items
+    let items_height = if headers.is_some() {
+        area.height.saturating_sub(1) as usize
+    } else {
+        area.height as usize
+    };
+
+    let actual_visible = visible_height.min(items_height);
+
+    // Cap scroll_offset to ensure we don't show blank lines at bottom
+    // Last item should be at the bottom when scrolled all the way down
+    let max_scroll = items.len().saturating_sub(actual_visible);
+    let effective_scroll = scroll_offset.min(max_scroll);
+
+    let visible_items: Vec<_> = items
         .iter()
         .enumerate()
-        .skip(scroll_offset)
-        .take(visible_height.min(area.height as usize));
+        .skip(effective_scroll)
+        .take(actual_visible)
+        .collect();
 
-    for (i, (idx, item)) in visible_items.enumerate() {
-        let is_item_selected = idx == selected_index;
-        let row_y = area.y + i as u16;
+    for (i, (idx, item)) in visible_items.iter().enumerate() {
+        let is_item_selected = *idx == selected_index;
+        let row_y = y + i as u16;
 
         if row_y >= area.y + area.height {
             break;
         }
 
-        let row_area = Rect::new(area.x, row_y, area.width, 1);
+        // Row area extends to the scrollbar (highlight fills to scrollbar)
+        let row_area = Rect::new(area.x, row_y, area.width.saturating_sub(scrollbar_width as u16), 1);
 
-        // Build display text from columns
-        let text: String = item.columns.join(" │ ");
+        // Build display text from columns with alignment
+        let mut text = String::new();
+        for (col_idx, col) in item.columns.iter().enumerate() {
+            if col_idx < col_widths.len() {
+                text.push_str(&format!("{:<width$}", col, width = col_widths[col_idx]));
+                if col_idx < item.columns.len() - 1 {
+                    text.push_str(&" ".repeat(col_spacing));
+                }
+            }
+        }
+
+        let prefix = if item.style.is_current { "* " } else { "  " };
+        let full_text = format!("{}{}", prefix, text);
+
+        // Pad to fill the entire row width (so highlight extends to scrollbar)
+        let padded_text = format!("{:<width$}", full_text, width = content_width);
 
         let style = if is_item_selected {
             Style::default()
@@ -387,13 +632,43 @@ fn render_list_field(
             Style::default().fg(theme.fg())
         };
 
-        let prefix = if item.style.is_current { "* " } else { "  " };
         let line = Line::from(Span::styled(
-            format!("{}{}", prefix, truncate_str(&text, area.width as usize - 2)),
+            truncate_str(&padded_text, content_width),
             style,
         ));
 
         f.render_widget(Paragraph::new(line), row_area);
+    }
+
+    // Render scrollbar on right edge if needed
+    if needs_scrollbar {
+        let scrollbar_x = area.x + area.width.saturating_sub(1);
+        let list_start_y = if headers.is_some() { header_y + 1 } else { header_y };
+        let scrollbar_height = actual_visible;
+
+        let total_items = items.len();
+        let thumb_size = ((scrollbar_height as f64 / total_items as f64) * scrollbar_height as f64).max(1.0) as usize;
+        let thumb_pos = if max_scroll == 0 {
+            0
+        } else {
+            ((effective_scroll as f64 / max_scroll as f64) * (scrollbar_height - thumb_size) as f64) as usize
+        };
+
+        for i in 0..scrollbar_height {
+            let row_y = list_start_y + i as u16;
+            if row_y >= area.y + area.height {
+                break;
+            }
+
+            let scrollbar_area = Rect::new(scrollbar_x, row_y, 1, 1);
+            let char = if i >= thumb_pos && i < thumb_pos + thumb_size {
+                "█"
+            } else {
+                "│"
+            };
+            let scrollbar_line = Line::from(Span::styled(char, Style::default().fg(theme.fg_dim())));
+            f.render_widget(Paragraph::new(scrollbar_line), scrollbar_area);
+        }
     }
 }
 
@@ -497,14 +772,20 @@ fn render_buttons(f: &mut Frame, state: &PopupState, area: Rect, theme: Theme) {
         spans.pop();
     }
 
-    // Center buttons
+    // Position buttons (right-aligned or centered)
     let total_width: usize = spans.iter().map(|s| s.content.len()).sum();
-    let padding = (area.width as usize).saturating_sub(total_width) / 2;
+    let padding = if state.definition.layout.buttons_right_align {
+        // Right align: padding pushes buttons to the right, shifted 1 char left
+        (area.width as usize).saturating_sub(total_width).saturating_sub(1)
+    } else {
+        // Center: padding on both sides
+        (area.width as usize).saturating_sub(total_width) / 2
+    };
 
-    let mut centered_spans = vec![Span::raw(" ".repeat(padding))];
-    centered_spans.extend(spans);
+    let mut positioned_spans = vec![Span::raw(" ".repeat(padding))];
+    positioned_spans.extend(spans);
 
-    let line = Line::from(centered_spans);
+    let line = Line::from(positioned_spans);
     f.render_widget(Paragraph::new(line), area);
 }
 
