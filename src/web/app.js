@@ -1615,6 +1615,10 @@
 
         // Hash password with SHA-256
         hashPassword(password).then(hash => {
+            // Debug: show hash being sent
+            if (window.Android && window.Android.showToast) {
+                window.Android.showToast('Hash: ' + hash.substring(0, 16));
+            }
             const msg = { type: 'AuthRequest', password_hash: hash };
             if (username) {
                 msg.username = username;
@@ -1623,6 +1627,10 @@
         }).catch(err => {
             // Try fallback directly if hashPassword somehow failed
             const hash = sha256Fallback(password);
+            // Debug: show hash being sent
+            if (window.Android && window.Android.showToast) {
+                window.Android.showToast('Fallback hash: ' + hash.substring(0, 16));
+            }
             const msg = { type: 'AuthRequest', password_hash: hash };
             if (username) {
                 msg.username = username;
@@ -1760,6 +1768,17 @@
 
         // Convert to hex string
         return H.map(h => h.toString(16).padStart(8, '0')).join('');
+    }
+
+    // Self-test SHA-256 fallback on Android
+    if (window.Android && window.Android.showToast) {
+        const testHash = sha256Fallback('test');
+        const expected = '9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08';
+        if (testHash === expected) {
+            window.Android.showToast('SHA256 test: PASS');
+        } else {
+            window.Android.showToast('SHA256 test: FAIL - ' + testHash.substring(0, 16));
+        }
     }
 
     // Send command
