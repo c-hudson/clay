@@ -15271,8 +15271,46 @@ fn handle_remote_client_key(
     // New unified popup system - handles help popup and others
     if app.has_new_popup() {
         match handle_new_popup_key(app, key) {
-            NewPopupAction::Command(_cmd) => {
-                // Menu command selected - remote client doesn't execute commands locally
+            NewPopupAction::Command(cmd) => {
+                // Menu command selected - parse and execute locally
+                let parsed = parse_command(&cmd);
+                match parsed {
+                    Command::Help => {
+                        app.open_help_popup_new();
+                    }
+                    Command::Version => {
+                        app.add_output(&get_version_string());
+                    }
+                    Command::Menu => {
+                        app.open_menu_popup_new();
+                    }
+                    Command::Setup => {
+                        app.open_setup_popup_new();
+                    }
+                    Command::Web => {
+                        app.open_web_popup_new();
+                    }
+                    Command::WorldSelector => {
+                        app.open_world_selector_new();
+                    }
+                    Command::WorldsList => {
+                        let _ = ws_tx.send(WsMessage::RequestConnectionsList);
+                    }
+                    Command::Actions { world } => {
+                        if let Some(world_name) = world {
+                            app.open_actions_list_popup_with_filter(&world_name);
+                        } else {
+                            app.open_actions_list_popup();
+                        }
+                    }
+                    _ => {
+                        // Other commands - send to server
+                        let _ = ws_tx.send(WsMessage::SendCommand {
+                            world_index: app.current_world_index,
+                            command: cmd,
+                        });
+                    }
+                }
             }
             NewPopupAction::Confirm(_data) => {
                 // Confirm action - remote client doesn't handle locally
