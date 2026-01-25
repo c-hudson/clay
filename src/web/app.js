@@ -1605,6 +1605,12 @@
         if (!password) return;
         if (!ws || ws.readyState !== WebSocket.OPEN) return;
 
+        // Debug: show password info (length and if it has whitespace)
+        if (window.Android && window.Android.showToast) {
+            const hasWhitespace = /\s/.test(password);
+            window.Android.showToast('Pass len=' + password.length + (hasWhitespace ? ' HAS SPACE' : ''));
+        }
+
         // Store password for saving on success (Android auto-login)
         pendingAuthPassword = password;
 
