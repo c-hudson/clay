@@ -1641,13 +1641,31 @@
                 const data = encoder.encode(password);
                 const hashBuffer = await crypto.subtle.digest('SHA-256', data);
                 const hashArray = Array.from(new Uint8Array(hashBuffer));
-                return hashArray.map(b => b.toString(16).padStart(2, '0')).join('');
+                const hash = hashArray.map(b => b.toString(16).padStart(2, '0')).join('');
+                // Debug: show which method was used
+                if (window.Android && window.Android.showToast) {
+                    window.Android.showToast('crypto.subtle OK');
+                }
+                return hash;
             } catch (err) {
+                // Debug: crypto.subtle failed
+                if (window.Android && window.Android.showToast) {
+                    window.Android.showToast('crypto err: ' + err.message);
+                }
                 // Fall through to fallback
+            }
+        } else {
+            // Debug: crypto.subtle not available
+            if (window.Android && window.Android.showToast) {
+                window.Android.showToast('No crypto.subtle');
             }
         }
         // Fallback: pure JavaScript SHA-256 for insecure contexts (HTTP)
-        return sha256Fallback(password);
+        const hash = sha256Fallback(password);
+        if (window.Android && window.Android.showToast) {
+            window.Android.showToast('Fallback hash: ' + (hash ? hash.substring(0, 8) + '...' : 'NULL'));
+        }
+        return hash;
     }
 
     // Pure JavaScript SHA-256 implementation (fallback for HTTP contexts)
