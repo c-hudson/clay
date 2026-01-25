@@ -898,11 +898,6 @@
                 hideCertWarning();
                 showConnecting(false);
 
-                // Debug: WebSocket connected
-                if (window.Android && window.Android.showToast) {
-                    window.Android.showToast('WebSocket connected');
-                }
-
                 // Check for saved password (Android auto-login)
                 let savedPassword = null;
                 try {
@@ -919,16 +914,8 @@
                 }
 
                 if (savedPassword) {
-                    // Auto-authenticate with saved password
-                    if (window.Android && window.Android.showToast) {
-                        window.Android.showToast('Auto-auth with saved password');
-                    }
                     authenticate(savedPassword);
                 } else {
-                    // Show auth modal for manual login
-                    if (window.Android && window.Android.showToast) {
-                        window.Android.showToast('Showing auth modal');
-                    }
                     showAuthModal(true);
                     elements.authPassword.focus();
                 }
@@ -961,10 +948,6 @@
             };
 
             ws.onerror = function(e) {
-                // Debug: WebSocket error
-                if (window.Android && window.Android.showToast) {
-                    window.Android.showToast('WebSocket error');
-                }
                 showConnecting(false);
             };
 
@@ -995,10 +978,6 @@
 
             case 'AuthResponse':
                 if (msg.success) {
-                    // Debug: Auth success
-                    if (window.Android && window.Android.showToast) {
-                        window.Android.showToast('Auth success!');
-                    }
                     authenticated = true;
                     multiuserMode = msg.multiuser_mode || false;
                     showAuthModal(false);
@@ -1016,10 +995,6 @@
                         window.Android.startBackgroundService();
                     }
                 } else {
-                    // Debug: Auth failed
-                    if (window.Android && window.Android.showToast) {
-                        window.Android.showToast('Auth failed: ' + (msg.error || 'Unknown'));
-                    }
                     elements.authError.textContent = msg.error || 'Authentication failed';
                     elements.authPassword.value = '';
                     pendingAuthPassword = null;
@@ -1603,12 +1578,6 @@
     function authenticate(passwordOverride) {
         // Trim password to remove any trailing spaces from Android keyboard
         const rawPassword = passwordOverride || elements.authPassword.value;
-
-        // Debug: show raw password info
-        if (window.Android && window.Android.showToast) {
-            window.Android.showToast('raw type=' + typeof rawPassword + ' val=' + String(rawPassword).length);
-        }
-
         const password = String(rawPassword || '').trim();
         if (!password) return;
         if (!ws || ws.readyState !== WebSocket.OPEN) return;
@@ -1623,9 +1592,13 @@
 
         // Hash password with SHA-256
         hashPassword(password).then(hash => {
-            // Debug: show hash being sent
-            if (window.Android && window.Android.showToast) {
-                window.Android.showToast('Hash: ' + hash.substring(0, 16));
+            // Debug: show all info in one alert on Android
+            if (window.Android) {
+                alert('DEBUG AUTH\\n' +
+                    'Raw type: ' + typeof rawPassword + '\\n' +
+                    'Raw len: ' + String(rawPassword).length + '\\n' +
+                    'Trimmed len: ' + password.length + '\\n' +
+                    'Hash: ' + hash);
             }
             const msg = { type: 'AuthRequest', password_hash: hash };
             if (username) {
@@ -1635,9 +1608,11 @@
         }).catch(err => {
             // Try fallback directly if hashPassword somehow failed
             const hash = sha256Fallback(password);
-            // Debug: show hash being sent
-            if (window.Android && window.Android.showToast) {
-                window.Android.showToast('Fallback hash: ' + hash.substring(0, 16));
+            if (window.Android) {
+                alert('DEBUG FALLBACK\\n' +
+                    'Raw len: ' + String(rawPassword).length + '\\n' +
+                    'Trimmed len: ' + password.length + '\\n' +
+                    'Hash: ' + hash);
             }
             const msg = { type: 'AuthRequest', password_hash: hash };
             if (username) {
@@ -1657,31 +1632,13 @@
                 const data = encoder.encode(password);
                 const hashBuffer = await crypto.subtle.digest('SHA-256', data);
                 const hashArray = Array.from(new Uint8Array(hashBuffer));
-                const hash = hashArray.map(b => b.toString(16).padStart(2, '0')).join('');
-                // Debug: show which method was used
-                if (window.Android && window.Android.showToast) {
-                    window.Android.showToast('crypto.subtle OK');
-                }
-                return hash;
+                return hashArray.map(b => b.toString(16).padStart(2, '0')).join('');
             } catch (err) {
-                // Debug: crypto.subtle failed
-                if (window.Android && window.Android.showToast) {
-                    window.Android.showToast('crypto err: ' + err.message);
-                }
                 // Fall through to fallback
-            }
-        } else {
-            // Debug: crypto.subtle not available
-            if (window.Android && window.Android.showToast) {
-                window.Android.showToast('No crypto.subtle');
             }
         }
         // Fallback: pure JavaScript SHA-256 for insecure contexts (HTTP)
-        const hash = sha256Fallback(password);
-        if (window.Android && window.Android.showToast) {
-            window.Android.showToast('Fallback hash: ' + (hash ? hash.substring(0, 8) + '...' : 'NULL'));
-        }
-        return hash;
+        return sha256Fallback(password);
     }
 
     // Pure JavaScript SHA-256 implementation (fallback for HTTP contexts)
@@ -1776,17 +1733,6 @@
 
         // Convert to hex string
         return H.map(h => h.toString(16).padStart(8, '0')).join('');
-    }
-
-    // Self-test SHA-256 fallback on Android
-    if (window.Android && window.Android.showToast) {
-        const testHash = sha256Fallback('test');
-        const expected = '9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08';
-        if (testHash === expected) {
-            window.Android.showToast('SHA256 test: PASS');
-        } else {
-            window.Android.showToast('SHA256 test: FAIL - ' + testHash.substring(0, 16));
-        }
     }
 
     // Send command
