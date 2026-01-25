@@ -1603,7 +1603,13 @@
     function authenticate(passwordOverride) {
         // Trim password to remove any trailing spaces from Android keyboard
         const rawPassword = passwordOverride || elements.authPassword.value;
-        const password = typeof rawPassword === 'string' ? rawPassword.trim() : rawPassword;
+
+        // Debug: show raw password info
+        if (window.Android && window.Android.showToast) {
+            window.Android.showToast('raw type=' + typeof rawPassword + ' val=' + String(rawPassword).length);
+        }
+
+        const password = String(rawPassword || '').trim();
         if (!password) return;
         if (!ws || ws.readyState !== WebSocket.OPEN) return;
 
