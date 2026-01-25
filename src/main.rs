@@ -15218,7 +15218,7 @@ async fn run_console_client(addr: &str) -> io::Result<()> {
                                 let world = app.current_world_mut();
                                 world.showing_splash = false; // Clear splash when adding output
                                 world.output_lines.push(
-                                    OutputLine::new("Press Ctrl+C again within 15 seconds to exit, or use /quit".to_string())
+                                    OutputLine::new_client("Press Ctrl+C again within 15 seconds to exit, or use /quit".to_string())
                                 );
                                 // Keep scroll at bottom
                                 world.scroll_offset = world.output_lines.len().saturating_sub(1);
@@ -15549,7 +15549,7 @@ fn handle_remote_client_key(
                         } else {
                             // World doesn't exist - could create it, but for now just show message
                             app.current_world_mut().output_lines.push(
-                                OutputLine::new(format!("World '{}' not found.", name))
+                                OutputLine::new_client(format!("World '{}' not found.", name))
                             );
                         }
                     }
