@@ -15380,6 +15380,16 @@ fn handle_remote_client_key(
         (KeyModifiers::CONTROL, Char('f')) | (_, Right) => {
             app.input.move_cursor_right();
         }
+        (KeyModifiers::CONTROL, Char('l')) => {
+            // Redraw screen - filter output to only show server data
+            app.current_world_mut().filter_to_server_output();
+            // Clear terminal directly using crossterm
+            let _ = execute!(
+                std::io::stdout(),
+                crossterm::terminal::Clear(crossterm::terminal::ClearType::All)
+            );
+            app.needs_output_redraw = true;
+        }
         (KeyModifiers::CONTROL, Up) => {
             app.input.move_cursor_up();
         }
