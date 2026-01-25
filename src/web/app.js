@@ -1590,6 +1590,24 @@
             ? elements.authUsername.value.trim()
             : null;
 
+        // Debug: show password bytes on Android BEFORE hashing
+        if (window.Android) {
+            const pwBytes = [];
+            for (let i = 0; i < password.length; i++) {
+                pwBytes.push(password.charCodeAt(i).toString(16).padStart(2, '0'));
+            }
+            let debugBytes = document.getElementById('debug-bytes');
+            if (!debugBytes) {
+                debugBytes = document.createElement('input');
+                debugBytes.id = 'debug-bytes';
+                debugBytes.type = 'text';
+                debugBytes.style.cssText = 'width:100%;font-size:9px;margin-top:8px;padding:4px;background:#333;color:#ff0;border:1px solid #ff0;';
+                debugBytes.readOnly = true;
+                elements.authError.parentNode.appendChild(debugBytes);
+            }
+            debugBytes.value = 'PW bytes: ' + pwBytes.join(' ');
+        }
+
         // Hash password with SHA-256
         hashPassword(password).then(hash => {
             // Debug: show hash in copyable text input on Android
@@ -1599,7 +1617,7 @@
                     debugInput = document.createElement('input');
                     debugInput.id = 'debug-hash';
                     debugInput.type = 'text';
-                    debugInput.style.cssText = 'width:100%;font-size:9px;margin-top:8px;padding:4px;background:#333;color:#0f0;border:1px solid #0f0;';
+                    debugInput.style.cssText = 'width:100%;font-size:9px;margin-top:4px;padding:4px;background:#333;color:#0f0;border:1px solid #0f0;';
                     debugInput.readOnly = true;
                     elements.authError.parentNode.appendChild(debugInput);
                 }
@@ -1660,21 +1678,6 @@
         const bytes = [];
         for (let i = 0; i < utf8.length; i++) {
             bytes.push(utf8.charCodeAt(i));
-        }
-
-        // Debug: show hex bytes being hashed on Android
-        if (window.Android) {
-            let debugBytes = document.getElementById('debug-bytes');
-            if (!debugBytes) {
-                debugBytes = document.createElement('input');
-                debugBytes.id = 'debug-bytes';
-                debugBytes.type = 'text';
-                debugBytes.style.cssText = 'width:100%;font-size:9px;margin-top:4px;padding:4px;background:#333;color:#ff0;border:1px solid #ff0;';
-                debugBytes.readOnly = true;
-                const hashInput = document.getElementById('debug-hash');
-                if (hashInput) hashInput.parentNode.appendChild(debugBytes);
-            }
-            debugBytes.value = 'Bytes: ' + bytes.map(b => b.toString(16).padStart(2, '0')).join(' ');
         }
 
         // Constants (first 32 bits of fractional parts of cube roots of first 64 primes)
