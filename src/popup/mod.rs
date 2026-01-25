@@ -82,10 +82,11 @@ pub enum FieldKind {
     Label { text: String },
     /// Visual separator line
     Separator,
-    /// Multi-line text editor
+    /// Multi-line text editor with scrolling viewport
     MultilineText {
         value: String,
-        line_count: usize,
+        visible_lines: usize,
+        scroll_offset: usize,
     },
     /// List of items (for selection popups)
     List {
@@ -191,11 +192,12 @@ impl FieldKind {
         Self::Separator
     }
 
-    /// Create a multiline text field
-    pub fn multiline(value: impl Into<String>, line_count: usize) -> Self {
+    /// Create a multiline text field with a visible viewport height
+    pub fn multiline(value: impl Into<String>, visible_lines: usize) -> Self {
         Self::MultilineText {
             value: value.into(),
-            line_count,
+            visible_lines,
+            scroll_offset: 0,
         }
     }
 
@@ -1184,6 +1186,197 @@ impl PopupState {
     pub fn cursor_end(&mut self) {
         if self.editing {
             self.edit_cursor = self.edit_buffer.chars().count();
+        }
+    }
+
+    /// Move cursor up one line in multiline text
+    pub fn cursor_up(&mut self) {
+        if !self.editing {
+            return;
+        }
+
+        let chars: Vec<char> = self.edit_buffer.chars().collect();
+
+        // Find current line start and column
+        let mut current_line_start = 0;
+        let mut current_col = self.edit_cursor;
+        for (i, ch) in chars.iter().enumerate() {
+            if i >= self.edit_cursor {
+                break;
+            }
+            if *ch == '\n' {
+                current_line_start = i + 1;
+                current_col = self.edit_cursor - (i + 1);
+            }
+        }
+
+        // If we're on the first line, can't go up
+        if current_line_start == 0 {
+            return;
+        }
+
+        // Find previous line start
+        let mut prev_line_start = 0;
+        for i in (0..current_line_start - 1).rev() {
+            if chars[i] == '\n' {
+                prev_line_start = i + 1;
+                break;
+            }
+        }
+
+        // Calculate previous line length
+        let prev_line_len = current_line_start - 1 - prev_line_start;
+
+        // Move to same column on previous line, or end of line if shorter
+        self.edit_cursor = prev_line_start + current_col.min(prev_line_len);
+    }
+
+    /// Move cursor down one line in multiline text
+    pub fn cursor_down(&mut self) {
+        if !self.editing {
+            return;
+        }
+
+        let chars: Vec<char> = self.edit_buffer.chars().collect();
+        let total_len = chars.len();
+
+        // Find current column position on current line
+        let mut current_col = self.edit_cursor;
+        for (i, ch) in chars.iter().enumerate() {
+            if i >= self.edit_cursor {
+                break;
+            }
+            if *ch == '\n' {
+                current_col = self.edit_cursor - (i + 1);
+            }
+        }
+
+        // Find next line start (after the newline following current position)
+        let mut next_line_start = None;
+        for i in self.edit_cursor..total_len {
+            if chars[i] == '\n' {
+                next_line_start = Some(i + 1);
+                break;
+            }
+        }
+
+        let next_line_start = match next_line_start {
+            Some(pos) => pos,
+            None => return, // No next line
+        };
+
+        // Find next line length
+        let mut next_line_len = 0;
+        for i in next_line_start..total_len {
+            if chars[i] == '\n' {
+                break;
+            }
+            next_line_len += 1;
+        }
+
+        // Move to same column on next line, or end of line if shorter
+        self.edit_cursor = next_line_start + current_col.min(next_line_len);
+    }
+
+    /// Insert a newline at cursor position
+    pub fn insert_newline(&mut self) {
+        self.insert_char('\n');
+    }
+
+    /// Get cursor display line number (0-indexed) accounting for line wrapping
+    /// wrap_width is the character width for wrapping (typically the field width)
+    pub fn get_cursor_display_line(&self, wrap_width: usize) -> usize {
+        if wrap_width == 0 {
+            return 0;
+        }
+
+        let mut display_line = 0;
+        let mut char_offset = 0;
+        let text_lines: Vec<&str> = self.edit_buffer.split('\n').collect();
+
+        for (line_idx, text_line) in text_lines.iter().enumerate() {
+            let line_len = text_line.chars().count();
+
+            if line_len == 0 {
+                // Empty line takes one display line
+                if self.edit_cursor == char_offset {
+                    return display_line;
+                }
+                display_line += 1;
+            } else {
+                // Wrap line into chunks of wrap_width
+                let mut pos = 0;
+                while pos < line_len {
+                    let end = (pos + wrap_width).min(line_len);
+                    let chunk_start = char_offset + pos;
+                    let chunk_end = char_offset + end;
+
+                    // Check if cursor is in this chunk
+                    if self.edit_cursor >= chunk_start && self.edit_cursor <= chunk_end {
+                        return display_line;
+                    }
+
+                    display_line += 1;
+                    pos = end;
+                }
+            }
+
+            // Account for the newline character (except for the last line)
+            char_offset += line_len;
+            if line_idx < text_lines.len() - 1 {
+                char_offset += 1; // newline
+            }
+        }
+
+        display_line.saturating_sub(1)
+    }
+
+    /// Ensure cursor is visible in multiline text field by adjusting scroll_offset
+    /// Uses wrapping to calculate the display line
+    pub fn ensure_multiline_cursor_visible(&mut self) {
+        // Use a very conservative (small) wrap width to ensure scrolling happens
+        // It's better to scroll more frequently than to have the cursor go off-screen
+        // The actual rendering may use a wider wrap, but this ensures safety
+        // Using 30 as a conservative minimum that works on most terminals
+        let wrap_width = 30;
+        let cursor_display_line = self.get_cursor_display_line(wrap_width);
+
+        // Find the selected field and update its scroll_offset
+        if let ElementSelection::Field(field_id) = &self.selected {
+            for field in &mut self.definition.fields {
+                if field.id == *field_id {
+                    if let FieldKind::MultilineText { visible_lines, scroll_offset, .. } = &mut field.kind {
+                        // Adjust scroll to keep cursor visible
+                        if cursor_display_line < *scroll_offset {
+                            *scroll_offset = cursor_display_line;
+                        } else if cursor_display_line >= *scroll_offset + *visible_lines {
+                            *scroll_offset = cursor_display_line - *visible_lines + 1;
+                        }
+                    }
+                    break;
+                }
+            }
+        }
+    }
+
+    /// Ensure cursor is visible with a specific wrap width
+    pub fn ensure_multiline_cursor_visible_with_width(&mut self, wrap_width: usize) {
+        let cursor_display_line = self.get_cursor_display_line(wrap_width);
+
+        if let ElementSelection::Field(field_id) = &self.selected {
+            for field in &mut self.definition.fields {
+                if field.id == *field_id {
+                    if let FieldKind::MultilineText { visible_lines, scroll_offset, .. } = &mut field.kind {
+                        // Adjust scroll to keep cursor visible
+                        if cursor_display_line < *scroll_offset {
+                            *scroll_offset = cursor_display_line;
+                        } else if cursor_display_line >= *scroll_offset + *visible_lines {
+                            *scroll_offset = cursor_display_line - *visible_lines + 1;
+                        }
+                    }
+                    break;
+                }
+            }
         }
     }
 

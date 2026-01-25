@@ -794,7 +794,7 @@ body {
 /* Actions Editor popup */
 .actions-editor-modal-content {
     min-width: min(350px, 95vw);
-    max-width: min(90vw, 500px);
+    max-width: 90vw;
     width: 90vw;
     padding: 12px;
     box-sizing: border-box;

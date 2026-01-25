@@ -15956,6 +15956,7 @@ enum ActionsListAction {
     Add,                  // Add new action
     Edit(usize),          // Edit action at index
     Delete(usize),        // Delete action at index
+    Toggle(usize),        // Toggle enable/disable action at index
 }
 
 /// Handle input for new unified popup system
@@ -16602,6 +16603,13 @@ fn handle_new_popup_key(app: &mut App, key: KeyEvent) -> NewPopupAction {
                     }
                     // Otherwise handle shortcuts
                     match c {
+                        ' ' => {
+                            // Space toggles enable/disable for selected action
+                            if let Some(idx) = get_selected_index() {
+                                // Don't close popup - stay on list for more toggles
+                                return NewPopupAction::ActionsList(ActionsListAction::Toggle(idx));
+                            }
+                        }
                         'f' | 'F' | '/' => {
                             state.select_field(ACTIONS_FIELD_FILTER);
                             state.start_edit();
@@ -16638,6 +16646,9 @@ fn handle_new_popup_key(app: &mut App, key: KeyEvent) -> NewPopupAction {
             let is_text_field = state.selected_field()
                 .map(|f| f.kind.is_text_editable())
                 .unwrap_or(false);
+            let is_multiline = state.selected_field()
+                .map(|f| matches!(&f.kind, popup::FieldKind::MultilineText { .. }))
+                .unwrap_or(false);
             let is_toggle = state.selected_field()
                 .map(|f| matches!(&f.kind, popup::FieldKind::Toggle { .. }))
                 .unwrap_or(false);
@@ -16654,7 +16665,11 @@ fn handle_new_popup_key(app: &mut App, key: KeyEvent) -> NewPopupAction {
                     }
                 }
                 Enter => {
-                    if state.editing {
+                    if state.editing && is_multiline {
+                        // In multiline field, Enter inserts a newline
+                        state.insert_newline();
+                        state.ensure_multiline_cursor_visible();
+                    } else if state.editing {
                         state.commit_edit();
                         state.next_field();
                     } else if state.is_on_button() {
@@ -16711,22 +16726,37 @@ fn handle_new_popup_key(app: &mut App, key: KeyEvent) -> NewPopupAction {
                     }
                 }
                 Up => {
-                    if state.editing {
-                        state.commit_edit();
+                    if state.editing && is_multiline {
+                        // In multiline field, Up moves cursor up
+                        state.cursor_up();
+                        state.ensure_multiline_cursor_visible();
+                    } else {
+                        if state.editing {
+                            state.commit_edit();
+                        }
+                        state.prev_field();
                     }
-                    state.prev_field();
                 }
                 Down => {
-                    if state.editing {
-                        state.commit_edit();
-                    }
-                    if !state.next_field() {
-                        state.select_first_button();
+                    if state.editing && is_multiline {
+                        // In multiline field, Down moves cursor down
+                        state.cursor_down();
+                        state.ensure_multiline_cursor_visible();
+                    } else {
+                        if state.editing {
+                            state.commit_edit();
+                        }
+                        if !state.next_field() {
+                            state.select_first_button();
+                        }
                     }
                 }
                 Left => {
                     if state.editing {
                         state.cursor_left();
+                        if is_multiline {
+                            state.ensure_multiline_cursor_visible();
+                        }
                     } else if is_select || is_toggle {
                         state.decrease_current();
                     } else if state.is_on_button() {
@@ -16736,6 +16766,9 @@ fn handle_new_popup_key(app: &mut App, key: KeyEvent) -> NewPopupAction {
                 Right => {
                     if state.editing {
                         state.cursor_right();
+                        if is_multiline {
+                            state.ensure_multiline_cursor_visible();
+                        }
                     } else if is_select || is_toggle {
                         state.increase_current();
                     } else if state.is_on_button() {
@@ -16745,6 +16778,9 @@ fn handle_new_popup_key(app: &mut App, key: KeyEvent) -> NewPopupAction {
                 Backspace => {
                     if state.editing {
                         state.backspace();
+                        if is_multiline {
+                            state.ensure_multiline_cursor_visible();
+                        }
                     }
                 }
                 Delete => {
@@ -16755,11 +16791,17 @@ fn handle_new_popup_key(app: &mut App, key: KeyEvent) -> NewPopupAction {
                 Home => {
                     if state.editing {
                         state.cursor_home();
+                        if is_multiline {
+                            state.ensure_multiline_cursor_visible();
+                        }
                     }
                 }
                 End => {
                     if state.editing {
                         state.cursor_end();
+                        if is_multiline {
+                            state.ensure_multiline_cursor_visible();
+                        }
                     }
                 }
                 Char('s') | Char('S') if !state.editing => {
@@ -16769,12 +16811,22 @@ fn handle_new_popup_key(app: &mut App, key: KeyEvent) -> NewPopupAction {
                 Char('c') | Char('C') if !state.editing => {
                     app.popup_manager.close();
                 }
+                Char(' ') if !state.editing && (is_toggle || is_select) => {
+                    // Space toggles current toggle/select field
+                    state.toggle_current();
+                }
                 Char(c) => {
                     if state.editing {
                         state.insert_char(c);
+                        if is_multiline {
+                            state.ensure_multiline_cursor_visible();
+                        }
                     } else if is_text_field {
                         state.start_edit();
                         state.insert_char(c);
+                        if is_multiline {
+                            state.ensure_multiline_cursor_visible();
+                        }
                     }
                 }
                 _ => {}
@@ -22796,6 +22848,70 @@ fn handle_key_event(key: KeyEvent, app: &mut App) -> KeyAction {
                         if idx < app.settings.actions.len() {
                             let name = app.settings.actions[idx].name.clone();
                             app.open_delete_action_confirm(&name, idx);
+                        }
+                    }
+                    ActionsListAction::Toggle(idx) => {
+                        // Toggle enable/disable for the action
+                        if idx < app.settings.actions.len() {
+                            app.settings.actions[idx].enabled = !app.settings.actions[idx].enabled;
+                            let _ = save_settings(app);
+
+                            // Update the list display in the popup
+                            use popup::definitions::actions::{ActionInfo, filter_actions, ACTIONS_FIELD_FILTER, ACTIONS_FIELD_LIST};
+                            if let Some(state) = app.popup_manager.current_mut() {
+                                // Get current filter text
+                                let filter_text = if state.editing && state.is_field_selected(ACTIONS_FIELD_FILTER) {
+                                    state.edit_buffer.clone()
+                                } else {
+                                    state.get_text(ACTIONS_FIELD_FILTER).unwrap_or("").to_string()
+                                };
+                                // Build action info list
+                                let all_actions: Vec<ActionInfo> = app.settings.actions
+                                    .iter()
+                                    .map(|a| ActionInfo {
+                                        name: a.name.clone(),
+                                        world: a.world.clone(),
+                                        pattern: a.pattern.clone(),
+                                        enabled: a.enabled,
+                                    })
+                                    .collect();
+                                // Apply filter
+                                let filtered = filter_actions(&all_actions, &filter_text);
+                                // Update the list in the popup state
+                                if let Some(field) = state.field_mut(ACTIONS_FIELD_LIST) {
+                                    if let popup::FieldKind::List { items, .. } = &mut field.kind {
+                                        // Rebuild items with indices
+                                        *items = filtered.iter().filter_map(|info| {
+                                            // Find original index
+                                            app.settings.actions.iter().position(|a| a.name == info.name).map(|orig_idx| {
+                                                let status = if info.enabled { "[✓]" } else { "[ ]" };
+                                                let world_part = if info.world.is_empty() {
+                                                    String::new()
+                                                } else {
+                                                    format!("({})", info.world)
+                                                };
+                                                let pattern_preview = if info.pattern.len() > 30 {
+                                                    format!("{}...", &info.pattern[..27])
+                                                } else {
+                                                    info.pattern.clone()
+                                                };
+                                                popup::ListItem {
+                                                    id: orig_idx.to_string(),
+                                                    columns: vec![
+                                                        format!("{} {}", status, info.name),
+                                                        world_part,
+                                                        pattern_preview,
+                                                    ],
+                                                    style: popup::ListItemStyle {
+                                                        is_disabled: !info.enabled,
+                                                        ..Default::default()
+                                                    },
+                                                }
+                                            })
+                                        }).collect();
+                                    }
+                                }
+                            }
                         }
                     }
                 }

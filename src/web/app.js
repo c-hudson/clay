@@ -4541,7 +4541,8 @@
             const world = worlds[currentWorldIndex];
             const serverPending = world ? (world.pending_count || 0) : 0;
             if (pendingLines.length > 0 || serverPending > 0) {
-                releasePendingLines(getVisibleLineCount());
+                // Release pending lines like Tab does when more mode is active
+                releaseScreenful();
             } else {
                 const pageHeight = container.clientHeight * 0.9;
                 container.scrollTop += pageHeight;

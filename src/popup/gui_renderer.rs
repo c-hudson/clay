@@ -269,7 +269,7 @@ pub fn render_popup_content(
                     });
             }
 
-            FieldKind::MultilineText { value, line_count } => {
+            FieldKind::MultilineText { value, visible_lines, .. } => {
                 ui.horizontal(|ui| {
                     ui.add_sized(
                         [label_width, row_height],
@@ -278,7 +278,7 @@ pub fn render_popup_content(
 
                     let mut text = value.clone();
                     let response = ui.add_sized(
-                        [ui.available_width(), (*line_count as f32) * row_height],
+                        [ui.available_width(), (*visible_lines as f32) * row_height],
                         egui::TextEdit::multiline(&mut text)
                             .text_color(theme.fg_primary),
                     );

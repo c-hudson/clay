@@ -182,7 +182,7 @@ fn calculate_content_height(state: &PopupState) -> usize {
         height += match &field.kind {
             FieldKind::Separator => 1,
             FieldKind::Label { text } => text.lines().count().max(1),
-            FieldKind::MultilineText { line_count, .. } => *line_count,
+            FieldKind::MultilineText { visible_lines, .. } => *visible_lines,
             FieldKind::List { visible_height, headers, .. } => {
                 // Use visible_height (set at popup creation) to maintain consistent size
                 // This prevents the popup from shrinking when filtering
@@ -238,7 +238,7 @@ fn render_popup_content(f: &mut Frame, state: &PopupState, area: Rect, theme: Th
 
         let field_height = match &field.kind {
             FieldKind::Label { text } => text.lines().count().max(1) as u16,
-            FieldKind::MultilineText { line_count, .. } => *line_count as u16,
+            FieldKind::MultilineText { visible_lines, .. } => *visible_lines as u16,
             FieldKind::List { visible_height, headers, .. } => {
                 // Use visible_height to maintain consistent size (don't shrink when filtering)
                 let header_rows = if headers.is_some() { 1 } else { 0 };
@@ -418,14 +418,184 @@ fn render_field(
             render_labeled_field(f, &field.label, &display_value, area, label_width, is_selected, theme);
         }
 
-        FieldKind::MultilineText { value, line_count } => {
-            // TODO: Implement multiline text rendering with scrolling
-            let lines: Vec<Line> = value
-                .lines()
-                .take(*line_count)
-                .map(|l| Line::from(Span::styled(l.to_string(), Style::default().fg(theme.fg()))))
-                .collect();
-            f.render_widget(Paragraph::new(lines), area);
+        FieldKind::MultilineText { value, visible_lines, scroll_offset } => {
+            // Use edit_buffer if this field is selected and being edited
+            let display_value = if is_selected && state.editing {
+                &state.edit_buffer
+            } else {
+                value
+            };
+
+            // Calculate label area similar to other labeled fields
+            let padding_width = label_width.saturating_sub(field.label.len() + 2);
+            let label_total = padding_width + field.label.len() + 2; // padding + label + ": "
+            let value_start_x = area.x + label_total as u16;
+            let value_width = area.width.saturating_sub(label_total as u16);
+            let wrap_width = if value_width > 0 { value_width as usize } else { 1 };
+
+            // Render label on first line
+            let label_style = Style::default().fg(theme.fg_dim());
+            let padding: String = " ".repeat(padding_width);
+            let label_line = Line::from(vec![
+                Span::styled(padding, label_style),
+                Span::styled(format!("{}: ", field.label), label_style),
+            ]);
+            f.render_widget(Paragraph::new(label_line), Rect::new(area.x, area.y, label_total as u16, 1));
+
+            // Wrap text into display lines and track cursor position
+            // Each display line is a (text, has_cursor, cursor_col) tuple
+            struct DisplayLine {
+                text: String,
+                cursor_col: Option<usize>, // Some(col) if cursor is on this line
+            }
+
+            let mut display_lines: Vec<DisplayLine> = Vec::new();
+            let mut cursor_display_line: Option<usize> = None;
+
+            // Calculate cursor position in the text
+            let cursor_char_pos = if is_selected {
+                if state.editing {
+                    state.edit_cursor
+                } else {
+                    display_value.chars().count()
+                }
+            } else {
+                usize::MAX
+            };
+
+            // Process each text line (separated by \n)
+            let mut char_offset = 0;
+            let text_lines: Vec<&str> = display_value.split('\n').collect();
+
+            for (line_idx, text_line) in text_lines.iter().enumerate() {
+                let line_chars: Vec<char> = text_line.chars().collect();
+                let line_len = line_chars.len();
+
+                if line_len == 0 {
+                    // Empty line
+                    let has_cursor = cursor_char_pos == char_offset;
+                    if has_cursor {
+                        cursor_display_line = Some(display_lines.len());
+                    }
+                    display_lines.push(DisplayLine {
+                        text: String::new(),
+                        cursor_col: if has_cursor { Some(0) } else { None },
+                    });
+                } else {
+                    // Wrap line into chunks of wrap_width
+                    let mut pos = 0;
+                    while pos < line_len {
+                        let end = (pos + wrap_width).min(line_len);
+                        let chunk: String = line_chars[pos..end].iter().collect();
+
+                        // Check if cursor is in this chunk
+                        let chunk_start = char_offset + pos;
+                        let chunk_end = char_offset + end;
+                        let cursor_col = if cursor_char_pos >= chunk_start && cursor_char_pos <= chunk_end {
+                            cursor_display_line = Some(display_lines.len());
+                            Some(cursor_char_pos - chunk_start)
+                        } else {
+                            None
+                        };
+
+                        display_lines.push(DisplayLine {
+                            text: chunk,
+                            cursor_col,
+                        });
+
+                        pos = end;
+                    }
+                }
+
+                // Account for the newline character (except for the last line)
+                char_offset += line_len;
+                if line_idx < text_lines.len() - 1 {
+                    char_offset += 1; // newline
+                }
+            }
+
+            // If text is empty, add one empty line for cursor
+            if display_lines.is_empty() {
+                cursor_display_line = if is_selected { Some(0) } else { None };
+                display_lines.push(DisplayLine {
+                    text: String::new(),
+                    cursor_col: if is_selected { Some(0) } else { None },
+                });
+            }
+
+            // Calculate the correct scroll_offset based on actual wrap width
+            // This fixes the mismatch between conservative scroll calculation and actual rendering
+            let mut effective_scroll_offset = *scroll_offset;
+            let total_display_lines = display_lines.len();
+
+            if let Some(cursor_line) = cursor_display_line {
+                // Ensure cursor is visible by adjusting scroll_offset
+                if cursor_line < effective_scroll_offset {
+                    effective_scroll_offset = cursor_line;
+                } else if cursor_line >= effective_scroll_offset + *visible_lines {
+                    effective_scroll_offset = cursor_line.saturating_sub(*visible_lines - 1);
+                }
+            }
+
+            // Clamp scroll_offset to valid range
+            let max_scroll = total_display_lines.saturating_sub(*visible_lines);
+            effective_scroll_offset = effective_scroll_offset.min(max_scroll);
+
+            // Value style - highlight background when selected
+            let value_bg = if is_selected { theme.selection_bg() } else { theme.bg() };
+
+            // Render visible display lines with scroll offset
+            let mut rendered_lines: Vec<Line> = Vec::new();
+            let start_line = effective_scroll_offset;
+
+            for display_row in 0..*visible_lines {
+                let line_idx = start_line + display_row;
+
+                if line_idx < total_display_lines {
+                    let dline = &display_lines[line_idx];
+
+                    if let Some(cursor_col) = dline.cursor_col {
+                        // This line has the cursor - render with '│' cursor like other text fields
+                        let chars: Vec<char> = dline.text.chars().collect();
+                        let cursor_pos = cursor_col.min(chars.len());
+                        let before: String = chars[..cursor_pos].iter().collect();
+                        let after: String = chars[cursor_pos..].iter().collect();
+
+                        // Build line with cursor inserted
+                        let line_with_cursor = format!("{}│{}", before, after);
+
+                        // Pad to fill the value area width (account for the cursor character)
+                        let content_len = before.chars().count() + 1 + after.chars().count();
+                        let padding_needed = wrap_width.saturating_sub(content_len);
+                        let padded_line = format!("{}{}", line_with_cursor, " ".repeat(padding_needed));
+
+                        rendered_lines.push(Line::from(Span::styled(
+                            padded_line,
+                            Style::default().fg(theme.fg()).bg(value_bg),
+                        )));
+                    } else {
+                        // Regular line without cursor
+                        let content_len = dline.text.chars().count();
+                        let padding_needed = wrap_width.saturating_sub(content_len);
+                        let padded_line = format!("{}{}", dline.text, " ".repeat(padding_needed));
+                        rendered_lines.push(Line::from(Span::styled(
+                            padded_line,
+                            Style::default().fg(theme.fg()).bg(value_bg),
+                        )));
+                    }
+                } else {
+                    // Empty line beyond content
+                    let padding_str: String = " ".repeat(wrap_width);
+                    rendered_lines.push(Line::from(Span::styled(
+                        padding_str,
+                        Style::default().bg(value_bg),
+                    )));
+                }
+            }
+
+            // Render the multiline content in the value area
+            let content_area = Rect::new(value_start_x, area.y, value_width, *visible_lines as u16);
+            f.render_widget(Paragraph::new(rendered_lines), content_area);
         }
 
         FieldKind::List { items, selected_index, scroll_offset, headers, column_widths, .. } => {

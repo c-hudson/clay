@@ -134,7 +134,7 @@ pub fn create_actions_list_popup(actions: &[ActionInfo], visible_height: usize) 
             center_horizontal: true,
             center_vertical: true,
             modal: true,
-            buttons_right_align: false,
+            buttons_right_align: true,
             blank_line_before_list: false,
         })
 }
@@ -192,11 +192,11 @@ pub fn create_action_editor_popup(settings: &ActionSettings, is_new: bool) -> Po
         .with_layout(PopupLayout {
             label_width: 12,
             min_width: 60,
-            max_width_percent: 80,
+            max_width_percent: 90,
             center_horizontal: true,
             center_vertical: true,
             modal: true,
-            buttons_right_align: false,
+            buttons_right_align: true,
             blank_line_before_list: false,
         })
 }
