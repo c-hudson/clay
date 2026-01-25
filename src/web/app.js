@@ -5215,7 +5215,7 @@
         });
 
         // Auth submit
-        elements.authSubmit.onclick = authenticate;
+        elements.authSubmit.onclick = function() { authenticate(); };
         elements.authPassword.onkeydown = function(e) {
             if (e.key === 'Enter') {
                 authenticate();
