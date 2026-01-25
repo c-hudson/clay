@@ -25341,7 +25341,8 @@ fn render_separator_bar(f: &mut Frame, app: &App, area: Rect) {
     ));
 
     // Only show connection ball, world name, and tag indicator when connected
-    let is_connected = world.command_tx.is_some();
+    // Use world.connected flag (works for both master and console client modes)
+    let is_connected = world.connected;
     let current_pos = if is_connected {
         // Connection status ball (green when connected)
         spans.push(Span::raw("🟢"));
