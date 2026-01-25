@@ -1579,6 +1579,43 @@ fn substitute_action_args(command: &str, args_str: &str) -> String {
     result
 }
 
+/// Substitute pattern captures ($0-$9) in a command string
+/// $0 is the entire match, $1-$9 are capture groups
+/// captures[0] is the full match, captures[1..] are the groups
+fn substitute_pattern_captures(command: &str, captures: &[&str]) -> String {
+    let mut result = String::with_capacity(command.len() * 2);
+    let mut chars = command.chars().peekable();
+
+    while let Some(c) = chars.next() {
+        if c == '$' {
+            if let Some(&next) = chars.peek() {
+                if next.is_ascii_digit() {
+                    // $0-$9
+                    chars.next();
+                    let idx = (next as usize) - ('0' as usize);
+                    if idx < captures.len() {
+                        result.push_str(captures[idx]);
+                    }
+                    // If capture doesn't exist, substitute with nothing
+                } else if next == '*' {
+                    // $* - keep as-is for manual arg substitution later
+                    result.push(c);
+                } else {
+                    // Not a substitution pattern, keep the $
+                    result.push(c);
+                }
+            } else {
+                // $ at end of string
+                result.push(c);
+            }
+        } else {
+            result.push(c);
+        }
+    }
+
+    result
+}
+
 /// Result of checking action triggers on a line
 struct ActionTriggerResult {
     should_gag: bool,           // If true, suppress the line from output
@@ -1589,6 +1626,7 @@ struct ActionTriggerResult {
 /// Supports \* and \? to match literal asterisk and question mark
 /// Normalizes quotes: any double quote matches all double quote variants,
 /// any single quote matches all single quote variants
+/// Each * and ? becomes a capture group for $1, $2, etc. substitution
 fn wildcard_to_regex(pattern: &str) -> String {
     // Wildcard patterns must match the entire line (anchored at start and end)
     let mut regex = String::with_capacity(pattern.len() * 2 + 2);
@@ -1611,8 +1649,9 @@ fn wildcard_to_regex(pattern: &str) -> String {
                     }
                 }
             }
-            '*' => regex.push_str(".*"),
-            '?' => regex.push('.'),
+            // Wildcards become capture groups for $1, $2, etc.
+            '*' => regex.push_str("(.*)"),
+            '?' => regex.push_str("(.)"),
             // Normalize double quotes: " (U+0022), " (U+201C), " (U+201D)
             '"' | '\u{201C}' | '\u{201D}' => {
                 regex.push_str("[\"\u{201C}\u{201D}]");
@@ -1808,15 +1847,21 @@ fn check_action_triggers(
             .case_insensitive(true)
             .build()
         {
-            if regex.is_match(&plain_line) {
+            if let Some(caps) = regex.captures(&plain_line) {
+                // Extract capture groups: $0 is full match, $1-$9 are groups
+                let captures: Vec<&str> = caps.iter()
+                    .map(|m| m.map(|m| m.as_str()).unwrap_or(""))
+                    .collect();
+
                 let commands = split_action_commands(&action.command);
                 let should_gag = commands.iter().any(|cmd|
                     cmd.eq_ignore_ascii_case("/gag") || cmd.to_lowercase().starts_with("/gag ")
                 );
 
-                // Filter out /gag from the commands to execute
+                // Filter out /gag and substitute captures in commands
                 let filtered_commands: Vec<String> = commands.into_iter()
                     .filter(|cmd| !cmd.eq_ignore_ascii_case("/gag") && !cmd.to_lowercase().starts_with("/gag "))
+                    .map(|cmd| substitute_pattern_captures(&cmd, &captures))
                     .collect();
 
                 return Some(ActionTriggerResult {

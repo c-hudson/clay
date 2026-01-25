@@ -997,6 +997,17 @@ Actions are automated triggers that match incoming MUD output against patterns a
 - Use `\*` and `\?` to match literal asterisk and question mark characters (e.g., `*what\?*` matches lines containing "what?")
 - Toggle match type in the action editor (console: Space/Enter/arrows, web/GUI: click button)
 
+**Capture Group Substitution:**
+- When a pattern matches, you can use captured text in the commands:
+  - `$0` - The entire matched text
+  - `$1` through `$9` - Captured groups from the pattern
+- For **Regexp** patterns, use parentheses to create capture groups: `^(\w+) tells you: (.*)$`
+  - `$1` = the name, `$2` = the message
+- For **Wildcard** patterns, each `*` and `?` becomes a capture group automatically
+  - Pattern `* tells you: *` with input "Bob tells you: Hello" gives `$1`="Bob", `$2`="Hello"
+- Example action: Pattern `* tells you: *` with command `say Thanks, $1!` replies with "Thanks, Bob!"
+- When manually invoking actions with `/actionname args`, `$1-$9` are the space-separated args and `$*` is all args
+
 **Commands:**
 - Multiple commands can be separated by semicolons
 - Special command `/gag` hides the matched line from display (but stores it for F2 viewing)

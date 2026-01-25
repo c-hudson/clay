@@ -19,6 +19,7 @@ import androidx.core.app.NotificationCompat;
 public class ClayForegroundService extends Service {
     private static final String CHANNEL_ID = "clay_service";
     private static final int NOTIFICATION_ID = 1;
+    public static final String ACTION_STOP_SERVICE = "com.clay.mudclient.STOP_SERVICE";
 
     @Override
     public void onCreate() {
@@ -28,6 +29,13 @@ public class ClayForegroundService extends Service {
 
     @Override
     public int onStartCommand(Intent intent, int flags, int startId) {
+        // Check if this is a stop request
+        if (intent != null && ACTION_STOP_SERVICE.equals(intent.getAction())) {
+            stopForeground(true);
+            stopSelf();
+            return START_NOT_STICKY;
+        }
+
         // Create intent to open app when notification is tapped
         Intent notificationIntent = new Intent(this, MainActivity.class);
         notificationIntent.setFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_CLEAR_TOP);
@@ -36,7 +44,15 @@ public class ClayForegroundService extends Service {
             PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE
         );
 
-        // Build the persistent notification
+        // Create intent for the Disconnect action button
+        Intent stopIntent = new Intent(this, ClayForegroundService.class);
+        stopIntent.setAction(ACTION_STOP_SERVICE);
+        PendingIntent stopPendingIntent = PendingIntent.getService(
+            this, 1, stopIntent,
+            PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE
+        );
+
+        // Build the persistent notification with Disconnect action
         Notification notification = new NotificationCompat.Builder(this, CHANNEL_ID)
             .setSmallIcon(R.drawable.ic_notification)
             .setContentTitle("Clay")
@@ -44,6 +60,7 @@ public class ClayForegroundService extends Service {
             .setOngoing(true)
             .setPriority(NotificationCompat.PRIORITY_LOW)
             .setContentIntent(pendingIntent)
+            .addAction(0, "Disconnect", stopPendingIntent)
             .build();
 
         // Start as foreground service
