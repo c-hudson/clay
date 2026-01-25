@@ -1592,9 +1592,18 @@
 
         // Hash password with SHA-256
         hashPassword(password).then(hash => {
-            // Debug: show hash in error field (selectable) on Android
+            // Debug: show hash in copyable text input on Android
             if (window.Android) {
-                elements.authError.textContent = 'Hash: ' + hash;
+                let debugInput = document.getElementById('debug-hash');
+                if (!debugInput) {
+                    debugInput = document.createElement('input');
+                    debugInput.id = 'debug-hash';
+                    debugInput.type = 'text';
+                    debugInput.style.cssText = 'width:100%;font-size:9px;margin-top:8px;padding:4px;background:#333;color:#0f0;border:1px solid #0f0;';
+                    debugInput.readOnly = true;
+                    elements.authError.parentNode.appendChild(debugInput);
+                }
+                debugInput.value = hash;
             }
             const msg = { type: 'AuthRequest', password_hash: hash };
             if (username) {
@@ -1605,7 +1614,16 @@
             // Try fallback directly if hashPassword somehow failed
             const hash = sha256Fallback(password);
             if (window.Android) {
-                elements.authError.textContent = 'Hash: ' + hash;
+                let debugInput = document.getElementById('debug-hash');
+                if (!debugInput) {
+                    debugInput = document.createElement('input');
+                    debugInput.id = 'debug-hash';
+                    debugInput.type = 'text';
+                    debugInput.style.cssText = 'width:100%;font-size:9px;margin-top:8px;padding:4px;background:#333;color:#0f0;border:1px solid #0f0;';
+                    debugInput.readOnly = true;
+                    elements.authError.parentNode.appendChild(debugInput);
+                }
+                debugInput.value = hash;
             }
             const msg = { type: 'AuthRequest', password_hash: hash };
             if (username) {
