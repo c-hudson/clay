@@ -15410,8 +15410,29 @@ fn handle_remote_client_key(
                         app.open_world_selector_new();
                     }
                     Command::WorldsList => {
-                        // Use the new unified popup system
-                        app.open_connections_popup_new();
+                        // Output connected worlds list as text (simplified - no timing info in console client)
+                        let current_idx = app.current_world_index;
+                        let mut lines = vec![
+                            OutputLine::new_client("".to_string()),
+                            OutputLine::new_client("Connected Worlds:".to_string()),
+                            OutputLine::new_client("─".repeat(50)),
+                        ];
+                        for (idx, world) in app.worlds.iter().enumerate() {
+                            let current = if idx == current_idx { "*" } else { " " };
+                            let connected = if world.connected { "✓" } else { " " };
+                            let unseen = if world.unseen_lines > 0 {
+                                format!(" ({} unseen)", world.unseen_lines)
+                            } else {
+                                String::new()
+                            };
+                            lines.push(OutputLine::new_client(
+                                format!("{}{} {}{}", current, connected, world.name, unseen)
+                            ));
+                        }
+                        lines.push(OutputLine::new_client("─".repeat(50)));
+                        lines.push(OutputLine::new_client("(*=current, ✓=connected)".to_string()));
+                        app.current_world_mut().output_lines.extend(lines);
+                        app.needs_output_redraw = true;
                     }
                     Command::WorldSwitch { ref name } | Command::WorldConnectNoLogin { ref name } => {
                         // /worlds <name> - switch to world if it exists
