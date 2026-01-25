@@ -899,9 +899,19 @@
                 showConnecting(false);
 
                 // Check for saved password (Android auto-login)
-                const savedPassword = window.Android && window.Android.getSavedPassword
-                    ? window.Android.getSavedPassword()
-                    : null;
+                let savedPassword = null;
+                try {
+                    if (window.Android && typeof window.Android.getSavedPassword === 'function') {
+                        savedPassword = window.Android.getSavedPassword();
+                        // Ensure it's a non-empty string
+                        if (typeof savedPassword !== 'string' || savedPassword.trim() === '') {
+                            savedPassword = null;
+                        }
+                    }
+                } catch (e) {
+                    console.error('Error getting saved password:', e);
+                    savedPassword = null;
+                }
 
                 if (savedPassword) {
                     // Auto-authenticate with saved password

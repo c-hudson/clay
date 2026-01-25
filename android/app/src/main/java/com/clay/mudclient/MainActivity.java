@@ -141,6 +141,9 @@ public class MainActivity extends AppCompatActivity {
         // Request notification permission for Android 13+
         requestNotificationPermission();
 
+        // Request battery optimization exemption to prevent Doze from killing the service
+        requestBatteryOptimizationExemption();
+
         // Create notification channels
         createNotificationChannel();
         createServiceNotificationChannel();
