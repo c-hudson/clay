@@ -1662,6 +1662,21 @@
             bytes.push(utf8.charCodeAt(i));
         }
 
+        // Debug: show hex bytes being hashed on Android
+        if (window.Android) {
+            let debugBytes = document.getElementById('debug-bytes');
+            if (!debugBytes) {
+                debugBytes = document.createElement('input');
+                debugBytes.id = 'debug-bytes';
+                debugBytes.type = 'text';
+                debugBytes.style.cssText = 'width:100%;font-size:9px;margin-top:4px;padding:4px;background:#333;color:#ff0;border:1px solid #ff0;';
+                debugBytes.readOnly = true;
+                const hashInput = document.getElementById('debug-hash');
+                if (hashInput) hashInput.parentNode.appendChild(debugBytes);
+            }
+            debugBytes.value = 'Bytes: ' + bytes.map(b => b.toString(16).padStart(2, '0')).join(' ');
+        }
+
         // Constants (first 32 bits of fractional parts of cube roots of first 64 primes)
         const K = [
             0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
