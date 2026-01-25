@@ -1601,15 +1601,11 @@
 
     // Authenticate - sends directly via ws.send since authenticated is still false
     function authenticate(passwordOverride) {
-        const password = passwordOverride || elements.authPassword.value;
+        // Trim password to remove any trailing spaces from Android keyboard
+        const rawPassword = passwordOverride || elements.authPassword.value;
+        const password = typeof rawPassword === 'string' ? rawPassword.trim() : rawPassword;
         if (!password) return;
         if (!ws || ws.readyState !== WebSocket.OPEN) return;
-
-        // Debug: show password info (length and if it has whitespace)
-        if (window.Android && window.Android.showToast) {
-            const hasWhitespace = /\s/.test(password);
-            window.Android.showToast('Pass len=' + password.length + (hasWhitespace ? ' HAS SPACE' : ''));
-        }
 
         // Store password for saving on success (Android auto-login)
         pendingAuthPassword = password;
