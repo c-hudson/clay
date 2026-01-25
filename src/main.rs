@@ -1321,6 +1321,8 @@ enum Command {
     Debug,
     /// /dump - dump all scrollback buffers to ~/.clay.dmp.log
     Dump,
+    /// /notify <message> - send notification to mobile clients
+    Notify { message: String },
     /// /<action_name> [args] - execute action
     ActionCommand { name: String, args: String },
     /// Not a command (regular text to send to MUD)
@@ -1387,6 +1389,13 @@ fn parse_command(input: &str) -> Command {
         "/testmusic" => Command::TestMusic,
         "/debug" => Command::Debug,
         "/dump" => Command::Dump,
+        "/notify" => {
+            if args.is_empty() {
+                Command::Unknown { cmd: trimmed.to_string() }
+            } else {
+                Command::Notify { message: args.join(" ") }
+            }
+        }
         _ => {
             // Check if it's an action command (starts with / but not a known command)
             let action_name = cmd.trim_start_matches('/');
@@ -20447,6 +20456,25 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                             from_server: false,
                                         });
                                     }
+                                    Command::Notify { message } => {
+                                        // Send notification to mobile clients
+                                        let title = if world_index < app.worlds.len() {
+                                            app.worlds[world_index].name.clone()
+                                        } else {
+                                            "Clay".to_string()
+                                        };
+                                        app.ws_broadcast(WsMessage::Notification {
+                                            title,
+                                            message: message.clone(),
+                                        });
+                                        app.ws_broadcast(WsMessage::ServerData {
+                                            world_index,
+                                            data: format!("Notification sent: {}", message),
+                                            is_viewed: false,
+                                            ts: current_timestamp_secs(),
+                                            from_server: false,
+                                        });
+                                    }
                                     Command::Debug => {
                                         let ts = current_timestamp_secs();
                                         app.ws_broadcast(WsMessage::ServerData { world_index, data: "=== Debug: World State ===".to_string(), is_viewed: false, ts , from_server: false });
@@ -22117,6 +22145,25 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                     app.ws_broadcast(WsMessage::ServerData {
                                         world_index,
                                         data: "Playing test music (C-D-E-F-G)...".to_string(),
+                                        is_viewed: false,
+                                        ts: current_timestamp_secs(),
+                                        from_server: false,
+                                    });
+                                }
+                                Command::Notify { message } => {
+                                    // Send notification to mobile clients
+                                    let title = if world_index < app.worlds.len() {
+                                        app.worlds[world_index].name.clone()
+                                    } else {
+                                        "Clay".to_string()
+                                    };
+                                    app.ws_broadcast(WsMessage::Notification {
+                                        title,
+                                        message: message.clone(),
+                                    });
+                                    app.ws_broadcast(WsMessage::ServerData {
+                                        world_index,
+                                        data: format!("Notification sent: {}", message),
                                         is_viewed: false,
                                         ts: current_timestamp_secs(),
                                         from_server: false,
@@ -24781,6 +24828,15 @@ async fn handle_command(cmd: &str, app: &mut App, event_tx: mpsc::Sender<AppEven
                 notes: test_notes,
             });
             app.add_output("Playing test music (C-D-E-F-G)...");
+        }
+        Command::Notify { message } => {
+            // Send notification to mobile clients
+            let title = app.current_world().name.clone();
+            app.ws_broadcast(WsMessage::Notification {
+                title,
+                message: message.clone(),
+            });
+            app.add_output(&format!("Notification sent: {}", message));
         }
         Command::Debug => {
             // Show debug info about all worlds to diagnose activity indicator issues

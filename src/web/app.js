@@ -908,6 +908,10 @@
                 authenticated = false;
                 showConnecting(false);
                 connectionFailures++;
+                // Stop Android foreground service when disconnected
+                if (window.Android && window.Android.stopBackgroundService) {
+                    window.Android.stopBackgroundService();
+                }
 
                 // After 2 failures, show error modal instead of auto-reconnecting
                 if (connectionFailures >= 2) {
@@ -960,6 +964,10 @@
                     elements.input.focus();
                     // Update UI based on multiuser mode
                     updateMultiuserUI();
+                    // Start Android foreground service to keep connection alive
+                    if (window.Android && window.Android.startBackgroundService) {
+                        window.Android.startBackgroundService();
+                    }
                 } else {
                     elements.authError.textContent = msg.error || 'Authentication failed';
                     elements.authPassword.value = '';
@@ -1430,6 +1438,13 @@
                         // Update status bar to show more indicator
                         updateStatusBar();
                     }
+                }
+                break;
+
+            case 'Notification':
+                // Send notification to Android app if available
+                if (window.Android && window.Android.showNotification) {
+                    window.Android.showNotification(msg.title || 'Clay', msg.message || '');
                 }
                 break;
 

@@ -90,6 +90,9 @@ pub enum WsMessage {
     /// Tell client to execute a command locally (for action commands like /worlds)
     ExecuteLocalCommand { command: String },
 
+    /// Notification for mobile clients (server -> client)
+    Notification { title: String, message: String },
+
     /// ANSI Music sequence to play (server -> client)
     AnsiMusic { world_index: usize, notes: Vec<MusicNote> },
 

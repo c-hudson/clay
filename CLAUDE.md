@@ -371,6 +371,7 @@ This logic applies to all interfaces (console, web, GUI). Remote clients query t
   - **NextNOP**: Time until next NOP keepalive
 - `/reload` - Hot reload: exec new binary while preserving TCP connections
 - `/testmusic` - Play a test ANSI music sequence (C-D-E-F-G) to verify audio works
+- `/notify <message>` - Send notification to Android app (works from input or action commands)
 - `/quit` - Exit the client
 
 ### TF Commands (TinyFugue Compatibility)
@@ -685,6 +686,33 @@ Note: HTTP automatically starts the non-secure WebSocket server if not already r
 - `src/web/index.html` - HTML template
 - `src/web/style.css` - CSS styles
 - `src/web/app.js` - JavaScript client
+
+### Android Notifications
+
+The Android app supports native notifications triggered by the `/notify` command.
+
+**Usage:**
+- `/notify Someone is attacking!` - Sends a notification with the message
+- Can be used in action commands: `/notify Page from $1`
+
+**Features:**
+- Notifications appear even when the app is in background
+- Tapping notification opens the app
+- Foreground service keeps WebSocket connection alive
+
+**Foreground Service:**
+When authenticated, the app starts a foreground service that:
+- Shows a persistent "Connected to MUD server" notification
+- Keeps the WebSocket connection alive in background
+- Allows notifications to be received even when app is not active
+- Automatically stops when disconnected
+
+**Action Example:**
+```
+Name: page_alert
+Pattern: *pages you*
+Command: /notify Page received: $0
+```
 
 ### Remote GUI Client
 

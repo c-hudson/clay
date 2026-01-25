@@ -1,8 +1,15 @@
 package com.clay.mudclient;
 
+import android.Manifest;
+import android.app.Notification;
+import android.app.NotificationChannel;
+import android.app.NotificationManager;
+import android.app.PendingIntent;
 import android.content.Intent;
 import android.content.SharedPreferences;
+import android.content.pm.PackageManager;
 import android.net.http.SslError;
+import android.os.Build;
 import android.os.Bundle;
 import android.webkit.ConsoleMessage;
 import android.webkit.SslErrorHandler;
@@ -16,8 +23,24 @@ import android.webkit.WebViewClient;
 import android.widget.Toast;
 
 import androidx.appcompat.app.AppCompatActivity;
+import androidx.core.app.ActivityCompat;
+import androidx.core.app.NotificationCompat;
+import androidx.core.content.ContextCompat;
 
 public class MainActivity extends AppCompatActivity {
+    private static final String PREFS_NAME = "ClayPrefs";
+    private static final String KEY_SERVER_HOST = "serverHost";
+    private static final String KEY_SERVER_PORT = "serverPort";
+    private static final String KEY_USE_SECURE = "useSecure";
+
+    private static final String CHANNEL_ID_ALERTS = "clay_alerts";
+    private static final String CHANNEL_ID_SERVICE = "clay_service";
+    private static final int NOTIFICATION_PERMISSION_REQUEST = 1001;
+
+    private WebView webView;
+    private boolean connectionFailed = false;
+    private int notificationId = 1000;
+
     // JavaScript interface for communication between web and Android
     public class AndroidInterface {
         @JavascriptInterface
@@ -34,20 +57,67 @@ public class MainActivity extends AppCompatActivity {
                 openSettings("Change Clay server connection");
             });
         }
+
+        @JavascriptInterface
+        public void showNotification(String title, String message) {
+            runOnUiThread(() -> {
+                createNotificationChannel();
+
+                // Create intent to open app when notification is tapped
+                Intent intent = new Intent(MainActivity.this, MainActivity.class);
+                intent.setFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_CLEAR_TOP);
+                PendingIntent pendingIntent = PendingIntent.getActivity(
+                    MainActivity.this, 0, intent,
+                    PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE
+                );
+
+                NotificationCompat.Builder builder = new NotificationCompat.Builder(MainActivity.this, CHANNEL_ID_ALERTS)
+                    .setSmallIcon(R.drawable.ic_notification)
+                    .setContentTitle(title != null ? title : "Clay")
+                    .setContentText(message != null ? message : "")
+                    .setPriority(NotificationCompat.PRIORITY_HIGH)
+                    .setAutoCancel(true)
+                    .setContentIntent(pendingIntent);
+
+                NotificationManager manager = getSystemService(NotificationManager.class);
+                if (manager != null) {
+                    manager.notify(notificationId++, builder.build());
+                }
+            });
+        }
+
+        @JavascriptInterface
+        public void startBackgroundService() {
+            runOnUiThread(() -> {
+                Intent serviceIntent = new Intent(MainActivity.this, ClayForegroundService.class);
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                    startForegroundService(serviceIntent);
+                } else {
+                    startService(serviceIntent);
+                }
+            });
+        }
+
+        @JavascriptInterface
+        public void stopBackgroundService() {
+            runOnUiThread(() -> {
+                Intent serviceIntent = new Intent(MainActivity.this, ClayForegroundService.class);
+                stopService(serviceIntent);
+            });
+        }
     }
-
-    private static final String PREFS_NAME = "ClayPrefs";
-    private static final String KEY_SERVER_HOST = "serverHost";
-    private static final String KEY_SERVER_PORT = "serverPort";
-    private static final String KEY_USE_SECURE = "useSecure";
-
-    private WebView webView;
-    private boolean connectionFailed = false;
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
         setContentView(R.layout.activity_main);
+
+        // Request notification permission for Android 13+
+        requestNotificationPermission();
+
+        // Create notification channels
+        createNotificationChannel();
+        createServiceNotificationChannel();
 
         webView = findViewById(R.id.webView);
         setupWebView();
@@ -63,6 +133,49 @@ public class MainActivity extends AppCompatActivity {
         } else {
             // Load the web interface
             loadWebInterface();
+        }
+    }
+
+    private void requestNotificationPermission() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            if (ContextCompat.checkSelfPermission(this, Manifest.permission.POST_NOTIFICATIONS)
+                    != PackageManager.PERMISSION_GRANTED) {
+                ActivityCompat.requestPermissions(this,
+                    new String[]{Manifest.permission.POST_NOTIFICATIONS},
+                    NOTIFICATION_PERMISSION_REQUEST);
+            }
+        }
+    }
+
+    private void createNotificationChannel() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            NotificationChannel channel = new NotificationChannel(
+                CHANNEL_ID_ALERTS,
+                "Clay Alerts",
+                NotificationManager.IMPORTANCE_HIGH
+            );
+            channel.setDescription("Notifications from Clay MUD client");
+
+            NotificationManager manager = getSystemService(NotificationManager.class);
+            if (manager != null) {
+                manager.createNotificationChannel(channel);
+            }
+        }
+    }
+
+    private void createServiceNotificationChannel() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            NotificationChannel channel = new NotificationChannel(
+                CHANNEL_ID_SERVICE,
+                "Clay Service",
+                NotificationManager.IMPORTANCE_LOW
+            );
+            channel.setDescription("Keeps Clay connected in the background");
+
+            NotificationManager manager = getSystemService(NotificationManager.class);
+            if (manager != null) {
+                manager.createNotificationChannel(channel);
+            }
         }
     }
 
