@@ -22619,6 +22619,8 @@ fn handle_key_event(key: KeyEvent, app: &mut App) -> KeyAction {
                             let action_name = app.settings.actions[action_index].name.clone();
                             app.settings.actions.remove(action_index);
                             app.add_output(&format!("Action '{}' deleted.", action_name));
+                            // Save settings to disk
+                            let _ = save_settings(app);
                             // Reopen actions list to show updated list
                             app.open_actions_list_popup();
                         }
@@ -22710,7 +22712,8 @@ fn handle_key_event(key: KeyEvent, app: &mut App) -> KeyAction {
                 app.input_height = settings.input_height as u16;
                 app.settings.gui_theme = Theme::from_name(&settings.gui_theme);
                 app.settings.tls_proxy_enabled = settings.tls_proxy;
-                // Settings will be saved when app state is persisted
+                // Save settings to disk
+                let _ = save_settings(app);
             }
             NewPopupAction::WebSaved(settings) => {
                 // Apply saved web settings
@@ -22723,7 +22726,10 @@ fn handle_key_event(key: KeyEvent, app: &mut App) -> KeyAction {
                 app.settings.websocket_allow_list = settings.ws_allow_list;
                 app.settings.websocket_cert_file = settings.ws_cert_file;
                 app.settings.websocket_key_file = settings.ws_key_file;
-                // Settings will be saved when app state is persisted
+                // Save settings to disk
+                let _ = save_settings(app);
+                // Note: Server start/stop requires reload to take effect
+                app.add_output("Web settings saved. Use /reload to apply server changes.");
             }
             NewPopupAction::ConnectionsClose => {
                 // Nothing to do, popup is already closed
@@ -22841,6 +22847,8 @@ fn handle_key_event(key: KeyEvent, app: &mut App) -> KeyAction {
                             app.settings.actions.push(action.clone());
                             app.add_output(&format!("Action '{}' created.", action.name));
                         }
+                        // Save settings to disk
+                        let _ = save_settings(app);
                         // Reopen actions list to show updated list
                         app.open_actions_list_popup();
                     }

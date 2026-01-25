@@ -39,6 +39,8 @@ public class MainActivity extends AppCompatActivity {
 
     private WebView webView;
     private boolean connectionFailed = false;
+    private boolean hasLoadedOnce = false;
+    private String lastLoadedUrl = null;
     private int notificationId = 1000;
 
     // JavaScript interface for communication between web and Android
@@ -241,6 +243,8 @@ public class MainActivity extends AppCompatActivity {
         String url = protocol + "://" + host + ":" + port;
 
         connectionFailed = false;
+        lastLoadedUrl = url;
+        hasLoadedOnce = true;
         webView.loadUrl(url);
     }
 
@@ -255,16 +259,21 @@ public class MainActivity extends AppCompatActivity {
     @Override
     protected void onResume() {
         super.onResume();
-        // Reload if returning from settings
+        // Only reload if settings changed or we haven't loaded yet
         SharedPreferences prefs = getSharedPreferences(PREFS_NAME, MODE_PRIVATE);
         String host = prefs.getString(KEY_SERVER_HOST, null);
         int port = prefs.getInt(KEY_SERVER_PORT, 0);
+        boolean useSecure = prefs.getBoolean(KEY_USE_SECURE, false);
 
         if (host != null && !host.isEmpty() && port > 0) {
-            // Check if we need to reload (settings may have changed)
-            if (!connectionFailed) {
+            String protocol = useSecure ? "https" : "http";
+            String currentUrl = protocol + "://" + host + ":" + port;
+
+            // Only reload if URL changed or haven't loaded yet
+            if (!hasLoadedOnce || !currentUrl.equals(lastLoadedUrl)) {
                 loadWebInterface();
             }
+            // Don't reload if just returning from background - WebSocket handles reconnection
         }
     }
 

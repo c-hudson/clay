@@ -4572,6 +4572,8 @@
             // Don't steal focus from modals, toolbars, or form elements (like select dropdowns)
             if (!elements.authModal.classList.contains('visible') &&
                 !elements.actionsListModal.classList.contains('visible') &&
+                !elements.actionsEditorModal.classList.contains('visible') &&
+                !elements.actionConfirmModal.classList.contains('visible') &&
                 !elements.worldsModal.classList.contains('visible') &&
                 !elements.worldSelectorModal.classList.contains('visible') &&
                 !elements.setupModal?.classList.contains('visible') &&
@@ -4591,6 +4593,7 @@
                 return elements.authModal.classList.contains('visible') ||
                     elements.actionsListModal.classList.contains('visible') ||
                     elements.actionsEditorModal.classList.contains('visible') ||
+                    elements.actionConfirmModal.classList.contains('visible') ||
                     elements.worldsModal.classList.contains('visible') ||
                     elements.worldSelectorModal.classList.contains('visible') ||
                     elements.webModal.classList.contains('visible') ||
