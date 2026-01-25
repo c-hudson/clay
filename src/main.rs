@@ -3182,6 +3182,23 @@ impl App {
                     self.needs_output_redraw = true;
                 }
             }
+            WsMessage::CalculatedWorld { index } => {
+                // Server calculated next/prev world for us - switch to it
+                if let Some(idx) = index {
+                    if idx < self.worlds.len() {
+                        self.current_world_index = idx;
+                        // Clear unseen for the world we're switching to
+                        if let Some(world) = self.worlds.get_mut(idx) {
+                            world.unseen_lines = 0;
+                        }
+                        self.needs_output_redraw = true;
+                        // Send MarkWorldSeen to notify server
+                        if let Some(ref tx) = self.ws_client_tx {
+                            let _ = tx.send(WsMessage::MarkWorldSeen { world_index: idx });
+                        }
+                    }
+                }
+            }
             _ => {}
         }
     }
@@ -15329,24 +15346,12 @@ fn handle_remote_client_key(
             }
         }
         (_, Up) => {
-            // Switch to previous active world
-            if !app.worlds.is_empty() {
-                let new_idx = if app.current_world_index == 0 {
-                    app.worlds.len() - 1
-                } else {
-                    app.current_world_index - 1
-                };
-                app.current_world_index = new_idx;
-                let _ = ws_tx.send(WsMessage::MarkWorldSeen { world_index: new_idx });
-            }
+            // Request previous active world from server
+            let _ = ws_tx.send(WsMessage::CalculatePrevWorld { current_index: app.current_world_index });
         }
         (_, Down) => {
-            // Switch to next active world
-            if !app.worlds.is_empty() {
-                let new_idx = (app.current_world_index + 1) % app.worlds.len();
-                app.current_world_index = new_idx;
-                let _ = ws_tx.send(WsMessage::MarkWorldSeen { world_index: new_idx });
-            }
+            // Request next active world from server
+            let _ = ws_tx.send(WsMessage::CalculateNextWorld { current_index: app.current_world_index });
         }
         (_, PageUp) => {
             let scroll_amount = app.output_height.saturating_sub(2) as usize;
