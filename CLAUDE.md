@@ -1031,6 +1031,64 @@ Actions are automated triggers that match incoming MUD output against patterns a
 - Matched lines get a dark background color
 - Useful for debugging action patterns without running commands
 
+### Actions List Popup
+
+Opened with `/actions` command:
+
+- Shows list of all actions with columns: Enable status, Name, World, Pattern preview
+- Filter box at top - type to filter actions by name, world, or pattern
+- Enabled actions show `[✓]`, disabled show `[ ]`
+
+**Controls:**
+- `Up/Down` - Navigate action list
+- `Space` - Toggle enable/disable for selected action (without opening editor)
+- `Enter` - Edit selected action
+- `Tab` - Cycle focus between list and buttons
+- `A` - Add new action
+- `E` - Edit selected action
+- `D` - Delete selected action
+- `C` - Cancel/close popup
+- `F` or `/` - Focus filter box
+- `Esc` - Close popup
+
+**Buttons (right-aligned):**
+- Add - Create new action and open editor
+- Edit - Open editor for selected action
+- Delete - Delete selected action (with confirmation)
+- Cancel - Close popup
+
+### Action Editor Popup
+
+Opened from actions list (Add or Edit):
+
+**Fields:**
+- Name - Action name (also used for manual invocation with `/actionname`)
+- World - Restrict to specific world (empty = all worlds)
+- Match Type - Regexp or Wildcard (toggle with Space/Enter/arrows)
+- Pattern - Trigger pattern (empty = manual-only action)
+- Command - Commands to execute (multiline editor, 3 visible lines with scrolling)
+- Enabled - Whether the action is active
+
+**Command Field:**
+- Multiline editor with 3 visible lines and scrolling viewport
+- `Enter` - Insert newline
+- `Up/Down` - Move cursor between lines
+- Viewport scrolls automatically to keep cursor visible
+- Cursor shown as `│` like other text fields
+
+**Controls:**
+- `Up/Down` - Navigate between fields
+- `Space` - Toggle Enabled field or cycle Match Type
+- `Enter` - Edit text field / Toggle option / Activate button
+- `Tab` - Cycle to buttons
+- `S` - Save shortcut
+- `C` - Cancel/close shortcut
+- `Esc` - Cancel edit or close popup
+
+**Buttons (right-aligned):**
+- Save - Save action and close
+- Cancel - Close without saving
+
 ### Confirmation Dialog
 
 Appears when deleting a world:
