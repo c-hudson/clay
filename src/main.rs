@@ -2645,6 +2645,8 @@ struct App {
     is_reload: bool,
     /// True if the output area needs to be redrawn (optimization to avoid unnecessary redraws)
     needs_output_redraw: bool,
+    /// True if terminal needs full clear (for Ctrl+L redraw in --console mode)
+    needs_terminal_clear: bool,
     /// True if running in multiuser mode (--multiuser flag)
     multiuser_mode: bool,
     /// User accounts (multiuser mode only)
@@ -2699,6 +2701,7 @@ impl App {
             is_master: true, // Console app is always master (remote GUI is separate execution path)
             is_reload: false, // Set to true in run_app if started from hot reload
             needs_output_redraw: true, // Start with true to ensure initial render
+            needs_terminal_clear: false, // Set to true by Ctrl+L in --console mode
             multiuser_mode: false, // Set to true in main if started with --multiuser
             users: Vec::new(),
             ban_list: BanList::new(),
@@ -15181,6 +15184,16 @@ async fn run_console_client(addr: &str) -> io::Result<()> {
             }
             popup_was_visible = any_popup_visible;
 
+            // Handle Ctrl+L terminal clear request
+            if app.needs_terminal_clear {
+                execute!(
+                    std::io::stdout(),
+                    crossterm::terminal::Clear(crossterm::terminal::ClearType::All)
+                )?;
+                terminal.clear()?;
+                app.needs_terminal_clear = false;
+            }
+
             terminal.draw(|f| ui(f, &mut app))?;
             // Render output with crossterm (bypasses ratatui's buggy ANSI handling)
             render_output_crossterm(&app);
@@ -15421,11 +15434,8 @@ fn handle_remote_client_key(
         (KeyModifiers::CONTROL, Char('l')) => {
             // Redraw screen - filter output to only show server data
             app.current_world_mut().filter_to_server_output();
-            // Clear terminal directly using crossterm
-            let _ = execute!(
-                std::io::stdout(),
-                crossterm::terminal::Clear(crossterm::terminal::ClearType::All)
-            );
+            // Signal main loop to clear terminal and redraw everything
+            app.needs_terminal_clear = true;
             app.needs_output_redraw = true;
         }
         (KeyModifiers::CONTROL, Up) => {
