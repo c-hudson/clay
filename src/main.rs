@@ -7676,7 +7676,7 @@ mod remote_gui {
                                 self.last_sent_view_state = Some((self.current_world, self.output_visible_lines));
                             }
                         }
-                        WsMessage::ServerData { world_index, data, is_viewed: _, ts } => {
+                        WsMessage::ServerData { world_index, data, is_viewed: _, ts, .. } => {
                             if world_index < self.worlds.len() {
                                 let world = &mut self.worlds[world_index];
 
