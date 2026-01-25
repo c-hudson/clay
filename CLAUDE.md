@@ -722,6 +722,45 @@ cargo build --features remote-gui    # Requires X11 or Wayland
 - The remote-gui feature cannot be built in headless environments
 - Requires X11 or Wayland display server
 
+### Remote Console Client
+
+A terminal-based client mode that connects to a running Clay's WebSocket server, providing the same interface as the main console but connecting remotely.
+
+**Running:**
+```bash
+./clay --console=hostname:port
+```
+
+**Features:**
+- Full terminal interface identical to the main console
+- Connects via WebSocket to a master Clay instance
+- All popup dialogs work (help, menu, setup, world selector, world editor, actions, web settings)
+- Output scrollback with PageUp/PageDown
+- More-mode pausing with Tab
+- World switching with Up/Down arrows
+- Command history with Ctrl+P/N
+- MUD tag stripping toggle (F2)
+- Output filtering (F4)
+- Action pattern highlighting (F8)
+
+**Key Differences from Main Console:**
+- No direct MUD connections - all data flows through the master instance
+- World switching is console-local (doesn't affect master or other clients)
+- Commands are sent to the master for execution
+- Popups are rendered locally using the unified popup system
+
+**Keyboard Shortcuts:**
+- All standard console shortcuts work (see Controls section)
+- `Ctrl+L` - Redraw screen (filters out client-generated output, keeps only server data)
+- `/menu` - Open hamburger menu popup
+- `/version` - Display version information
+
+**Building:**
+```bash
+# No special features required - works with standard musl build
+cargo build --target x86_64-unknown-linux-musl --no-default-features --features rustls-backend
+```
+
 ### GUI Keyboard Shortcuts
 
 The remote GUI client supports keyboard shortcuts similar to the console client:
