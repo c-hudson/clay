@@ -4469,11 +4469,19 @@
         function handlePgDn() {
             const container = elements.outputContainer;
             const world = worlds[currentWorldIndex];
-            if (world && world.pendingLines && world.pendingLines.length > 0) {
+            const serverPending = world ? (world.pending_count || 0) : 0;
+            if (pendingLines.length > 0 || serverPending > 0) {
                 releasePendingLines(getVisibleLineCount());
             } else {
                 const pageHeight = container.clientHeight * 0.9;
                 container.scrollTop += pageHeight;
+            }
+            // If at bottom now and no pending (local or server), unpause
+            if (isAtBottom()) {
+                if (pendingLines.length === 0 && serverPending === 0) {
+                    paused = false;
+                    linesSincePause = 0;
+                }
             }
             updateStatusBar();
         }
@@ -4636,11 +4644,18 @@
                 paused = true;
                 updateStatusBar();
             }
-            // If user scrolls to bottom, unpause
-            if (paused && isAtBottom() && pendingLines.length === 0) {
-                paused = false;
-                linesSincePause = 0;
-                updateStatusBar();
+            // If user scrolls to bottom, check pending state
+            if (isAtBottom()) {
+                const world = worlds[currentWorldIndex];
+                const serverPending = world ? (world.pending_count || 0) : 0;
+                if (pendingLines.length === 0 && serverPending === 0) {
+                    paused = false;
+                    linesSincePause = 0;
+                    updateStatusBar();
+                } else if (paused) {
+                    // At bottom but have pending - release them
+                    releaseAll();
+                }
             }
         };
 
@@ -4927,10 +4942,17 @@
             } else if (e.key === 'PageDown') {
                 e.preventDefault();
                 elements.outputContainer.scrollBy(0, elements.outputContainer.clientHeight);
-                if (isAtBottom() && pendingLines.length === 0) {
-                    paused = false;
-                    linesSincePause = 0;
-                    updateStatusBar();
+                if (isAtBottom()) {
+                    const world = worlds[currentWorldIndex];
+                    const serverPending = world ? (world.pending_count || 0) : 0;
+                    if (pendingLines.length === 0 && serverPending === 0) {
+                        paused = false;
+                        linesSincePause = 0;
+                        updateStatusBar();
+                    } else {
+                        // Release any pending (local or server) when at bottom
+                        releaseAll();
+                    }
                 }
             } else if (e.key === 'ArrowUp' && !e.ctrlKey && !e.shiftKey && !e.altKey && document.activeElement !== elements.input) {
                 // Up: Switch to previous active world (request from server)
@@ -5052,11 +5074,18 @@
                 // PageDown: Scroll output down
                 e.preventDefault();
                 elements.outputContainer.scrollBy(0, elements.outputContainer.clientHeight);
-                // If at bottom now and no pending, unpause
-                if (isAtBottom() && pendingLines.length === 0) {
-                    paused = false;
-                    linesSincePause = 0;
-                    updateStatusBar();
+                // If at bottom now and no pending (local or server), unpause
+                if (isAtBottom()) {
+                    const world = worlds[currentWorldIndex];
+                    const serverPending = world ? (world.pending_count || 0) : 0;
+                    if (pendingLines.length === 0 && serverPending === 0) {
+                        paused = false;
+                        linesSincePause = 0;
+                        updateStatusBar();
+                    } else {
+                        // Release any pending (local or server) when at bottom
+                        releaseAll();
+                    }
                 }
             }
             // Note: F2, F3, F4 are handled at document level (before this handler)
