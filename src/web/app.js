@@ -5465,6 +5465,15 @@
         }
     }
 
+    // Expose keepalive function for Android app to call
+    // This helps keep the WebSocket connection alive when screen is off
+    window.keepalivePing = function() {
+        if (ws && ws.readyState === WebSocket.OPEN) {
+            // Send a ping to keep the connection alive
+            send({ type: 'Ping' });
+        }
+    };
+
     // Start the app
     init();
 })();

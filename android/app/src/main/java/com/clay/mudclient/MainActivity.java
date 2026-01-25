@@ -5,6 +5,7 @@ import android.app.Notification;
 import android.app.NotificationChannel;
 import android.app.NotificationManager;
 import android.app.PendingIntent;
+import android.content.Context;
 import android.content.Intent;
 import android.content.SharedPreferences;
 import android.content.pm.PackageManager;
@@ -12,6 +13,8 @@ import android.net.Uri;
 import android.net.http.SslError;
 import android.os.Build;
 import android.os.Bundle;
+import android.os.Handler;
+import android.os.Looper;
 import android.os.PowerManager;
 import android.provider.Settings;
 import android.webkit.ConsoleMessage;
@@ -41,10 +44,15 @@ public class MainActivity extends AppCompatActivity {
     private static final String CHANNEL_ID_ALERTS = "clay_alerts";
     private static final String CHANNEL_ID_SERVICE = "clay_service";
     private static final int NOTIFICATION_PERMISSION_REQUEST = 1001;
+    private static final int KEEPALIVE_INTERVAL_MS = 30000; // 30 seconds
 
     private WebView webView;
     private boolean connectionFailed = false;
     private int notificationId = 1000;
+    private boolean isConnected = false;
+    private PowerManager.WakeLock screenOffWakeLock;
+    private Handler keepaliveHandler;
+    private Runnable keepaliveRunnable;
 
     // JavaScript interface for communication between web and Android
     public class AndroidInterface {
@@ -103,15 +111,30 @@ public class MainActivity extends AppCompatActivity {
                 } else {
                     startService(serviceIntent);
                 }
+
+                // Mark as connected and start keepalive
+                isConnected = true;
+                acquireScreenOffWakeLock();
+                startKeepalive();
             });
         }
 
         @JavascriptInterface
         public void stopBackgroundService() {
             runOnUiThread(() -> {
+                isConnected = false;
+                stopKeepalive();
+                releaseScreenOffWakeLock();
+
                 Intent serviceIntent = new Intent(MainActivity.this, ClayForegroundService.class);
                 stopService(serviceIntent);
             });
+        }
+
+        @JavascriptInterface
+        public void keepaliveAck() {
+            // Called by JavaScript to acknowledge keepalive ping
+            // This helps detect if the WebView is actually responsive
         }
 
         @JavascriptInterface
@@ -236,6 +259,56 @@ public class MainActivity extends AppCompatActivity {
         }
     }
 
+    private void acquireScreenOffWakeLock() {
+        if (screenOffWakeLock == null) {
+            PowerManager pm = (PowerManager) getSystemService(Context.POWER_SERVICE);
+            if (pm != null) {
+                screenOffWakeLock = pm.newWakeLock(
+                    PowerManager.PARTIAL_WAKE_LOCK,
+                    "Clay::ScreenOffWakeLock"
+                );
+                screenOffWakeLock.acquire();
+            }
+        }
+    }
+
+    private void releaseScreenOffWakeLock() {
+        if (screenOffWakeLock != null && screenOffWakeLock.isHeld()) {
+            screenOffWakeLock.release();
+            screenOffWakeLock = null;
+        }
+    }
+
+    private void startKeepalive() {
+        if (keepaliveHandler == null) {
+            keepaliveHandler = new Handler(Looper.getMainLooper());
+        }
+
+        keepaliveRunnable = new Runnable() {
+            @Override
+            public void run() {
+                if (isConnected && webView != null) {
+                    // Ping the JavaScript to keep the WebSocket alive
+                    // This also wakes up the WebView if it was suspended
+                    webView.evaluateJavascript(
+                        "if (typeof keepalivePing === 'function') { keepalivePing(); Android.keepaliveAck(); }",
+                        null
+                    );
+                    keepaliveHandler.postDelayed(this, KEEPALIVE_INTERVAL_MS);
+                }
+            }
+        };
+
+        keepaliveHandler.postDelayed(keepaliveRunnable, KEEPALIVE_INTERVAL_MS);
+    }
+
+    private void stopKeepalive() {
+        if (keepaliveHandler != null && keepaliveRunnable != null) {
+            keepaliveHandler.removeCallbacks(keepaliveRunnable);
+            keepaliveRunnable = null;
+        }
+    }
+
     private void setupWebView() {
         WebSettings webSettings = webView.getSettings();
         webSettings.setJavaScriptEnabled(true);
@@ -339,6 +412,29 @@ public class MainActivity extends AppCompatActivity {
             }
             // Don't reload if just returning from background with WebView intact
         }
+    }
+
+    @Override
+    protected void onPause() {
+        super.onPause();
+        // Don't pause WebView if connected - we want to keep receiving notifications
+        // The WebView will continue running in the background with the foreground service
+        if (!isConnected && webView != null) {
+            webView.onPause();
+        }
+    }
+
+    @Override
+    protected void onStop() {
+        super.onStop();
+        // WebView continues running if connected (foreground service keeps process alive)
+    }
+
+    @Override
+    protected void onDestroy() {
+        stopKeepalive();
+        releaseScreenOffWakeLock();
+        super.onDestroy();
     }
 
     @Override
