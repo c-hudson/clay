@@ -1592,13 +1592,9 @@
 
         // Hash password with SHA-256
         hashPassword(password).then(hash => {
-            // Debug: show all info in one alert on Android
+            // Debug: show hash in error field (selectable) on Android
             if (window.Android) {
-                alert('DEBUG AUTH\\n' +
-                    'Raw type: ' + typeof rawPassword + '\\n' +
-                    'Raw len: ' + String(rawPassword).length + '\\n' +
-                    'Trimmed len: ' + password.length + '\\n' +
-                    'Hash: ' + hash);
+                elements.authError.textContent = 'Hash: ' + hash;
             }
             const msg = { type: 'AuthRequest', password_hash: hash };
             if (username) {
@@ -1609,10 +1605,7 @@
             // Try fallback directly if hashPassword somehow failed
             const hash = sha256Fallback(password);
             if (window.Android) {
-                alert('DEBUG FALLBACK\\n' +
-                    'Raw len: ' + String(rawPassword).length + '\\n' +
-                    'Trimmed len: ' + password.length + '\\n' +
-                    'Hash: ' + hash);
+                elements.authError.textContent = 'Hash: ' + hash;
             }
             const msg = { type: 'AuthRequest', password_hash: hash };
             if (username) {
