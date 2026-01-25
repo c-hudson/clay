@@ -18529,10 +18529,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
         match load_reload_state(&mut app) {
             Ok(true) => {
                 debug_log(true, "STARTUP: Reload state loaded successfully");
-                // Only show hot reload message, crash recovery is silent when successful
-                if !is_crash {
-                    startup_messages.push("Hot reload successful!".to_string());
-                }
+                // Silent on success - only show errors
             }
             Ok(false) => {
                 debug_log(true, "STARTUP: No reload state found");
