@@ -8,9 +8,12 @@ import android.app.PendingIntent;
 import android.content.Intent;
 import android.content.SharedPreferences;
 import android.content.pm.PackageManager;
+import android.net.Uri;
 import android.net.http.SslError;
 import android.os.Build;
 import android.os.Bundle;
+import android.os.PowerManager;
+import android.provider.Settings;
 import android.webkit.ConsoleMessage;
 import android.webkit.SslErrorHandler;
 import android.webkit.WebChromeClient;
@@ -91,6 +94,9 @@ public class MainActivity extends AppCompatActivity {
         @JavascriptInterface
         public void startBackgroundService() {
             runOnUiThread(() -> {
+                // Request battery optimization exemption first
+                requestBatteryOptimizationExemption();
+
                 Intent serviceIntent = new Intent(MainActivity.this, ClayForegroundService.class);
                 if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
                     startForegroundService(serviceIntent);
@@ -163,6 +169,27 @@ public class MainActivity extends AppCompatActivity {
                 ActivityCompat.requestPermissions(this,
                     new String[]{Manifest.permission.POST_NOTIFICATIONS},
                     NOTIFICATION_PERMISSION_REQUEST);
+            }
+        }
+    }
+
+    private void requestBatteryOptimizationExemption() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+            PowerManager pm = (PowerManager) getSystemService(POWER_SERVICE);
+            String packageName = getPackageName();
+            if (pm != null && !pm.isIgnoringBatteryOptimizations(packageName)) {
+                // Request exemption from battery optimization
+                Intent intent = new Intent();
+                intent.setAction(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS);
+                intent.setData(Uri.parse("package:" + packageName));
+                try {
+                    startActivity(intent);
+                } catch (Exception e) {
+                    // Some devices may not support this intent
+                    Toast.makeText(this,
+                        "Please disable battery optimization for Clay in Settings",
+                        Toast.LENGTH_LONG).show();
+                }
             }
         }
     }
