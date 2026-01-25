@@ -17168,6 +17168,8 @@ async fn handle_daemon_ws_message(
                 app.worlds[world_index].first_unseen_at = None;
                 app.ws_broadcast(WsMessage::UnseenCleared { world_index });
                 app.broadcast_activity();
+                // Trigger console redraw to update activity indicator
+                app.needs_output_redraw = true;
             }
         }
         WsMessage::ReleasePending { world_index, count } => {
@@ -20349,6 +20351,8 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                     app.ws_broadcast(WsMessage::UnseenCleared { world_index });
                                     // Broadcast activity count since a world was just marked as seen
                                     app.broadcast_activity();
+                                    // Trigger console redraw to update activity indicator
+                                    app.needs_output_redraw = true;
                                 }
                             }
                             WsMessage::UpdateViewState { world_index, visible_lines } => {
