@@ -15341,11 +15341,88 @@ fn handle_remote_client_key(
             NewPopupAction::WorldSelectorFilter => {
                 // Filter changed - remote client doesn't handle locally
             }
-            NewPopupAction::SetupSaved(_settings) => {
-                // Setup saved - remote client doesn't handle locally
+            NewPopupAction::SetupSaved(settings) => {
+                // Send settings update to master daemon
+                // Update local app settings first
+                app.settings.more_mode_enabled = settings.more_mode;
+                app.settings.spell_check_enabled = settings.spell_check;
+                app.settings.temp_convert_enabled = settings.temp_convert;
+                app.settings.world_switch_mode = WorldSwitchMode::from_name(&settings.world_switching);
+                app.show_tags = settings.show_tags;
+                app.input_height = settings.input_height as u16;
+                app.input.visible_height = app.input_height;
+                app.settings.gui_theme = Theme::from_name(&settings.gui_theme);
+                app.settings.tls_proxy_enabled = settings.tls_proxy;
+
+                // Send UpdateGlobalSettings to daemon
+                let _ = ws_tx.send(WsMessage::UpdateGlobalSettings {
+                    more_mode_enabled: app.settings.more_mode_enabled,
+                    spell_check_enabled: app.settings.spell_check_enabled,
+                    temp_convert_enabled: app.settings.temp_convert_enabled,
+                    world_switch_mode: app.settings.world_switch_mode.name().to_string(),
+                    show_tags: app.show_tags,
+                    ansi_music_enabled: app.settings.ansi_music_enabled,
+                    console_theme: app.settings.theme.name().to_string(),
+                    gui_theme: app.settings.gui_theme.name().to_string(),
+                    gui_transparency: app.settings.gui_transparency,
+                    color_offset_percent: app.settings.color_offset_percent,
+                    input_height: app.input_height,
+                    font_name: app.settings.font_name.clone(),
+                    font_size: app.settings.font_size,
+                    web_font_size_phone: app.settings.web_font_size_phone,
+                    web_font_size_tablet: app.settings.web_font_size_tablet,
+                    web_font_size_desktop: app.settings.web_font_size_desktop,
+                    ws_allow_list: app.settings.websocket_allow_list.clone(),
+                    web_secure: app.settings.web_secure,
+                    http_enabled: app.settings.http_enabled,
+                    http_port: app.settings.http_port,
+                    ws_enabled: app.settings.ws_enabled,
+                    ws_port: app.settings.ws_port,
+                    ws_cert_file: app.settings.websocket_cert_file.clone(),
+                    ws_key_file: app.settings.websocket_key_file.clone(),
+                    tls_proxy_enabled: app.settings.tls_proxy_enabled,
+                });
             }
-            NewPopupAction::WebSaved(_settings) => {
-                // Web settings saved - remote client doesn't handle locally
+            NewPopupAction::WebSaved(settings) => {
+                // Update local web settings
+                app.settings.web_secure = settings.web_secure;
+                app.settings.http_enabled = settings.http_enabled;
+                app.settings.http_port = settings.http_port.parse().unwrap_or(9000);
+                app.settings.ws_enabled = settings.ws_enabled;
+                app.settings.ws_port = settings.ws_port.parse().unwrap_or(9002);
+                app.settings.websocket_allow_list = settings.ws_allow_list.clone();
+                app.settings.websocket_cert_file = settings.ws_cert_file.clone();
+                app.settings.websocket_key_file = settings.ws_key_file.clone();
+                // Password update handled separately if changed
+
+                // Send UpdateGlobalSettings to daemon
+                let _ = ws_tx.send(WsMessage::UpdateGlobalSettings {
+                    more_mode_enabled: app.settings.more_mode_enabled,
+                    spell_check_enabled: app.settings.spell_check_enabled,
+                    temp_convert_enabled: app.settings.temp_convert_enabled,
+                    world_switch_mode: app.settings.world_switch_mode.name().to_string(),
+                    show_tags: app.show_tags,
+                    ansi_music_enabled: app.settings.ansi_music_enabled,
+                    console_theme: app.settings.theme.name().to_string(),
+                    gui_theme: app.settings.gui_theme.name().to_string(),
+                    gui_transparency: app.settings.gui_transparency,
+                    color_offset_percent: app.settings.color_offset_percent,
+                    input_height: app.input_height,
+                    font_name: app.settings.font_name.clone(),
+                    font_size: app.settings.font_size,
+                    web_font_size_phone: app.settings.web_font_size_phone,
+                    web_font_size_tablet: app.settings.web_font_size_tablet,
+                    web_font_size_desktop: app.settings.web_font_size_desktop,
+                    ws_allow_list: app.settings.websocket_allow_list.clone(),
+                    web_secure: app.settings.web_secure,
+                    http_enabled: app.settings.http_enabled,
+                    http_port: app.settings.http_port,
+                    ws_enabled: app.settings.ws_enabled,
+                    ws_port: app.settings.ws_port,
+                    ws_cert_file: app.settings.websocket_cert_file.clone(),
+                    ws_key_file: app.settings.websocket_key_file.clone(),
+                    tls_proxy_enabled: app.settings.tls_proxy_enabled,
+                });
             }
             NewPopupAction::ConnectionsClose => {
                 // Connections popup closed - no action needed
@@ -15356,17 +15433,60 @@ fn handle_remote_client_key(
             NewPopupAction::ActionsListFilter => {
                 // Filter changed - remote client doesn't handle locally
             }
-            NewPopupAction::ActionEditorSave { .. } => {
-                // Action editor save - remote client doesn't handle locally
+            NewPopupAction::ActionEditorSave { action, editing_index } => {
+                // Update local actions list
+                if let Some(idx) = editing_index {
+                    if idx < app.settings.actions.len() {
+                        app.settings.actions[idx] = action;
+                    }
+                } else {
+                    app.settings.actions.push(action);
+                }
+                // Send UpdateActions to daemon
+                let _ = ws_tx.send(WsMessage::UpdateActions {
+                    actions: app.settings.actions.clone()
+                });
             }
-            NewPopupAction::WorldEditorSaved(_) => {
-                // World editor save - remote client doesn't handle locally
+            NewPopupAction::WorldEditorSaved(settings) => {
+                // Update local world settings
+                let idx = settings.world_index;
+                if idx < app.worlds.len() {
+                    app.worlds[idx].name = settings.name.clone();
+                    app.worlds[idx].settings.hostname = settings.hostname.clone();
+                    app.worlds[idx].settings.port = settings.port.clone();
+                    app.worlds[idx].settings.user = settings.user.clone();
+                    app.worlds[idx].settings.password = settings.password.clone();
+                    app.worlds[idx].settings.use_ssl = settings.use_ssl;
+                    app.worlds[idx].settings.log_enabled = settings.log_enabled;
+                    app.worlds[idx].settings.encoding = Encoding::from_name(&settings.encoding);
+                    app.worlds[idx].settings.auto_connect_type = AutoConnectType::from_name(&settings.auto_connect);
+                    app.worlds[idx].settings.keep_alive_type = KeepAliveType::from_name(&settings.keep_alive);
+                    app.worlds[idx].settings.keep_alive_cmd = settings.keep_alive_cmd.clone();
+
+                    // Send UpdateWorldSettings to daemon
+                    let _ = ws_tx.send(WsMessage::UpdateWorldSettings {
+                        world_index: idx,
+                        name: settings.name,
+                        hostname: settings.hostname,
+                        port: settings.port,
+                        user: settings.user,
+                        password: settings.password,
+                        use_ssl: settings.use_ssl,
+                        log_enabled: settings.log_enabled,
+                        encoding: settings.encoding,
+                        auto_login: settings.auto_connect,
+                        keep_alive_type: settings.keep_alive,
+                        keep_alive_cmd: settings.keep_alive_cmd,
+                    });
+                }
             }
-            NewPopupAction::WorldEditorDelete(_) => {
-                // World editor delete - remote client doesn't handle locally
+            NewPopupAction::WorldEditorDelete(idx) => {
+                // Send delete request to daemon
+                let _ = ws_tx.send(WsMessage::DeleteWorld { world_index: idx });
             }
-            NewPopupAction::WorldEditorConnect(_) => {
-                // World editor connect - remote client doesn't handle locally
+            NewPopupAction::WorldEditorConnect(idx) => {
+                // Send connect request to daemon
+                let _ = ws_tx.send(WsMessage::ConnectWorld { world_index: idx });
             }
             NewPopupAction::None => {}
         }
