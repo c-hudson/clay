@@ -15,6 +15,9 @@ use crate::ansi_music::MusicNote;
 // WebSocket Protocol Types
 // ============================================================================
 
+/// Default function for serde to return true (for from_server field backwards compatibility)
+fn default_true() -> bool { true }
+
 /// WebSocket protocol messages for client-server communication
 #[derive(Serialize, Deserialize, Clone, Debug)]
 #[serde(tag = "type")]
@@ -67,7 +70,8 @@ pub enum WsMessage {
     // Real-time updates (server -> client)
     /// is_viewed: true if any interface (console/web/GUI) is viewing this world
     /// ts: timestamp in seconds since Unix epoch (when the line was received)
-    ServerData { world_index: usize, data: String, is_viewed: bool, #[serde(default)] ts: u64 },
+    /// from_server: true if data came from MUD server, false if client-generated
+    ServerData { world_index: usize, data: String, is_viewed: bool, #[serde(default)] ts: u64, #[serde(default = "default_true")] from_server: bool },
     WorldConnected { world_index: usize, name: String },
     WorldDisconnected { world_index: usize },
     WorldAdded { world: Box<WorldStateMsg> },

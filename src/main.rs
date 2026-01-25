@@ -3063,13 +3063,19 @@ impl App {
     /// Handle incoming WebSocket message when running as remote client
     fn handle_remote_ws_message(&mut self, msg: WsMessage) {
         match msg {
-            WsMessage::ServerData { world_index, data, .. } => {
+            WsMessage::ServerData { world_index, data, from_server, .. } => {
                 if let Some(world) = self.worlds.get_mut(world_index) {
                     // Check if user was at bottom before adding lines
                     let was_at_bottom = world.is_at_bottom();
 
                     for line in data.lines() {
-                        world.output_lines.push(OutputLine::new(line.to_string()));
+                        // Preserve from_server flag for Ctrl+L filtering
+                        let output_line = if from_server {
+                            OutputLine::new(line.to_string())
+                        } else {
+                            OutputLine::new_client(line.to_string())
+                        };
+                        world.output_lines.push(output_line);
                     }
 
                     // Keep scroll at bottom if user was viewing latest output
@@ -3808,6 +3814,7 @@ impl App {
                     data: ws_data,
                     is_viewed: is_current,
                     ts: current_timestamp_secs(),
+                    from_server: true,
                 });
             }
 
@@ -17176,6 +17183,7 @@ async fn handle_daemon_ws_message(
                         data: "Configure host/port in world settings.\n".to_string(),
                         is_viewed: false,
                         ts: current_timestamp_secs(),
+                        from_server: false,
                     });
                     return;
                 }
@@ -17186,6 +17194,7 @@ async fn handle_daemon_ws_message(
                     data: format!("Connecting to {}:{}{}...\n", settings.hostname, settings.port, ssl_msg),
                     is_viewed: false,
                     ts: current_timestamp_secs(),
+                    from_server: false,
                 });
 
                 // Attempt connection
@@ -17211,6 +17220,7 @@ async fn handle_daemon_ws_message(
                         data: "Connection failed.\n".to_string(),
                         is_viewed: false,
                         ts: current_timestamp_secs(),
+                        from_server: false,
                     });
                 }
             }
@@ -17335,6 +17345,7 @@ async fn handle_daemon_ws_message(
                             data: ws_data,
                             is_viewed: true,
                             ts: current_timestamp_secs(),
+                            from_server: false,
                         });
                     }
 
@@ -17541,6 +17552,7 @@ keep_alive_type=Generic
                                         data: "No connection settings configured for this world.\n".to_string(),
                                         is_viewed: true,
                                         ts: current_timestamp_secs(),
+                                        from_server: false,
                                     }, Some(&requesting_username));
                                 }
                             // Create per-user connection
@@ -17573,6 +17585,7 @@ keep_alive_type=Generic
                                         data: "✨ Connection failed.\n".to_string(),
                                         is_viewed: true,
                                         ts: current_timestamp_secs(),
+                                        from_server: false,
                                     }, Some(&requesting_username));
                                 }
                             }
@@ -17601,6 +17614,7 @@ keep_alive_type=Generic
                                     data: decoded,
                                     is_viewed: true,
                                     ts: current_timestamp_secs(),
+                                    from_server: false,
                                 }, Some(&username));
                             }
                         }
@@ -19646,6 +19660,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                 data: "Disconnected.\n".to_string(),
                                 is_viewed: world_idx == app.current_world_index,
                                 ts: disconnect_msg.timestamp.duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs(),
+                                from_server: false,
                             });
                             app.ws_broadcast(WsMessage::WorldDisconnected { world_index: world_idx });
                         }
@@ -19834,6 +19849,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                         data: ws_data,
                                         is_viewed: is_current,
                                         ts: current_timestamp_secs(),
+                                        from_server: false,
                                     });
                                 }
 
@@ -19929,6 +19945,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                                     data: format!("✨ Action '{}' is disabled.", name),
                                                     is_viewed: false,
                                                     ts: current_timestamp_secs(),
+                                                    from_server: false,
                                                 });
                                             } else {
                                             let commands = split_action_commands(&action.command);
@@ -19952,6 +19969,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                                                 data: msg,
                                                                 is_viewed: false,
                                                                 ts: current_timestamp_secs(),
+                                                                from_server: false,
                                                             });
                                                         }
                                                         tf::TfCommandResult::Success(None) => {}
@@ -19961,6 +19979,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                                                 data: format!("Error: {}", err),
                                                                 is_viewed: false,
                                                                 ts: current_timestamp_secs(),
+                                                                from_server: false,
                                                             });
                                                         }
                                                         tf::TfCommandResult::SendToMud(text) => {
@@ -19983,18 +20002,18 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
 
                                                                 if !opts.quiet {
                                                                     if let Some(h) = header {
-                                                                        app.ws_broadcast(WsMessage::ServerData { world_index, data: h, is_viewed: false, ts });
+                                                                        app.ws_broadcast(WsMessage::ServerData { world_index, data: h, is_viewed: false, ts , from_server: false });
                                                                     }
                                                                 }
                                                                 if matches.is_empty() {
-                                                                    app.ws_broadcast(WsMessage::ServerData { world_index, data: format!("✨ No matches for '{}'", pattern_str), is_viewed: false, ts });
+                                                                    app.ws_broadcast(WsMessage::ServerData { world_index, data: format!("✨ No matches for '{}'", pattern_str), is_viewed: false, ts, from_server: false });
                                                                 } else {
                                                                     for m in matches {
-                                                                        app.ws_broadcast(WsMessage::ServerData { world_index, data: m, is_viewed: false, ts });
+                                                                        app.ws_broadcast(WsMessage::ServerData { world_index, data: m, is_viewed: false, ts , from_server: false });
                                                                     }
                                                                 }
                                                                 if !opts.quiet {
-                                                                    app.ws_broadcast(WsMessage::ServerData { world_index, data: "================= Recall end =================".to_string(), is_viewed: false, ts });
+                                                                    app.ws_broadcast(WsMessage::ServerData { world_index, data: "================= Recall end =================".to_string(), is_viewed: false, ts , from_server: false });
                                                                 }
                                                             }
                                                         }
@@ -20018,6 +20037,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                                 data: format!("Unknown action: /{}", name),
                                                 is_viewed: false,
                                                 ts: current_timestamp_secs(),
+                                                from_server: false,
                                             });
                                         }
                                     }
@@ -20038,6 +20058,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                             data: format!("Unknown command: {}", cmd),
                                             is_viewed: false,
                                             ts: current_timestamp_secs(),
+                                            from_server: false,
                                         });
                                     }
                                     Command::Send { text, all_worlds, target_world, no_newline } => {
@@ -20075,6 +20096,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                                         data: format!("World '{}' is not connected.", target),
                                                         is_viewed: false,
                                                         ts: current_timestamp_secs(),
+                                                        from_server: false,
                                                     });
                                                 }
                                             } else {
@@ -20083,6 +20105,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                                     data: format!("Unknown world: {}", target),
                                                     is_viewed: false,
                                                     ts: current_timestamp_secs(),
+                                                    from_server: false,
                                                 });
                                             }
                                         } else {
@@ -20117,6 +20140,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                                 data: "Disconnected.".to_string(),
                                                 is_viewed: false,
                                                 ts: current_timestamp_secs(),
+                                                from_server: false,
                                             });
                                             app.ws_broadcast(WsMessage::WorldDisconnected { world_index });
                                         } else {
@@ -20125,6 +20149,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                                 data: "Not connected.".to_string(),
                                                 is_viewed: false,
                                                 ts: current_timestamp_secs(),
+                                                from_server: false,
                                             });
                                         }
                                     }
@@ -20143,6 +20168,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                                 data: format!("Flushed {} lines from output buffer.", line_count),
                                                 is_viewed: false,
                                                 ts: current_timestamp_secs(),
+                                                from_server: false,
                                             });
                                         }
                                     }
@@ -20164,6 +20190,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                                 data: info,
                                                 is_viewed: false,
                                                 ts: current_timestamp_secs(),
+                                                from_server: false,
                                             });
                                         }
                                     }
@@ -20174,6 +20201,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                             data: format!("Gag pattern set: {}", pattern),
                                             is_viewed: false,
                                             ts: current_timestamp_secs(),
+                                            from_server: false,
                                         });
                                     }
                                     Command::BanList => {
@@ -20185,6 +20213,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                                 data: "No hosts are currently banned.".to_string(),
                                                 is_viewed: false,
                                                 ts: current_timestamp_secs(),
+                                                from_server: false,
                                             });
                                         } else {
                                             let mut output = String::new();
@@ -20204,6 +20233,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                                 data: output,
                                                 is_viewed: false,
                                                 ts: current_timestamp_secs(),
+                                                from_server: false,
                                             });
                                         }
                                         app.ws_send_to_client(client_id, WsMessage::BanListResponse { bans });
@@ -20217,6 +20247,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                                 data: format!("Removed ban for: {}", host),
                                                 is_viewed: false,
                                                 ts: current_timestamp_secs(),
+                                                from_server: false,
                                             });
                                             // Broadcast updated ban list
                                             app.ws_broadcast(WsMessage::BanListResponse { bans: app.ban_list.get_ban_info() });
@@ -20227,6 +20258,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                                 data: format!("No ban found for: {}", host),
                                                 is_viewed: false,
                                                 ts: current_timestamp_secs(),
+                                                from_server: false,
                                             });
                                             app.ws_send_to_client(client_id, WsMessage::UnbanResult { success: false, host, error: Some("No ban found".to_string()) });
                                         }
@@ -20249,27 +20281,28 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                             data: "Playing test music (C-D-E-F-G)...".to_string(),
                                             is_viewed: false,
                                             ts: current_timestamp_secs(),
+                                            from_server: false,
                                         });
                                     }
                                     Command::Debug => {
                                         let ts = current_timestamp_secs();
-                                        app.ws_broadcast(WsMessage::ServerData { world_index, data: "=== Debug: World State ===".to_string(), is_viewed: false, ts });
-                                        app.ws_broadcast(WsMessage::ServerData { world_index, data: format!("current_world_index: {}", app.current_world_index), is_viewed: false, ts });
-                                        app.ws_broadcast(WsMessage::ServerData { world_index, data: format!("activity_count(): {}", app.activity_count()), is_viewed: false, ts });
+                                        app.ws_broadcast(WsMessage::ServerData { world_index, data: "=== Debug: World State ===".to_string(), is_viewed: false, ts , from_server: false });
+                                        app.ws_broadcast(WsMessage::ServerData { world_index, data: format!("current_world_index: {}", app.current_world_index), is_viewed: false, ts, from_server: false });
+                                        app.ws_broadcast(WsMessage::ServerData { world_index, data: format!("activity_count(): {}", app.activity_count()), is_viewed: false, ts, from_server: false });
                                         for (i, w) in app.worlds.iter().enumerate() {
                                             let current = if i == app.current_world_index { " *CURRENT*" } else { "" };
-                                            app.ws_broadcast(WsMessage::ServerData { world_index, data: format!("[{}] {}{}", i, w.name, current), is_viewed: false, ts });
-                                            app.ws_broadcast(WsMessage::ServerData { world_index, data: format!("  unseen_lines: {}, pending: {}, has_activity: {}", w.unseen_lines, w.pending_lines.len(), w.has_activity()), is_viewed: false, ts });
+                                            app.ws_broadcast(WsMessage::ServerData { world_index, data: format!("[{}] {}{}", i, w.name, current), is_viewed: false, ts, from_server: false });
+                                            app.ws_broadcast(WsMessage::ServerData { world_index, data: format!("  unseen_lines: {}, pending: {}, has_activity: {}", w.unseen_lines, w.pending_lines.len(), w.has_activity()), is_viewed: false, ts, from_server: false });
                                         }
                                         // Debug action patterns
-                                        app.ws_broadcast(WsMessage::ServerData { world_index, data: "=== Actions ===".to_string(), is_viewed: false, ts });
+                                        app.ws_broadcast(WsMessage::ServerData { world_index, data: "=== Actions ===".to_string(), is_viewed: false, ts , from_server: false });
                                         for (i, action) in app.settings.actions.iter().enumerate() {
-                                            app.ws_broadcast(WsMessage::ServerData { world_index, data: format!("[{}] {} ({})", i, action.name, action.match_type.as_str()), is_viewed: false, ts });
+                                            app.ws_broadcast(WsMessage::ServerData { world_index, data: format!("[{}] {} ({})", i, action.name, action.match_type.as_str()), is_viewed: false, ts, from_server: false });
                                             let pattern_bytes: Vec<String> = action.pattern.bytes().map(|b| format!("{:02x}", b)).collect();
-                                            app.ws_broadcast(WsMessage::ServerData { world_index, data: format!("  pattern: {:?}", action.pattern), is_viewed: false, ts });
-                                            app.ws_broadcast(WsMessage::ServerData { world_index, data: format!("  bytes: {}", pattern_bytes.join(" ")), is_viewed: false, ts });
+                                            app.ws_broadcast(WsMessage::ServerData { world_index, data: format!("  pattern: {:?}", action.pattern), is_viewed: false, ts, from_server: false });
+                                            app.ws_broadcast(WsMessage::ServerData { world_index, data: format!("  bytes: {}", pattern_bytes.join(" ")), is_viewed: false, ts, from_server: false });
                                         }
-                                        app.ws_broadcast(WsMessage::ServerData { world_index, data: "=== End Debug ===".to_string(), is_viewed: false, ts });
+                                        app.ws_broadcast(WsMessage::ServerData { world_index, data: "=== End Debug ===".to_string(), is_viewed: false, ts , from_server: false });
                                     }
                                     Command::Dump => {
                                         // Dump all scrollback buffers to ~/.clay.dmp.log
@@ -20319,6 +20352,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                                     data: format!("Dumped {} lines from {} worlds to {}", total_lines, app.worlds.len(), dump_path),
                                                     is_viewed: false,
                                                     ts,
+                                                    from_server: false,
                                                 });
                                             }
                                             Err(e) => {
@@ -20327,6 +20361,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                                     data: format!("Failed to create dump file: {}", e),
                                                     is_viewed: false,
                                                     ts,
+                                                    from_server: false,
                                                 });
                                             }
                                         }
@@ -20338,6 +20373,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                             data: "This command is not available from remote interfaces.".to_string(),
                                             is_viewed: false,
                                             ts: current_timestamp_secs(),
+                                            from_server: false,
                                         });
                                     }
                                     // UI popup commands - handled client-side, no-op on server
@@ -20363,6 +20399,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                                     data: "No connection settings configured for this world.".to_string(),
                                                     is_viewed: false,
                                                     ts: current_timestamp_secs(),
+                                                    from_server: false,
                                                 });
                                             }
                                         }
@@ -20392,6 +20429,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                                 data: format!("World '{}' not found.", name),
                                                 is_viewed: false,
                                                 ts: current_timestamp_secs(),
+                                                from_server: false,
                                             });
                                         }
                                     }
@@ -20414,6 +20452,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                             data: "No connection settings configured for this world.".to_string(),
                                             is_viewed: false,
                                             ts: current_timestamp_secs(),
+                                            from_server: false,
                                         });
                                     } else {
                                         // Save current world index, switch to target, connect, then restore
@@ -20539,6 +20578,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                                 data: ws_data,
                                                 is_viewed: is_current,
                                                 ts: current_timestamp_secs(),
+                                                from_server: false,
                                             });
                                         }
 
@@ -21248,6 +21288,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                     data: ws_data,
                                     is_viewed: is_current,
                                     ts: current_timestamp_secs(),
+                                    from_server: false,
                                 });
                             }
 
@@ -21349,6 +21390,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                             data: "Disconnected.\n".to_string(),
                             is_viewed: world_idx == app.current_world_index,
                             ts: disconnect_msg.timestamp.duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs(),
+                            from_server: false,
                         });
                         app.ws_broadcast(WsMessage::WorldDisconnected { world_index: world_idx });
                     }
@@ -21504,6 +21546,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                 data,
                                 is_viewed: is_current,
                                 ts: current_timestamp_secs(),
+                                from_server: false,
                             });
                         }
 
@@ -21576,6 +21619,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                                 data: format!("✨ Action '{}' is disabled.", name),
                                                 is_viewed: false,
                                                 ts: current_timestamp_secs(),
+                                                from_server: false,
                                             });
                                         } else {
                                         let commands = split_action_commands(&action.command);
@@ -21599,6 +21643,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                                             data: msg,
                                                             is_viewed: false,
                                                             ts: current_timestamp_secs(),
+                                                            from_server: false,
                                                         });
                                                     }
                                                     tf::TfCommandResult::Success(None) => {}
@@ -21608,6 +21653,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                                             data: format!("Error: {}", err),
                                                             is_viewed: false,
                                                             ts: current_timestamp_secs(),
+                                                            from_server: false,
                                                         });
                                                     }
                                                     tf::TfCommandResult::SendToMud(text) => {
@@ -21630,18 +21676,18 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
 
                                                             if !opts.quiet {
                                                                 if let Some(h) = header {
-                                                                    app.ws_broadcast(WsMessage::ServerData { world_index, data: h, is_viewed: false, ts });
+                                                                    app.ws_broadcast(WsMessage::ServerData { world_index, data: h, is_viewed: false, ts , from_server: false });
                                                                 }
                                                             }
                                                             if matches.is_empty() {
-                                                                app.ws_broadcast(WsMessage::ServerData { world_index, data: format!("✨ No matches for '{}'", pattern_str), is_viewed: false, ts });
+                                                                app.ws_broadcast(WsMessage::ServerData { world_index, data: format!("✨ No matches for '{}'", pattern_str), is_viewed: false, ts, from_server: false });
                                                             } else {
                                                                 for m in matches {
-                                                                    app.ws_broadcast(WsMessage::ServerData { world_index, data: m, is_viewed: false, ts });
+                                                                    app.ws_broadcast(WsMessage::ServerData { world_index, data: m, is_viewed: false, ts , from_server: false });
                                                                 }
                                                             }
                                                             if !opts.quiet {
-                                                                app.ws_broadcast(WsMessage::ServerData { world_index, data: "================= Recall end =================".to_string(), is_viewed: false, ts });
+                                                                app.ws_broadcast(WsMessage::ServerData { world_index, data: "================= Recall end =================".to_string(), is_viewed: false, ts , from_server: false });
                                                             }
                                                         }
                                                     }
@@ -21665,6 +21711,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                             data: format!("Unknown action: /{}", name),
                                             is_viewed: false,
                                             ts: current_timestamp_secs(),
+                                            from_server: false,
                                         });
                                     }
                                 }
@@ -21685,6 +21732,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                         data: format!("Unknown command: {}", cmd),
                                         is_viewed: false,
                                         ts: current_timestamp_secs(),
+                                        from_server: false,
                                     });
                                 }
                                 Command::Send { text, all_worlds, target_world, no_newline } => {
@@ -21722,6 +21770,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                                     data: format!("World '{}' is not connected.", target),
                                                     is_viewed: false,
                                                     ts: current_timestamp_secs(),
+                                                    from_server: false,
                                                 });
                                             }
                                         } else {
@@ -21730,6 +21779,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                                 data: format!("Unknown world: {}", target),
                                                 is_viewed: false,
                                                 ts: current_timestamp_secs(),
+                                                from_server: false,
                                             });
                                         }
                                     } else {
@@ -21764,6 +21814,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                             data: "Disconnected.".to_string(),
                                             is_viewed: false,
                                             ts: current_timestamp_secs(),
+                                            from_server: false,
                                         });
                                         app.ws_broadcast(WsMessage::WorldDisconnected { world_index });
                                     } else {
@@ -21772,6 +21823,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                             data: "Not connected.".to_string(),
                                             is_viewed: false,
                                             ts: current_timestamp_secs(),
+                                            from_server: false,
                                         });
                                     }
                                 }
@@ -21790,6 +21842,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                             data: format!("Flushed {} lines from output buffer.", line_count),
                                             is_viewed: false,
                                             ts: current_timestamp_secs(),
+                                            from_server: false,
                                         });
                                     }
                                 }
@@ -21811,6 +21864,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                             data: info,
                                             is_viewed: false,
                                             ts: current_timestamp_secs(),
+                                            from_server: false,
                                         });
                                     }
                                 }
@@ -21821,6 +21875,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                         data: format!("Gag pattern set: {}", pattern),
                                         is_viewed: false,
                                         ts: current_timestamp_secs(),
+                                        from_server: false,
                                     });
                                 }
                                 Command::BanList => {
@@ -21832,6 +21887,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                             data: "No hosts are currently banned.".to_string(),
                                             is_viewed: false,
                                             ts: current_timestamp_secs(),
+                                            from_server: false,
                                         });
                                     } else {
                                         let mut output = String::new();
@@ -21851,6 +21907,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                             data: output,
                                             is_viewed: false,
                                             ts: current_timestamp_secs(),
+                                            from_server: false,
                                         });
                                     }
                                     app.ws_send_to_client(client_id, WsMessage::BanListResponse { bans });
@@ -21864,6 +21921,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                             data: format!("Removed ban for: {}", host),
                                             is_viewed: false,
                                             ts: current_timestamp_secs(),
+                                            from_server: false,
                                         });
                                         // Broadcast updated ban list
                                         app.ws_broadcast(WsMessage::BanListResponse { bans: app.ban_list.get_ban_info() });
@@ -21874,6 +21932,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                             data: format!("No ban found for: {}", host),
                                             is_viewed: false,
                                             ts: current_timestamp_secs(),
+                                            from_server: false,
                                         });
                                         app.ws_send_to_client(client_id, WsMessage::UnbanResult { success: false, host, error: Some("No ban found".to_string()) });
                                     }
@@ -21896,19 +21955,20 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                         data: "Playing test music (C-D-E-F-G)...".to_string(),
                                         is_viewed: false,
                                         ts: current_timestamp_secs(),
+                                        from_server: false,
                                     });
                                 }
                                 Command::Debug => {
                                     let ts = current_timestamp_secs();
-                                    app.ws_broadcast(WsMessage::ServerData { world_index, data: "=== Debug: World State ===".to_string(), is_viewed: false, ts });
-                                    app.ws_broadcast(WsMessage::ServerData { world_index, data: format!("current_world_index: {}", app.current_world_index), is_viewed: false, ts });
-                                    app.ws_broadcast(WsMessage::ServerData { world_index, data: format!("activity_count(): {}", app.activity_count()), is_viewed: false, ts });
+                                    app.ws_broadcast(WsMessage::ServerData { world_index, data: "=== Debug: World State ===".to_string(), is_viewed: false, ts , from_server: false });
+                                    app.ws_broadcast(WsMessage::ServerData { world_index, data: format!("current_world_index: {}", app.current_world_index), is_viewed: false, ts, from_server: false });
+                                    app.ws_broadcast(WsMessage::ServerData { world_index, data: format!("activity_count(): {}", app.activity_count()), is_viewed: false, ts, from_server: false });
                                     for (i, w) in app.worlds.iter().enumerate() {
                                         let current = if i == app.current_world_index { " *CURRENT*" } else { "" };
-                                        app.ws_broadcast(WsMessage::ServerData { world_index, data: format!("[{}] {}{}", i, w.name, current), is_viewed: false, ts });
-                                        app.ws_broadcast(WsMessage::ServerData { world_index, data: format!("  unseen_lines: {}, pending: {}, has_activity: {}", w.unseen_lines, w.pending_lines.len(), w.has_activity()), is_viewed: false, ts });
+                                        app.ws_broadcast(WsMessage::ServerData { world_index, data: format!("[{}] {}{}", i, w.name, current), is_viewed: false, ts, from_server: false });
+                                        app.ws_broadcast(WsMessage::ServerData { world_index, data: format!("  unseen_lines: {}, pending: {}, has_activity: {}", w.unseen_lines, w.pending_lines.len(), w.has_activity()), is_viewed: false, ts, from_server: false });
                                     }
-                                    app.ws_broadcast(WsMessage::ServerData { world_index, data: "=== End Debug ===".to_string(), is_viewed: false, ts });
+                                    app.ws_broadcast(WsMessage::ServerData { world_index, data: "=== End Debug ===".to_string(), is_viewed: false, ts , from_server: false });
                                 }
                                 Command::Dump => {
                                     // Dump all scrollback buffers to ~/.clay.dmp.log
@@ -21958,6 +22018,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                                 data: format!("Dumped {} lines from {} worlds to {}", total_lines, app.worlds.len(), dump_path),
                                                 is_viewed: false,
                                                 ts,
+                                                from_server: false,
                                             });
                                         }
                                         Err(e) => {
@@ -21966,6 +22027,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                                 data: format!("Failed to create dump file: {}", e),
                                                 is_viewed: false,
                                                 ts,
+                                                from_server: false,
                                             });
                                         }
                                     }
@@ -21977,6 +22039,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                         data: "This command is not available from remote interfaces.".to_string(),
                                         is_viewed: false,
                                         ts: current_timestamp_secs(),
+                                        from_server: false,
                                     });
                                 }
                                 // UI popup commands - handled client-side, no-op on server
@@ -21992,6 +22055,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                         data: "Use ConnectWorld message for connection.".to_string(),
                                         is_viewed: false,
                                         ts: current_timestamp_secs(),
+                                        from_server: false,
                                     });
                                 }
                                 // WorldSwitch - do the switch part, skip async connect
@@ -22007,6 +22071,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                             data: format!("World '{}' not found.", name),
                                             is_viewed: false,
                                             ts: current_timestamp_secs(),
+                                            from_server: false,
                                         });
                                     }
                                 }
@@ -22759,6 +22824,7 @@ fn handle_key_event(key: KeyEvent, app: &mut App) -> KeyAction {
                     data: ws_data,
                     is_viewed: true,
                     ts: current_timestamp_secs(),
+                    from_server: false,
                 });
             }
 
@@ -22892,6 +22958,7 @@ fn handle_key_event(key: KeyEvent, app: &mut App) -> KeyAction {
                     data: ws_data,
                     is_viewed: true,
                     ts: current_timestamp_secs(),
+                    from_server: false,
                 });
             }
 
