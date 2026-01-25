@@ -898,6 +898,11 @@
                 hideCertWarning();
                 showConnecting(false);
 
+                // Debug: WebSocket connected
+                if (window.Android && window.Android.showToast) {
+                    window.Android.showToast('WebSocket connected');
+                }
+
                 // Check for saved password (Android auto-login)
                 let savedPassword = null;
                 try {
@@ -915,9 +920,15 @@
 
                 if (savedPassword) {
                     // Auto-authenticate with saved password
+                    if (window.Android && window.Android.showToast) {
+                        window.Android.showToast('Auto-auth with saved password');
+                    }
                     authenticate(savedPassword);
                 } else {
                     // Show auth modal for manual login
+                    if (window.Android && window.Android.showToast) {
+                        window.Android.showToast('Showing auth modal');
+                    }
                     showAuthModal(true);
                     elements.authPassword.focus();
                 }
@@ -949,7 +960,11 @@
                 }
             };
 
-            ws.onerror = function() {
+            ws.onerror = function(e) {
+                // Debug: WebSocket error
+                if (window.Android && window.Android.showToast) {
+                    window.Android.showToast('WebSocket error');
+                }
                 showConnecting(false);
             };
 
@@ -980,6 +995,10 @@
 
             case 'AuthResponse':
                 if (msg.success) {
+                    // Debug: Auth success
+                    if (window.Android && window.Android.showToast) {
+                        window.Android.showToast('Auth success!');
+                    }
                     authenticated = true;
                     multiuserMode = msg.multiuser_mode || false;
                     showAuthModal(false);
@@ -997,6 +1016,10 @@
                         window.Android.startBackgroundService();
                     }
                 } else {
+                    // Debug: Auth failed
+                    if (window.Android && window.Android.showToast) {
+                        window.Android.showToast('Auth failed: ' + (msg.error || 'Unknown'));
+                    }
                     elements.authError.textContent = msg.error || 'Authentication failed';
                     elements.authPassword.value = '';
                     pendingAuthPassword = null;

@@ -131,6 +131,13 @@ public class MainActivity extends AppCompatActivity {
             SharedPreferences prefs = getSharedPreferences(PREFS_NAME, MODE_PRIVATE);
             prefs.edit().remove(KEY_SAVED_PASSWORD).apply();
         }
+
+        @JavascriptInterface
+        public void showToast(String message) {
+            runOnUiThread(() -> {
+                Toast.makeText(MainActivity.this, message, Toast.LENGTH_SHORT).show();
+            });
+        }
     }
 
     @Override
