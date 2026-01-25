@@ -210,6 +210,8 @@ pub struct TimestampedLine {
     pub ts: u64, // seconds since Unix epoch
     #[serde(default)]
     pub gagged: bool, // true if line was gagged by an action (only shown with F2/show_tags)
+    #[serde(default = "default_true")]
+    pub from_server: bool, // true if from MUD server, false if client-generated
 }
 
 /// World state for WebSocket protocol

@@ -3200,6 +3200,43 @@ impl App {
                 }
                 self.needs_output_redraw = true;
             }
+            WsMessage::ExecuteLocalCommand { command } => {
+                // Server wants us to execute a command locally (from action)
+                let parsed = parse_command(&command);
+                match parsed {
+                    Command::WorldSelector => {
+                        self.open_world_selector_new();
+                    }
+                    Command::WorldsList => {
+                        // Request connections list from server
+                        if let Some(ref tx) = self.ws_client_tx {
+                            let _ = tx.send(WsMessage::RequestConnectionsList);
+                        }
+                    }
+                    Command::Help => {
+                        self.open_help_popup_new();
+                    }
+                    Command::Setup => {
+                        self.open_setup_popup_new();
+                    }
+                    Command::Web => {
+                        self.open_web_popup_new();
+                    }
+                    Command::Actions { world } => {
+                        if let Some(world_name) = world {
+                            self.open_actions_list_popup_with_filter(&world_name);
+                        } else {
+                            self.open_actions_list_popup();
+                        }
+                    }
+                    Command::Menu => {
+                        self.open_menu_popup_new();
+                    }
+                    _ => {
+                        // Unknown local command - ignore or log
+                    }
+                }
+            }
             _ => {}
         }
     }
@@ -3240,7 +3277,7 @@ impl App {
                 OutputLine {
                     text: tl.text,
                     timestamp: std::time::UNIX_EPOCH + std::time::Duration::from_secs(tl.ts),
-                    from_server: true,
+                    from_server: tl.from_server,
                     gagged: tl.gagged,
                 }
             }).collect();
@@ -3255,7 +3292,7 @@ impl App {
                 OutputLine {
                     text: tl.text,
                     timestamp: std::time::UNIX_EPOCH + std::time::Duration::from_secs(tl.ts),
-                    from_server: true,
+                    from_server: tl.from_server,
                     gagged: tl.gagged,
                 }
             }).collect();
@@ -3878,6 +3915,7 @@ impl App {
                         text,
                         ts: s.timestamp.duration_since(UNIX_EPOCH).unwrap_or_default().as_secs(),
                         gagged: s.gagged,
+                        from_server: s.from_server,
                     }
                 })
                 .collect();
@@ -7610,7 +7648,7 @@ mod remote_gui {
                                     } else {
                                         // Fallback for old protocol: use current time
                                         let now = current_timestamp_secs();
-                                        w.output_lines.into_iter().map(|text| TimestampedLine { text, ts: now, gagged: false }).collect()
+                                        w.output_lines.into_iter().map(|text| TimestampedLine { text, ts: now, gagged: false, from_server: true }).collect()
                                     }
                                 },
                                 prompt: w.prompt,
@@ -7676,7 +7714,7 @@ mod remote_gui {
                                 self.last_sent_view_state = Some((self.current_world, self.output_visible_lines));
                             }
                         }
-                        WsMessage::ServerData { world_index, data, is_viewed: _, ts, .. } => {
+                        WsMessage::ServerData { world_index, data, is_viewed: _, ts, from_server } => {
                             if world_index < self.worlds.len() {
                                 let world = &mut self.worlds[world_index];
 
@@ -7725,7 +7763,7 @@ mod remote_gui {
                                             line.to_string()
                                         };
                                         // All lines go to output_lines - server controls more-mode via pending_count
-                                        world.output_lines.push(TimestampedLine { text, ts, gagged: false });
+                                        world.output_lines.push(TimestampedLine { text, ts, gagged: false, from_server });
                                     }
                                 }
 
@@ -7912,6 +7950,7 @@ mod remote_gui {
                                                 text: line.to_string(),
                                                 ts,
                                                 gagged: false,
+                                                from_server: false,
                                             });
                                         }
                                     }
@@ -7945,7 +7984,7 @@ mod remote_gui {
                                     let ts = super::current_timestamp_secs();
                                     if self.current_world < self.worlds.len() {
                                         self.worlds[self.current_world].output_lines.push(
-                                            TimestampedLine { text: super::get_version_string(), ts, gagged: false }
+                                            TimestampedLine { text: super::get_version_string(), ts, gagged: false, from_server: false }
                                         );
                                     }
                                 }
@@ -10193,6 +10232,7 @@ mod remote_gui {
                                     text: message,
                                     ts: current_timestamp_secs(),
                                     gagged: false,
+                                    from_server: false,
                                 });
                             }
                         }
@@ -10466,6 +10506,7 @@ mod remote_gui {
                                                     text: line.to_string(),
                                                     ts,
                                                     gagged: false,
+                                                    from_server: false,
                                                 });
                                             }
                                         }
@@ -10477,7 +10518,7 @@ mod remote_gui {
                                         let ts = current_timestamp_secs();
                                         if self.current_world < self.worlds.len() {
                                             self.worlds[self.current_world].output_lines.push(
-                                                TimestampedLine { text: super::get_version_string(), ts, gagged: false }
+                                                TimestampedLine { text: super::get_version_string(), ts, gagged: false, from_server: false }
                                             );
                                         }
                                     }
@@ -10512,7 +10553,7 @@ mod remote_gui {
                                             let ts = current_timestamp_secs();
                                             if self.current_world < self.worlds.len() {
                                                 self.worlds[self.current_world].output_lines.push(
-                                                    TimestampedLine { text: format!("✨ World '{}' not found.", name), ts, gagged: false }
+                                                    TimestampedLine { text: format!("✨ World '{}' not found.", name), ts, gagged: false, from_server: false }
                                                 );
                                             }
                                         }
@@ -10530,7 +10571,7 @@ mod remote_gui {
                                             let ts = current_timestamp_secs();
                                             if self.current_world < self.worlds.len() {
                                                 self.worlds[self.current_world].output_lines.push(
-                                                    TimestampedLine { text: format!("✨ World '{}' not found.", name), ts, gagged: false }
+                                                    TimestampedLine { text: format!("✨ World '{}' not found.", name), ts, gagged: false, from_server: false }
                                                 );
                                             }
                                         }
@@ -13768,7 +13809,7 @@ mod remote_gui {
                                 let ts = current_timestamp_secs();
                                 if self.current_world < self.worlds.len() {
                                     self.worlds[self.current_world].output_lines.push(
-                                        TimestampedLine { text: super::get_version_string(), ts, gagged: false }
+                                        TimestampedLine { text: super::get_version_string(), ts, gagged: false, from_server: false }
                                     );
                                 }
                             }
@@ -18291,6 +18332,7 @@ fn build_multiuser_initial_state(app: &App, username: &str) -> WsMessage {
                         text,
                         ts: s.timestamp.duration_since(UNIX_EPOCH).unwrap_or_default().as_secs(),
                         gagged: s.gagged,
+                        from_server: s.from_server,
                     }
                 })
                 .collect();
@@ -18306,6 +18348,7 @@ fn build_multiuser_initial_state(app: &App, username: &str) -> WsMessage {
                         text,
                         ts: s.timestamp.duration_since(UNIX_EPOCH).unwrap_or_default().as_secs(),
                         gagged: s.gagged,
+                        from_server: s.from_server,
                     }
                 })
                 .collect();
@@ -20938,6 +20981,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                             text: line.text.clone(),
                                             ts: line.timestamp.duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs(),
                                             gagged: line.gagged,
+                                            from_server: line.from_server,
                                         })
                                         .collect::<Vec<_>>()
                                         .into_iter()
@@ -22392,6 +22436,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                         text: line.text.clone(),
                                         ts: line.timestamp.duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs(),
                                         gagged: line.gagged,
+                                        from_server: line.from_server,
                                     })
                                     .collect::<Vec<_>>()
                                     .into_iter()
