@@ -181,6 +181,7 @@
     let ws = null;
     let authenticated = false;
     let multiuserMode = false;  // True when server is in multiuser mode
+    let pendingAuthPassword = null;  // Password being authenticated (saved on success for Android auto-login)
     let hasReceivedInitialState = false;  // True after first InitialState (to preserve world on resync)
     let worlds = [];
     let currentWorldIndex = 0;
@@ -896,8 +897,20 @@
                 connectionFailures = 0;
                 hideCertWarning();
                 showConnecting(false);
-                showAuthModal(true);
-                elements.authPassword.focus();
+
+                // Check for saved password (Android auto-login)
+                const savedPassword = window.Android && window.Android.getSavedPassword
+                    ? window.Android.getSavedPassword()
+                    : null;
+
+                if (savedPassword) {
+                    // Auto-authenticate with saved password
+                    authenticate(savedPassword);
+                } else {
+                    // Show auth modal for manual login
+                    showAuthModal(true);
+                    elements.authPassword.focus();
+                }
             };
 
             ws.onclose = function() {
@@ -964,6 +977,11 @@
                     elements.input.focus();
                     // Update UI based on multiuser mode
                     updateMultiuserUI();
+                    // Save password for Android auto-login on Activity recreation
+                    if (window.Android && window.Android.savePassword && pendingAuthPassword) {
+                        window.Android.savePassword(pendingAuthPassword);
+                    }
+                    pendingAuthPassword = null;
                     // Start Android foreground service to keep connection alive
                     if (window.Android && window.Android.startBackgroundService) {
                         window.Android.startBackgroundService();
@@ -971,10 +989,17 @@
                 } else {
                     elements.authError.textContent = msg.error || 'Authentication failed';
                     elements.authPassword.value = '';
+                    pendingAuthPassword = null;
+                    // Clear saved password on auth failure (it may be outdated)
+                    if (window.Android && window.Android.clearSavedPassword) {
+                        window.Android.clearSavedPassword();
+                    }
                     // Detect multiuser mode from error messages
                     if (msg.error === 'Username required' || msg.error === 'Unknown user' || msg.multiuser_mode) {
                         enableMultiuserAuthUI();
                     }
+                    // Show auth modal (may have been hidden during auto-login attempt)
+                    showAuthModal(true);
                     if (multiuserMode && elements.authUsername) {
                         elements.authUsername.focus();
                     } else {
@@ -1542,10 +1567,13 @@
     }
 
     // Authenticate - sends directly via ws.send since authenticated is still false
-    function authenticate() {
-        const password = elements.authPassword.value;
+    function authenticate(passwordOverride) {
+        const password = passwordOverride || elements.authPassword.value;
         if (!password) return;
         if (!ws || ws.readyState !== WebSocket.OPEN) return;
+
+        // Store password for saving on success (Android auto-login)
+        pendingAuthPassword = password;
 
         // Get username if in multiuser mode (visible input)
         const username = elements.authUsername && elements.authUsernameRow.style.display !== 'none'

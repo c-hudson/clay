@@ -32,6 +32,8 @@ public class MainActivity extends AppCompatActivity {
     private static final String KEY_SERVER_HOST = "serverHost";
     private static final String KEY_SERVER_PORT = "serverPort";
     private static final String KEY_USE_SECURE = "useSecure";
+    private static final String KEY_LAST_LOADED_URL = "lastLoadedUrl";
+    private static final String KEY_SAVED_PASSWORD = "savedPassword";
 
     private static final String CHANNEL_ID_ALERTS = "clay_alerts";
     private static final String CHANNEL_ID_SERVICE = "clay_service";
@@ -39,8 +41,6 @@ public class MainActivity extends AppCompatActivity {
 
     private WebView webView;
     private boolean connectionFailed = false;
-    private boolean hasLoadedOnce = false;
-    private String lastLoadedUrl = null;
     private int notificationId = 1000;
 
     // JavaScript interface for communication between web and Android
@@ -106,6 +106,24 @@ public class MainActivity extends AppCompatActivity {
                 Intent serviceIntent = new Intent(MainActivity.this, ClayForegroundService.class);
                 stopService(serviceIntent);
             });
+        }
+
+        @JavascriptInterface
+        public void savePassword(String password) {
+            SharedPreferences prefs = getSharedPreferences(PREFS_NAME, MODE_PRIVATE);
+            prefs.edit().putString(KEY_SAVED_PASSWORD, password).apply();
+        }
+
+        @JavascriptInterface
+        public String getSavedPassword() {
+            SharedPreferences prefs = getSharedPreferences(PREFS_NAME, MODE_PRIVATE);
+            return prefs.getString(KEY_SAVED_PASSWORD, "");
+        }
+
+        @JavascriptInterface
+        public void clearSavedPassword() {
+            SharedPreferences prefs = getSharedPreferences(PREFS_NAME, MODE_PRIVATE);
+            prefs.edit().remove(KEY_SAVED_PASSWORD).apply();
         }
     }
 
@@ -243,8 +261,10 @@ public class MainActivity extends AppCompatActivity {
         String url = protocol + "://" + host + ":" + port;
 
         connectionFailed = false;
-        lastLoadedUrl = url;
-        hasLoadedOnce = true;
+
+        // Persist URL to survive Activity recreation
+        prefs.edit().putString(KEY_LAST_LOADED_URL, url).apply();
+
         webView.loadUrl(url);
     }
 
@@ -259,21 +279,28 @@ public class MainActivity extends AppCompatActivity {
     @Override
     protected void onResume() {
         super.onResume();
-        // Only reload if settings changed or we haven't loaded yet
+        // Only reload if settings changed or WebView was destroyed
         SharedPreferences prefs = getSharedPreferences(PREFS_NAME, MODE_PRIVATE);
         String host = prefs.getString(KEY_SERVER_HOST, null);
         int port = prefs.getInt(KEY_SERVER_PORT, 0);
         boolean useSecure = prefs.getBoolean(KEY_USE_SECURE, false);
+        String savedUrl = prefs.getString(KEY_LAST_LOADED_URL, null);
 
         if (host != null && !host.isEmpty() && port > 0) {
             String protocol = useSecure ? "https" : "http";
-            String currentUrl = protocol + "://" + host + ":" + port;
+            String expectedUrl = protocol + "://" + host + ":" + port;
 
-            // Only reload if URL changed or haven't loaded yet
-            if (!hasLoadedOnce || !currentUrl.equals(lastLoadedUrl)) {
+            // Check if WebView already has content loaded
+            String webViewUrl = webView.getUrl();
+            boolean webViewHasContent = webViewUrl != null && webViewUrl.startsWith(expectedUrl);
+
+            // Only reload if:
+            // 1. WebView was destroyed (no URL or wrong URL)
+            // 2. Settings changed (expected URL differs from saved URL)
+            if (!webViewHasContent || (savedUrl != null && !expectedUrl.equals(savedUrl))) {
                 loadWebInterface();
             }
-            // Don't reload if just returning from background - WebSocket handles reconnection
+            // Don't reload if just returning from background with WebView intact
         }
     }
 

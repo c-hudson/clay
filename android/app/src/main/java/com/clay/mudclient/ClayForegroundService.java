@@ -5,9 +5,12 @@ import android.app.NotificationChannel;
 import android.app.NotificationManager;
 import android.app.PendingIntent;
 import android.app.Service;
+import android.content.Context;
 import android.content.Intent;
+import android.net.wifi.WifiManager;
 import android.os.Build;
 import android.os.IBinder;
+import android.os.PowerManager;
 
 import androidx.core.app.NotificationCompat;
 
@@ -21,16 +24,54 @@ public class ClayForegroundService extends Service {
     private static final int NOTIFICATION_ID = 1;
     public static final String ACTION_STOP_SERVICE = "com.clay.mudclient.STOP_SERVICE";
 
+    private PowerManager.WakeLock wakeLock;
+    private WifiManager.WifiLock wifiLock;
+
     @Override
     public void onCreate() {
         super.onCreate();
         createNotificationChannel();
+        acquireWakeLocks();
+    }
+
+    private void acquireWakeLocks() {
+        // Acquire partial wake lock to keep CPU running
+        PowerManager powerManager = (PowerManager) getSystemService(Context.POWER_SERVICE);
+        if (powerManager != null) {
+            wakeLock = powerManager.newWakeLock(
+                PowerManager.PARTIAL_WAKE_LOCK,
+                "Clay::BackgroundService"
+            );
+            wakeLock.acquire();
+        }
+
+        // Acquire wifi lock to keep wifi connection active
+        WifiManager wifiManager = (WifiManager) getApplicationContext().getSystemService(Context.WIFI_SERVICE);
+        if (wifiManager != null) {
+            wifiLock = wifiManager.createWifiLock(
+                WifiManager.WIFI_MODE_FULL_HIGH_PERF,
+                "Clay::WifiLock"
+            );
+            wifiLock.acquire();
+        }
+    }
+
+    private void releaseWakeLocks() {
+        if (wakeLock != null && wakeLock.isHeld()) {
+            wakeLock.release();
+            wakeLock = null;
+        }
+        if (wifiLock != null && wifiLock.isHeld()) {
+            wifiLock.release();
+            wifiLock = null;
+        }
     }
 
     @Override
     public int onStartCommand(Intent intent, int flags, int startId) {
         // Check if this is a stop request
         if (intent != null && ACTION_STOP_SERVICE.equals(intent.getAction())) {
+            releaseWakeLocks();
             stopForeground(true);
             stopSelf();
             return START_NOT_STICKY;
@@ -77,6 +118,7 @@ public class ClayForegroundService extends Service {
 
     @Override
     public void onDestroy() {
+        releaseWakeLocks();
         super.onDestroy();
         stopForeground(true);
     }
