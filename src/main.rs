@@ -2921,37 +2921,6 @@ impl App {
         }
     }
 
-    /// Open the connections popup showing connected worlds status
-    fn open_connections_popup_new(&mut self) {
-        use popup::definitions::connections::{
-            create_connections_popup, format_elapsed, format_next_nop, ConnectionInfo,
-        };
-
-        let now = std::time::Instant::now();
-        let connections: Vec<ConnectionInfo> = self.worlds.iter().enumerate().map(|(i, w)| {
-            let last_send_secs = w.last_user_command_time.map(|t| now.duration_since(t).as_secs());
-            let last_recv_secs = w.last_receive_time.map(|t| now.duration_since(t).as_secs());
-            let last_nop_secs = w.last_nop_time.map(|t| now.duration_since(t).as_secs());
-
-            ConnectionInfo {
-                name: w.name.clone(),
-                is_current: i == self.current_world_index,
-                is_connected: w.connected,
-                is_ssl: w.is_tls,
-                is_proxy: w.proxy_pid.is_some(),
-                unseen_lines: w.unseen_lines,
-                last_send: format_elapsed(last_send_secs),
-                last_recv: format_elapsed(last_recv_secs),
-                ka_next: format!("{}/{}", format_elapsed(last_nop_secs), format_next_nop(last_send_secs, last_recv_secs)),
-            }
-        }).collect();
-
-        let connected_count = connections.iter().filter(|c| c.is_connected).count();
-        let visible_height = 10.min(connected_count.max(1));
-        let def = create_connections_popup(&connections, visible_height);
-        self.popup_manager.open(def);
-    }
-
     /// Open the actions list popup
     fn open_actions_list_popup(&mut self) {
         self.open_actions_list_popup_with_filter("");
