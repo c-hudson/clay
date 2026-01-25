@@ -15460,6 +15460,12 @@ fn handle_remote_client_key(
                     Command::Help => {
                         app.open_help_popup_new();
                     }
+                    Command::Version => {
+                        app.add_output(&get_version_string());
+                    }
+                    Command::Menu => {
+                        app.open_menu_popup_new();
+                    }
                     Command::Setup => {
                         app.open_setup_popup_new();
                     }
