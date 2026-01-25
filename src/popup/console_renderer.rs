@@ -16,7 +16,7 @@ use super::{
 use crate::encoding::Theme;
 
 /// Render a popup to the console
-pub fn render_popup(f: &mut Frame, state: &PopupState, theme: Theme) {
+pub fn render_popup(f: &mut Frame, state: &mut PopupState, theme: Theme) {
     if !state.visible {
         return;
     }
@@ -27,8 +27,22 @@ pub fn render_popup(f: &mut Frame, state: &PopupState, theme: Theme) {
     // Calculate popup dimensions
     let (popup_area, inner_area) = calculate_popup_area(area, layout, state);
 
-    // Clear background
+    // Update actual_content_height for scroll calculations
+    // Inner area height minus space for buttons (if any)
+    let button_space = if state.definition.buttons.is_empty() { 0 } else { 2 };
+    state.actual_content_height = Some((inner_area.height as usize).saturating_sub(button_space));
+
+    // Clear background using Clear widget
     f.render_widget(Clear, popup_area);
+
+    // Fill the ENTIRE popup area with background color (including where border will go)
+    // This ensures no bleed-through from previous content
+    let fill_text_full = " ".repeat(popup_area.width as usize);
+    for row in 0..popup_area.height {
+        let row_area = Rect::new(popup_area.x, popup_area.y + row, popup_area.width, 1);
+        let fill_span = Span::styled(&fill_text_full, Style::default().bg(theme.popup_bg()));
+        f.render_widget(Paragraph::new(Line::from(fill_span)), row_area);
+    }
 
     // Create border block with title
     let title = format!(" {} ", state.definition.title);
@@ -135,6 +149,10 @@ fn calculate_content_width(state: &PopupState, layout: &PopupLayout) -> usize {
                     .max()
                     .unwrap_or(20) + 4
             }
+            FieldKind::ScrollableContent { lines, .. } => {
+                // Find the longest line in the scrollable content
+                lines.iter().map(|l| l.len()).max().unwrap_or(40) + 4
+            }
             _ => layout.label_width + 20,
         };
 
@@ -175,6 +193,9 @@ fn calculate_content_height(state: &PopupState) -> usize {
                 } else {
                     list_height
                 }
+            }
+            FieldKind::ScrollableContent { visible_height, .. } => {
+                *visible_height
             }
             _ => 1,
         };
@@ -225,6 +246,10 @@ fn render_popup_content(f: &mut Frame, state: &PopupState, area: Rect, theme: Th
                 let list_height = (*visible_height).min(max_items) as u16;
                 list_height + header_rows as u16
             }
+            FieldKind::ScrollableContent { visible_height, .. } => {
+                // Use available space, capped by visible_height
+                (*visible_height).min(available_for_field) as u16
+            }
             _ => 1,
         };
 
@@ -236,7 +261,16 @@ fn render_popup_content(f: &mut Frame, state: &PopupState, area: Rect, theme: Th
 
     // Render buttons if present
     if !state.definition.buttons.is_empty() {
-        y += 1; // Blank line before buttons
+        // Render blank line before buttons with background
+        if y < area.y + area.height {
+            let blank_area = Rect::new(area.x, y, area.width, 1);
+            let blank_line = Line::from(Span::styled(
+                " ".repeat(area.width as usize),
+                Style::default().bg(theme.popup_bg()),
+            ));
+            f.render_widget(Paragraph::new(blank_line), blank_area);
+        }
+        y += 1;
 
         if y < area.y + area.height {
             let button_area = Rect::new(area.x, y, area.width, 1);
@@ -694,9 +728,12 @@ fn render_scrollable_content(
         }
 
         let row_area = Rect::new(area.x, row_y, area.width.saturating_sub(1), 1);
+        // Pad line to fill the row area (prevents background bleed-through)
+        let display_text = truncate_str(line, area.width as usize - 2);
+        let padded_text = format!("{:<width$}", display_text, width = row_area.width as usize);
         let text_line = Line::from(Span::styled(
-            truncate_str(line, area.width as usize - 2),
-            Style::default().fg(theme.fg()),
+            padded_text,
+            Style::default().fg(theme.fg()).bg(theme.popup_bg()),
         ));
         f.render_widget(Paragraph::new(text_line), row_area);
     }
@@ -723,7 +760,10 @@ fn render_scrollable_content(
             } else {
                 "│"
             };
-            let scrollbar_line = Line::from(Span::styled(char, Style::default().fg(theme.fg_dim())));
+            let scrollbar_line = Line::from(Span::styled(
+                char,
+                Style::default().fg(theme.fg_dim()).bg(theme.popup_bg()),
+            ));
             f.render_widget(Paragraph::new(scrollbar_line), scrollbar_area);
         }
     }
@@ -766,7 +806,10 @@ fn render_buttons(f: &mut Frame, state: &PopupState, area: Rect, theme: Theme) {
             spans.push(Span::styled(format!("[{}]", button.label), style));
         }
 
-        spans.push(Span::raw(button_spacing.to_string()));
+        spans.push(Span::styled(
+            button_spacing.to_string(),
+            Style::default().bg(theme.popup_bg()),
+        ));
     }
 
     // Remove trailing spacing
@@ -784,19 +827,32 @@ fn render_buttons(f: &mut Frame, state: &PopupState, area: Rect, theme: Theme) {
         (area.width as usize).saturating_sub(total_width) / 2
     };
 
-    let mut positioned_spans = vec![Span::raw(" ".repeat(padding))];
+    // Add leading padding with popup background
+    let mut positioned_spans = vec![Span::styled(
+        " ".repeat(padding),
+        Style::default().bg(theme.popup_bg()),
+    )];
     positioned_spans.extend(spans);
+    // Add trailing padding to fill the row
+    let used_width: usize = positioned_spans.iter().map(|s| s.content.len()).sum();
+    let trailing_padding = (area.width as usize).saturating_sub(used_width);
+    if trailing_padding > 0 {
+        positioned_spans.push(Span::styled(
+            " ".repeat(trailing_padding),
+            Style::default().bg(theme.popup_bg()),
+        ));
+    }
 
     let line = Line::from(positioned_spans);
-    f.render_widget(Paragraph::new(line), area);
+    f.render_widget(Paragraph::new(line).style(Style::default().bg(theme.popup_bg())), area);
 }
 
 /// Get button style based on type and selection state
 fn get_button_style(button_style: ButtonStyle, is_selected: bool, theme: Theme) -> Style {
     let base = match button_style {
-        ButtonStyle::Primary => Style::default().fg(theme.fg_accent()),
-        ButtonStyle::Danger => Style::default().fg(Color::Red),
-        ButtonStyle::Secondary => Style::default().fg(theme.fg()),
+        ButtonStyle::Primary => Style::default().fg(theme.fg_accent()).bg(theme.popup_bg()),
+        ButtonStyle::Danger => Style::default().fg(Color::Red).bg(theme.popup_bg()),
+        ButtonStyle::Secondary => Style::default().fg(theme.fg()).bg(theme.popup_bg()),
     };
 
     if is_selected {

@@ -677,6 +677,8 @@ pub struct PopupState {
     pub scroll_offset: usize,
     /// Custom state for complex popups (e.g., filter text)
     pub custom: HashMap<String, String>,
+    /// Actual rendered content height (set during rendering, used for scroll calculations)
+    pub actual_content_height: Option<usize>,
 }
 
 impl PopupState {
@@ -706,6 +708,7 @@ impl PopupState {
             error: None,
             scroll_offset: 0,
             custom: HashMap::new(),
+            actual_content_height: None,
         }
     }
 
@@ -1293,10 +1296,14 @@ impl PopupState {
 
     /// Scroll the selected scrollable field down
     pub fn scroll_down(&mut self, amount: usize) {
+        // Get actual content height if available (set during rendering)
+        let actual_height = self.actual_content_height;
         if let Some(field) = self.selected_field_mut() {
             match &mut field.kind {
                 FieldKind::ScrollableContent { lines, scroll_offset, visible_height } => {
-                    let max_scroll = lines.len().saturating_sub(*visible_height);
+                    // Use actual rendered height if available, otherwise fall back to visible_height
+                    let effective_height = actual_height.unwrap_or(*visible_height);
+                    let max_scroll = lines.len().saturating_sub(effective_height);
                     *scroll_offset = (*scroll_offset + amount).min(max_scroll);
                 }
                 FieldKind::List { items, scroll_offset, visible_height, .. } => {

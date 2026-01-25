@@ -2660,6 +2660,8 @@ struct App {
     proxy_debug_reload_at: Option<std::time::Instant>,
     /// Remote client mode: WebSocket transmitter for sending commands to server
     ws_client_tx: Option<mpsc::UnboundedSender<WsMessage>>,
+    /// Activity count from server (used in remote client mode, i.e. --console)
+    server_activity_count: usize,
 }
 
 impl App {
@@ -2704,6 +2706,7 @@ impl App {
             tf_engine: tf::TfEngine::new(),
             proxy_debug_reload_at: None, // PROXY DEBUG: TODO remove
             ws_client_tx: None, // Set when running as remote client (--console mode)
+            server_activity_count: 0, // Activity count from server (remote client mode)
         }
         // Note: No initial world created here - it will be created after load_settings()
         // if no worlds are configured
@@ -2754,8 +2757,12 @@ impl App {
 
     /// Open the help popup using the new unified popup system
     fn open_help_popup_new(&mut self) {
-        use popup::definitions::help::create_help_popup;
+        use popup::definitions::help::{create_help_popup, HELP_FIELD_CONTENT};
         self.popup_manager.open(create_help_popup());
+        // Select the content field so arrow keys can scroll
+        if let Some(state) = self.popup_manager.current_mut() {
+            state.select_field(HELP_FIELD_CONTENT);
+        }
     }
 
     /// Close the current new-style popup
@@ -3167,6 +3174,22 @@ impl App {
                         }
                     }
                 }
+            }
+            WsMessage::ActivityUpdate { count } => {
+                // Server's activity count changed - update our copy
+                self.server_activity_count = count;
+                self.needs_output_redraw = true;
+            }
+            WsMessage::ConnectionsListResponse { lines } => {
+                // Display the connections list from server
+                let was_at_bottom = self.current_world().is_at_bottom();
+                for line in lines {
+                    self.current_world_mut().output_lines.push(OutputLine::new_client(line));
+                }
+                if was_at_bottom {
+                    self.current_world_mut().scroll_to_bottom();
+                }
+                self.needs_output_redraw = true;
             }
             _ => {}
         }
@@ -15086,9 +15109,15 @@ async fn run_console_client(addr: &str) -> io::Result<()> {
     // Now set up the terminal for the main UI
     enable_raw_mode()?;
     let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen)?;
+    execute!(
+        stdout,
+        EnterAlternateScreen,
+        crossterm::terminal::Clear(crossterm::terminal::ClearType::All),
+        crossterm::cursor::MoveTo(0, 0)
+    )?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
+    terminal.clear()?;
 
     // Wait for InitialState
     loop {
@@ -15131,9 +15160,27 @@ async fn run_console_client(addr: &str) -> io::Result<()> {
     app.needs_output_redraw = true;
     let mut needs_redraw = true;
 
+    // Track popup visibility for transition detection
+    let mut popup_was_visible = false;
+
     loop {
         // Draw if needed
         if needs_redraw || app.needs_output_redraw {
+            // Check current popup visibility
+            let any_popup_visible = app.has_new_popup() || app.confirm_dialog.visible;
+
+            // Only clear when TRANSITIONING to a popup (not on every frame)
+            // This prevents slow performance from excessive redraws
+            if any_popup_visible && !popup_was_visible {
+                // Use crossterm directly to ensure screen is cleared
+                execute!(
+                    std::io::stdout(),
+                    crossterm::terminal::Clear(crossterm::terminal::ClearType::All)
+                )?;
+                terminal.clear()?;
+            }
+            popup_was_visible = any_popup_visible;
+
             terminal.draw(|f| ui(f, &mut app))?;
             // Render output with crossterm (bypasses ratatui's buggy ANSI handling)
             render_output_crossterm(&app);
@@ -15271,6 +15318,43 @@ fn handle_remote_client_key(
         handle_remote_filter_popup_key(app, key);
         return false;
     }
+
+    // Helper to check if escape was pressed recently (for Escape+key sequences)
+    let recent_escape = app.last_escape
+        .map(|t| t.elapsed() < std::time::Duration::from_millis(500))
+        .unwrap_or(false);
+
+    // Track bare Escape key presses for Escape+key sequences
+    if key.code == Esc && key.modifiers.is_empty() {
+        app.last_escape = Some(std::time::Instant::now());
+        return false;
+    }
+
+    // Handle Escape+j (Alt+j) to jump to end - release all pending
+    if key.code == Char('j') && (key.modifiers.contains(KeyModifiers::ALT) || recent_escape) {
+        app.last_escape = None;
+        let has_pending = !app.current_world().pending_lines.is_empty() || app.current_world().pending_count > 0;
+        if app.current_world().paused && has_pending {
+            // Send release all (count=0 means release all)
+            let _ = ws_tx.send(WsMessage::ReleasePending {
+                world_index: app.current_world_index,
+                count: 0,
+            });
+        }
+        // Also scroll to bottom
+        app.current_world_mut().scroll_to_bottom();
+        app.needs_output_redraw = true;
+        return false;
+    }
+
+    // Handle Escape+w (Alt+w) to switch to world with oldest pending
+    if key.code == Char('w') && (key.modifiers.contains(KeyModifiers::ALT) || recent_escape) {
+        app.last_escape = None;
+        // Request oldest pending world from server
+        let _ = ws_tx.send(WsMessage::CalculateOldestPending { current_index: app.current_world_index });
+        return false;
+    }
+
     match (key.modifiers, key.code) {
         (KeyModifiers::CONTROL, Char('u')) => {
             app.input.clear();
@@ -15323,13 +15407,16 @@ fn handle_remote_client_key(
             let _ = ws_tx.send(WsMessage::CalculateNextWorld { current_index: app.current_world_index });
         }
         (_, PageUp) => {
+            // Scroll up (towards older content) = decrease scroll_offset
             let scroll_amount = app.output_height.saturating_sub(2) as usize;
-            app.current_world_mut().scroll_offset = app.current_world().scroll_offset.saturating_add(scroll_amount.max(1));
+            app.current_world_mut().scroll_offset = app.current_world().scroll_offset.saturating_sub(scroll_amount.max(1));
             app.needs_output_redraw = true;
         }
         (_, PageDown) => {
+            // Scroll down (towards newer content) = increase scroll_offset
             let scroll_amount = app.output_height.saturating_sub(2) as usize;
-            app.current_world_mut().scroll_offset = app.current_world().scroll_offset.saturating_sub(scroll_amount.max(1));
+            let max_offset = app.current_world().output_lines.len().saturating_sub(1);
+            app.current_world_mut().scroll_offset = (app.current_world().scroll_offset + scroll_amount.max(1)).min(max_offset);
             app.needs_output_redraw = true;
         }
         (_, Tab) => {
@@ -15341,17 +15428,21 @@ fn handle_remote_client_key(
                     world_index: app.current_world_index,
                     count: app.output_height.saturating_sub(2) as usize,
                 });
-            } else if app.current_world().scroll_offset > 0 {
+            } else if !app.current_world().is_at_bottom() {
+                // Scroll down (towards newer content) = increase scroll_offset
                 let scroll_amount = app.output_height.saturating_sub(2) as usize;
-                app.current_world_mut().scroll_offset = app.current_world().scroll_offset.saturating_sub(scroll_amount.max(1));
+                let max_offset = app.current_world().output_lines.len().saturating_sub(1);
+                app.current_world_mut().scroll_offset = (app.current_world().scroll_offset + scroll_amount.max(1)).min(max_offset);
                 app.needs_output_redraw = true;
             }
         }
         (_, Backspace) => {
             app.input.delete_char();
+            app.last_input_was_delete = true;
         }
         (_, Delete) => {
             app.input.delete_char_forward();
+            app.last_input_was_delete = true;
         }
         (_, Enter) => {
             let cmd = app.input.take_input();
@@ -15379,29 +15470,8 @@ fn handle_remote_client_key(
                         app.open_world_selector_new();
                     }
                     Command::WorldsList => {
-                        // Output connected worlds list as text (simplified - no timing info in console client)
-                        let current_idx = app.current_world_index;
-                        let mut lines = vec![
-                            OutputLine::new_client("".to_string()),
-                            OutputLine::new_client("Connected Worlds:".to_string()),
-                            OutputLine::new_client("─".repeat(50)),
-                        ];
-                        for (idx, world) in app.worlds.iter().enumerate() {
-                            let current = if idx == current_idx { "*" } else { " " };
-                            let connected = if world.connected { "✓" } else { " " };
-                            let unseen = if world.unseen_lines > 0 {
-                                format!(" ({} unseen)", world.unseen_lines)
-                            } else {
-                                String::new()
-                            };
-                            lines.push(OutputLine::new_client(
-                                format!("{}{} {}{}", current, connected, world.name, unseen)
-                            ));
-                        }
-                        lines.push(OutputLine::new_client("─".repeat(50)));
-                        lines.push(OutputLine::new_client("(*=current, ✓=connected)".to_string()));
-                        app.current_world_mut().output_lines.extend(lines);
-                        app.needs_output_redraw = true;
+                        // Request connections list from server (includes timing info)
+                        let _ = ws_tx.send(WsMessage::RequestConnectionsList);
                     }
                     Command::WorldSwitch { ref name } | Command::WorldConnectNoLogin { ref name } => {
                         // /worlds <name> - switch to world if it exists
@@ -15495,6 +15565,8 @@ fn handle_remote_client_key(
         }
         (_, Char(c)) => {
             app.input.insert_char(c);
+            app.last_input_was_delete = false;
+            app.check_temp_conversion();
         }
         _ => {}
     }
@@ -16679,7 +16751,7 @@ fn handle_new_popup_key(app: &mut App, key: KeyEvent) -> NewPopupAction {
                 // For other popups, Enter closes
                 app.popup_manager.close();
             }
-            Up | Down | Left | Right | Tab => {
+            Up | Down => {
                 if is_menu {
                     if matches!(key.code, Up) {
                         state.list_select_up();
@@ -16694,13 +16766,24 @@ fn handle_new_popup_key(app: &mut App, key: KeyEvent) -> NewPopupAction {
                         state.select_button(CONFIRM_BTN_YES);
                     }
                 } else {
-                    // Scrollable content
+                    // Scrollable content (help popup)
                     if matches!(key.code, Up) {
                         state.scroll_up(1);
                     } else {
                         state.scroll_down(1);
                     }
                 }
+            }
+            Left | Right | Tab => {
+                if is_confirm {
+                    // Toggle between Yes and No
+                    if state.is_button_focused(CONFIRM_BTN_YES) {
+                        state.select_button(CONFIRM_BTN_NO);
+                    } else {
+                        state.select_button(CONFIRM_BTN_YES);
+                    }
+                }
+                // For other popups like help, Left/Right/Tab do nothing
             }
             PageUp => {
                 state.scroll_up(5);
@@ -20569,6 +20652,46 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                 );
                                 app.ws_send_to_client(client_id, WsMessage::CalculatedWorld { index: prev_idx });
                             }
+                            WsMessage::CalculateOldestPending { current_index } => {
+                                // Find world with oldest pending output (for Escape+w)
+                                // Priority: 1) oldest pending, 2) any unseen, 3) previous world
+                                let mut oldest_idx: Option<usize> = None;
+                                let mut oldest_time: Option<std::time::Instant> = None;
+
+                                // Check for worlds with pending output
+                                for (idx, world) in app.worlds.iter().enumerate() {
+                                    if idx == current_index || world.pending_lines.is_empty() {
+                                        continue;
+                                    }
+                                    if let Some(pending_time) = world.pending_since {
+                                        if oldest_time.is_none() || pending_time < oldest_time.unwrap() {
+                                            oldest_time = Some(pending_time);
+                                            oldest_idx = Some(idx);
+                                        }
+                                    }
+                                }
+
+                                // If no pending, check for unseen output
+                                if oldest_idx.is_none() {
+                                    for (idx, world) in app.worlds.iter().enumerate() {
+                                        if idx != current_index && world.unseen_lines > 0 {
+                                            oldest_idx = Some(idx);
+                                            break;
+                                        }
+                                    }
+                                }
+
+                                // If still none, use previous world
+                                if oldest_idx.is_none() {
+                                    if let Some(prev_idx) = app.previous_world_index {
+                                        if prev_idx != current_index && prev_idx < app.worlds.len() {
+                                            oldest_idx = Some(prev_idx);
+                                        }
+                                    }
+                                }
+
+                                app.ws_send_to_client(client_id, WsMessage::CalculatedWorld { index: oldest_idx });
+                            }
                             WsMessage::RequestState => {
                                 // Client requested full state resync - send initial state
                                 let initial_state = app.build_initial_state();
@@ -20621,6 +20744,28 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                 } else {
                                     app.ws_send_to_client(client_id, WsMessage::UnbanResult { success: false, host, error: Some("No ban found".to_string()) });
                                 }
+                            }
+                            WsMessage::RequestConnectionsList => {
+                                // Generate connections list using same format as master console
+                                let current_idx = app.current_world_index;
+                                let worlds_info: Vec<util::WorldListInfo> = app.worlds.iter().enumerate().map(|(idx, world)| {
+                                    let now = std::time::Instant::now();
+                                    util::WorldListInfo {
+                                        name: world.name.clone(),
+                                        connected: world.connected,
+                                        is_current: idx == current_idx,
+                                        is_ssl: world.is_tls,
+                                        is_proxy: world.proxy_pid.is_some(),
+                                        unseen_lines: world.unseen_lines,
+                                        last_send_secs: world.last_user_command_time.map(|t| now.duration_since(t).as_secs()),
+                                        last_recv_secs: world.last_receive_time.map(|t| now.duration_since(t).as_secs()),
+                                        last_nop_secs: world.last_nop_time.map(|t| now.duration_since(t).as_secs()),
+                                        next_nop_secs: None,
+                                    }
+                                }).collect();
+                                let output = util::format_worlds_list(&worlds_info);
+                                let lines: Vec<String> = output.lines().map(|s| s.to_string()).collect();
+                                app.ws_send_to_client(client_id, WsMessage::ConnectionsListResponse { lines });
                             }
                             _ => {
                                 // Other message types handled elsewhere or ignored
@@ -21940,6 +22085,42 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                             );
                             app.ws_send_to_client(client_id, WsMessage::CalculatedWorld { index: prev_idx });
                         }
+                        WsMessage::CalculateOldestPending { current_index } => {
+                            // Find world with oldest pending output (for Escape+w)
+                            let mut oldest_idx: Option<usize> = None;
+                            let mut oldest_time: Option<std::time::Instant> = None;
+
+                            for (idx, world) in app.worlds.iter().enumerate() {
+                                if idx == current_index || world.pending_lines.is_empty() {
+                                    continue;
+                                }
+                                if let Some(pending_time) = world.pending_since {
+                                    if oldest_time.is_none() || pending_time < oldest_time.unwrap() {
+                                        oldest_time = Some(pending_time);
+                                        oldest_idx = Some(idx);
+                                    }
+                                }
+                            }
+
+                            if oldest_idx.is_none() {
+                                for (idx, world) in app.worlds.iter().enumerate() {
+                                    if idx != current_index && world.unseen_lines > 0 {
+                                        oldest_idx = Some(idx);
+                                        break;
+                                    }
+                                }
+                            }
+
+                            if oldest_idx.is_none() {
+                                if let Some(prev_idx) = app.previous_world_index {
+                                    if prev_idx != current_index && prev_idx < app.worlds.len() {
+                                        oldest_idx = Some(prev_idx);
+                                    }
+                                }
+                            }
+
+                            app.ws_send_to_client(client_id, WsMessage::CalculatedWorld { index: oldest_idx });
+                        }
                         WsMessage::RequestState => {
                             // Client requested full state resync - send initial state
                             let initial_state = app.build_initial_state();
@@ -21992,6 +22173,28 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                             } else {
                                 app.ws_send_to_client(client_id, WsMessage::UnbanResult { success: false, host, error: Some("No ban found".to_string()) });
                             }
+                        }
+                        WsMessage::RequestConnectionsList => {
+                            // Generate connections list for remote console client
+                            let current_idx = app.current_world_index;
+                            let now = std::time::Instant::now();
+                            let worlds_info: Vec<util::WorldListInfo> = app.worlds.iter().enumerate().map(|(idx, world)| {
+                                util::WorldListInfo {
+                                    name: world.name.clone(),
+                                    connected: world.connected,
+                                    is_current: idx == current_idx,
+                                    is_ssl: world.is_tls,
+                                    is_proxy: world.proxy_pid.is_some(),
+                                    unseen_lines: world.unseen_lines,
+                                    last_send_secs: world.last_user_command_time.map(|t| now.duration_since(t).as_secs()),
+                                    last_recv_secs: world.last_receive_time.map(|t| now.duration_since(t).as_secs()),
+                                    last_nop_secs: world.last_nop_time.map(|t| now.duration_since(t).as_secs()),
+                                    next_nop_secs: None,
+                                }
+                            }).collect();
+                            let output = util::format_worlds_list(&worlds_info);
+                            let lines: Vec<String> = output.lines().map(|s| s.to_string()).collect();
+                            app.ws_send_to_client(client_id, WsMessage::ConnectionsListResponse { lines });
                         }
                         _ => {}
                     }
@@ -25301,7 +25504,12 @@ fn render_separator_bar(f: &mut Frame, app: &App, area: Rect) {
 
     // Activity indicator - positioned at column 24
     const ACTIVITY_POSITION: usize = 24;
-    let activity_count = app.activity_count();
+    // In remote client mode, use the server's activity count
+    let activity_count = if app.is_master {
+        app.activity_count()
+    } else {
+        app.server_activity_count
+    };
 
     // Determine activity string based on available space
     // Full format: "(Activity: X)", Short format: "(Act X)"
@@ -25832,8 +26040,8 @@ fn render_filter_popup(f: &mut Frame, app: &App) {
 }
 
 /// Render new unified popup system
-fn render_new_popup(f: &mut Frame, app: &App) {
-    if let Some(state) = app.popup_manager.current() {
+fn render_new_popup(f: &mut Frame, app: &mut App) {
+    if let Some(state) = app.popup_manager.current_mut() {
         popup::console_renderer::render_popup(f, state, app.settings.theme);
     }
 }

@@ -183,8 +183,16 @@ pub enum WsMessage {
     // World switching calculation (client -> server)
     CalculateNextWorld { current_index: usize },
     CalculatePrevWorld { current_index: usize },
+    /// Find world with oldest pending output (for Escape+w)
+    CalculateOldestPending { current_index: usize },
     // World switching response (server -> client)
     CalculatedWorld { index: Option<usize> },
+
+    /// Request connections list (/l command) - client -> server
+    RequestConnectionsList,
+    /// Connections list response - server -> client
+    /// Lines are pre-formatted for display
+    ConnectionsListResponse { lines: Vec<String> },
 
     // Keepalive
     Ping,

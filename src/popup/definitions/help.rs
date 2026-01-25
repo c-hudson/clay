@@ -71,15 +71,16 @@ pub fn create_help_popup() -> PopupDefinition {
         .with_field(Field::new(
             HELP_FIELD_CONTENT,
             "",
-            FieldKind::scrollable_content_static(HELP_LINES, 15),
+            // Use large visible_height - will be capped by terminal size
+            FieldKind::scrollable_content_static(HELP_LINES, 100),
         ))
         .with_button(Button::new(HELP_BTN_OK, "Ok").primary().with_shortcut('O'))
         .with_layout(PopupLayout {
             label_width: 0,
-            min_width: 50,
+            min_width: 1000, // Large value to ensure 90% width is used
             max_width_percent: 90,
             center_horizontal: true,
-            center_vertical: true,
+            center_vertical: false, // Position at top, not centered
             modal: true,
             buttons_right_align: false,
             blank_line_before_list: false,
