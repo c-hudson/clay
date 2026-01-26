@@ -12703,39 +12703,42 @@ mod remote_gui {
                                 should_close = true;
                             }
 
-                            // Bottom panel for buttons - use allocate_ui to get precise control
+                            // Bottom panel for buttons
                             egui::TopBottomPanel::bottom("setup_buttons")
                                 .exact_height(60.0)
-                                .frame(egui::Frame::none().fill(theme.bg_elevated())
-                                    .inner_margin(egui::Margin { left: 16.0, right: 18.0, top: 0.0, bottom: 20.0 }))
+                                .frame(egui::Frame::none()
+                                    .fill(theme.bg_elevated())
+                                    .stroke(egui::Stroke::NONE)
+                                    .inner_margin(egui::Margin { left: 16.0, right: 18.0, top: 12.0, bottom: 20.0 }))
                                 .show(ctx, |ui| {
-                                    // Use bottom-up layout to position from bottom edge
-                                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Max), |ui| {
-                                        ui.spacing_mut().item_spacing = egui::vec2(8.0, 0.0);
+                                    ui.horizontal(|ui| {
+                                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                            ui.spacing_mut().item_spacing = egui::vec2(8.0, 0.0);
 
-                                        // Cancel button
-                                        if ui.add(egui::Button::new(
-                                            egui::RichText::new("CANCEL").size(11.0).color(theme.fg_secondary()).family(egui::FontFamily::Monospace))
-                                            .fill(theme.bg_hover())
-                                            .stroke(egui::Stroke::new(1.0, theme.border_medium()))
-                                            .rounding(egui::Rounding::same(4.0))
-                                            .min_size(egui::vec2(70.0, 28.0))
-                                        ).clicked() {
-                                            should_cancel = true;
-                                            should_close = true;
-                                        }
+                                            // Cancel button
+                                            if ui.add(egui::Button::new(
+                                                egui::RichText::new("CANCEL").size(11.0).color(theme.fg_secondary()).family(egui::FontFamily::Monospace))
+                                                .fill(theme.bg_hover())
+                                                .stroke(egui::Stroke::new(1.0, theme.border_medium()))
+                                                .rounding(egui::Rounding::same(4.0))
+                                                .min_size(egui::vec2(70.0, 28.0))
+                                            ).clicked() {
+                                                should_cancel = true;
+                                                should_close = true;
+                                            }
 
-                                        // Save button (primary)
-                                        if ui.add(egui::Button::new(
-                                            egui::RichText::new("SAVE").size(11.0).color(theme.bg_deep()).strong().family(egui::FontFamily::Monospace))
-                                            .fill(theme.accent_dim())
-                                            .stroke(egui::Stroke::NONE)
-                                            .rounding(egui::Rounding::same(4.0))
-                                            .min_size(egui::vec2(70.0, 28.0))
-                                        ).clicked() {
-                                            should_save = true;
-                                            should_close = true;
-                                        }
+                                            // Save button (primary)
+                                            if ui.add(egui::Button::new(
+                                                egui::RichText::new("SAVE").size(11.0).color(theme.bg_deep()).strong().family(egui::FontFamily::Monospace))
+                                                .fill(theme.accent_dim())
+                                                .stroke(egui::Stroke::NONE)
+                                                .rounding(egui::Rounding::same(4.0))
+                                                .min_size(egui::vec2(70.0, 28.0))
+                                            ).clicked() {
+                                                should_save = true;
+                                                should_close = true;
+                                            }
+                                        });
                                     });
                                 });
 
