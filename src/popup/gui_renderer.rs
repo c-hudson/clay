@@ -229,15 +229,25 @@ pub fn render_popup_content(
                 ui.add_space(row_spacing);
             }
 
-            FieldKind::List { items, selected_index, visible_height, headers, .. } => {
-                // Render list with optional headers
+            FieldKind::List { items, selected_index, visible_height, headers, column_widths, .. } => {
+                // Render list with optional headers and proper column alignment
                 let list_height = (*visible_height as f32) * row_height;
+
+                // Calculate column widths - use provided widths or default proportions
+                let default_widths = vec![150.0, 100.0, 200.0];
+                let widths: Vec<f32> = if let Some(cw) = column_widths {
+                    cw.iter().map(|&w| w as f32).collect()
+                } else {
+                    default_widths
+                };
 
                 if let Some(hdrs) = headers {
                     ui.horizontal(|ui| {
-                        for h in hdrs {
-                            ui.label(RichText::new(h).color(theme.fg_dim).strong());
-                            ui.add_space(16.0);
+                        for (i, h) in hdrs.iter().enumerate() {
+                            let w = widths.get(i).copied().unwrap_or(100.0);
+                            ui.add_sized([w, row_height], egui::Label::new(
+                                RichText::new(h).color(theme.fg_dim).strong()
+                            ));
                         }
                     });
                 }
@@ -248,7 +258,6 @@ pub fn render_popup_content(
                     .show(ui, |ui| {
                         for (idx, item) in items.iter().enumerate() {
                             let is_item_selected = idx == *selected_index;
-                            let display = item.columns.join("  ");
 
                             // Use explicit colors for list items
                             let text_color = if is_item_selected {
@@ -262,13 +271,24 @@ pub fn render_popup_content(
                                 Color32::TRANSPARENT
                             };
 
-                            let response = ui.add(
-                                egui::Button::new(RichText::new(&display).color(text_color))
-                                    .fill(bg_color)
-                                    .stroke(egui::Stroke::NONE)
-                                    .frame(false)
-                                    .min_size(egui::vec2(ui.available_width(), row_height))
-                            );
+                            // Render as a clickable row with columns
+                            let response = ui.horizontal(|ui| {
+                                // Background for selection
+                                let rect = ui.available_rect_before_wrap();
+                                if is_item_selected {
+                                    ui.painter().rect_filled(rect, 0.0, bg_color);
+                                }
+
+                                for (i, col) in item.columns.iter().enumerate() {
+                                    let w = widths.get(i).copied().unwrap_or(100.0);
+                                    ui.add_sized([w, row_height], egui::Label::new(
+                                        RichText::new(col).color(text_color)
+                                    ));
+                                }
+
+                                ui.interact(rect, ui.id().with(idx), egui::Sense::click())
+                            }).inner;
+
                             if response.clicked() {
                                 actions.list_selected.push((field_id, idx));
                             }
@@ -317,22 +337,69 @@ pub fn render_popup_content(
         ui.separator();
         ui.add_space(8.0);
 
+        // Split buttons: danger buttons on left, others on right
+        let danger_buttons: Vec<_> = state.definition.buttons.iter()
+            .filter(|b| b.enabled && matches!(b.style, ButtonStyle::Danger))
+            .collect();
+        let other_buttons: Vec<_> = state.definition.buttons.iter()
+            .filter(|b| b.enabled && !matches!(b.style, ButtonStyle::Danger))
+            .collect();
+
         ui.horizontal(|ui| {
-            if state.definition.layout.buttons_right_align {
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    render_buttons(ui, state, theme, &mut actions.clicked_button);
-                });
-            } else {
-                ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
-                    render_buttons(ui, state, theme, &mut actions.clicked_button);
-                });
+            // Danger buttons on left
+            for button in &danger_buttons {
+                render_single_button(ui, button, state, theme, &mut actions.clicked_button);
+                ui.add_space(8.0);
             }
+
+            // Spacer to push other buttons to the right
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                // Render in reverse order for right-to-left layout
+                for button in other_buttons.iter().rev() {
+                    ui.add_space(8.0);
+                    render_single_button(ui, button, state, theme, &mut actions.clicked_button);
+                }
+            });
         });
     }
 
     actions
 }
 
+fn render_single_button(
+    ui: &mut Ui,
+    button: &super::Button,
+    state: &PopupState,
+    theme: &GuiPopupTheme,
+    clicked_button: &mut Option<super::ButtonId>,
+) {
+    let is_selected = matches!(&state.selected, ElementSelection::Button(id) if *id == button.id);
+
+    let (fill, text_color) = match button.style {
+        ButtonStyle::Primary => (theme.accent_dim, theme.bg_deep),
+        ButtonStyle::Danger => (theme.danger, theme.fg_primary),
+        ButtonStyle::Secondary => (theme.bg_hover, theme.fg_secondary),
+    };
+
+    let btn = egui::Button::new(
+        RichText::new(&button.label)
+            .color(text_color),
+    )
+    .fill(fill)
+    .stroke(if is_selected {
+        egui::Stroke::new(2.0, theme.accent)
+    } else {
+        egui::Stroke::NONE
+    })
+    .rounding(egui::Rounding::same(4.0))
+    .min_size(egui::vec2(70.0, 28.0));
+
+    if ui.add(btn).clicked() {
+        *clicked_button = Some(button.id);
+    }
+}
+
+#[allow(dead_code)]
 fn render_buttons(
     ui: &mut Ui,
     state: &PopupState,
@@ -343,33 +410,7 @@ fn render_buttons(
 
     // Render in reverse order for right-to-left layout
     for button in buttons.iter().rev() {
-        let is_selected = matches!(&state.selected, ElementSelection::Button(id) if *id == button.id);
-
-        let (fill, text_color) = match button.style {
-            ButtonStyle::Primary => (theme.accent_dim, theme.bg_deep),
-            ButtonStyle::Danger => (theme.danger, theme.fg_primary),
-            ButtonStyle::Secondary => (theme.bg_hover, theme.fg_secondary),
-        };
-
-        let btn = egui::Button::new(
-            RichText::new(&button.label)
-                .size(12.0)
-                .color(text_color)
-                .strong(),
-        )
-        .fill(fill)
-        .stroke(if is_selected {
-            egui::Stroke::new(2.0, theme.accent)
-        } else {
-            egui::Stroke::NONE
-        })
-        .rounding(egui::Rounding::same(4.0))
-        .min_size(egui::vec2(70.0, 28.0));
-
-        if ui.add(btn).clicked() {
-            *clicked_button = Some(button.id);
-        }
-
+        render_single_button(ui, button, state, theme, clicked_button);
         ui.add_space(8.0);
     }
 }
