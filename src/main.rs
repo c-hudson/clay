@@ -13180,7 +13180,7 @@ mod remote_gui {
                                 .exact_height(90.0)
                                 .frame(egui::Frame::none()
                                     .fill(theme.bg_elevated())
-                                    .inner_margin(egui::Margin { left: 16.0, right: 16.0, top: 15.0, bottom: 15.0 }))
+                                    .inner_margin(egui::Margin { left: 16.0, right: 16.0, top: 30.0, bottom: 15.0 }))
                                 .show(ctx, |ui| {
                                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                                         ui.spacing_mut().item_spacing = egui::vec2(8.0, 0.0);
