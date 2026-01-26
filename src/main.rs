@@ -13122,7 +13122,7 @@ mod remote_gui {
                         egui::ViewportId::from_hash_of("web_settings_window"),
                         egui::ViewportBuilder::default()
                             .with_title("Web Settings")
-                            .with_inner_size([380.0, 300.0])
+                            .with_inner_size([380.0, 320.0])
                             .with_resizable(false),
                         |ctx, _class| {
                             // Apply popup styling - remove all default strokes
@@ -13177,10 +13177,10 @@ mod remote_gui {
 
                             // Bottom panel for buttons - positioned like actions list
                             egui::TopBottomPanel::bottom("web_settings_buttons")
-                                .exact_height(90.0)
+                                .exact_height(55.0)
                                 .frame(egui::Frame::none()
                                     .fill(theme.bg_elevated())
-                                    .inner_margin(egui::Margin { left: 16.0, right: 16.0, top: 10.0, bottom: 15.0 }))
+                                    .inner_margin(egui::Margin { left: 16.0, right: 16.0, top: 12.0, bottom: 12.0 }))
                                 .show(ctx, |ui| {
                                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                                         ui.spacing_mut().item_spacing = egui::vec2(8.0, 0.0);
