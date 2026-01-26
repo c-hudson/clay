@@ -1,4 +1,5 @@
 use std::collections::HashSet;
+use std::process::Command;
 use strsim::levenshtein;
 
 // System dictionary paths to try (in order of preference)
@@ -32,7 +33,7 @@ pub struct SpellChecker {
 
 impl SpellChecker {
     pub fn new() -> Self {
-        // Try to load system dictionary
+        // Try to load system dictionary from file
         let mut words = HashSet::new();
         for path in SYSTEM_DICT_PATHS {
             if let Ok(content) = std::fs::read_to_string(path) {
@@ -44,6 +45,25 @@ impl SpellChecker {
                 break;
             }
         }
+
+        // If no dictionary file found, try aspell (works with aspell-en on Termux)
+        if words.is_empty() {
+            if let Ok(output) = Command::new("aspell")
+                .args(["dump", "master"])
+                .output()
+            {
+                if output.status.success() {
+                    if let Ok(content) = String::from_utf8(output.stdout) {
+                        words = content
+                            .lines()
+                            .map(|s| s.trim().to_lowercase())
+                            .filter(|s| !s.is_empty() && s.chars().all(|c| c.is_alphabetic()))
+                            .collect();
+                    }
+                }
+            }
+        }
+
         Self { words }
     }
 
