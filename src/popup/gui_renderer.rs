@@ -297,7 +297,7 @@ pub fn render_popup_content(
 
                 // Calculate list height - use remaining available height minus space for buttons
                 let min_list_height = (*visible_height as f32) * row_height;
-                let available_height = ui.available_height() - 30.0; // Reserve space for buttons
+                let available_height = ui.available_height() - 50.0; // Reserve space for buttons
                 let list_height = available_height.max(min_list_height);
 
                 // Draw slightly lighter background for list area
