@@ -138,11 +138,15 @@ pub fn render_popup_content(
                 let has_label = !field.label.is_empty();
 
                 ui.horizontal(|ui| {
-                    // Label (only if not empty)
+                    // Label (only if not empty) - right aligned
                     if has_label {
-                        ui.add_sized(
-                            [label_width, row_height],
-                            egui::Label::new(RichText::new(&field.label).color(theme.fg_secondary)),
+                        ui.allocate_ui_with_layout(
+                            egui::vec2(label_width, row_height),
+                            egui::Layout::right_to_left(egui::Align::Center),
+                            |ui| {
+                                ui.add_space(8.0); // padding from text field
+                                ui.label(RichText::new(&field.label).color(theme.fg_secondary));
+                            },
                         );
                     }
 
@@ -185,9 +189,13 @@ pub fn render_popup_content(
 
             FieldKind::Toggle { value } => {
                 ui.horizontal(|ui| {
-                    ui.add_sized(
-                        [label_width, row_height],
-                        egui::Label::new(RichText::new(&field.label).color(theme.fg_secondary)),
+                    ui.allocate_ui_with_layout(
+                        egui::vec2(label_width, row_height),
+                        egui::Layout::right_to_left(egui::Align::Center),
+                        |ui| {
+                            ui.add_space(8.0);
+                            ui.label(RichText::new(&field.label).color(theme.fg_secondary));
+                        },
                     );
 
                     let mut checked = *value;
@@ -200,9 +208,13 @@ pub fn render_popup_content(
 
             FieldKind::Select { options, selected_index } => {
                 ui.horizontal(|ui| {
-                    ui.add_sized(
-                        [label_width, row_height],
-                        egui::Label::new(RichText::new(&field.label).color(theme.fg_secondary)),
+                    ui.allocate_ui_with_layout(
+                        egui::vec2(label_width, row_height),
+                        egui::Layout::right_to_left(egui::Align::Center),
+                        |ui| {
+                            ui.add_space(8.0);
+                            ui.label(RichText::new(&field.label).color(theme.fg_secondary));
+                        },
                     );
 
                     let current = options.get(*selected_index).map(|o| o.label.as_str()).unwrap_or("-");
@@ -222,9 +234,13 @@ pub fn render_popup_content(
 
             FieldKind::Number { value, min, max } => {
                 ui.horizontal(|ui| {
-                    ui.add_sized(
-                        [label_width, row_height],
-                        egui::Label::new(RichText::new(&field.label).color(theme.fg_secondary)),
+                    ui.allocate_ui_with_layout(
+                        egui::vec2(label_width, row_height),
+                        egui::Layout::right_to_left(egui::Align::Center),
+                        |ui| {
+                            ui.add_space(8.0);
+                            ui.label(RichText::new(&field.label).color(theme.fg_secondary));
+                        },
                     );
 
                     let mut num = *value;
@@ -374,9 +390,13 @@ pub fn render_popup_content(
 
             FieldKind::MultilineText { value, visible_lines, .. } => {
                 ui.horizontal(|ui| {
-                    ui.add_sized(
-                        [label_width, row_height],
-                        egui::Label::new(RichText::new(&field.label).color(theme.fg_secondary)),
+                    ui.allocate_ui_with_layout(
+                        egui::vec2(label_width, row_height),
+                        egui::Layout::right_to_left(egui::Align::Center),
+                        |ui| {
+                            ui.add_space(8.0);
+                            ui.label(RichText::new(&field.label).color(theme.fg_secondary));
+                        },
                     );
 
                     let mut text = value.clone();

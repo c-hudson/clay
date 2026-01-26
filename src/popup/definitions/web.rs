@@ -91,8 +91,8 @@ pub fn create_web_popup(
             "TLS Key File",
             FieldKind::text(ws_key_file),
         ))
-        .with_button(Button::new(WEB_BTN_SAVE, "Save").primary().with_shortcut('S'))
         .with_button(Button::new(WEB_BTN_CANCEL, "Cancel").with_shortcut('C'))
+        .with_button(Button::new(WEB_BTN_SAVE, "Save").primary().with_shortcut('S'))
         .with_layout(PopupLayout {
             label_width: 15,
             min_width: 50,
