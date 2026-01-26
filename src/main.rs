@@ -13122,7 +13122,8 @@ mod remote_gui {
                         egui::ViewportId::from_hash_of("web_settings_window"),
                         egui::ViewportBuilder::default()
                             .with_title("Web Settings")
-                            .with_inner_size([380.0, 300.0]),
+                            .with_inner_size([380.0, 300.0])
+                            .with_resizable(false),
                         |ctx, _class| {
                             // Apply popup styling - remove all default strokes
                             ctx.style_mut(|style| {
@@ -13176,7 +13177,7 @@ mod remote_gui {
 
                             // Bottom panel for buttons - positioned like actions list
                             egui::TopBottomPanel::bottom("web_settings_buttons")
-                                .exact_height(50.0)
+                                .exact_height(90.0)
                                 .frame(egui::Frame::none()
                                     .fill(theme.bg_elevated())
                                     .inner_margin(egui::Margin { left: 16.0, right: 16.0, top: 15.0, bottom: 15.0 }))
@@ -13325,10 +13326,11 @@ mod remote_gui {
                                             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                                                 ui.label(egui::RichText::new("Allow List").size(12.0).color(theme.fg_secondary()));
                                             });
+                                            let allow_list_width = ui.available_width() - 16.0; // padding from right edge
                                             ui.add(egui::TextEdit::singleline(&mut ws_allow_list)
                                                 .text_color(theme.fg())
                                                 .hint_text("localhost, 192.168.*")
-                                                .desired_width(180.0)
+                                                .desired_width(allow_list_width)
                                                 .margin(egui::vec2(8.0, 6.0)));
                                             ui.end_row();
                                         });
