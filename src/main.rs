@@ -13185,6 +13185,17 @@ mod remote_gui {
                                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                                         ui.spacing_mut().item_spacing = egui::vec2(8.0, 0.0);
 
+                                        // Save button (primary) - rightmost
+                                        if ui.add(egui::Button::new(
+                                            egui::RichText::new("Save").size(11.0).color(theme.bg_deep()).strong())
+                                            .fill(theme.accent_dim())
+                                            .stroke(egui::Stroke::NONE)
+                                            .rounding(egui::Rounding::same(4.0))
+                                            .min_size(egui::vec2(70.0, 28.0))
+                                        ).clicked() {
+                                            should_save = true;
+                                        }
+
                                         // Cancel button
                                         if ui.add(egui::Button::new(
                                             egui::RichText::new("Cancel").size(11.0).color(theme.fg_secondary()))
@@ -13194,17 +13205,6 @@ mod remote_gui {
                                             .min_size(egui::vec2(70.0, 28.0))
                                         ).clicked() {
                                             should_close = true;
-                                        }
-
-                                        // Save button (primary)
-                                        if ui.add(egui::Button::new(
-                                            egui::RichText::new("Save").size(11.0).color(theme.bg_deep()).strong())
-                                            .fill(theme.accent_dim())
-                                            .stroke(egui::Stroke::NONE)
-                                            .rounding(egui::Rounding::same(4.0))
-                                            .min_size(egui::vec2(70.0, 28.0))
-                                        ).clicked() {
-                                            should_save = true;
                                         }
                                     });
                                 });
@@ -13226,7 +13226,9 @@ mod remote_gui {
                                         .spacing([16.0, 10.0])
                                         .show(ui, |ui| {
                                             // Protocol selection
-                                            ui.label(egui::RichText::new("Protocol").size(12.0).color(theme.fg_secondary()));
+                                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                                ui.label(egui::RichText::new("Protocol").size(12.0).color(theme.fg_secondary()));
+                                            });
                                             ui.horizontal(|ui| {
                                                 ui.spacing_mut().item_spacing = egui::vec2(2.0, 0.0);
                                                 if ui.add(egui::Button::new(
@@ -13254,7 +13256,9 @@ mod remote_gui {
 
                                             // HTTP/HTTPS enabled
                                             let http_label = if web_secure { "HTTPS enabled" } else { "HTTP enabled" };
-                                            ui.label(egui::RichText::new(http_label).size(12.0).color(theme.fg_secondary()));
+                                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                                ui.label(egui::RichText::new(http_label).size(12.0).color(theme.fg_secondary()));
+                                            });
                                             let http_text = if http_enabled { "ON" } else { "OFF" };
                                             let http_color = if http_enabled { theme.accent() } else { theme.fg_muted() };
                                             if ui.add(egui::Button::new(
@@ -13270,9 +13274,12 @@ mod remote_gui {
 
                                             // HTTP/HTTPS port
                                             let http_port_label = if web_secure { "HTTPS port" } else { "HTTP port" };
-                                            ui.label(egui::RichText::new(http_port_label).size(12.0).color(theme.fg_secondary()));
+                                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                                ui.label(egui::RichText::new(http_port_label).size(12.0).color(theme.fg_secondary()));
+                                            });
                                             let mut http_port_str = http_port.to_string();
                                             if ui.add(egui::TextEdit::singleline(&mut http_port_str)
+                                                .text_color(theme.fg())
                                                 .desired_width(80.0)
                                                 .margin(egui::vec2(8.0, 6.0))).changed() {
                                                 if let Ok(port) = http_port_str.parse::<u16>() {
@@ -13283,7 +13290,9 @@ mod remote_gui {
 
                                             // WS/WSS enabled
                                             let ws_label = if web_secure { "WSS enabled" } else { "WS enabled" };
-                                            ui.label(egui::RichText::new(ws_label).size(12.0).color(theme.fg_secondary()));
+                                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                                ui.label(egui::RichText::new(ws_label).size(12.0).color(theme.fg_secondary()));
+                                            });
                                             let ws_text = if ws_enabled { "ON" } else { "OFF" };
                                             let ws_color = if ws_enabled { theme.accent() } else { theme.fg_muted() };
                                             if ui.add(egui::Button::new(
@@ -13299,9 +13308,12 @@ mod remote_gui {
 
                                             // WS/WSS port
                                             let ws_port_label = if web_secure { "WSS port" } else { "WS port" };
-                                            ui.label(egui::RichText::new(ws_port_label).size(12.0).color(theme.fg_secondary()));
+                                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                                ui.label(egui::RichText::new(ws_port_label).size(12.0).color(theme.fg_secondary()));
+                                            });
                                             let mut ws_port_str = ws_port.to_string();
                                             if ui.add(egui::TextEdit::singleline(&mut ws_port_str)
+                                                .text_color(theme.fg())
                                                 .desired_width(80.0)
                                                 .margin(egui::vec2(8.0, 6.0))).changed() {
                                                 if let Ok(port) = ws_port_str.parse::<u16>() {
@@ -13311,8 +13323,11 @@ mod remote_gui {
                                             ui.end_row();
 
                                             // Allow list
-                                            ui.label(egui::RichText::new("Allow List").size(12.0).color(theme.fg_secondary()));
+                                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                                ui.label(egui::RichText::new("Allow List").size(12.0).color(theme.fg_secondary()));
+                                            });
                                             ui.add(egui::TextEdit::singleline(&mut ws_allow_list)
+                                                .text_color(theme.fg())
                                                 .hint_text("localhost, 192.168.*")
                                                 .desired_width(180.0)
                                                 .margin(egui::vec2(8.0, 6.0)));
