@@ -2828,12 +2828,14 @@
         elements.separatorFill.textContent = '_'.repeat(Math.max(200, numUnderscores));
     }
 
-    // Update time
+    // Update time (12-hour format, no leading zeros)
     function updateTime() {
         const now = new Date();
-        const hours = now.getHours();
+        let hours = now.getHours();
+        const ampm = hours >= 12 ? 'pm' : 'am';
+        hours = hours % 12 || 12; // Convert 0 to 12 for midnight
         const minutes = now.getMinutes().toString().padStart(2, '0');
-        elements.statusTime.textContent = `${hours}:${minutes}`;
+        elements.statusTime.textContent = `${hours}:${minutes}${ampm}`;
     }
 
     // Set input area height (number of lines)
