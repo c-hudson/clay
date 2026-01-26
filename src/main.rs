@@ -14220,7 +14220,7 @@ mod remote_gui {
                                         // Delete button (danger) - left aligned
                                         if ui.add(egui::Button::new(
                                             egui::RichText::new("DELETE").size(11.0).color(Color32::WHITE).family(egui::FontFamily::Monospace))
-                                            .fill(Color32::from_rgb(211, 47, 47))  // Material Design red #d32f2f
+                                            .fill(Color32::from_rgb(244, 67, 54))  // Bright red #f44336
                                             .stroke(egui::Stroke::NONE)
                                             .rounding(egui::Rounding::same(4.0))
                                             .min_size(egui::vec2(70.0, 28.0))
