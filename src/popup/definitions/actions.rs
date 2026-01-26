@@ -111,8 +111,8 @@ pub fn create_actions_list_popup(actions: &[ActionInfo], visible_height: usize) 
     PopupDefinition::new(PopupId("actions_list"), "Actions")
         .with_field(Field::new(
             ACTIONS_FIELD_FILTER,
-            "Filter",
-            FieldKind::text_with_placeholder("", "Type to filter..."),
+            "",
+            FieldKind::text_with_placeholder("", "Filter Actions..."),
         ))
         .with_field(Field::new(
             ACTIONS_FIELD_LIST,

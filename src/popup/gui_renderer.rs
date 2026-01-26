@@ -136,11 +136,13 @@ pub fn render_popup_content(
 
             FieldKind::Text { value, masked, placeholder } => {
                 ui.horizontal(|ui| {
-                    // Label
-                    ui.add_sized(
-                        [label_width, row_height],
-                        egui::Label::new(RichText::new(&field.label).color(theme.fg_secondary)),
-                    );
+                    // Label (only if not empty)
+                    if !field.label.is_empty() {
+                        ui.add_sized(
+                            [label_width, row_height],
+                            egui::Label::new(RichText::new(&field.label).color(theme.fg_secondary)),
+                        );
+                    }
 
                     // Text field
                     let display_value = if *masked {
