@@ -473,27 +473,43 @@ async fn start_https_server(
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     use std::fs::File;
     use std::io::BufReader;
-    use rustls_pemfile::{certs, private_key};
+    use rustls_pemfile::{certs, pkcs8_private_keys, rsa_private_keys};
+    use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 
     // Read certificate chain
     let cert_file_handle = File::open(cert_file)
         .map_err(|e| format!("Failed to open cert file '{}': {}", cert_file, e))?;
     let mut cert_reader = BufReader::new(cert_file_handle);
-    let certs: Vec<rustls::pki_types::CertificateDer<'static>> = certs(&mut cert_reader)
-        .filter_map(|r| r.ok())
+    let certs: Vec<CertificateDer<'static>> = certs(&mut cert_reader)
+        .map_err(|e| format!("Failed to parse cert file '{}': {}", cert_file, e))?
+        .into_iter()
+        .map(|c| CertificateDer::from(c))
         .collect();
 
     if certs.is_empty() {
         return Err(format!("No certificates found in cert file '{}'", cert_file).into());
     }
 
-    // Read private key
+    // Read private key - try PKCS8 first, then RSA
     let key_file_handle = File::open(key_file)
         .map_err(|e| format!("Failed to open key file '{}': {}", key_file, e))?;
     let mut key_reader = BufReader::new(key_file_handle);
-    let key = private_key(&mut key_reader)
-        .map_err(|e| format!("Failed to parse key file '{}': {}", key_file, e))?
-        .ok_or_else(|| format!("No private key found in key file '{}'", key_file))?;
+    let keys = pkcs8_private_keys(&mut key_reader)
+        .map_err(|e| format!("Failed to parse key file '{}': {}", key_file, e))?;
+    let key: PrivateKeyDer<'static> = if !keys.is_empty() {
+        PrivateKeyDer::Pkcs8(keys.into_iter().next().unwrap().into())
+    } else {
+        // Try RSA format
+        let key_file_handle = File::open(key_file)
+            .map_err(|e| format!("Failed to open key file '{}': {}", key_file, e))?;
+        let mut key_reader = BufReader::new(key_file_handle);
+        let keys = rsa_private_keys(&mut key_reader)
+            .map_err(|e| format!("Failed to parse key file '{}': {}", key_file, e))?;
+        if keys.is_empty() {
+            return Err(format!("No private key found in key file '{}'", key_file).into());
+        }
+        PrivateKeyDer::Pkcs1(keys.into_iter().next().unwrap().into())
+    };
 
     // Build TLS config
     let config = rustls::ServerConfig::builder()
@@ -6501,7 +6517,7 @@ async fn run_tls_proxy_async(host: &str, port: &str, socket_path: &PathBuf) {
 
         // Create a config that accepts invalid certs (common for MUD servers)
         let mut root_store = RootCertStore::empty();
-        root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+        root_store.roots = webpki_roots::TLS_SERVER_ROOTS.iter().map(|ta| { rustls::pki_types::TrustAnchor { subject: ta.subject.into(), subject_public_key_info: ta.spki.into(), name_constraints: ta.name_constraints.map(|nc| nc.into()), } }).collect();
 
         let config = rustls::ClientConfig::builder()
             .dangerous()
@@ -18045,7 +18061,7 @@ async fn connect_multiuser_world(
                     use rustls::pki_types::ServerName;
 
                     let mut root_store = RootCertStore::empty();
-                    root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+                    root_store.roots = webpki_roots::TLS_SERVER_ROOTS.iter().map(|ta| { rustls::pki_types::TrustAnchor { subject: ta.subject.into(), subject_public_key_info: ta.spki.into(), name_constraints: ta.name_constraints.map(|nc| nc.into()), } }).collect();
 
                     let config = rustls::ClientConfig::builder()
                         .dangerous()
@@ -18277,7 +18293,7 @@ async fn connect_daemon_world(
                     use rustls::pki_types::ServerName;
 
                     let mut root_store = RootCertStore::empty();
-                    root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+                    root_store.roots = webpki_roots::TLS_SERVER_ROOTS.iter().map(|ta| { rustls::pki_types::TrustAnchor { subject: ta.subject.into(), subject_public_key_info: ta.spki.into(), name_constraints: ta.name_constraints.map(|nc| nc.into()), } }).collect();
 
                     let config = rustls::ClientConfig::builder()
                         .dangerous()
@@ -24548,7 +24564,7 @@ async fn handle_command(cmd: &str, app: &mut App, event_tx: mpsc::Sender<AppEven
 
                             // Create a config that accepts invalid certs (common for MUD servers)
                             let mut root_store = RootCertStore::empty();
-                            root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+                            root_store.roots = webpki_roots::TLS_SERVER_ROOTS.iter().map(|ta| { rustls::pki_types::TrustAnchor { subject: ta.subject.into(), subject_public_key_info: ta.spki.into(), name_constraints: ta.name_constraints.map(|nc| nc.into()), } }).collect();
 
                             let config = rustls::ClientConfig::builder()
                                 .dangerous()
@@ -25290,7 +25306,7 @@ async fn handle_command(cmd: &str, app: &mut App, event_tx: mpsc::Sender<AppEven
 }
 
 fn ui(f: &mut Frame, app: &mut App) {
-    let total_height = f.area().height.max(3);  // Minimum 3 lines for output + separator + input
+    let total_height = f.size().height.max(3);  // Minimum 3 lines for output + separator + input
 
     // Layout: output area, separator bar (1 line), input area
     let separator_height = 1;
@@ -25300,7 +25316,7 @@ fn ui(f: &mut Frame, app: &mut App) {
     // Store output dimensions for scrolling and more-mode calculations
     // Use max(1) to prevent any division by zero elsewhere
     let new_output_height = output_height.max(1);
-    let new_output_width = f.area().width.max(1);
+    let new_output_width = f.size().width.max(1);
     // Mark output for redraw if dimensions changed (terminal resize)
     let dimensions_changed = new_output_height != app.output_height || new_output_width != app.output_width;
     if dimensions_changed {
@@ -25320,7 +25336,7 @@ fn ui(f: &mut Frame, app: &mut App) {
             Constraint::Length(separator_height),
             Constraint::Length(input_total_height),
         ])
-        .split(f.area());
+        .split(f.size());
 
     let output_area = chunks[0];
     let separator_area = chunks[1];
@@ -26247,7 +26263,7 @@ fn render_input_area(f: &mut Frame, app: &mut App, area: Rect) {
         let cursor_x = area.x + cursor_col as u16;
         // Calculate visual line within viewport
         let cursor_y = area.y + viewport_line as u16;
-        f.set_cursor_position((cursor_x, cursor_y.min(area.y + area.height - 1)));
+        f.set_cursor(cursor_x, cursor_y.min(area.y + area.height - 1));
     }
 }
 
@@ -26535,7 +26551,7 @@ fn render_confirm_dialog(f: &mut Frame, app: &App) {
         return;
     }
 
-    let area = f.area();
+    let area = f.size();
     let dialog = &app.confirm_dialog;
     let theme = app.settings.theme;
 
@@ -26593,7 +26609,7 @@ fn render_filter_popup(f: &mut Frame, app: &App) {
         return;
     }
 
-    let area = f.area();
+    let area = f.size();
     let filter = &app.filter_popup;
     let theme = app.settings.theme;
 

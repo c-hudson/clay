@@ -497,27 +497,43 @@ impl WebSocketServer {
     pub fn configure_tls(&mut self, cert_file: &str, key_file: &str) -> Result<(), Box<dyn std::error::Error>> {
         use std::fs::File;
         use std::io::BufReader;
-        use rustls_pemfile::{certs, private_key};
+        use rustls_pemfile::{certs, pkcs8_private_keys, rsa_private_keys};
+        use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 
         // Read certificate chain
         let cert_file_handle = File::open(cert_file)
             .map_err(|e| format!("Failed to open cert file '{}': {}", cert_file, e))?;
         let mut cert_reader = BufReader::new(cert_file_handle);
-        let certs: Vec<rustls::pki_types::CertificateDer<'static>> = certs(&mut cert_reader)
-            .filter_map(|r| r.ok())
+        let certs: Vec<CertificateDer<'static>> = certs(&mut cert_reader)
+            .map_err(|e| format!("Failed to parse cert file '{}': {}", cert_file, e))?
+            .into_iter()
+            .map(|c| CertificateDer::from(c))
             .collect();
 
         if certs.is_empty() {
             return Err(format!("No certificates found in cert file '{}'", cert_file).into());
         }
 
-        // Read private key
+        // Read private key - try PKCS8 first, then RSA
         let key_file_handle = File::open(key_file)
             .map_err(|e| format!("Failed to open key file '{}': {}", key_file, e))?;
         let mut key_reader = BufReader::new(key_file_handle);
-        let key = private_key(&mut key_reader)
-            .map_err(|e| format!("Failed to parse key file '{}': {}", key_file, e))?
-            .ok_or_else(|| format!("No private key found in key file '{}'", key_file))?;
+        let keys = pkcs8_private_keys(&mut key_reader)
+            .map_err(|e| format!("Failed to parse key file '{}': {}", key_file, e))?;
+        let key: PrivateKeyDer<'static> = if !keys.is_empty() {
+            PrivateKeyDer::Pkcs8(keys.into_iter().next().unwrap().into())
+        } else {
+            // Try RSA format
+            let key_file_handle = File::open(key_file)
+                .map_err(|e| format!("Failed to open key file '{}': {}", key_file, e))?;
+            let mut key_reader = BufReader::new(key_file_handle);
+            let keys = rsa_private_keys(&mut key_reader)
+                .map_err(|e| format!("Failed to parse key file '{}': {}", key_file, e))?;
+            if keys.is_empty() {
+                return Err(format!("No private key found in key file '{}'", key_file).into());
+            }
+            PrivateKeyDer::Pkcs1(keys.into_iter().next().unwrap().into())
+        };
 
         // Build TLS config
         let config = rustls::ServerConfig::builder()

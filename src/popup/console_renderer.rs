@@ -21,7 +21,7 @@ pub fn render_popup(f: &mut Frame, state: &mut PopupState, theme: Theme) {
         return;
     }
 
-    let area = f.area();
+    let area = f.size();
     let layout = &state.definition.layout;
 
     // Calculate popup dimensions
@@ -1056,7 +1056,7 @@ pub fn render_filter_popup_new(
     cursor: usize,
     theme: Theme,
 ) {
-    let area = f.area();
+    let area = f.size();
 
     // Small popup in upper right corner
     let popup_width = 40u16.min(area.width);
