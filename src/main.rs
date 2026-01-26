@@ -49,6 +49,7 @@ use aes_gcm::{
     aead::{Aead, KeyInit},
     Aes256Gcm, Nonce,
 };
+use async_recursion::async_recursion;
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use bytes::BytesMut;
 use crossterm::{
@@ -419,8 +420,6 @@ async fn handle_https_client(
     ws_port: u16,
     ws_use_tls: bool,
 ) {
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-
     let mut buf = [0u8; 4096];
     let n = match stream.read(&mut buf).await {
         Ok(n) if n > 0 => n,
@@ -740,8 +739,6 @@ async fn handle_http_client(
     ban_list: BanList,
     client_ip: String,
 ) {
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-
     // Check if IP is banned
     if ban_list.is_banned(&client_ip) {
         // Send minimal response and close
@@ -6475,9 +6472,7 @@ fn spawn_tls_proxy(
 /// Async implementation of the TLS proxy main loop (runs in separate process via --tls-proxy)
 #[cfg(not(target_os = "android"))]
 async fn run_tls_proxy_async(host: &str, port: &str, socket_path: &PathBuf) {
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    use tokio::net::{TcpStream, UnixListener};
-    use std::os::unix::io::AsRawFd;
+    use tokio::net::UnixListener;
 
     // Step 1: Connect to the MUD server with TLS
     let tcp_stream = match TcpStream::connect(format!("{}:{}", host, port)).await {
@@ -6510,7 +6505,6 @@ async fn run_tls_proxy_async(host: &str, port: &str, socket_path: &PathBuf) {
     // Establish TLS connection
     #[cfg(feature = "rustls-backend")]
     let tls_stream = {
-        use std::sync::Arc;
         use rustls::RootCertStore;
         use tokio_rustls::TlsConnector;
         use rustls::pki_types::ServerName;
@@ -6744,7 +6738,6 @@ mod remote_gui {
 
     impl GuiCachedNow {
         fn new() -> Self {
-            use std::time::{SystemTime, UNIX_EPOCH};
             let now_secs = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .unwrap_or_default()
@@ -15141,7 +15134,7 @@ fn run_remote_gui(addr: &str) -> io::Result<()> {
 /// Uses the same App struct and ui() function as the normal console interface
 async fn run_console_client(addr: &str) -> io::Result<()> {
     use tokio_tungstenite::{connect_async, tungstenite::Message};
-    use futures::{StreamExt, SinkExt};
+    use futures::SinkExt;
 
     // Parse address - add ws:// prefix if not present
     let ws_url = if addr.starts_with("ws://") || addr.starts_with("wss://") {
@@ -17984,10 +17977,6 @@ async fn connect_multiuser_world(
     settings: &WorldSettings,
     event_tx: mpsc::Sender<AppEvent>,
 ) -> Option<mpsc::Sender<WriteCommand>> {
-    use tokio::net::TcpStream;
-    use tokio::io::AsyncReadExt;
-    use bytes::BytesMut;
-
     let host = &settings.hostname;
     let port = &settings.port;
     let use_ssl = settings.use_ssl;
@@ -18003,7 +17992,6 @@ async fn connect_multiuser_world(
             // Enable TCP keepalive to detect dead connections faster
             #[cfg(unix)]
             {
-                use std::os::unix::io::AsRawFd;
                 let fd = tcp_stream.as_raw_fd();
                 unsafe {
                     let enable: libc::c_int = 1;
@@ -18048,7 +18036,6 @@ async fn connect_multiuser_world(
 
                 #[cfg(feature = "rustls-backend")]
                 {
-                    use std::sync::Arc;
                     use rustls::RootCertStore;
                     use tokio_rustls::TlsConnector;
                     use rustls::pki_types::ServerName;
@@ -18177,7 +18164,6 @@ async fn connect_multiuser_world(
 
             // Spawn writer task
             tokio::spawn(async move {
-                use tokio::io::AsyncWriteExt;
                 while let Some(cmd) = cmd_rx.recv().await {
                     match cmd {
                         WriteCommand::Text(text) => {
@@ -18235,7 +18221,6 @@ async fn connect_daemon_world(
             // Enable TCP keepalive to detect dead connections faster
             #[cfg(unix)]
             {
-                use std::os::unix::io::AsRawFd;
                 let fd = tcp_stream.as_raw_fd();
                 unsafe {
                     let enable: libc::c_int = 1;
@@ -18280,7 +18265,6 @@ async fn connect_daemon_world(
 
                 #[cfg(feature = "rustls-backend")]
                 {
-                    use std::sync::Arc;
                     use rustls::RootCertStore;
                     use tokio_rustls::TlsConnector;
                     use rustls::pki_types::ServerName;
@@ -18396,7 +18380,6 @@ async fn connect_daemon_world(
 
             // Spawn writer task
             tokio::spawn(async move {
-                use tokio::io::AsyncWriteExt;
                 while let Some(cmd) = cmd_rx.recv().await {
                     match cmd {
                         WriteCommand::Text(text) => {
@@ -19226,7 +19209,6 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
 
                 // Spawn writer task
                 tokio::spawn(async move {
-                    use tokio::io::AsyncWriteExt;
                     while let Some(cmd) = cmd_rx.recv().await {
                         match cmd {
                             WriteCommand::Text(text) => {
@@ -23675,7 +23657,6 @@ async fn connect_slack(app: &mut App, event_tx: mpsc::Sender<AppEvent>) -> bool 
 
     // Connect to Slack WebSocket
     use tokio_tungstenite::tungstenite::Message as WsMsg;
-    use futures::StreamExt;
 
     let (ws_stream, _) = match tokio_tungstenite::connect_async(&ws_url).await {
         Ok(s) => s,
@@ -23937,7 +23918,6 @@ async fn connect_discord(app: &mut App, event_tx: mpsc::Sender<AppEvent>) -> boo
 
     // Connect to Discord Gateway
     use tokio_tungstenite::tungstenite::Message as WsMsg;
-    use futures::StreamExt;
 
     let (ws_stream, _) = match tokio_tungstenite::connect_async("wss://gateway.discord.gg/?v=10&encoding=json").await {
         Ok(s) => s,
@@ -24122,6 +24102,7 @@ async fn connect_discord(app: &mut App, event_tx: mpsc::Sender<AppEvent>) -> boo
     false
 }
 
+#[async_recursion(?Send)]
 async fn handle_command(cmd: &str, app: &mut App, event_tx: mpsc::Sender<AppEvent>) -> bool {
     let parsed = parse_command(cmd);
 
@@ -24550,7 +24531,6 @@ async fn handle_command(cmd: &str, app: &mut App, event_tx: mpsc::Sender<AppEven
 
                         #[cfg(feature = "rustls-backend")]
                         {
-                            use std::sync::Arc;
                             use rustls::RootCertStore;
                             use tokio_rustls::TlsConnector;
                             use rustls::pki_types::ServerName;
@@ -24783,7 +24763,6 @@ async fn handle_command(cmd: &str, app: &mut App, event_tx: mpsc::Sender<AppEven
                     });
 
                     tokio::spawn(async move {
-                        use tokio::io::AsyncWriteExt;
                         while let Some(cmd) = cmd_rx.recv().await {
                             match cmd {
                                 WriteCommand::Text(text) => {
@@ -25359,7 +25338,7 @@ fn ui(f: &mut Frame, app: &mut App) {
 /// Returns early if splash screen or popup is visible (let ratatui handle those)
 fn render_output_crossterm(app: &App) {
     use std::io::Write;
-    use crossterm::{cursor, style::Print, QueueableCommand};
+    use crossterm::{style::Print, QueueableCommand};
 
     // Skip if showing splash screen or any popup is visible (except filter popup)
     let any_popup_visible = app.confirm_dialog.visible
