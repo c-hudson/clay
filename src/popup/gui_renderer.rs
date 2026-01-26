@@ -162,11 +162,14 @@ pub fn render_popup_content(
                     let hint = placeholder.as_deref().unwrap_or("");
 
                     // For full-width fields (no label), add left margin
+                    // Vertical margin calculated to center text in row_height (28px)
+                    let horizontal_margin = if has_label { 4.0 } else { 15.0 };
                     let text_edit = egui::TextEdit::singleline(&mut text)
                         .hint_text(RichText::new(hint).color(theme.fg_dim))
                         .text_color(theme.fg_primary)
                         .frame(true)
-                        .margin(egui::vec2(if has_label { 4.0 } else { 15.0 }, 4.0));
+                        .vertical_align(egui::Align::Center)
+                        .margin(egui::vec2(horizontal_margin, 6.0));
 
                     let response = ui.add_sized(
                         [ui.available_width(), row_height],
