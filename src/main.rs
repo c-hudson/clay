@@ -37,8 +37,11 @@ pub use websocket::{
 use std::collections::{HashMap, HashSet};
 use std::io::{self, stdout, BufRead, Write as IoWrite};
 use std::os::unix::io::{AsRawFd, FromRawFd, RawFd};
+#[cfg(not(target_os = "android"))]
 use std::os::unix::fs::PermissionsExt;
-use std::path::{Path, PathBuf};
+#[cfg(not(target_os = "android"))]
+use std::path::Path;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicPtr, AtomicU32, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -17348,6 +17351,7 @@ async fn run_daemon_server() -> io::Result<()> {
 
     // Main event loop - handles MUD connections and WebSocket messages
     loop {
+        #[cfg(not(target_os = "android"))]
         reap_zombie_children();
 
         tokio::select! {
@@ -17812,6 +17816,7 @@ keep_alive_type=Generic
     // Main event loop - only handles WebSocket events
     loop {
         // Reap any zombie child processes (TLS proxies that have exited)
+        #[cfg(not(target_os = "android"))]
         reap_zombie_children();
 
         tokio::select! {
