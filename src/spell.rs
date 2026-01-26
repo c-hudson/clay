@@ -6,6 +6,10 @@ const SYSTEM_DICT_PATHS: &[&str] = &[
     "/usr/share/dict/words",
     "/usr/share/dict/american-english",
     "/usr/share/dict/british-english",
+    // Termux (Android) paths
+    "/data/data/com.termux/files/usr/share/dict/words",
+    "/data/data/com.termux/files/usr/share/dict/american-english",
+    "/data/data/com.termux/files/usr/share/dict/british-english",
 ];
 
 // Common contraction suffixes (after apostrophe)
@@ -43,7 +47,15 @@ impl SpellChecker {
         Self { words }
     }
 
+    pub fn has_dictionary(&self) -> bool {
+        !self.words.is_empty()
+    }
+
     pub fn is_valid(&self, word: &str) -> bool {
+        // If no dictionary loaded, consider all words valid (don't mark anything as misspelled)
+        if self.words.is_empty() {
+            return true;
+        }
         if word.is_empty() {
             return true;
         }
