@@ -13292,9 +13292,10 @@ mod remote_gui {
                                                 ui.label(egui::RichText::new(http_port_label).size(12.0).color(theme.fg_secondary()));
                                             });
                                             let mut http_port_str = http_port.to_string();
+                                            let field_width = ui.available_width();
                                             if ui.add(egui::TextEdit::singleline(&mut http_port_str)
                                                 .text_color(theme.fg())
-                                                .desired_width(80.0)
+                                                .desired_width(field_width)
                                                 .margin(egui::vec2(8.0, 6.0))).changed() {
                                                 if let Ok(port) = http_port_str.parse::<u16>() {
                                                     http_port = port;
@@ -13326,9 +13327,10 @@ mod remote_gui {
                                                 ui.label(egui::RichText::new(ws_port_label).size(12.0).color(theme.fg_secondary()));
                                             });
                                             let mut ws_port_str = ws_port.to_string();
+                                            let field_width = ui.available_width();
                                             if ui.add(egui::TextEdit::singleline(&mut ws_port_str)
                                                 .text_color(theme.fg())
-                                                .desired_width(80.0)
+                                                .desired_width(field_width)
                                                 .margin(egui::vec2(8.0, 6.0))).changed() {
                                                 if let Ok(port) = ws_port_str.parse::<u16>() {
                                                     ws_port = port;
@@ -13340,11 +13342,11 @@ mod remote_gui {
                                             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                                                 ui.label(egui::RichText::new("Allow List").size(12.0).color(theme.fg_secondary()));
                                             });
-                                            let allow_list_width = ui.available_width() - 16.0; // padding from right edge
+                                            let field_width = ui.available_width();
                                             ui.add(egui::TextEdit::singleline(&mut ws_allow_list)
                                                 .text_color(theme.fg())
                                                 .hint_text("localhost, 192.168.*")
-                                                .desired_width(allow_list_width)
+                                                .desired_width(field_width)
                                                 .margin(egui::vec2(8.0, 6.0)));
                                             ui.end_row();
                                         });
