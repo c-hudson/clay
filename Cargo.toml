@@ -44,7 +44,7 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "rus
 # GUI client (optional)
 eframe = { version = "0.30", optional = true, default-features = false, features = ["default_fonts", "glow", "x11"] }
 egui = { version = "0.30", optional = true }
-egui_extras = { version = "0.30", optional = true, features = ["image", "svg"] }
+egui_extras = { version = "0.30", optional = true, default-features = false, features = ["image", "svg"] }
 image = { version = "0.25", optional = true, default-features = false, features = ["png", "gif"] }
 
 # Audio playback for ANSI music (optional, requires ALSA dev libraries on Linux)
