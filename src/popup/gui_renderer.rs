@@ -245,9 +245,13 @@ pub fn render_popup_content(
                     ui.horizontal(|ui| {
                         for (i, h) in hdrs.iter().enumerate() {
                             let w = widths.get(i).copied().unwrap_or(100.0);
-                            ui.add_sized([w, row_height], egui::Label::new(
-                                RichText::new(h).color(theme.fg_dim).strong()
-                            ));
+                            ui.allocate_ui_with_layout(
+                                egui::vec2(w, row_height),
+                                egui::Layout::left_to_right(egui::Align::Center),
+                                |ui| {
+                                    ui.label(RichText::new(h.as_str()).color(theme.fg_dim).strong());
+                                }
+                            );
                         }
                     });
                 }
@@ -281,9 +285,13 @@ pub fn render_popup_content(
 
                                 for (i, col) in item.columns.iter().enumerate() {
                                     let w = widths.get(i).copied().unwrap_or(100.0);
-                                    ui.add_sized([w, row_height], egui::Label::new(
-                                        RichText::new(col).color(text_color)
-                                    ));
+                                    ui.allocate_ui_with_layout(
+                                        egui::vec2(w, row_height),
+                                        egui::Layout::left_to_right(egui::Align::Center),
+                                        |ui| {
+                                            ui.label(RichText::new(col).color(text_color));
+                                        }
+                                    );
                                 }
 
                                 ui.interact(rect, ui.id().with(idx), egui::Sense::click())
