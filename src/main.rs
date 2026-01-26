@@ -10145,7 +10145,7 @@ mod remote_gui {
                                 ui.close_menu();
                             }
                             if ui.button("Worlds").clicked() {
-                                action = Some("connected_worlds");
+                                action = Some("world_selector");
                                 ui.close_menu();
                             }
                             ui.separator();
@@ -10285,6 +10285,11 @@ mod remote_gui {
                     }
                     Some("connected_worlds") => {
                         self.open_connections_unified();
+                    }
+                    Some("world_selector") => {
+                        self.popup_state = PopupState::ConnectedWorlds;
+                        self.world_list_selected = self.current_world;
+                        self.only_connected_worlds = false;
                     }
                     Some("actions") => {
                         self.open_actions_list_unified();
@@ -13942,7 +13947,33 @@ mod remote_gui {
                                 self.only_connected_worlds = false;
                             }
                             super::Command::WorldsList => {
-                                self.open_connections_unified();
+                                // Output connected worlds list as text (no window)
+                                let worlds_info: Vec<super::util::WorldListInfo> = self.worlds.iter().enumerate().map(|(idx, world)| {
+                                    super::util::WorldListInfo {
+                                        name: world.name.clone(),
+                                        connected: world.connected,
+                                        is_current: idx == self.current_world,
+                                        is_ssl: world.settings.use_ssl,
+                                        is_proxy: false,
+                                        unseen_lines: world.unseen_lines,
+                                        last_send_secs: world.last_send_secs,
+                                        last_recv_secs: world.last_recv_secs,
+                                        last_nop_secs: world.last_nop_secs,
+                                        next_nop_secs: None,
+                                    }
+                                }).collect();
+                                let output = super::util::format_worlds_list(&worlds_info);
+                                let ts = super::current_timestamp_secs();
+                                if self.current_world < self.worlds.len() {
+                                    for line in output.lines() {
+                                        self.worlds[self.current_world].output_lines.push(TimestampedLine {
+                                            text: line.to_string(),
+                                            ts,
+                                            gagged: false,
+                                            from_server: false,
+                                        });
+                                    }
+                                }
                             }
                             _ => close_popup = true,
                         }
