@@ -241,25 +241,34 @@ pub fn render_popup_content(
                     default_widths
                 };
 
+                // Calculate column start positions
+                let mut col_starts: Vec<f32> = vec![0.0];
+                for w in &widths[..widths.len().saturating_sub(1)] {
+                    col_starts.push(col_starts.last().unwrap() + w);
+                }
+
+                let available_width = ui.available_width();
+
                 if let Some(hdrs) = headers {
-                    ui.horizontal(|ui| {
-                        for (i, h) in hdrs.iter().enumerate() {
-                            let w = widths.get(i).copied().unwrap_or(100.0);
-                            ui.allocate_ui_with_layout(
-                                egui::vec2(w, row_height),
-                                egui::Layout::left_to_right(egui::Align::Center),
-                                |ui| {
-                                    ui.label(RichText::new(h.as_str()).color(theme.fg_dim).strong());
-                                }
-                            );
-                        }
-                    });
+                    let (rect, _) = ui.allocate_exact_size(egui::vec2(available_width, row_height), egui::Sense::hover());
+                    for (i, h) in hdrs.iter().enumerate() {
+                        let x = rect.min.x + col_starts.get(i).copied().unwrap_or(0.0);
+                        let text_pos = egui::pos2(x, rect.min.y + (row_height - 14.0) / 2.0);
+                        ui.painter().text(
+                            text_pos,
+                            egui::Align2::LEFT_TOP,
+                            h.as_str(),
+                            egui::FontId::proportional(14.0),
+                            theme.fg_dim,
+                        );
+                    }
                 }
 
                 egui::ScrollArea::vertical()
                     .max_height(list_height)
                     .id_source(format!("{:?}_list", field_id))
                     .show(ui, |ui| {
+                        let scroll_width = ui.available_width();
                         for (idx, item) in items.iter().enumerate() {
                             let is_item_selected = idx == *selected_index;
 
@@ -275,27 +284,29 @@ pub fn render_popup_content(
                                 Color32::TRANSPARENT
                             };
 
-                            // Render as a clickable row with columns
-                            let response = ui.horizontal(|ui| {
-                                // Background for selection
-                                let rect = ui.available_rect_before_wrap();
-                                if is_item_selected {
-                                    ui.painter().rect_filled(rect, 0.0, bg_color);
-                                }
+                            // Allocate row space
+                            let (rect, response) = ui.allocate_exact_size(
+                                egui::vec2(scroll_width, row_height),
+                                egui::Sense::click()
+                            );
 
-                                for (i, col) in item.columns.iter().enumerate() {
-                                    let w = widths.get(i).copied().unwrap_or(100.0);
-                                    ui.allocate_ui_with_layout(
-                                        egui::vec2(w, row_height),
-                                        egui::Layout::left_to_right(egui::Align::Center),
-                                        |ui| {
-                                            ui.label(RichText::new(col).color(text_color));
-                                        }
-                                    );
-                                }
+                            // Draw selection background
+                            if is_item_selected {
+                                ui.painter().rect_filled(rect, 0.0, bg_color);
+                            }
 
-                                ui.interact(rect, ui.id().with(idx), egui::Sense::click())
-                            }).inner;
+                            // Draw each column at fixed positions
+                            for (i, col) in item.columns.iter().enumerate() {
+                                let x = rect.min.x + col_starts.get(i).copied().unwrap_or(0.0);
+                                let text_pos = egui::pos2(x, rect.min.y + (row_height - 14.0) / 2.0);
+                                ui.painter().text(
+                                    text_pos,
+                                    egui::Align2::LEFT_TOP,
+                                    col,
+                                    egui::FontId::proportional(14.0),
+                                    text_color,
+                                );
+                            }
 
                             if response.clicked() {
                                 actions.list_selected.push((field_id, idx));
