@@ -135,9 +135,11 @@ pub fn render_popup_content(
             }
 
             FieldKind::Text { value, masked, placeholder } => {
+                let has_label = !field.label.is_empty();
+
                 ui.horizontal(|ui| {
                     // Label (only if not empty)
-                    if !field.label.is_empty() {
+                    if has_label {
                         ui.add_sized(
                             [label_width, row_height],
                             egui::Label::new(RichText::new(&field.label).color(theme.fg_secondary)),
@@ -158,12 +160,17 @@ pub fn render_popup_content(
                     };
 
                     let hint = placeholder.as_deref().unwrap_or("");
+
+                    // For full-width fields (no label), add left margin
+                    let text_edit = egui::TextEdit::singleline(&mut text)
+                        .hint_text(RichText::new(hint).color(theme.fg_dim))
+                        .text_color(theme.fg_primary)
+                        .frame(true)
+                        .margin(egui::vec2(if has_label { 4.0 } else { 15.0 }, 4.0));
+
                     let response = ui.add_sized(
                         [ui.available_width(), row_height],
-                        egui::TextEdit::singleline(&mut text)
-                            .hint_text(RichText::new(hint).color(theme.fg_dim))
-                            .text_color(theme.fg_primary)
-                            .frame(true),
+                        text_edit,
                     );
 
                     if response.changed() {
