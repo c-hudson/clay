@@ -13174,13 +13174,12 @@ mod remote_gui {
                                 should_close = true;
                             }
 
-                            // Bottom panel for buttons
+                            // Bottom panel for buttons - positioned like actions list
                             egui::TopBottomPanel::bottom("web_settings_buttons")
-                                .exact_height(44.0)
+                                .exact_height(50.0)
                                 .frame(egui::Frame::none()
-                                    .fill(theme.bg_surface())
-                                    .stroke(egui::Stroke::new(1.0, theme.border_subtle()))
-                                    .inner_margin(egui::Margin { left: 16.0, right: 1.0, top: 8.0, bottom: 8.0 }))
+                                    .fill(theme.bg_elevated())
+                                    .inner_margin(egui::Margin { left: 16.0, right: 16.0, top: 15.0, bottom: 15.0 }))
                                 .show(ctx, |ui| {
                                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                                         ui.spacing_mut().item_spacing = egui::vec2(8.0, 0.0);
