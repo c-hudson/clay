@@ -300,6 +300,12 @@ pub fn render_popup_content(
                 let available_height = ui.available_height() - 45.0; // Reserve space for buttons
                 let list_height = available_height.max(min_list_height);
 
+                // Draw slightly lighter background for list area
+                let list_bg = Color32::from_rgb(38, 38, 38);
+                egui::Frame::none()
+                    .fill(list_bg)
+                    .rounding(4.0)
+                    .show(ui, |ui| {
                 egui::ScrollArea::vertical()
                     .max_height(list_height)
                     .id_source(format!("{:?}_list", field_id))
@@ -349,6 +355,7 @@ pub fn render_popup_content(
                             }
                         }
                     });
+                }); // Close Frame
                 ui.add_space(row_spacing);
             }
 
