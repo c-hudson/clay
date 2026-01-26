@@ -127,7 +127,7 @@ pub fn create_actions_list_popup(actions: &[ActionInfo], visible_height: usize) 
         .with_button(Button::new(ACTIONS_BTN_DELETE, "Delete").danger().with_shortcut('D'))
         .with_button(Button::new(ACTIONS_BTN_ADD, "Add").with_shortcut('A'))
         .with_button(Button::new(ACTIONS_BTN_EDIT, "Edit").with_shortcut('E'))
-        .with_button(Button::new(ACTIONS_BTN_CANCEL, "Cancel").with_shortcut('C'))
+        .with_button(Button::new(ACTIONS_BTN_CANCEL, "Ok").primary().with_shortcut('O'))
         .with_layout(PopupLayout {
             label_width: 8,
             min_width: 550,  // Accommodate columns (180+100+220) plus padding

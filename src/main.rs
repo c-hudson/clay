@@ -14836,7 +14836,7 @@ mod remote_gui {
                         egui::ViewportId::from_hash_of(format!("unified_popup_{}", popup_id_str)),
                         egui::ViewportBuilder::default()
                             .with_title(format!("{} - Clay MUD Client", popup_title))
-                            .with_inner_size([min_width.max(400.0), 480.0]),
+                            .with_inner_size([min_width.max(400.0), 420.0]),
                         |ctx, _class| {
                             // Apply popup styling
                             ctx.style_mut(|style| {
@@ -14879,7 +14879,7 @@ mod remote_gui {
                             egui::CentralPanel::default()
                                 .frame(egui::Frame::none()
                                     .fill(theme.bg_elevated())
-                                    .inner_margin(egui::Margin::same(16.0)))
+                                    .inner_margin(egui::Margin { left: 16.0, right: 16.0, top: 16.0, bottom: 15.0 }))
                                 .show(ctx, |ui| {
                                     // Create GUI popup theme from current theme
                                     let gui_theme = crate::popup::gui_renderer::GuiPopupTheme::from_colors(

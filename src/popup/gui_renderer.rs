@@ -229,40 +229,63 @@ pub fn render_popup_content(
                 ui.add_space(row_spacing);
             }
 
-            FieldKind::List { items, selected_index, visible_height, headers, column_widths, .. } => {
-                // Render list with optional headers and proper column alignment
-                let list_height = (*visible_height as f32) * row_height;
+            FieldKind::List { items, selected_index, visible_height, headers, .. } => {
+                // Auto-size columns based on content
+                // First, measure max width of each column (except last which gets remaining space)
+                let num_cols = items.first().map(|i| i.columns.len()).unwrap_or(3);
+                let font_id = egui::TextStyle::Body.resolve(ui.style());
+                let col_padding = 16.0; // padding between columns
 
-                // Calculate column widths - use provided widths or default proportions
-                let default_widths = vec![150.0, 100.0, 200.0];
-                let widths: Vec<f32> = if let Some(cw) = column_widths {
-                    cw.iter().map(|&w| w as f32).collect()
-                } else {
-                    default_widths
-                };
+                let mut col_widths: Vec<f32> = vec![0.0; num_cols];
+
+                // Measure header widths
+                if let Some(hdrs) = headers {
+                    for (i, h) in hdrs.iter().enumerate() {
+                        if i < num_cols {
+                            let galley = ui.fonts(|f| f.layout_no_wrap(h.clone(), font_id.clone(), Color32::WHITE));
+                            col_widths[i] = col_widths[i].max(galley.size().x + col_padding);
+                        }
+                    }
+                }
+
+                // Measure content widths for first N-1 columns (last column gets remaining space)
+                for item in items.iter() {
+                    for (i, col) in item.columns.iter().enumerate() {
+                        if i < num_cols.saturating_sub(1) {
+                            let galley = ui.fonts(|f| f.layout_no_wrap(col.clone(), font_id.clone(), Color32::WHITE));
+                            col_widths[i] = col_widths[i].max(galley.size().x + col_padding);
+                        }
+                    }
+                }
 
                 // Calculate column start positions
                 let mut col_starts: Vec<f32> = vec![0.0];
-                for w in &widths[..widths.len().saturating_sub(1)] {
-                    col_starts.push(col_starts.last().unwrap() + w);
+                for i in 0..num_cols.saturating_sub(1) {
+                    col_starts.push(col_starts.last().unwrap() + col_widths[i]);
                 }
 
                 let available_width = ui.available_width();
 
+                // Render headers
                 if let Some(hdrs) = headers {
                     let (rect, _) = ui.allocate_exact_size(egui::vec2(available_width, row_height), egui::Sense::hover());
                     for (i, h) in hdrs.iter().enumerate() {
                         let x = rect.min.x + col_starts.get(i).copied().unwrap_or(0.0);
-                        let text_pos = egui::pos2(x, rect.min.y + (row_height - 14.0) / 2.0);
+                        let text_pos = egui::pos2(x, rect.min.y + (row_height - font_id.size) / 2.0);
                         ui.painter().text(
                             text_pos,
                             egui::Align2::LEFT_TOP,
                             h.as_str(),
-                            egui::FontId::proportional(14.0),
+                            font_id.clone(),
                             theme.fg_dim,
                         );
                     }
                 }
+
+                // Calculate list height - use remaining available height minus space for buttons
+                let min_list_height = (*visible_height as f32) * row_height;
+                let available_height = ui.available_height() - 60.0; // Reserve space for buttons
+                let list_height = available_height.max(min_list_height);
 
                 egui::ScrollArea::vertical()
                     .max_height(list_height)
@@ -298,12 +321,12 @@ pub fn render_popup_content(
                             // Draw each column at fixed positions
                             for (i, col) in item.columns.iter().enumerate() {
                                 let x = rect.min.x + col_starts.get(i).copied().unwrap_or(0.0);
-                                let text_pos = egui::pos2(x, rect.min.y + (row_height - 14.0) / 2.0);
+                                let text_pos = egui::pos2(x, rect.min.y + (row_height - font_id.size) / 2.0);
                                 ui.painter().text(
                                     text_pos,
                                     egui::Align2::LEFT_TOP,
                                     col,
-                                    egui::FontId::proportional(14.0),
+                                    font_id.clone(),
                                     text_color,
                                 );
                             }
