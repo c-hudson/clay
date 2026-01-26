@@ -13226,7 +13226,7 @@ mod remote_gui {
                             egui::CentralPanel::default()
                                 .frame(egui::Frame::none()
                                     .fill(theme.bg_elevated())
-                                    .inner_margin(egui::Margin::same(16.0)))
+                                    .inner_margin(egui::Margin { left: 16.0, right: 8.0, top: 16.0, bottom: 16.0 }))
                                 .show(ctx, |ui| {
                                     // Header
                                     ui.label(egui::RichText::new("WEB SETTINGS")
