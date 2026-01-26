@@ -12705,14 +12705,16 @@ mod remote_gui {
 
                             // Bottom panel for buttons
                             egui::TopBottomPanel::bottom("setup_buttons")
-                                .exact_height(60.0)
+                                .exact_height(80.0)
                                 .frame(egui::Frame::none()
                                     .fill(theme.bg_elevated())
-                                    .stroke(egui::Stroke::NONE)
-                                    .inner_margin(egui::Margin { left: 16.0, right: 18.0, top: 12.0, bottom: 20.0 }))
+                                    .stroke(egui::Stroke::NONE))
                                 .show(ctx, |ui| {
+                                    ui.add_space(30.0);  // Top padding to push buttons down
                                     ui.horizontal(|ui| {
+                                        ui.add_space(16.0);  // Left padding
                                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                            ui.add_space(18.0);  // Right padding
                                             ui.spacing_mut().item_spacing = egui::vec2(8.0, 0.0);
 
                                             // Cancel button
@@ -12740,6 +12742,7 @@ mod remote_gui {
                                             }
                                         });
                                     });
+                                    // 80 - 30 - 28 = 22px left at bottom for padding
                                 });
 
                             egui::CentralPanel::default()
