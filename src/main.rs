@@ -13190,7 +13190,7 @@ mod remote_gui {
 
                                             // Spacer to push buttons right
                                             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                                ui.add_space(16.0); // right padding
+                                                ui.add_space(18.0); // right padding
 
                                                 // Save button (primary) - rightmost
                                                 if ui.add(egui::Button::new(
@@ -13226,7 +13226,7 @@ mod remote_gui {
                             egui::CentralPanel::default()
                                 .frame(egui::Frame::none()
                                     .fill(theme.bg_elevated())
-                                    .inner_margin(egui::Margin { left: 16.0, right: 8.0, top: 16.0, bottom: 16.0 }))
+                                    .inner_margin(egui::Margin { left: 16.0, right: 0.0, top: 16.0, bottom: 16.0 }))
                                 .show(ctx, |ui| {
                                     // Header
                                     ui.label(egui::RichText::new("WEB SETTINGS")
