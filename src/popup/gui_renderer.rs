@@ -193,7 +193,7 @@ pub fn render_popup_content(
                     );
 
                     let current = options.get(*selected_index).map(|o| o.label.as_str()).unwrap_or("-");
-                    egui::ComboBox::from_id_salt(format!("select_{}", field_id.0))
+                    egui::ComboBox::from_id_source(format!("select_{}", field_id.0))
                         .selected_text(current)
                         .show_ui(ui, |ui| {
                             for (idx, opt) in options.iter().enumerate() {
@@ -222,7 +222,7 @@ pub fn render_popup_content(
                         (None, None) => i64::MIN..=i64::MAX,
                     };
 
-                    if ui.add(egui::DragValue::new(&mut num).range(range)).changed() {
+                    if ui.add(egui::DragValue::new(&mut num).clamp_range(range)).changed() {
                         actions.number_changed.push((field_id, num));
                     }
                 });

@@ -7011,7 +7011,7 @@ mod remote_gui {
     struct TextEditOutputWrapper {
         response: egui::Response,
         galley: std::sync::Arc<egui::Galley>,
-        cursor_range: Option<egui::text_selection::CursorRange>,
+        cursor_range: Option<egui::text_edit::CursorRange>,
         galley_pos: egui::Pos2,
     }
 
@@ -9508,7 +9508,7 @@ mod remote_gui {
                 let text_pos = rect.min;
 
                 // Paint the galley
-                ui.painter().galley(text_pos, galley.clone(), default_color);
+                ui.painter().galley(text_pos, galley.clone());
 
                 // Check for clicks and hovers using global input state
                 let pointer_pos = ui.input(|i| i.pointer.interact_pos());
@@ -9632,7 +9632,7 @@ mod remote_gui {
                         );
                         fonts.font_data.insert(
                             "custom_mono".to_owned(),
-                            std::sync::Arc::new(font_data),
+                            font_data,
                         );
 
                         // Make it the first priority for monospace
@@ -9659,7 +9659,7 @@ mod remote_gui {
                     if let Ok(font_data) = std::fs::read(path) {
                         fonts.font_data.insert(
                             (*name).to_owned(),
-                            std::sync::Arc::new(egui::FontData::from_owned(font_data)),
+                            egui::FontData::from_owned(font_data),
                         );
                         fonts.families
                             .entry(egui::FontFamily::Monospace)
@@ -9762,7 +9762,7 @@ mod remote_gui {
                                 let password_edit = TextEdit::singleline(&mut self.password)
                                     .password(true)
                                     .desired_width(280.0)
-                                    .margin(egui::Margin::symmetric(12.0, 8.0));
+                                    .margin(egui::vec2(12.0, 8.0));
                                 let response = ui.add(password_edit);
 
                                 if response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
@@ -10380,7 +10380,7 @@ mod remote_gui {
                         let mut scroll_to_y: Option<f32> = None;
 
                         let scroll_output = egui::ScrollArea::vertical()
-                            .id_salt(scroll_id)
+                            .id_source(scroll_id)
                             .max_height(available_height)
                             .auto_shrink([false, false])
                             .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden)
@@ -10398,7 +10398,7 @@ mod remote_gui {
                                     TextEdit::multiline(&mut self.input_buffer)
                                         .font(egui::TextStyle::Monospace)
                                         .desired_width(available_width)
-                                        .margin(egui::Margin::ZERO)
+                                        .margin(egui::vec2(0.0, 0.0))
                                         .frame(false)
                                         .id(input_id)
                                         .layouter(&mut |_ui, text, wrap_width| {
@@ -10472,7 +10472,7 @@ mod remote_gui {
                         // Calculate cursor position and scroll to it if needed
                         if response.has_focus() {
                             if let Some(state) = egui::TextEdit::load_state(ctx, input_id) {
-                                if let Some(cursor_range) = state.cursor.char_range() {
+                                if let Some(cursor_range) = state.ccursor_range() {
                                     // Estimate cursor Y position based on character position
                                     // Count newlines before cursor to estimate line number
                                     let cursor_pos = cursor_range.primary.index;
@@ -10536,7 +10536,7 @@ mod remote_gui {
                                 let mut state = egui::TextEdit::load_state(ctx, input_id)
                                     .unwrap_or_default();
                                 let ccursor = egui::text::CCursor::new(self.input_buffer.len());
-                                state.cursor.set_char_range(Some(egui::text::CCursorRange::one(ccursor)));
+                                state.set_ccursor_range(Some(egui::text::CCursorRange::one(ccursor)));
                                 state.store(ctx, input_id);
                             }
                         }
@@ -10546,7 +10546,7 @@ mod remote_gui {
                             let mut state = egui::TextEdit::load_state(ctx, input_id)
                                 .unwrap_or_default();
                             let ccursor = egui::text::CCursor::new(0);
-                            state.cursor.set_char_range(Some(egui::text::CCursorRange::one(ccursor)));
+                            state.set_ccursor_range(Some(egui::text::CCursorRange::one(ccursor)));
                             state.store(ctx, input_id);
                         }
 
@@ -11041,7 +11041,7 @@ mod remote_gui {
                         let scroll_delta = self.scroll_offset.take();
 
                         let mut scroll_area = ScrollArea::vertical()
-                            .id_salt(scroll_id)
+                            .id_source(scroll_id)
                             .auto_shrink([false; 2])
                             .stick_to_bottom(stick_to_bottom)
                             .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysVisible);
@@ -11180,7 +11180,7 @@ mod remote_gui {
                                 }
 
                                 // Handle selection end on release
-                                if alloc_response.drag_stopped_by(egui::PointerButton::Primary) {
+                                if alloc_response.drag_released() {
                                     self.selection_dragging = false;
                                 }
 
@@ -11243,7 +11243,7 @@ mod remote_gui {
                                             if bg != egui::Color32::TRANSPARENT {
                                                 let glyph_rect = egui::Rect::from_min_max(
                                                     egui::pos2(text_pos.x + glyph.pos.x, row_top),
-                                                    egui::pos2(text_pos.x + glyph.pos.x + glyph.size().x, row_bottom),
+                                                    egui::pos2(text_pos.x + glyph.pos.x + glyph.size.x, row_bottom),
                                                 );
                                                 painter.rect_filled(glyph_rect, 0.0, bg);
                                             }
@@ -11308,14 +11308,14 @@ mod remote_gui {
                                 }
 
                                 // Paint the text on top
-                                painter.galley(text_pos, galley.clone(), egui::Color32::WHITE);
+                                painter.galley(text_pos, galley.clone());
 
                                 // Build cursor_range if we have a selection
                                 let cursor_range = if let (Some(sel_start), Some(sel_end)) = (self.selection_start, self.selection_end) {
                                     if sel_start != sel_end {
                                         let primary_ccursor = egui::text::CCursor::new(sel_start);
                                         let secondary_ccursor = egui::text::CCursor::new(sel_end);
-                                        Some(egui::text_selection::CursorRange {
+                                        Some(egui::text_edit::CursorRange {
                                             primary: galley.from_ccursor(primary_ccursor),
                                             secondary: galley.from_ccursor(secondary_ccursor),
                                         })
@@ -11588,10 +11588,13 @@ mod remote_gui {
                                     }
                                 });
                                 // Check if debug was requested
-                                let debug_request: Option<String> = ui.ctx().data_mut(|d| d.remove_temp(debug_request_id));
+                                let debug_request: Option<String> = ui.ctx().data(|d| {
+                                    d.get_temp::<String>(debug_request_id).map(|s| s.clone())
+                                });
                                 if let Some(debug_text) = debug_request {
                                     self.debug_text = debug_text;
                                     self.popup_state = PopupState::DebugText;
+                                    ui.ctx().data_mut(|d| { let _ = d.remove::<String>(debug_request_id); });
                                 }
                             });
 
@@ -11791,9 +11794,7 @@ mod remote_gui {
                                     let filter_rect = ui.allocate_space(egui::vec2(ui.available_width(), 28.0)).1;
                                     ui.painter().rect_filled(filter_rect, egui::Rounding::same(4.0), theme.bg_deep());
                                     let filter_inner = filter_rect.shrink2(egui::vec2(8.0, 4.0));
-                                    let mut filter_ui = ui.new_child(egui::UiBuilder::new()
-                                        .max_rect(filter_inner)
-                                        .layout(egui::Layout::left_to_right(egui::Align::Center)));
+                                    let mut filter_ui = ui.child_ui(filter_inner, egui::Layout::left_to_right(egui::Align::Center));
                                     let filter_edit = TextEdit::singleline(&mut self.connected_worlds_filter)
                                         .frame(false)
                                         .hint_text(egui::RichText::new("Filter worlds...").color(theme.fg_dim()))
@@ -12037,7 +12038,7 @@ mod remote_gui {
 
                                 // Text edit - no cursor stroke
                                 style.visuals.extreme_bg_color = widget_bg;
-                                style.visuals.text_cursor.stroke = egui::Stroke::new(1.0, theme.fg());
+                                style.visuals.text_cursor = egui::Stroke::new(1.0, theme.fg());
                             });
 
                             if ctx.input(|i| i.key_pressed(egui::Key::Escape)) ||
@@ -12183,9 +12184,7 @@ mod remote_gui {
 
                                         // Inner text edit area (no frame, no background)
                                         let inner_rect = field_rect.shrink2(egui::vec2(8.0, 4.0));
-                                        let mut child_ui = ui.new_child(egui::UiBuilder::new()
-                                            .max_rect(inner_rect)
-                                            .layout(egui::Layout::left_to_right(egui::Align::Center)));
+                                        let mut child_ui = ui.child_ui(inner_rect, egui::Layout::left_to_right(egui::Align::Center));
                                         let text_edit = TextEdit::singleline(text)
                                             .frame(false)
                                             .desired_width(inner_rect.width())
@@ -12319,7 +12318,7 @@ mod remote_gui {
                                             ui.memory_mut(|mem| mem.toggle_popup(dropdown_id));
                                         }
 
-                                        egui::popup_below_widget(ui, dropdown_id, &response, egui::PopupCloseBehavior::CloseOnClickOutside, |ui| {
+                                        egui::popup_below_widget(ui, dropdown_id, &response, |ui| {
                                             ui.set_min_width(dropdown_width);
                                             ui.style_mut().visuals.widgets.inactive.fg_stroke = egui::Stroke::new(1.0, theme.fg());
                                             ui.style_mut().visuals.widgets.hovered.fg_stroke = egui::Stroke::new(1.0, theme.fg());
@@ -12368,7 +12367,7 @@ mod remote_gui {
                                             ui.memory_mut(|mem| mem.toggle_popup(dropdown_id));
                                         }
 
-                                        egui::popup_below_widget(ui, dropdown_id, &response, egui::PopupCloseBehavior::CloseOnClickOutside, |ui| {
+                                        egui::popup_below_widget(ui, dropdown_id, &response, |ui| {
                                             ui.set_min_width(dropdown_width);
                                             ui.style_mut().visuals.widgets.inactive.fg_stroke = egui::Stroke::new(1.0, theme.fg());
                                             ui.style_mut().visuals.widgets.hovered.fg_stroke = egui::Stroke::new(1.0, theme.fg());
@@ -12417,7 +12416,7 @@ mod remote_gui {
                                             ui.memory_mut(|mem| mem.toggle_popup(dropdown_id));
                                         }
 
-                                        egui::popup_below_widget(ui, dropdown_id, &response, egui::PopupCloseBehavior::CloseOnClickOutside, |ui| {
+                                        egui::popup_below_widget(ui, dropdown_id, &response, |ui| {
                                             ui.set_min_width(dropdown_width);
                                             ui.style_mut().visuals.widgets.inactive.fg_stroke = egui::Stroke::new(1.0, theme.fg());
                                             ui.style_mut().visuals.widgets.hovered.fg_stroke = egui::Stroke::new(1.0, theme.fg());
@@ -12815,7 +12814,7 @@ mod remote_gui {
                                             ui.memory_mut(|mem| mem.toggle_popup(dropdown_id));
                                         }
 
-                                        egui::popup_below_widget(ui, dropdown_id, &response, egui::PopupCloseBehavior::CloseOnClickOutside, |ui| {
+                                        egui::popup_below_widget(ui, dropdown_id, &response, |ui| {
                                             ui.set_min_width(dropdown_width);
                                             ui.style_mut().visuals.widgets.inactive.fg_stroke = egui::Stroke::new(1.0, theme.fg());
                                             ui.style_mut().visuals.widgets.hovered.fg_stroke = egui::Stroke::new(1.0, theme.fg());
@@ -12862,7 +12861,7 @@ mod remote_gui {
                                             ui.memory_mut(|mem| mem.toggle_popup(dropdown_id));
                                         }
 
-                                        egui::popup_below_widget(ui, dropdown_id, &response, egui::PopupCloseBehavior::CloseOnClickOutside, |ui| {
+                                        egui::popup_below_widget(ui, dropdown_id, &response, |ui| {
                                             ui.set_min_width(dropdown_width);
                                             ui.style_mut().visuals.widgets.inactive.fg_stroke = egui::Stroke::new(1.0, theme.fg());
                                             ui.style_mut().visuals.widgets.hovered.fg_stroke = egui::Stroke::new(1.0, theme.fg());
@@ -13282,7 +13281,7 @@ mod remote_gui {
                                             let mut http_port_str = http_port.to_string();
                                             if ui.add(egui::TextEdit::singleline(&mut http_port_str)
                                                 .desired_width(80.0)
-                                                .margin(egui::Margin::symmetric(8.0, 6.0))).changed() {
+                                                .margin(egui::vec2(8.0, 6.0))).changed() {
                                                 if let Ok(port) = http_port_str.parse::<u16>() {
                                                     http_port = port;
                                                 }
@@ -13311,7 +13310,7 @@ mod remote_gui {
                                             let mut ws_port_str = ws_port.to_string();
                                             if ui.add(egui::TextEdit::singleline(&mut ws_port_str)
                                                 .desired_width(80.0)
-                                                .margin(egui::Margin::symmetric(8.0, 6.0))).changed() {
+                                                .margin(egui::vec2(8.0, 6.0))).changed() {
                                                 if let Ok(port) = ws_port_str.parse::<u16>() {
                                                     ws_port = port;
                                                 }
@@ -13323,7 +13322,7 @@ mod remote_gui {
                                             ui.add(egui::TextEdit::singleline(&mut ws_allow_list)
                                                 .hint_text("localhost, 192.168.*")
                                                 .desired_width(180.0)
-                                                .margin(egui::Margin::symmetric(8.0, 6.0)));
+                                                .margin(egui::vec2(8.0, 6.0)));
                                             ui.end_row();
                                         });
                             });
@@ -13522,7 +13521,7 @@ mod remote_gui {
                                                 ui.memory_mut(|mem| mem.toggle_popup(dropdown_id));
                                             }
 
-                                            egui::popup_below_widget(ui, dropdown_id, &response, egui::PopupCloseBehavior::CloseOnClickOutside, |ui| {
+                                            egui::popup_below_widget(ui, dropdown_id, &response, |ui| {
                                                 ui.set_min_width(dropdown_width);
                                                 ui.style_mut().visuals.widgets.inactive.fg_stroke = egui::Stroke::new(1.0, theme.fg());
                                                 ui.style_mut().visuals.widgets.hovered.fg_stroke = egui::Stroke::new(1.0, theme.fg());
@@ -13557,7 +13556,7 @@ mod remote_gui {
                                                 }
                                                 ui.add(egui::TextEdit::singleline(&mut edit_font_size)
                                                     .desired_width(50.0)
-                                                    .margin(egui::Margin::symmetric(8.0, 6.0)));
+                                                    .margin(egui::vec2(8.0, 6.0)));
                                                 if ui.add(egui::Button::new(
                                                     egui::RichText::new("+").size(11.0).color(theme.fg_secondary()))
                                                     .fill(theme.bg_hover())
@@ -14061,7 +14060,7 @@ mod remote_gui {
                                                                 .monospace()
                                                                 .size(11.0)
                                                                 .color(theme.fg_secondary())
-                                                        ).wrap()
+                                                        ).wrap(true)
                                                     );
                                                 });
                                         });
@@ -14212,9 +14211,7 @@ mod remote_gui {
                                     let filter_rect = ui.allocate_space(egui::vec2(ui.available_width(), 28.0)).1;
                                     ui.painter().rect_filled(filter_rect, egui::Rounding::same(4.0), theme.bg_deep());
                                     let filter_inner = filter_rect.shrink2(egui::vec2(8.0, 4.0));
-                                    let mut filter_ui = ui.new_child(egui::UiBuilder::new()
-                                        .max_rect(filter_inner)
-                                        .layout(egui::Layout::left_to_right(egui::Align::Center)));
+                                    let mut filter_ui = ui.child_ui(filter_inner, egui::Layout::left_to_right(egui::Align::Center));
                                     let filter_edit = TextEdit::singleline(&mut actions_list_filter)
                                         .frame(false)
                                         .hint_text(egui::RichText::new("Filter actions...").color(theme.fg_dim()))
@@ -14543,9 +14540,7 @@ mod remote_gui {
                                         let field_rect = ui.allocate_space(egui::vec2(width, row_height)).1;
                                         ui.painter().rect_filled(field_rect, egui::Rounding::same(4.0), theme.bg_deep());
                                         let inner_rect = field_rect.shrink2(egui::vec2(8.0, 4.0));
-                                        let mut child_ui = ui.new_child(egui::UiBuilder::new()
-                                            .max_rect(inner_rect)
-                                            .layout(egui::Layout::left_to_right(egui::Align::Center)));
+                                        let mut child_ui = ui.child_ui(inner_rect, egui::Layout::left_to_right(egui::Align::Center));
                                         let mut text_edit = TextEdit::singleline(text)
                                             .frame(false)
                                             .desired_width(inner_rect.width())
@@ -14598,7 +14593,7 @@ mod remote_gui {
                                             ui.memory_mut(|mem| mem.toggle_popup(dropdown_id));
                                         }
 
-                                        egui::popup_below_widget(ui, dropdown_id, &response, egui::PopupCloseBehavior::CloseOnClickOutside, |ui| {
+                                        egui::popup_below_widget(ui, dropdown_id, &response, |ui| {
                                             ui.set_min_width(dropdown_width);
                                             ui.style_mut().visuals.widgets.inactive.fg_stroke = egui::Stroke::new(1.0, theme.fg());
                                             ui.style_mut().visuals.widgets.hovered.fg_stroke = egui::Stroke::new(1.0, theme.fg());
@@ -14647,9 +14642,7 @@ mod remote_gui {
                                     let cmd_rect = ui.allocate_space(egui::vec2(ui.available_width(), 100.0)).1;
                                     ui.painter().rect_filled(cmd_rect, egui::Rounding::same(4.0), theme.bg_deep());
                                     let cmd_inner = cmd_rect.shrink2(egui::vec2(8.0, 6.0));
-                                    let mut cmd_ui = ui.new_child(egui::UiBuilder::new()
-                                        .max_rect(cmd_inner)
-                                        .layout(egui::Layout::left_to_right(egui::Align::TOP)));
+                                    let mut cmd_ui = ui.child_ui(cmd_inner, egui::Layout::left_to_right(egui::Align::TOP));
                                     cmd_ui.add(egui::TextEdit::multiline(&mut edit_action_command)
                                         .frame(false)
                                         .hint_text(egui::RichText::new("Commands (semicolon-separated)").color(theme.fg_dim()))
@@ -15132,7 +15125,7 @@ mod remote_gui {
             Box::new(move |cc| {
                 // Install image loaders for Discord emoji support
                 egui_extras::install_image_loaders(&cc.egui_ctx);
-                Ok(Box::new(RemoteGuiApp::new(addr_string, runtime)) as Box<dyn eframe::App>)
+                Box::new(RemoteGuiApp::new(addr_string, runtime)) as Box<dyn eframe::App>
             }),
         ).map_err(|e| io::Error::other(format!("eframe error: {}", e)))
     }
