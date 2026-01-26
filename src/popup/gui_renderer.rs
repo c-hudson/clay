@@ -157,10 +157,11 @@ pub fn render_popup_content(
                         display_value
                     };
 
+                    let hint = placeholder.as_deref().unwrap_or("");
                     let response = ui.add_sized(
                         [ui.available_width(), row_height],
                         egui::TextEdit::singleline(&mut text)
-                            .hint_text(placeholder.as_deref().unwrap_or(""))
+                            .hint_text(RichText::new(hint).color(theme.fg_dim))
                             .text_color(theme.fg_primary)
                             .frame(true),
                     );
