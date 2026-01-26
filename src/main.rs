@@ -12707,7 +12707,7 @@ mod remote_gui {
                             egui::TopBottomPanel::bottom("setup_buttons")
                                 .exact_height(65.0)
                                 .frame(egui::Frame::none()
-                                    .fill(theme.bg_surface())
+                                    .fill(theme.bg_elevated())
                                     .stroke(egui::Stroke::NONE))
                                 .show(ctx, |ui| {
                                     ui.vertical(|ui| {
