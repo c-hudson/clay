@@ -18202,10 +18202,6 @@ async fn connect_daemon_world(
     settings: &WorldSettings,
     event_tx: mpsc::Sender<AppEvent>,
 ) -> Option<mpsc::Sender<WriteCommand>> {
-    use tokio::net::TcpStream;
-    use tokio::io::AsyncReadExt;
-    use bytes::BytesMut;
-
     let host = &settings.hostname;
     let port = &settings.port;
     let use_ssl = settings.use_ssl;
@@ -18421,6 +18417,8 @@ fn build_multiuser_initial_state(app: &App, username: &str) -> WsMessage {
             let user_conn = app.user_connections.get(&key);
 
             // Use user's connection state or empty defaults
+            let empty_output: Vec<OutputLine> = vec![];
+            let empty_pending: Vec<OutputLine> = vec![];
             let (connected, output_lines, pending_lines, prompt, scroll_offset, paused, unseen_lines, last_send, last_recv) =
                 if let Some(conn) = user_conn {
                     (
@@ -18435,7 +18433,7 @@ fn build_multiuser_initial_state(app: &App, username: &str) -> WsMessage {
                         conn.last_receive_time,
                     )
                 } else {
-                    (false, &vec![] as &Vec<OutputLine>, &vec![] as &Vec<OutputLine>, String::new(), 0, false, 0, None, None)
+                    (false, &empty_output, &empty_pending, String::new(), 0, false, 0, None, None)
                 };
 
             let clean_output: Vec<String> = output_lines.iter()
