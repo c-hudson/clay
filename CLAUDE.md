@@ -43,6 +43,34 @@ rustup target add x86_64-unknown-linux-musl
 - native-tls requires OpenSSL, which needs cross-compilation setup for musl
 - rustls is pure Rust and works seamlessly with musl builds
 
+### Building for Termux (Android)
+
+Clay compiles and runs on Termux (Android terminal emulator):
+
+```bash
+# On Termux, install rust first
+pkg install rust
+
+# Build without GUI features
+cargo build --no-default-features --features rustls-backend
+```
+
+**Limitations on Termux:**
+- Hot reload (`/reload`, `Ctrl+R`, `SIGUSR1`) is not available - exec() and signals are limited on Android
+- TLS proxy is not available - TLS connections cannot be preserved across restarts
+- Process suspension (`Ctrl+Z`) is not available
+- Remote GUI client is not available
+
+**What works on Termux:**
+- Core MUD client (connect, send, receive)
+- Multiple worlds
+- TLS connections (direct, not via proxy)
+- More-mode pausing
+- Actions/triggers
+- Command history
+- All TUI features
+- Settings persistence
+
 ## Architecture
 
 Clay is a terminal-based MUD (Multi-User Dungeon) client built with ratatui/crossterm for TUI and tokio for async networking. Supports multiple simultaneous world connections with SSL/TLS support.

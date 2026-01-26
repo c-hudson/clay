@@ -68,8 +68,9 @@ use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream},
     sync::mpsc,
-    signal::unix::{signal, SignalKind},
 };
+#[cfg(not(target_os = "android"))]
+use tokio::signal::unix::{signal, SignalKind};
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use serde::{Deserialize, Serialize};
@@ -1954,7 +1955,8 @@ fn get_app_ptr() -> *mut App {
     APP_PTR.load(Ordering::SeqCst)
 }
 
-/// Attempt to restart after a crash
+/// Attempt to restart after a crash (not available on Android)
+#[cfg(not(target_os = "android"))]
 fn crash_restart() {
     // Read crash count directly from env var, not from atomic
     // This ensures correct count even if crash happens before atomic is initialized
@@ -2014,7 +2016,8 @@ fn crash_restart() {
     }
 }
 
-/// Set up the crash handler (panic hook)
+/// Set up the crash handler (panic hook) - not available on Android
+#[cfg(not(target_os = "android"))]
 fn setup_crash_handler() {
     let default_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |panic_info| {
@@ -4499,6 +4502,7 @@ pub enum AppEvent {
     NawsRequested(String),        // world_name - server sent DO NAWS (we should send window size)
     TtypeRequested(String),       // world_name - server sent SB TTYPE SEND (we should send terminal type)
     SystemMessage(String),       // message to display in current world's output
+    Sigusr1Received,             // SIGUSR1 received - trigger hot reload (not available on Android)
     // WebSocket events
     WsClientConnected(u64),                    // client_id
     WsClientDisconnected(u64),                 // client_id
@@ -6254,6 +6258,8 @@ fn load_reload_state(app: &mut App) -> io::Result<bool> {
     Ok(true)
 }
 
+// Hot reload helper - not available on Android/Termux
+#[cfg(not(target_os = "android"))]
 fn clear_cloexec(fd: RawFd) -> io::Result<()> {
     // Clear the FD_CLOEXEC flag so the fd survives exec
     unsafe {
@@ -6270,6 +6276,7 @@ fn clear_cloexec(fd: RawFd) -> io::Result<()> {
 }
 
 /// Check if a process with the given PID is still alive
+#[cfg(not(target_os = "android"))]
 fn is_process_alive(pid: u32) -> bool {
     // Use waitpid with WNOHANG to check without blocking
     // A return of 0 means the process is still running
@@ -6280,8 +6287,15 @@ fn is_process_alive(pid: u32) -> bool {
     }
 }
 
+/// Stub for Android - TLS proxy processes don't exist on Android
+#[cfg(target_os = "android")]
+fn is_process_alive(_pid: u32) -> bool {
+    false  // Always return false since we never spawn proxy processes on Android
+}
+
 /// Reap any zombie child processes to prevent defunct processes from accumulating.
 /// This should be called periodically from the main event loop.
+#[cfg(not(target_os = "android"))]
 fn reap_zombie_children() {
     // Call waitpid with -1 (any child) and WNOHANG (don't block) to reap zombies
     // Keep calling until no more zombies are found
@@ -6346,6 +6360,7 @@ fn get_unix_timestamp() -> u64 {
 // ============================================================================
 
 /// Generate a unique socket path for the TLS proxy
+#[cfg(not(target_os = "android"))]
 fn get_proxy_socket_path(world_name: &str) -> PathBuf {
     let sanitized_name = world_name
         .chars()
@@ -6359,6 +6374,7 @@ fn get_proxy_socket_path(world_name: &str) -> PathBuf {
 }
 
 /// Get the config file path for a TLS proxy (derived from socket path)
+#[cfg(not(target_os = "android"))]
 fn get_proxy_config_path(socket_path: &Path) -> PathBuf {
     let mut config_path = socket_path.to_path_buf();
     config_path.set_extension("conf");
@@ -6369,6 +6385,7 @@ fn get_proxy_config_path(socket_path: &Path) -> PathBuf {
 /// Returns (proxy_pid, socket_path) on success.
 /// The proxy process handles the TLS connection to the MUD server and exposes
 /// a Unix socket for the main client to connect to.
+#[cfg(not(target_os = "android"))]
 fn spawn_tls_proxy(
     world_name: &str,
     host: &str,
@@ -6437,6 +6454,7 @@ fn spawn_tls_proxy(
 }
 
 /// Async implementation of the TLS proxy main loop (runs in separate process via --tls-proxy)
+#[cfg(not(target_os = "android"))]
 async fn run_tls_proxy_async(host: &str, port: &str, socket_path: &PathBuf) {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::{TcpStream, UnixListener};
@@ -6606,6 +6624,7 @@ async fn run_tls_proxy_async(host: &str, port: &str, socket_path: &PathBuf) {
 }
 
 /// Strip " (deleted)" suffix from a path string if present.
+#[cfg(not(target_os = "android"))]
 fn strip_deleted_suffix(path_str: &str) -> String {
     // Try common variations of the deleted marker
     for suffix in [" (deleted)", "(deleted)"] {
@@ -6620,6 +6639,7 @@ fn strip_deleted_suffix(path_str: &str) -> String {
 /// On Linux, if the binary was replaced, /proc/self/exe shows " (deleted)".
 /// We strip that suffix to get the path to the new binary.
 /// Returns (path, debug_info) for better error messages.
+#[cfg(not(target_os = "android"))]
 fn get_executable_path() -> io::Result<(PathBuf, String)> {
     let proc_exe = PathBuf::from("/proc/self/exe");
     let link_target = std::fs::read_link(&proc_exe)?;
@@ -6634,6 +6654,7 @@ fn get_executable_path() -> io::Result<(PathBuf, String)> {
     Ok((PathBuf::from(clean_path), debug_info))
 }
 
+#[cfg(not(target_os = "android"))]
 fn exec_reload(app: &App) -> io::Result<()> {
     debug_log(true, "RELOAD: Starting exec_reload");
 
@@ -18785,9 +18806,10 @@ async fn main() -> io::Result<()> {
     let is_crash_arg = std::env::args().any(|a| a == "--crash");
     debug_log(true, &format!("STARTUP: {} (reload={}, crash={})", get_version_string(), is_reload_arg, is_crash_arg));
 
-    // Check for --tls-proxy=config_path argument for TLS proxy mode
+    // Check for --tls-proxy=config_path argument for TLS proxy mode (not available on Android)
     // This is used internally when spawning TLS proxy processes
     // Config file contains host:port on first line, socket_path on second line
+    #[cfg(not(target_os = "android"))]
     if let Some(proxy_arg) = std::env::args().find(|a| a.starts_with("--tls-proxy=")) {
         let config_path = proxy_arg.strip_prefix("--tls-proxy=").unwrap();
         if let Ok(contents) = std::fs::read_to_string(config_path) {
@@ -18840,7 +18862,8 @@ async fn main() -> io::Result<()> {
         return run_console_client(addr).await;
     }
 
-    // Set up signal handlers for crash debugging
+    // Set up signal handlers for crash debugging (not available on Android)
+    #[cfg(not(target_os = "android"))]
     unsafe {
         extern "C" fn sigfpe_handler(_: libc::c_int) {
             // Restore terminal before printing
@@ -18902,7 +18925,8 @@ async fn main() -> io::Result<()> {
         libc::signal(libc::SIGABRT, sigabrt_handler as libc::sighandler_t);
     }
 
-    // Set up crash handler for automatic recovery
+    // Set up crash handler for automatic recovery (not available on Android)
+    #[cfg(not(target_os = "android"))]
     setup_crash_handler();
 
     enable_raw_mode()?;
@@ -19600,9 +19624,24 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
     // Use async event stream instead of polling to reduce CPU usage
     let mut event_stream = EventStream::new();
 
-    // Set up SIGUSR1 handler for hot reload
-    let mut sigusr1 = signal(SignalKind::user_defined1())
-        .expect("Failed to set up SIGUSR1 handler");
+    // Spawn SIGUSR1 handler task for hot reload (not available on Android)
+    #[cfg(not(target_os = "android"))]
+    {
+        let sigusr1_tx = event_tx.clone();
+        tokio::spawn(async move {
+            let mut sigusr1 = match signal(SignalKind::user_defined1()) {
+                Ok(s) => s,
+                Err(e) => {
+                    eprintln!("Failed to set up SIGUSR1 handler: {}", e);
+                    return;
+                }
+            };
+            loop {
+                sigusr1.recv().await;
+                let _ = sigusr1_tx.send(AppEvent::Sigusr1Received).await;
+            }
+        });
+    }
 
     // Initial draw
     terminal.clear()?;
@@ -19641,18 +19680,11 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
 
         // Reap any zombie child processes (TLS proxies that have exited)
         // This is a fast non-blocking call that prevents defunct processes from accumulating
+        #[cfg(not(target_os = "android"))]
         reap_zombie_children();
 
         // Use tokio::select! to efficiently wait for events without busy-polling
         tokio::select! {
-            // SIGUSR1 signal - trigger hot reload
-            _ = sigusr1.recv() => {
-                debug_log(true, "LOOP: Received SIGUSR1");
-                app.add_output("Received SIGUSR1, performing hot reload...");
-                if handle_command("/reload", &mut app, event_tx.clone()).await {
-                    return Ok(());
-                }
-            }
             // Terminal events (keyboard input)
             maybe_event = event_stream.next() => {
                 if let Some(Ok(Event::Key(key))) = maybe_event {
@@ -19677,20 +19709,28 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                             }
                         }
                         KeyAction::Suspend => {
-                            // Restore terminal to normal mode before suspending
-                            disable_raw_mode()?;
-                            execute!(std::io::stdout(), LeaveAlternateScreen)?;
+                            // Process suspension not available on Android
+                            #[cfg(not(target_os = "android"))]
+                            {
+                                // Restore terminal to normal mode before suspending
+                                disable_raw_mode()?;
+                                execute!(std::io::stdout(), LeaveAlternateScreen)?;
 
-                            // Send SIGTSTP to self to suspend
-                            unsafe {
-                                libc::kill(libc::getpid(), libc::SIGTSTP);
+                                // Send SIGTSTP to self to suspend
+                                unsafe {
+                                    libc::kill(libc::getpid(), libc::SIGTSTP);
+                                }
+
+                                // When we resume (after fg), re-enter raw mode and redraw
+                                enable_raw_mode()?;
+                                execute!(std::io::stdout(), EnterAlternateScreen)?;
+                                terminal.clear()?;
+                                app.needs_output_redraw = true;
                             }
-
-                            // When we resume (after fg), re-enter raw mode and redraw
-                            enable_raw_mode()?;
-                            execute!(std::io::stdout(), EnterAlternateScreen)?;
-                            terminal.clear()?;
-                            app.needs_output_redraw = true;
+                            #[cfg(target_os = "android")]
+                            {
+                                app.add_output("Process suspension (Ctrl+Z) is not available on Android.");
+                            }
                         }
                         KeyAction::SendCommand(cmd) => {
                             // Clear crash count after first successful user input
@@ -20038,6 +20078,14 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                     AppEvent::SystemMessage(message) => {
                         // Display system message in current world's output
                         app.add_output(&message);
+                    }
+                    AppEvent::Sigusr1Received => {
+                        // SIGUSR1 received - trigger hot reload (only on non-Android)
+                        debug_log(true, "LOOP: Received SIGUSR1 via event channel");
+                        app.add_output("Received SIGUSR1, performing hot reload...");
+                        if handle_command("/reload", &mut app, event_tx.clone()).await {
+                            return Ok(());
+                        }
                     }
                     // Multiuser events are only used in multiuser mode, ignore in normal mode
                     AppEvent::ConnectWorldRequest(_, _) => {}
@@ -21793,6 +21841,8 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                 AppEvent::MultiuserDisconnected(_, _) => {}
                 AppEvent::MultiuserTelnetDetected(_, _) => {}
                 AppEvent::MultiuserPrompt(_, _, _) => {}
+                // SIGUSR1 - only relevant in main console mode, ignore in daemon mode
+                AppEvent::Sigusr1Received => {}
                 // Slack/Discord events
                 AppEvent::SlackMessage(ref world_name, message) | AppEvent::DiscordMessage(ref world_name, message) => {
                     if let Some(world_idx) = app.find_world_index(world_name) {
@@ -24239,7 +24289,11 @@ async fn handle_command(cmd: &str, app: &mut App, event_tx: mpsc::Sender<AppEven
             };
 
             // Check if using TLS proxy for connection preservation
+            // TLS proxy not available on Android
+            #[cfg(not(target_os = "android"))]
             let use_tls_proxy = use_ssl && app.settings.tls_proxy_enabled;
+            #[cfg(target_os = "android")]
+            let use_tls_proxy = false;
 
             let ssl_msg = if use_ssl {
                 if use_tls_proxy { " with SSL (via proxy)" } else { " with SSL" }
@@ -24249,6 +24303,8 @@ async fn handle_command(cmd: &str, app: &mut App, event_tx: mpsc::Sender<AppEven
             app.add_output("");
 
             // Handle TLS proxy case separately (proxy does its own TCP connect)
+            // TLS proxy not available on Android
+            #[cfg(not(target_os = "android"))]
             if use_tls_proxy {
                 let world_name = app.current_world().name.clone();
                 match spawn_tls_proxy(&world_name, &host, &port) {
@@ -24833,109 +24889,119 @@ async fn handle_command(cmd: &str, app: &mut App, event_tx: mpsc::Sender<AppEven
             }
         }
         Command::Reload => {
-            // ================================================================
-            // PROXY DEBUG: Send "think proxy" and wait 2 seconds before reload
-            // TODO: Remove this section once proxy issues are resolved
-            // ================================================================
-            let has_proxy_connections = app.worlds.iter()
-                .any(|w| w.connected && w.is_tls && w.proxy_pid.is_some());
+            // Hot reload is not available on Android/Termux
+            #[cfg(target_os = "android")]
+            {
+                app.add_output("Hot reload is not available on Android/Termux.");
+                app.add_output("Restart the app manually to apply changes.");
+            }
 
-            if has_proxy_connections && app.proxy_debug_reload_at.is_none() {
-                // Log proxy status before reload
-                log_proxy_debug_status(app, "PRE-RELOAD STATUS");
+            #[cfg(not(target_os = "android"))]
+            {
+                // ================================================================
+                // PROXY DEBUG: Send "think proxy" and wait 2 seconds before reload
+                // TODO: Remove this section once proxy issues are resolved
+                // ================================================================
+                let has_proxy_connections = app.worlds.iter()
+                    .any(|w| w.connected && w.is_tls && w.proxy_pid.is_some());
 
-                // Send "think proxy - [timestamp]" to all proxy-connected worlds
-                let timestamp = get_unix_timestamp();
-                let think_cmd = format!("think proxy - {}", timestamp);
-                debug_log(true, &format!("PROXY_DEBUG: Sending '{}' to proxy worlds", think_cmd));
+                if has_proxy_connections && app.proxy_debug_reload_at.is_none() {
+                    // Log proxy status before reload
+                    log_proxy_debug_status(app, "PRE-RELOAD STATUS");
 
-                for world in &app.worlds {
-                    if world.connected && world.is_tls && world.proxy_pid.is_some() {
-                        if let Some(tx) = &world.command_tx {
-                            let _ = tx.try_send(WriteCommand::Text(think_cmd.clone()));
-                            debug_log(true, &format!("PROXY_DEBUG: Sent to world '{}'", world.name));
+                    // Send "think proxy - [timestamp]" to all proxy-connected worlds
+                    let timestamp = get_unix_timestamp();
+                    let think_cmd = format!("think proxy - {}", timestamp);
+                    debug_log(true, &format!("PROXY_DEBUG: Sending '{}' to proxy worlds", think_cmd));
+
+                    for world in &app.worlds {
+                        if world.connected && world.is_tls && world.proxy_pid.is_some() {
+                            if let Some(tx) = &world.command_tx {
+                                let _ = tx.try_send(WriteCommand::Text(think_cmd.clone()));
+                                debug_log(true, &format!("PROXY_DEBUG: Sent to world '{}'", world.name));
+                            }
                         }
                     }
+
+                    // Set the timer - reload will proceed after 2 seconds
+                    app.proxy_debug_reload_at = Some(std::time::Instant::now());
+                    app.add_output("Proxy debug: waiting 2 seconds to collect output before reload...");
+                    debug_log(true, "PROXY_DEBUG: Waiting 2 seconds for server response");
+                    return false; // Don't do reload yet
                 }
 
-                // Set the timer - reload will proceed after 2 seconds
-                app.proxy_debug_reload_at = Some(std::time::Instant::now());
-                app.add_output("Proxy debug: waiting 2 seconds to collect output before reload...");
-                debug_log(true, "PROXY_DEBUG: Waiting 2 seconds for server response");
-                return false; // Don't do reload yet
-            }
+                // If we're in debug mode, check if 2 seconds have passed
+                if let Some(start_time) = app.proxy_debug_reload_at {
+                    if start_time.elapsed() < std::time::Duration::from_secs(2) {
+                        // Still waiting - this shouldn't normally happen since we trigger from event loop
+                        return false;
+                    }
+                    // 2 seconds passed, clear the flag and log final status
+                    app.proxy_debug_reload_at = None;
+                    log_proxy_debug_status(app, "RELOAD STARTING (after 2s wait)");
+                }
+                // ================================================================
+                // END PROXY DEBUG
+                // ================================================================
 
-            // If we're in debug mode, check if 2 seconds have passed
-            if let Some(start_time) = app.proxy_debug_reload_at {
-                if start_time.elapsed() < std::time::Duration::from_secs(2) {
-                    // Still waiting - this shouldn't normally happen since we trigger from event loop
+                // First check if we can find the executable (handling " (deleted)" suffix)
+                let exe_path = match get_executable_path() {
+                    Ok((p, _)) => p,
+                    Err(e) => {
+                        app.add_output(&format!("Cannot find executable: {}", e));
+                        return false;
+                    }
+                };
+
+                if !exe_path.exists() {
+                    app.add_output(&format!("Executable not found: {}", exe_path.display()));
+                    app.add_output("Hot reload requires the binary to exist on disk.");
+                    app.add_output("If running via 'cargo run', try running the compiled binary directly.");
                     return false;
                 }
-                // 2 seconds passed, clear the flag and log final status
-                app.proxy_debug_reload_at = None;
-                log_proxy_debug_status(app, "RELOAD STARTING (after 2s wait)");
-            }
-            // ================================================================
-            // END PROXY DEBUG
-            // ================================================================
 
-            // First check if we can find the executable (handling " (deleted)" suffix)
-            let exe_path = match get_executable_path() {
-                Ok((p, _)) => p,
-                Err(e) => {
-                    app.add_output(&format!("Cannot find executable: {}", e));
-                    return false;
+                // Check if there are any TLS connections that will be lost (only those without proxy)
+                let tls_worlds: Vec<_> = app
+                    .worlds
+                    .iter()
+                    .filter(|w| w.connected && w.is_tls && w.proxy_pid.is_none())
+                    .map(|w| w.name.clone())
+                    .collect();
+
+                if !tls_worlds.is_empty() {
+                    app.add_output(&format!(
+                        "Warning: TLS connections will be closed: {}",
+                        tls_worlds.join(", ")
+                    ));
+                    app.add_output("These connections will need to be re-established after reload.");
                 }
-            };
 
-            if !exe_path.exists() {
-                app.add_output(&format!("Executable not found: {}", exe_path.display()));
-                app.add_output("Hot reload requires the binary to exist on disk.");
-                app.add_output("If running via 'cargo run', try running the compiled binary directly.");
-                return false;
-            }
+                // Binary path is only shown on failure (see error handler below)
 
-            // Check if there are any TLS connections that will be lost (only those without proxy)
-            let tls_worlds: Vec<_> = app
-                .worlds
-                .iter()
-                .filter(|w| w.connected && w.is_tls && w.proxy_pid.is_none())
-                .map(|w| w.name.clone())
-                .collect();
+                // Disable raw mode before exec (the new process will re-enable it)
+                let _ = crossterm::terminal::disable_raw_mode();
+                let _ = crossterm::execute!(
+                    std::io::stdout(),
+                    crossterm::terminal::LeaveAlternateScreen
+                );
 
-            if !tls_worlds.is_empty() {
-                app.add_output(&format!(
-                    "Warning: TLS connections will be closed: {}",
-                    tls_worlds.join(", ")
-                ));
-                app.add_output("These connections will need to be re-established after reload.");
-            }
-
-            // Binary path is only shown on failure (see error handler below)
-
-            // Disable raw mode before exec (the new process will re-enable it)
-            let _ = crossterm::terminal::disable_raw_mode();
-            let _ = crossterm::execute!(
-                std::io::stdout(),
-                crossterm::terminal::LeaveAlternateScreen
-            );
-
-            match exec_reload(app) {
-                Ok(()) => {
-                    // This should never be reached - exec replaces the process
-                    unreachable!();
-                }
-                Err(e) => {
-                    // Restore terminal state if exec failed
-                    let _ = crossterm::terminal::enable_raw_mode();
-                    let _ = crossterm::execute!(
-                        std::io::stdout(),
-                        crossterm::terminal::EnterAlternateScreen,
-                        crossterm::terminal::Clear(crossterm::terminal::ClearType::All),
-                        crossterm::cursor::MoveTo(0, 0)
-                    );
-                    app.add_output(&format!("Hot reload failed: {}", e));
-                    app.add_output(&format!("Executable path: {}", exe_path.display()));
+                match exec_reload(app) {
+                    Ok(()) => {
+                        // This should never be reached - exec replaces the process
+                        unreachable!();
+                    }
+                    Err(e) => {
+                        // Restore terminal state if exec failed
+                        let _ = crossterm::terminal::enable_raw_mode();
+                        let _ = crossterm::execute!(
+                            std::io::stdout(),
+                            crossterm::terminal::EnterAlternateScreen,
+                            crossterm::terminal::Clear(crossterm::terminal::ClearType::All),
+                            crossterm::cursor::MoveTo(0, 0)
+                        );
+                        app.add_output(&format!("Hot reload failed: {}", e));
+                        app.add_output(&format!("Executable path: {}", exe_path.display()));
+                    }
                 }
             }
         }
