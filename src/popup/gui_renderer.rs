@@ -307,7 +307,9 @@ pub fn render_popup_content(
                     .rounding(4.0)
                     .show(ui, |ui| {
                 egui::ScrollArea::vertical()
+                    .min_scrolled_height(list_height)
                     .max_height(list_height)
+                    .auto_shrink([false, false])
                     .id_source(format!("{:?}_list", field_id))
                     .show(ui, |ui| {
                         let scroll_width = ui.available_width();

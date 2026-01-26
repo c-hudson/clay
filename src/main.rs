@@ -14836,7 +14836,8 @@ mod remote_gui {
                         egui::ViewportId::from_hash_of(format!("unified_popup_{}", popup_id_str)),
                         egui::ViewportBuilder::default()
                             .with_title(format!("{} - Clay MUD Client", popup_title))
-                            .with_inner_size([min_width.max(400.0), 420.0]),
+                            .with_inner_size([min_width.max(400.0), 420.0])
+                            .with_resizable(true),
                         |ctx, _class| {
                             // Apply popup styling
                             ctx.style_mut(|style| {
