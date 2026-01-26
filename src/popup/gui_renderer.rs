@@ -373,11 +373,9 @@ pub fn render_popup_content(
         }
     }
 
-    // Render buttons
+    // Render buttons - 15px gap between list and buttons
     if !state.definition.buttons.is_empty() {
-        ui.add_space(8.0);
-        ui.separator();
-        ui.add_space(8.0);
+        ui.add_space(15.0);
 
         // Split buttons: danger buttons on left, others on right
         let danger_buttons: Vec<_> = state.definition.buttons.iter()
