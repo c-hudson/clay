@@ -244,12 +244,31 @@ pub fn render_popup_content(
 
                 egui::ScrollArea::vertical()
                     .max_height(list_height)
+                    .id_source(format!("{:?}_list", field_id))
                     .show(ui, |ui| {
                         for (idx, item) in items.iter().enumerate() {
                             let is_item_selected = idx == *selected_index;
                             let display = item.columns.join("  ");
 
-                            let response = ui.selectable_label(is_item_selected, &display);
+                            // Use explicit colors for list items
+                            let text_color = if is_item_selected {
+                                theme.fg_primary
+                            } else {
+                                theme.fg_secondary
+                            };
+                            let bg_color = if is_item_selected {
+                                theme.selection_bg
+                            } else {
+                                Color32::TRANSPARENT
+                            };
+
+                            let response = ui.add(
+                                egui::Button::new(RichText::new(&display).color(text_color))
+                                    .fill(bg_color)
+                                    .stroke(egui::Stroke::NONE)
+                                    .frame(false)
+                                    .min_size(egui::vec2(ui.available_width(), row_height))
+                            );
                             if response.clicked() {
                                 actions.list_selected.push((field_id, idx));
                             }
