@@ -3078,7 +3078,7 @@ impl App {
             .with_button(popup::Button::new(popup::definitions::actions::ACTIONS_BTN_DELETE, "Delete").danger().with_shortcut('D').left_align())
             .with_button(popup::Button::new(popup::definitions::actions::ACTIONS_BTN_ADD, "Add").with_shortcut('A'))
             .with_button(popup::Button::new(popup::definitions::actions::ACTIONS_BTN_EDIT, "Edit").with_shortcut('E'))
-            .with_button(popup::Button::new(popup::definitions::actions::ACTIONS_BTN_CANCEL, "Cancel").with_shortcut('C'))
+            .with_button(popup::Button::new(popup::definitions::actions::ACTIONS_BTN_CANCEL, "Ok").primary().with_shortcut('O'))
             .with_layout(popup::PopupLayout {
                 label_width: 8,
                 min_width: 70,
@@ -4868,6 +4868,10 @@ fn save_settings(app: &App) -> io::Result<()> {
             // Escape newlines and equals signs in command
             writeln!(file, "command={}", action.command.replace('\\', "\\\\").replace('=', "\\e").replace('\n', "\\n"))?;
         }
+        // Only save enabled if not the default (true)
+        if !action.enabled {
+            writeln!(file, "enabled=false")?;
+        }
     }
 
     // Save permanent bans
@@ -5027,6 +5031,7 @@ fn load_settings(app: &mut App) -> io::Result<()> {
                         "match_type" => action.match_type = MatchType::parse(value),
                         "pattern" => action.pattern = unescape_action_value(value),
                         "command" => action.command = unescape_action_value(value),
+                        "enabled" => action.enabled = value != "false",
                         _ => {}
                     }
                 }
@@ -5433,6 +5438,7 @@ fn load_multiuser_settings(app: &mut App) -> io::Result<()> {
                         "match_type" => action.match_type = MatchType::parse(value),
                         "pattern" => action.pattern = unescape_action_value(value),
                         "command" => action.command = unescape_action_value(value),
+                        "enabled" => action.enabled = value != "false",
                         _ => {}
                     }
                 }
@@ -5806,6 +5812,9 @@ fn save_reload_state(app: &App) -> io::Result<()> {
         }
         if !action.command.is_empty() {
             writeln!(file, "command={}", action.command.replace('\\', "\\\\").replace('=', "\\e").replace('\n', "\\n"))?;
+        }
+        if !action.enabled {
+            writeln!(file, "enabled=false")?;
         }
     }
 
@@ -6290,6 +6299,7 @@ fn load_reload_state(app: &mut App) -> io::Result<bool> {
                             "match_type" => action.match_type = MatchType::parse(value),
                             "pattern" => action.pattern = unescape_action_value(value),
                             "command" => action.command = unescape_action_value(value),
+                            "enabled" => action.enabled = value != "false",
                             _ => {}
                         }
                     }
