@@ -3075,9 +3075,9 @@ impl App {
                 "",
                 popup::FieldKind::list(items, visible_height),
             ))
+            .with_button(popup::Button::new(popup::definitions::actions::ACTIONS_BTN_DELETE, "Delete").danger().with_shortcut('D').left_align())
             .with_button(popup::Button::new(popup::definitions::actions::ACTIONS_BTN_ADD, "Add").with_shortcut('A'))
             .with_button(popup::Button::new(popup::definitions::actions::ACTIONS_BTN_EDIT, "Edit").with_shortcut('E'))
-            .with_button(popup::Button::new(popup::definitions::actions::ACTIONS_BTN_DELETE, "Delete").danger().with_shortcut('D'))
             .with_button(popup::Button::new(popup::definitions::actions::ACTIONS_BTN_CANCEL, "Cancel").with_shortcut('C'))
             .with_layout(popup::PopupLayout {
                 label_width: 8,
