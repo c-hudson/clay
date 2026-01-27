@@ -17836,6 +17836,18 @@ async fn handle_daemon_ws_message(
                 }
             }
         }
+        WsMessage::ReportSeqMismatch { world_index, expected_seq_gt, actual_seq, line_text, source } => {
+            let world_name = app.worlds.get(world_index).map(|w| w.name.as_str()).unwrap_or("?");
+            use std::io::Write;
+            if let Ok(mut f) = std::fs::OpenOptions::new()
+                .create(true).append(true)
+                .open("clay.output.debug")
+            {
+                let _ = writeln!(f, "SEQ MISMATCH [{}] in '{}': expected seq>{}, got seq={}, text={:?}",
+                    source, world_name, expected_seq_gt, actual_seq,
+                    line_text.chars().take(80).collect::<String>());
+            }
+        }
         _ => {}
     }
 }
@@ -18971,6 +18983,18 @@ async fn handle_multiuser_ws_message(
         // Reject world editing in multiuser mode
         WsMessage::UpdateWorldSettings { .. } | WsMessage::DeleteWorld { .. } | WsMessage::CreateWorld { .. } => {
             // Silently reject - users can't edit worlds in multiuser mode
+        }
+        WsMessage::ReportSeqMismatch { world_index, expected_seq_gt, actual_seq, line_text, source } => {
+            let world_name = app.worlds.get(world_index).map(|w| w.name.as_str()).unwrap_or("?");
+            use std::io::Write;
+            if let Ok(mut f) = std::fs::OpenOptions::new()
+                .create(true).append(true)
+                .open("clay.output.debug")
+            {
+                let _ = writeln!(f, "SEQ MISMATCH [{}] in '{}': expected seq>{}, got seq={}, text={:?}",
+                    source, world_name, expected_seq_gt, actual_seq,
+                    line_text.chars().take(80).collect::<String>());
+            }
         }
         _ => {} // Handle other messages as needed
     }
@@ -21414,6 +21438,18 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                 let lines: Vec<String> = output.lines().map(|s| s.to_string()).collect();
                                 app.ws_send_to_client(client_id, WsMessage::ConnectionsListResponse { lines });
                             }
+                            WsMessage::ReportSeqMismatch { world_index, expected_seq_gt, actual_seq, line_text, source } => {
+                                let world_name = app.worlds.get(world_index).map(|w| w.name.as_str()).unwrap_or("?");
+                                use std::io::Write;
+                                if let Ok(mut f) = std::fs::OpenOptions::new()
+                                    .create(true).append(true)
+                                    .open("clay.output.debug")
+                                {
+                                    let _ = writeln!(f, "SEQ MISMATCH [{}] in '{}': expected seq>{}, got seq={}, text={:?}",
+                                        source, world_name, expected_seq_gt, actual_seq,
+                                        line_text.chars().take(80).collect::<String>());
+                                }
+                            }
                             _ => {
                                 // Other message types handled elsewhere or ignored
                             }
@@ -22905,6 +22941,18 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                             let output = util::format_worlds_list(&worlds_info);
                             let lines: Vec<String> = output.lines().map(|s| s.to_string()).collect();
                             app.ws_send_to_client(client_id, WsMessage::ConnectionsListResponse { lines });
+                        }
+                        WsMessage::ReportSeqMismatch { world_index, expected_seq_gt, actual_seq, line_text, source } => {
+                            let world_name = app.worlds.get(world_index).map(|w| w.name.as_str()).unwrap_or("?");
+                            use std::io::Write;
+                            if let Ok(mut f) = std::fs::OpenOptions::new()
+                                .create(true).append(true)
+                                .open("clay.output.debug")
+                            {
+                                let _ = writeln!(f, "SEQ MISMATCH [{}] in '{}': expected seq>{}, got seq={}, text={:?}",
+                                    source, world_name, expected_seq_gt, actual_seq,
+                                    line_text.chars().take(80).collect::<String>());
+                            }
                         }
                         _ => {}
                     }
@@ -26027,14 +26075,25 @@ fn render_output_crossterm(app: &App) {
             }
             if let Some(prev_seq) = last_seq {
                 if line.seq <= prev_seq {
-                    use std::io::Write;
-                    if let Ok(mut f) = std::fs::OpenOptions::new()
-                        .create(true).append(true)
-                        .open("clay.output.debug")
-                    {
-                        let _ = writeln!(f, "SEQ MISMATCH in '{}': idx={}, expected seq>{}, got seq={}, text={:?}",
-                            world.name, idx, prev_seq, line.seq,
-                            line.text.chars().take(80).collect::<String>());
+                    if let Some(ref tx) = app.ws_client_tx {
+                        // Remote console: report to master via WebSocket
+                        let _ = tx.send(WsMessage::ReportSeqMismatch {
+                            world_index: app.current_world_index,
+                            expected_seq_gt: prev_seq,
+                            actual_seq: line.seq,
+                            line_text: line.text.chars().take(80).collect::<String>(),
+                            source: "console".to_string(),
+                        });
+                    } else {
+                        // Local console: write to debug file
+                        if let Ok(mut f) = std::fs::OpenOptions::new()
+                            .create(true).append(true)
+                            .open("clay.output.debug")
+                        {
+                            let _ = writeln!(f, "SEQ MISMATCH in '{}': idx={}, expected seq>{}, got seq={}, text={:?}",
+                                world.name, idx, prev_seq, line.seq,
+                                line.text.chars().take(80).collect::<String>());
+                        }
                     }
                 }
             }

@@ -203,6 +203,15 @@ pub enum WsMessage {
     /// Lines are pre-formatted for display
     ConnectionsListResponse { lines: Vec<String> },
 
+    /// Report a sequence mismatch detected by a remote client (client -> server)
+    ReportSeqMismatch {
+        world_index: usize,
+        expected_seq_gt: u64,
+        actual_seq: u64,
+        line_text: String,
+        source: String,  // "web", "gui", "console"
+    },
+
     // Keepalive
     Ping,
     Pong,

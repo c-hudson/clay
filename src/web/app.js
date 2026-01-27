@@ -1223,6 +1223,14 @@
                                 const prevSeq = world.output_lines[lineIndex - 1].seq;
                                 if (prevSeq !== undefined && lineSeq !== undefined && lineSeq <= prevSeq) {
                                     console.warn('SEQ MISMATCH in world ' + msg.world_index + ': idx=' + lineIndex + ' expected seq>' + prevSeq + ' got seq=' + lineSeq);
+                                    sendMessage({
+                                        type: 'ReportSeqMismatch',
+                                        world_index: msg.world_index,
+                                        expected_seq_gt: prevSeq,
+                                        actual_seq: lineSeq,
+                                        line_text: line.substring(0, 80),
+                                        source: 'web'
+                                    });
                                 }
                             }
                             if (msg.world_index === currentWorldIndex) {
