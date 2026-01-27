@@ -509,7 +509,7 @@ impl WebSocketServer {
         let certs: Vec<CertificateDer<'static>> = certs(&mut cert_reader)
             .map_err(|e| format!("Failed to parse cert file '{}': {}", cert_file, e))?
             .into_iter()
-            .map(|c| CertificateDer::from(c))
+            .map(CertificateDer::from)
             .collect();
 
         if certs.is_empty() {
@@ -848,7 +848,7 @@ where
     let send_task = tokio::spawn(async move {
         while let Some(msg) = rx.recv().await {
             if let Ok(json) = serde_json::to_string(&msg) {
-                if ws_sink.send(WsRawMessage::Text(json.into())).await.is_err() {
+                if ws_sink.send(WsRawMessage::Text(json)).await.is_err() {
                     break;
                 }
             }

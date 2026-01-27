@@ -1933,8 +1933,10 @@ fn line_matches_action(
     false
 }
 
+#[cfg(not(target_os = "android"))]
 const RELOAD_FDS_ENV: &str = "CLAY_RELOAD_FDS";
 const CRASH_COUNT_ENV: &str = "CLAY_CRASH_COUNT";
+#[cfg(not(target_os = "android"))]
 const MAX_CRASH_RESTARTS: u32 = 2;
 
 // Static pointer to App for crash recovery - set when app is running
@@ -1967,6 +1969,7 @@ fn set_app_ptr(app: *mut App) {
 }
 
 /// Get the global app pointer
+#[cfg(not(target_os = "android"))]
 fn get_app_ptr() -> *mut App {
     APP_PTR.load(Ordering::SeqCst)
 }
@@ -5617,6 +5620,7 @@ fn save_multiuser_settings(app: &App) -> io::Result<()> {
     Ok(())
 }
 
+#[cfg(not(target_os = "android"))]
 fn save_reload_state(app: &App) -> io::Result<()> {
     let path = get_reload_state_path();
     let mut file = std::fs::File::create(&path)?;
@@ -7209,10 +7213,10 @@ mod remote_gui {
         /// TLS proxy enabled (for connection preservation over hot reload)
         tls_proxy_enabled: bool,
         /// Audio output stream (must stay alive for audio to play)
-        #[cfg(feature = "rodio")]
+        #[cfg(all(feature = "rodio", not(target_os = "android")))]
         audio_stream: Option<rodio::OutputStream>,
         /// Audio output stream handle for playing sounds
-        #[cfg(feature = "rodio")]
+        #[cfg(all(feature = "rodio", not(target_os = "android")))]
         audio_stream_handle: Option<rodio::OutputStreamHandle>,
         /// Text selection start cursor (character index) per world
         selection_start: Option<usize>,
@@ -7231,7 +7235,7 @@ mod remote_gui {
     }
 
     /// Square wave audio source for ANSI music playback
-    #[cfg(feature = "rodio")]
+    #[cfg(all(feature = "rodio", not(target_os = "android")))]
     struct SquareWaveSource {
         sample_rate: u32,
         frequency: f32,
@@ -7239,7 +7243,7 @@ mod remote_gui {
         current_sample: usize,
     }
 
-    #[cfg(feature = "rodio")]
+    #[cfg(all(feature = "rodio", not(target_os = "android")))]
     impl SquareWaveSource {
         fn new(frequency: f32, duration_ms: u32, sample_rate: u32) -> Self {
             let duration_samples = (sample_rate as f32 * duration_ms as f32 / 1000.0) as usize;
@@ -7252,7 +7256,7 @@ mod remote_gui {
         }
     }
 
-    #[cfg(feature = "rodio")]
+    #[cfg(all(feature = "rodio", not(target_os = "android")))]
     impl Iterator for SquareWaveSource {
         type Item = f32;
 
@@ -7275,7 +7279,7 @@ mod remote_gui {
         }
     }
 
-    #[cfg(feature = "rodio")]
+    #[cfg(all(feature = "rodio", not(target_os = "android")))]
     impl rodio::Source for SquareWaveSource {
         fn current_frame_len(&self) -> Option<usize> {
             Some(self.duration_samples - self.current_sample)
@@ -7393,9 +7397,9 @@ mod remote_gui {
                 color_offset_percent: 0,
                 ansi_music_enabled: true,
                 tls_proxy_enabled: false,
-                #[cfg(feature = "rodio")]
+                #[cfg(all(feature = "rodio", not(target_os = "android")))]
                 audio_stream: None,
-                #[cfg(feature = "rodio")]
+                #[cfg(all(feature = "rodio", not(target_os = "android")))]
                 audio_stream_handle: None,
                 selection_start: None,
                 selection_end: None,
@@ -7408,7 +7412,7 @@ mod remote_gui {
         }
 
         /// Initialize audio output for ANSI music playback
-        #[cfg(feature = "rodio")]
+        #[cfg(all(feature = "rodio", not(target_os = "android")))]
         fn init_audio(&mut self) {
             if self.audio_stream.is_none() {
                 match rodio::OutputStream::try_default() {
@@ -7424,7 +7428,7 @@ mod remote_gui {
         }
 
         /// Play ANSI music notes
-        #[cfg(feature = "rodio")]
+        #[cfg(all(feature = "rodio", not(target_os = "android")))]
         fn play_ansi_music(&mut self, notes: &[crate::ansi_music::MusicNote]) {
             if !self.ansi_music_enabled || notes.is_empty() {
                 return;
@@ -7447,7 +7451,7 @@ mod remote_gui {
         }
 
         /// Play ANSI music notes (no-op when rodio is not available)
-        #[cfg(not(feature = "rodio"))]
+        #[cfg(any(not(feature = "rodio"), target_os = "android"))]
         fn play_ansi_music(&mut self, _notes: &[crate::ansi_music::MusicNote]) {
             // Audio playback disabled - rodio feature not enabled
         }
@@ -9252,6 +9256,12 @@ mod remote_gui {
         /// Open a URL in the default browser
         fn open_url(url: &str) {
             #[cfg(target_os = "linux")]
+            {
+                let _ = std::process::Command::new("xdg-open")
+                    .arg(url)
+                    .spawn();
+            }
+            #[cfg(target_os = "android")]
             {
                 let _ = std::process::Command::new("xdg-open")
                     .arg(url)

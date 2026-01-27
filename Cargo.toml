@@ -55,7 +55,9 @@ egui = { version = "0.24", optional = true }
 egui_extras = { version = "0.24", optional = true, default-features = false, features = ["image", "svg"] }
 image = { version = "0.24", optional = true, default-features = false, features = ["png", "gif"] }
 
+[target.'cfg(not(target_os = "android"))'.dependencies]
 # Audio playback for ANSI music (optional, requires ALSA dev libraries on Linux)
+# Not available on Android/Termux (oboe-sys requires libc++_static from NDK)
 rodio = { version = "0.17", optional = true, default-features = false, features = ["wav"] }
 
 [features]
