@@ -1045,6 +1045,15 @@ fn get_home_dir() -> String {
         .unwrap_or_else(|| ".".to_string())
 }
 
+/// Returns a dot-prefixed filename on Unix, plain filename on Windows.
+/// e.g. clay_filename("clay.dat") → ".clay.dat" on Unix, "clay.dat" on Windows.
+fn clay_filename(name: &str) -> String {
+    #[cfg(unix)]
+    { format!(".{}", name) }
+    #[cfg(not(unix))]
+    { name.to_string() }
+}
+
 fn enable_tcp_keepalive(tcp_stream: &TcpStream) {
     use socket2::SockRef;
     let keepalive = socket2::TcpKeepalive::new()
@@ -1967,7 +1976,7 @@ static CRASH_COUNT: AtomicU32 = AtomicU32::new(0);
 
 fn get_reload_state_path() -> PathBuf {
     let home = get_home_dir();
-    PathBuf::from(home).join(".clay.reload")
+    PathBuf::from(home).join(clay_filename("clay.reload"))
 }
 
 /// Get the current crash count from environment variable
@@ -2309,7 +2318,7 @@ impl World {
     /// Get the path to the logs directory, creating it if needed
     fn get_logs_dir() -> std::path::PathBuf {
         let home = get_home_dir();
-        let logs_dir = std::path::PathBuf::from(home).join(".clay").join("logs");
+        let logs_dir = std::path::PathBuf::from(home).join(clay_filename("clay")).join("logs");
         if !logs_dir.exists() {
             let _ = std::fs::create_dir_all(&logs_dir);
         }
@@ -4624,12 +4633,12 @@ impl UserConnection {
 
 fn get_settings_path() -> PathBuf {
     let home = get_home_dir();
-    PathBuf::from(home).join(".clay.dat")
+    PathBuf::from(home).join(clay_filename("clay.dat"))
 }
 
 fn get_multiuser_settings_path() -> PathBuf {
     let home = get_home_dir();
-    PathBuf::from(home).join(".clay.multiuser.dat")
+    PathBuf::from(home).join(clay_filename("clay.multiuser.dat"))
 }
 
 fn get_debug_log_path() -> PathBuf {
@@ -20871,7 +20880,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                         let ts = current_timestamp_secs();
 
                                         let home = get_home_dir();
-                                        let dump_path = format!("{}/.clay.dmp.log", home);
+                                        let dump_path = format!("{}/{}", home, clay_filename("clay.dmp.log"));
 
                                         match std::fs::File::create(&dump_path) {
                                             Ok(mut file) => {
@@ -22591,7 +22600,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                     let ts = current_timestamp_secs();
 
                                     let home = get_home_dir();
-                                    let dump_path = format!("{}/.clay.dmp.log", home);
+                                    let dump_path = format!("{}/{}", home, clay_filename("clay.dmp.log"));
 
                                     match std::fs::File::create(&dump_path) {
                                         Ok(mut file) => {
@@ -25394,7 +25403,7 @@ async fn handle_command(cmd: &str, app: &mut App, event_tx: mpsc::Sender<AppEven
             use std::io::Write;
 
             let home = get_home_dir();
-            let dump_path = format!("{}/.clay.dmp.log", home);
+            let dump_path = format!("{}/{}", home, clay_filename("clay.dmp.log"));
 
             match std::fs::File::create(&dump_path) {
                 Ok(mut file) => {
