@@ -420,17 +420,17 @@ pub fn render_popup_content(
     if !state.definition.buttons.is_empty() {
         ui.add_space(15.0);
 
-        // Split buttons: danger buttons on left, others on right
-        let danger_buttons: Vec<_> = state.definition.buttons.iter()
-            .filter(|b| b.enabled && matches!(b.style, ButtonStyle::Danger))
+        // Split buttons: left-aligned buttons on left, others on right
+        let left_buttons: Vec<_> = state.definition.buttons.iter()
+            .filter(|b| b.enabled && b.left_align)
             .collect();
-        let other_buttons: Vec<_> = state.definition.buttons.iter()
-            .filter(|b| b.enabled && !matches!(b.style, ButtonStyle::Danger))
+        let right_buttons: Vec<_> = state.definition.buttons.iter()
+            .filter(|b| b.enabled && !b.left_align)
             .collect();
 
         ui.horizontal(|ui| {
-            // Danger buttons on left
-            for button in &danger_buttons {
+            // Left-aligned buttons
+            for button in &left_buttons {
                 render_single_button(ui, button, state, theme, &mut actions.clicked_button);
                 ui.add_space(8.0);
             }
@@ -438,7 +438,7 @@ pub fn render_popup_content(
             // Spacer to push other buttons to the right
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 // Render in reverse order for right-to-left layout
-                for button in other_buttons.iter().rev() {
+                for button in right_buttons.iter().rev() {
                     ui.add_space(8.0);
                     render_single_button(ui, button, state, theme, &mut actions.clicked_button);
                 }

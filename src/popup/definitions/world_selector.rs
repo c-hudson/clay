@@ -81,7 +81,7 @@ pub fn create_world_selector_popup(worlds: &[WorldInfo], visible_height: usize) 
         ))
         .with_button(Button::new(SELECTOR_BTN_ADD, "Add").with_shortcut('A'))
         .with_button(Button::new(SELECTOR_BTN_EDIT, "Edit").with_shortcut('E'))
-        .with_button(Button::new(SELECTOR_BTN_DELETE, "Delete").danger().with_shortcut('D'))
+        .with_button(Button::new(SELECTOR_BTN_DELETE, "Delete").danger().with_shortcut('D').left_align())
         .with_button(Button::new(SELECTOR_BTN_CONNECT, "Connect").primary().with_shortcut('O'))
         .with_button(Button::new(SELECTOR_BTN_CANCEL, "Cancel").with_shortcut('C'))
         .with_layout(PopupLayout {

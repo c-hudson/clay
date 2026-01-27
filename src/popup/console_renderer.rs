@@ -940,81 +940,107 @@ fn render_scrollable_content(
 }
 
 /// Render button row
-fn render_buttons(f: &mut Frame, state: &PopupState, area: Rect, theme: Theme) {
+fn build_button_spans(button: &super::Button, state: &PopupState, theme: Theme) -> Vec<Span<'static>> {
     let mut spans = Vec::new();
-    let button_spacing = "  ";
+    let is_selected = matches!(&state.selected, ElementSelection::Button(id) if *id == button.id);
 
-    for button in &state.definition.buttons {
-        if !button.enabled {
-            continue;
-        }
+    if let Some(shortcut) = button.shortcut {
+        let shortcut_lower = shortcut.to_ascii_lowercase();
+        let shortcut_upper = shortcut.to_ascii_uppercase();
 
-        let is_selected = matches!(&state.selected, ElementSelection::Button(id) if *id == button.id);
+        if let Some(pos) = button.label.find([shortcut_lower, shortcut_upper]) {
+            let (before, rest) = button.label.split_at(pos);
+            let (shortcut_char, after) = rest.split_at(1);
 
-        // Build button label with shortcut highlight
-        if let Some(shortcut) = button.shortcut {
-            // Find and highlight shortcut character
-            let shortcut_lower = shortcut.to_ascii_lowercase();
-            let shortcut_upper = shortcut.to_ascii_uppercase();
+            let base_style = get_button_style(button.style, is_selected, theme);
+            let shortcut_style = base_style.add_modifier(Modifier::UNDERLINED);
 
-            if let Some(pos) = button.label.find([shortcut_lower, shortcut_upper]) {
-                let (before, rest) = button.label.split_at(pos);
-                let (shortcut_char, after) = rest.split_at(1);
-
-                let base_style = get_button_style(button.style, is_selected, theme);
-                let shortcut_style = base_style.add_modifier(Modifier::UNDERLINED);
-
-                spans.push(Span::styled(format!("[{}", before), base_style));
-                spans.push(Span::styled(shortcut_char.to_string(), shortcut_style));
-                spans.push(Span::styled(format!("{}]", after), base_style));
-            } else {
-                let style = get_button_style(button.style, is_selected, theme);
-                spans.push(Span::styled(format!("[{}]", button.label), style));
-            }
+            spans.push(Span::styled(format!("[{}", before), base_style));
+            spans.push(Span::styled(shortcut_char.to_string(), shortcut_style));
+            spans.push(Span::styled(format!("{}]", after), base_style));
         } else {
             let style = get_button_style(button.style, is_selected, theme);
             spans.push(Span::styled(format!("[{}]", button.label), style));
         }
-
-        spans.push(Span::styled(
-            button_spacing.to_string(),
-            Style::default().bg(theme.popup_bg()),
-        ));
-    }
-
-    // Remove trailing spacing
-    if !spans.is_empty() {
-        spans.pop();
-    }
-
-    // Position buttons (right-aligned or centered)
-    let total_width: usize = spans.iter().map(|s| s.content.len()).sum();
-    let padding = if state.definition.layout.buttons_right_align {
-        // Right align: padding pushes buttons to the right, shifted 1 char left
-        (area.width as usize).saturating_sub(total_width).saturating_sub(1)
     } else {
-        // Center: padding on both sides
-        (area.width as usize).saturating_sub(total_width) / 2
-    };
-
-    // Add leading padding with popup background
-    let mut positioned_spans = vec![Span::styled(
-        " ".repeat(padding),
-        Style::default().bg(theme.popup_bg()),
-    )];
-    positioned_spans.extend(spans);
-    // Add trailing padding to fill the row
-    let used_width: usize = positioned_spans.iter().map(|s| s.content.len()).sum();
-    let trailing_padding = (area.width as usize).saturating_sub(used_width);
-    if trailing_padding > 0 {
-        positioned_spans.push(Span::styled(
-            " ".repeat(trailing_padding),
-            Style::default().bg(theme.popup_bg()),
-        ));
+        let style = get_button_style(button.style, is_selected, theme);
+        spans.push(Span::styled(format!("[{}]", button.label), style));
     }
 
-    let line = Line::from(positioned_spans);
-    f.render_widget(Paragraph::new(line).style(Style::default().bg(theme.popup_bg())), area);
+    spans
+}
+
+fn render_buttons(f: &mut Frame, state: &PopupState, area: Rect, theme: Theme) {
+    let button_spacing = "  ";
+    let bg_style = Style::default().bg(theme.popup_bg());
+
+    // Split buttons into left-aligned and right-aligned groups
+    let has_left_buttons = state.definition.buttons.iter().any(|b| b.enabled && b.left_align);
+
+    if has_left_buttons {
+        // Split layout: left buttons on left, right buttons on right
+        let mut left_spans: Vec<Span<'static>> = Vec::new();
+        let mut right_spans: Vec<Span<'static>> = Vec::new();
+
+        for button in &state.definition.buttons {
+            if !button.enabled { continue; }
+            let target = if button.left_align { &mut left_spans } else { &mut right_spans };
+            if !target.is_empty() {
+                target.push(Span::styled(button_spacing.to_string(), bg_style));
+            }
+            target.extend(build_button_spans(button, state, theme));
+        }
+
+        let left_width: usize = left_spans.iter().map(|s| s.content.len()).sum();
+        let right_width: usize = right_spans.iter().map(|s| s.content.len()).sum();
+        let gap = (area.width as usize).saturating_sub(left_width + right_width + 2); // 1 margin each side
+
+        let mut positioned_spans = Vec::new();
+        positioned_spans.push(Span::styled(" ".to_string(), bg_style)); // left margin
+        positioned_spans.extend(left_spans);
+        positioned_spans.push(Span::styled(" ".repeat(gap), bg_style));
+        positioned_spans.extend(right_spans);
+
+        // Trailing padding to fill the row
+        let used_width: usize = positioned_spans.iter().map(|s| s.content.len()).sum();
+        let trailing = (area.width as usize).saturating_sub(used_width);
+        if trailing > 0 {
+            positioned_spans.push(Span::styled(" ".repeat(trailing), bg_style));
+        }
+
+        let line = Line::from(positioned_spans);
+        f.render_widget(Paragraph::new(line).style(bg_style), area);
+    } else {
+        // Original layout: all buttons together (right-aligned or centered)
+        let mut spans: Vec<Span<'static>> = Vec::new();
+
+        for button in &state.definition.buttons {
+            if !button.enabled { continue; }
+            if !spans.is_empty() {
+                spans.push(Span::styled(button_spacing.to_string(), bg_style));
+            }
+            spans.extend(build_button_spans(button, state, theme));
+        }
+
+        let total_width: usize = spans.iter().map(|s| s.content.len()).sum();
+        let padding = if state.definition.layout.buttons_right_align {
+            (area.width as usize).saturating_sub(total_width).saturating_sub(1)
+        } else {
+            (area.width as usize).saturating_sub(total_width) / 2
+        };
+
+        let mut positioned_spans = vec![Span::styled(" ".repeat(padding), bg_style)];
+        positioned_spans.extend(spans);
+
+        let used_width: usize = positioned_spans.iter().map(|s| s.content.len()).sum();
+        let trailing = (area.width as usize).saturating_sub(used_width);
+        if trailing > 0 {
+            positioned_spans.push(Span::styled(" ".repeat(trailing), bg_style));
+        }
+
+        let line = Line::from(positioned_spans);
+        f.render_widget(Paragraph::new(line).style(bg_style), area);
+    }
 }
 
 /// Get button style based on type and selection state

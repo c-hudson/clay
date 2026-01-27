@@ -453,6 +453,7 @@ pub struct Button {
     pub shortcut: Option<char>,
     pub style: ButtonStyle,
     pub enabled: bool,
+    pub left_align: bool,
 }
 
 impl Button {
@@ -463,6 +464,7 @@ impl Button {
             shortcut: None,
             style: ButtonStyle::Secondary,
             enabled: true,
+            left_align: false,
         }
     }
 
@@ -483,6 +485,11 @@ impl Button {
 
     pub fn disabled(mut self) -> Self {
         self.enabled = false;
+        self
+    }
+
+    pub fn left_align(mut self) -> Self {
+        self.left_align = true;
         self
     }
 }

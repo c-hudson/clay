@@ -259,7 +259,7 @@ pub fn create_world_editor_popup(settings: &WorldSettings) -> PopupDefinition {
         // Buttons
         .with_button(Button::new(WORLD_BTN_SAVE, "Save").primary().with_shortcut('S'))
         .with_button(Button::new(WORLD_BTN_CANCEL, "Cancel").with_shortcut('C'))
-        .with_button(Button::new(WORLD_BTN_DELETE, "Delete").danger().with_shortcut('D'))
+        .with_button(Button::new(WORLD_BTN_DELETE, "Delete").danger().with_shortcut('D').left_align())
         .with_button(Button::new(WORLD_BTN_CONNECT, "Connect").with_shortcut('O'))
         .with_layout(PopupLayout {
             label_width: 12,
