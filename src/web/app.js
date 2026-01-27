@@ -1216,7 +1216,15 @@
                                 return;
                             }
                             const lineIndex = world.output_lines.length;
-                            world.output_lines.push({ text: truncateIfNeeded(line), ts: lineTs });
+                            const lineSeq = (msg.seq !== undefined) ? msg.seq + lineIndex : lineIndex;
+                            world.output_lines.push({ text: truncateIfNeeded(line), ts: lineTs, seq: lineSeq });
+                            // Verify sequence order
+                            if (lineIndex > 0) {
+                                const prevSeq = world.output_lines[lineIndex - 1].seq;
+                                if (prevSeq !== undefined && lineSeq !== undefined && lineSeq <= prevSeq) {
+                                    console.warn('SEQ MISMATCH in world ' + msg.world_index + ': idx=' + lineIndex + ' expected seq>' + prevSeq + ' got seq=' + lineSeq);
+                                }
+                            }
                             if (msg.world_index === currentWorldIndex) {
                                 handleIncomingLine(line, lineTs, msg.world_index, lineIndex);
                             }

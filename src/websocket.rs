@@ -215,6 +215,8 @@ pub struct TimestampedLine {
     pub gagged: bool, // true if line was gagged by an action (only shown with F2/show_tags)
     #[serde(default = "default_true")]
     pub from_server: bool, // true if from MUD server, false if client-generated
+    #[serde(default)]
+    pub seq: u64, // Unique sequential number within the world (for debugging)
 }
 
 /// World state for WebSocket protocol

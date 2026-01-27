@@ -2075,6 +2075,7 @@ struct OutputLine {
     timestamp: SystemTime,
     from_server: bool,  // true if from MUD server, false if client-generated
     gagged: bool,       // true if line was gagged by an action (only shown with F2)
+    seq: u64,           // Unique sequential number within the world (for debugging out-of-order issues)
 }
 
 /// Maximum characters per output line (prevents performance issues with extremely long lines)
@@ -2110,35 +2111,38 @@ impl OutputLine {
         }
     }
 
-    fn new(text: String) -> Self {
+    fn new(text: String, seq: u64) -> Self {
         Self {
             text: Self::truncate_if_needed(text),
             timestamp: SystemTime::now(),
             from_server: true,  // Default to server output
             gagged: false,
+            seq,
         }
     }
 
-    fn new_client(text: String) -> Self {
+    fn new_client(text: String, seq: u64) -> Self {
         Self {
             text: Self::truncate_if_needed(text),
             timestamp: SystemTime::now(),
             from_server: false,
             gagged: false,
+            seq,
         }
     }
 
-    fn new_gagged(text: String) -> Self {
+    fn new_gagged(text: String, seq: u64) -> Self {
         Self {
             text: Self::truncate_if_needed(text),
             timestamp: SystemTime::now(),
             from_server: true,
             gagged: true,
+            seq,
         }
     }
 
-    fn new_with_timestamp(text: String, timestamp: SystemTime) -> Self {
-        Self { text: Self::truncate_if_needed(text), timestamp, from_server: true, gagged: false }
+    fn new_with_timestamp(text: String, timestamp: SystemTime, seq: u64) -> Self {
+        Self { text: Self::truncate_if_needed(text), timestamp, from_server: true, gagged: false, seq }
     }
 
     /// Format timestamp for display based on whether it's from today
@@ -2213,6 +2217,7 @@ struct World {
     proxy_socket_path: Option<std::path::PathBuf>, // Unix socket path for TLS proxy
     naws_enabled: bool,          // True if NAWS telnet option was negotiated
     naws_sent_size: Option<(u16, u16)>, // Last sent window size (width, height) to avoid duplicates
+    next_seq: u64,               // Next sequence number for output lines (for debugging)
 }
 
 impl World {
@@ -2268,6 +2273,7 @@ impl World {
             proxy_socket_path: None,
             naws_enabled: false,
             naws_sent_size: None,
+            next_seq: 0,
         }
     }
 
@@ -2475,10 +2481,12 @@ impl World {
                 && self.output_lines.len() >= max_lines;
 
             // Create OutputLine with appropriate from_server flag
+            let seq = self.next_seq;
+            self.next_seq += 1;
             let new_line = if from_server {
-                OutputLine::new(line.to_string())
+                OutputLine::new(line.to_string(), seq)
             } else {
-                OutputLine::new_client(line.to_string())
+                OutputLine::new_client(line.to_string(), seq)
             };
 
             if goes_to_pending {
@@ -2657,19 +2665,20 @@ impl World {
         //     /        /
         //  -`/_------'\_.
         let now = SystemTime::now();
+        // Splash lines use seq 0-11 (will be cleared when real MUD data arrives)
         vec![
-            OutputLine::new_with_timestamp("".to_string(), now),
-            OutputLine::new_with_timestamp("\x1b[38;5;180m          (\\/\\__o     \x1b[38;5;209m ██████╗██╗      █████╗ ██╗   ██╗\x1b[0m".to_string(), now),
-            OutputLine::new_with_timestamp("\x1b[38;5;180m  __      `-/ `_/     \x1b[38;5;208m██╔════╝██║     ██╔══██╗╚██╗ ██╔╝\x1b[0m".to_string(), now),
-            OutputLine::new_with_timestamp("\x1b[38;5;180m `--\\______/  |       \x1b[38;5;215m██║     ██║     ███████║ ╚████╔╝ \x1b[0m".to_string(), now),
-            OutputLine::new_with_timestamp("\x1b[38;5;180m    /        /        \x1b[38;5;216m██║     ██║     ██╔══██║  ╚██╔╝  \x1b[0m".to_string(), now),
-            OutputLine::new_with_timestamp("\x1b[38;5;180m -`/_------'\\_.       \x1b[38;5;217m╚██████╗███████╗██║  ██║   ██║   \x1b[0m".to_string(), now),
-            OutputLine::new_with_timestamp("\x1b[38;5;218m                       ╚═════╝╚══════╝╚═╝  ╚═╝   ╚═╝   \x1b[0m".to_string(), now),
-            OutputLine::new_with_timestamp("".to_string(), now),
-            OutputLine::new_with_timestamp("\x1b[38;5;213m✨ A 90dies mud client written today ✨\x1b[0m".to_string(), now),
-            OutputLine::new_with_timestamp("".to_string(), now),
-            OutputLine::new_with_timestamp("\x1b[38;5;244m/help for how to use clay\x1b[0m".to_string(), now),
-            OutputLine::new_with_timestamp("".to_string(), now),
+            OutputLine::new_with_timestamp("".to_string(), now, 0),
+            OutputLine::new_with_timestamp("\x1b[38;5;180m          (\\/\\__o     \x1b[38;5;209m ██████╗██╗      █████╗ ██╗   ██╗\x1b[0m".to_string(), now, 1),
+            OutputLine::new_with_timestamp("\x1b[38;5;180m  __      `-/ `_/     \x1b[38;5;208m██╔════╝██║     ██╔══██╗╚██╗ ██╔╝\x1b[0m".to_string(), now, 2),
+            OutputLine::new_with_timestamp("\x1b[38;5;180m `--\\______/  |       \x1b[38;5;215m██║     ██║     ███████║ ╚████╔╝ \x1b[0m".to_string(), now, 3),
+            OutputLine::new_with_timestamp("\x1b[38;5;180m    /        /        \x1b[38;5;216m██║     ██║     ██╔══██║  ╚██╔╝  \x1b[0m".to_string(), now, 4),
+            OutputLine::new_with_timestamp("\x1b[38;5;180m -`/_------'\\_.       \x1b[38;5;217m╚██████╗███████╗██║  ██║   ██║   \x1b[0m".to_string(), now, 5),
+            OutputLine::new_with_timestamp("\x1b[38;5;218m                       ╚═════╝╚══════╝╚═╝  ╚═╝   ╚═╝   \x1b[0m".to_string(), now, 6),
+            OutputLine::new_with_timestamp("".to_string(), now, 7),
+            OutputLine::new_with_timestamp("\x1b[38;5;213m✨ A 90dies mud client written today ✨\x1b[0m".to_string(), now, 8),
+            OutputLine::new_with_timestamp("".to_string(), now, 9),
+            OutputLine::new_with_timestamp("\x1b[38;5;244m/help for how to use clay\x1b[0m".to_string(), now, 10),
+            OutputLine::new_with_timestamp("".to_string(), now, 11),
         ]
     }
 }
@@ -3143,10 +3152,12 @@ impl App {
 
                     for line in data.lines() {
                         // Preserve from_server flag for Ctrl+L filtering
+                        let seq = world.next_seq;
+                        world.next_seq += 1;
                         let output_line = if from_server {
-                            OutputLine::new(line.to_string())
+                            OutputLine::new(line.to_string(), seq)
                         } else {
-                            OutputLine::new_client(line.to_string())
+                            OutputLine::new_client(line.to_string(), seq)
                         };
                         world.output_lines.push(output_line);
                     }
@@ -3219,11 +3230,14 @@ impl App {
                     world.paused = pending_count > 0;
                     // Append recent lines
                     for tl in recent_lines {
+                        let seq = world.next_seq;
+                        world.next_seq += 1;
                         world.output_lines.push(OutputLine {
                             text: tl.text,
                             timestamp: std::time::UNIX_EPOCH + std::time::Duration::from_secs(tl.ts),
                             from_server: true,
                             gagged: tl.gagged,
+                            seq,
                         });
                     }
                     self.needs_output_redraw = true;
@@ -3266,7 +3280,10 @@ impl App {
                 // Display the connections list from server
                 let was_at_bottom = self.current_world().is_at_bottom();
                 for line in lines {
-                    self.current_world_mut().output_lines.push(OutputLine::new_client(line));
+                    let seq = self.current_world().next_seq;
+                    let world = self.current_world_mut();
+                    world.next_seq = seq + 1;
+                    world.output_lines.push(OutputLine::new_client(line, seq));
                 }
                 if was_at_bottom {
                     self.current_world_mut().scroll_to_bottom();
@@ -3352,8 +3369,11 @@ impl App {
                     timestamp: std::time::UNIX_EPOCH + std::time::Duration::from_secs(tl.ts),
                     from_server: tl.from_server,
                     gagged: tl.gagged,
+                    seq: tl.seq,
                 }
             }).collect();
+            // Update next_seq to continue from highest seq in output_lines
+            world.next_seq = world.output_lines.iter().map(|l| l.seq).max().unwrap_or(0).saturating_add(1);
             world.unseen_lines = w.unseen_lines;
             // Use server's scroll_offset, or set to end of buffer if showing splash
             world.scroll_offset = if w.showing_splash {
@@ -3367,8 +3387,13 @@ impl App {
                     timestamp: std::time::UNIX_EPOCH + std::time::Duration::from_secs(tl.ts),
                     from_server: tl.from_server,
                     gagged: tl.gagged,
+                    seq: tl.seq,
                 }
             }).collect();
+            // Update next_seq if pending_lines have higher seq values
+            if let Some(max_pending_seq) = world.pending_lines.iter().map(|l| l.seq).max() {
+                world.next_seq = world.next_seq.max(max_pending_seq.saturating_add(1));
+            }
             world.paused = w.paused;
             world.prompt = w.prompt;
             world.showing_splash = w.showing_splash;
@@ -3403,8 +3428,13 @@ impl App {
                         let _ = writeln!(f, "DEBUG: Adding splash screen to world {} (was empty and not connected)", world.name);
                     }
                     world.output_lines = splash_lines.into_iter()
-                        .map(OutputLine::new)
+                        .enumerate()
+                        .map(|(i, line)| {
+                            let seq = world.next_seq + i as u64;
+                            OutputLine::new(line, seq)
+                        })
                         .collect();
+                    world.next_seq += world.output_lines.len() as u64;
                     world.showing_splash = true;
                     world.scroll_offset = world.output_lines.len().saturating_sub(1);
                 } else if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open("/tmp/clay-debug.log") {
@@ -3951,7 +3981,9 @@ impl App {
 
         // Add gagged lines to output (they'll only show with F2)
         for line in gagged_lines {
-            self.worlds[world_idx].output_lines.push(OutputLine::new_gagged(line.to_string()));
+            let seq = self.worlds[world_idx].next_seq;
+            self.worlds[world_idx].next_seq += 1;
+            self.worlds[world_idx].output_lines.push(OutputLine::new_gagged(line.to_string(), seq));
         }
         // Keep scroll at bottom if we added gagged lines
         if !self.worlds[world_idx].paused {
@@ -3989,6 +4021,7 @@ impl App {
                         ts: s.timestamp.duration_since(UNIX_EPOCH).unwrap_or_default().as_secs(),
                         gagged: s.gagged,
                         from_server: s.from_server,
+                        seq: s.seq,
                     }
                 })
                 .collect();
@@ -4757,8 +4790,14 @@ fn save_settings(app: &App) -> io::Result<()> {
     }
     writeln!(file, "tls_proxy_enabled={}", app.settings.tls_proxy_enabled)?;
 
-    // Save each world's settings
+    // Save each world's settings (skip unconfigured worlds that have no connection info)
     for world in &app.worlds {
+        let has_mud_config = !world.settings.hostname.is_empty();
+        let has_slack_config = !world.settings.slack_token.is_empty();
+        let has_discord_config = !world.settings.discord_token.is_empty();
+        if !has_mud_config && !has_slack_config && !has_discord_config {
+            continue; // Don't persist unconfigured worlds
+        }
         writeln!(file)?;
         writeln!(file, "[world:{}]", world.name)?;
         writeln!(file, "world_type={}", world.settings.world_type.name())?;
@@ -5654,6 +5693,7 @@ fn save_reload_state(app: &App) -> io::Result<()> {
         writeln!(file, "was_connected={}", world.was_connected)?;
         writeln!(file, "telnet_mode={}", world.telnet_mode)?;
         writeln!(file, "uses_wont_echo_prompt={}", world.uses_wont_echo_prompt)?;
+        writeln!(file, "next_seq={}", world.next_seq)?;
         if !world.prompt.is_empty() {
             writeln!(file, "prompt={}", world.prompt.replace('=', "\\e"))?;
         }
@@ -5717,7 +5757,7 @@ fn save_reload_state(app: &App) -> io::Result<()> {
     }
 
     // Save output lines in a separate section (can be large)
-    // Format: timestamp_secs|flags|escaped_text
+    // Format: timestamp_secs|flags|seq|escaped_text
     // Flags: s = from_server (omit if false), g = gagged (omit if false)
     for (idx, world) in app.worlds.iter().enumerate() {
         writeln!(file)?;
@@ -5728,7 +5768,7 @@ fn save_reload_state(app: &App) -> io::Result<()> {
             if line.from_server { flags.push('s'); }
             if line.gagged { flags.push('g'); }
             let escaped = line.text.replace('\\', "\\\\").replace('\n', "\\n");
-            writeln!(file, "{}|{}|{}", ts_secs, flags, escaped)?;
+            writeln!(file, "{}|{}|{}|{}", ts_secs, flags, line.seq, escaped)?;
         }
         writeln!(file, "[pending:{}]", idx)?;
         for line in &world.pending_lines {
@@ -5737,7 +5777,7 @@ fn save_reload_state(app: &App) -> io::Result<()> {
             if line.from_server { flags.push('s'); }
             if line.gagged { flags.push('g'); }
             let escaped = line.text.replace('\\', "\\\\").replace('\n', "\\n");
-            writeln!(file, "{}|{}|{}", ts_secs, flags, escaped)?;
+            writeln!(file, "{}|{}|{}|{}", ts_secs, flags, line.seq, escaped)?;
         }
     }
 
@@ -5830,20 +5870,36 @@ fn load_reload_state(app: &mut App) -> io::Result<bool> {
         uses_wont_echo_prompt: bool,
         prompt: String,
         settings: WorldSettings,
+        next_seq: u64,
     }
 
     // Parse a saved output/pending line with timestamp
-    // New format: timestamp_secs|flags|text (flags: s=from_server, g=gagged)
-    // Old format: timestamp_secs|text (for backward compatibility)
+    // Newest format: timestamp_secs|flags|seq|text (flags: s=from_server, g=gagged)
+    // Older format: timestamp_secs|flags|text (flags: s=from_server, g=gagged) - seq=0
+    // Old format: timestamp_secs|text (for backward compatibility) - seq=0
     fn parse_timestamped_line(line: &str) -> OutputLine {
-        let parts: Vec<&str> = line.splitn(3, '|').collect();
+        let parts: Vec<&str> = line.splitn(4, '|').collect();
 
         if parts.len() >= 2 {
             if let Ok(ts_secs) = parts[0].parse::<u64>() {
                 let timestamp = UNIX_EPOCH + Duration::from_secs(ts_secs);
 
-                if parts.len() == 3 {
-                    // New format: timestamp|flags|text
+                if parts.len() == 4 {
+                    // Newest format: timestamp|flags|seq|text
+                    let flags = parts[1];
+                    let seq = parts[2].parse::<u64>().unwrap_or(0);
+                    let text = unescape_string(parts[3]);
+                    let from_server = flags.contains('s');
+                    let gagged = flags.contains('g');
+                    return OutputLine {
+                        text,
+                        timestamp,
+                        from_server,
+                        gagged,
+                        seq,
+                    };
+                } else if parts.len() == 3 {
+                    // Older format: timestamp|flags|text (no seq)
                     let flags = parts[1];
                     let text = unescape_string(parts[2]);
                     let from_server = flags.contains('s');
@@ -5853,6 +5909,7 @@ fn load_reload_state(app: &mut App) -> io::Result<bool> {
                         timestamp,
                         from_server,
                         gagged,
+                        seq: 0,
                     };
                 } else {
                     // Old format: timestamp|text (assume from_server=true for compatibility)
@@ -5861,12 +5918,13 @@ fn load_reload_state(app: &mut App) -> io::Result<bool> {
                         timestamp,
                         from_server: true,
                         gagged: false,
+                        seq: 0,
                     };
                 }
             }
         }
         // Fallback: no timestamp in old format, use current time
-        OutputLine::new(unescape_string(line))
+        OutputLine::new(unescape_string(line), 0)
     }
 
     let mut temp_worlds: Vec<TempWorld> = Vec::new();
@@ -5903,6 +5961,7 @@ fn load_reload_state(app: &mut App) -> io::Result<bool> {
                         uses_wont_echo_prompt: false,
                         prompt: String::new(),
                         settings: WorldSettings::default(),
+                        next_seq: 0,
                     });
                 }
             } else if let Some(suffix) = section.strip_prefix("output:") {
@@ -6176,6 +6235,7 @@ fn load_reload_state(app: &mut App) -> io::Result<bool> {
                             "socket_fd" => tw.socket_fd = value.parse().ok(),
                             "proxy_pid" => tw.proxy_pid = value.parse().ok(),
                             "proxy_socket_path" => tw.proxy_socket_path = Some(PathBuf::from(value)),
+                            "next_seq" => tw.next_seq = value.parse().unwrap_or(0),
                             "world_type" => tw.settings.world_type = WorldType::from_name(value),
                             "hostname" => tw.settings.hostname = value.to_string(),
                             "port" => tw.settings.port = value.to_string(),
@@ -6255,6 +6315,7 @@ fn load_reload_state(app: &mut App) -> io::Result<bool> {
         world.proxy_pid = tw.proxy_pid;
         world.proxy_socket_path = tw.proxy_socket_path;
         world.settings = tw.settings;
+        world.next_seq = tw.next_seq;
         // Leave timing fields as None for connected worlds after reload
         // This triggers immediate keepalive since we don't know how long connection was idle
         app.worlds.push(world);
@@ -7735,7 +7796,7 @@ mod remote_gui {
                                     } else {
                                         // Fallback for old protocol: use current time
                                         let now = current_timestamp_secs();
-                                        w.output_lines.into_iter().map(|text| TimestampedLine { text, ts: now, gagged: false, from_server: true }).collect()
+                                        w.output_lines.into_iter().enumerate().map(|(i, text)| TimestampedLine { text, ts: now, gagged: false, from_server: true, seq: i as u64 }).collect()
                                     }
                                 },
                                 prompt: w.prompt,
@@ -7850,7 +7911,8 @@ mod remote_gui {
                                             line.to_string()
                                         };
                                         // All lines go to output_lines - server controls more-mode via pending_count
-                                        world.output_lines.push(TimestampedLine { text, ts, gagged: false, from_server });
+                                        let seq = world.output_lines.len() as u64;
+                                        world.output_lines.push(TimestampedLine { text, ts, gagged: false, from_server, seq });
                                     }
                                 }
 
@@ -8033,11 +8095,13 @@ mod remote_gui {
                                     let ts = super::current_timestamp_secs();
                                     if self.current_world < self.worlds.len() {
                                         for line in output.lines() {
+                                            let seq = self.worlds[self.current_world].output_lines.len() as u64;
                                             self.worlds[self.current_world].output_lines.push(TimestampedLine {
                                                 text: line.to_string(),
                                                 ts,
                                                 gagged: false,
                                                 from_server: false,
+                                                seq,
                                             });
                                         }
                                     }
@@ -8070,8 +8134,9 @@ mod remote_gui {
                                 Command::Version => {
                                     let ts = super::current_timestamp_secs();
                                     if self.current_world < self.worlds.len() {
+                                        let seq = self.worlds[self.current_world].output_lines.len() as u64;
                                         self.worlds[self.current_world].output_lines.push(
-                                            TimestampedLine { text: super::get_version_string(), ts, gagged: false, from_server: false }
+                                            TimestampedLine { text: super::get_version_string(), ts, gagged: false, from_server: false, seq }
                                         );
                                     }
                                 }
@@ -10320,11 +10385,13 @@ mod remote_gui {
                         if let Some(message) = self.handle_spell_check() {
                             // Add suggestion message to current world's output
                             if let Some(world) = self.worlds.get_mut(self.current_world) {
+                                let seq = world.output_lines.len() as u64;
                                 world.output_lines.push(TimestampedLine {
                                     text: message,
                                     ts: current_timestamp_secs(),
                                     gagged: false,
                                     from_server: false,
+                                    seq,
                                 });
                             }
                         }
@@ -10594,11 +10661,13 @@ mod remote_gui {
                                         let ts = super::current_timestamp_secs();
                                         if self.current_world < self.worlds.len() {
                                             for line in output.lines() {
+                                                let seq = self.worlds[self.current_world].output_lines.len() as u64;
                                                 self.worlds[self.current_world].output_lines.push(TimestampedLine {
                                                     text: line.to_string(),
                                                     ts,
                                                     gagged: false,
                                                     from_server: false,
+                                                    seq,
                                                 });
                                             }
                                         }
@@ -10609,8 +10678,9 @@ mod remote_gui {
                                     super::Command::Version => {
                                         let ts = current_timestamp_secs();
                                         if self.current_world < self.worlds.len() {
+                                            let seq = self.worlds[self.current_world].output_lines.len() as u64;
                                             self.worlds[self.current_world].output_lines.push(
-                                                TimestampedLine { text: super::get_version_string(), ts, gagged: false, from_server: false }
+                                                TimestampedLine { text: super::get_version_string(), ts, gagged: false, from_server: false, seq }
                                             );
                                         }
                                     }
@@ -10644,8 +10714,9 @@ mod remote_gui {
                                             // World not found - show error locally (red % prefix)
                                             let ts = current_timestamp_secs();
                                             if self.current_world < self.worlds.len() {
+                                                let seq = self.worlds[self.current_world].output_lines.len() as u64;
                                                 self.worlds[self.current_world].output_lines.push(
-                                                    TimestampedLine { text: format!("✨ World '{}' not found.", name), ts, gagged: false, from_server: false }
+                                                    TimestampedLine { text: format!("✨ World '{}' not found.", name), ts, gagged: false, from_server: false, seq }
                                                 );
                                             }
                                         }
@@ -10662,8 +10733,9 @@ mod remote_gui {
                                             // World not found - show error locally (red % prefix)
                                             let ts = current_timestamp_secs();
                                             if self.current_world < self.worlds.len() {
+                                                let seq = self.worlds[self.current_world].output_lines.len() as u64;
                                                 self.worlds[self.current_world].output_lines.push(
-                                                    TimestampedLine { text: format!("✨ World '{}' not found.", name), ts, gagged: false, from_server: false }
+                                                    TimestampedLine { text: format!("✨ World '{}' not found.", name), ts, gagged: false, from_server: false, seq }
                                                 );
                                             }
                                         }
@@ -13941,8 +14013,9 @@ mod remote_gui {
                             super::Command::Version => {
                                 let ts = current_timestamp_secs();
                                 if self.current_world < self.worlds.len() {
+                                    let seq = self.worlds[self.current_world].output_lines.len() as u64;
                                     self.worlds[self.current_world].output_lines.push(
-                                        TimestampedLine { text: super::get_version_string(), ts, gagged: false, from_server: false }
+                                        TimestampedLine { text: super::get_version_string(), ts, gagged: false, from_server: false, seq }
                                     );
                                 }
                             }
@@ -13976,11 +14049,13 @@ mod remote_gui {
                                 let ts = super::current_timestamp_secs();
                                 if self.current_world < self.worlds.len() {
                                     for line in output.lines() {
+                                        let seq = self.worlds[self.current_world].output_lines.len() as u64;
                                         self.worlds[self.current_world].output_lines.push(TimestampedLine {
                                             text: line.to_string(),
                                             ts,
                                             gagged: false,
                                             from_server: false,
+                                            seq,
                                         });
                                     }
                                 }
@@ -15438,8 +15513,10 @@ async fn run_console_client(addr: &str) -> io::Result<()> {
                                 app.last_ctrl_c = Some(std::time::Instant::now());
                                 let world = app.current_world_mut();
                                 world.showing_splash = false; // Clear splash when adding output
+                                let seq = world.next_seq;
+                                world.next_seq += 1;
                                 world.output_lines.push(
-                                    OutputLine::new_client("Press Ctrl+C again within 15 seconds to exit, or use /quit".to_string())
+                                    OutputLine::new_client("Press Ctrl+C again within 15 seconds to exit, or use /quit".to_string(), seq)
                                 );
                                 // Keep scroll at bottom
                                 world.scroll_offset = world.output_lines.len().saturating_sub(1);
@@ -15889,8 +15966,11 @@ fn handle_remote_client_key(
                             }
                         } else {
                             // World doesn't exist - could create it, but for now just show message
-                            app.current_world_mut().output_lines.push(
-                                OutputLine::new_client(format!("World '{}' not found.", name))
+                            let ci = app.current_world_index;
+                            let seq = app.worlds[ci].next_seq;
+                            app.worlds[ci].next_seq += 1;
+                            app.worlds[ci].output_lines.push(
+                                OutputLine::new_client(format!("World '{}' not found.", name), seq)
                             );
                         }
                     }
@@ -17992,7 +18072,8 @@ keep_alive_type=Generic
 
                             // Add to user's output buffer
                             for line in decoded.lines() {
-                                conn.output_lines.push(OutputLine::new(line.to_string()));
+                                let seq = conn.output_lines.len() as u64;
+                                conn.output_lines.push(OutputLine::new(line.to_string(), seq));
                             }
 
                             // Send to this user's WebSocket clients only
@@ -18548,6 +18629,7 @@ fn build_multiuser_initial_state(app: &App, username: &str) -> WsMessage {
                         ts: s.timestamp.duration_since(UNIX_EPOCH).unwrap_or_default().as_secs(),
                         gagged: s.gagged,
                         from_server: s.from_server,
+                        seq: s.seq,
                     }
                 })
                 .collect();
@@ -18564,6 +18646,7 @@ fn build_multiuser_initial_state(app: &App, username: &str) -> WsMessage {
                         ts: s.timestamp.duration_since(UNIX_EPOCH).unwrap_or_default().as_secs(),
                         gagged: s.gagged,
                         from_server: s.from_server,
+                        seq: s.seq,
                     }
                 })
                 .collect();
@@ -19145,7 +19228,9 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
             app.worlds[world_idx].connected = false;
             app.worlds[world_idx].command_tx = None;
             app.worlds[world_idx].socket_fd = None;
-            app.worlds[world_idx].output_lines.push(OutputLine::new_client(tls_msg.to_string()));
+            let seq = app.worlds[world_idx].next_seq;
+            app.worlds[world_idx].next_seq += 1;
+            app.worlds[world_idx].output_lines.push(OutputLine::new_client(tls_msg.to_string(), seq));
             // If not the current world, set unseen_lines for activity indicator
             if world_idx != app.current_world_index {
                 if app.worlds[world_idx].unseen_lines == 0 {
@@ -19336,8 +19421,10 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                     app.worlds[world_idx].connected = false;
                     app.worlds[world_idx].proxy_pid = None;
                     app.worlds[world_idx].proxy_socket_path = None;
+                    let seq = app.worlds[world_idx].next_seq;
+                    app.worlds[world_idx].next_seq += 1;
                     app.worlds[world_idx].output_lines.push(OutputLine::new(
-                        "TLS proxy terminated during reload. Use /worlds to reconnect.".to_string()
+                        "TLS proxy terminated during reload. Use /worlds to reconnect.".to_string(), seq
                     ));
                     continue;
                 }
@@ -19469,8 +19556,10 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                         app.worlds[world_idx].connected = false;
                         app.worlds[world_idx].proxy_pid = None;
                         app.worlds[world_idx].proxy_socket_path = None;
+                        let seq = app.worlds[world_idx].next_seq;
+                        app.worlds[world_idx].next_seq += 1;
                         app.worlds[world_idx].output_lines.push(OutputLine::new(
-                            format!("Failed to reconnect to TLS proxy: {}. Use /worlds to reconnect.", e)
+                            format!("Failed to reconnect to TLS proxy: {}. Use /worlds to reconnect.", e), seq
                         ));
                     }
                 }
@@ -19483,8 +19572,10 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
             if world.connected && world.command_tx.is_none() {
                 world.connected = false;
                 world.socket_fd = None;
+                let seq = world.next_seq;
+                world.next_seq += 1;
                 world.output_lines
-                    .push(OutputLine::new("Connection was not restored during reload. Use /worlds to reconnect.".to_string()));
+                    .push(OutputLine::new("Connection was not restored during reload. Use /worlds to reconnect.".to_string(), seq));
             }
 
             // For ALL worlds: flush pending_lines to output_lines so content isn't lost,
@@ -20035,11 +20126,15 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                             // If there's a prompt, display it as output before clearing
                             if !app.worlds[world_idx].prompt.is_empty() {
                                 let prompt_text = app.worlds[world_idx].prompt.trim().to_string();
-                                app.worlds[world_idx].output_lines.push(OutputLine::new(prompt_text));
+                                let seq = app.worlds[world_idx].next_seq;
+                                app.worlds[world_idx].next_seq += 1;
+                                app.worlds[world_idx].output_lines.push(OutputLine::new(prompt_text, seq));
                             }
                             app.worlds[world_idx].prompt.clear();
                             // Show disconnection message
-                            let disconnect_msg = OutputLine::new_client("Disconnected.".to_string());
+                            let seq = app.worlds[world_idx].next_seq;
+                            app.worlds[world_idx].next_seq += 1;
+                            let disconnect_msg = OutputLine::new_client("Disconnected.".to_string(), seq);
                             app.worlds[world_idx].output_lines.push(disconnect_msg.clone());
 
                             // If this is not the current world, increment unseen_lines for activity indicator
@@ -20105,7 +20200,9 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
 
                             // If world is not connected, display prompt as output instead of input area
                             if !app.worlds[world_idx].connected {
-                                app.worlds[world_idx].output_lines.push(OutputLine::new(prompt_normalized.trim().to_string()));
+                                let seq = app.worlds[world_idx].next_seq;
+                                app.worlds[world_idx].next_seq += 1;
+                                app.worlds[world_idx].output_lines.push(OutputLine::new(prompt_normalized.trim().to_string(), seq));
                                 app.worlds[world_idx].prompt.clear();
                                 continue;
                             }
@@ -20206,7 +20303,9 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
 
                             if is_gagged {
                                 // Add as gagged line (only visible with F2)
-                                app.worlds[world_idx].output_lines.push(OutputLine::new_gagged(message.clone()));
+                                let seq = app.worlds[world_idx].next_seq;
+                                app.worlds[world_idx].next_seq += 1;
+                                app.worlds[world_idx].output_lines.push(OutputLine::new_gagged(message.clone(), seq));
                                 if !app.worlds[world_idx].paused {
                                     app.worlds[world_idx].scroll_to_bottom();
                                 }
@@ -21242,6 +21341,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                             ts: line.timestamp.duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs(),
                                             gagged: line.gagged,
                                             from_server: line.from_server,
+                                            seq: line.seq,
                                         })
                                         .collect::<Vec<_>>()
                                         .into_iter()
@@ -21374,7 +21474,9 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                 world.command_tx = None;
                                 world.proxy_pid = None;
                                 world.proxy_socket_path = None;
-                                world.output_lines.push(OutputLine::new("TLS proxy terminated. Connection lost.".to_string()));
+                                let seq = world.next_seq;
+                                world.next_seq += 1;
+                                world.output_lines.push(OutputLine::new("TLS proxy terminated. Connection lost.".to_string(), seq));
                             }
                         }
                     }
@@ -21418,7 +21520,9 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
 
                                 // If world is not connected, display prompt as output instead
                                 if !world.connected {
-                                    world.output_lines.push(OutputLine::new(normalized.trim().to_string()));
+                                    let seq = world.next_seq;
+                                    world.next_seq += 1;
+                                    world.output_lines.push(OutputLine::new(normalized.trim().to_string(), seq));
                                     world.wont_echo_time = None;
                                     continue;
                                 }
@@ -21739,7 +21843,9 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
 
                         // Add gagged lines to output (they'll only show with F2)
                         for line in gagged_lines {
-                            app.worlds[world_idx].output_lines.push(OutputLine::new_gagged(line.to_string()));
+                            let seq = app.worlds[world_idx].next_seq;
+                            app.worlds[world_idx].next_seq += 1;
+                            app.worlds[world_idx].output_lines.push(OutputLine::new_gagged(line.to_string(), seq));
                         }
                         if !app.worlds[world_idx].paused {
                             app.worlds[world_idx].scroll_to_bottom();
@@ -21793,11 +21899,15 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                         // If there's a prompt, display it as output before clearing
                         if !app.worlds[world_idx].prompt.is_empty() {
                             let prompt_text = app.worlds[world_idx].prompt.trim().to_string();
-                            app.worlds[world_idx].output_lines.push(OutputLine::new(prompt_text));
+                            let seq = app.worlds[world_idx].next_seq;
+                            app.worlds[world_idx].next_seq += 1;
+                            app.worlds[world_idx].output_lines.push(OutputLine::new(prompt_text, seq));
                         }
                         app.worlds[world_idx].prompt.clear();
                         // Show disconnection message
-                        let disconnect_msg = OutputLine::new_client("Disconnected.".to_string());
+                        let seq = app.worlds[world_idx].next_seq;
+                        app.worlds[world_idx].next_seq += 1;
+                        let disconnect_msg = OutputLine::new_client("Disconnected.".to_string(), seq);
                         app.worlds[world_idx].output_lines.push(disconnect_msg.clone());
 
                         // If this is not the current world, increment unseen_lines for activity indicator
@@ -21863,7 +21973,9 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
 
                         // If world is not connected, display prompt as output instead of input area
                         if !app.worlds[world_idx].connected {
-                            app.worlds[world_idx].output_lines.push(OutputLine::new(prompt_normalized.trim().to_string()));
+                            let seq = app.worlds[world_idx].next_seq;
+                            app.worlds[world_idx].next_seq += 1;
+                            app.worlds[world_idx].output_lines.push(OutputLine::new(prompt_normalized.trim().to_string(), seq));
                             app.worlds[world_idx].prompt.clear();
                             continue;
                         }
@@ -21956,7 +22068,9 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
 
                         if is_gagged {
                             // Add as gagged line (only visible with F2)
-                            app.worlds[world_idx].output_lines.push(OutputLine::new_gagged(message.clone()));
+                            let seq = app.worlds[world_idx].next_seq;
+                            app.worlds[world_idx].next_seq += 1;
+                            app.worlds[world_idx].output_lines.push(OutputLine::new_gagged(message.clone(), seq));
                             if !app.worlds[world_idx].paused {
                                 app.worlds[world_idx].scroll_to_bottom();
                             }
@@ -22718,6 +22832,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                         ts: line.timestamp.duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs(),
                                         gagged: line.gagged,
                                         from_server: line.from_server,
+                                        seq: line.seq,
                                     })
                                     .collect::<Vec<_>>()
                                     .into_iter()
@@ -25877,6 +25992,33 @@ fn render_output_crossterm(app: &App) {
                     break;
                 }
             }
+        }
+    }
+
+    // Debug: verify output line sequence order (only check visible range, log mismatches)
+    if !world.output_lines.is_empty() {
+        let check_start = first_line_idx;
+        let check_end = world.scroll_offset.min(world.output_lines.len().saturating_sub(1));
+        let mut last_seq: Option<u64> = None;
+        for idx in check_start..=check_end {
+            let line = &world.output_lines[idx];
+            if line.gagged && !show_tags {
+                continue; // Skip gagged lines when not showing tags
+            }
+            if let Some(prev_seq) = last_seq {
+                if line.seq <= prev_seq {
+                    use std::io::Write;
+                    if let Ok(mut f) = std::fs::OpenOptions::new()
+                        .create(true).append(true)
+                        .open("clay.output.debug")
+                    {
+                        let _ = writeln!(f, "SEQ MISMATCH in '{}': idx={}, expected seq>{}, got seq={}, text={:?}",
+                            world.name, idx, prev_seq, line.seq,
+                            line.text.chars().take(80).collect::<String>());
+                    }
+                }
+            }
+            last_seq = Some(line.seq);
         }
     }
 
