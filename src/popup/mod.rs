@@ -1252,27 +1252,13 @@ impl PopupState {
         }
 
         // Find next line start (after the newline following current position)
-        let mut next_line_start = None;
-        for i in self.edit_cursor..total_len {
-            if chars[i] == '\n' {
-                next_line_start = Some(i + 1);
-                break;
-            }
-        }
-
-        let next_line_start = match next_line_start {
-            Some(pos) => pos,
+        let next_line_start = match chars[self.edit_cursor..total_len].iter().position(|&c| c == '\n') {
+            Some(offset) => self.edit_cursor + offset + 1,
             None => return, // No next line
         };
 
         // Find next line length
-        let mut next_line_len = 0;
-        for i in next_line_start..total_len {
-            if chars[i] == '\n' {
-                break;
-            }
-            next_line_len += 1;
-        }
+        let next_line_len = chars[next_line_start..total_len].iter().take_while(|&&c| c != '\n').count();
 
         // Move to same column on next line, or end of line if shorter
         self.edit_cursor = next_line_start + current_col.min(next_line_len);

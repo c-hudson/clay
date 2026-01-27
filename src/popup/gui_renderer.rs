@@ -60,6 +60,7 @@ impl GuiPopupTheme {
 
     /// Create theme from individual color values
     /// Useful for converting from other theme types
+    #[allow(clippy::too_many_arguments)]
     pub fn from_colors(
         bg_elevated: Color32,
         bg_surface: Color32,
@@ -289,8 +290,8 @@ pub fn render_popup_content(
 
                 // Calculate column start positions
                 let mut col_starts: Vec<f32> = vec![0.0];
-                for i in 0..num_cols.saturating_sub(1) {
-                    col_starts.push(col_starts.last().unwrap() + col_widths[i]);
+                for width in col_widths.iter().take(num_cols.saturating_sub(1)) {
+                    col_starts.push(col_starts.last().unwrap() + width);
                 }
 
                 let available_width = ui.available_width();

@@ -482,7 +482,7 @@ async fn start_https_server(
     let certs: Vec<CertificateDer<'static>> = certs(&mut cert_reader)
         .map_err(|e| format!("Failed to parse cert file '{}': {}", cert_file, e))?
         .into_iter()
-        .map(|c| CertificateDer::from(c))
+        .map(CertificateDer::from)
         .collect();
 
     if certs.is_empty() {
@@ -3254,23 +3254,22 @@ impl App {
                     self.needs_output_redraw = true;
                 }
             }
-            WsMessage::CalculatedWorld { index } => {
+            WsMessage::CalculatedWorld { index: Some(idx) } => {
                 // Server calculated next/prev world for us - switch to it
-                if let Some(idx) = index {
-                    if idx < self.worlds.len() {
-                        self.current_world_index = idx;
-                        // Clear unseen for the world we're switching to
-                        if let Some(world) = self.worlds.get_mut(idx) {
-                            world.unseen_lines = 0;
-                        }
-                        self.needs_output_redraw = true;
-                        // Send MarkWorldSeen to notify server
-                        if let Some(ref tx) = self.ws_client_tx {
-                            let _ = tx.send(WsMessage::MarkWorldSeen { world_index: idx });
-                        }
+                if idx < self.worlds.len() {
+                    self.current_world_index = idx;
+                    // Clear unseen for the world we're switching to
+                    if let Some(world) = self.worlds.get_mut(idx) {
+                        world.unseen_lines = 0;
+                    }
+                    self.needs_output_redraw = true;
+                    // Send MarkWorldSeen to notify server
+                    if let Some(ref tx) = self.ws_client_tx {
+                        let _ = tx.send(WsMessage::MarkWorldSeen { world_index: idx });
                     }
                 }
             }
+            WsMessage::CalculatedWorld { index: None } => {}
             WsMessage::ActivityUpdate { count } => {
                 // Server's activity count changed - update our copy
                 self.server_activity_count = count;
@@ -7662,7 +7661,7 @@ mod remote_gui {
                         if password_submitted {
                             let auth_msg = WsMessage::AuthRequest { username: None, password_hash };
                             if let Ok(json) = serde_json::to_string(&auth_msg) {
-                                let _ = ws_sink.send(WsRawMessage::Text(json.into())).await;
+                                let _ = ws_sink.send(WsRawMessage::Text(json)).await;
                             }
                         }
 
@@ -7671,7 +7670,7 @@ mod remote_gui {
                         tokio::spawn(async move {
                             while let Some(msg) = out_rx.recv().await {
                                 if let Ok(json) = serde_json::to_string(&msg) {
-                                    if ws_sink.send(WsRawMessage::Text(json.into())).await.is_err() {
+                                    if ws_sink.send(WsRawMessage::Text(json)).await.is_err() {
                                         break;
                                     }
                                 }
@@ -8014,21 +8013,20 @@ mod remote_gui {
                             // Server's activity count changed - just display it
                             self.server_activity_count = count;
                         }
-                        WsMessage::CalculatedWorld { index } => {
+                        WsMessage::CalculatedWorld { index: Some(idx) } => {
                             // Server calculated the next/prev world for us
-                            if let Some(idx) = index {
-                                if idx < self.worlds.len() && idx != self.current_world {
-                                    self.current_world = idx;
-                                    self.worlds[idx].unseen_lines = 0;
-                                    self.scroll_offset = None; // Reset scroll
-                                    // Notify server and request current state
-                                    if let Some(ref tx) = self.ws_tx {
-                                        let _ = tx.send(WsMessage::MarkWorldSeen { world_index: idx });
-                                        let _ = tx.send(WsMessage::RequestWorldState { world_index: idx });
-                                    }
+                            if idx < self.worlds.len() && idx != self.current_world {
+                                self.current_world = idx;
+                                self.worlds[idx].unseen_lines = 0;
+                                self.scroll_offset = None; // Reset scroll
+                                // Notify server and request current state
+                                if let Some(ref tx) = self.ws_tx {
+                                    let _ = tx.send(WsMessage::MarkWorldSeen { world_index: idx });
+                                    let _ = tx.send(WsMessage::RequestWorldState { world_index: idx });
                                 }
                             }
                         }
+                        WsMessage::CalculatedWorld { index: None } => {}
                         WsMessage::ExecuteLocalCommand { command } => {
                             // Server wants us to execute a command locally (from action)
                             let parsed = parse_command(&command);
@@ -11622,12 +11620,12 @@ mod remote_gui {
                                 });
                                 // Check if debug was requested
                                 let debug_request: Option<String> = ui.ctx().data(|d| {
-                                    d.get_temp::<String>(debug_request_id).map(|s| s.clone())
+                                    d.get_temp::<String>(debug_request_id)
                                 });
                                 if let Some(debug_text) = debug_request {
                                     self.debug_text = debug_text;
                                     self.popup_state = PopupState::DebugText;
-                                    ui.ctx().data_mut(|d| { let _ = d.remove::<String>(debug_request_id); });
+                                    ui.ctx().data_mut(|d| { d.remove::<String>(debug_request_id); });
                                 }
                             });
 
@@ -15294,7 +15292,7 @@ async fn run_console_client(addr: &str) -> io::Result<()> {
     let ws_write_handle = tokio::spawn(async move {
         while let Some(msg) = ws_rx.recv().await {
             if let Ok(json) = serde_json::to_string(&msg) {
-                if ws_write.send(Message::Text(json.into())).await.is_err() {
+                if ws_write.send(Message::Text(json)).await.is_err() {
                     break;
                 }
             }
@@ -23863,7 +23861,7 @@ async fn connect_slack(app: &mut App, event_tx: mpsc::Sender<AppEvent>) -> bool 
                         if let Some(envelope_id) = json.get("envelope_id").and_then(|v| v.as_str()) {
                             let ack = serde_json::json!({ "envelope_id": envelope_id });
                             let mut w = write_clone.lock().await;
-                            let _ = w.send(WsMsg::Text(ack.to_string().into())).await;
+                            let _ = w.send(WsMsg::Text(ack.to_string())).await;
                         }
 
                         // Handle events
@@ -24151,7 +24149,7 @@ async fn connect_discord(app: &mut App, event_tx: mpsc::Sender<AppEvent>) -> boo
                                             }
                                         });
                                         let mut w = write_clone.lock().await;
-                                        let _ = w.send(WsMsg::Text(identify.to_string().into())).await;
+                                        let _ = w.send(WsMsg::Text(identify.to_string())).await;
                                     }
                                 }
                             }
@@ -24184,7 +24182,7 @@ async fn connect_discord(app: &mut App, event_tx: mpsc::Sender<AppEvent>) -> boo
                                     "d": last_sequence
                                 });
                                 let mut w = write_clone.lock().await;
-                                let _ = w.send(WsMsg::Text(hb.to_string().into())).await;
+                                let _ = w.send(WsMsg::Text(hb.to_string())).await;
                             }
                             _ => {}
                         }
@@ -24215,7 +24213,7 @@ async fn connect_discord(app: &mut App, event_tx: mpsc::Sender<AppEvent>) -> boo
                 "d": null
             });
             let mut w = write_for_heartbeat.lock().await;
-            if w.send(WsMsg::Text(hb.to_string().into())).await.is_err() {
+            if w.send(WsMsg::Text(hb.to_string())).await.is_err() {
                 break;
             }
         }
