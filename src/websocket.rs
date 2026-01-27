@@ -145,6 +145,8 @@ pub enum WsMessage {
         temp_convert_enabled: bool,
         world_switch_mode: String,
         show_tags: bool,
+        #[serde(default)]
+        debug_enabled: bool,
         ansi_music_enabled: bool,
         console_theme: String,
         gui_theme: String,

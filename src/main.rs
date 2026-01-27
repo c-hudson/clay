@@ -4761,6 +4761,7 @@ fn save_settings(app: &App) -> io::Result<()> {
     writeln!(file, "spell_check={}", app.settings.spell_check_enabled)?;
     writeln!(file, "temp_convert={}", app.settings.temp_convert_enabled)?;
     writeln!(file, "world_switch_mode={}", app.settings.world_switch_mode.name())?;
+    writeln!(file, "show_tags={}", app.show_tags)?;
     writeln!(file, "debug_enabled={}", app.settings.debug_enabled)?;
     writeln!(file, "ansi_music_enabled={}", app.settings.ansi_music_enabled)?;
     writeln!(file, "input_height={}", app.input_height)?;
@@ -5575,6 +5576,29 @@ fn save_multiuser_settings(app: &App) -> io::Result<()> {
             if !world.settings.keep_alive_cmd.is_empty() {
                 writeln!(file, "keep_alive_cmd={}", world.settings.keep_alive_cmd)?;
             }
+            // Slack settings
+            if !world.settings.slack_token.is_empty() {
+                writeln!(file, "slack_token={}", encrypt_password(&world.settings.slack_token))?;
+            }
+            if !world.settings.slack_channel.is_empty() {
+                writeln!(file, "slack_channel={}", world.settings.slack_channel)?;
+            }
+            if !world.settings.slack_workspace.is_empty() {
+                writeln!(file, "slack_workspace={}", world.settings.slack_workspace)?;
+            }
+            // Discord settings
+            if !world.settings.discord_token.is_empty() {
+                writeln!(file, "discord_token={}", encrypt_password(&world.settings.discord_token))?;
+            }
+            if !world.settings.discord_guild.is_empty() {
+                writeln!(file, "discord_guild={}", world.settings.discord_guild)?;
+            }
+            if !world.settings.discord_channel.is_empty() {
+                writeln!(file, "discord_channel={}", world.settings.discord_channel)?;
+            }
+            if !world.settings.discord_dm_user.is_empty() {
+                writeln!(file, "discord_dm_user={}", world.settings.discord_dm_user)?;
+            }
         }
     }
 
@@ -5610,6 +5634,9 @@ fn save_multiuser_settings(app: &App) -> io::Result<()> {
                 .replace('\n', "\\n");
             writeln!(file, "pattern={}", escaped_pattern)?;
             writeln!(file, "command={}", escaped_command)?;
+            if !action.enabled {
+                writeln!(file, "enabled=false")?;
+            }
         }
     }
 
@@ -8591,6 +8618,7 @@ mod remote_gui {
                     temp_convert_enabled: self.temp_convert_enabled,
                     world_switch_mode: self.world_switch_mode.name().to_string(),
                     show_tags: self.show_tags,
+                    debug_enabled: self.debug_enabled,
                     ansi_music_enabled: self.ansi_music_enabled,
                     console_theme: self.console_theme.to_string_value(),
                     gui_theme: self.theme.to_string_value(),
@@ -15633,6 +15661,7 @@ fn handle_remote_client_key(
                     temp_convert_enabled: app.settings.temp_convert_enabled,
                     world_switch_mode: app.settings.world_switch_mode.name().to_string(),
                     show_tags: app.show_tags,
+                    debug_enabled: app.settings.debug_enabled,
                     ansi_music_enabled: app.settings.ansi_music_enabled,
                     console_theme: app.settings.theme.name().to_string(),
                     gui_theme: app.settings.gui_theme.name().to_string(),
@@ -15674,6 +15703,7 @@ fn handle_remote_client_key(
                     temp_convert_enabled: app.settings.temp_convert_enabled,
                     world_switch_mode: app.settings.world_switch_mode.name().to_string(),
                     show_tags: app.show_tags,
+                    debug_enabled: app.settings.debug_enabled,
                     ansi_music_enabled: app.settings.ansi_music_enabled,
                     console_theme: app.settings.theme.name().to_string(),
                     gui_theme: app.settings.gui_theme.name().to_string(),
@@ -17686,12 +17716,13 @@ async fn handle_daemon_ws_message(
                 app.ws_broadcast(WsMessage::WorldSwitched { new_index: world_index });
             }
         }
-        WsMessage::UpdateGlobalSettings { more_mode_enabled, spell_check_enabled, temp_convert_enabled, world_switch_mode, show_tags, ansi_music_enabled, console_theme, gui_theme, gui_transparency, color_offset_percent, input_height, font_name, font_size, web_font_size_phone, web_font_size_tablet, web_font_size_desktop, ws_allow_list, web_secure, http_enabled, http_port, ws_enabled, ws_port, ws_cert_file, ws_key_file, tls_proxy_enabled } => {
+        WsMessage::UpdateGlobalSettings { more_mode_enabled, spell_check_enabled, temp_convert_enabled, world_switch_mode, show_tags, debug_enabled, ansi_music_enabled, console_theme, gui_theme, gui_transparency, color_offset_percent, input_height, font_name, font_size, web_font_size_phone, web_font_size_tablet, web_font_size_desktop, ws_allow_list, web_secure, http_enabled, http_port, ws_enabled, ws_port, ws_cert_file, ws_key_file, tls_proxy_enabled } => {
             app.settings.more_mode_enabled = more_mode_enabled;
             app.settings.spell_check_enabled = spell_check_enabled;
             app.settings.temp_convert_enabled = temp_convert_enabled;
             app.settings.world_switch_mode = WorldSwitchMode::from_name(&world_switch_mode);
             app.show_tags = show_tags;
+            app.settings.debug_enabled = debug_enabled;
             app.settings.ansi_music_enabled = ansi_music_enabled;
             app.input_height = input_height;
             app.settings.theme = Theme::from_name(&console_theme);
@@ -21147,13 +21178,14 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                     });
                                 }
                             }
-                            WsMessage::UpdateGlobalSettings { more_mode_enabled, spell_check_enabled, temp_convert_enabled, world_switch_mode, show_tags, ansi_music_enabled, console_theme, gui_theme, gui_transparency, color_offset_percent, input_height, font_name, font_size, web_font_size_phone, web_font_size_tablet, web_font_size_desktop, ws_allow_list, web_secure, http_enabled, http_port, ws_enabled, ws_port, ws_cert_file, ws_key_file, tls_proxy_enabled } => {
+                            WsMessage::UpdateGlobalSettings { more_mode_enabled, spell_check_enabled, temp_convert_enabled, world_switch_mode, show_tags, debug_enabled, ansi_music_enabled, console_theme, gui_theme, gui_transparency, color_offset_percent, input_height, font_name, font_size, web_font_size_phone, web_font_size_tablet, web_font_size_desktop, ws_allow_list, web_secure, http_enabled, http_port, ws_enabled, ws_port, ws_cert_file, ws_key_file, tls_proxy_enabled } => {
                                 // Update global settings from remote client
                                 app.settings.more_mode_enabled = more_mode_enabled;
                                 app.settings.spell_check_enabled = spell_check_enabled;
                                 app.settings.temp_convert_enabled = temp_convert_enabled;
                                 app.settings.world_switch_mode = WorldSwitchMode::from_name(&world_switch_mode);
                                 app.show_tags = show_tags;
+                                app.settings.debug_enabled = debug_enabled;
                                 app.settings.ansi_music_enabled = ansi_music_enabled;
                                 // Console theme affects the TUI on the server
                                 app.settings.theme = Theme::from_name(&console_theme);
@@ -22660,12 +22692,13 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                 app.ws_broadcast(WsMessage::WorldSettingsUpdated { world_index, settings: settings_msg, name });
                             }
                         }
-                        WsMessage::UpdateGlobalSettings { more_mode_enabled, spell_check_enabled, temp_convert_enabled, world_switch_mode, show_tags, ansi_music_enabled, console_theme, gui_theme, gui_transparency, color_offset_percent, input_height, font_name, font_size, web_font_size_phone, web_font_size_tablet, web_font_size_desktop, ws_allow_list, web_secure, http_enabled, http_port, ws_enabled, ws_port, ws_cert_file, ws_key_file, tls_proxy_enabled } => {
+                        WsMessage::UpdateGlobalSettings { more_mode_enabled, spell_check_enabled, temp_convert_enabled, world_switch_mode, show_tags, debug_enabled, ansi_music_enabled, console_theme, gui_theme, gui_transparency, color_offset_percent, input_height, font_name, font_size, web_font_size_phone, web_font_size_tablet, web_font_size_desktop, ws_allow_list, web_secure, http_enabled, http_port, ws_enabled, ws_port, ws_cert_file, ws_key_file, tls_proxy_enabled } => {
                             app.settings.more_mode_enabled = more_mode_enabled;
                             app.settings.spell_check_enabled = spell_check_enabled;
                             app.settings.temp_convert_enabled = temp_convert_enabled;
                             app.settings.world_switch_mode = WorldSwitchMode::from_name(&world_switch_mode);
                             app.show_tags = show_tags;
+                            app.settings.debug_enabled = debug_enabled;
                             app.settings.ansi_music_enabled = ansi_music_enabled;
                             app.settings.theme = Theme::from_name(&console_theme);
                             app.settings.gui_theme = Theme::from_name(&gui_theme);
