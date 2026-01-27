@@ -50,7 +50,7 @@ home = "=0.5.5"
 reqwest = { version = "0.11", default-features = false, features = ["json", "rustls-tls"] }
 
 # GUI client (optional)
-eframe = { version = "0.24", optional = true, default-features = false, features = ["default_fonts", "glow", "x11"] }
+eframe = { version = "0.24", optional = true, default-features = false, features = ["default_fonts", "glow", "x11", "android-native-activity"] }
 egui = { version = "0.24", optional = true }
 egui_extras = { version = "0.24", optional = true, default-features = false, features = ["image", "svg"] }
 image = { version = "0.24", optional = true, default-features = false, features = ["png", "gif"] }
