@@ -7497,6 +7497,13 @@ mod remote_gui {
             self.unified_popup = None;
         }
 
+        /// Open the world selector popup
+        fn open_world_selector_unified(&mut self) {
+            self.popup_state = PopupState::ConnectedWorlds;
+            self.world_list_selected = self.current_world;
+            self.only_connected_worlds = false;
+        }
+
         /// Open the actions list popup using unified system
         fn open_actions_list_unified(&mut self) {
             use crate::popup::definitions::actions::*;
@@ -7761,7 +7768,7 @@ mod remote_gui {
             let mut deferred_edit: Option<usize> = None;
             let mut deferred_music: Vec<crate::ansi_music::MusicNote> = Vec::new();
             let mut deferred_open_actions = false;
-            let mut deferred_open_connections = false;
+            let deferred_open_connections = false;
 
             if let Some(ref mut rx) = self.ws_rx {
                 while let Ok(msg) = rx.try_recv() {
