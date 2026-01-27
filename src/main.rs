@@ -6788,7 +6788,7 @@ fn exec_reload(app: &App) -> io::Result<()> {
 // Remote GUI Client (feature = "remote-gui")
 // ============================================================================
 
-#[cfg(feature = "remote-gui")]
+#[cfg(all(feature = "remote-gui", not(target_os = "android")))]
 mod remote_gui {
     use super::*;
     use egui::{Color32, ScrollArea, TextEdit};
@@ -15263,7 +15263,7 @@ mod remote_gui {
     }
 }
 
-#[cfg(feature = "remote-gui")]
+#[cfg(all(feature = "remote-gui", not(target_os = "android")))]
 fn run_remote_gui(addr: &str) -> io::Result<()> {
     let runtime = tokio::runtime::Handle::current();
     remote_gui::run(addr, runtime)
@@ -18973,12 +18973,18 @@ async fn main() -> io::Result<()> {
 
     // Check for --remote=host:port argument for GUI client mode
     if let Some(remote_arg) = std::env::args().find(|a| a.starts_with("--remote=")) {
-        #[cfg(feature = "remote-gui")]
+        #[cfg(all(feature = "remote-gui", not(target_os = "android")))]
         {
             let addr = remote_arg.strip_prefix("--remote=").unwrap();
             return run_remote_gui(addr);
         }
-        #[cfg(not(feature = "remote-gui"))]
+        #[cfg(target_os = "android")]
+        {
+            eprintln!("Error: --remote (GUI client) is not available on Android/Termux.");
+            eprintln!("Argument provided: {}", remote_arg);
+            return Ok(());
+        }
+        #[cfg(all(not(feature = "remote-gui"), not(target_os = "android")))]
         {
             eprintln!("Error: --remote requires the 'remote-gui' feature.");
             eprintln!("Rebuild with: cargo build --features remote-gui");
