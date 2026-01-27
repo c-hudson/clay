@@ -55,7 +55,7 @@ use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use bytes::BytesMut;
 use crossterm::{
     cursor,
-    event::{Event, EventStream, KeyCode, KeyEvent, KeyModifiers},
+    event::{Event, EventStream, KeyCode, KeyEvent, KeyEventKind, KeyModifiers},
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen, Clear, ClearType},
 };
@@ -15340,6 +15340,7 @@ async fn run_console_client(addr: &str) -> io::Result<()> {
         tokio::select! {
             maybe_event = event_stream.next() => {
                 if let Some(Ok(Event::Key(key))) = maybe_event {
+                    if key.kind != KeyEventKind::Press { continue; }
                     match key.code {
                         KeyCode::Enter => {
                             disable_raw_mode()?;
@@ -15491,7 +15492,7 @@ async fn run_console_client(addr: &str) -> io::Result<()> {
             maybe_event = event_stream.next() => {
                 if let Some(Ok(event)) = maybe_event {
                     match event {
-                        Event::Key(key) => {
+                        Event::Key(key) if key.kind == KeyEventKind::Press => {
                             // Handle Ctrl+C with double-press to quit
                             if key.modifiers == KeyModifiers::CONTROL && key.code == KeyCode::Char('c') {
                                 if let Some(last_time) = app.last_ctrl_c {
@@ -19902,6 +19903,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
             // Terminal events (keyboard input)
             maybe_event = event_stream.next() => {
                 if let Some(Ok(Event::Key(key))) = maybe_event {
+                    if key.kind != KeyEventKind::Press { continue; }
                     match handle_key_event(key, &mut app) {
                         KeyAction::Quit => return Ok(()),
                         KeyAction::Redraw => {
