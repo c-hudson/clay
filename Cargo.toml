@@ -11,7 +11,7 @@ tokio = { version = "1", features = ["full"] }
 ansi-to-tui = "4"
 bytes = "1"
 strsim = "0.11"
-libc = "0.2"
+socket2 = { version = "0.5", features = ["all"] }
 unicode-width = "0.1"
 regex = "1"
 futures = "0.3"
@@ -49,13 +49,25 @@ home = "=0.5.5"
 # HTTP client for Slack/Discord APIs
 reqwest = { version = "0.11", default-features = false, features = ["json", "rustls-tls"] }
 
-[target.'cfg(not(target_os = "android"))'.dependencies]
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[target.'cfg(all(unix, not(target_os = "android")))'.dependencies]
 # GUI client (optional, not available on Android/Termux - requires X11/Wayland and NDK symbols)
 eframe = { version = "0.24", optional = true, default-features = false, features = ["default_fonts", "glow", "x11"] }
 egui = { version = "0.24", optional = true }
 egui_extras = { version = "0.24", optional = true, default-features = false, features = ["image", "svg"] }
 image = { version = "0.24", optional = true, default-features = false, features = ["png", "gif"] }
 # Audio playback for ANSI music (optional, requires ALSA dev libraries on Linux)
+rodio = { version = "0.17", optional = true, default-features = false, features = ["wav"] }
+
+[target.'cfg(windows)'.dependencies]
+# GUI client for Windows (no x11 feature needed)
+eframe = { version = "0.24", optional = true, default-features = false, features = ["default_fonts", "glow"] }
+egui = { version = "0.24", optional = true }
+egui_extras = { version = "0.24", optional = true, default-features = false, features = ["image", "svg"] }
+image = { version = "0.24", optional = true, default-features = false, features = ["png", "gif"] }
+# Audio playback for ANSI music (uses WASAPI on Windows automatically)
 rodio = { version = "0.17", optional = true, default-features = false, features = ["wav"] }
 
 [features]

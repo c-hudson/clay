@@ -17,6 +17,7 @@ pub const SETUP_FIELD_SHOW_TAGS: FieldId = FieldId(6);
 pub const SETUP_FIELD_INPUT_HEIGHT: FieldId = FieldId(7);
 pub const SETUP_FIELD_GUI_THEME: FieldId = FieldId(8);
 pub const SETUP_FIELD_TLS_PROXY: FieldId = FieldId(9);
+pub const SETUP_FIELD_DICTIONARY: FieldId = FieldId(10);
 
 // Button IDs
 pub const SETUP_BTN_SAVE: ButtonId = ButtonId(1);
@@ -50,6 +51,7 @@ pub fn create_setup_popup(
     input_height: i64,
     gui_theme: &str,
     tls_proxy: bool,
+    dictionary_path: &str,
 ) -> PopupDefinition {
     let world_switching_idx = if world_switching == "alphabetical" { 1 } else { 0 };
     let gui_theme_idx = if gui_theme == "light" { 1 } else { 0 };
@@ -100,6 +102,11 @@ pub fn create_setup_popup(
             "TLS Proxy",
             FieldKind::toggle(tls_proxy),
         ))
+        .with_field(Field::new(
+            SETUP_FIELD_DICTIONARY,
+            "Dictionary",
+            FieldKind::text(dictionary_path),
+        ))
         .with_button(Button::new(SETUP_BTN_SAVE, "Save").primary().with_shortcut('S'))
         .with_button(Button::new(SETUP_BTN_CANCEL, "Cancel").with_shortcut('C'))
         .with_layout(PopupLayout {
@@ -123,13 +130,13 @@ mod tests {
     fn test_setup_popup_creation() {
         let def = create_setup_popup(
             true, true, false, "unseen_first",
-            false, false, 3, "dark", false,
+            false, false, 3, "dark", false, "",
         );
         let state = PopupState::new(def);
 
         assert_eq!(state.definition.id, PopupId("setup"));
         assert_eq!(state.definition.title, "Setup");
-        assert_eq!(state.definition.fields.len(), 9);
+        assert_eq!(state.definition.fields.len(), 10);
         assert_eq!(state.definition.buttons.len(), 2);
     }
 
@@ -137,7 +144,7 @@ mod tests {
     fn test_setup_popup_values() {
         let def = create_setup_popup(
             true, false, true, "alphabetical",
-            true, true, 5, "light", true,
+            true, true, 5, "light", true, "/custom/dict",
         );
         let state = PopupState::new(def);
 

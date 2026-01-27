@@ -32,17 +32,31 @@ pub struct SpellChecker {
 }
 
 impl SpellChecker {
-    pub fn new() -> Self {
-        // Try to load system dictionary from file
+    pub fn new(custom_path: &str) -> Self {
         let mut words = HashSet::new();
-        for path in SYSTEM_DICT_PATHS {
-            if let Ok(content) = std::fs::read_to_string(path) {
+
+        // Try custom dictionary path first
+        if !custom_path.is_empty() {
+            if let Ok(content) = std::fs::read_to_string(custom_path) {
                 words = content
                     .lines()
                     .map(|s| s.trim().to_lowercase())
                     .filter(|s| !s.is_empty() && s.chars().all(|c| c.is_alphabetic()))
                     .collect();
-                break;
+            }
+        }
+
+        // Try system dictionary paths
+        if words.is_empty() {
+            for path in SYSTEM_DICT_PATHS {
+                if let Ok(content) = std::fs::read_to_string(path) {
+                    words = content
+                        .lines()
+                        .map(|s| s.trim().to_lowercase())
+                        .filter(|s| !s.is_empty() && s.chars().all(|c| c.is_alphabetic()))
+                        .collect();
+                    break;
+                }
             }
         }
 
@@ -133,7 +147,7 @@ impl SpellChecker {
 
 impl Default for SpellChecker {
     fn default() -> Self {
-        Self::new()
+        Self::new("")
     }
 }
 

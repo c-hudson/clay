@@ -168,6 +168,8 @@ pub enum WsMessage {
         ws_cert_file: String,
         ws_key_file: String,
         tls_proxy_enabled: bool,
+        #[serde(default)]
+        dictionary_path: String,
     },
 
     // Settings update confirmations (server -> client)
@@ -311,6 +313,8 @@ pub struct GlobalSettingsMsg {
     pub ws_key_file: String,
     #[serde(default)]
     pub tls_proxy_enabled: bool,
+    #[serde(default)]
+    pub dictionary_path: String,
 }
 
 fn default_gui_transparency() -> f32 {

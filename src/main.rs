@@ -27,7 +27,7 @@ pub use telnet::{
 };
 pub use spell::{SpellChecker, SpellState};
 pub use input::{InputArea, display_width, display_width_chars, chars_for_display_width};
-pub use util::{get_binary_name, strip_ansi_codes, visual_line_count, get_current_time_12hr, strip_mud_tag, truncate_str, convert_temperatures, parse_discord_timestamps};
+pub use util::{get_binary_name, strip_ansi_codes, visual_line_count, get_current_time_12hr, strip_mud_tag, truncate_str, convert_temperatures, parse_discord_timestamps, local_time_from_epoch, local_time_now};
 pub use websocket::{
     WsMessage, WorldStateMsg, WorldSettingsMsg, GlobalSettingsMsg, TimestampedLine,
     WsClientInfo, WebSocketServer,
@@ -36,10 +36,11 @@ pub use websocket::{
 
 use std::collections::{HashMap, HashSet};
 use std::io::{self, stdout, BufRead, Write as IoWrite};
+#[cfg(unix)]
 use std::os::unix::io::{AsRawFd, FromRawFd, RawFd};
-#[cfg(not(target_os = "android"))]
+#[cfg(all(unix, not(target_os = "android")))]
 use std::os::unix::fs::PermissionsExt;
-#[cfg(not(target_os = "android"))]
+#[cfg(all(unix, not(target_os = "android")))]
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicPtr, AtomicU32, Ordering};
@@ -73,7 +74,7 @@ use tokio::{
     net::{TcpListener, TcpStream},
     sync::mpsc,
 };
-#[cfg(not(target_os = "android"))]
+#[cfg(all(unix, not(target_os = "android")))]
 use tokio::signal::unix::{signal, SignalKind};
 use std::sync::Arc;
 use tokio::sync::RwLock;
@@ -1038,6 +1039,23 @@ fn filter_wildcard_to_regex(pattern: &str) -> Option<regex::Regex> {
         .ok()
 }
 
+fn get_home_dir() -> String {
+    home::home_dir()
+        .map(|p| p.to_string_lossy().to_string())
+        .unwrap_or_else(|| ".".to_string())
+}
+
+fn enable_tcp_keepalive(tcp_stream: &TcpStream) {
+    use socket2::SockRef;
+    let keepalive = socket2::TcpKeepalive::new()
+        .with_time(std::time::Duration::from_secs(60))
+        .with_interval(std::time::Duration::from_secs(10));
+    #[cfg(unix)]
+    let keepalive = keepalive.with_retries(6);
+    let sock_ref = SockRef::from(tcp_stream);
+    let _ = sock_ref.set_tcp_keepalive(&keepalive);
+}
+
 #[derive(Clone)]
 struct Settings {
     more_mode_enabled: bool,
@@ -1073,6 +1091,8 @@ struct Settings {
     actions: Vec<Action>,
     // TLS proxy for connection preservation over hot reload
     tls_proxy_enabled: bool,
+    // Custom dictionary path for spell checking (empty = use system defaults)
+    dictionary_path: String,
 }
 
 impl Default for Settings {
@@ -1106,6 +1126,7 @@ impl Default for Settings {
             websocket_key_file: String::new(),
             actions: Vec::new(),
             tls_proxy_enabled: false,
+            dictionary_path: String::new(),
         }
     }
 }
@@ -1933,10 +1954,10 @@ fn line_matches_action(
     false
 }
 
-#[cfg(not(target_os = "android"))]
+#[cfg(all(unix, not(target_os = "android")))]
 const RELOAD_FDS_ENV: &str = "CLAY_RELOAD_FDS";
 const CRASH_COUNT_ENV: &str = "CLAY_CRASH_COUNT";
-#[cfg(not(target_os = "android"))]
+#[cfg(all(unix, not(target_os = "android")))]
 const MAX_CRASH_RESTARTS: u32 = 2;
 
 // Static pointer to App for crash recovery - set when app is running
@@ -1945,7 +1966,7 @@ static APP_PTR: AtomicPtr<App> = AtomicPtr::new(std::ptr::null_mut());
 static CRASH_COUNT: AtomicU32 = AtomicU32::new(0);
 
 fn get_reload_state_path() -> PathBuf {
-    let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
+    let home = get_home_dir();
     PathBuf::from(home).join(".clay.reload")
 }
 
@@ -1969,13 +1990,13 @@ fn set_app_ptr(app: *mut App) {
 }
 
 /// Get the global app pointer
-#[cfg(not(target_os = "android"))]
+#[cfg(all(unix, not(target_os = "android")))]
 fn get_app_ptr() -> *mut App {
     APP_PTR.load(Ordering::SeqCst)
 }
 
-/// Attempt to restart after a crash (not available on Android)
-#[cfg(not(target_os = "android"))]
+/// Attempt to restart after a crash (not available on Android or Windows)
+#[cfg(all(unix, not(target_os = "android")))]
 fn crash_restart() {
     // Read crash count directly from env var, not from atomic
     // This ensures correct count even if crash happens before atomic is initialized
@@ -2035,8 +2056,8 @@ fn crash_restart() {
     }
 }
 
-/// Set up the crash handler (panic hook) - not available on Android
-#[cfg(not(target_os = "android"))]
+/// Set up the crash handler (panic hook) - not available on Android or Windows
+#[cfg(all(unix, not(target_os = "android")))]
 fn setup_crash_handler() {
     let default_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |panic_info| {
@@ -2157,15 +2178,11 @@ impl OutputLine {
 
     /// Format timestamp using a pre-computed "now" value for batch rendering
     fn format_timestamp_with_now(&self, _now: &CachedNow) -> String {
-        let ts_secs = self.timestamp.duration_since(UNIX_EPOCH).unwrap_or_default().as_secs() as libc::time_t;
-
-        let mut ts_tm: libc::tm = unsafe { std::mem::zeroed() };
-        unsafe {
-            libc::localtime_r(&ts_secs, &mut ts_tm);
-        }
+        let ts_secs = self.timestamp.duration_since(UNIX_EPOCH).unwrap_or_default().as_secs() as i64;
+        let lt = local_time_from_epoch(ts_secs);
 
         // Always show day/month for debugging ordering issues
-        format!("{:02}/{:02} {:02}:{:02}>", ts_tm.tm_mday, ts_tm.tm_mon + 1, ts_tm.tm_hour, ts_tm.tm_min)
+        format!("{:02}/{:02} {:02}:{:02}>", lt.day, lt.month, lt.hour, lt.minute)
     }
 }
 
@@ -2193,7 +2210,10 @@ struct World {
     settings: WorldSettings,
     log_handle: Option<std::sync::Arc<std::sync::Mutex<std::fs::File>>>,
     log_date: Option<String>,    // Current log file date (MMDDYY) for day rollover detection
-    socket_fd: Option<RawFd>,    // Store fd for hot reload (plain TCP only)
+    #[cfg(unix)]
+    socket_fd: Option<RawFd>,    // Store fd for hot reload (plain TCP only, Unix only)
+    #[cfg(not(unix))]
+    socket_fd: Option<i64>,      // Placeholder on non-Unix (never used)
     is_tls: bool,                // Track if using TLS
     telnet_mode: bool,           // True if telnet negotiation detected
     prompt: String,              // Current prompt detected via telnet GA
@@ -2282,22 +2302,13 @@ impl World {
 
     /// Get the current date as MMDDYY string for log file naming
     fn get_current_date_string() -> String {
-        let now_secs = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs() as libc::time_t;
-
-        let mut tm: libc::tm = unsafe { std::mem::zeroed() };
-        unsafe {
-            libc::localtime_r(&now_secs, &mut tm);
-        }
-
-        format!("{:02}{:02}{:02}", tm.tm_mon + 1, tm.tm_mday, (tm.tm_year + 1900) % 100)
+        let lt = local_time_now();
+        format!("{:02}{:02}{:02}", lt.month, lt.day, lt.year % 100)
     }
 
     /// Get the path to the logs directory, creating it if needed
     fn get_logs_dir() -> std::path::PathBuf {
-        let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
+        let home = get_home_dir();
         let logs_dir = std::path::PathBuf::from(home).join(".clay").join("logs");
         if !logs_dir.exists() {
             let _ = std::fs::create_dir_all(&logs_dir);
@@ -2363,20 +2374,11 @@ impl World {
 
         if let Some(ref handle) = self.log_handle {
             if let Ok(mut file) = handle.lock() {
-                // Get current time for timestamp
-                let now_secs = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_secs() as libc::time_t;
-
-                let mut tm: libc::tm = unsafe { std::mem::zeroed() };
-                unsafe {
-                    libc::localtime_r(&now_secs, &mut tm);
-                }
+                let lt = local_time_now();
 
                 // Format: [HH:MM:SS] line
                 let _ = writeln!(file, "[{:02}:{:02}:{:02}] {}",
-                    tm.tm_hour, tm.tm_min, tm.tm_sec, line);
+                    lt.hour, lt.minute, lt.second, line);
             }
         }
     }
@@ -2761,7 +2763,7 @@ impl App {
             input_height: 3,
             output_height: 20, // Will be updated by ui()
             output_width: 80,  // Will be updated by ui()
-            spell_checker: SpellChecker::new(),
+            spell_checker: SpellChecker::new(""),
             spell_state: SpellState::new(),
             last_input_was_delete: false,
             skip_temp_conversion: None,
@@ -2927,6 +2929,7 @@ impl App {
             self.input_height as i64,
             self.settings.gui_theme.name(),
             self.settings.tls_proxy_enabled,
+            &self.settings.dictionary_path,
         );
         self.popup_manager.open(def);
 
@@ -4094,6 +4097,7 @@ impl App {
             ws_cert_file: self.settings.websocket_cert_file.clone(),
             ws_key_file: self.settings.websocket_key_file.clone(),
             tls_proxy_enabled: self.settings.tls_proxy_enabled,
+            dictionary_path: self.settings.dictionary_path.clone(),
         };
 
         // Debug: log what we're sending to file
@@ -4619,17 +4623,17 @@ impl UserConnection {
 }
 
 fn get_settings_path() -> PathBuf {
-    let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
+    let home = get_home_dir();
     PathBuf::from(home).join(".clay.dat")
 }
 
 fn get_multiuser_settings_path() -> PathBuf {
-    let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
+    let home = get_home_dir();
     PathBuf::from(home).join(".clay.multiuser.dat")
 }
 
 fn get_debug_log_path() -> PathBuf {
-    let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
+    let home = get_home_dir();
     PathBuf::from(home).join("clay.debug.log")
 }
 
@@ -4646,25 +4650,12 @@ fn debug_log(debug_enabled: bool, message: &str) {
         .open(&path)
     {
         Ok(mut file) => {
-            // Get local time using libc
-            let timestamp = unsafe {
-                let mut now: libc::time_t = 0;
-                libc::time(&mut now);
-                let tm = libc::localtime(&now);
-                if tm.is_null() {
-                    "????-??-?? ??:??:??".to_string()
-                } else {
-                    format!(
-                        "{:04}-{:02}-{:02} {:02}:{:02}:{:02}",
-                        (*tm).tm_year + 1900,
-                        (*tm).tm_mon + 1,
-                        (*tm).tm_mday,
-                        (*tm).tm_hour,
-                        (*tm).tm_min,
-                        (*tm).tm_sec
-                    )
-                }
-            };
+            let lt = local_time_now();
+            let timestamp = format!(
+                "{:04}-{:02}-{:02} {:02}:{:02}:{:02}",
+                lt.year, lt.month, lt.day,
+                lt.hour, lt.minute, lt.second
+            );
             let _ = writeln!(file, "[{}] {}", timestamp, message);
         }
         Err(e) => {
@@ -4792,6 +4783,9 @@ fn save_settings(app: &App) -> io::Result<()> {
         writeln!(file, "websocket_key_file={}", app.settings.websocket_key_file)?;
     }
     writeln!(file, "tls_proxy_enabled={}", app.settings.tls_proxy_enabled)?;
+    if !app.settings.dictionary_path.is_empty() {
+        writeln!(file, "dictionary_path={}", app.settings.dictionary_path)?;
+    }
 
     // Save each world's settings (skip unconfigured worlds that have no connection info)
     for world in &app.worlds {
@@ -5199,6 +5193,9 @@ fn load_settings(app: &mut App) -> io::Result<()> {
                     "encoding" => {}
                     "tls_proxy_enabled" => {
                         app.settings.tls_proxy_enabled = value == "true";
+                    }
+                    "dictionary_path" => {
+                        app.settings.dictionary_path = value.to_string();
                     }
                     _ => {}
                 }
@@ -5653,7 +5650,7 @@ fn save_multiuser_settings(app: &App) -> io::Result<()> {
     Ok(())
 }
 
-#[cfg(not(target_os = "android"))]
+#[cfg(all(unix, not(target_os = "android")))]
 fn save_reload_state(app: &App) -> io::Result<()> {
     let path = get_reload_state_path();
     let mut file = std::fs::File::create(&path)?;
@@ -5705,6 +5702,9 @@ fn save_reload_state(app: &App) -> io::Result<()> {
         writeln!(file, "websocket_key_file={}", app.settings.websocket_key_file)?;
     }
     writeln!(file, "tls_proxy_enabled={}", app.settings.tls_proxy_enabled)?;
+    if !app.settings.dictionary_path.is_empty() {
+        writeln!(file, "dictionary_path={}", app.settings.dictionary_path)?;
+    }
 
     // Save input history (base64 encode each line to handle special chars)
     writeln!(file, "history_count={}", app.input.history.len())?;
@@ -5896,7 +5896,10 @@ fn load_reload_state(app: &mut App) -> io::Result<bool> {
         output_lines: Vec<OutputLine>,
         scroll_offset: usize,
         connected: bool,
+        #[cfg(unix)]
         socket_fd: Option<RawFd>,
+        #[cfg(not(unix))]
+        socket_fd: Option<i64>,
         proxy_pid: Option<u32>,
         proxy_socket_path: Option<PathBuf>,
         unseen_lines: usize,
@@ -6242,6 +6245,9 @@ fn load_reload_state(app: &mut App) -> io::Result<bool> {
                     "tls_proxy_enabled" => {
                         app.settings.tls_proxy_enabled = value == "true";
                     }
+                    "dictionary_path" => {
+                        app.settings.dictionary_path = value.to_string();
+                    }
                     "history_count" | "world_count" => {
                         // These are informational, not needed for parsing
                     }
@@ -6376,7 +6382,7 @@ fn load_reload_state(app: &mut App) -> io::Result<bool> {
 }
 
 // Hot reload helper - not available on Android/Termux
-#[cfg(not(target_os = "android"))]
+#[cfg(all(unix, not(target_os = "android")))]
 fn clear_cloexec(fd: RawFd) -> io::Result<()> {
     // Clear the FD_CLOEXEC flag so the fd survives exec
     unsafe {
@@ -6393,7 +6399,7 @@ fn clear_cloexec(fd: RawFd) -> io::Result<()> {
 }
 
 /// Check if a process with the given PID is still alive
-#[cfg(not(target_os = "android"))]
+#[cfg(all(unix, not(target_os = "android")))]
 fn is_process_alive(pid: u32) -> bool {
     // Use waitpid with WNOHANG to check without blocking
     // A return of 0 means the process is still running
@@ -6404,15 +6410,15 @@ fn is_process_alive(pid: u32) -> bool {
     }
 }
 
-/// Stub for Android - TLS proxy processes don't exist on Android
-#[cfg(target_os = "android")]
+/// Stub for Android/Windows - TLS proxy processes don't exist on these platforms
+#[cfg(any(target_os = "android", not(unix)))]
 fn is_process_alive(_pid: u32) -> bool {
-    false  // Always return false since we never spawn proxy processes on Android
+    false  // Always return false since we never spawn proxy processes on this platform
 }
 
 /// Reap any zombie child processes to prevent defunct processes from accumulating.
 /// This should be called periodically from the main event loop.
-#[cfg(not(target_os = "android"))]
+#[cfg(all(unix, not(target_os = "android")))]
 fn reap_zombie_children() {
     // Call waitpid with -1 (any child) and WNOHANG (don't block) to reap zombies
     // Keep calling until no more zombies are found
@@ -6477,7 +6483,7 @@ fn get_unix_timestamp() -> u64 {
 // ============================================================================
 
 /// Generate a unique socket path for the TLS proxy
-#[cfg(not(target_os = "android"))]
+#[cfg(all(unix, not(target_os = "android")))]
 fn get_proxy_socket_path(world_name: &str) -> PathBuf {
     let sanitized_name = world_name
         .chars()
@@ -6491,7 +6497,7 @@ fn get_proxy_socket_path(world_name: &str) -> PathBuf {
 }
 
 /// Get the config file path for a TLS proxy (derived from socket path)
-#[cfg(not(target_os = "android"))]
+#[cfg(all(unix, not(target_os = "android")))]
 fn get_proxy_config_path(socket_path: &Path) -> PathBuf {
     let mut config_path = socket_path.to_path_buf();
     config_path.set_extension("conf");
@@ -6502,7 +6508,7 @@ fn get_proxy_config_path(socket_path: &Path) -> PathBuf {
 /// Returns (proxy_pid, socket_path) on success.
 /// The proxy process handles the TLS connection to the MUD server and exposes
 /// a Unix socket for the main client to connect to.
-#[cfg(not(target_os = "android"))]
+#[cfg(all(unix, not(target_os = "android")))]
 fn spawn_tls_proxy(
     world_name: &str,
     host: &str,
@@ -6571,7 +6577,7 @@ fn spawn_tls_proxy(
 }
 
 /// Async implementation of the TLS proxy main loop (runs in separate process via --tls-proxy)
-#[cfg(not(target_os = "android"))]
+#[cfg(all(unix, not(target_os = "android")))]
 async fn run_tls_proxy_async(host: &str, port: &str, socket_path: &PathBuf) {
     use tokio::net::UnixListener;
 
@@ -6582,26 +6588,7 @@ async fn run_tls_proxy_async(host: &str, port: &str, socket_path: &PathBuf) {
     };
 
     // Enable TCP keepalive to detect dead connections faster
-    // Settings: start probing after 60s idle, probe every 10s, give up after 6 failed probes
-    // This detects dead connections within ~2 minutes instead of waiting for app-level timeout
-    let fd = tcp_stream.as_raw_fd();
-    unsafe {
-        let enable: libc::c_int = 1;
-        libc::setsockopt(fd, libc::SOL_SOCKET, libc::SO_KEEPALIVE,
-            &enable as *const _ as *const libc::c_void, std::mem::size_of_val(&enable) as libc::socklen_t);
-
-        let idle: libc::c_int = 60; // Start probing after 60 seconds idle
-        libc::setsockopt(fd, libc::IPPROTO_TCP, libc::TCP_KEEPIDLE,
-            &idle as *const _ as *const libc::c_void, std::mem::size_of_val(&idle) as libc::socklen_t);
-
-        let interval: libc::c_int = 10; // Probe every 10 seconds
-        libc::setsockopt(fd, libc::IPPROTO_TCP, libc::TCP_KEEPINTVL,
-            &interval as *const _ as *const libc::c_void, std::mem::size_of_val(&interval) as libc::socklen_t);
-
-        let count: libc::c_int = 6; // Give up after 6 failed probes
-        libc::setsockopt(fd, libc::IPPROTO_TCP, libc::TCP_KEEPCNT,
-            &count as *const _ as *const libc::c_void, std::mem::size_of_val(&count) as libc::socklen_t);
-    }
+    enable_tcp_keepalive(&tcp_stream);
 
     // Establish TLS connection
     #[cfg(feature = "rustls-backend")]
@@ -6738,7 +6725,7 @@ async fn run_tls_proxy_async(host: &str, port: &str, socket_path: &PathBuf) {
 }
 
 /// Strip " (deleted)" suffix from a path string if present.
-#[cfg(not(target_os = "android"))]
+#[cfg(all(unix, not(target_os = "android")))]
 fn strip_deleted_suffix(path_str: &str) -> String {
     // Try common variations of the deleted marker
     for suffix in [" (deleted)", "(deleted)"] {
@@ -6753,7 +6740,7 @@ fn strip_deleted_suffix(path_str: &str) -> String {
 /// On Linux, if the binary was replaced, /proc/self/exe shows " (deleted)".
 /// We strip that suffix to get the path to the new binary.
 /// Returns (path, debug_info) for better error messages.
-#[cfg(not(target_os = "android"))]
+#[cfg(all(unix, not(target_os = "android")))]
 fn get_executable_path() -> io::Result<(PathBuf, String)> {
     let proc_exe = PathBuf::from("/proc/self/exe");
     let link_target = std::fs::read_link(&proc_exe)?;
@@ -6768,7 +6755,7 @@ fn get_executable_path() -> io::Result<(PathBuf, String)> {
     Ok((PathBuf::from(clean_path), debug_info))
 }
 
-#[cfg(not(target_os = "android"))]
+#[cfg(all(unix, not(target_os = "android")))]
 fn exec_reload(app: &App) -> io::Result<()> {
     debug_log(true, "RELOAD: Starting exec_reload");
 
@@ -7249,6 +7236,8 @@ mod remote_gui {
         ansi_music_enabled: bool,
         /// TLS proxy enabled (for connection preservation over hot reload)
         tls_proxy_enabled: bool,
+        /// Custom dictionary path for spell checking
+        dictionary_path: String,
         /// Audio output stream (must stay alive for audio to play)
         #[cfg(all(feature = "rodio", not(target_os = "android")))]
         audio_stream: Option<rodio::OutputStream>,
@@ -7415,7 +7404,7 @@ mod remote_gui {
                 ws_key_file: String::new(),
                 world_switch_mode: WorldSwitchMode::UnseenFirst,
                 debug_enabled: false,
-                spell_checker: SpellChecker::new(),
+                spell_checker: SpellChecker::new(""),
                 spell_state: SpellState::new(),
                 suggestion_message: None,
                 actions: Vec::new(),
@@ -7434,6 +7423,7 @@ mod remote_gui {
                 color_offset_percent: 0,
                 ansi_music_enabled: true,
                 tls_proxy_enabled: false,
+                dictionary_path: String::new(),
                 #[cfg(all(feature = "rodio", not(target_os = "android")))]
                 audio_stream: None,
                 #[cfg(all(feature = "rodio", not(target_os = "android")))]
@@ -7855,6 +7845,7 @@ mod remote_gui {
                             self.show_tags = settings.show_tags;
                             self.ansi_music_enabled = settings.ansi_music_enabled;
                             self.tls_proxy_enabled = settings.tls_proxy_enabled;
+                            self.dictionary_path = settings.dictionary_path.clone();
                             self.actions = actions;
                             // Send initial view state for synchronized more-mode
                             if let Some(ref tx) = self.ws_tx {
@@ -8014,6 +8005,7 @@ mod remote_gui {
                             self.show_tags = settings.show_tags;
                             self.ansi_music_enabled = settings.ansi_music_enabled;
                             self.tls_proxy_enabled = settings.tls_proxy_enabled;
+                            self.dictionary_path = settings.dictionary_path.clone();
                         }
                         WsMessage::PendingLinesUpdate { world_index, count } => {
                             // Update pending count for world
@@ -8639,6 +8631,7 @@ mod remote_gui {
                     ws_cert_file: self.ws_cert_file.clone(),
                     ws_key_file: self.ws_key_file.clone(),
                     tls_proxy_enabled: self.tls_proxy_enabled,
+                    dictionary_path: self.dictionary_path.clone(),
                 });
             }
         }
@@ -8708,15 +8701,10 @@ mod remote_gui {
 
         /// Format timestamp using cached "now" value for batch rendering
         fn format_timestamp_gui_cached(ts: u64, _now: &GuiCachedNow) -> String {
-            let ts_secs = ts as libc::time_t;
-
-            let mut ts_tm: libc::tm = unsafe { std::mem::zeroed() };
-            unsafe {
-                libc::localtime_r(&ts_secs, &mut ts_tm);
-            }
+            let lt = local_time_from_epoch(ts as i64);
 
             // Always show day/month for debugging ordering issues
-            format!("{:02}/{:02} {:02}:{:02}>", ts_tm.tm_mday, ts_tm.tm_mon + 1, ts_tm.tm_hour, ts_tm.tm_min)
+            format!("{:02}/{:02} {:02}:{:02}>", lt.day, lt.month, lt.hour, lt.minute)
         }
 
         /// Strip MUD tags like [channel:] or [channel(player)] from start of line
@@ -10879,16 +10867,9 @@ mod remote_gui {
                             // Spacer with underscore-style fill
                             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                                 // Current time (H:MM) in 12-hour format
-                                let (hours_24, mins) = unsafe {
-                                    let mut now: libc::time_t = 0;
-                                    libc::time(&mut now);
-                                    let tm = libc::localtime(&now);
-                                    if tm.is_null() {
-                                        (0, 0)
-                                    } else {
-                                        ((*tm).tm_hour as u32, (*tm).tm_min as u32)
-                                    }
-                                };
+                                let lt = local_time_now();
+                                let hours_24 = lt.hour as u32;
+                                let mins = lt.minute as u32;
                                 // Convert to 12-hour format
                                 let hours = if hours_24 == 0 {
                                     12
@@ -15661,6 +15642,10 @@ fn handle_remote_client_key(
                 app.input.visible_height = app.input_height;
                 app.settings.gui_theme = Theme::from_name(&settings.gui_theme);
                 app.settings.tls_proxy_enabled = settings.tls_proxy;
+                if app.settings.dictionary_path != settings.dictionary_path {
+                    app.settings.dictionary_path = settings.dictionary_path.clone();
+                    app.spell_checker = SpellChecker::new(&app.settings.dictionary_path);
+                }
 
                 // Send UpdateGlobalSettings to daemon
                 let _ = ws_tx.send(WsMessage::UpdateGlobalSettings {
@@ -15690,6 +15675,7 @@ fn handle_remote_client_key(
                     ws_cert_file: app.settings.websocket_cert_file.clone(),
                     ws_key_file: app.settings.websocket_key_file.clone(),
                     tls_proxy_enabled: app.settings.tls_proxy_enabled,
+                    dictionary_path: app.settings.dictionary_path.clone(),
                 });
             }
             NewPopupAction::WebSaved(settings) => {
@@ -15732,6 +15718,7 @@ fn handle_remote_client_key(
                     ws_cert_file: app.settings.websocket_cert_file.clone(),
                     ws_key_file: app.settings.websocket_key_file.clone(),
                     tls_proxy_enabled: app.settings.tls_proxy_enabled,
+                    dictionary_path: app.settings.dictionary_path.clone(),
                 });
             }
             NewPopupAction::ConnectionsClose => {
@@ -16121,6 +16108,7 @@ struct SetupSettings {
     input_height: i64,
     gui_theme: String,
     tls_proxy: bool,
+    dictionary_path: String,
 }
 
 /// Settings from the web popup
@@ -16194,7 +16182,7 @@ fn handle_new_popup_key(app: &mut App, key: KeyEvent) -> NewPopupAction {
         SETUP_FIELD_MORE_MODE, SETUP_FIELD_SPELL_CHECK, SETUP_FIELD_TEMP_CONVERT,
         SETUP_FIELD_WORLD_SWITCHING, SETUP_FIELD_DEBUG, SETUP_FIELD_SHOW_TAGS,
         SETUP_FIELD_INPUT_HEIGHT, SETUP_FIELD_GUI_THEME, SETUP_FIELD_TLS_PROXY,
-        SETUP_BTN_SAVE, SETUP_BTN_CANCEL,
+        SETUP_FIELD_DICTIONARY, SETUP_BTN_SAVE, SETUP_BTN_CANCEL,
     };
     use popup::definitions::web::{
         WEB_FIELD_PROTOCOL, WEB_FIELD_HTTP_ENABLED, WEB_FIELD_HTTP_PORT,
@@ -16404,6 +16392,8 @@ fn handle_new_popup_key(app: &mut App, key: KeyEvent) -> NewPopupAction {
                     gui_theme: state.get_selected(SETUP_FIELD_GUI_THEME)
                         .unwrap_or("dark").to_string(),
                     tls_proxy: state.get_bool(SETUP_FIELD_TLS_PROXY).unwrap_or(false),
+                    dictionary_path: state.get_text(SETUP_FIELD_DICTIONARY)
+                        .unwrap_or("").to_string(),
                 }
             };
 
@@ -17451,6 +17441,11 @@ async fn run_daemon_server() -> io::Result<()> {
     // Ensure at least one world exists
     app.ensure_has_world();
 
+    // Re-create spell checker with custom dictionary path if configured
+    if !app.settings.dictionary_path.is_empty() {
+        app.spell_checker = SpellChecker::new(&app.settings.dictionary_path);
+    }
+
     let (event_tx, mut event_rx) = mpsc::channel::<AppEvent>(100);
 
     // Start WebSocket server if enabled
@@ -17563,7 +17558,7 @@ async fn run_daemon_server() -> io::Result<()> {
 
     // Main event loop - handles MUD connections and WebSocket messages
     loop {
-        #[cfg(not(target_os = "android"))]
+        #[cfg(all(unix, not(target_os = "android")))]
         reap_zombie_children();
 
         tokio::select! {
@@ -17742,7 +17737,7 @@ async fn handle_daemon_ws_message(
                 app.ws_broadcast(WsMessage::WorldSwitched { new_index: world_index });
             }
         }
-        WsMessage::UpdateGlobalSettings { more_mode_enabled, spell_check_enabled, temp_convert_enabled, world_switch_mode, show_tags, debug_enabled, ansi_music_enabled, console_theme, gui_theme, gui_transparency, color_offset_percent, input_height, font_name, font_size, web_font_size_phone, web_font_size_tablet, web_font_size_desktop, ws_allow_list, web_secure, http_enabled, http_port, ws_enabled, ws_port, ws_cert_file, ws_key_file, tls_proxy_enabled } => {
+        WsMessage::UpdateGlobalSettings { more_mode_enabled, spell_check_enabled, temp_convert_enabled, world_switch_mode, show_tags, debug_enabled, ansi_music_enabled, console_theme, gui_theme, gui_transparency, color_offset_percent, input_height, font_name, font_size, web_font_size_phone, web_font_size_tablet, web_font_size_desktop, ws_allow_list, web_secure, http_enabled, http_port, ws_enabled, ws_port, ws_cert_file, ws_key_file, tls_proxy_enabled, dictionary_path } => {
             app.settings.more_mode_enabled = more_mode_enabled;
             app.settings.spell_check_enabled = spell_check_enabled;
             app.settings.temp_convert_enabled = temp_convert_enabled;
@@ -17769,6 +17764,10 @@ async fn handle_daemon_ws_message(
             app.settings.websocket_cert_file = ws_cert_file;
             app.settings.websocket_key_file = ws_key_file;
             app.settings.tls_proxy_enabled = tls_proxy_enabled;
+            if app.settings.dictionary_path != dictionary_path {
+                app.settings.dictionary_path = dictionary_path;
+                app.spell_checker = SpellChecker::new(&app.settings.dictionary_path);
+            }
 
             // Save settings
             let _ = save_settings(app);
@@ -17801,6 +17800,7 @@ async fn handle_daemon_ws_message(
                 ws_cert_file: app.settings.websocket_cert_file.clone(),
                 ws_key_file: app.settings.websocket_key_file.clone(),
                 tls_proxy_enabled: app.settings.tls_proxy_enabled,
+                dictionary_path: app.settings.dictionary_path.clone(),
             };
             app.ws_broadcast(WsMessage::GlobalSettingsUpdated { settings, input_height: app.input_height });
         }
@@ -18041,7 +18041,7 @@ keep_alive_type=Generic
     // Main event loop - only handles WebSocket events
     loop {
         // Reap any zombie child processes (TLS proxies that have exited)
-        #[cfg(not(target_os = "android"))]
+        #[cfg(all(unix, not(target_os = "android")))]
         reap_zombie_children();
 
         tokio::select! {
@@ -18214,27 +18214,7 @@ async fn connect_multiuser_world(
             let _ = tcp_stream.set_nodelay(true);
 
             // Enable TCP keepalive to detect dead connections faster
-            #[cfg(unix)]
-            {
-                let fd = tcp_stream.as_raw_fd();
-                unsafe {
-                    let enable: libc::c_int = 1;
-                    libc::setsockopt(fd, libc::SOL_SOCKET, libc::SO_KEEPALIVE,
-                        &enable as *const _ as *const libc::c_void, std::mem::size_of_val(&enable) as libc::socklen_t);
-
-                    let idle: libc::c_int = 60;
-                    libc::setsockopt(fd, libc::IPPROTO_TCP, libc::TCP_KEEPIDLE,
-                        &idle as *const _ as *const libc::c_void, std::mem::size_of_val(&idle) as libc::socklen_t);
-
-                    let interval: libc::c_int = 10;
-                    libc::setsockopt(fd, libc::IPPROTO_TCP, libc::TCP_KEEPINTVL,
-                        &interval as *const _ as *const libc::c_void, std::mem::size_of_val(&interval) as libc::socklen_t);
-
-                    let count: libc::c_int = 6;
-                    libc::setsockopt(fd, libc::IPPROTO_TCP, libc::TCP_KEEPCNT,
-                        &count as *const _ as *const libc::c_void, std::mem::size_of_val(&count) as libc::socklen_t);
-                }
-            }
+            enable_tcp_keepalive(&tcp_stream);
 
             // Handle SSL if needed
             let (mut read_half, mut write_half): (StreamReader, StreamWriter) = if use_ssl {
@@ -18439,27 +18419,7 @@ async fn connect_daemon_world(
             let _ = tcp_stream.set_nodelay(true);
 
             // Enable TCP keepalive to detect dead connections faster
-            #[cfg(unix)]
-            {
-                let fd = tcp_stream.as_raw_fd();
-                unsafe {
-                    let enable: libc::c_int = 1;
-                    libc::setsockopt(fd, libc::SOL_SOCKET, libc::SO_KEEPALIVE,
-                        &enable as *const _ as *const libc::c_void, std::mem::size_of_val(&enable) as libc::socklen_t);
-
-                    let idle: libc::c_int = 60;
-                    libc::setsockopt(fd, libc::IPPROTO_TCP, libc::TCP_KEEPIDLE,
-                        &idle as *const _ as *const libc::c_void, std::mem::size_of_val(&idle) as libc::socklen_t);
-
-                    let interval: libc::c_int = 10;
-                    libc::setsockopt(fd, libc::IPPROTO_TCP, libc::TCP_KEEPINTVL,
-                        &interval as *const _ as *const libc::c_void, std::mem::size_of_val(&interval) as libc::socklen_t);
-
-                    let count: libc::c_int = 6;
-                    libc::setsockopt(fd, libc::IPPROTO_TCP, libc::TCP_KEEPCNT,
-                        &count as *const _ as *const libc::c_void, std::mem::size_of_val(&count) as libc::socklen_t);
-                }
-            }
+            enable_tcp_keepalive(&tcp_stream);
 
             // Handle SSL if needed
             let (mut read_half, mut write_half): (StreamReader, StreamWriter) = if use_ssl {
@@ -18767,6 +18727,7 @@ fn build_multiuser_initial_state(app: &App, username: &str) -> WsMessage {
         ws_cert_file: app.settings.websocket_cert_file.clone(),
         ws_key_file: app.settings.websocket_key_file.clone(),
         tls_proxy_enabled: app.settings.tls_proxy_enabled,
+        dictionary_path: app.settings.dictionary_path.clone(),
     };
 
     // Find current world index for this user
@@ -19042,7 +19003,7 @@ async fn main() -> io::Result<()> {
     // Check for --tls-proxy=config_path argument for TLS proxy mode (not available on Android)
     // This is used internally when spawning TLS proxy processes
     // Config file contains host:port on first line, socket_path on second line
-    #[cfg(not(target_os = "android"))]
+    #[cfg(all(unix, not(target_os = "android")))]
     if let Some(proxy_arg) = std::env::args().find(|a| a.starts_with("--tls-proxy=")) {
         let config_path = proxy_arg.strip_prefix("--tls-proxy=").unwrap();
         if let Ok(contents) = std::fs::read_to_string(config_path) {
@@ -19101,8 +19062,8 @@ async fn main() -> io::Result<()> {
         return run_console_client(addr).await;
     }
 
-    // Set up signal handlers for crash debugging (not available on Android)
-    #[cfg(not(target_os = "android"))]
+    // Set up signal handlers for crash debugging (not available on Android or Windows)
+    #[cfg(all(unix, not(target_os = "android")))]
     unsafe {
         extern "C" fn sigfpe_handler(_: libc::c_int) {
             // Restore terminal before printing
@@ -19164,8 +19125,8 @@ async fn main() -> io::Result<()> {
         libc::signal(libc::SIGABRT, sigabrt_handler as libc::sighandler_t);
     }
 
-    // Set up crash handler for automatic recovery (not available on Android)
-    #[cfg(not(target_os = "android"))]
+    // Set up crash handler for automatic recovery (not available on Android or Windows)
+    #[cfg(all(unix, not(target_os = "android")))]
     setup_crash_handler();
 
     enable_raw_mode()?;
@@ -19261,6 +19222,11 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
     app.ensure_has_world();
     debug_log(true, &format!("STARTUP: Have {} worlds", app.worlds.len()));
 
+    // Re-create spell checker with custom dictionary path if configured
+    if !app.settings.dictionary_path.is_empty() {
+        app.spell_checker = SpellChecker::new(&app.settings.dictionary_path);
+    }
+
     // Note: pending_lines and paused state are preserved across reload
     // so that more-mode continues seamlessly. Disconnected worlds have their
     // pending_lines cleared in the cleanup pass below (line ~17205).
@@ -19275,6 +19241,8 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
     let (event_tx, mut event_rx) = mpsc::channel::<AppEvent>(100);
 
     // If in reload or crash recovery mode, reconstruct connections from saved fds
+    // FD reconstruction is Unix-only (reload/crash recovery requires exec() which is Unix-only)
+    #[cfg(unix)]
     if should_load_state {
         debug_log(true, "STARTUP: Reconstructing connections...");
         // First pass: identify TLS worlds WITHOUT proxy that need to be disconnected
@@ -19870,8 +19838,8 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
     // Use async event stream instead of polling to reduce CPU usage
     let mut event_stream = EventStream::new();
 
-    // Spawn SIGUSR1 handler task for hot reload (not available on Android)
-    #[cfg(not(target_os = "android"))]
+    // Spawn SIGUSR1 handler task for hot reload (not available on Android or Windows)
+    #[cfg(all(unix, not(target_os = "android")))]
     {
         let sigusr1_tx = event_tx.clone();
         tokio::spawn(async move {
@@ -19926,7 +19894,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
 
         // Reap any zombie child processes (TLS proxies that have exited)
         // This is a fast non-blocking call that prevents defunct processes from accumulating
-        #[cfg(not(target_os = "android"))]
+        #[cfg(all(unix, not(target_os = "android")))]
         reap_zombie_children();
 
         // Use tokio::select! to efficiently wait for events without busy-polling
@@ -19955,8 +19923,8 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                             }
                         }
                         KeyAction::Suspend => {
-                            // Process suspension not available on Android
-                            #[cfg(not(target_os = "android"))]
+                            // Process suspension not available on Android or Windows
+                            #[cfg(all(unix, not(target_os = "android")))]
                             {
                                 // Restore terminal to normal mode before suspending
                                 disable_raw_mode()?;
@@ -19973,9 +19941,9 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                 terminal.clear()?;
                                 app.needs_output_redraw = true;
                             }
-                            #[cfg(target_os = "android")]
+                            #[cfg(any(target_os = "android", not(unix)))]
                             {
-                                app.add_output("Process suspension (Ctrl+Z) is not available on Android.");
+                                app.add_output("Process suspension (Ctrl+Z) is not available on this platform.");
                             }
                         }
                         KeyAction::SendCommand(cmd) => {
@@ -20693,6 +20661,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                         // Disconnect the specified world
                                         if world_index < app.worlds.len() && app.worlds[world_index].connected {
                                             // Kill proxy process if one exists
+                                            #[cfg(unix)]
                                             if let Some(proxy_pid) = app.worlds[world_index].proxy_pid {
                                                 unsafe { libc::kill(proxy_pid as libc::pid_t, libc::SIGTERM); }
                                             }
@@ -20899,7 +20868,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                         use std::io::Write;
                                         let ts = current_timestamp_secs();
 
-                                        let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
+                                        let home = get_home_dir();
                                         let dump_path = format!("{}/.clay.dmp.log", home);
 
                                         match std::fs::File::create(&dump_path) {
@@ -20910,13 +20879,12 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                                         let line_ts = line.timestamp
                                                             .duration_since(std::time::UNIX_EPOCH)
                                                             .map(|d| d.as_secs())
-                                                            .unwrap_or(0) as libc::time_t;
-                                                        let mut tm: libc::tm = unsafe { std::mem::zeroed() };
-                                                        unsafe { libc::localtime_r(&line_ts, &mut tm); }
+                                                            .unwrap_or(0) as i64;
+                                                        let lt = local_time_from_epoch(line_ts);
                                                         let datetime = format!(
                                                             "{:04}-{:02}-{:02} {:02}:{:02}:{:02}",
-                                                            tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday,
-                                                            tm.tm_hour, tm.tm_min, tm.tm_sec
+                                                            lt.year, lt.month, lt.day,
+                                                            lt.hour, lt.minute, lt.second
                                                         );
                                                         let _ = writeln!(file, "{},{},{}", world.name, datetime, line.text);
                                                         total_lines += 1;
@@ -20925,13 +20893,12 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                                         let line_ts = line.timestamp
                                                             .duration_since(std::time::UNIX_EPOCH)
                                                             .map(|d| d.as_secs())
-                                                            .unwrap_or(0) as libc::time_t;
-                                                        let mut tm: libc::tm = unsafe { std::mem::zeroed() };
-                                                        unsafe { libc::localtime_r(&line_ts, &mut tm); }
+                                                            .unwrap_or(0) as i64;
+                                                        let lt = local_time_from_epoch(line_ts);
                                                         let datetime = format!(
                                                             "{:04}-{:02}-{:02} {:02}:{:02}:{:02}",
-                                                            tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday,
-                                                            tm.tm_hour, tm.tm_min, tm.tm_sec
+                                                            lt.year, lt.month, lt.day,
+                                                            lt.hour, lt.minute, lt.second
                                                         );
                                                         let _ = writeln!(file, "{},{},{}", world.name, datetime, line.text);
                                                         total_lines += 1;
@@ -21228,7 +21195,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                     });
                                 }
                             }
-                            WsMessage::UpdateGlobalSettings { more_mode_enabled, spell_check_enabled, temp_convert_enabled, world_switch_mode, show_tags, debug_enabled, ansi_music_enabled, console_theme, gui_theme, gui_transparency, color_offset_percent, input_height, font_name, font_size, web_font_size_phone, web_font_size_tablet, web_font_size_desktop, ws_allow_list, web_secure, http_enabled, http_port, ws_enabled, ws_port, ws_cert_file, ws_key_file, tls_proxy_enabled } => {
+                            WsMessage::UpdateGlobalSettings { more_mode_enabled, spell_check_enabled, temp_convert_enabled, world_switch_mode, show_tags, debug_enabled, ansi_music_enabled, console_theme, gui_theme, gui_transparency, color_offset_percent, input_height, font_name, font_size, web_font_size_phone, web_font_size_tablet, web_font_size_desktop, ws_allow_list, web_secure, http_enabled, http_port, ws_enabled, ws_port, ws_cert_file, ws_key_file, tls_proxy_enabled, dictionary_path } => {
                                 // Update global settings from remote client
                                 app.settings.more_mode_enabled = more_mode_enabled;
                                 app.settings.spell_check_enabled = spell_check_enabled;
@@ -21264,6 +21231,10 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                 app.settings.websocket_cert_file = ws_cert_file;
                                 app.settings.websocket_key_file = ws_key_file;
                                 app.settings.tls_proxy_enabled = tls_proxy_enabled;
+                                if app.settings.dictionary_path != dictionary_path {
+                                    app.settings.dictionary_path = dictionary_path;
+                                    app.spell_checker = SpellChecker::new(&app.settings.dictionary_path);
+                                }
                                 // Save settings to persist changes
                                 let _ = save_settings(&app);
                                 // Build settings message for broadcast
@@ -21294,6 +21265,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                     ws_cert_file: app.settings.websocket_cert_file.clone(),
                                     ws_key_file: app.settings.websocket_key_file.clone(),
                                     tls_proxy_enabled: app.settings.tls_proxy_enabled,
+                                    dictionary_path: app.settings.dictionary_path.clone(),
                                 };
                                 // Broadcast update to all clients
                                 app.ws_broadcast(WsMessage::GlobalSettingsUpdated {
@@ -22417,6 +22389,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                     // Disconnect the specified world
                                     if world_index < app.worlds.len() && app.worlds[world_index].connected {
                                         // Kill proxy process if one exists
+                                        #[cfg(unix)]
                                         if let Some(proxy_pid) = app.worlds[world_index].proxy_pid {
                                             unsafe { libc::kill(proxy_pid as libc::pid_t, libc::SIGTERM); }
                                         }
@@ -22615,7 +22588,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                     use std::io::Write;
                                     let ts = current_timestamp_secs();
 
-                                    let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
+                                    let home = get_home_dir();
                                     let dump_path = format!("{}/.clay.dmp.log", home);
 
                                     match std::fs::File::create(&dump_path) {
@@ -22626,13 +22599,12 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                                     let line_ts = line.timestamp
                                                         .duration_since(std::time::UNIX_EPOCH)
                                                         .map(|d| d.as_secs())
-                                                        .unwrap_or(0) as libc::time_t;
-                                                    let mut tm: libc::tm = unsafe { std::mem::zeroed() };
-                                                    unsafe { libc::localtime_r(&line_ts, &mut tm); }
+                                                        .unwrap_or(0) as i64;
+                                                    let lt = local_time_from_epoch(line_ts);
                                                     let datetime = format!(
                                                         "{:04}-{:02}-{:02} {:02}:{:02}:{:02}",
-                                                        tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday,
-                                                        tm.tm_hour, tm.tm_min, tm.tm_sec
+                                                        lt.year, lt.month, lt.day,
+                                                        lt.hour, lt.minute, lt.second
                                                     );
                                                     let _ = writeln!(file, "{},{},{}", world.name, datetime, line.text);
                                                     total_lines += 1;
@@ -22641,13 +22613,12 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                                     let line_ts = line.timestamp
                                                         .duration_since(std::time::UNIX_EPOCH)
                                                         .map(|d| d.as_secs())
-                                                        .unwrap_or(0) as libc::time_t;
-                                                    let mut tm: libc::tm = unsafe { std::mem::zeroed() };
-                                                    unsafe { libc::localtime_r(&line_ts, &mut tm); }
+                                                        .unwrap_or(0) as i64;
+                                                    let lt = local_time_from_epoch(line_ts);
                                                     let datetime = format!(
                                                         "{:04}-{:02}-{:02} {:02}:{:02}:{:02}",
-                                                        tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday,
-                                                        tm.tm_hour, tm.tm_min, tm.tm_sec
+                                                        lt.year, lt.month, lt.day,
+                                                        lt.hour, lt.minute, lt.second
                                                     );
                                                     let _ = writeln!(file, "{},{},{}", world.name, datetime, line.text);
                                                     total_lines += 1;
@@ -22754,7 +22725,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                 app.ws_broadcast(WsMessage::WorldSettingsUpdated { world_index, settings: settings_msg, name });
                             }
                         }
-                        WsMessage::UpdateGlobalSettings { more_mode_enabled, spell_check_enabled, temp_convert_enabled, world_switch_mode, show_tags, debug_enabled, ansi_music_enabled, console_theme, gui_theme, gui_transparency, color_offset_percent, input_height, font_name, font_size, web_font_size_phone, web_font_size_tablet, web_font_size_desktop, ws_allow_list, web_secure, http_enabled, http_port, ws_enabled, ws_port, ws_cert_file, ws_key_file, tls_proxy_enabled } => {
+                        WsMessage::UpdateGlobalSettings { more_mode_enabled, spell_check_enabled, temp_convert_enabled, world_switch_mode, show_tags, debug_enabled, ansi_music_enabled, console_theme, gui_theme, gui_transparency, color_offset_percent, input_height, font_name, font_size, web_font_size_phone, web_font_size_tablet, web_font_size_desktop, ws_allow_list, web_secure, http_enabled, http_port, ws_enabled, ws_port, ws_cert_file, ws_key_file, tls_proxy_enabled, dictionary_path } => {
                             app.settings.more_mode_enabled = more_mode_enabled;
                             app.settings.spell_check_enabled = spell_check_enabled;
                             app.settings.temp_convert_enabled = temp_convert_enabled;
@@ -22785,6 +22756,10 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                             app.settings.websocket_cert_file = ws_cert_file;
                             app.settings.websocket_key_file = ws_key_file;
                             app.settings.tls_proxy_enabled = tls_proxy_enabled;
+                            if app.settings.dictionary_path != dictionary_path {
+                                app.settings.dictionary_path = dictionary_path;
+                                app.spell_checker = SpellChecker::new(&app.settings.dictionary_path);
+                            }
                             let _ = save_settings(&app);
                             let settings_msg = GlobalSettingsMsg {
                                 more_mode_enabled: app.settings.more_mode_enabled,
@@ -22813,6 +22788,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                 ws_cert_file: app.settings.websocket_cert_file.clone(),
                                 ws_key_file: app.settings.websocket_key_file.clone(),
                                 tls_proxy_enabled: app.settings.tls_proxy_enabled,
+                                dictionary_path: app.settings.dictionary_path.clone(),
                             };
                             app.ws_broadcast(WsMessage::GlobalSettingsUpdated { settings: settings_msg, input_height: app.input_height });
                         }
@@ -23165,6 +23141,10 @@ fn handle_key_event(key: KeyEvent, app: &mut App) -> KeyAction {
                 app.input_height = settings.input_height as u16;
                 app.settings.gui_theme = Theme::from_name(&settings.gui_theme);
                 app.settings.tls_proxy_enabled = settings.tls_proxy;
+                if app.settings.dictionary_path != settings.dictionary_path {
+                    app.settings.dictionary_path = settings.dictionary_path.clone();
+                    app.spell_checker = SpellChecker::new(&app.settings.dictionary_path);
+                }
                 // Save settings to disk
                 let _ = save_settings(app);
             }
@@ -24429,6 +24409,7 @@ async fn handle_command(cmd: &str, app: &mut App, event_tx: mpsc::Sender<AppEven
         Command::Quit => {
             // Kill all TLS proxy processes before quitting
             for world in &app.worlds {
+                #[cfg(unix)]
                 if let Some(proxy_pid) = world.proxy_pid {
                     unsafe { libc::kill(proxy_pid as libc::pid_t, libc::SIGTERM); }
                 }
@@ -24595,9 +24576,9 @@ async fn handle_command(cmd: &str, app: &mut App, event_tx: mpsc::Sender<AppEven
 
             // Check if using TLS proxy for connection preservation
             // TLS proxy not available on Android
-            #[cfg(not(target_os = "android"))]
+            #[cfg(all(unix, not(target_os = "android")))]
             let use_tls_proxy = use_ssl && app.settings.tls_proxy_enabled;
-            #[cfg(target_os = "android")]
+            #[cfg(any(target_os = "android", not(unix)))]
             let use_tls_proxy = false;
 
             let ssl_msg = if use_ssl {
@@ -24608,8 +24589,8 @@ async fn handle_command(cmd: &str, app: &mut App, event_tx: mpsc::Sender<AppEven
             app.add_output("");
 
             // Handle TLS proxy case separately (proxy does its own TCP connect)
-            // TLS proxy not available on Android
-            #[cfg(not(target_os = "android"))]
+            // TLS proxy only available on Unix (not Android or Windows)
+            #[cfg(all(unix, not(target_os = "android")))]
             if use_tls_proxy {
                 let world_name = app.current_world().name.clone();
                 match spawn_tls_proxy(&world_name, &host, &port) {
@@ -24769,6 +24750,7 @@ async fn handle_command(cmd: &str, app: &mut App, event_tx: mpsc::Sender<AppEven
                             Err(e) => {
                                 app.add_output(&format!("Failed to connect to TLS proxy: {}", e));
                                 // Kill the proxy process
+                                #[cfg(unix)]
                                 unsafe { libc::kill(proxy_pid as libc::pid_t, libc::SIGTERM); }
                                 return false;
                             }
@@ -24784,27 +24766,12 @@ async fn handle_command(cmd: &str, app: &mut App, event_tx: mpsc::Sender<AppEven
 
             match TcpStream::connect(format!("{}:{}", host, port)).await {
                 Ok(tcp_stream) => {
-                    // Store the socket fd for hot reload (before splitting)
+                    // Store the socket fd for hot reload (before splitting, Unix only)
+                    #[cfg(unix)]
                     let socket_fd = tcp_stream.as_raw_fd();
 
                     // Enable TCP keepalive to detect dead connections faster
-                    unsafe {
-                        let enable: libc::c_int = 1;
-                        libc::setsockopt(socket_fd, libc::SOL_SOCKET, libc::SO_KEEPALIVE,
-                            &enable as *const _ as *const libc::c_void, std::mem::size_of_val(&enable) as libc::socklen_t);
-
-                        let idle: libc::c_int = 60;
-                        libc::setsockopt(socket_fd, libc::IPPROTO_TCP, libc::TCP_KEEPIDLE,
-                            &idle as *const _ as *const libc::c_void, std::mem::size_of_val(&idle) as libc::socklen_t);
-
-                        let interval: libc::c_int = 10;
-                        libc::setsockopt(socket_fd, libc::IPPROTO_TCP, libc::TCP_KEEPINTVL,
-                            &interval as *const _ as *const libc::c_void, std::mem::size_of_val(&interval) as libc::socklen_t);
-
-                        let count: libc::c_int = 6;
-                        libc::setsockopt(socket_fd, libc::IPPROTO_TCP, libc::TCP_KEEPCNT,
-                            &count as *const _ as *const libc::c_void, std::mem::size_of_val(&count) as libc::socklen_t);
-                    }
+                    enable_tcp_keepalive(&tcp_stream);
 
                     // Handle SSL if needed
                     let (mut read_half, mut write_half): (StreamReader, StreamWriter) = if use_ssl {
@@ -24884,8 +24851,9 @@ async fn handle_command(cmd: &str, app: &mut App, event_tx: mpsc::Sender<AppEven
                             return false;
                         }
                     } else {
-                        // Store fd for plain TCP connections (can be preserved across reload)
-                        app.current_world_mut().socket_fd = Some(socket_fd);
+                        // Store fd for plain TCP connections (can be preserved across reload, Unix only)
+                        #[cfg(unix)]
+                        { app.current_world_mut().socket_fd = Some(socket_fd); }
                         app.current_world_mut().is_tls = false;
                         let (r, w) = tcp_stream.into_split();
                         (StreamReader::Plain(r), StreamWriter::Plain(w))
@@ -25102,6 +25070,7 @@ async fn handle_command(cmd: &str, app: &mut App, event_tx: mpsc::Sender<AppEven
         Command::Disconnect => {
             if app.current_world().connected {
                 // Kill proxy process if one exists
+                #[cfg(unix)]
                 if let Some(proxy_pid) = app.current_world().proxy_pid {
                     unsafe { libc::kill(proxy_pid as libc::pid_t, libc::SIGTERM); }
                 }
@@ -25192,14 +25161,14 @@ async fn handle_command(cmd: &str, app: &mut App, event_tx: mpsc::Sender<AppEven
             }
         }
         Command::Reload => {
-            // Hot reload is not available on Android/Termux
-            #[cfg(target_os = "android")]
+            // Hot reload is not available on Android/Termux or Windows
+            #[cfg(any(target_os = "android", not(unix)))]
             {
-                app.add_output("Hot reload is not available on Android/Termux.");
+                app.add_output("Hot reload is not available on this platform.");
                 app.add_output("Restart the app manually to apply changes.");
             }
 
-            #[cfg(not(target_os = "android"))]
+            #[cfg(all(unix, not(target_os = "android")))]
             {
                 // ================================================================
                 // PROXY DEBUG: Send "think proxy" and wait 2 seconds before reload
@@ -25422,7 +25391,7 @@ async fn handle_command(cmd: &str, app: &mut App, event_tx: mpsc::Sender<AppEven
             // Dump all scrollback buffers to ~/.clay.dmp.log
             use std::io::Write;
 
-            let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
+            let home = get_home_dir();
             let dump_path = format!("{}/.clay.dmp.log", home);
 
             match std::fs::File::create(&dump_path) {
@@ -25437,17 +25406,12 @@ async fn handle_command(cmd: &str, app: &mut App, event_tx: mpsc::Sender<AppEven
                             let ts = line.timestamp
                                 .duration_since(std::time::UNIX_EPOCH)
                                 .map(|d| d.as_secs())
-                                .unwrap_or(0) as libc::time_t;
-                            let mut tm: libc::tm = unsafe { std::mem::zeroed() };
-                            unsafe { libc::localtime_r(&ts, &mut tm); }
+                                .unwrap_or(0) as i64;
+                            let lt = local_time_from_epoch(ts);
                             let datetime = format!(
                                 "{:04}-{:02}-{:02} {:02}:{:02}:{:02}",
-                                tm.tm_year + 1900,
-                                tm.tm_mon + 1,
-                                tm.tm_mday,
-                                tm.tm_hour,
-                                tm.tm_min,
-                                tm.tm_sec
+                                lt.year, lt.month, lt.day,
+                                lt.hour, lt.minute, lt.second
                             );
 
                             // Write: world_name,datetime,line_text
@@ -25460,17 +25424,12 @@ async fn handle_command(cmd: &str, app: &mut App, event_tx: mpsc::Sender<AppEven
                             let ts = line.timestamp
                                 .duration_since(std::time::UNIX_EPOCH)
                                 .map(|d| d.as_secs())
-                                .unwrap_or(0) as libc::time_t;
-                            let mut tm: libc::tm = unsafe { std::mem::zeroed() };
-                            unsafe { libc::localtime_r(&ts, &mut tm); }
+                                .unwrap_or(0) as i64;
+                            let lt = local_time_from_epoch(ts);
                             let datetime = format!(
                                 "{:04}-{:02}-{:02} {:02}:{:02}:{:02}",
-                                tm.tm_year + 1900,
-                                tm.tm_mon + 1,
-                                tm.tm_mday,
-                                tm.tm_hour,
-                                tm.tm_min,
-                                tm.tm_sec
+                                lt.year, lt.month, lt.day,
+                                lt.hour, lt.minute, lt.second
                             );
 
                             let _ = writeln!(file, "{},{},{}", world.name, datetime, line.text);

@@ -44,12 +44,14 @@ pub enum WriteCommand {
 pub enum StreamReader {
     Plain(tokio::net::tcp::OwnedReadHalf),
     Tls(ReadHalf<TlsStream<TcpStream>>),
+    #[cfg(unix)]
     Proxy(tokio::net::unix::OwnedReadHalf),  // Unix socket for TLS proxy
 }
 
 pub enum StreamWriter {
     Plain(tokio::net::tcp::OwnedWriteHalf),
     Tls(WriteHalf<TlsStream<TcpStream>>),
+    #[cfg(unix)]
     Proxy(tokio::net::unix::OwnedWriteHalf),  // Unix socket for TLS proxy
 }
 
@@ -62,6 +64,7 @@ impl AsyncRead for StreamReader {
         match self.get_mut() {
             StreamReader::Plain(s) => Pin::new(s).poll_read(cx, buf),
             StreamReader::Tls(s) => Pin::new(s).poll_read(cx, buf),
+            #[cfg(unix)]
             StreamReader::Proxy(s) => Pin::new(s).poll_read(cx, buf),
         }
     }
@@ -76,6 +79,7 @@ impl AsyncWrite for StreamWriter {
         match self.get_mut() {
             StreamWriter::Plain(s) => Pin::new(s).poll_write(cx, buf),
             StreamWriter::Tls(s) => Pin::new(s).poll_write(cx, buf),
+            #[cfg(unix)]
             StreamWriter::Proxy(s) => Pin::new(s).poll_write(cx, buf),
         }
     }
@@ -84,6 +88,7 @@ impl AsyncWrite for StreamWriter {
         match self.get_mut() {
             StreamWriter::Plain(s) => Pin::new(s).poll_flush(cx),
             StreamWriter::Tls(s) => Pin::new(s).poll_flush(cx),
+            #[cfg(unix)]
             StreamWriter::Proxy(s) => Pin::new(s).poll_flush(cx),
         }
     }
@@ -92,6 +97,7 @@ impl AsyncWrite for StreamWriter {
         match self.get_mut() {
             StreamWriter::Plain(s) => Pin::new(s).poll_shutdown(cx),
             StreamWriter::Tls(s) => Pin::new(s).poll_shutdown(cx),
+            #[cfg(unix)]
             StreamWriter::Proxy(s) => Pin::new(s).poll_shutdown(cx),
         }
     }

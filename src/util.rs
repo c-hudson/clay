@@ -66,22 +66,119 @@ pub fn visual_line_count(line: &str, width: usize) -> usize {
     }
 }
 
-/// Get the current time in 12-hour format (H:MM)
-pub fn get_current_time_12hr() -> String {
-    use std::time::{SystemTime, UNIX_EPOCH};
+// ============================================================================
+// Cross-Platform Local Time
+// ============================================================================
 
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_secs() as libc::time_t;
+/// Portable local time representation
+pub struct LocalTime {
+    pub year: i32,
+    pub month: i32,
+    pub day: i32,
+    pub hour: i32,
+    pub minute: i32,
+    pub second: i32,
+    pub weekday: i32, // 0=Sunday
+}
 
+/// Convert epoch seconds to local time (Unix implementation)
+#[cfg(unix)]
+pub fn local_time_from_epoch(epoch_secs: i64) -> LocalTime {
+    let time_t = epoch_secs as libc::time_t;
     let mut tm: libc::tm = unsafe { std::mem::zeroed() };
     unsafe {
-        libc::localtime_r(&now, &mut tm);
+        libc::localtime_r(&time_t, &mut tm);
+    }
+    LocalTime {
+        year: tm.tm_year as i32 + 1900,
+        month: tm.tm_mon as i32 + 1,
+        day: tm.tm_mday as i32,
+        hour: tm.tm_hour as i32,
+        minute: tm.tm_min as i32,
+        second: tm.tm_sec as i32,
+        weekday: tm.tm_wday as i32,
+    }
+}
+
+/// Convert epoch seconds to local time (Windows implementation)
+#[cfg(windows)]
+pub fn local_time_from_epoch(epoch_secs: i64) -> LocalTime {
+    // Windows FILETIME epoch is 1601-01-01, Unix epoch is 1970-01-01
+    // Difference: 11644473600 seconds
+    const UNIX_TO_FILETIME_OFFSET: i64 = 11_644_473_600;
+    // FILETIME is in 100-nanosecond intervals
+    let filetime_val = (epoch_secs + UNIX_TO_FILETIME_OFFSET) * 10_000_000;
+
+    #[repr(C)]
+    struct FILETIME {
+        dw_low_date_time: u32,
+        dw_high_date_time: u32,
     }
 
-    let hours_24 = tm.tm_hour as u32;
-    let minutes = tm.tm_min as u32;
+    #[repr(C)]
+    struct SYSTEMTIME {
+        w_year: u16,
+        w_month: u16,
+        w_day_of_week: u16,
+        w_day: u16,
+        w_hour: u16,
+        w_minute: u16,
+        w_second: u16,
+        w_milliseconds: u16,
+    }
+
+    extern "system" {
+        fn FileTimeToSystemTime(ft: *const FILETIME, st: *mut SYSTEMTIME) -> i32;
+        fn SystemTimeToTzSpecificLocalTime(
+            tz: *const std::ffi::c_void,
+            utc: *const SYSTEMTIME,
+            local: *mut SYSTEMTIME,
+        ) -> i32;
+    }
+
+    let ft = FILETIME {
+        dw_low_date_time: filetime_val as u32,
+        dw_high_date_time: (filetime_val >> 32) as u32,
+    };
+
+    let mut utc_st: SYSTEMTIME = unsafe { std::mem::zeroed() };
+    let mut local_st: SYSTEMTIME = unsafe { std::mem::zeroed() };
+
+    unsafe {
+        if FileTimeToSystemTime(&ft, &mut utc_st) == 0 {
+            return LocalTime { year: 1970, month: 1, day: 1, hour: 0, minute: 0, second: 0, weekday: 4 };
+        }
+        if SystemTimeToTzSpecificLocalTime(std::ptr::null(), &utc_st, &mut local_st) == 0 {
+            return LocalTime { year: 1970, month: 1, day: 1, hour: 0, minute: 0, second: 0, weekday: 4 };
+        }
+    }
+
+    LocalTime {
+        year: local_st.w_year as i32,
+        month: local_st.w_month as i32,
+        day: local_st.w_day as i32,
+        hour: local_st.w_hour as i32,
+        minute: local_st.w_minute as i32,
+        second: local_st.w_second as i32,
+        weekday: local_st.w_day_of_week as i32,
+    }
+}
+
+/// Get the current local time
+pub fn local_time_now() -> LocalTime {
+    let epoch_secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64;
+    local_time_from_epoch(epoch_secs)
+}
+
+/// Get the current time in 12-hour format (H:MM)
+pub fn get_current_time_12hr() -> String {
+    let lt = local_time_now();
+
+    let hours_24 = lt.hour as u32;
+    let minutes = lt.minute as u32;
 
     let hours_12 = if hours_24 == 0 {
         12
@@ -201,20 +298,15 @@ pub fn parse_discord_timestamps(text: &str) -> String {
 fn format_discord_timestamp(timestamp: i64, format: &str) -> String {
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    // Convert timestamp to tm struct using libc
-    let time_t = timestamp as libc::time_t;
-    let mut tm: libc::tm = unsafe { std::mem::zeroed() };
-    unsafe {
-        libc::localtime_r(&time_t, &mut tm);
-    }
+    let lt = local_time_from_epoch(timestamp);
 
-    let year = tm.tm_year + 1900;
-    let month = tm.tm_mon + 1;
-    let day = tm.tm_mday;
-    let hour = tm.tm_hour;
-    let minute = tm.tm_min;
-    let second = tm.tm_sec;
-    let weekday = tm.tm_wday;
+    let year = lt.year;
+    let month = lt.month;
+    let day = lt.day;
+    let hour = lt.hour;
+    let minute = lt.minute;
+    let second = lt.second;
+    let weekday = lt.weekday;
 
     let month_names = ["January", "February", "March", "April", "May", "June",
                        "July", "August", "September", "October", "November", "December"];
