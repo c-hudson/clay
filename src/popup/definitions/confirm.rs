@@ -26,8 +26,8 @@ pub fn create_confirm_dialog(id: &'static str, title: &str, message: &str) -> Po
             "",
             FieldKind::label(message.to_string()),
         ))
-        .with_button(Button::new(CONFIRM_BTN_YES, "Yes").danger().with_shortcut('Y'))
-        .with_button(Button::new(CONFIRM_BTN_NO, "No").primary().with_shortcut('N'))
+        .with_button(Button::new(CONFIRM_BTN_YES, "Yes").primary().with_shortcut('Y'))
+        .with_button(Button::new(CONFIRM_BTN_NO, "No").danger().with_shortcut('N'))
         .with_layout(PopupLayout {
             label_width: 0,
             min_width: 30,

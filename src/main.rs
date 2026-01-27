@@ -15128,6 +15128,25 @@ mod remote_gui {
                                     self.open_actions_list_unified();
                                 }
                             }
+                            Some("delete_world") => {
+                                use crate::popup::definitions::confirm::*;
+                                if btn_id == CONFIRM_BTN_YES {
+                                    // Get world index from custom_data and send delete request to server
+                                    if let Some(ps) = &self.unified_popup {
+                                        if let Some(world_index_str) = ps.definition.custom_data.get("world_index") {
+                                            if let Ok(world_index) = world_index_str.parse::<usize>() {
+                                                if let Some(ref ws_tx) = self.ws_tx {
+                                                    let msg = WsMessage::DeleteWorld { world_index };
+                                                    let _ = ws_tx.send(msg);
+                                                }
+                                            }
+                                        }
+                                    }
+                                    self.open_world_selector_unified();
+                                } else if btn_id == CONFIRM_BTN_NO {
+                                    self.open_world_selector_unified();
+                                }
+                            }
                             _ => {
                                 // Generic close on any button for unknown popups
                                 should_close_unified = true;
