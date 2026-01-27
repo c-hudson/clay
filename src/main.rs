@@ -6792,27 +6792,11 @@ mod remote_gui {
     use tokio_tungstenite::{connect_async, tungstenite::Message as WsRawMessage};
 
     /// Cached "now" time for batch timestamp formatting in GUI
-    struct GuiCachedNow {
-        year: i32,
-        yday: i32,
-    }
+    struct GuiCachedNow;
 
     impl GuiCachedNow {
         fn new() -> Self {
-            let now_secs = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs() as libc::time_t;
-
-            let mut now_tm: libc::tm = unsafe { std::mem::zeroed() };
-            unsafe {
-                libc::localtime_r(&now_secs, &mut now_tm);
-            }
-
-            Self {
-                year: now_tm.tm_year,
-                yday: now_tm.tm_yday,
-            }
+            Self
         }
     }
 
@@ -7467,34 +7451,6 @@ mod remote_gui {
         #[cfg(not(feature = "rodio"))]
         fn play_ansi_music(&mut self, _notes: &[crate::ansi_music::MusicNote]) {
             // Audio playback disabled - rodio feature not enabled
-        }
-
-        /// Convert GuiTheme to GuiPopupTheme for unified popup rendering
-        fn get_popup_theme(&self) -> crate::popup::gui_renderer::GuiPopupTheme {
-            let theme = self.theme;
-            crate::popup::gui_renderer::GuiPopupTheme::from_colors(
-                theme.bg_elevated(),
-                theme.bg_surface(),
-                theme.bg_deep(),
-                theme.bg_hover(),
-                theme.fg(),
-                theme.fg_secondary(),
-                theme.fg_muted(),
-                theme.accent(),
-                theme.accent_dim(),
-                theme.border_medium(),
-                theme.error(),
-            )
-        }
-
-        /// Open a unified popup with the given definition
-        fn open_unified_popup(&mut self, def: crate::popup::PopupDefinition) {
-            self.unified_popup = Some(crate::popup::PopupState::new(def));
-        }
-
-        /// Close the unified popup
-        fn close_unified_popup(&mut self) {
-            self.unified_popup = None;
         }
 
         /// Open the world selector popup
@@ -9885,7 +9841,7 @@ mod remote_gui {
 
                 // Handle keyboard shortcuts (only when no popup is open)
                 if self.popup_state == PopupState::None && !self.filter_active {
-                    let mut switch_world: Option<usize> = None;
+                    let switch_world: Option<usize> = None;
                     let mut history_action: Option<i32> = None; // -1 = prev, 1 = next
                     let mut scroll_action: Option<i32> = None; // -1 = up, 1 = down
                     let mut clear_input = false;
