@@ -4104,7 +4104,6 @@
                 world_index: selectedWorldIndex
             });
             closeWorldConfirmPopup();
-            closeWorldSelectorPopup();
         }
     }
 

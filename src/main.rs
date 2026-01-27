@@ -15635,6 +15635,14 @@ fn handle_remote_client_key(
             NewPopupAction::Confirm(_data) => {
                 // Confirm action - remote client doesn't handle locally
             }
+            NewPopupAction::ConfirmCancelled(data) => {
+                // Reopen the parent list popup when confirm dialog is cancelled
+                if data.contains_key("world_index") {
+                    app.open_world_selector_new();
+                } else if data.contains_key("action_index") {
+                    app.open_actions_list_popup();
+                }
+            }
             NewPopupAction::WorldSelector(_action) => {
                 // World selector action - remote client doesn't handle locally
             }
@@ -16076,6 +16084,8 @@ enum NewPopupAction {
     Command(String),
     /// Confirm action with custom_data from the popup
     Confirm(std::collections::HashMap<String, String>),
+    /// Confirm dialog cancelled (No/Esc) with custom_data from the popup
+    ConfirmCancelled(std::collections::HashMap<String, String>),
     /// World selector action
     WorldSelector(WorldSelectorAction),
     /// World selector filter changed - need to update the list
@@ -17277,6 +17287,11 @@ fn handle_new_popup_key(app: &mut App, key: KeyEvent) -> NewPopupAction {
 
         match key.code {
             Esc => {
+                if is_confirm {
+                    let data = state.definition.custom_data.clone();
+                    app.popup_manager.close();
+                    return NewPopupAction::ConfirmCancelled(data);
+                }
                 app.popup_manager.close();
             }
             Enter => {
@@ -17295,6 +17310,10 @@ fn handle_new_popup_key(app: &mut App, key: KeyEvent) -> NewPopupAction {
                         app.popup_manager.close();
                         return NewPopupAction::Confirm(data);
                     }
+                    // No button - cancel
+                    let data = state.definition.custom_data.clone();
+                    app.popup_manager.close();
+                    return NewPopupAction::ConfirmCancelled(data);
                 }
                 // For other popups, Enter closes
                 app.popup_manager.close();
@@ -17348,7 +17367,9 @@ fn handle_new_popup_key(app: &mut App, key: KeyEvent) -> NewPopupAction {
             }
             Char('n') | Char('N') => {
                 if is_confirm {
+                    let data = state.definition.custom_data.clone();
                     app.popup_manager.close();
+                    return NewPopupAction::ConfirmCancelled(data);
                 }
             }
             Char('o') | Char('O') => {
@@ -17357,6 +17378,11 @@ fn handle_new_popup_key(app: &mut App, key: KeyEvent) -> NewPopupAction {
             }
             Char('c') | Char('C') => {
                 // Cancel shortcut
+                if is_confirm {
+                    let data = state.definition.custom_data.clone();
+                    app.popup_manager.close();
+                    return NewPopupAction::ConfirmCancelled(data);
+                }
                 app.popup_manager.close();
             }
             _ => {}
@@ -23027,6 +23053,8 @@ fn handle_key_event(key: KeyEvent, app: &mut App) -> KeyAction {
                                 app.current_world_index = app.worlds.len().saturating_sub(1);
                             }
                             app.add_output(&format!("World '{}' deleted.", world_name));
+                            // Reopen world selector to show updated list
+                            app.open_world_selector_new();
                         }
                     }
                 } else if let Some(action_index_str) = data.get("action_index") {
@@ -23042,6 +23070,14 @@ fn handle_key_event(key: KeyEvent, app: &mut App) -> KeyAction {
                             app.open_actions_list_popup();
                         }
                     }
+                }
+            }
+            NewPopupAction::ConfirmCancelled(data) => {
+                // Reopen the parent list popup when confirm dialog is cancelled
+                if data.contains_key("world_index") {
+                    app.open_world_selector_new();
+                } else if data.contains_key("action_index") {
+                    app.open_actions_list_popup();
                 }
             }
             NewPopupAction::WorldSelector(action) => {
