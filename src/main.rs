@@ -8034,11 +8034,16 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
         });
     }
 
-    // Initial draw
+    // Initial draw - after reload, we need to force a complete redraw
+    // because the terminal state may be inconsistent
     terminal.clear()?;
+    // Force ratatui to redraw everything by resizing (clears internal buffer cache)
+    terminal.resize(terminal.size()?)?;
     terminal.draw(|f| ui(f, &mut app))?;
     // Render output with crossterm (needed after reload when ratatui early-returns)
     render_output_crossterm(&app);
+    // Flush stdout to ensure everything is displayed
+    std::io::Write::flush(&mut std::io::stdout())?;
 
     // Create a persistent interval for periodic tasks (clock updates, keepalive checks)
     let mut keepalive_interval = tokio::time::interval(Duration::from_secs(60));
