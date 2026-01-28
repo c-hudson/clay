@@ -3611,15 +3611,25 @@ fn get_unix_timestamp() -> u64 {
 // END PROXY DEBUG LOGGING
 // ============================================================================
 
-/// Generate a unique socket path for the TLS proxy
+/// Generate a unique socket path for the TLS proxy.
+/// Uses $XDG_RUNTIME_DIR (typically /run/user/<uid> with mode 0700) for security,
+/// falling back to /tmp if not available.
 #[cfg(all(unix, not(target_os = "android")))]
 fn get_proxy_socket_path(world_name: &str) -> PathBuf {
     let sanitized_name = world_name
         .chars()
         .map(|c| if c.is_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
         .collect::<String>();
-    PathBuf::from(format!(
-        "/tmp/clay-tls-{}-{}.sock",
+
+    // Prefer XDG_RUNTIME_DIR for security (typically /run/user/<uid> with mode 0700)
+    let base_dir = std::env::var("XDG_RUNTIME_DIR")
+        .ok()
+        .map(PathBuf::from)
+        .filter(|p| p.exists())
+        .unwrap_or_else(|| PathBuf::from("/tmp"));
+
+    base_dir.join(format!(
+        "clay-tls-{}-{}.sock",
         std::process::id(),
         sanitized_name
     ))
@@ -3770,16 +3780,23 @@ async fn run_tls_proxy_async(host: &str, port: &str, socket_path: &PathBuf) {
         return;
     }
 
-    // Step 2: Create Unix socket listener
-    // Set socket permissions to owner-only (0600)
-    // Step 2: Create Unix socket listener
+    // Step 2: Create Unix socket listener with restrictive permissions
+    // Set umask to 0o077 before binding so socket is created with 0o600 atomically
+    // (prevents race condition where socket exists briefly with permissive mode)
+    let old_umask = unsafe { libc::umask(0o077) };
     let listener = match UnixListener::bind(socket_path) {
-        Ok(l) => l,
-        Err(_) => return,
+        Ok(l) => {
+            unsafe { libc::umask(old_umask) }; // Restore original umask
+            l
+        }
+        Err(_) => {
+            unsafe { libc::umask(old_umask) }; // Restore original umask
+            return;
+        }
     };
 
-    // Try to set restrictive permissions on the socket
-    let _ = std::fs::set_permissions(socket_path, std::fs::Permissions::from_mode(0o600));
+    // Get our UID for peer credential verification
+    let our_uid = unsafe { libc::getuid() };
 
     // Step 3: Main loop - accept clients and relay data
     // Supports reconnection: when client disconnects, wait for new client (for hot reload)
@@ -3795,6 +3812,31 @@ async fn run_tls_proxy_async(host: &str, port: &str, socket_path: &PathBuf) {
             Ok(Err(_)) => break,
             Err(_) => break, // Timeout waiting for client
         };
+
+        // Verify peer credentials - only accept connections from the same user
+        // This prevents other users from hijacking the connection
+        let peer_uid = {
+            use std::os::unix::io::AsRawFd;
+            let fd = client_stream.as_raw_fd();
+            let mut cred: libc::ucred = unsafe { std::mem::zeroed() };
+            let mut len = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
+            let ret = unsafe {
+                libc::getsockopt(
+                    fd,
+                    libc::SOL_SOCKET,
+                    libc::SO_PEERCRED,
+                    &mut cred as *mut _ as *mut libc::c_void,
+                    &mut len,
+                )
+            };
+            if ret == 0 { Some(cred.uid) } else { None }
+        };
+
+        // Reject connections from different users
+        if peer_uid != Some(our_uid) {
+            // Close connection silently and wait for next
+            continue;
+        }
 
         let (mut client_read, mut client_write) = client_stream.into_split();
 
