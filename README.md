@@ -9,6 +9,7 @@ A terminal-based MUD (Multi-User Dungeon) client built with Rust featuring multi
 - **ANSI Colors** - Full ANSI color and formatting support
 - **Web Interface** - Browser-based client via WebSocket
 - **Remote GUI** - Optional graphical client using egui
+- **Remote Console** - Connect to a running Clay instance from another terminal
 - **More-Mode** - Pagination for fast-scrolling output
 - **Scrollback** - Unlimited history with PageUp/PageDown navigation
 - **Command History** - Navigate previous commands with Ctrl+P/N
@@ -20,6 +21,10 @@ A terminal-based MUD (Multi-User Dungeon) client built with Rust featuring multi
 - **Output Filtering** - Search/filter output with F4
 - **File Logging** - Per-world output logging
 - **ANSI Music** - BBS-style music playback (web/GUI interfaces)
+- **Actions/Triggers** - Pattern matching with regex or wildcard, auto-commands
+- **TinyFugue Compatibility** - `#` commands for TF users (`#def`, `#set`, `#if`, etc.)
+- **Termux Support** - Runs on Android via Termux
+- **Android Notifications** - Push notifications via companion app
 
 ## Installation
 
@@ -30,10 +35,6 @@ Download pre-built binaries from the [Releases](https://github.com/c-hudson/clay
 | Platform | Binary | Notes |
 |----------|--------|-------|
 | Linux x86_64 | `clay-linux-x86_64` | GUI + audio, requires glibc |
-| Linux x86_64 (static) | `clay-linux-musl-x86_64` | TUI only, works on any Linux |
-| Linux x86_64 (TUI) | `clay-linux-x86_64-tui` | TUI only, smaller binary |
-| macOS x86_64 | `clay-macos-x86_64` | Intel Macs |
-| macOS ARM | `clay-macos-aarch64` | Apple Silicon (M1/M2/M3) |
 | Windows x86_64 | `clay-windows-x86_64.exe` | GUI + audio |
 
 ```bash
@@ -47,33 +48,19 @@ chmod +x clay
 
 ### Linux
 
-Use the included build script to build with GUI and audio support:
-
 ```bash
-./build.sh
-```
-
-This builds a release binary with `--features remote-gui-audio` and prompts for an install location (defaults to `$HOME`).
-
-**System dependencies (Debian/Ubuntu):**
-```bash
+# Install dependencies (Debian/Ubuntu)
 sudo apt install libasound2-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev libxcb1-dev pkg-config
-```
 
-**Manual build options:**
+# Easy build with included script (GUI + audio)
+./build.sh
 
-```bash
-# Standard build (TUI only)
-cargo build --release
-
-# Static binary (requires musl, TUI only)
-cargo build --release --target x86_64-unknown-linux-musl --no-default-features --features rustls-backend
-
-# With remote GUI support (requires X11/Wayland)
-cargo build --release --features remote-gui
-
-# With remote GUI and ANSI music audio
+# Or manual build with GUI + audio
 cargo build --release --features remote-gui-audio
+
+# Static binary for any Linux (TUI only, no GUI)
+rustup target add x86_64-unknown-linux-musl
+cargo build --release --target x86_64-unknown-linux-musl --no-default-features --features rustls-backend
 ```
 
 ### macOS
@@ -95,9 +82,17 @@ cargo build --release --features remote-gui-audio
 cargo build --release --features remote-gui-audio
 ```
 
-### Docker
+### Termux (Android)
 
-Build using Docker for a consistent environment:
+```bash
+# Install Rust in Termux
+pkg install rust
+
+# Build TUI only (no GUI on Android)
+cargo build --release --no-default-features --features rustls-backend
+```
+
+### Docker
 
 ```bash
 # Build with GUI + audio (glibc)
@@ -115,27 +110,48 @@ docker run --rm -v $(pwd)/output:/output clay-static-builder
 
 ```bash
 # Run the TUI client
-./target/release/clay
+./clay
 
-# Run as remote GUI client
-./target/release/clay --remote=hostname:port
+# Run as remote GUI client (connects to running Clay instance)
+./clay --remote=hostname:port
+
+# Run as remote console client
+./clay --console=hostname:port
 ```
 
 ## Commands
 
 | Command | Description |
 |---------|-------------|
-| `/connect [host port [ssl]]` | Connect to a MUD server |
+| `/worlds` | Open world selector popup |
+| `/worlds <name>` | Connect to or create a world |
+| `/worlds -e [name]` | Edit world settings |
+| `/connections` or `/l` | List connected worlds |
 | `/disconnect` or `/dc` | Disconnect current world |
-| `/world` | Open world selector |
-| `/world <name>` | Connect to or create a world |
-| `/world -e [name]` | Edit world settings |
-| `/worlds` or `/l` | List connected worlds |
 | `/setup` | Open global settings |
+| `/web` | Open web/WebSocket settings |
+| `/actions` | Open actions/triggers editor |
 | `/reload` | Hot reload the binary |
 | `/testmusic` | Play test ANSI music sequence |
 | `/quit` | Exit the client |
 | `/help` | Show help |
+
+## TinyFugue Commands
+
+Clay includes TinyFugue compatibility using `#` prefix:
+
+| Command | Description |
+|---------|-------------|
+| `#set name value` | Set a variable |
+| `#echo message` | Display local message |
+| `#def name = body` | Define a macro/trigger |
+| `#if (expr) cmd` | Conditional execution |
+| `#while (expr) ... #done` | While loop |
+| `#for var start end ... #done` | For loop |
+| `#bind key = cmd` | Bind key to command |
+| `#help [topic]` | Show TF help |
+
+See `#help` for full command list.
 
 ## Controls
 
@@ -144,7 +160,8 @@ docker run --rm -v $(pwd)/output:/output clay-static-builder
 | `Up/Down` | Switch between active worlds |
 | `PageUp/PageDown` | Scroll output history |
 | `Tab` | Release one screenful (when paused) |
-| `Alt+j` | Jump to end, release all pending |
+| `Escape j` | Jump to end, release all pending |
+| `Escape w` | Switch to world with activity |
 | `Ctrl+P/N` | Command history |
 | `Ctrl+U` | Clear input |
 | `Ctrl+W` | Delete word |
@@ -159,14 +176,25 @@ docker run --rm -v $(pwd)/output:/output clay-static-builder
 
 ## Web Interface
 
-Enable the WebSocket server in `/setup` to access the web interface:
+Enable in `/web` settings:
 
-1. Set `WS enabled` to Yes
-2. Configure `WS port` (default: 9001)
-3. Set a `WS password`
-4. Optionally enable HTTPS with cert/key files
+1. Set `HTTP enabled` to Yes (default port: 9000)
+2. Set `WS enabled` to Yes for secure WebSocket (default port: 9002)
+3. Set a `WS password` (required for authentication)
+4. Optionally configure TLS cert/key for HTTPS
 
-Access via browser at `http://localhost:9001` (or `https://` if configured).
+Access via browser at `http://localhost:9000`.
+
+## Actions/Triggers
+
+Actions match incoming MUD output against patterns and execute commands:
+
+1. Open `/actions` to create triggers
+2. Set a pattern (regex or wildcard)
+3. Set command(s) to execute when matched
+4. Use `$1`-`$9` for captured groups, `$0` for full match
+
+Example: Pattern `* tells you: *` with command `#echo Got tell from $1`
 
 ## Configuration
 
@@ -175,8 +203,9 @@ Settings are stored in `~/.clay.dat`. Per-world settings include:
 - Hostname, port, SSL toggle
 - Username/password for auto-login
 - Character encoding (UTF-8, Latin1, FANSI)
+- Auto-login type (Connect, Prompt, MOO_prompt)
+- Keepalive type (NOP, Custom, Generic)
 - Log file path
-- Keepalive type (NOP, GMCP, None)
 
 ## License
 
