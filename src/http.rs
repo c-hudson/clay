@@ -83,10 +83,6 @@ const WEB_STYLE_CSS: &str = include_str!("web/style.css");
 #[cfg(feature = "native-tls-backend")]
 const WEB_APP_JS: &str = include_str!("web/app.js");
 
-/// Embedded clay.png for the web interface menu icon
-#[cfg(feature = "native-tls-backend")]
-const WEB_CLAY_PNG: &[u8] = include_bytes!("../clay.png");
-
 /// Parse an HTTP request line and return the method and path
 #[cfg(feature = "native-tls-backend")]
 fn parse_http_request(request: &str) -> Option<(&str, &str)> {
@@ -162,9 +158,6 @@ async fn handle_https_client(
             }
             "/app.js" => {
                 build_http_response(200, "OK", "application/javascript", WEB_APP_JS)
-            }
-            "/clay.png" => {
-                build_http_response_binary(200, "OK", "image/png", WEB_CLAY_PNG)
             }
             _ => {
                 build_http_response(404, "Not Found", "text/plain", "Not Found")
@@ -273,10 +266,6 @@ const WEB_STYLE_CSS: &str = include_str!("web/style.css");
 #[cfg(feature = "rustls-backend")]
 const WEB_APP_JS: &str = include_str!("web/app.js");
 
-/// Embedded clay.png for the web interface menu icon (rustls version)
-#[cfg(feature = "rustls-backend")]
-const WEB_CLAY_PNG: &[u8] = include_bytes!("../clay.png");
-
 /// Parse an HTTP request line and return the method and path (rustls version)
 #[cfg(feature = "rustls-backend")]
 fn parse_http_request(request: &str) -> Option<(&str, &str)> {
@@ -352,9 +341,6 @@ async fn handle_https_client(
             }
             "/app.js" => {
                 build_http_response(200, "OK", "application/javascript", WEB_APP_JS)
-            }
-            "/clay.png" => {
-                build_http_response_binary(200, "OK", "image/png", WEB_CLAY_PNG)
             }
             _ => {
                 build_http_response(404, "Not Found", "text/plain", "Not Found")
@@ -706,7 +692,6 @@ async fn handle_http_client(
         const HTTP_INDEX_HTML: &str = include_str!("web/index.html");
         const HTTP_STYLE_CSS: &str = include_str!("web/style.css");
         const HTTP_APP_JS: &str = include_str!("web/app.js");
-        const HTTP_CLAY_PNG: &[u8] = include_bytes!("../clay.png");
 
         let response = match path {
             "/" | "/index.html" => {
@@ -721,9 +706,6 @@ async fn handle_http_client(
             }
             "/app.js" => {
                 build_response(200, "OK", "application/javascript", HTTP_APP_JS)
-            }
-            "/clay.png" => {
-                build_response_binary(200, "OK", "image/png", HTTP_CLAY_PNG)
             }
             _ => {
                 // Log the 404 before recording violation
