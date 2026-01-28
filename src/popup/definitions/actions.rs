@@ -58,7 +58,8 @@ pub fn match_type_options() -> Vec<SelectOption> {
 pub fn create_actions_list_popup(actions: &[ActionInfo], visible_height: usize) -> PopupDefinition {
     let items: Vec<ListItem> = actions
         .iter()
-        .map(|a| {
+        .enumerate()
+        .map(|(i, a)| {
             // Format: "[x] name   world   pattern"
             let status = if a.enabled { "[x]" } else { "[ ]" };
             let world_part = a.world.clone();
@@ -75,7 +76,7 @@ pub fn create_actions_list_popup(actions: &[ActionInfo], visible_height: usize) 
             ];
 
             ListItem {
-                id: a.name.clone(),
+                id: i.to_string(),
                 columns,
                 style: ListItemStyle {
                     is_disabled: !a.enabled,
