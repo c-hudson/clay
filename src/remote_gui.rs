@@ -8484,6 +8484,23 @@ impl eframe::App for RemoteGuiApp {
     }
 }
 
+/// Load the application icon from embedded PNG data
+fn load_app_icon() -> Option<egui::IconData> {
+    // Embed the icon PNG at compile time
+    const ICON_PNG: &[u8] = include_bytes!("../clay_icon.png");
+
+    // Decode the PNG using the image crate
+    let img = image::load_from_memory(ICON_PNG).ok()?;
+    let rgba = img.to_rgba8();
+    let (width, height) = rgba.dimensions();
+
+    Some(egui::IconData {
+        rgba: rgba.into_raw(),
+        width,
+        height,
+    })
+}
+
 /// Run the remote GUI client
 pub fn run(addr: &str, runtime: tokio::runtime::Handle) -> io::Result<()> {
     // Check for display server availability (Unix only - Windows always has a display)
@@ -8498,10 +8515,17 @@ pub fn run(addr: &str, runtime: tokio::runtime::Handle) -> io::Result<()> {
         }
     }
 
+    let mut viewport = egui::ViewportBuilder::default()
+        .with_inner_size([800.0, 600.0])
+        .with_title("Clay Mud Client");
+
+    // Set window icon from embedded PNG
+    if let Some(icon) = load_app_icon() {
+        viewport = viewport.with_icon(std::sync::Arc::new(icon));
+    }
+
     let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default()
-            .with_inner_size([800.0, 600.0])
-            .with_title("Clay Mud Client"),
+        viewport,
         hardware_acceleration: eframe::HardwareAcceleration::Preferred,
         ..Default::default()
     };
@@ -8556,10 +8580,17 @@ pub fn run_master_gui() -> std::io::Result<()> {
     });
 
     // Run the GUI on the main thread (required by eframe/windowing systems)
+    let mut viewport = egui::ViewportBuilder::default()
+        .with_inner_size([800.0, 600.0])
+        .with_title("Clay Mud Client");
+
+    // Set window icon from embedded PNG
+    if let Some(icon) = load_app_icon() {
+        viewport = viewport.with_icon(std::sync::Arc::new(icon));
+    }
+
     let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default()
-            .with_inner_size([800.0, 600.0])
-            .with_title("Clay Mud Client"),
+        viewport,
         hardware_acceleration: eframe::HardwareAcceleration::Preferred,
         ..Default::default()
     };
