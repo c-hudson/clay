@@ -5252,7 +5252,7 @@ impl eframe::App for RemoteGuiApp {
                 let can_delete = self.worlds.len() > 1;
 
                 // Dynamic height based on whether keep-alive cmd is shown
-                let popup_height = if edit_keep_alive_type == KeepAliveType::Custom { 480.0 } else { 440.0 };
+                let popup_height = if edit_keep_alive_type == KeepAliveType::Custom { 510.0 } else { 470.0 };
 
                 ctx.show_viewport_immediate(
                     egui::ViewportId::from_hash_of("world_editor_window"),
@@ -6689,9 +6689,9 @@ impl eframe::App for RemoteGuiApp {
                     egui::ViewportId::from_hash_of("font_settings_window"),
                     egui::ViewportBuilder::default()
                         .with_title("Font Settings")
-                        .with_inner_size([380.0, 180.0]),
+                        .with_inner_size([380.0, 520.0]),
                     |ctx, _class| {
-                        // Apply popup styling - remove all default strokes
+                        // Apply popup styling
                         ctx.style_mut(|style| {
                             style.visuals.window_fill = theme.bg_elevated();
                             style.visuals.panel_fill = theme.bg_elevated();
@@ -6703,31 +6703,31 @@ impl eframe::App for RemoteGuiApp {
 
                             style.visuals.widgets.noninteractive.bg_fill = widget_bg;
                             style.visuals.widgets.noninteractive.bg_stroke = egui::Stroke::NONE;
-                            style.visuals.widgets.noninteractive.fg_stroke = egui::Stroke::NONE;
+                            style.visuals.widgets.noninteractive.fg_stroke = egui::Stroke::new(1.0, theme.fg_muted());
                             style.visuals.widgets.noninteractive.rounding = widget_rounding;
                             style.visuals.widgets.noninteractive.weak_bg_fill = widget_bg;
 
                             style.visuals.widgets.inactive.bg_fill = theme.bg_hover();
                             style.visuals.widgets.inactive.bg_stroke = egui::Stroke::NONE;
-                            style.visuals.widgets.inactive.fg_stroke = egui::Stroke::NONE;
+                            style.visuals.widgets.inactive.fg_stroke = egui::Stroke::new(1.0, theme.fg());
                             style.visuals.widgets.inactive.rounding = widget_rounding;
                             style.visuals.widgets.inactive.weak_bg_fill = widget_bg;
 
                             style.visuals.widgets.hovered.bg_fill = theme.bg_hover();
                             style.visuals.widgets.hovered.bg_stroke = egui::Stroke::NONE;
-                            style.visuals.widgets.hovered.fg_stroke = egui::Stroke::NONE;
+                            style.visuals.widgets.hovered.fg_stroke = egui::Stroke::new(1.0, theme.fg());
                             style.visuals.widgets.hovered.rounding = widget_rounding;
                             style.visuals.widgets.hovered.weak_bg_fill = widget_bg;
 
                             style.visuals.widgets.active.bg_fill = theme.accent_dim();
                             style.visuals.widgets.active.bg_stroke = egui::Stroke::NONE;
-                            style.visuals.widgets.active.fg_stroke = egui::Stroke::NONE;
+                            style.visuals.widgets.active.fg_stroke = egui::Stroke::new(1.0, theme.fg());
                             style.visuals.widgets.active.rounding = widget_rounding;
                             style.visuals.widgets.active.weak_bg_fill = widget_bg;
 
                             style.visuals.widgets.open.bg_fill = widget_bg;
                             style.visuals.widgets.open.bg_stroke = egui::Stroke::NONE;
-                            style.visuals.widgets.open.fg_stroke = egui::Stroke::NONE;
+                            style.visuals.widgets.open.fg_stroke = egui::Stroke::new(1.0, theme.fg());
                             style.visuals.widgets.open.rounding = widget_rounding;
                             style.visuals.widgets.open.weak_bg_fill = widget_bg;
 
@@ -6743,11 +6743,11 @@ impl eframe::App for RemoteGuiApp {
 
                         // Bottom panel for buttons
                         egui::TopBottomPanel::bottom("font_settings_buttons")
-                            .exact_height(44.0)
+                            .exact_height(48.0)
                             .frame(egui::Frame::none()
                                 .fill(theme.bg_surface())
                                 .stroke(egui::Stroke::new(1.0, theme.border_subtle()))
-                                .inner_margin(egui::Margin { left: 16.0, right: 1.0, top: 8.0, bottom: 8.0 }))
+                                .inner_margin(egui::Margin { left: 16.0, right: 1.0, top: 10.0, bottom: 10.0 }))
                             .show(ctx, |ui| {
                                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                                     ui.spacing_mut().item_spacing = egui::vec2(8.0, 0.0);
@@ -6793,65 +6793,27 @@ impl eframe::App for RemoteGuiApp {
                                     .spacing([16.0, 12.0])
                                     .show(ui, |ui| {
                                         ui.label(egui::RichText::new("Font family").size(12.0).color(theme.fg_secondary()));
-                                        let current_label = FONT_FAMILIES.iter()
-                                            .find(|(value, _)| *value == edit_font_name)
-                                            .map(|(_, label)| *label)
-                                            .unwrap_or_else(|| {
-                                                if edit_font_name.is_empty() { "System Default" } else { &edit_font_name }
+
+                                        // Inline scrollable font list
+                                        let list_height = 288.0; // 12 fonts * 24px per row
+                                        egui::Frame::none()
+                                            .fill(theme.bg_deep())
+                                            .rounding(egui::Rounding::same(4.0))
+                                            .inner_margin(egui::Margin::same(4.0))
+                                            .show(ui, |ui| {
+                                                egui::ScrollArea::vertical()
+                                                    .max_height(list_height)
+                                                    .show(ui, |ui| {
+                                                        ui.set_min_width(180.0);
+                                                        for (value, label) in FONT_FAMILIES {
+                                                            let is_selected = *value == edit_font_name;
+                                                            if ui.selectable_label(is_selected,
+                                                                egui::RichText::new(*label).size(11.0).color(theme.fg()).family(egui::FontFamily::Monospace)).clicked() {
+                                                                edit_font_name = value.to_string();
+                                                            }
+                                                        }
+                                                    });
                                             });
-
-                                        // Custom dropdown (matches world switching style)
-                                        let dropdown_id = ui.id().with("font_family_dropdown");
-                                        let dropdown_width = 180.0;
-                                        let row_height = 24.0;
-
-                                        let (rect, response) = ui.allocate_exact_size(egui::vec2(dropdown_width, row_height), egui::Sense::click());
-
-                                        ui.painter().rect_filled(rect, egui::Rounding::same(4.0), theme.bg_deep());
-
-                                        ui.painter().text(
-                                            egui::pos2(rect.min.x + 12.0, rect.center().y),
-                                            egui::Align2::LEFT_CENTER,
-                                            current_label,
-                                            egui::FontId::monospace(11.0),
-                                            theme.fg()
-                                        );
-
-                                        // Draw chevron
-                                        let chevron_x = rect.max.x - 16.0;
-                                        let chevron_y = rect.center().y;
-                                        let chevron_size = 4.0;
-                                        ui.painter().line_segment(
-                                            [egui::pos2(chevron_x - chevron_size, chevron_y - chevron_size / 2.0),
-                                             egui::pos2(chevron_x, chevron_y + chevron_size / 2.0)],
-                                            egui::Stroke::new(1.5, theme.fg_muted())
-                                        );
-                                        ui.painter().line_segment(
-                                            [egui::pos2(chevron_x, chevron_y + chevron_size / 2.0),
-                                             egui::pos2(chevron_x + chevron_size, chevron_y - chevron_size / 2.0)],
-                                            egui::Stroke::new(1.5, theme.fg_muted())
-                                        );
-
-                                        if response.clicked() {
-                                            ui.memory_mut(|mem| mem.toggle_popup(dropdown_id));
-                                        }
-
-                                        egui::popup_below_widget(ui, dropdown_id, &response, |ui| {
-                                            ui.set_min_width(dropdown_width);
-                                            ui.style_mut().visuals.widgets.inactive.fg_stroke = egui::Stroke::new(1.0, theme.fg());
-                                            ui.style_mut().visuals.widgets.hovered.fg_stroke = egui::Stroke::new(1.0, theme.fg());
-                                            ui.style_mut().visuals.widgets.active.fg_stroke = egui::Stroke::new(1.0, theme.fg());
-                                            egui::ScrollArea::vertical().max_height(200.0).show(ui, |ui| {
-                                                for (value, label) in FONT_FAMILIES {
-                                                    let is_selected = *value == edit_font_name;
-                                                    if ui.selectable_label(is_selected,
-                                                        egui::RichText::new(*label).size(11.0).color(theme.fg()).family(egui::FontFamily::Monospace)).clicked() {
-                                                        edit_font_name = value.to_string();
-                                                        ui.memory_mut(|mem| mem.close_popup());
-                                                    }
-                                                }
-                                            });
-                                        });
                                         ui.end_row();
 
                                         ui.label(egui::RichText::new("Font size").size(12.0).color(theme.fg_secondary()));
@@ -7486,11 +7448,11 @@ impl eframe::App for RemoteGuiApp {
 
                         // Bottom panel for buttons
                         egui::TopBottomPanel::bottom("actions_buttons")
-                            .exact_height(44.0)
+                            .exact_height(48.0)
                             .frame(egui::Frame::none()
                                 .fill(theme.bg_surface())
                                 .stroke(egui::Stroke::NONE)
-                                .inner_margin(egui::Margin { left: 16.0, right: 17.0, top: 8.0, bottom: 8.0 }))
+                                .inner_margin(egui::Margin { left: 16.0, right: 17.0, top: 10.0, bottom: 10.0 }))
                             .show(ctx, |ui| {
                                 ui.horizontal(|ui| {
                                     ui.spacing_mut().item_spacing = egui::vec2(8.0, 0.0);
@@ -7779,11 +7741,11 @@ impl eframe::App for RemoteGuiApp {
 
                         // Bottom panel for buttons
                         egui::TopBottomPanel::bottom("action_editor_buttons")
-                            .exact_height(44.0)
+                            .exact_height(48.0)
                             .frame(egui::Frame::none()
                                 .fill(theme.bg_surface())
                                 .stroke(egui::Stroke::NONE)
-                                .inner_margin(egui::Margin { left: 16.0, right: 17.0, top: 8.0, bottom: 8.0 }))
+                                .inner_margin(egui::Margin { left: 16.0, right: 17.0, top: 10.0, bottom: 10.0 }))
                             .show(ctx, |ui| {
                                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                                     ui.spacing_mut().item_spacing = egui::vec2(8.0, 0.0);

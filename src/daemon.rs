@@ -194,10 +194,16 @@ pub async fn run_daemon_server() -> io::Result<()> {
                                     }
                                 } else if cmd.starts_with('#') {
                                     // TF command
-                                    if let tf::TfCommandResult::SendToMud(text) = app.tf_engine.execute(&cmd) {
-                                        if let Some(tx) = &app.worlds[world_idx].command_tx {
-                                            let _ = tx.try_send(WriteCommand::Text(text));
+                                    match app.tf_engine.execute(&cmd) {
+                                        tf::TfCommandResult::SendToMud(text) => {
+                                            if let Some(tx) = &app.worlds[world_idx].command_tx {
+                                                let _ = tx.try_send(WriteCommand::Text(text));
+                                            }
                                         }
+                                        tf::TfCommandResult::RepeatProcess(process) => {
+                                            app.tf_engine.processes.push(process);
+                                        }
+                                        _ => {}
                                     }
                                 } else if let Some(tx) = &app.worlds[world_idx].command_tx {
                                     // Plain text - send to MUD
@@ -341,6 +347,9 @@ pub async fn handle_daemon_ws_message(
                                                     app.ws_broadcast(WsMessage::ServerData { world_index, data: "================= Recall end =================".to_string(), is_viewed: false, ts, from_server: false });
                                                 }
                                             }
+                                        }
+                                        tf::TfCommandResult::RepeatProcess(process) => {
+                                            app.tf_engine.processes.push(process);
                                         }
                                         _ => {}
                                     }

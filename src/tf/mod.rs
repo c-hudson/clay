@@ -13,6 +13,7 @@ pub mod builtins;
 pub mod bridge;
 
 use std::collections::HashMap;
+use std::time::{Duration, Instant};
 use regex::Regex;
 
 /// Value types for TF variables
@@ -147,6 +148,20 @@ pub struct RecallOptions {
     pub context_after: usize,       // -An
 }
 
+/// A background repeat process
+#[derive(Debug)]
+pub struct TfProcess {
+    pub id: u32,
+    pub command: String,
+    pub interval: Duration,
+    pub count: Option<u32>,        // None = infinite ("i")
+    pub remaining: Option<u32>,    // Counts down
+    pub next_run: Instant,
+    pub world: Option<String>,     // -w option
+    pub synchronous: bool,         // -S flag
+    pub on_prompt: bool,           // -P flag
+}
+
 /// Result of executing a TF command
 #[derive(Debug)]
 pub enum TfCommandResult {
@@ -160,6 +175,8 @@ pub enum TfCommandResult {
     ClayCommand(String),
     /// Recall output history with full options
     Recall(RecallOptions),
+    /// Register a repeat process for the main loop to tick
+    RepeatProcess(TfProcess),
     /// Not a TF command (doesn't start with #)
     NotTfCommand,
     /// Unknown TF command
@@ -286,6 +303,10 @@ pub struct TfEngine {
     pub current_dir: Option<String>,
     /// Current control flow state (for multi-line if/while/for)
     pub control_state: control_flow::ControlState,
+    /// Background repeat processes
+    pub processes: Vec<TfProcess>,
+    /// Next process ID counter
+    pub next_process_id: u32,
 }
 
 impl TfEngine {

@@ -139,8 +139,9 @@ pub fn execute_command(engine: &mut TfEngine, input: &str) -> TfCommandResult {
         "load" => builtins::cmd_load(engine, args),
         "save" => builtins::cmd_save(engine, args),
         "log" => builtins::cmd_log(args),
-        "ps" => builtins::cmd_ps(),
-        "kill" => builtins::cmd_kill(args),
+        "repeat" => builtins::cmd_repeat(engine, args),
+        "ps" => builtins::cmd_ps(engine),
+        "kill" => builtins::cmd_kill(engine, args),
 
         // Check for user-defined macro with this name
         _ => {
@@ -434,11 +435,14 @@ File Operations:
   #save filename       - Save macros to file
   #lcd path            - Change local directory
 
+Process:
+  #repeat [opts] count cmd - Repeat command on timer
+  #ps                  - List background processes
+  #kill id             - Kill background process
+
 Misc:
   #time                - Display current time
   #sh command          - Execute shell command
-  #ps                  - List background processes
-  #kill id             - Kill background process
   #help [topic]        - Show this help
   #version             - Show version info
   #quit                - Exit Clay
@@ -505,7 +509,34 @@ Examples:
             "hook" | "hooks" => TfCommandResult::Success(Some(
                 "Hooks fire macros on events. Use #def -h<event> to register.\n\nEvents:\n  CONNECT     - When connected to MUD\n  DISCONNECT  - When disconnected\n  LOGIN       - After login\n  PROMPT      - On prompt received\n  SEND        - Before sending command\n\nExample: #def -hCONNECT auto_look = look".to_string()
             )),
-            _ => TfCommandResult::Success(Some(format!("No help available for '{}'\nTry: set, echo, send, def, if, while, for, expr, bind, hooks", topic))),
+            "repeat" => TfCommandResult::Success(Some(
+                r#"#repeat [-w[world]] [-n] {[-time]|-S|-P} count command
+
+Repeat a command on a timer.
+
+Options:
+  -w[world]  Send to specific world (empty = current)
+  -n         No initial delay (run immediately first time)
+  -S         Synchronous (execute all iterations now)
+  -P         Execute on prompt (not yet implemented)
+  -time      Interval: seconds, M:S, or H:M:S
+
+Count: integer or "i" for infinite
+
+Examples:
+  #repeat -30 5 #echo hi        - Every 30s, 5 times
+  #repeat -0:30 i #echo hi      - Every 30s, infinite
+  #repeat -1:0:0 1 #echo hourly - After 1 hour, once
+  #repeat -n -5 10 #echo fast   - Every 5s, 10 times, no delay
+  #repeat -S 3 #echo sync       - 3 times immediately"#.to_string()
+            )),
+            "ps" => TfCommandResult::Success(Some(
+                "#ps\n\nList all background processes (from #repeat).\nShows PID, interval, remaining count, and command.".to_string()
+            )),
+            "kill" => TfCommandResult::Success(Some(
+                "#kill pid\n\nKill a background process by its PID.\nUse #ps to see running processes.".to_string()
+            )),
+            _ => TfCommandResult::Success(Some(format!("No help available for '{}'\nTry: set, echo, send, def, if, while, for, expr, bind, hooks, repeat, ps, kill", topic))),
         }
     }
 }

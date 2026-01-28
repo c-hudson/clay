@@ -8,7 +8,8 @@
 use std::fs;
 use std::path::Path;
 use std::io::{BufRead, BufReader};
-use super::{TfEngine, TfCommandResult, RecallOptions, RecallSource, RecallRange, RecallMatchStyle};
+use std::time::{Duration, Instant};
+use super::{TfEngine, TfProcess, TfCommandResult, RecallOptions, RecallSource, RecallRange, RecallMatchStyle};
 
 /// #beep - Sound the terminal bell
 pub fn cmd_beep() -> TfCommandResult {
@@ -681,18 +682,230 @@ pub fn cmd_log(args: &str) -> TfCommandResult {
     }
 }
 
-/// #ps - List background processes (placeholder)
-pub fn cmd_ps() -> TfCommandResult {
-    TfCommandResult::Success(Some("No background processes.".to_string()))
+/// Parse a TF time string into a Duration
+/// Formats: "S" (seconds, supports decimals), "M:S", "H:M:S"
+/// Leading '-' is stripped (TF convention for repeat intervals)
+pub fn parse_tf_time(s: &str) -> Option<Duration> {
+    let s = s.strip_prefix('-').unwrap_or(s);
+    let parts: Vec<&str> = s.split(':').collect();
+    match parts.len() {
+        1 => {
+            // Just seconds (supports decimals)
+            let secs: f64 = parts[0].parse().ok()?;
+            if secs < 0.0 { return None; }
+            Some(Duration::from_secs_f64(secs))
+        }
+        2 => {
+            // M:S
+            let mins: f64 = parts[0].parse().ok()?;
+            let secs: f64 = parts[1].parse().ok()?;
+            if mins < 0.0 || secs < 0.0 { return None; }
+            Some(Duration::from_secs_f64(mins * 60.0 + secs))
+        }
+        3 => {
+            // H:M:S
+            let hours: f64 = parts[0].parse().ok()?;
+            let mins: f64 = parts[1].parse().ok()?;
+            let secs: f64 = parts[2].parse().ok()?;
+            if hours < 0.0 || mins < 0.0 || secs < 0.0 { return None; }
+            Some(Duration::from_secs_f64(hours * 3600.0 + mins * 60.0 + secs))
+        }
+        _ => None,
+    }
 }
 
-/// #kill pid - Kill background process (placeholder)
-pub fn cmd_kill(args: &str) -> TfCommandResult {
-    let pid = args.trim();
-    if pid.is_empty() {
-        TfCommandResult::Error("Usage: #kill pid".to_string())
+/// #repeat [-w[world]] [-n] {[-time]|-S|-P} count command
+pub fn cmd_repeat(engine: &mut TfEngine, args: &str) -> TfCommandResult {
+    let args = args.trim();
+    if args.is_empty() {
+        return TfCommandResult::Error(
+            "Usage: #repeat [-w[world]] [-n] {[-time]|-S|-P} count command".to_string()
+        );
+    }
+
+    let mut world: Option<String> = None;
+    let mut no_initial_delay = false;
+    let mut synchronous = false;
+    let mut on_prompt = false;
+    let mut interval: Option<Duration> = None;
+    let mut remaining = args;
+
+    // Parse flags
+    loop {
+        remaining = remaining.trim_start();
+        if remaining.is_empty() {
+            break;
+        }
+
+        if remaining.starts_with("-w") {
+            // -w or -wworld
+            let rest = &remaining[2..];
+            if rest.starts_with(char::is_whitespace) || rest.is_empty() {
+                // -w with no world name — current world
+                world = Some(String::new());
+                remaining = rest.trim_start();
+            } else {
+                // -wworld
+                let end = rest.find(char::is_whitespace).unwrap_or(rest.len());
+                world = Some(rest[..end].to_string());
+                remaining = &rest[end..];
+            }
+            continue;
+        }
+
+        if remaining.starts_with("-n") && (remaining.len() == 2 || remaining[2..].starts_with(char::is_whitespace)) {
+            no_initial_delay = true;
+            remaining = &remaining[2..];
+            continue;
+        }
+
+        if remaining.starts_with("-S") && (remaining.len() == 2 || remaining[2..].starts_with(char::is_whitespace)) {
+            synchronous = true;
+            remaining = &remaining[2..];
+            continue;
+        }
+
+        if remaining.starts_with("-P") && (remaining.len() == 2 || remaining[2..].starts_with(char::is_whitespace)) {
+            on_prompt = true;
+            remaining = &remaining[2..];
+            continue;
+        }
+
+        // Check for -time (e.g. -30, -0:30, -1:0:0)
+        if remaining.starts_with('-') {
+            let rest = &remaining[1..];
+            let time_end = rest.find(char::is_whitespace).unwrap_or(rest.len());
+            let time_str = &rest[..time_end];
+            // Must start with a digit to be a time value (not another flag)
+            if time_str.chars().next().map_or(false, |c| c.is_ascii_digit()) {
+                if let Some(dur) = parse_tf_time(time_str) {
+                    interval = Some(dur);
+                    remaining = &rest[time_end..];
+                    continue;
+                }
+            }
+        }
+
+        break;
+    }
+
+    remaining = remaining.trim_start();
+
+    // Parse count: integer or "i" for infinite
+    let count_end = remaining.find(char::is_whitespace).unwrap_or(remaining.len());
+    let count_str = &remaining[..count_end];
+    let count: Option<u32> = if count_str.eq_ignore_ascii_case("i") {
+        None // infinite
+    } else if let Ok(n) = count_str.parse::<u32>() {
+        if n == 0 {
+            return TfCommandResult::Error("#repeat: count must be > 0".to_string());
+        }
+        Some(n)
     } else {
-        TfCommandResult::Error(format!("Process {} not found", pid))
+        return TfCommandResult::Error(format!("#repeat: invalid count '{}'", count_str));
+    };
+    remaining = &remaining[count_end..].trim_start();
+
+    // Parse command (rest of args)
+    let command = remaining.to_string();
+    if command.is_empty() {
+        return TfCommandResult::Error("#repeat: no command specified".to_string());
+    }
+
+    // Synchronous mode: execute all iterations immediately
+    if synchronous {
+        let iterations = count.unwrap_or(1);
+        let mut last_result = TfCommandResult::Success(None);
+        for _ in 0..iterations {
+            last_result = engine.execute(&command);
+        }
+        return last_result;
+    }
+
+    // Need an interval for async mode
+    let interval = interval.unwrap_or(Duration::from_secs(1));
+
+    // Create process
+    let id = engine.next_process_id;
+    engine.next_process_id += 1;
+
+    let next_run = if no_initial_delay {
+        Instant::now()
+    } else {
+        Instant::now() + interval
+    };
+
+    let process = TfProcess {
+        id,
+        command,
+        interval,
+        count,
+        remaining: count,
+        next_run,
+        world,
+        synchronous: false,
+        on_prompt,
+    };
+
+    TfCommandResult::RepeatProcess(process)
+}
+
+/// #ps - List background processes
+pub fn cmd_ps(engine: &TfEngine) -> TfCommandResult {
+    if engine.processes.is_empty() {
+        return TfCommandResult::Success(Some("No background processes.".to_string()));
+    }
+
+    let mut lines = vec![format!("{:<6} {:<12} {:<10} {}", "PID", "INTERVAL", "REMAINING", "COMMAND")];
+    for p in &engine.processes {
+        let interval_str = format_duration(p.interval);
+        let remaining_str = match p.remaining {
+            Some(r) => r.to_string(),
+            None => "inf".to_string(),
+        };
+        lines.push(format!("{:<6} {:<12} {:<10} {}", p.id, interval_str, remaining_str, p.command));
+    }
+    TfCommandResult::Success(Some(lines.join("\n")))
+}
+
+/// Format a Duration for display
+fn format_duration(d: Duration) -> String {
+    let total_secs = d.as_secs_f64();
+    if total_secs < 60.0 {
+        if total_secs == total_secs.floor() {
+            format!("{}s", total_secs as u64)
+        } else {
+            format!("{:.1}s", total_secs)
+        }
+    } else if total_secs < 3600.0 {
+        let mins = (total_secs / 60.0) as u64;
+        let secs = (total_secs % 60.0) as u64;
+        format!("{}m{}s", mins, secs)
+    } else {
+        let hours = (total_secs / 3600.0) as u64;
+        let mins = ((total_secs % 3600.0) / 60.0) as u64;
+        let secs = (total_secs % 60.0) as u64;
+        format!("{}h{}m{}s", hours, mins, secs)
+    }
+}
+
+/// #kill pid - Kill background process
+pub fn cmd_kill(engine: &mut TfEngine, args: &str) -> TfCommandResult {
+    let pid_str = args.trim();
+    if pid_str.is_empty() {
+        return TfCommandResult::Error("Usage: #kill pid".to_string());
+    }
+
+    if let Ok(pid) = pid_str.parse::<u32>() {
+        let before = engine.processes.len();
+        engine.processes.retain(|p| p.id != pid);
+        if engine.processes.len() < before {
+            TfCommandResult::Success(Some(format!("Process {} killed.", pid)))
+        } else {
+            TfCommandResult::Error(format!("Process {} not found.", pid))
+        }
+    } else {
+        TfCommandResult::Error(format!("Invalid pid: {}", pid_str))
     }
 }
 
