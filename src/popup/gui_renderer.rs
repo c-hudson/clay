@@ -219,16 +219,57 @@ pub fn render_popup_content(
                     );
 
                     let current = options.get(*selected_index).map(|o| o.label.as_str()).unwrap_or("-");
-                    egui::ComboBox::from_id_source(format!("select_{}", field_id.0))
-                        .selected_text(current)
-                        .show_ui(ui, |ui| {
-                            for (idx, opt) in options.iter().enumerate() {
-                                let is_current = idx == *selected_index;
-                                if ui.selectable_label(is_current, &opt.label).clicked() {
-                                    actions.select_changed.push((field_id, idx));
-                                }
+                    let dropdown_id = ui.id().with(format!("select_{}", field_id.0));
+                    let dropdown_width = ui.available_width().min(200.0);
+
+                    let button_rect = ui.allocate_space(egui::vec2(dropdown_width, row_height)).1;
+                    let response = ui.interact(button_rect, dropdown_id.with("button"), egui::Sense::click());
+
+                    ui.painter().rect_filled(button_rect, egui::Rounding::same(4.0), theme.bg_deep);
+
+                    ui.painter().text(
+                        egui::pos2(button_rect.min.x + 12.0, button_rect.center().y),
+                        egui::Align2::LEFT_CENTER,
+                        current,
+                        egui::FontId::monospace(11.0),
+                        theme.fg_primary,
+                    );
+
+                    // Draw chevron
+                    let chevron_center = egui::pos2(button_rect.max.x - 16.0, button_rect.center().y);
+                    let half_w = 5.0;
+                    let half_h = 3.0;
+                    let chevron_stroke = egui::Stroke::new(1.5, theme.fg_dim);
+                    ui.painter().line_segment(
+                        [egui::pos2(chevron_center.x - half_w, chevron_center.y - half_h),
+                         egui::pos2(chevron_center.x, chevron_center.y + half_h)],
+                        chevron_stroke,
+                    );
+                    ui.painter().line_segment(
+                        [egui::pos2(chevron_center.x + half_w, chevron_center.y - half_h),
+                         egui::pos2(chevron_center.x, chevron_center.y + half_h)],
+                        chevron_stroke,
+                    );
+
+                    if response.clicked() {
+                        ui.memory_mut(|mem| mem.toggle_popup(dropdown_id));
+                    }
+
+                    egui::popup_below_widget(ui, dropdown_id, &response, |ui| {
+                        ui.set_min_width(dropdown_width);
+                        ui.style_mut().visuals.widgets.inactive.fg_stroke = egui::Stroke::new(1.0, theme.fg_primary);
+                        ui.style_mut().visuals.widgets.hovered.fg_stroke = egui::Stroke::new(1.0, theme.fg_primary);
+                        ui.style_mut().visuals.widgets.active.fg_stroke = egui::Stroke::new(1.0, theme.fg_primary);
+                        for (idx, opt) in options.iter().enumerate() {
+                            let is_current = idx == *selected_index;
+                            if ui.selectable_label(is_current,
+                                RichText::new(&opt.label).size(11.0).color(theme.fg_primary).family(egui::FontFamily::Monospace)
+                            ).clicked() {
+                                actions.select_changed.push((field_id, idx));
+                                ui.memory_mut(|mem| mem.close_popup());
                             }
-                        });
+                        }
+                    });
                 });
                 ui.add_space(row_spacing);
             }
