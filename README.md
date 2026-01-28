@@ -35,9 +35,10 @@ Download pre-built binaries from the [Releases](https://github.com/c-hudson/clay
 | Platform | Binary | Notes |
 |----------|--------|-------|
 | Linux x86_64 | `clay-linux-x86_64` | GUI + audio, requires glibc |
-| Linux x86_64 (static) | `clay-linux-musl-x86_64` | TUI only, works on any Linux |
+| Linux x86_64 (static) | `clay-linux-x86_64-musl` | TUI only, works on any Linux |
+| Linux ARM64 (Termux) | `clay-linux-aarch64` | TUI only, for Android/Termux |
+| macOS (Universal) | `clay-macos-universal` | GUI + audio, Intel & Apple Silicon |
 | Windows x86_64 | `clay-windows-x86_64.exe` | GUI + audio |
-| Android/Termux | `clay-termux-aarch64` | TUI only, ARM64 |
 
 ```bash
 # Example: Download and install on Linux
