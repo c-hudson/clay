@@ -6311,6 +6311,16 @@ async fn main() -> io::Result<()> {
         }
     }
 
+    // On Windows, detach from the console window when running in GUI mode
+    // so the DOS prompt disappears immediately
+    #[cfg(windows)]
+    if use_gui {
+        extern "system" {
+            fn FreeConsole() -> i32;
+        }
+        unsafe { FreeConsole(); }
+    }
+
     // Dispatch based on (interface, connection_mode)
     match (use_gui, remote_addr) {
         // Remote GUI: connect to a running Clay instance via WebSocket

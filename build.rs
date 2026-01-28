@@ -33,6 +33,122 @@ fn main() {
     println!("cargo:rerun-if-changed=src");
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-changed=Cargo.toml");
+
+    // On Windows, embed the application icon into the executable
+    #[cfg(target_os = "windows")]
+    embed_windows_icon();
+}
+
+/// Embed clay_icon.png as a Windows application icon.
+/// Creates an ICO file from the PNG, writes a .rc resource script,
+/// and compiles it using the Windows resource compiler.
+#[cfg(target_os = "windows")]
+fn embed_windows_icon() {
+    let png_path = Path::new("clay_icon.png");
+    if !png_path.exists() {
+        return;
+    }
+
+    let out_dir = std::env::var("OUT_DIR").unwrap();
+    let out_path = Path::new(&out_dir);
+
+    // Read the PNG file
+    let mut png_data = Vec::new();
+    if fs::File::open(png_path)
+        .and_then(|mut f| f.read_to_end(&mut png_data))
+        .is_err()
+    {
+        return;
+    }
+
+    // Parse PNG dimensions from IHDR chunk (bytes 16-23)
+    if png_data.len() < 24 {
+        return;
+    }
+    let width = u32::from_be_bytes([png_data[16], png_data[17], png_data[18], png_data[19]]);
+    let height = u32::from_be_bytes([png_data[20], png_data[21], png_data[22], png_data[23]]);
+
+    // Build ICO file: header + one directory entry + PNG data
+    // ICO files can embed PNG data directly (Vista+ format)
+    let ico_header_size: u32 = 6 + 16; // ICO header (6) + one dir entry (16)
+    let mut ico = Vec::new();
+
+    // ICO header: reserved(2) + type=1(2) + count=1(2)
+    ico.extend_from_slice(&[0, 0]); // reserved
+    ico.extend_from_slice(&1u16.to_le_bytes()); // type: icon
+    ico.extend_from_slice(&1u16.to_le_bytes()); // count: 1 image
+
+    // Directory entry: w, h, colors, reserved, planes, bpp, size, offset
+    let w = if width >= 256 { 0u8 } else { width as u8 };
+    let h = if height >= 256 { 0u8 } else { height as u8 };
+    ico.push(w);
+    ico.push(h);
+    ico.push(0); // color palette count (0 = no palette)
+    ico.push(0); // reserved
+    ico.extend_from_slice(&1u16.to_le_bytes()); // color planes
+    ico.extend_from_slice(&32u16.to_le_bytes()); // bits per pixel
+    ico.extend_from_slice(&(png_data.len() as u32).to_le_bytes()); // image size
+    ico.extend_from_slice(&ico_header_size.to_le_bytes()); // offset to image data
+
+    // Append the raw PNG data
+    ico.extend_from_slice(&png_data);
+
+    let ico_path = out_path.join("clay_icon.ico");
+    if fs::write(&ico_path, &ico).is_err() {
+        return;
+    }
+
+    // Write a .rc resource script
+    let rc_path = out_path.join("clay_icon.rc");
+    let rc_content = format!(
+        "1 ICON \"{}\"",
+        ico_path.to_str().unwrap().replace('\\', "\\\\")
+    );
+    if fs::write(&rc_path, rc_content).is_err() {
+        return;
+    }
+
+    // Compile the resource file using embed-resource logic (windres or rc.exe)
+    compile_resource(&rc_path, out_path);
+
+    println!("cargo:rerun-if-changed=clay_icon.png");
+}
+
+/// Compile a .rc file into a .res/.o and link it.
+#[cfg(target_os = "windows")]
+fn compile_resource(rc_path: &Path, out_dir: &Path) {
+    use std::process::Command;
+
+    let target = std::env::var("TARGET").unwrap_or_default();
+    let obj_path = out_dir.join("clay_icon.res.lib");
+
+    if target.contains("msvc") {
+        // Use rc.exe for MSVC targets
+        let status = Command::new("rc")
+            .arg("/fo")
+            .arg(&obj_path)
+            .arg(rc_path)
+            .status();
+        if let Ok(s) = status {
+            if s.success() {
+                println!("cargo:rustc-link-arg={}", obj_path.display());
+                return;
+            }
+        }
+    }
+
+    // Use windres for GNU/MinGW targets
+    let obj_path = out_dir.join("clay_icon.o");
+    let status = Command::new("windres")
+        .arg(rc_path)
+        .arg("-o")
+        .arg(&obj_path)
+        .status();
+    if let Ok(s) = status {
+        if s.success() {
+            println!("cargo:rustc-link-arg={}", obj_path.display());
+        }
+    }
 }
 
 fn collect_source_files(dir: &Path, files: &mut BTreeSet<String>) {
