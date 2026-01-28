@@ -2555,8 +2555,15 @@ impl App {
         }
     }
 
-    /// Send a message to a specific WebSocket client
+    /// Send a message to a specific WebSocket client (or embedded GUI if client_id == 0)
     fn ws_send_to_client(&self, client_id: u64, msg: WsMessage) {
+        // client_id 0 is the embedded GUI in master GUI mode
+        if client_id == 0 {
+            if let Some(ref tx) = self.gui_tx {
+                let _ = tx.send(msg);
+            }
+            return;
+        }
         if let Some(ref server) = self.ws_server {
             let clients = server.clients.clone();
             tokio::spawn(async move {
