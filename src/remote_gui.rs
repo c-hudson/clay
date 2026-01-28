@@ -6689,7 +6689,7 @@ impl eframe::App for RemoteGuiApp {
                     egui::ViewportId::from_hash_of("font_settings_window"),
                     egui::ViewportBuilder::default()
                         .with_title("Font Settings")
-                        .with_inner_size([380.0, 340.0]),
+                        .with_inner_size([380.0, 480.0]),
                     |ctx, _class| {
                         // Apply popup styling
                         ctx.style_mut(|style| {
@@ -6788,64 +6788,64 @@ impl eframe::App for RemoteGuiApp {
                                     .strong());
                                 ui.add_space(16.0);
 
-                                egui::Grid::new("font_grid")
-                                    .num_columns(2)
-                                    .spacing([16.0, 12.0])
+                                // Font family label and list
+                                ui.label(egui::RichText::new("Font family").size(12.0).color(theme.fg_secondary()));
+                                ui.add_space(4.0);
+
+                                egui::Frame::none()
+                                    .fill(theme.bg_deep())
+                                    .rounding(egui::Rounding::same(4.0))
+                                    .inner_margin(egui::Margin::same(4.0))
                                     .show(ui, |ui| {
-                                        ui.label(egui::RichText::new("Font family").size(12.0).color(theme.fg_secondary()));
-
-                                        // Horizontal wrapped font list
-                                        egui::Frame::none()
-                                            .fill(theme.bg_deep())
-                                            .rounding(egui::Rounding::same(4.0))
-                                            .inner_margin(egui::Margin::same(6.0))
+                                        egui::ScrollArea::vertical()
+                                            .max_height(288.0)
                                             .show(ui, |ui| {
-                                                ui.horizontal_wrapped(|ui| {
-                                                    ui.spacing_mut().item_spacing = egui::vec2(6.0, 6.0);
-                                                    for (value, label) in FONT_FAMILIES {
-                                                        let is_selected = *value == edit_font_name;
-                                                        if ui.selectable_label(is_selected,
-                                                            egui::RichText::new(*label).size(11.0).color(theme.fg()).family(egui::FontFamily::Monospace)).clicked() {
-                                                            edit_font_name = value.to_string();
-                                                        }
+                                                ui.set_min_width(ui.available_width());
+                                                for (value, label) in FONT_FAMILIES {
+                                                    let is_selected = *value == edit_font_name;
+                                                    if ui.selectable_label(is_selected,
+                                                        egui::RichText::new(*label).size(11.0).color(theme.fg()).family(egui::FontFamily::Monospace)).clicked() {
+                                                        edit_font_name = value.to_string();
                                                     }
-                                                });
+                                                }
                                             });
-                                        ui.end_row();
-
-                                        ui.label(egui::RichText::new("Font size").size(12.0).color(theme.fg_secondary()));
-                                        ui.horizontal(|ui| {
-                                            ui.spacing_mut().item_spacing = egui::vec2(4.0, 0.0);
-                                            if ui.add(egui::Button::new(
-                                                egui::RichText::new("-").size(11.0).color(theme.fg_secondary()))
-                                                .fill(theme.bg_hover())
-                                                .stroke(egui::Stroke::new(1.0, theme.border_medium()))
-                                                .rounding(egui::Rounding::same(4.0))
-                                                .min_size(egui::vec2(28.0, 24.0))
-                                            ).clicked() {
-                                                if let Ok(size) = edit_font_size.parse::<f32>() {
-                                                    let new_size = (size - 1.0).max(8.0);
-                                                    edit_font_size = format!("{:.1}", new_size);
-                                                }
-                                            }
-                                            ui.add(egui::TextEdit::singleline(&mut edit_font_size)
-                                                .desired_width(50.0)
-                                                .margin(egui::vec2(8.0, 6.0)));
-                                            if ui.add(egui::Button::new(
-                                                egui::RichText::new("+").size(11.0).color(theme.fg_secondary()))
-                                                .fill(theme.bg_hover())
-                                                .stroke(egui::Stroke::new(1.0, theme.border_medium()))
-                                                .rounding(egui::Rounding::same(4.0))
-                                                .min_size(egui::vec2(28.0, 24.0))
-                                            ).clicked() {
-                                                if let Ok(size) = edit_font_size.parse::<f32>() {
-                                                    let new_size = (size + 1.0).min(48.0);
-                                                    edit_font_size = format!("{:.1}", new_size);
-                                                }
-                                            }
-                                        });
-                                        ui.end_row();
                                     });
+
+                                ui.add_space(12.0);
+
+                                // Font size label and controls
+                                ui.horizontal(|ui| {
+                                    ui.label(egui::RichText::new("Font size").size(12.0).color(theme.fg_secondary()));
+                                    ui.add_space(8.0);
+                                    ui.spacing_mut().item_spacing = egui::vec2(4.0, 0.0);
+                                    if ui.add(egui::Button::new(
+                                        egui::RichText::new("-").size(11.0).color(theme.fg_secondary()))
+                                        .fill(theme.bg_hover())
+                                        .stroke(egui::Stroke::new(1.0, theme.border_medium()))
+                                        .rounding(egui::Rounding::same(4.0))
+                                        .min_size(egui::vec2(28.0, 24.0))
+                                    ).clicked() {
+                                        if let Ok(size) = edit_font_size.parse::<f32>() {
+                                            let new_size = (size - 1.0).max(8.0);
+                                            edit_font_size = format!("{:.1}", new_size);
+                                        }
+                                    }
+                                    ui.add(egui::TextEdit::singleline(&mut edit_font_size)
+                                        .desired_width(50.0)
+                                        .margin(egui::vec2(8.0, 6.0)));
+                                    if ui.add(egui::Button::new(
+                                        egui::RichText::new("+").size(11.0).color(theme.fg_secondary()))
+                                        .fill(theme.bg_hover())
+                                        .stroke(egui::Stroke::new(1.0, theme.border_medium()))
+                                        .rounding(egui::Rounding::same(4.0))
+                                        .min_size(egui::vec2(28.0, 24.0))
+                                    ).clicked() {
+                                        if let Ok(size) = edit_font_size.parse::<f32>() {
+                                            let new_size = (size + 1.0).min(48.0);
+                                            edit_font_size = format!("{:.1}", new_size);
+                                        }
+                                    }
+                                });
                         });
                     },
                 );
