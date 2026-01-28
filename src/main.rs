@@ -3985,10 +3985,12 @@ fn exec_reload(app: &App) -> io::Result<()> {
     // TLS proxy connections reconnect via Unix socket path after reload
     let mut fds_to_keep: Vec<RawFd> = Vec::new();
     for world in &app.worlds {
-        // Plain TCP socket
+        // Plain TCP socket - skip if FD is stale (connection closed but fd not cleared)
         if let Some(fd) = world.socket_fd {
-            clear_cloexec(fd)?;
-            fds_to_keep.push(fd);
+            if clear_cloexec(fd).is_ok() {
+                fds_to_keep.push(fd);
+            }
+            // If clear_cloexec fails, the FD is stale - just skip it
         }
     }
     debug_log(true, &format!("RELOAD: Keeping {} fds", fds_to_keep.len()));
