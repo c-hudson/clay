@@ -377,6 +377,12 @@ pub fn strip_non_sgr_sequences(s: &str) -> String {
         ('@'..='~').contains(&c)
     }
 
+    // Check if a character is a valid CSI parameter byte
+    // Valid: digits, semicolons, and leading private mode indicators (? < = >)
+    fn is_csi_param_byte(c: char) -> bool {
+        c.is_ascii_digit() || c == ';' || c == '?' || c == '<' || c == '=' || c == '>'
+    }
+
     while let Some(c) = chars.next() {
         if c == '\x1b' {
             // Start of escape sequence
@@ -415,9 +421,20 @@ pub fn strip_non_sgr_sequences(s: &str) -> String {
                     let mut seq = String::new();
                     seq.push('\x1b');
                     seq.push('[');
+                    let mut valid_sequence = true;
+                    let mut has_private_prefix = false;
+                    let mut has_digit = false;
                     while let Some(&sc) = chars.peek() {
                         if is_csi_final_byte(sc) {
-                            // End of CSI sequence
+                            // End of CSI sequence - but validate it first
+                            // If we have a private prefix (?) but no digits, and the final byte
+                            // could be the start of a URL scheme (h for https://, f for ftp://, etc.),
+                            // treat this as malformed to avoid consuming URL text
+                            if has_private_prefix && !has_digit && (sc == 'h' || sc == 'f') {
+                                // This looks like ESC[?https:// or similar - treat as malformed
+                                valid_sequence = false;
+                                break;
+                            }
                             chars.next();
                             seq.push(sc);
                             // Only keep SGR sequences (ending with 'm')
@@ -451,10 +468,26 @@ pub fn strip_non_sgr_sequences(s: &str) -> String {
                                 }
                             }
                             break;
-                        } else {
+                        } else if is_csi_param_byte(sc) {
+                            // Valid parameter character - continue collecting
+                            if sc == '?' || sc == '<' || sc == '=' || sc == '>' {
+                                has_private_prefix = true;
+                            }
+                            if sc.is_ascii_digit() {
+                                has_digit = true;
+                            }
                             chars.next();
                             seq.push(sc);
+                        } else {
+                            // Invalid parameter character - this isn't a well-formed CSI sequence
+                            // Abort and output what we've collected as literal text
+                            valid_sequence = false;
+                            break;
                         }
+                    }
+                    // If sequence was invalid, output the collected characters as literal text
+                    if !valid_sequence {
+                        result.push_str(&seq);
                     }
                 }
                 Some(&']') => {
@@ -619,8 +652,9 @@ pub fn wrap_urls_with_osc8(s: &str) -> String {
             // URL can contain most characters, ends at whitespace or certain delimiters
             while url_end < chars.len() {
                 let c = chars[url_end];
-                // End URL at whitespace or common text delimiters
-                if c.is_whitespace() || c == '"' || c == '\'' || c == '<' || c == '>'
+                // End URL at whitespace, ANSI escape, or common text delimiters
+                // ESC (0x1B) must be a delimiter to avoid including ANSI color codes in URLs
+                if c.is_whitespace() || c == '\x1b' || c == '"' || c == '\'' || c == '<' || c == '>'
                    || c == '[' || c == ']' || c == '(' || c == ')' || c == '{' || c == '}' {
                     break;
                 }

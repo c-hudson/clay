@@ -19,6 +19,20 @@ pub mod remote_gui;
 const VERSION: &str = "1.0.0-alpha";
 const BUILD_HASH: &str = env!("BUILD_HASH");
 
+// Custom config file path (set via --conf=<path> argument)
+use std::sync::OnceLock;
+static CUSTOM_CONFIG_PATH: OnceLock<PathBuf> = OnceLock::new();
+
+/// Set a custom config file path (call early in main before loading settings)
+pub fn set_custom_config_path(path: PathBuf) {
+    let _ = CUSTOM_CONFIG_PATH.set(path);
+}
+
+/// Get the custom config path if one was set
+pub fn get_custom_config_path() -> Option<&'static PathBuf> {
+    CUSTOM_CONFIG_PATH.get()
+}
+
 /// Get the full version string including build hash
 pub fn get_version_string() -> String {
     format!("Clay v{} (build {})", VERSION, BUILD_HASH)
@@ -3472,6 +3486,10 @@ impl UserConnection {
 }
 
 pub fn get_settings_path() -> PathBuf {
+    // Use custom config path if set via --conf=<path>
+    if let Some(custom_path) = get_custom_config_path() {
+        return custom_path.clone();
+    }
     let home = get_home_dir();
     PathBuf::from(home).join(clay_filename("clay.dat"))
 }
@@ -6302,6 +6320,12 @@ async fn main() -> io::Result<()> {
     if std::env::args().any(|a| a == "-v" || a == "--version") {
         println!("{}", get_version_string());
         return Ok(());
+    }
+
+    // Check for --conf=<path> to use a custom config file
+    if let Some(conf_arg) = std::env::args().find(|a| a.starts_with("--conf=")) {
+        let conf_path = conf_arg.strip_prefix("--conf=").unwrap();
+        set_custom_config_path(PathBuf::from(conf_path));
     }
 
     // Log startup for debugging reload/crash issues
@@ -15754,6 +15778,17 @@ mod tests {
         let input = "text\x1b[H\x1b[Hmore";
         let result = strip_non_sgr_sequences(input);
         assert_eq!(result, "text\nmore", "Consecutive H should only add one newline");
+
+        // Test that malformed CSI sequences don't consume URL text
+        // A malformed sequence like ESC[? followed by https:// should not consume the 'h'
+        let input = "before\x1b[?https://example.com";
+        let result = strip_non_sgr_sequences(input);
+        assert_eq!(result, "before\x1b[?https://example.com", "Malformed CSI should preserve URL text");
+
+        // Test that valid private mode sequences are still processed
+        let input = "before\x1b[?25hafter";
+        let result = strip_non_sgr_sequences(input);
+        assert_eq!(result, "beforeafter", "Valid private mode sequence should be stripped");
     }
 
     #[test]
@@ -15962,6 +15997,14 @@ mod tests {
         assert!(result.contains("\x1b]8;;https://example.com/path/to/page\x07"));
         // Visible text should preserve ZWSP for word breaking
         assert!(result.contains("/\u{200B}path/\u{200B}to/\u{200B}page"));
+
+        // URL followed by ANSI color code should stop at ESC, not include the code in URL
+        let url_with_ansi = "https://example.com\x1b[0;37m rest";
+        let result = wrap_urls_with_osc8(url_with_ansi);
+        // URL should end at the ESC, not include the ANSI code
+        assert!(result.contains("\x1b]8;;https://example.com\x07"));
+        // The ANSI code should be preserved after the OSC 8 closing sequence
+        assert!(result.contains("\x1b]8;;\x07\x1b[0;37m"));
     }
 
     #[test]

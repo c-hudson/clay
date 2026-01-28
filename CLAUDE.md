@@ -91,11 +91,33 @@ cargo build --features remote-gui-audio
 # Output: target/debug/clay
 ```
 
+**Building a Universal Binary (Intel + Apple Silicon):**
+
+```bash
+# Install both targets (one-time setup)
+rustup target add x86_64-apple-darwin
+rustup target add aarch64-apple-darwin
+
+# Build for both architectures with GUI and audio
+cargo build --release --target x86_64-apple-darwin --features remote-gui-audio
+cargo build --release --target aarch64-apple-darwin --features remote-gui-audio
+
+# Combine into universal binary
+lipo -create \
+    target/x86_64-apple-darwin/release/clay \
+    target/aarch64-apple-darwin/release/clay \
+    -output clay-macos-universal
+
+# Verify (should show "universal binary with 2 architectures")
+file clay-macos-universal
+```
+
 **Notes:**
 - No musl target needed on macOS (use native libc)
 - macOS uses native Cocoa windowing (no X11/Wayland required)
 - Audio uses CoreAudio automatically
 - Works on both Intel (x86_64) and Apple Silicon (aarch64)
+- Universal binaries run natively on both architectures without Rosetta 2
 
 **What works on macOS:**
 - All core features (connect, send, receive, multiple worlds)
