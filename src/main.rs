@@ -45,7 +45,7 @@ pub use actions::{
     wildcard_to_regex, execute_recall, check_action_triggers,
     compile_action_patterns, line_matches_compiled_patterns,
 };
-pub use http::{HttpsServer, HttpServer, BanList, start_https_server, start_http_server};
+pub use http::{HttpsServer, HttpServer, BanList, start_https_server, start_http_server, log_http_404, log_ws_auth, log_ban};
 pub use persistence::{
     encrypt_password, decrypt_password,
     save_settings, load_settings,

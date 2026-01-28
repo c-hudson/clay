@@ -10,6 +10,7 @@ use tokio_tungstenite::{accept_async, tungstenite::Message as WsRawMessage};
 // Import AppEvent and Action from the main crate
 use crate::{AppEvent, Action, BanList};
 use crate::ansi_music::MusicNote;
+use crate::http::log_ws_auth;
 
 // ============================================================================
 // WebSocket Protocol Types
@@ -906,6 +907,9 @@ where
                             };
 
                             if auth_success {
+                                // Log successful auth
+                                log_ws_auth(&client_ip, true, auth_username.as_deref());
+
                                 // Mark as authenticated and set username
                                 let mut clients_guard = clients.write().await;
                                 if let Some(client) = clients_guard.get_mut(&client_id) {
@@ -926,6 +930,8 @@ where
                                     }
                                 }
                             } else {
+                                // Log failed auth
+                                log_ws_auth(&client_ip, false, None);
                                 // Record violation for failed auth attempt
                                 ban_list.record_violation(&client_ip, "WebSocket: failed auth");
                             }

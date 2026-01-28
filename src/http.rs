@@ -5,6 +5,50 @@ use tokio::net::TcpStream;
 use tokio::sync::RwLock;
 
 // ============================================================================
+// Remote Connection Logging
+// ============================================================================
+
+/// Log a remote connection event to clay.remote.log
+fn log_remote_event(event_type: &str, ip: &str, details: &str) {
+    use std::io::Write;
+    let timestamp = crate::util::local_time_now();
+    let time_str = format!("{:04}-{:02}-{:02} {:02}:{:02}:{:02}",
+        timestamp.year, timestamp.month, timestamp.day,
+        timestamp.hour, timestamp.minute, timestamp.second);
+
+    let log_line = format!("[{}] {} {} {}\n", time_str, event_type, ip, details);
+
+    if let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open("clay.remote.log")
+    {
+        let _ = file.write_all(log_line.as_bytes());
+    }
+}
+
+/// Log an HTTP 404 error
+pub fn log_http_404(ip: &str, path: &str) {
+    log_remote_event("HTTP-404", ip, path);
+}
+
+/// Log a WebSocket authentication attempt
+pub fn log_ws_auth(ip: &str, success: bool, username: Option<&str>) {
+    let details = match (success, username) {
+        (true, Some(user)) => format!("AUTH-SUCCESS user={}", user),
+        (true, None) => "AUTH-SUCCESS".to_string(),
+        (false, _) => "AUTH-FAILURE".to_string(),
+    };
+    log_remote_event("WEBSOCKET", ip, &details);
+}
+
+/// Log when an IP is banned
+pub fn log_ban(ip: &str, ban_type: &str, reason: &str) {
+    let details = format!("{} reason={}", ban_type, reason);
+    log_remote_event("BANNED", ip, &details);
+}
+
+// ============================================================================
 // HTTPS Web Interface Server
 // ============================================================================
 
@@ -494,11 +538,13 @@ impl BanList {
         if violation_count >= 5 {
             // Permanent ban
             self.permanent_bans.write().unwrap().insert(ip.to_string());
+            log_ban(ip, "PERMANENT", reason);
             violations.remove(ip); // Clear violations since permanently banned
             true
         } else if violation_count >= 3 {
             // Temporary ban (5 minutes) after 3+ violations
             self.temp_bans.write().unwrap().insert(ip.to_string(), now + 300);
+            log_ban(ip, "TEMPORARY", reason);
             true
         } else {
             false
@@ -680,6 +726,8 @@ async fn handle_http_client(
                 build_response_binary(200, "OK", "image/png", HTTP_CLAY_PNG)
             }
             _ => {
+                // Log the 404 before recording violation
+                log_http_404(&client_ip, path);
                 // Record violation for accessing non-existent page
                 ban_list.record_violation(&client_ip, path);
                 build_response(404, "Not Found", "text/plain", "Not Found")
