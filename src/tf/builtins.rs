@@ -829,11 +829,10 @@ pub fn cmd_repeat(engine: &mut TfEngine, args: &str) -> TfCommandResult {
     let id = engine.next_process_id;
     engine.next_process_id += 1;
 
-    let next_run = if no_initial_delay {
-        Instant::now()
-    } else {
-        Instant::now() + interval
-    };
+    // Always run first iteration immediately, then wait interval between subsequent runs
+    // The -n flag is now a no-op (kept for backwards compatibility)
+    let _ = no_initial_delay;
+    let next_run = Instant::now();
 
     let process = TfProcess {
         id,

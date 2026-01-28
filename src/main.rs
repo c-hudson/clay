@@ -8256,9 +8256,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                         }
                                     }
                                     tf::TfCommandResult::RepeatProcess(process) => {
-                                        let pid = process.id;
                                         app.tf_engine.processes.push(process);
-                                        app.add_tf_output(&format!("Process {} started.", pid));
                                     }
                                     tf::TfCommandResult::NotTfCommand => {
                                         // Shouldn't happen since we checked for #

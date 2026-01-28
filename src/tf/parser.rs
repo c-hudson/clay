@@ -510,13 +510,13 @@ Examples:
                 "Hooks fire macros on events. Use #def -h<event> to register.\n\nEvents:\n  CONNECT     - When connected to MUD\n  DISCONNECT  - When disconnected\n  LOGIN       - After login\n  PROMPT      - On prompt received\n  SEND        - Before sending command\n\nExample: #def -hCONNECT auto_look = look".to_string()
             )),
             "repeat" => TfCommandResult::Success(Some(
-                r#"#repeat [-w[world]] [-n] {[-time]|-S|-P} count command
+                r#"#repeat [-w[world]] {[-time]|-S|-P} count command
 
-Repeat a command on a timer.
+Repeat a command on a timer. First iteration runs immediately,
+then waits the interval before each subsequent iteration.
 
 Options:
   -w[world]  Send to specific world (empty = current)
-  -n         No initial delay (run immediately first time)
   -S         Synchronous (execute all iterations now)
   -P         Execute on prompt (not yet implemented)
   -time      Interval: seconds, M:S, or H:M:S
@@ -524,10 +524,9 @@ Options:
 Count: integer or "i" for infinite
 
 Examples:
-  #repeat -30 5 #echo hi        - Every 30s, 5 times
-  #repeat -0:30 i #echo hi      - Every 30s, infinite
-  #repeat -1:0:0 1 #echo hourly - After 1 hour, once
-  #repeat -n -5 10 #echo fast   - Every 5s, 10 times, no delay
+  #repeat -30 5 #echo hi        - Now, then every 30s, 5 times total
+  #repeat -0:30 i #echo hi      - Now, then every 30s, infinite
+  #repeat -1:0:0 1 #echo hourly - Once now (1 hour interval unused)
   #repeat -S 3 #echo sync       - 3 times immediately"#.to_string()
             )),
             "ps" => TfCommandResult::Success(Some(
