@@ -36,6 +36,7 @@ Download pre-built binaries from the [Releases](https://github.com/c-hudson/clay
 |----------|--------|-------|
 | Linux x86_64 | `clay-linux-x86_64` | GUI + audio, requires glibc |
 | Windows x86_64 | `clay-windows-x86_64.exe` | GUI + audio |
+| Android/Termux | `clay-termux-aarch64` | TUI only, ARM64 |
 
 ```bash
 # Example: Download and install on Linux
