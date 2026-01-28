@@ -64,7 +64,10 @@ pub fn create_actions_list_popup(actions: &[ActionInfo], visible_height: usize) 
     let items: Vec<ListItem> = sorted_actions
         .iter()
         .map(|a| {
-            // Format: "[x] name   world   pattern"
+            // Format: "[✓] name   world   pattern" (or "[x]" on Windows)
+            #[cfg(not(windows))]
+            let status = if a.enabled { "[✓]" } else { "[ ]" };
+            #[cfg(windows)]
             let status = if a.enabled { "[x]" } else { "[ ]" };
             let world_part = a.world.clone();
             let pattern_preview = if a.pattern.len() > 30 {

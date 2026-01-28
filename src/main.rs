@@ -1865,6 +1865,9 @@ impl App {
                 }
             })
             .map(|(idx, a)| {
+                #[cfg(not(windows))]
+                let status = if a.enabled { "[✓]" } else { "[ ]" };
+                #[cfg(windows)]
                 let status = if a.enabled { "[x]" } else { "[ ]" };
                 let world_part = if a.world.is_empty() {
                     String::new()
@@ -4495,6 +4498,9 @@ fn handle_remote_client_key(
                                 if let Some(field) = state.field_mut(ACTIONS_FIELD_LIST) {
                                     if let popup::FieldKind::List { items, .. } = &mut field.kind {
                                         *items = filtered.iter().map(|info| {
+                                                #[cfg(not(windows))]
+                                                let status = if info.enabled { "[✓]" } else { "[ ]" };
+                                                #[cfg(windows)]
                                                 let status = if info.enabled { "[x]" } else { "[ ]" };
                                                 let world_part = if info.world.is_empty() {
                                                     String::new()
@@ -4552,6 +4558,9 @@ fn handle_remote_client_key(
                         if let popup::FieldKind::List { items, selected_index, scroll_offset, .. } = &mut field.kind {
                             let old_len = items.len();
                             *items = filtered.iter().map(|info| {
+                                    #[cfg(not(windows))]
+                                    let status = if info.enabled { "[✓]" } else { "[ ]" };
+                                    #[cfg(windows)]
                                     let status = if info.enabled { "[x]" } else { "[ ]" };
                                     let world_part = if info.world.is_empty() {
                                         String::new()
@@ -11424,6 +11433,9 @@ fn handle_key_event(key: KeyEvent, app: &mut App) -> KeyAction {
                                     if let popup::FieldKind::List { items, .. } = &mut field.kind {
                                         // Rebuild items with indices
                                         *items = filtered.iter().map(|info| {
+                                                #[cfg(not(windows))]
+                                                let status = if info.enabled { "[✓]" } else { "[ ]" };
+                                                #[cfg(windows)]
                                                 let status = if info.enabled { "[x]" } else { "[ ]" };
                                                 let world_part = if info.world.is_empty() {
                                                     String::new()
@@ -11486,6 +11498,9 @@ fn handle_key_event(key: KeyEvent, app: &mut App) -> KeyAction {
                             let old_len = items.len();
                             // Rebuild items with indices
                             *items = filtered.iter().map(|info| {
+                                    #[cfg(not(windows))]
+                                    let status = if info.enabled { "[✓]" } else { "[ ]" };
+                                    #[cfg(windows)]
                                     let status = if info.enabled { "[x]" } else { "[ ]" };
                                     let world_part = if info.world.is_empty() {
                                         String::new()

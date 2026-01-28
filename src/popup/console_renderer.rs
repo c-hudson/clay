@@ -401,6 +401,10 @@ fn render_field(
         }
 
         FieldKind::Toggle { value } => {
+            // Use checkmark on Unix/macOS, 'x' on Windows (Windows console has limited Unicode support)
+            #[cfg(not(windows))]
+            let display_value = if *value { "[✓]" } else { "[ ]" };
+            #[cfg(windows)]
             let display_value = if *value { "[x]" } else { "[ ]" };
             render_labeled_field(f, &field.label, display_value, area, label_width, is_selected, theme);
         }
