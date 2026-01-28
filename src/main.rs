@@ -12095,21 +12095,17 @@ fn handle_key_event(key: KeyEvent, app: &mut App) -> KeyAction {
             KeyAction::None
         }
 
-        // Submit - Enter resets more-mode so new output from the command is visible
+        // Submit - Only reset lines_since_pause if not currently paused
+        // If paused, user must Tab/PageDown to see pending output first
         (_, KeyCode::Enter) => {
             let input = app.input.take_input();
             // Allow empty input to be sent if connected (some MUDs use empty lines)
             if !input.is_empty() || app.current_world().connected {
-                // Reset more mode completely: release any pending lines, unpause, reset counter
-                // This ensures new output from the command displays fresh
-                let world = app.current_world_mut();
-                if !world.pending_lines.is_empty() {
-                    world.output_lines.append(&mut world.pending_lines);
+                // Only reset counter if not paused - if paused, leave state alone
+                // so user must explicitly release pending output
+                if !app.current_world().paused {
+                    app.current_world_mut().lines_since_pause = 0;
                 }
-                world.pending_since = None;
-                world.paused = false;
-                world.lines_since_pause = 0;
-                world.scroll_to_bottom();
                 KeyAction::SendCommand(input)
             } else {
                 KeyAction::None
