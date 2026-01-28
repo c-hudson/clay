@@ -15,7 +15,10 @@ use crate::{
     ClientViewState, Command, OutputLine,
     get_multiuser_settings_path,
     enable_tcp_keepalive, parse_command, current_timestamp_secs,
+    get_home_dir, clay_filename,
 };
+use crate::actions::{split_action_commands, substitute_action_args, execute_recall};
+use crate::util::local_time_from_epoch;
 
 /// Run in daemon mode (-D) - background server for remote connections only
 /// No console UI, just prints listening ports and handles remote clients
@@ -249,13 +252,562 @@ pub async fn handle_daemon_ws_message(
 ) {
     match msg {
         WsMessage::SendCommand { world_index, command } => {
-            if world_index < app.worlds.len() && app.worlds[world_index].connected {
-                if let Some(tx) = &app.worlds[world_index].command_tx {
-                    let _ = tx.send(WriteCommand::Text(command)).await;
-                    app.worlds[world_index].last_send_time = Some(std::time::Instant::now());
-                    app.worlds[world_index].last_user_command_time = Some(std::time::Instant::now());
-                    // Reset more-mode counter when user sends a command
-                    app.worlds[world_index].lines_since_pause = 0;
+            // Use shared command parsing (same as console mode)
+            let parsed = parse_command(&command);
+
+            // Reset more-mode counter when user sends a command
+            if world_index < app.worlds.len() {
+                app.worlds[world_index].lines_since_pause = 0;
+                app.worlds[world_index].last_user_command_time = Some(std::time::Instant::now());
+            }
+
+            match parsed {
+                Command::ActionCommand { name, args } => {
+                    // Execute action if it exists
+                    if let Some(action) = app.settings.actions.iter().find(|a| a.name.eq_ignore_ascii_case(&name)) {
+                        if !action.enabled {
+                            app.ws_broadcast(WsMessage::ServerData {
+                                world_index,
+                                data: format!("\u{2728} Action '{}' is disabled.", name),
+                                is_viewed: false,
+                                ts: current_timestamp_secs(),
+                                from_server: false,
+                            });
+                        } else {
+                            let commands = split_action_commands(&action.command);
+                            let mut sent_to_server = false;
+                            for cmd in commands {
+                                let cmd = substitute_action_args(&cmd, &args);
+
+                                if cmd.eq_ignore_ascii_case("/gag") || cmd.to_lowercase().starts_with("/gag ") {
+                                    continue;
+                                }
+                                if cmd.starts_with('/') {
+                                    // Sub-command starting with / - send back to client for local execution
+                                    app.ws_send_to_client(client_id, WsMessage::ExecuteLocalCommand { command: cmd });
+                                } else if cmd.starts_with('#') {
+                                    // TinyFugue command - execute on server
+                                    match app.tf_engine.execute(&cmd) {
+                                        tf::TfCommandResult::Success(Some(msg)) => {
+                                            app.ws_broadcast(WsMessage::ServerData {
+                                                world_index,
+                                                data: msg,
+                                                is_viewed: false,
+                                                ts: current_timestamp_secs(),
+                                                from_server: false,
+                                            });
+                                        }
+                                        tf::TfCommandResult::Success(None) => {}
+                                        tf::TfCommandResult::Error(err) => {
+                                            app.ws_broadcast(WsMessage::ServerData {
+                                                world_index,
+                                                data: format!("Error: {}", err),
+                                                is_viewed: false,
+                                                ts: current_timestamp_secs(),
+                                                from_server: false,
+                                            });
+                                        }
+                                        tf::TfCommandResult::SendToMud(text) => {
+                                            if world_index < app.worlds.len() {
+                                                if let Some(tx) = &app.worlds[world_index].command_tx {
+                                                    let _ = tx.try_send(WriteCommand::Text(text));
+                                                    sent_to_server = true;
+                                                }
+                                            }
+                                        }
+                                        tf::TfCommandResult::ClayCommand(clay_cmd) => {
+                                            app.ws_send_to_client(client_id, WsMessage::ExecuteLocalCommand { command: clay_cmd });
+                                        }
+                                        tf::TfCommandResult::Recall(opts) => {
+                                            if world_index < app.worlds.len() {
+                                                let output_lines = app.worlds[world_index].output_lines.clone();
+                                                let (matches, header) = execute_recall(&opts, &output_lines);
+                                                let pattern_str = opts.pattern.as_deref().unwrap_or("*");
+                                                let ts = current_timestamp_secs();
+
+                                                if !opts.quiet {
+                                                    if let Some(h) = header {
+                                                        app.ws_broadcast(WsMessage::ServerData { world_index, data: h, is_viewed: false, ts, from_server: false });
+                                                    }
+                                                }
+                                                if matches.is_empty() {
+                                                    app.ws_broadcast(WsMessage::ServerData { world_index, data: format!("\u{2728} No matches for '{}'", pattern_str), is_viewed: false, ts, from_server: false });
+                                                } else {
+                                                    for m in matches {
+                                                        app.ws_broadcast(WsMessage::ServerData { world_index, data: m, is_viewed: false, ts, from_server: false });
+                                                    }
+                                                }
+                                                if !opts.quiet {
+                                                    app.ws_broadcast(WsMessage::ServerData { world_index, data: "================= Recall end =================".to_string(), is_viewed: false, ts, from_server: false });
+                                                }
+                                            }
+                                        }
+                                        _ => {}
+                                    }
+                                } else if world_index < app.worlds.len() {
+                                    // Plain text - send to MUD server
+                                    if let Some(tx) = &app.worlds[world_index].command_tx {
+                                        let _ = tx.try_send(WriteCommand::Text(cmd));
+                                        sent_to_server = true;
+                                    }
+                                }
+                            }
+                            if sent_to_server && world_index < app.worlds.len() {
+                                app.worlds[world_index].last_send_time = Some(std::time::Instant::now());
+                            }
+                        }
+                    } else {
+                        app.ws_broadcast(WsMessage::ServerData {
+                            world_index,
+                            data: format!("Unknown action: /{}", name),
+                            is_viewed: false,
+                            ts: current_timestamp_secs(),
+                            from_server: false,
+                        });
+                    }
+                }
+                Command::NotACommand { text } => {
+                    // Regular text - send to MUD
+                    if world_index < app.worlds.len() {
+                        if let Some(tx) = &app.worlds[world_index].command_tx {
+                            if tx.try_send(WriteCommand::Text(text)).is_ok() {
+                                app.worlds[world_index].last_send_time = Some(std::time::Instant::now());
+                                app.worlds[world_index].prompt.clear();
+                            }
+                        }
+                    }
+                }
+                Command::Unknown { cmd } => {
+                    app.ws_broadcast(WsMessage::ServerData {
+                        world_index,
+                        data: format!("Unknown command: {}", cmd),
+                        is_viewed: false,
+                        ts: current_timestamp_secs(),
+                        from_server: false,
+                    });
+                }
+                Command::Send { text, all_worlds, target_world, no_newline } => {
+                    let make_write_cmd = |t: &str| -> WriteCommand {
+                        if no_newline {
+                            WriteCommand::Raw(t.as_bytes().to_vec())
+                        } else {
+                            WriteCommand::Text(t.to_string())
+                        }
+                    };
+
+                    if all_worlds {
+                        for world in app.worlds.iter_mut() {
+                            if world.connected {
+                                if let Some(tx) = &world.command_tx {
+                                    let _ = tx.try_send(make_write_cmd(&text));
+                                    world.last_send_time = Some(std::time::Instant::now());
+                                }
+                            }
+                        }
+                    } else if let Some(ref target) = target_world {
+                        if let Some(world) = app.worlds.iter_mut().find(|w| w.name.eq_ignore_ascii_case(target)) {
+                            if world.connected {
+                                if let Some(tx) = &world.command_tx {
+                                    let _ = tx.try_send(make_write_cmd(&text));
+                                    world.last_send_time = Some(std::time::Instant::now());
+                                }
+                            } else {
+                                app.ws_broadcast(WsMessage::ServerData {
+                                    world_index,
+                                    data: format!("World '{}' is not connected.", target),
+                                    is_viewed: false,
+                                    ts: current_timestamp_secs(),
+                                    from_server: false,
+                                });
+                            }
+                        } else {
+                            app.ws_broadcast(WsMessage::ServerData {
+                                world_index,
+                                data: format!("Unknown world: {}", target),
+                                is_viewed: false,
+                                ts: current_timestamp_secs(),
+                                from_server: false,
+                            });
+                        }
+                    } else if world_index < app.worlds.len() {
+                        if let Some(tx) = &app.worlds[world_index].command_tx {
+                            let _ = tx.try_send(make_write_cmd(&text));
+                            app.worlds[world_index].last_send_time = Some(std::time::Instant::now());
+                        }
+                    }
+                }
+                Command::Disconnect => {
+                    if world_index < app.worlds.len() && app.worlds[world_index].connected {
+                        #[cfg(unix)]
+                        if let Some(proxy_pid) = app.worlds[world_index].proxy_pid {
+                            unsafe { libc::kill(proxy_pid as libc::pid_t, libc::SIGTERM); }
+                        }
+                        if let Some(ref socket_path) = app.worlds[world_index].proxy_socket_path {
+                            let _ = std::fs::remove_file(socket_path);
+                        }
+                        app.worlds[world_index].proxy_pid = None;
+                        app.worlds[world_index].proxy_socket_path = None;
+                        app.worlds[world_index].command_tx = None;
+                        app.worlds[world_index].connected = false;
+                        app.worlds[world_index].socket_fd = None;
+                        app.worlds[world_index].close_log_file();
+                        app.worlds[world_index].prompt.clear();
+                        app.ws_broadcast(WsMessage::ServerData {
+                            world_index,
+                            data: "Disconnected.".to_string(),
+                            is_viewed: false,
+                            ts: current_timestamp_secs(),
+                            from_server: false,
+                        });
+                        app.ws_broadcast(WsMessage::WorldDisconnected { world_index });
+                    } else {
+                        app.ws_broadcast(WsMessage::ServerData {
+                            world_index,
+                            data: "Not connected.".to_string(),
+                            is_viewed: false,
+                            ts: current_timestamp_secs(),
+                            from_server: false,
+                        });
+                    }
+                }
+                Command::Flush => {
+                    if world_index < app.worlds.len() {
+                        let line_count = app.worlds[world_index].output_lines.len();
+                        app.worlds[world_index].output_lines.clear();
+                        app.worlds[world_index].pending_lines.clear();
+                        app.worlds[world_index].scroll_offset = 0;
+                        app.worlds[world_index].lines_since_pause = 0;
+                        app.worlds[world_index].paused = false;
+                        app.ws_broadcast(WsMessage::WorldFlushed { world_index });
+                        app.ws_broadcast(WsMessage::ServerData {
+                            world_index,
+                            data: format!("Flushed {} lines from output buffer.", line_count),
+                            is_viewed: false,
+                            ts: current_timestamp_secs(),
+                            from_server: false,
+                        });
+                    }
+                }
+                Command::Keepalive => {
+                    if world_index < app.worlds.len() {
+                        let world = &app.worlds[world_index];
+                        let info = format!(
+                            "Keepalive: {} ({})",
+                            world.settings.keep_alive_type.name(),
+                            if world.settings.keep_alive_type == KeepAliveType::Custom {
+                                world.settings.keep_alive_cmd.clone()
+                            } else {
+                                world.settings.keep_alive_type.name().to_string()
+                            }
+                        );
+                        app.ws_broadcast(WsMessage::ServerData {
+                            world_index,
+                            data: info,
+                            is_viewed: false,
+                            ts: current_timestamp_secs(),
+                            from_server: false,
+                        });
+                    }
+                }
+                Command::Gag { pattern } => {
+                    app.ws_broadcast(WsMessage::ServerData {
+                        world_index,
+                        data: format!("Gag pattern set: {}", pattern),
+                        is_viewed: false,
+                        ts: current_timestamp_secs(),
+                        from_server: false,
+                    });
+                }
+                Command::BanList => {
+                    let bans = app.ban_list.get_ban_info();
+                    if bans.is_empty() {
+                        app.ws_broadcast(WsMessage::ServerData {
+                            world_index,
+                            data: "No hosts are currently banned.".to_string(),
+                            is_viewed: false,
+                            ts: current_timestamp_secs(),
+                            from_server: false,
+                        });
+                    } else {
+                        let mut output = String::new();
+                        output.push_str("\nBanned Hosts:\n");
+                        output.push_str(&"\u{2500}".repeat(70));
+                        output.push_str(&format!("\n{:<20} {:<12} {}\n", "Host", "Type", "Last URL/Reason"));
+                        output.push_str(&"\u{2500}".repeat(70));
+                        output.push('\n');
+                        for (ip, ban_type, reason) in &bans {
+                            let reason_display = if reason.is_empty() { "(unknown)" } else { reason };
+                            output.push_str(&format!("{:<20} {:<12} {}\n", ip, ban_type, reason_display));
+                        }
+                        output.push_str(&"\u{2500}".repeat(70));
+                        output.push_str("\nUse /unban <host> to remove a ban.");
+                        app.ws_broadcast(WsMessage::ServerData {
+                            world_index,
+                            data: output,
+                            is_viewed: false,
+                            ts: current_timestamp_secs(),
+                            from_server: false,
+                        });
+                    }
+                    app.ws_send_to_client(client_id, WsMessage::BanListResponse { bans });
+                }
+                Command::Unban { host } => {
+                    if app.ban_list.remove_ban(&host) {
+                        let _ = persistence::save_settings(app);
+                        app.ws_broadcast(WsMessage::ServerData {
+                            world_index,
+                            data: format!("Removed ban for: {}", host),
+                            is_viewed: false,
+                            ts: current_timestamp_secs(),
+                            from_server: false,
+                        });
+                        app.ws_broadcast(WsMessage::BanListResponse { bans: app.ban_list.get_ban_info() });
+                        app.ws_send_to_client(client_id, WsMessage::UnbanResult { success: true, host, error: None });
+                    } else {
+                        app.ws_broadcast(WsMessage::ServerData {
+                            world_index,
+                            data: format!("No ban found for: {}", host),
+                            is_viewed: false,
+                            ts: current_timestamp_secs(),
+                            from_server: false,
+                        });
+                        app.ws_send_to_client(client_id, WsMessage::UnbanResult { success: false, host, error: Some("No ban found".to_string()) });
+                    }
+                }
+                Command::TestMusic => {
+                    let test_notes = vec![
+                        ansi_music::MusicNote { frequency: 261.63, duration_ms: 250 },
+                        ansi_music::MusicNote { frequency: 293.66, duration_ms: 250 },
+                        ansi_music::MusicNote { frequency: 329.63, duration_ms: 250 },
+                        ansi_music::MusicNote { frequency: 349.23, duration_ms: 250 },
+                        ansi_music::MusicNote { frequency: 392.00, duration_ms: 250 },
+                    ];
+                    app.ws_broadcast(WsMessage::AnsiMusic {
+                        world_index,
+                        notes: test_notes,
+                    });
+                    app.ws_broadcast(WsMessage::ServerData {
+                        world_index,
+                        data: "Playing test music (C-D-E-F-G)...".to_string(),
+                        is_viewed: false,
+                        ts: current_timestamp_secs(),
+                        from_server: false,
+                    });
+                }
+                Command::Notify { message } => {
+                    let title = if world_index < app.worlds.len() {
+                        app.worlds[world_index].name.clone()
+                    } else {
+                        "Clay".to_string()
+                    };
+                    app.ws_broadcast(WsMessage::Notification {
+                        title,
+                        message: message.clone(),
+                    });
+                    app.ws_broadcast(WsMessage::ServerData {
+                        world_index,
+                        data: format!("Notification sent: {}", message),
+                        is_viewed: false,
+                        ts: current_timestamp_secs(),
+                        from_server: false,
+                    });
+                }
+                Command::Debug => {
+                    let ts = current_timestamp_secs();
+                    app.ws_broadcast(WsMessage::ServerData { world_index, data: "=== Debug: World State ===".to_string(), is_viewed: false, ts, from_server: false });
+                    app.ws_broadcast(WsMessage::ServerData { world_index, data: format!("current_world_index: {}", app.current_world_index), is_viewed: false, ts, from_server: false });
+                    app.ws_broadcast(WsMessage::ServerData { world_index, data: format!("activity_count(): {}", app.activity_count()), is_viewed: false, ts, from_server: false });
+                    for (i, w) in app.worlds.iter().enumerate() {
+                        let current = if i == app.current_world_index { " *CURRENT*" } else { "" };
+                        app.ws_broadcast(WsMessage::ServerData { world_index, data: format!("[{}] {}{}", i, w.name, current), is_viewed: false, ts, from_server: false });
+                        app.ws_broadcast(WsMessage::ServerData { world_index, data: format!("  unseen_lines: {}, pending: {}, has_activity: {}", w.unseen_lines, w.pending_lines.len(), w.has_activity()), is_viewed: false, ts, from_server: false });
+                    }
+                    app.ws_broadcast(WsMessage::ServerData { world_index, data: "=== Actions ===".to_string(), is_viewed: false, ts, from_server: false });
+                    for (i, action) in app.settings.actions.iter().enumerate() {
+                        app.ws_broadcast(WsMessage::ServerData { world_index, data: format!("[{}] {} ({})", i, action.name, action.match_type.as_str()), is_viewed: false, ts, from_server: false });
+                        let pattern_bytes: Vec<String> = action.pattern.bytes().map(|b| format!("{:02x}", b)).collect();
+                        app.ws_broadcast(WsMessage::ServerData { world_index, data: format!("  pattern: {:?}", action.pattern), is_viewed: false, ts, from_server: false });
+                        app.ws_broadcast(WsMessage::ServerData { world_index, data: format!("  bytes: {}", pattern_bytes.join(" ")), is_viewed: false, ts, from_server: false });
+                    }
+                    app.ws_broadcast(WsMessage::ServerData { world_index, data: "=== End Debug ===".to_string(), is_viewed: false, ts, from_server: false });
+                }
+                Command::Dump => {
+                    use std::io::Write;
+                    let ts = current_timestamp_secs();
+                    let home = get_home_dir();
+                    let dump_path = format!("{}/{}", home, clay_filename("clay.dmp.log"));
+
+                    match std::fs::File::create(&dump_path) {
+                        Ok(mut file) => {
+                            let mut total_lines = 0;
+                            for world in app.worlds.iter() {
+                                for line in &world.output_lines {
+                                    let line_ts = line.timestamp
+                                        .duration_since(std::time::UNIX_EPOCH)
+                                        .map(|d| d.as_secs())
+                                        .unwrap_or(0) as i64;
+                                    let lt = local_time_from_epoch(line_ts);
+                                    let datetime = format!(
+                                        "{:04}-{:02}-{:02} {:02}:{:02}:{:02}",
+                                        lt.year, lt.month, lt.day,
+                                        lt.hour, lt.minute, lt.second
+                                    );
+                                    let _ = writeln!(file, "{},{},{}", world.name, datetime, line.text);
+                                    total_lines += 1;
+                                }
+                                for line in &world.pending_lines {
+                                    let line_ts = line.timestamp
+                                        .duration_since(std::time::UNIX_EPOCH)
+                                        .map(|d| d.as_secs())
+                                        .unwrap_or(0) as i64;
+                                    let lt = local_time_from_epoch(line_ts);
+                                    let datetime = format!(
+                                        "{:04}-{:02}-{:02} {:02}:{:02}:{:02}",
+                                        lt.year, lt.month, lt.day,
+                                        lt.hour, lt.minute, lt.second
+                                    );
+                                    let _ = writeln!(file, "{},{},{}", world.name, datetime, line.text);
+                                    total_lines += 1;
+                                }
+                            }
+                            app.ws_broadcast(WsMessage::ServerData {
+                                world_index,
+                                data: format!("Dumped {} lines from {} worlds to {}", total_lines, app.worlds.len(), dump_path),
+                                is_viewed: false,
+                                ts,
+                                from_server: false,
+                            });
+                        }
+                        Err(e) => {
+                            app.ws_broadcast(WsMessage::ServerData {
+                                world_index,
+                                data: format!("Failed to create dump file: {}", e),
+                                is_viewed: false,
+                                ts,
+                                from_server: false,
+                            });
+                        }
+                    }
+                }
+                // Commands that should be blocked from remote
+                Command::Quit | Command::Reload => {
+                    app.ws_broadcast(WsMessage::ServerData {
+                        world_index,
+                        data: "This command is not available from remote interfaces.".to_string(),
+                        is_viewed: false,
+                        ts: current_timestamp_secs(),
+                        from_server: false,
+                    });
+                }
+                // UI popup commands - handled client-side, no-op on server
+                Command::Help | Command::Version | Command::Menu | Command::Setup | Command::Web | Command::Actions { .. } |
+                Command::WorldsList | Command::WorldSelector | Command::WorldEdit { .. } => {
+                    // These are handled by the GUI/web interface locally
+                }
+                // Connect command - use daemon connection logic
+                Command::Connect { .. } => {
+                    if world_index < app.worlds.len() && !app.worlds[world_index].connected {
+                        if app.worlds[world_index].settings.has_connection_settings() {
+                            let settings = app.worlds[world_index].settings.clone();
+                            let world_name = app.worlds[world_index].name.clone();
+
+                            let ssl_msg = if settings.use_ssl { " with SSL" } else { "" };
+                            app.ws_broadcast(WsMessage::ServerData {
+                                world_index,
+                                data: format!("Connecting to {}:{}{}...\n", settings.hostname, settings.port, ssl_msg),
+                                is_viewed: false,
+                                ts: current_timestamp_secs(),
+                                from_server: false,
+                            });
+
+                            if let Some(cmd_tx) = connect_daemon_world(
+                                world_index,
+                                world_name.clone(),
+                                &settings,
+                                event_tx.clone(),
+                            ).await {
+                                app.worlds[world_index].connected = true;
+                                app.worlds[world_index].command_tx = Some(cmd_tx);
+                                app.worlds[world_index].was_connected = true;
+                                let now = std::time::Instant::now();
+                                app.worlds[world_index].last_send_time = Some(now);
+                                app.worlds[world_index].last_receive_time = Some(now);
+                                app.ws_broadcast(WsMessage::WorldConnected { world_index, name: world_name });
+                            } else {
+                                app.ws_broadcast(WsMessage::ServerData {
+                                    world_index,
+                                    data: "Connection failed.\n".to_string(),
+                                    is_viewed: false,
+                                    ts: current_timestamp_secs(),
+                                    from_server: false,
+                                });
+                            }
+                        } else {
+                            app.ws_broadcast(WsMessage::ServerData {
+                                world_index,
+                                data: "No connection settings configured for this world.".to_string(),
+                                is_viewed: false,
+                                ts: current_timestamp_secs(),
+                                from_server: false,
+                            });
+                        }
+                    }
+                }
+                Command::WorldSwitch { ref name } | Command::WorldConnectNoLogin { ref name } => {
+                    if let Some(idx) = app.worlds.iter().position(|w| w.name.eq_ignore_ascii_case(name)) {
+                        app.switch_world(idx);
+                        app.ws_broadcast(WsMessage::WorldSwitched { new_index: idx });
+                        // Connect if not connected and has settings
+                        if !app.worlds[idx].connected
+                            && app.worlds[idx].settings.has_connection_settings()
+                        {
+                            if matches!(parsed, Command::WorldConnectNoLogin { .. }) {
+                                app.worlds[idx].skip_auto_login = true;
+                            }
+                            let settings = app.worlds[idx].settings.clone();
+                            let world_name = app.worlds[idx].name.clone();
+
+                            let ssl_msg = if settings.use_ssl { " with SSL" } else { "" };
+                            app.ws_broadcast(WsMessage::ServerData {
+                                world_index: idx,
+                                data: format!("Connecting to {}:{}{}...\n", settings.hostname, settings.port, ssl_msg),
+                                is_viewed: false,
+                                ts: current_timestamp_secs(),
+                                from_server: false,
+                            });
+
+                            if let Some(cmd_tx) = connect_daemon_world(
+                                idx,
+                                world_name.clone(),
+                                &settings,
+                                event_tx.clone(),
+                            ).await {
+                                app.worlds[idx].connected = true;
+                                app.worlds[idx].command_tx = Some(cmd_tx);
+                                app.worlds[idx].was_connected = true;
+                                let now = std::time::Instant::now();
+                                app.worlds[idx].last_send_time = Some(now);
+                                app.worlds[idx].last_receive_time = Some(now);
+                                app.ws_broadcast(WsMessage::WorldConnected { world_index: idx, name: world_name });
+                            } else {
+                                app.ws_broadcast(WsMessage::ServerData {
+                                    world_index: idx,
+                                    data: "Connection failed.\n".to_string(),
+                                    is_viewed: false,
+                                    ts: current_timestamp_secs(),
+                                    from_server: false,
+                                });
+                            }
+                        }
+                    } else {
+                        app.ws_broadcast(WsMessage::ServerData {
+                            world_index,
+                            data: format!("World '{}' not found.", name),
+                            is_viewed: false,
+                            ts: current_timestamp_secs(),
+                            from_server: false,
+                        });
+                    }
                 }
             }
         }

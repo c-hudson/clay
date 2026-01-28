@@ -318,7 +318,7 @@ fn filter_wildcard_to_regex(pattern: &str) -> Option<regex::Regex> {
         .ok()
 }
 
-fn get_home_dir() -> String {
+pub fn get_home_dir() -> String {
     home::home_dir()
         .map(|p| p.to_string_lossy().to_string())
         .unwrap_or_else(|| ".".to_string())
@@ -326,7 +326,7 @@ fn get_home_dir() -> String {
 
 /// Returns a dot-prefixed filename on Unix, plain filename on Windows.
 /// e.g. clay_filename("clay.dat") → ".clay.dat" on Unix, "clay.dat" on Windows.
-fn clay_filename(name: &str) -> String {
+pub fn clay_filename(name: &str) -> String {
     #[cfg(unix)]
     { format!(".{}", name) }
     #[cfg(not(unix))]

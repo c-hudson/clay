@@ -8542,7 +8542,7 @@ pub fn run_master_gui() -> std::io::Result<()> {
         ..Default::default()
     };
 
-    eframe::run_native(
+    let result = eframe::run_native(
         "Clay Mud Client",
         options,
         Box::new(move |cc| {
@@ -8550,5 +8550,12 @@ pub fn run_master_gui() -> std::io::Result<()> {
             Box::new(RemoteGuiApp::new_master(app_to_gui_rx, gui_to_app_tx, handle))
                 as Box<dyn eframe::App>
         }),
-    ).map_err(|e| std::io::Error::other(format!("eframe error: {}", e)))
+    ).map_err(|e| std::io::Error::other(format!("eframe error: {}", e)));
+
+    // Shut down tokio runtime on a background thread to avoid panic when
+    // dropping it after eframe's event loop exits (blocking is not allowed
+    // in that context)
+    runtime.shutdown_background();
+
+    result
 }
