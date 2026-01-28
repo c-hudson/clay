@@ -3039,6 +3039,7 @@
                 }
                 return true;
             })
+            .sort((a, b) => a.action.name.toLowerCase().localeCompare(b.action.name.toLowerCase()))
             .map(({ index }) => index);
     }
 

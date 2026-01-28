@@ -44,6 +44,7 @@ pub struct ActionInfo {
     pub world: String,
     pub pattern: String,
     pub enabled: bool,
+    pub index: usize,
 }
 
 /// Match type options
@@ -56,10 +57,13 @@ pub fn match_type_options() -> Vec<SelectOption> {
 
 /// Create the actions list popup definition
 pub fn create_actions_list_popup(actions: &[ActionInfo], visible_height: usize) -> PopupDefinition {
-    let items: Vec<ListItem> = actions
+    // Sort alphabetically by action name (case-insensitive)
+    let mut sorted_actions: Vec<&ActionInfo> = actions.iter().collect();
+    sorted_actions.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+
+    let items: Vec<ListItem> = sorted_actions
         .iter()
-        .enumerate()
-        .map(|(i, a)| {
+        .map(|a| {
             // Format: "[x] name   world   pattern"
             let status = if a.enabled { "[x]" } else { "[ ]" };
             let world_part = a.world.clone();
@@ -76,7 +80,7 @@ pub fn create_actions_list_popup(actions: &[ActionInfo], visible_height: usize) 
             ];
 
             ListItem {
-                id: i.to_string(),
+                id: a.index.to_string(),
                 columns,
                 style: ListItemStyle {
                     is_disabled: !a.enabled,
@@ -210,12 +214,14 @@ mod tests {
                 world: "TestMUD".to_string(),
                 pattern: "^You are bleeding".to_string(),
                 enabled: true,
+                index: 0,
             },
             ActionInfo {
                 name: "highlight_says".to_string(),
                 world: "".to_string(),
                 pattern: "* says *".to_string(),
                 enabled: false,
+                index: 1,
             },
         ]
     }

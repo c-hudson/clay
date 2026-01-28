@@ -699,11 +699,13 @@ impl RemoteGuiApp {
         use crate::popup::definitions::actions::*;
 
         let actions: Vec<ActionInfo> = self.actions.iter()
-            .map(|a| ActionInfo {
+            .enumerate()
+            .map(|(i, a)| ActionInfo {
                 name: a.name.clone(),
                 world: a.world.clone(),
                 pattern: a.pattern.clone(),
                 enabled: a.enabled,
+                index: i,
             })
             .collect();
 
@@ -1516,23 +1518,24 @@ impl RemoteGuiApp {
     /// Check for temperature patterns and convert them when followed by a separator.
     /// Patterns: 32F, 32f, 100C, 100c, 32°F, 32.5F, -10C, etc.
     /// When detected, inserts conversion in parentheses: "32F " -> "32F(0C) "
-    fn check_temp_conversion(&mut self) {
+    /// Returns true if a conversion was performed (caller should update cursor to end).
+    fn check_temp_conversion(&mut self) -> bool {
         // Only convert temperatures when enabled
         if !self.temp_convert_enabled {
-            return;
+            return false;
         }
 
         let current_len = self.input_buffer.len();
         // Don't convert when user is deleting - allows undoing conversion
         if current_len <= self.prev_input_len {
             self.prev_input_len = current_len;
-            return;
+            return false;
         }
         self.prev_input_len = current_len;
 
         let chars: Vec<char> = self.input_buffer.chars().collect();
         if chars.is_empty() {
-            return;
+            return false;
         }
 
         // Check if we just typed a separator after a temperature
@@ -1540,21 +1543,21 @@ impl RemoteGuiApp {
         if !last_char.is_whitespace() && !matches!(last_char, '.' | ',' | '!' | '?' | ';' | ':' | ')' | ']' | '}') {
             // Non-separator typed - clear skip so next temperature can convert
             self.skip_temp_conversion = None;
-            return;
+            return false;
         }
 
         // Look backwards for a temperature pattern before the separator
         // Pattern: optional minus, digits, optional decimal+digits, optional °, F or C
         let end = chars.len() - 1; // Position of the separator
         if end == 0 {
-            return;
+            return false;
         }
 
         // Find the F/C unit character
         let unit_pos = end - 1;
         let unit_char = chars[unit_pos].to_ascii_uppercase();
         if unit_char != 'F' && unit_char != 'C' {
-            return;
+            return false;
         }
 
         // Check for optional degree symbol before the unit
@@ -1576,8 +1579,8 @@ impl RemoteGuiApp {
             } else if c == '.' && !found_decimal {
                 found_decimal = true;
                 num_start -= 1;
-            } else if c == '-' && num_start == num_end - (if found_decimal { 2 } else { 1 }) + 1 {
-                // Only allow minus at the very start of the number
+            } else if c == '-' {
+                // Allow minus at the very start of the number
                 num_start -= 1;
                 break;
             } else {
@@ -1587,7 +1590,7 @@ impl RemoteGuiApp {
 
         // Check we have at least one digit
         if !found_digit {
-            return;
+            return false;
         }
 
         // Make sure the character before the number isn't part of the "word"
@@ -1595,7 +1598,7 @@ impl RemoteGuiApp {
         if num_start > 0 {
             let prev_char = chars[num_start - 1];
             if prev_char.is_alphanumeric() || prev_char == '_' {
-                return;
+                return false;
             }
         }
 
@@ -1605,7 +1608,7 @@ impl RemoteGuiApp {
         // Check if this temperature was already converted and undone - skip if so
         if let Some(ref skip) = self.skip_temp_conversion {
             if skip == &temp_str {
-                return;
+                return false;
             }
         }
 
@@ -1613,7 +1616,7 @@ impl RemoteGuiApp {
         let num_str: String = chars[num_start..num_end].iter().collect();
         let temp: f64 = match num_str.parse() {
             Ok(t) => t,
-            Err(_) => return,
+            Err(_) => return false,
         };
 
         // Convert temperature
@@ -1643,6 +1646,7 @@ impl RemoteGuiApp {
         self.input_buffer = format!("{}{}{}", before_sep, converted_str, sep);
         // Update prev_input_len to reflect new length after conversion
         self.prev_input_len = self.input_buffer.len();
+        true
     }
 
     /// Get the word at or before the cursor position
@@ -3731,8 +3735,13 @@ impl eframe::App for RemoteGuiApp {
                     let response = scroll_output.inner;
 
                     // Check for temperature conversion when input changes
-                    if response.changed() {
-                        self.check_temp_conversion();
+                    if response.changed() && self.check_temp_conversion() {
+                        // Conversion happened - move cursor to end of buffer
+                        let mut state = egui::TextEdit::load_state(ctx, input_id)
+                            .unwrap_or_default();
+                        let ccursor = egui::text::CCursor::new(self.input_buffer.chars().count());
+                        state.set_ccursor_range(Some(egui::text::CCursorRange::one(ccursor)));
+                        state.store(ctx, input_id);
                     }
 
                     // Calculate cursor position and scroll to it if needed

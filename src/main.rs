@@ -1856,7 +1856,7 @@ impl App {
         use popup::definitions::actions::ACTIONS_FIELD_LIST;
 
         // Build items with indices for the popup
-        let items: Vec<popup::ListItem> = self.settings.actions.iter().enumerate()
+        let mut items: Vec<popup::ListItem> = self.settings.actions.iter().enumerate()
             .filter(|(_, a)| {
                 if world_filter.is_empty() {
                     true
@@ -1890,6 +1890,14 @@ impl App {
                 }
             })
             .collect();
+
+        // Sort alphabetically by action name (case-insensitive)
+        items.sort_by(|a, b| {
+            // Extract name from first column: "[x] name" or "[ ] name"
+            let name_a = a.columns[0].get(4..).unwrap_or("").to_lowercase();
+            let name_b = b.columns[0].get(4..).unwrap_or("").to_lowercase();
+            name_a.cmp(&name_b)
+        });
 
         let visible_height = 10.min(items.len().max(3));
 
@@ -3130,8 +3138,8 @@ impl App {
             } else if c == '.' && !found_decimal {
                 found_decimal = true;
                 num_start -= 1;
-            } else if c == '-' && num_start == num_end - (if found_decimal { 2 } else { 1 }) + 1 {
-                // Only allow minus at the very start of the number
+            } else if c == '-' {
+                // Allow minus at the very start of the number
                 num_start -= 1;
                 break;
             } else {
@@ -4414,18 +4422,20 @@ fn handle_remote_client_key(
                                 };
                                 let all_actions: Vec<ActionInfo> = app.settings.actions
                                     .iter()
-                                    .map(|a| ActionInfo {
+                                    .enumerate()
+                                    .map(|(i, a)| ActionInfo {
                                         name: a.name.clone(),
                                         world: a.world.clone(),
                                         pattern: a.pattern.clone(),
                                         enabled: a.enabled,
+                                        index: i,
                                     })
                                     .collect();
-                                let filtered = filter_actions(&all_actions, &filter_text);
+                                let mut filtered = filter_actions(&all_actions, &filter_text);
+                                filtered.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
                                 if let Some(field) = state.field_mut(ACTIONS_FIELD_LIST) {
                                     if let popup::FieldKind::List { items, .. } = &mut field.kind {
-                                        *items = filtered.iter().filter_map(|info| {
-                                            app.settings.actions.iter().position(|a| a.name == info.name).map(|orig_idx| {
+                                        *items = filtered.iter().map(|info| {
                                                 let status = if info.enabled { "[x]" } else { "[ ]" };
                                                 let world_part = if info.world.is_empty() {
                                                     String::new()
@@ -4438,7 +4448,7 @@ fn handle_remote_client_key(
                                                     info.pattern.clone()
                                                 };
                                                 popup::ListItem {
-                                                    id: orig_idx.to_string(),
+                                                    id: info.index.to_string(),
                                                     columns: vec![
                                                         format!("{} {}", status, info.name),
                                                         world_part,
@@ -4449,7 +4459,6 @@ fn handle_remote_client_key(
                                                         ..Default::default()
                                                     },
                                                 }
-                                            })
                                         }).collect();
                                     }
                                 }
@@ -4469,19 +4478,21 @@ fn handle_remote_client_key(
                     };
                     let all_actions: Vec<ActionInfo> = app.settings.actions
                         .iter()
-                        .map(|a| ActionInfo {
+                        .enumerate()
+                        .map(|(i, a)| ActionInfo {
                             name: a.name.clone(),
                             world: a.world.clone(),
                             pattern: a.pattern.clone(),
                             enabled: a.enabled,
+                            index: i,
                         })
                         .collect();
-                    let filtered = filter_actions(&all_actions, &filter_text);
+                    let mut filtered = filter_actions(&all_actions, &filter_text);
+                    filtered.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
                     if let Some(field) = state.field_mut(ACTIONS_FIELD_LIST) {
                         if let popup::FieldKind::List { items, selected_index, scroll_offset, .. } = &mut field.kind {
                             let old_len = items.len();
-                            *items = filtered.iter().filter_map(|info| {
-                                app.settings.actions.iter().position(|a| a.name == info.name).map(|orig_idx| {
+                            *items = filtered.iter().map(|info| {
                                     let status = if info.enabled { "[x]" } else { "[ ]" };
                                     let world_part = if info.world.is_empty() {
                                         String::new()
@@ -4494,7 +4505,7 @@ fn handle_remote_client_key(
                                         info.pattern.clone()
                                     };
                                     popup::ListItem {
-                                        id: orig_idx.to_string(),
+                                        id: info.index.to_string(),
                                         columns: vec![
                                             format!("{} {}", status, info.name),
                                             world_part,
@@ -4505,7 +4516,6 @@ fn handle_remote_client_key(
                                             ..Default::default()
                                         },
                                     }
-                                })
                             }).collect();
                             if items.is_empty() {
                                 *selected_index = 0;
@@ -11338,22 +11348,23 @@ fn handle_key_event(key: KeyEvent, app: &mut App) -> KeyAction {
                                 // Build action info list
                                 let all_actions: Vec<ActionInfo> = app.settings.actions
                                     .iter()
-                                    .map(|a| ActionInfo {
+                                    .enumerate()
+                                    .map(|(i, a)| ActionInfo {
                                         name: a.name.clone(),
                                         world: a.world.clone(),
                                         pattern: a.pattern.clone(),
                                         enabled: a.enabled,
+                                        index: i,
                                     })
                                     .collect();
-                                // Apply filter
-                                let filtered = filter_actions(&all_actions, &filter_text);
+                                // Apply filter and sort alphabetically
+                                let mut filtered = filter_actions(&all_actions, &filter_text);
+                                filtered.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
                                 // Update the list in the popup state
                                 if let Some(field) = state.field_mut(ACTIONS_FIELD_LIST) {
                                     if let popup::FieldKind::List { items, .. } = &mut field.kind {
                                         // Rebuild items with indices
-                                        *items = filtered.iter().filter_map(|info| {
-                                            // Find original index
-                                            app.settings.actions.iter().position(|a| a.name == info.name).map(|orig_idx| {
+                                        *items = filtered.iter().map(|info| {
                                                 let status = if info.enabled { "[x]" } else { "[ ]" };
                                                 let world_part = if info.world.is_empty() {
                                                     String::new()
@@ -11366,7 +11377,7 @@ fn handle_key_event(key: KeyEvent, app: &mut App) -> KeyAction {
                                                     info.pattern.clone()
                                                 };
                                                 popup::ListItem {
-                                                    id: orig_idx.to_string(),
+                                                    id: info.index.to_string(),
                                                     columns: vec![
                                                         format!("{} {}", status, info.name),
                                                         world_part,
@@ -11377,7 +11388,6 @@ fn handle_key_event(key: KeyEvent, app: &mut App) -> KeyAction {
                                                         ..Default::default()
                                                     },
                                                 }
-                                            })
                                         }).collect();
                                     }
                                 }
@@ -11399,23 +11409,24 @@ fn handle_key_event(key: KeyEvent, app: &mut App) -> KeyAction {
                     // Build action info list
                     let all_actions: Vec<ActionInfo> = app.settings.actions
                         .iter()
-                        .map(|a| ActionInfo {
+                        .enumerate()
+                        .map(|(i, a)| ActionInfo {
                             name: a.name.clone(),
                             world: a.world.clone(),
                             pattern: a.pattern.clone(),
                             enabled: a.enabled,
+                            index: i,
                         })
                         .collect();
-                    // Apply filter
-                    let filtered = filter_actions(&all_actions, &filter_text);
+                    // Apply filter and sort alphabetically
+                    let mut filtered = filter_actions(&all_actions, &filter_text);
+                    filtered.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
                     // Update the list in the popup state
                     if let Some(field) = state.field_mut(popup::definitions::actions::ACTIONS_FIELD_LIST) {
                         if let popup::FieldKind::List { items, selected_index, scroll_offset, .. } = &mut field.kind {
                             let old_len = items.len();
                             // Rebuild items with indices
-                            *items = filtered.iter().filter_map(|info| {
-                                // Find original index
-                                app.settings.actions.iter().position(|a| a.name == info.name).map(|orig_idx| {
+                            *items = filtered.iter().map(|info| {
                                     let status = if info.enabled { "[x]" } else { "[ ]" };
                                     let world_part = if info.world.is_empty() {
                                         String::new()
@@ -11428,7 +11439,7 @@ fn handle_key_event(key: KeyEvent, app: &mut App) -> KeyAction {
                                         info.pattern.clone()
                                     };
                                     popup::ListItem {
-                                        id: orig_idx.to_string(),  // Store original index as ID
+                                        id: info.index.to_string(),  // Store original index as ID
                                         columns: vec![
                                             format!("{} {}", status, info.name),
                                             world_part,
@@ -11439,7 +11450,6 @@ fn handle_key_event(key: KeyEvent, app: &mut App) -> KeyAction {
                                             ..Default::default()
                                         },
                                     }
-                                })
                             }).collect();
                             // Reset selection if list changed significantly
                             if items.is_empty() {
