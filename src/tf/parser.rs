@@ -380,7 +380,7 @@ fn cmd_connect(args: &str) -> TfCommandResult {
 
 /// #help [topic] - Display help
 fn cmd_help(args: &str) -> TfCommandResult {
-    let topic = args.trim().to_lowercase();
+    let topic = args.trim().trim_start_matches('#').to_lowercase();
 
     if topic.is_empty() {
         let help_text = r#"TinyFugue Commands
