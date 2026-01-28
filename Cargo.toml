@@ -70,6 +70,9 @@ image = { version = "0.24", optional = true, default-features = false, features 
 # Audio playback for ANSI music (uses WASAPI on Windows automatically)
 rodio = { version = "0.17", optional = true, default-features = false, features = ["wav"] }
 
+[target.'cfg(windows)'.build-dependencies]
+winres = "0.1"
+
 [features]
 default = ["rustls-backend", "remote-gui-audio"]
 native-tls-backend = ["tokio-native-tls", "native-tls", "tokio-tungstenite/native-tls"]

@@ -39,9 +39,8 @@ fn main() {
     embed_windows_icon();
 }
 
-/// Embed clay_icon.png as a Windows application icon.
-/// Creates an ICO file from the PNG, writes a .rc resource script,
-/// and compiles it using the Windows resource compiler.
+/// Embed clay_icon.png as a Windows application icon using winres.
+/// Creates an ICO file from the PNG and uses winres to compile and link it.
 #[cfg(target_os = "windows")]
 fn embed_windows_icon() {
     let png_path = Path::new("clay_icon.png");
@@ -98,57 +97,15 @@ fn embed_windows_icon() {
         return;
     }
 
-    // Write a .rc resource script
-    let rc_path = out_path.join("clay_icon.rc");
-    let rc_content = format!(
-        "1 ICON \"{}\"",
-        ico_path.to_str().unwrap().replace('\\', "\\\\")
-    );
-    if fs::write(&rc_path, rc_content).is_err() {
-        return;
+    // Use winres to compile and link the icon resource
+    if let Err(e) = winres::WindowsResource::new()
+        .set_icon(ico_path.to_str().unwrap())
+        .compile()
+    {
+        eprintln!("cargo:warning=Failed to compile Windows icon resource: {}", e);
     }
-
-    // Compile the resource file using embed-resource logic (windres or rc.exe)
-    compile_resource(&rc_path, out_path);
 
     println!("cargo:rerun-if-changed=clay_icon.png");
-}
-
-/// Compile a .rc file into a .res/.o and link it.
-#[cfg(target_os = "windows")]
-fn compile_resource(rc_path: &Path, out_dir: &Path) {
-    use std::process::Command;
-
-    let target = std::env::var("TARGET").unwrap_or_default();
-    let obj_path = out_dir.join("clay_icon.res.lib");
-
-    if target.contains("msvc") {
-        // Use rc.exe for MSVC targets
-        let status = Command::new("rc")
-            .arg("/fo")
-            .arg(&obj_path)
-            .arg(rc_path)
-            .status();
-        if let Ok(s) = status {
-            if s.success() {
-                println!("cargo:rustc-link-arg={}", obj_path.display());
-                return;
-            }
-        }
-    }
-
-    // Use windres for GNU/MinGW targets
-    let obj_path = out_dir.join("clay_icon.o");
-    let status = Command::new("windres")
-        .arg(rc_path)
-        .arg("-o")
-        .arg(&obj_path)
-        .status();
-    if let Ok(s) = status {
-        if s.success() {
-            println!("cargo:rustc-link-arg={}", obj_path.display());
-        }
-    }
 }
 
 fn collect_source_files(dir: &Path, files: &mut BTreeSet<String>) {
