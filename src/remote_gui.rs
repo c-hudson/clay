@@ -8503,8 +8503,8 @@ fn load_app_icon() -> Option<egui::IconData> {
 
 /// Run the remote GUI client
 pub fn run(addr: &str, runtime: tokio::runtime::Handle) -> io::Result<()> {
-    // Check for display server availability (Unix only - Windows always has a display)
-    #[cfg(unix)]
+    // Check for display server availability (Linux only - Windows/macOS always have a display)
+    #[cfg(all(unix, not(target_os = "macos")))]
     {
         let has_display = std::env::var("DISPLAY").map(|v| !v.is_empty()).unwrap_or(false)
             || std::env::var("WAYLAND_DISPLAY").map(|v| !v.is_empty()).unwrap_or(false);
@@ -8552,8 +8552,8 @@ pub fn run_remote_gui(addr: &str) -> std::io::Result<()> {
 pub fn run_master_gui() -> std::io::Result<()> {
     use tokio::sync::mpsc;
 
-    // Check for display server availability (Unix only - Windows always has a display)
-    #[cfg(unix)]
+    // Check for display server availability (Linux only - Windows/macOS always have a display)
+    #[cfg(all(unix, not(target_os = "macos")))]
     {
         let has_display = std::env::var("DISPLAY").map(|v| !v.is_empty()).unwrap_or(false)
             || std::env::var("WAYLAND_DISPLAY").map(|v| !v.is_empty()).unwrap_or(false);

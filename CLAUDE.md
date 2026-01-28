@@ -71,6 +71,43 @@ cargo build --no-default-features --features rustls-backend
 - All TUI features
 - Settings persistence
 
+### Building for macOS
+
+Clay compiles and runs on macOS (Intel and Apple Silicon):
+
+```bash
+# Install Rust (if not already installed)
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+
+# Build without GUI (terminal client only)
+cargo build --no-default-features --features rustls-backend
+
+# Build with GUI client
+cargo build --features remote-gui
+
+# Build with GUI and audio support
+cargo build --features remote-gui-audio
+
+# Output: target/debug/clay
+```
+
+**Notes:**
+- No musl target needed on macOS (use native libc)
+- macOS uses native Cocoa windowing (no X11/Wayland required)
+- Audio uses CoreAudio automatically
+- Works on both Intel (x86_64) and Apple Silicon (aarch64)
+
+**What works on macOS:**
+- All core features (connect, send, receive, multiple worlds)
+- TLS/SSL connections
+- Hot reload (`/reload`, `Ctrl+R`, `SIGUSR1`)
+- TLS proxy for preserving connections across reload
+- Remote GUI client (native Cocoa window)
+- ANSI music playback (with `remote-gui-audio` feature)
+- WebSocket/HTTP/HTTPS servers
+- Spell checking (`/usr/share/dict/words` exists on macOS)
+- All TUI features
+
 ## Architecture
 
 Clay is a terminal-based MUD (Multi-User Dungeon) client built with ratatui/crossterm for TUI and tokio for async networking. Supports multiple simultaneous world connections with SSL/TLS support.

@@ -3818,18 +3818,35 @@ async fn run_tls_proxy_async(host: &str, port: &str, socket_path: &PathBuf) {
         let peer_uid = {
             use std::os::unix::io::AsRawFd;
             let fd = client_stream.as_raw_fd();
-            let mut cred: libc::ucred = unsafe { std::mem::zeroed() };
-            let mut len = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
-            let ret = unsafe {
-                libc::getsockopt(
-                    fd,
-                    libc::SOL_SOCKET,
-                    libc::SO_PEERCRED,
-                    &mut cred as *mut _ as *mut libc::c_void,
-                    &mut len,
-                )
-            };
-            if ret == 0 { Some(cred.uid) } else { None }
+
+            #[cfg(target_os = "linux")]
+            {
+                let mut cred: libc::ucred = unsafe { std::mem::zeroed() };
+                let mut len = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
+                let ret = unsafe {
+                    libc::getsockopt(
+                        fd,
+                        libc::SOL_SOCKET,
+                        libc::SO_PEERCRED,
+                        &mut cred as *mut _ as *mut libc::c_void,
+                        &mut len,
+                    )
+                };
+                if ret == 0 { Some(cred.uid) } else { None }
+            }
+
+            #[cfg(target_os = "macos")]
+            {
+                let mut euid: libc::uid_t = 0;
+                let mut egid: libc::gid_t = 0;
+                let ret = unsafe { libc::getpeereid(fd, &mut euid, &mut egid) };
+                if ret == 0 { Some(euid) } else { None }
+            }
+
+            #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+            {
+                None // Other Unix platforms: skip peer check
+            }
         };
 
         // Reject connections from different users
