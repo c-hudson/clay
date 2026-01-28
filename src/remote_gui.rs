@@ -2,6 +2,45 @@ use crate::*;
 use egui::{Color32, ScrollArea, TextEdit};
 use tokio_tungstenite::{connect_async, tungstenite::Message as WsRawMessage};
 
+// Windows-specific: Set title bar to dark/light mode
+#[cfg(target_os = "windows")]
+mod windows_titlebar {
+    use std::ffi::c_void;
+
+    #[link(name = "dwmapi")]
+    extern "system" {
+        fn DwmSetWindowAttribute(
+            hwnd: *mut c_void,
+            dw_attribute: u32,
+            pv_attribute: *const c_void,
+            cb_attribute: u32,
+        ) -> i32;
+    }
+
+    #[link(name = "user32")]
+    extern "system" {
+        fn GetActiveWindow() -> *mut c_void;
+    }
+
+    const DWMWA_USE_IMMERSIVE_DARK_MODE: u32 = 20;
+
+    /// Set the title bar to dark or light mode on Windows 11+
+    pub fn set_dark_mode(dark: bool) {
+        unsafe {
+            let hwnd = GetActiveWindow();
+            if !hwnd.is_null() {
+                let value: u32 = if dark { 1 } else { 0 };
+                DwmSetWindowAttribute(
+                    hwnd,
+                    DWMWA_USE_IMMERSIVE_DARK_MODE,
+                    &value as *const u32 as *const c_void,
+                    std::mem::size_of::<u32>() as u32,
+                );
+            }
+        }
+    }
+}
+
 /// Cached "now" time for batch timestamp formatting in GUI
 struct GuiCachedNow;
 
@@ -331,6 +370,8 @@ pub struct RemoteGuiApp {
     console_theme: GuiTheme,
     /// GUI theme (local)
     theme: GuiTheme,
+    /// Last theme applied to title bar (to detect changes)
+    titlebar_theme: Option<GuiTheme>,
     /// Font name (empty for system default)
     font_name: String,
     /// Font size in points
@@ -561,6 +602,7 @@ impl RemoteGuiApp {
             input_height: 3,
             console_theme: GuiTheme::Dark,
             theme: GuiTheme::Dark,
+            titlebar_theme: None,
             font_name: String::new(),
             font_size: 14.0,
             web_font_size_phone: 10.0,
@@ -2860,6 +2902,13 @@ impl eframe::App for RemoteGuiApp {
         visuals.widgets.hovered.fg_stroke = fg_stroke;
         visuals.widgets.active.fg_stroke = fg_stroke;
         ctx.set_visuals(visuals);
+
+        // Update Windows title bar color to match theme
+        #[cfg(target_os = "windows")]
+        if self.titlebar_theme != Some(theme) {
+            self.titlebar_theme = Some(theme);
+            windows_titlebar::set_dark_mode(theme == GuiTheme::Dark);
+        }
 
         // Make scrollbars always visible and solid (not floating)
         let mut style = (*ctx.style()).clone();
