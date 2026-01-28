@@ -1052,6 +1052,10 @@ pub struct World {
     socket_fd: Option<RawFd>,    // Store fd for hot reload (plain TCP only, Unix only)
     #[cfg(not(unix))]
     socket_fd: Option<i64>,      // Placeholder on non-Unix (never used)
+    #[cfg(unix)]
+    proxy_socket_fd: Option<RawFd>, // Store Unix socket fd to TLS proxy for hot reload
+    #[cfg(not(unix))]
+    proxy_socket_fd: Option<i64>,   // Placeholder on non-Unix (never used)
     is_tls: bool,                // Track if using TLS
     telnet_mode: bool,           // True if telnet negotiation detected
     prompt: String,              // Current prompt detected via telnet GA
@@ -1108,6 +1112,7 @@ impl World {
             log_handle: None,
             log_date: None,
             socket_fd: None,
+            proxy_socket_fd: None,
             is_tls: false,
             telnet_mode: false,
             prompt: String::new(),
@@ -3976,10 +3981,16 @@ fn exec_reload(app: &App) -> io::Result<()> {
     persistence::save_reload_state(app)?;
     debug_log(true, "RELOAD: State saved successfully");
 
-    // Collect socket fds that need to survive exec
+    // Collect socket fds that need to survive exec (plain TCP and TLS proxy Unix sockets)
     let mut fds_to_keep: Vec<RawFd> = Vec::new();
     for world in &app.worlds {
+        // Plain TCP socket
         if let Some(fd) = world.socket_fd {
+            clear_cloexec(fd)?;
+            fds_to_keep.push(fd);
+        }
+        // TLS proxy Unix socket - preserve this to avoid reconnection
+        if let Some(fd) = world.proxy_socket_fd {
             clear_cloexec(fd)?;
             fds_to_keep.push(fd);
         }
@@ -7017,6 +7028,7 @@ pub async fn run_app_headless(
                             app.worlds[world_idx].command_tx = None;
                             app.worlds[world_idx].telnet_mode = false;
                             app.worlds[world_idx].socket_fd = None;
+                            app.worlds[world_idx].proxy_socket_fd = None;
                             app.worlds[world_idx].naws_enabled = false;
                             app.worlds[world_idx].naws_sent_size = None;
                             if !app.worlds[world_idx].prompt.is_empty() {
@@ -7595,19 +7607,21 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
             }
         }
 
-        // Third pass: reconnect to TLS proxy connections
+        // Third pass: restore TLS proxy connections
         for world_idx in 0..app.worlds.len() {
             let world = &app.worlds[world_idx];
             if world.connected && world.is_tls && world.proxy_pid.is_some() {
                 let proxy_pid = world.proxy_pid.unwrap();
                 let socket_path = world.proxy_socket_path.clone();
+                let preserved_fd = world.proxy_socket_fd;
 
-                // Check if proxy is still alive and socket exists
-                if !is_process_alive(proxy_pid) || socket_path.is_none() || !socket_path.as_ref().unwrap().exists() {
+                // Check if proxy is still alive
+                if !is_process_alive(proxy_pid) {
                     // Proxy died, mark disconnected
                     app.worlds[world_idx].connected = false;
                     app.worlds[world_idx].proxy_pid = None;
                     app.worlds[world_idx].proxy_socket_path = None;
+                    app.worlds[world_idx].proxy_socket_fd = None;
                     let seq = app.worlds[world_idx].next_seq;
                     app.worlds[world_idx].next_seq += 1;
                     app.worlds[world_idx].output_lines.push(OutputLine::new(
@@ -7616,30 +7630,55 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                     continue;
                 }
 
-                let socket_path = socket_path.unwrap();
+                // Try to use preserved FD first (most reliable), fall back to reconnection
+                let unix_stream: Option<tokio::net::UnixStream> = if let Some(fd) = preserved_fd {
+                    // Reconstruct UnixStream from preserved file descriptor
+                    use std::os::unix::io::FromRawFd;
+                    let std_stream = unsafe { std::os::unix::net::UnixStream::from_raw_fd(fd) };
+                    match tokio::net::UnixStream::from_std(std_stream) {
+                        Ok(stream) => Some(stream),
+                        Err(_) => None,
+                    }
+                } else {
+                    None
+                };
 
-                // Reconnect to proxy via Unix socket with retry logic
-                // Sometimes the proxy needs a moment to be ready after exec()
-                let mut connect_result = None;
-                for attempt in 0..5 {
-                    match tokio::net::UnixStream::connect(&socket_path).await {
-                        Ok(stream) => {
-                            connect_result = Some(Ok(stream));
-                            break;
-                        }
-                        Err(e) => {
-                            if attempt < 4 {
-                                // Wait 50ms before retrying
-                                tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
-                            } else {
-                                connect_result = Some(Err(e));
+                // If FD reconstruction failed, try reconnecting via socket path
+                let unix_stream = if unix_stream.is_some() {
+                    unix_stream
+                } else if let Some(ref path) = socket_path {
+                    if path.exists() {
+                        // Reconnect with retry logic
+                        let mut result = None;
+                        for attempt in 0..10 {
+                            match tokio::net::UnixStream::connect(path).await {
+                                Ok(stream) => {
+                                    result = Some(stream);
+                                    break;
+                                }
+                                Err(_) => {
+                                    if attempt < 9 {
+                                        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+                                    }
+                                }
                             }
                         }
+                        result
+                    } else {
+                        None
                     }
-                }
+                } else {
+                    None
+                };
 
-                match connect_result.unwrap() {
-                    Ok(unix_stream) => {
+                match unix_stream {
+                    Some(unix_stream) => {
+                        // Store the new FD for future reloads
+                        #[cfg(unix)]
+                        {
+                            use std::os::unix::io::AsRawFd;
+                            app.worlds[world_idx].proxy_socket_fd = Some(unix_stream.as_raw_fd());
+                        }
                         let (r, w) = unix_stream.into_split();
                         let mut read_half = StreamReader::Proxy(r);
                         let mut write_half = StreamWriter::Proxy(w);
@@ -7738,15 +7777,16 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                             }
                         });
                     }
-                    Err(e) => {
-                        // Failed to reconnect
+                    None => {
+                        // Failed to reconnect - neither FD preservation nor socket reconnect worked
                         app.worlds[world_idx].connected = false;
                         app.worlds[world_idx].proxy_pid = None;
                         app.worlds[world_idx].proxy_socket_path = None;
+                        app.worlds[world_idx].proxy_socket_fd = None;
                         let seq = app.worlds[world_idx].next_seq;
                         app.worlds[world_idx].next_seq += 1;
                         app.worlds[world_idx].output_lines.push(OutputLine::new(
-                            format!("Failed to reconnect to TLS proxy: {}. Use /worlds to reconnect.", e), seq
+                            "Failed to reconnect to TLS proxy. Use /worlds to reconnect.".to_string(), seq
                         ));
                     }
                 }
@@ -12843,6 +12883,12 @@ async fn handle_command(cmd: &str, app: &mut App, event_tx: mpsc::Sender<AppEven
                         // Connect to the proxy via Unix socket
                         match tokio::net::UnixStream::connect(&socket_path).await {
                             Ok(unix_stream) => {
+                                // Store the Unix socket FD for hot reload preservation
+                                #[cfg(unix)]
+                                {
+                                    use std::os::unix::io::AsRawFd;
+                                    app.current_world_mut().proxy_socket_fd = Some(unix_stream.as_raw_fd());
+                                }
                                 app.current_world_mut().socket_fd = None;  // Can't preserve TLS fd directly
                                 app.current_world_mut().is_tls = true;
                                 app.current_world_mut().proxy_pid = Some(proxy_pid);

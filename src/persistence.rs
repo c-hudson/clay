@@ -1098,6 +1098,10 @@ pub fn save_reload_state(app: &App) -> io::Result<()> {
         if let Some(ref proxy_socket_path) = world.proxy_socket_path {
             writeln!(file, "proxy_socket_path={}", proxy_socket_path.display())?;
         }
+        #[cfg(unix)]
+        if let Some(fd) = world.proxy_socket_fd {
+            writeln!(file, "proxy_socket_fd={}", fd)?;
+        }
 
         // World settings
         writeln!(file, "world_type={}", world.settings.world_type.name())?;
@@ -1254,6 +1258,10 @@ pub fn load_reload_state(app: &mut App) -> io::Result<bool> {
         socket_fd: Option<i64>,
         proxy_pid: Option<u32>,
         proxy_socket_path: Option<PathBuf>,
+        #[cfg(unix)]
+        proxy_socket_fd: Option<RawFd>,
+        #[cfg(not(unix))]
+        proxy_socket_fd: Option<i64>,
         unseen_lines: usize,
         paused: bool,
         pending_lines: Vec<OutputLine>,
@@ -1345,6 +1353,7 @@ pub fn load_reload_state(app: &mut App) -> io::Result<bool> {
                         socket_fd: None,
                         proxy_pid: None,
                         proxy_socket_path: None,
+                        proxy_socket_fd: None,
                         unseen_lines: 0,
                         paused: false,
                         pending_lines: Vec::new(),
@@ -1632,6 +1641,7 @@ pub fn load_reload_state(app: &mut App) -> io::Result<bool> {
                             "socket_fd" => tw.socket_fd = value.parse().ok(),
                             "proxy_pid" => tw.proxy_pid = value.parse().ok(),
                             "proxy_socket_path" => tw.proxy_socket_path = Some(PathBuf::from(value)),
+                            "proxy_socket_fd" => tw.proxy_socket_fd = value.parse().ok(),
                             "next_seq" => tw.next_seq = value.parse().unwrap_or(0),
                             "world_type" => tw.settings.world_type = WorldType::from_name(value),
                             "hostname" => tw.settings.hostname = value.to_string(),
@@ -1712,6 +1722,7 @@ pub fn load_reload_state(app: &mut App) -> io::Result<bool> {
         world.socket_fd = tw.socket_fd;
         world.proxy_pid = tw.proxy_pid;
         world.proxy_socket_path = tw.proxy_socket_path;
+        world.proxy_socket_fd = tw.proxy_socket_fd;
         world.settings = tw.settings;
         world.next_seq = tw.next_seq;
         // Leave timing fields as None for connected worlds after reload
