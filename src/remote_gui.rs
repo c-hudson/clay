@@ -6689,7 +6689,7 @@ impl eframe::App for RemoteGuiApp {
                     egui::ViewportId::from_hash_of("font_settings_window"),
                     egui::ViewportBuilder::default()
                         .with_title("Font Settings")
-                        .with_inner_size([380.0, 480.0]),
+                        .with_inner_size([380.0, 440.0]),
                     |ctx, _class| {
                         // Apply popup styling
                         ctx.style_mut(|style| {
@@ -6749,30 +6749,35 @@ impl eframe::App for RemoteGuiApp {
                                 .stroke(egui::Stroke::NONE)
                                 .inner_margin(egui::Margin { left: 16.0, right: 17.0, top: 10.0, bottom: 10.0 }))
                             .show(ctx, |ui| {
-                                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                ui.horizontal(|ui| {
                                     ui.spacing_mut().item_spacing = egui::vec2(8.0, 0.0);
 
-                                    // Cancel button
-                                    if ui.add(egui::Button::new(
-                                        egui::RichText::new("CANCEL").size(11.0).color(theme.fg_secondary()).family(egui::FontFamily::Monospace))
-                                        .fill(theme.bg_hover())
-                                        .stroke(egui::Stroke::new(1.0, theme.border_medium()))
-                                        .rounding(egui::Rounding::same(4.0))
-                                        .min_size(egui::vec2(70.0, 28.0))
-                                    ).clicked() {
-                                        should_close = true;
-                                    }
+                                    // Spacer to push buttons to the right
+                                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                        ui.spacing_mut().item_spacing = egui::vec2(8.0, 0.0);
 
-                                    // OK button (primary)
-                                    if ui.add(egui::Button::new(
-                                        egui::RichText::new("OK").size(11.0).color(theme.bg_deep()).strong().family(egui::FontFamily::Monospace))
-                                        .fill(theme.accent_dim())
-                                        .stroke(egui::Stroke::NONE)
-                                        .rounding(egui::Rounding::same(4.0))
-                                        .min_size(egui::vec2(70.0, 28.0))
-                                    ).clicked() {
-                                        should_save = true;
-                                    }
+                                        // OK button (primary) - rightmost
+                                        if ui.add(egui::Button::new(
+                                            egui::RichText::new("OK").size(11.0).color(theme.bg_deep()).strong().family(egui::FontFamily::Monospace))
+                                            .fill(theme.accent_dim())
+                                            .stroke(egui::Stroke::NONE)
+                                            .rounding(egui::Rounding::same(4.0))
+                                            .min_size(egui::vec2(70.0, 28.0))
+                                        ).clicked() {
+                                            should_save = true;
+                                        }
+
+                                        // Cancel button
+                                        if ui.add(egui::Button::new(
+                                            egui::RichText::new("CANCEL").size(11.0).color(theme.fg_secondary()).family(egui::FontFamily::Monospace))
+                                            .fill(theme.bg_hover())
+                                            .stroke(egui::Stroke::new(1.0, theme.border_medium()))
+                                            .rounding(egui::Rounding::same(4.0))
+                                            .min_size(egui::vec2(70.0, 28.0))
+                                        ).clicked() {
+                                            should_close = true;
+                                        }
+                                    });
                                 });
                             });
 
