@@ -200,6 +200,10 @@ pub fn render_popup_content(
                     );
 
                     let mut checked = *value;
+                    // Override fg_stroke so the checkmark is visible
+                    ui.style_mut().visuals.widgets.inactive.fg_stroke = egui::Stroke::new(1.0, theme.fg_primary);
+                    ui.style_mut().visuals.widgets.hovered.fg_stroke = egui::Stroke::new(1.0, theme.fg_primary);
+                    ui.style_mut().visuals.widgets.active.fg_stroke = egui::Stroke::new(1.0, theme.fg_primary);
                     if ui.checkbox(&mut checked, "").changed() {
                         actions.toggle_changed.push((field_id, checked));
                     }
@@ -220,7 +224,7 @@ pub fn render_popup_content(
 
                     let current = options.get(*selected_index).map(|o| o.label.as_str()).unwrap_or("-");
                     let dropdown_id = ui.id().with(format!("select_{}", field_id.0));
-                    let dropdown_width = ui.available_width().min(200.0);
+                    let dropdown_width = ui.available_width();
 
                     let button_rect = ui.allocate_space(egui::vec2(dropdown_width, row_height)).1;
                     let response = ui.interact(button_rect, dropdown_id.with("button"), egui::Sense::click());

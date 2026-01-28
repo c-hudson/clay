@@ -6689,7 +6689,7 @@ impl eframe::App for RemoteGuiApp {
                     egui::ViewportId::from_hash_of("font_settings_window"),
                     egui::ViewportBuilder::default()
                         .with_title("Font Settings")
-                        .with_inner_size([380.0, 520.0]),
+                        .with_inner_size([380.0, 340.0]),
                     |ctx, _class| {
                         // Apply popup styling
                         ctx.style_mut(|style| {
@@ -6746,15 +6746,15 @@ impl eframe::App for RemoteGuiApp {
                             .exact_height(48.0)
                             .frame(egui::Frame::none()
                                 .fill(theme.bg_surface())
-                                .stroke(egui::Stroke::new(1.0, theme.border_subtle()))
-                                .inner_margin(egui::Margin { left: 16.0, right: 1.0, top: 10.0, bottom: 10.0 }))
+                                .stroke(egui::Stroke::NONE)
+                                .inner_margin(egui::Margin { left: 16.0, right: 17.0, top: 10.0, bottom: 10.0 }))
                             .show(ctx, |ui| {
                                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                                     ui.spacing_mut().item_spacing = egui::vec2(8.0, 0.0);
 
                                     // Cancel button
                                     if ui.add(egui::Button::new(
-                                        egui::RichText::new("Cancel").size(11.0).color(theme.fg_secondary()))
+                                        egui::RichText::new("CANCEL").size(11.0).color(theme.fg_secondary()).family(egui::FontFamily::Monospace))
                                         .fill(theme.bg_hover())
                                         .stroke(egui::Stroke::new(1.0, theme.border_medium()))
                                         .rounding(egui::Rounding::same(4.0))
@@ -6765,7 +6765,7 @@ impl eframe::App for RemoteGuiApp {
 
                                     // OK button (primary)
                                     if ui.add(egui::Button::new(
-                                        egui::RichText::new("OK").size(11.0).color(theme.bg_deep()).strong())
+                                        egui::RichText::new("OK").size(11.0).color(theme.bg_deep()).strong().family(egui::FontFamily::Monospace))
                                         .fill(theme.accent_dim())
                                         .stroke(egui::Stroke::NONE)
                                         .rounding(egui::Rounding::same(4.0))
@@ -6794,25 +6794,22 @@ impl eframe::App for RemoteGuiApp {
                                     .show(ui, |ui| {
                                         ui.label(egui::RichText::new("Font family").size(12.0).color(theme.fg_secondary()));
 
-                                        // Inline scrollable font list
-                                        let list_height = 288.0; // 12 fonts * 24px per row
+                                        // Horizontal wrapped font list
                                         egui::Frame::none()
                                             .fill(theme.bg_deep())
                                             .rounding(egui::Rounding::same(4.0))
-                                            .inner_margin(egui::Margin::same(4.0))
+                                            .inner_margin(egui::Margin::same(6.0))
                                             .show(ui, |ui| {
-                                                egui::ScrollArea::vertical()
-                                                    .max_height(list_height)
-                                                    .show(ui, |ui| {
-                                                        ui.set_min_width(180.0);
-                                                        for (value, label) in FONT_FAMILIES {
-                                                            let is_selected = *value == edit_font_name;
-                                                            if ui.selectable_label(is_selected,
-                                                                egui::RichText::new(*label).size(11.0).color(theme.fg()).family(egui::FontFamily::Monospace)).clicked() {
-                                                                edit_font_name = value.to_string();
-                                                            }
+                                                ui.horizontal_wrapped(|ui| {
+                                                    ui.spacing_mut().item_spacing = egui::vec2(6.0, 6.0);
+                                                    for (value, label) in FONT_FAMILIES {
+                                                        let is_selected = *value == edit_font_name;
+                                                        if ui.selectable_label(is_selected,
+                                                            egui::RichText::new(*label).size(11.0).color(theme.fg()).family(egui::FontFamily::Monospace)).clicked() {
+                                                            edit_font_name = value.to_string();
                                                         }
-                                                    });
+                                                    }
+                                                });
                                             });
                                         ui.end_row();
 
