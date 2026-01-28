@@ -1316,11 +1316,15 @@ impl World {
                 self.write_log_line(line);
             }
 
+            // Calculate visual lines FIRST (before pause check) to properly handle long wrapped lines
+            let visual_lines = visual_line_count(line, output_width as usize);
+
             // Track if this line goes to pending (for partial tracking)
             let goes_to_pending = self.paused && settings.more_mode_enabled;
+            // Use projected line count (current + this line's visual lines) for pause trigger
             let triggers_pause = !goes_to_pending
                 && settings.more_mode_enabled
-                && self.lines_since_pause >= max_lines
+                && (self.lines_since_pause + visual_lines) > max_lines
                 && self.output_lines.len() >= max_lines;
 
             // Create OutputLine with appropriate from_server flag
@@ -1354,31 +1358,30 @@ impl World {
                         .create(true).append(true)
                         .open("/tmp/clay_more_debug.log")
                     {
-                        let _ = writeln!(f, "MORE TRIGGERED: output_lines={}, scroll_offset={}, lines_since_pause={}, max_lines={}, line={:?}",
-                            self.output_lines.len(), self.scroll_offset, self.lines_since_pause, max_lines,
+                        let _ = writeln!(f, "MORE TRIGGERED: output_lines={}, scroll_offset={}, lines_since_pause={}, visual_lines={}, max_lines={}, line={:?}",
+                            self.output_lines.len(), self.scroll_offset, self.lines_since_pause, visual_lines, max_lines,
                             line.chars().take(50).collect::<String>());
                     }
                 }
-                // Scroll to show lines added before pause, then pause
-                self.scroll_to_bottom();
-                self.paused = true;
-                // Track when pending output first appeared
-                if self.pending_lines.is_empty() {
-                    self.pending_since = Some(std::time::Instant::now());
-                    // Also track first unseen timestamp
-                    if self.first_unseen_at.is_none() {
+                // Add line to output_lines BEFORE pausing so it's visible when we scroll to bottom
+                self.output_lines.push(new_line);
+                self.lines_since_pause += visual_lines;
+                if !is_current {
+                    if self.unseen_lines == 0 && self.first_unseen_at.is_none() {
                         self.first_unseen_at = Some(std::time::Instant::now());
                     }
+                    self.unseen_lines += 1;
                 }
-                self.pending_lines.push(new_line);
+                // Scroll to show the triggering line, then pause for subsequent lines
+                self.scroll_to_bottom();
+                self.paused = true;
+                // Note: pending_since will be set when the NEXT line arrives and goes to pending_lines
                 if is_partial {
                     self.partial_line = line.to_string();
-                    self.partial_in_pending = true;
+                    self.partial_in_pending = false; // It went to output_lines, not pending
                 }
             } else {
                 self.output_lines.push(new_line);
-                // Count visual lines (accounting for word wrap) instead of logical lines
-                let visual_lines = visual_line_count(line, output_width as usize);
                 self.lines_since_pause += visual_lines;
                 if !is_current {
                     // Track when first unseen output arrived
