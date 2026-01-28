@@ -8,6 +8,12 @@ pub mod websocket;
 pub mod ansi_music;
 pub mod tf;
 pub mod popup;
+pub mod actions;
+pub mod http;
+pub mod persistence;
+pub mod daemon;
+#[cfg(all(feature = "remote-gui", not(target_os = "android")))]
+pub mod remote_gui;
 
 // Version information
 const VERSION: &str = "1.0.0-alpha";
@@ -33,9 +39,29 @@ pub use websocket::{
     WsClientInfo, WebSocketServer,
     hash_password, is_ip_in_allow_list, start_websocket_server,
 };
+pub use actions::{
+    Action, MatchType, ActionTriggerResult,
+    split_action_commands, substitute_action_args, substitute_pattern_captures,
+    wildcard_to_regex, execute_recall, check_action_triggers,
+    compile_action_patterns, line_matches_compiled_patterns,
+};
+pub use http::{HttpsServer, HttpServer, BanList, start_https_server, start_http_server};
+pub use persistence::{
+    encrypt_password, decrypt_password,
+    save_settings, load_settings,
+    load_multiuser_settings, save_multiuser_settings,
+    load_reload_state,
+    unescape_string,
+};
+#[cfg(all(unix, not(target_os = "android")))]
+pub use persistence::save_reload_state;
+pub use daemon::{
+    run_daemon_server, run_multiuser_server,
+    generate_splash_strings,
+};
 
 use std::collections::{HashMap, HashSet};
-use std::io::{self, stdout, BufRead, Write as IoWrite};
+use std::io::{self, stdout, Write as IoWrite};
 #[cfg(unix)]
 use std::os::unix::io::{AsRawFd, FromRawFd, RawFd};
 #[cfg(all(unix, not(target_os = "android")))]
@@ -46,12 +72,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicPtr, AtomicU32, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use aes_gcm::{
-    aead::{Aead, KeyInit},
-    Aes256Gcm, Nonce,
-};
 use async_recursion::async_recursion;
-use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use bytes::BytesMut;
 use crossterm::{
     cursor,
@@ -68,21 +89,18 @@ use ratatui::{
     widgets::{Block, Borders, Paragraph},
     Frame, Terminal,
 };
-use regex::RegexBuilder;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
-    net::{TcpListener, TcpStream},
+    net::TcpStream,
     sync::mpsc,
 };
 #[cfg(all(unix, not(target_os = "android")))]
 use tokio::signal::unix::{signal, SignalKind};
 use std::sync::Arc;
-use tokio::sync::RwLock;
-use serde::{Deserialize, Serialize};
 
 // Rustls danger module for accepting invalid certificates (MUD servers often have self-signed certs)
 #[cfg(feature = "rustls-backend")]
-mod danger {
+pub mod danger {
     use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
     use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
     use rustls::{DigitallySignedStruct, Error, SignatureScheme};
@@ -144,750 +162,11 @@ mod danger {
 }
 
 // ============================================================================
-// HTTPS Web Interface Server
-// ============================================================================
-
-/// HTTPS server state for the web interface
-#[cfg(feature = "native-tls-backend")]
-struct HttpsServer {
-    running: Arc<RwLock<bool>>,
-    shutdown_tx: Option<tokio::sync::oneshot::Sender<()>>,
-    port: u16,
-}
-
-#[cfg(feature = "native-tls-backend")]
-impl HttpsServer {
-    fn new(port: u16) -> Self {
-        Self {
-            running: Arc::new(RwLock::new(false)),
-            shutdown_tx: None,
-            port,
-        }
-    }
-}
-
-/// Embedded HTML for the web interface
-#[cfg(feature = "native-tls-backend")]
-const WEB_INDEX_HTML: &str = include_str!("web/index.html");
-
-/// Embedded CSS for the web interface
-#[cfg(feature = "native-tls-backend")]
-const WEB_STYLE_CSS: &str = include_str!("web/style.css");
-
-/// Embedded JavaScript for the web interface
-#[cfg(feature = "native-tls-backend")]
-const WEB_APP_JS: &str = include_str!("web/app.js");
-
-/// Embedded clay.png for the web interface menu icon
-#[cfg(feature = "native-tls-backend")]
-const WEB_CLAY_PNG: &[u8] = include_bytes!("../clay.png");
-
-/// Parse an HTTP request line and return the method and path
-#[cfg(feature = "native-tls-backend")]
-fn parse_http_request(request: &str) -> Option<(&str, &str)> {
-    let first_line = request.lines().next()?;
-    let mut parts = first_line.split_whitespace();
-    let method = parts.next()?;
-    let path = parts.next()?;
-    Some((method, path))
-}
-
-/// Build an HTTP response with the given status, content type, and body
-#[cfg(feature = "native-tls-backend")]
-fn build_http_response(status: u16, status_text: &str, content_type: &str, body: &str) -> Vec<u8> {
-    format!(
-        "HTTP/1.1 {} {}\r\n\
-         Content-Type: {}; charset=utf-8\r\n\
-         Content-Length: {}\r\n\
-         Connection: close\r\n\
-         \r\n\
-         {}",
-        status, status_text, content_type, body.len(), body
-    ).into_bytes()
-}
-
-/// Build an HTTP response with binary body (for images)
-#[cfg(feature = "native-tls-backend")]
-fn build_http_response_binary(status: u16, status_text: &str, content_type: &str, body: &[u8]) -> Vec<u8> {
-    let header = format!(
-        "HTTP/1.1 {} {}\r\n\
-         Content-Type: {}\r\n\
-         Content-Length: {}\r\n\
-         Connection: close\r\n\
-         \r\n",
-        status, status_text, content_type, body.len()
-    );
-    let mut response = header.into_bytes();
-    response.extend_from_slice(body);
-    response
-}
-
-/// Handle an HTTPS connection
-#[cfg(feature = "native-tls-backend")]
-async fn handle_https_client(
-    mut stream: tokio_native_tls::TlsStream<TcpStream>,
-    ws_port: u16,
-    ws_use_tls: bool,
-) {
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-
-    let mut buf = [0u8; 4096];
-    let n = match stream.read(&mut buf).await {
-        Ok(n) if n > 0 => n,
-        _ => return,
-    };
-
-    let request = String::from_utf8_lossy(&buf[..n]);
-
-    if let Some((method, path)) = parse_http_request(&request) {
-        if method != "GET" {
-            let response = build_http_response(405, "Method Not Allowed", "text/plain", "Method Not Allowed");
-            let _ = stream.write_all(&response).await;
-            return;
-        }
-
-        let response = match path {
-            "/" | "/index.html" => {
-                // Inject WebSocket configuration into the HTML
-                let html = WEB_INDEX_HTML
-                    .replace("{{WS_PORT}}", &ws_port.to_string())
-                    .replace("{{WS_PROTOCOL}}", if ws_use_tls { "wss" } else { "ws" });
-                build_http_response(200, "OK", "text/html", &html)
-            }
-            "/style.css" => {
-                build_http_response(200, "OK", "text/css", WEB_STYLE_CSS)
-            }
-            "/app.js" => {
-                build_http_response(200, "OK", "application/javascript", WEB_APP_JS)
-            }
-            "/clay.png" => {
-                build_http_response_binary(200, "OK", "image/png", WEB_CLAY_PNG)
-            }
-            _ => {
-                build_http_response(404, "Not Found", "text/plain", "Not Found")
-            }
-        };
-
-        let _ = stream.write_all(&response).await;
-    }
-}
-
-/// Start the HTTPS server
-#[cfg(feature = "native-tls-backend")]
-async fn start_https_server(
-    server: &mut HttpsServer,
-    cert_file: &str,
-    key_file: &str,
-    ws_port: u16,
-    ws_use_tls: bool,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    use std::fs::File;
-    use std::io::Read;
-
-    // Read certificate and key
-    let mut cert_data = Vec::new();
-    File::open(cert_file)?.read_to_end(&mut cert_data)?;
-
-    let mut key_data = Vec::new();
-    File::open(key_file)?.read_to_end(&mut key_data)?;
-
-    // Create identity from PEM files (same as WebSocket TLS)
-    let identity = native_tls::Identity::from_pkcs8(&cert_data, &key_data)?;
-    let tls_acceptor = native_tls::TlsAcceptor::new(identity)?;
-    let tls_acceptor = tokio_native_tls::TlsAcceptor::from(tls_acceptor);
-    let tls_acceptor = Arc::new(tls_acceptor);
-
-    let addr = format!("0.0.0.0:{}", server.port);
-    let listener = TcpListener::bind(&addr).await?;
-
-    let (shutdown_tx, mut shutdown_rx) = tokio::sync::oneshot::channel::<()>();
-    server.shutdown_tx = Some(shutdown_tx);
-
-    let running = Arc::clone(&server.running);
-    *running.write().await = true;
-
-    tokio::spawn(async move {
-        loop {
-            tokio::select! {
-                result = listener.accept() => {
-                    match result {
-                        Ok((stream, _addr)) => {
-                            // Disable Nagle's algorithm for lower latency
-                            let _ = stream.set_nodelay(true);
-                            let tls_acceptor = tls_acceptor.clone();
-                            tokio::spawn(async move {
-                                if let Ok(tls_stream) = tls_acceptor.accept(stream).await {
-                                    handle_https_client(tls_stream, ws_port, ws_use_tls).await;
-                                }
-                            });
-                        }
-                        Err(_) => break,
-                    }
-                }
-                _ = &mut shutdown_rx => {
-                    break;
-                }
-            }
-        }
-        *running.write().await = false;
-    });
-
-    Ok(())
-}
-
-// ============================================================================
-// HTTPS Server implementation for rustls-backend
-// ============================================================================
-
-/// HTTPS server state for the web interface (rustls version)
-#[cfg(feature = "rustls-backend")]
-struct HttpsServer {
-    running: Arc<RwLock<bool>>,
-    shutdown_tx: Option<tokio::sync::oneshot::Sender<()>>,
-    port: u16,
-}
-
-#[cfg(feature = "rustls-backend")]
-impl HttpsServer {
-    fn new(port: u16) -> Self {
-        Self {
-            running: Arc::new(RwLock::new(false)),
-            shutdown_tx: None,
-            port,
-        }
-    }
-}
-
-/// Embedded HTML for the web interface (rustls version)
-#[cfg(feature = "rustls-backend")]
-const WEB_INDEX_HTML: &str = include_str!("web/index.html");
-
-/// Embedded CSS for the web interface (rustls version)
-#[cfg(feature = "rustls-backend")]
-const WEB_STYLE_CSS: &str = include_str!("web/style.css");
-
-/// Embedded JavaScript for the web interface (rustls version)
-#[cfg(feature = "rustls-backend")]
-const WEB_APP_JS: &str = include_str!("web/app.js");
-
-/// Embedded clay.png for the web interface menu icon (rustls version)
-#[cfg(feature = "rustls-backend")]
-const WEB_CLAY_PNG: &[u8] = include_bytes!("../clay.png");
-
-/// Parse an HTTP request line and return the method and path (rustls version)
-#[cfg(feature = "rustls-backend")]
-fn parse_http_request(request: &str) -> Option<(&str, &str)> {
-    let first_line = request.lines().next()?;
-    let mut parts = first_line.split_whitespace();
-    let method = parts.next()?;
-    let path = parts.next()?;
-    Some((method, path))
-}
-
-/// Build an HTTP response with the given status, content type, and body (rustls version)
-#[cfg(feature = "rustls-backend")]
-fn build_http_response(status: u16, status_text: &str, content_type: &str, body: &str) -> Vec<u8> {
-    format!(
-        "HTTP/1.1 {} {}\r\n\
-         Content-Type: {}; charset=utf-8\r\n\
-         Content-Length: {}\r\n\
-         Connection: close\r\n\
-         \r\n\
-         {}",
-        status, status_text, content_type, body.len(), body
-    ).into_bytes()
-}
-
-/// Build an HTTP response with binary body (for images) (rustls version)
-#[cfg(feature = "rustls-backend")]
-fn build_http_response_binary(status: u16, status_text: &str, content_type: &str, body: &[u8]) -> Vec<u8> {
-    let header = format!(
-        "HTTP/1.1 {} {}\r\n\
-         Content-Type: {}\r\n\
-         Content-Length: {}\r\n\
-         Connection: close\r\n\
-         \r\n",
-        status, status_text, content_type, body.len()
-    );
-    let mut response = header.into_bytes();
-    response.extend_from_slice(body);
-    response
-}
-
-/// Handle an HTTPS connection (rustls version)
-#[cfg(feature = "rustls-backend")]
-async fn handle_https_client(
-    mut stream: tokio_rustls::server::TlsStream<TcpStream>,
-    ws_port: u16,
-    ws_use_tls: bool,
-) {
-    let mut buf = [0u8; 4096];
-    let n = match stream.read(&mut buf).await {
-        Ok(n) if n > 0 => n,
-        _ => return,
-    };
-
-    let request = String::from_utf8_lossy(&buf[..n]);
-
-    if let Some((method, path)) = parse_http_request(&request) {
-        if method != "GET" {
-            let response = build_http_response(405, "Method Not Allowed", "text/plain", "Method Not Allowed");
-            let _ = stream.write_all(&response).await;
-            return;
-        }
-
-        let response = match path {
-            "/" | "/index.html" => {
-                // Inject WebSocket configuration into the HTML
-                let html = WEB_INDEX_HTML
-                    .replace("{{WS_PORT}}", &ws_port.to_string())
-                    .replace("{{WS_PROTOCOL}}", if ws_use_tls { "wss" } else { "ws" });
-                build_http_response(200, "OK", "text/html", &html)
-            }
-            "/style.css" => {
-                build_http_response(200, "OK", "text/css", WEB_STYLE_CSS)
-            }
-            "/app.js" => {
-                build_http_response(200, "OK", "application/javascript", WEB_APP_JS)
-            }
-            "/clay.png" => {
-                build_http_response_binary(200, "OK", "image/png", WEB_CLAY_PNG)
-            }
-            _ => {
-                build_http_response(404, "Not Found", "text/plain", "Not Found")
-            }
-        };
-
-        let _ = stream.write_all(&response).await;
-    }
-}
-
-/// Start the HTTPS server (rustls version)
-#[cfg(feature = "rustls-backend")]
-async fn start_https_server(
-    server: &mut HttpsServer,
-    cert_file: &str,
-    key_file: &str,
-    ws_port: u16,
-    ws_use_tls: bool,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    use std::fs::File;
-    use std::io::BufReader;
-    use rustls_pemfile::{certs, pkcs8_private_keys, rsa_private_keys};
-    use rustls::pki_types::{CertificateDer, PrivateKeyDer};
-
-    // Read certificate chain
-    let cert_file_handle = File::open(cert_file)
-        .map_err(|e| format!("Failed to open cert file '{}': {}", cert_file, e))?;
-    let mut cert_reader = BufReader::new(cert_file_handle);
-    let certs: Vec<CertificateDer<'static>> = certs(&mut cert_reader)
-        .map_err(|e| format!("Failed to parse cert file '{}': {}", cert_file, e))?
-        .into_iter()
-        .map(CertificateDer::from)
-        .collect();
-
-    if certs.is_empty() {
-        return Err(format!("No certificates found in cert file '{}'", cert_file).into());
-    }
-
-    // Read private key - try PKCS8 first, then RSA
-    let key_file_handle = File::open(key_file)
-        .map_err(|e| format!("Failed to open key file '{}': {}", key_file, e))?;
-    let mut key_reader = BufReader::new(key_file_handle);
-    let keys = pkcs8_private_keys(&mut key_reader)
-        .map_err(|e| format!("Failed to parse key file '{}': {}", key_file, e))?;
-    let key: PrivateKeyDer<'static> = if !keys.is_empty() {
-        PrivateKeyDer::Pkcs8(keys.into_iter().next().unwrap().into())
-    } else {
-        // Try RSA format
-        let key_file_handle = File::open(key_file)
-            .map_err(|e| format!("Failed to open key file '{}': {}", key_file, e))?;
-        let mut key_reader = BufReader::new(key_file_handle);
-        let keys = rsa_private_keys(&mut key_reader)
-            .map_err(|e| format!("Failed to parse key file '{}': {}", key_file, e))?;
-        if keys.is_empty() {
-            return Err(format!("No private key found in key file '{}'", key_file).into());
-        }
-        PrivateKeyDer::Pkcs1(keys.into_iter().next().unwrap().into())
-    };
-
-    // Build TLS config
-    let config = rustls::ServerConfig::builder()
-        .with_no_client_auth()
-        .with_single_cert(certs, key)
-        .map_err(|e| format!("Failed to build TLS config: {}", e))?;
-
-    let tls_acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(config));
-
-    let addr = format!("0.0.0.0:{}", server.port);
-    let listener = TcpListener::bind(&addr).await
-        .map_err(|e| format!("Failed to bind to port {}: {}", server.port, e))?;
-
-    let (shutdown_tx, mut shutdown_rx) = tokio::sync::oneshot::channel::<()>();
-    server.shutdown_tx = Some(shutdown_tx);
-
-    let running = Arc::clone(&server.running);
-    *running.write().await = true;
-
-    tokio::spawn(async move {
-        loop {
-            tokio::select! {
-                result = listener.accept() => {
-                    match result {
-                        Ok((stream, _addr)) => {
-                            // Disable Nagle's algorithm for lower latency
-                            let _ = stream.set_nodelay(true);
-                            let tls_acceptor = tls_acceptor.clone();
-                            tokio::spawn(async move {
-                                if let Ok(tls_stream) = tls_acceptor.accept(stream).await {
-                                    handle_https_client(tls_stream, ws_port, ws_use_tls).await;
-                                }
-                            });
-                        }
-                        Err(_) => break,
-                    }
-                }
-                _ = &mut shutdown_rx => {
-                    break;
-                }
-            }
-        }
-        *running.write().await = false;
-    });
-
-    Ok(())
-}
-
-// ============================================================================
-// Ban List for HTTP/WebSocket security
-// ============================================================================
-
-/// Tracks violations and bans for IP addresses
-#[derive(Clone)]
-pub struct BanList {
-    /// Permanently banned IPs (saved to .dat file)
-    permanent_bans: Arc<std::sync::RwLock<HashSet<String>>>,
-    /// Temporary bans: IP -> expiration time (Unix timestamp)
-    temp_bans: Arc<std::sync::RwLock<HashMap<String, u64>>>,
-    /// Violation tracking: IP -> list of violation timestamps
-    violations: Arc<std::sync::RwLock<HashMap<String, Vec<u64>>>>,
-    /// Ban reasons: IP -> last URL/reason that caused the ban
-    ban_reasons: Arc<std::sync::RwLock<HashMap<String, String>>>,
-}
-
-impl BanList {
-    pub fn new() -> Self {
-        Self {
-            permanent_bans: Arc::new(std::sync::RwLock::new(HashSet::new())),
-            temp_bans: Arc::new(std::sync::RwLock::new(HashMap::new())),
-            violations: Arc::new(std::sync::RwLock::new(HashMap::new())),
-            ban_reasons: Arc::new(std::sync::RwLock::new(HashMap::new())),
-        }
-    }
-
-    /// Check if an IP is currently banned (permanent or temporary)
-    pub fn is_banned(&self, ip: &str) -> bool {
-        // Check permanent bans
-        if self.permanent_bans.read().unwrap().contains(ip) {
-            return true;
-        }
-        // Check temporary bans
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
-        if let Some(&expiry) = self.temp_bans.read().unwrap().get(ip) {
-            if now < expiry {
-                return true;
-            }
-        }
-        false
-    }
-
-    /// Record a violation for an IP address with a reason (URL or description)
-    /// Returns true if the IP should be banned (5+ violations in 1 hour = permanent)
-    pub fn record_violation(&self, ip: &str, reason: &str) -> bool {
-        // Never ban localhost
-        if ip == "127.0.0.1" || ip == "::1" || ip == "localhost" {
-            return false;
-        }
-
-        // Store the reason for this violation
-        self.ban_reasons.write().unwrap().insert(ip.to_string(), reason.to_string());
-
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
-        let one_hour_ago = now.saturating_sub(3600);
-
-        let mut violations = self.violations.write().unwrap();
-        let ip_violations = violations.entry(ip.to_string()).or_default();
-
-        // Remove old violations (older than 1 hour)
-        ip_violations.retain(|&ts| ts > one_hour_ago);
-
-        // Add new violation
-        ip_violations.push(now);
-
-        let violation_count = ip_violations.len();
-
-        if violation_count >= 5 {
-            // Permanent ban
-            self.permanent_bans.write().unwrap().insert(ip.to_string());
-            violations.remove(ip); // Clear violations since permanently banned
-            true
-        } else if violation_count >= 3 {
-            // Temporary ban (5 minutes) after 3+ violations
-            self.temp_bans.write().unwrap().insert(ip.to_string(), now + 300);
-            true
-        } else {
-            false
-        }
-    }
-
-    /// Add a permanent ban directly
-    pub fn add_permanent_ban(&self, ip: &str) {
-        self.permanent_bans.write().unwrap().insert(ip.to_string());
-    }
-
-    /// Get all permanent bans (for saving to .dat file)
-    pub fn get_permanent_bans(&self) -> Vec<String> {
-        self.permanent_bans.read().unwrap().iter().cloned().collect()
-    }
-
-    /// Clean up expired temporary bans
-    pub fn cleanup_expired(&self) {
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
-        self.temp_bans.write().unwrap().retain(|_, &mut expiry| expiry > now);
-    }
-
-    /// Remove a ban (both permanent and temporary) for an IP
-    /// Returns true if a ban was removed
-    pub fn remove_ban(&self, ip: &str) -> bool {
-        let removed_perm = self.permanent_bans.write().unwrap().remove(ip);
-        let removed_temp = self.temp_bans.write().unwrap().remove(ip).is_some();
-        // Also clear violations and reason
-        self.violations.write().unwrap().remove(ip);
-        self.ban_reasons.write().unwrap().remove(ip);
-        removed_perm || removed_temp
-    }
-
-    /// Get all current bans with their reasons
-    /// Returns Vec of (ip, ban_type, reason) where ban_type is "permanent" or "temporary"
-    pub fn get_ban_info(&self) -> Vec<(String, String, String)> {
-        let mut result = Vec::new();
-        let reasons = self.ban_reasons.read().unwrap();
-
-        // Get permanent bans
-        for ip in self.permanent_bans.read().unwrap().iter() {
-            let reason = reasons.get(ip).cloned().unwrap_or_default();
-            result.push((ip.clone(), "permanent".to_string(), reason));
-        }
-
-        // Get active temporary bans
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
-        for (ip, expiry) in self.temp_bans.read().unwrap().iter() {
-            if *expiry > now {
-                let reason = reasons.get(ip).cloned().unwrap_or_default();
-                result.push((ip.clone(), "temporary".to_string(), reason));
-            }
-        }
-
-        result
-    }
-}
-
-impl Default for BanList {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-// ============================================================================
-// HTTP Web Interface Server (no TLS)
-// ============================================================================
-
-/// HTTP server state for the web interface (no TLS)
-struct HttpServer {
-    running: Arc<RwLock<bool>>,
-    shutdown_tx: Option<tokio::sync::oneshot::Sender<()>>,
-    port: u16,
-}
-
-impl HttpServer {
-    fn new(port: u16) -> Self {
-        Self {
-            running: Arc::new(RwLock::new(false)),
-            shutdown_tx: None,
-            port,
-        }
-    }
-}
-
-/// Handle an HTTP connection (plain TCP, no TLS)
-/// Returns true if a violation occurred (404 access)
-async fn handle_http_client(
-    mut stream: TcpStream,
-    ws_port: u16,
-    ws_use_tls: bool,
-    ban_list: BanList,
-    client_ip: String,
-) {
-    // Check if IP is banned
-    if ban_list.is_banned(&client_ip) {
-        // Send minimal response and close
-        let _ = stream.write_all(b"HTTP/1.1 403 Forbidden\r\nContent-Length: 7\r\nConnection: close\r\n\r\nBanned\n").await;
-        return;
-    }
-
-    let mut buf = [0u8; 4096];
-    let n = match stream.read(&mut buf).await {
-        Ok(n) if n > 0 => n,
-        _ => return,
-    };
-
-    let request = String::from_utf8_lossy(&buf[..n]);
-
-    // Reuse the parse function from either TLS backend
-    fn parse_request(request: &str) -> Option<(&str, &str)> {
-        let first_line = request.lines().next()?;
-        let mut parts = first_line.split_whitespace();
-        let method = parts.next()?;
-        let path = parts.next()?;
-        Some((method, path))
-    }
-
-    fn build_response(status: u16, status_text: &str, content_type: &str, body: &str) -> Vec<u8> {
-        format!(
-            "HTTP/1.1 {} {}\r\n\
-             Content-Type: {}; charset=utf-8\r\n\
-             Content-Length: {}\r\n\
-             Connection: close\r\n\
-             \r\n\
-             {}",
-            status, status_text, content_type, body.len(), body
-        ).into_bytes()
-    }
-
-    fn build_response_binary(status: u16, status_text: &str, content_type: &str, body: &[u8]) -> Vec<u8> {
-        let header = format!(
-            "HTTP/1.1 {} {}\r\n\
-             Content-Type: {}\r\n\
-             Content-Length: {}\r\n\
-             Connection: close\r\n\
-             \r\n",
-            status, status_text, content_type, body.len()
-        );
-        let mut response = header.into_bytes();
-        response.extend_from_slice(body);
-        response
-    }
-
-    if let Some((method, path)) = parse_request(&request) {
-        if method != "GET" {
-            let response = build_response(405, "Method Not Allowed", "text/plain", "Method Not Allowed");
-            let _ = stream.write_all(&response).await;
-            return;
-        }
-
-        // Read embedded files at compile time
-        const HTTP_INDEX_HTML: &str = include_str!("web/index.html");
-        const HTTP_STYLE_CSS: &str = include_str!("web/style.css");
-        const HTTP_APP_JS: &str = include_str!("web/app.js");
-        const HTTP_CLAY_PNG: &[u8] = include_bytes!("../clay.png");
-
-        let response = match path {
-            "/" | "/index.html" => {
-                // Inject WebSocket configuration into the HTML
-                let html = HTTP_INDEX_HTML
-                    .replace("{{WS_PORT}}", &ws_port.to_string())
-                    .replace("{{WS_PROTOCOL}}", if ws_use_tls { "wss" } else { "ws" });
-                build_response(200, "OK", "text/html", &html)
-            }
-            "/style.css" => {
-                build_response(200, "OK", "text/css", HTTP_STYLE_CSS)
-            }
-            "/app.js" => {
-                build_response(200, "OK", "application/javascript", HTTP_APP_JS)
-            }
-            "/clay.png" => {
-                build_response_binary(200, "OK", "image/png", HTTP_CLAY_PNG)
-            }
-            _ => {
-                // Record violation for accessing non-existent page
-                ban_list.record_violation(&client_ip, path);
-                build_response(404, "Not Found", "text/plain", "Not Found")
-            }
-        };
-
-        let _ = stream.write_all(&response).await;
-    }
-}
-
-/// Start the HTTP server (plain TCP, no TLS)
-async fn start_http_server(
-    server: &mut HttpServer,
-    ws_port: u16,
-    ws_use_tls: bool,
-    ban_list: BanList,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let addr = format!("0.0.0.0:{}", server.port);
-    let listener = TcpListener::bind(&addr).await
-        .map_err(|e| format!("Failed to bind HTTP to port {}: {}", server.port, e))?;
-
-    let (shutdown_tx, mut shutdown_rx) = tokio::sync::oneshot::channel::<()>();
-    server.shutdown_tx = Some(shutdown_tx);
-
-    let running = Arc::clone(&server.running);
-    *running.write().await = true;
-
-    tokio::spawn(async move {
-        loop {
-            tokio::select! {
-                result = listener.accept() => {
-                    match result {
-                        Ok((mut stream, addr)) => {
-                            let client_ip = addr.ip().to_string();
-                            // Check if banned before processing
-                            if ban_list.is_banned(&client_ip) {
-                                // Send minimal response and close
-                                let _ = stream.write_all(b"HTTP/1.1 403 Forbidden\r\nContent-Length: 7\r\nConnection: close\r\n\r\nBanned\n").await;
-                                continue;
-                            }
-                            // Disable Nagle's algorithm for lower latency
-                            let _ = stream.set_nodelay(true);
-                            let ban_list_clone = ban_list.clone();
-                            tokio::spawn(async move {
-                                handle_http_client(stream, ws_port, ws_use_tls, ban_list_clone, client_ip).await;
-                            });
-                        }
-                        Err(_) => break,
-                    }
-                }
-                _ = &mut shutdown_rx => {
-                    break;
-                }
-            }
-        }
-        *running.write().await = false;
-    });
-
-    Ok(())
-}
-
-// ============================================================================
 // Web Settings Popup (/web command)
 // ============================================================================
 
 
-struct ConfirmDialog {
+pub struct ConfirmDialog {
     visible: bool,
     message: String,
     yes_selected: bool,
@@ -915,7 +194,7 @@ impl ConfirmDialog {
     }
 }
 
-struct FilterPopup {
+pub struct FilterPopup {
     visible: bool,
     filter_text: String,
     cursor: usize,
@@ -1054,7 +333,7 @@ fn clay_filename(name: &str) -> String {
     { name.to_string() }
 }
 
-fn enable_tcp_keepalive(tcp_stream: &TcpStream) {
+pub fn enable_tcp_keepalive(tcp_stream: &TcpStream) {
     use socket2::SockRef;
     let keepalive = socket2::TcpKeepalive::new()
         .with_time(std::time::Duration::from_secs(60))
@@ -1066,7 +345,7 @@ fn enable_tcp_keepalive(tcp_stream: &TcpStream) {
 }
 
 #[derive(Clone)]
-struct Settings {
+pub struct Settings {
     more_mode_enabled: bool,
     spell_check_enabled: bool,
     temp_convert_enabled: bool,  // Temperature conversion (e.g., 32F -> 32F (0C))
@@ -1142,7 +421,7 @@ impl Default for Settings {
 
 /// Type of world connection
 #[derive(Clone, Debug, PartialEq, Default)]
-enum WorldType {
+pub enum WorldType {
     #[default]
     Mud,
     Slack,
@@ -1169,7 +448,7 @@ impl WorldType {
 }
 
 #[derive(Clone)]
-struct WorldSettings {
+pub struct WorldSettings {
     world_type: WorldType,
     // MUD settings
     hostname: String,
@@ -1229,29 +508,6 @@ impl WorldSettings {
     }
 }
 
-/// Match type for action patterns
-#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize, Default)]
-pub enum MatchType {
-    #[default]
-    Regexp,     // Regular expression matching
-    Wildcard,   // Glob/wildcard matching (* and ?)
-}
-
-impl MatchType {
-    fn as_str(self) -> &'static str {
-        match self {
-            MatchType::Regexp => "Regexp",
-            MatchType::Wildcard => "Wildcard",
-        }
-    }
-
-    fn parse(s: &str) -> Self {
-        match s.to_lowercase().as_str() {
-            "wildcard" => MatchType::Wildcard,
-            _ => MatchType::Regexp,
-        }
-    }
-}
 
 /// User account for multiuser mode
 #[derive(Clone, Debug)]
@@ -1280,38 +536,6 @@ pub struct ClientViewState {
     pub dimensions: Option<(u16, u16)>,
 }
 
-/// Helper function for serde default to return true
-fn default_enabled() -> bool { true }
-
-/// User-defined action/trigger
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct Action {
-    pub name: String,           // Unique name (also used as /name command if no pattern)
-    pub world: String,          // World name to match (empty = all worlds)
-    #[serde(default)]
-    pub match_type: MatchType,  // How to interpret pattern (regexp or wildcard)
-    pub pattern: String,        // Pattern to match output (empty = manual /name only)
-    pub command: String,        // Command(s) to execute, semicolon-separated
-    #[serde(default)]
-    pub owner: Option<String>,  // Username who owns this action (multiuser mode)
-    #[serde(default = "default_enabled")]
-    pub enabled: bool,          // If false, action will not fire
-}
-
-impl Action {
-    fn new() -> Self {
-        Self {
-            name: String::new(),
-            world: String::new(),
-            match_type: MatchType::Regexp,
-            pattern: String::new(),
-            command: String::new(),
-            owner: None,
-            enabled: true,
-        }
-    }
-}
-
 // ============================================================================
 // Shared Command Parsing
 // ============================================================================
@@ -1319,7 +543,7 @@ impl Action {
 /// Parsed command representation - shared across console, GUI, and web interfaces
 #[derive(Debug, Clone, PartialEq)]
 #[allow(clippy::enum_variant_names)]
-enum Command {
+pub enum Command {
     /// /help - show help popup
     Help,
     /// /version - show version info
@@ -1379,7 +603,7 @@ enum Command {
 }
 
 /// Parse a command string into a Command enum
-fn parse_command(input: &str) -> Command {
+pub fn parse_command(input: &str) -> Command {
     let trimmed = input.trim();
 
     // Not a command if doesn't start with /
@@ -1554,415 +778,6 @@ fn parse_send_command(args: &[&str], full_cmd: &str) -> Command {
     Command::Send { text, all_worlds, target_world, no_newline }
 }
 
-/// Split action command string by semicolons, handling escaped semicolons (\;)
-fn split_action_commands(command: &str) -> Vec<String> {
-    let mut result = Vec::new();
-    let mut current = String::new();
-    let mut chars = command.chars().peekable();
-
-    while let Some(c) = chars.next() {
-        if c == '\\' && chars.peek() == Some(&';') {
-            // Escaped semicolon - add literal semicolon
-            chars.next(); // consume the semicolon
-            current.push(';');
-        } else if c == ';' {
-            // Command separator
-            let trimmed = current.trim().to_string();
-            if !trimmed.is_empty() {
-                result.push(trimmed);
-            }
-            current.clear();
-        } else {
-            current.push(c);
-        }
-    }
-
-    // Don't forget the last command
-    let trimmed = current.trim().to_string();
-    if !trimmed.is_empty() {
-        result.push(trimmed);
-    }
-
-    result
-}
-
-/// Substitute action arguments ($1-$9, $*) in a command string
-/// args_str is the space-separated arguments passed to the action
-fn substitute_action_args(command: &str, args_str: &str) -> String {
-    // Split args into words
-    let args: Vec<&str> = args_str.split_whitespace().collect();
-
-    let mut result = String::with_capacity(command.len() + args_str.len());
-    let mut chars = command.chars().peekable();
-
-    while let Some(c) = chars.next() {
-        if c == '$' {
-            if let Some(&next) = chars.peek() {
-                if next == '*' {
-                    // $* - all arguments
-                    chars.next();
-                    result.push_str(args_str);
-                } else if next.is_ascii_digit() && next != '0' {
-                    // $1-$9
-                    chars.next();
-                    let idx = (next as usize) - ('1' as usize);
-                    if idx < args.len() {
-                        result.push_str(args[idx]);
-                    }
-                    // If arg doesn't exist, substitute with nothing
-                } else {
-                    // Not a substitution pattern, keep the $
-                    result.push(c);
-                }
-            } else {
-                // $ at end of string
-                result.push(c);
-            }
-        } else {
-            result.push(c);
-        }
-    }
-
-    result
-}
-
-/// Substitute pattern captures ($0-$9) in a command string
-/// $0 is the entire match, $1-$9 are capture groups
-/// captures[0] is the full match, captures[1..] are the groups
-fn substitute_pattern_captures(command: &str, captures: &[&str]) -> String {
-    let mut result = String::with_capacity(command.len() * 2);
-    let mut chars = command.chars().peekable();
-
-    while let Some(c) = chars.next() {
-        if c == '$' {
-            if let Some(&next) = chars.peek() {
-                if next.is_ascii_digit() {
-                    // $0-$9
-                    chars.next();
-                    let idx = (next as usize) - ('0' as usize);
-                    if idx < captures.len() {
-                        result.push_str(captures[idx]);
-                    }
-                    // If capture doesn't exist, substitute with nothing
-                } else if next == '*' {
-                    // $* - keep as-is for manual arg substitution later
-                    result.push(c);
-                } else {
-                    // Not a substitution pattern, keep the $
-                    result.push(c);
-                }
-            } else {
-                // $ at end of string
-                result.push(c);
-            }
-        } else {
-            result.push(c);
-        }
-    }
-
-    result
-}
-
-/// Result of checking action triggers on a line
-struct ActionTriggerResult {
-    should_gag: bool,           // If true, suppress the line from output
-    commands: Vec<String>,      // Commands to execute
-}
-
-/// Convert a wildcard pattern (* and ?) to a regex pattern
-/// Supports \* and \? to match literal asterisk and question mark
-/// Normalizes quotes: any double quote matches all double quote variants,
-/// any single quote matches all single quote variants
-/// Each * and ? becomes a capture group for $1, $2, etc. substitution
-fn wildcard_to_regex(pattern: &str) -> String {
-    // Wildcard patterns must match the entire line (anchored at start and end)
-    let mut regex = String::with_capacity(pattern.len() * 2 + 2);
-    regex.push('^');
-    let mut chars = pattern.chars().peekable();
-    while let Some(c) = chars.next() {
-        match c {
-            '\\' => {
-                // Check for escape sequences
-                match chars.peek() {
-                    Some('*') | Some('?') | Some('\\') => {
-                        // Escaped wildcard or backslash - treat as literal
-                        let escaped = chars.next().unwrap();
-                        regex.push('\\');
-                        regex.push(escaped);
-                    }
-                    _ => {
-                        // Lone backslash - escape it for regex
-                        regex.push_str("\\\\");
-                    }
-                }
-            }
-            // Wildcards become capture groups for $1, $2, etc.
-            '*' => regex.push_str("(.*)"),
-            '?' => regex.push_str("(.)"),
-            // Normalize double quotes: " (U+0022), " (U+201C), " (U+201D)
-            '"' | '\u{201C}' | '\u{201D}' => {
-                regex.push_str("[\"\u{201C}\u{201D}]");
-            }
-            // Normalize single quotes: ' (U+0027), ' (U+2018), ' (U+2019)
-            '\'' | '\u{2018}' | '\u{2019}' => {
-                regex.push_str("['\u{2018}\u{2019}]");
-            }
-            // Escape regex special characters
-            '.' | '+' | '^' | '$' | '|' | '(' | ')' | '[' | ']' | '{' | '}' => {
-                regex.push('\\');
-                regex.push(c);
-            }
-            _ => regex.push(c),
-        }
-    }
-    regex.push('$');
-    regex
-}
-
-/// Execute recall command with options
-/// Returns (matches, header_message) - matches is the list of matching lines
-fn execute_recall(opts: &tf::RecallOptions, output_lines: &[OutputLine]) -> (Vec<String>, Option<String>) {
-    use tf::{RecallMatchStyle, RecallRange};
-
-    // Build regex from pattern based on match style
-    let regex = opts.pattern.as_ref().map(|pattern| {
-        let regex_pattern = match opts.match_style {
-            RecallMatchStyle::Simple => {
-                // Simple: escape everything, just substring match
-                regex::escape(pattern)
-            }
-            RecallMatchStyle::Glob => {
-                // Glob: convert wildcards to regex
-                wildcard_to_regex(pattern)
-            }
-            RecallMatchStyle::Regexp => {
-                // Regexp: use as-is
-                pattern.clone()
-            }
-        };
-        regex::RegexBuilder::new(&regex_pattern)
-            .case_insensitive(true)
-            .build()
-    });
-
-    // Determine line range based on RecallRange
-    let (start_idx, end_idx) = match &opts.range {
-        RecallRange::All => (0, output_lines.len()),
-        RecallRange::Last(n) => {
-            let start = output_lines.len().saturating_sub(*n);
-            (start, output_lines.len())
-        }
-        RecallRange::LastMatching(_n) => {
-            // Will be handled specially below - get last n MATCHING lines
-            (0, output_lines.len())
-        }
-        RecallRange::Range(x, y) => {
-            // x and y are 1-based line numbers
-            let start = x.saturating_sub(1).min(output_lines.len());
-            let end = (*y).min(output_lines.len());
-            (start, end)
-        }
-        RecallRange::Previous(n) => {
-            // -y means yth previous line
-            let idx = output_lines.len().saturating_sub(*n);
-            (idx, idx + 1)
-        }
-        RecallRange::After(x) => {
-            // x- means lines after x (1-based)
-            let start = x.saturating_sub(1).min(output_lines.len());
-            (start, output_lines.len())
-        }
-        RecallRange::TimePeriod(secs) => {
-            // Lines within the last `secs` seconds
-            let now = std::time::SystemTime::now();
-            let cutoff = now - std::time::Duration::from_secs_f64(*secs);
-            let start = output_lines.iter().position(|line| line.timestamp >= cutoff).unwrap_or(output_lines.len());
-            (start, output_lines.len())
-        }
-        RecallRange::TimeRange(start_secs, end_secs) => {
-            // Lines between two time periods
-            let now = std::time::SystemTime::now();
-            let start_time = now - std::time::Duration::from_secs_f64(*start_secs);
-            let end_time = now - std::time::Duration::from_secs_f64(*end_secs);
-            let start = output_lines.iter().position(|line| line.timestamp >= start_time).unwrap_or(output_lines.len());
-            let end = output_lines.iter().rposition(|line| line.timestamp <= end_time).map(|i| i + 1).unwrap_or(0);
-            (start, end.max(start))
-        }
-    };
-
-    // Collect matching lines
-    let mut matches: Vec<(usize, String)> = Vec::new();
-    let lines_to_check = &output_lines[start_idx..end_idx];
-
-    for (rel_idx, line) in lines_to_check.iter().enumerate() {
-        let abs_idx = start_idx + rel_idx;
-
-        // Skip gagged lines unless show_gagged is set
-        if line.gagged && !opts.show_gagged {
-            continue;
-        }
-
-        let plain = strip_ansi_codes(&line.text);
-        let is_match = match &regex {
-            Some(Ok(re)) => {
-                let matched = re.is_match(&plain);
-                if opts.inverse_match { !matched } else { matched }
-            }
-            Some(Err(_)) => false, // Invalid regex
-            None => true, // No pattern = match all
-        };
-
-        if is_match {
-            let mut display_line = line.text.clone();
-
-            // Add timestamp if requested
-            if opts.show_timestamps {
-                let ts = line.timestamp.duration_since(std::time::UNIX_EPOCH)
-                    .map(|d| d.as_secs())
-                    .unwrap_or(0);
-                // Simple timestamp format HH:MM:SS
-                let secs = ts % 60;
-                let mins = (ts / 60) % 60;
-                let hours = (ts / 3600) % 24;
-                let ts_str = format!("{:02}:{:02}:{:02}", hours, mins, secs);
-                display_line = format!("[{}] {}", ts_str, display_line);
-            }
-
-            // Add line number if requested
-            if opts.show_line_numbers {
-                display_line = format!("{}: {}", abs_idx + 1, display_line);
-            }
-
-            matches.push((abs_idx, display_line));
-        }
-    }
-
-    // Handle LastMatching - keep only last N matches
-    if let RecallRange::LastMatching(n) = &opts.range {
-        let skip = matches.len().saturating_sub(*n);
-        matches = matches.into_iter().skip(skip).collect();
-    }
-
-    // TODO: Handle context lines (-A, -B, -C) if needed
-
-    let result: Vec<String> = matches.into_iter().map(|(_, s)| s).collect();
-
-    // Generate header if not quiet
-    let header = if opts.quiet {
-        None
-    } else {
-        Some("================ Recall start ================".to_string())
-    };
-
-    (result, header)
-}
-
-/// Check if a line matches any action triggers
-/// Returns None if no match, Some(result) if matched
-fn check_action_triggers(
-    line: &str,
-    world_name: &str,
-    actions: &[Action],
-) -> Option<ActionTriggerResult> {
-    // Strip ANSI codes for pattern matching
-    let plain_line = strip_ansi_codes(line);
-
-    for action in actions {
-        // Skip disabled actions
-        if !action.enabled {
-            continue;
-        }
-
-        // Skip actions without patterns (those are manual /name only)
-        if action.pattern.is_empty() {
-            continue;
-        }
-
-        // Check if world matches (empty = all worlds, case-insensitive)
-        if !action.world.is_empty() && !action.world.eq_ignore_ascii_case(world_name) {
-            continue;
-        }
-
-        // Convert pattern based on match type
-        let regex_pattern = match action.match_type {
-            MatchType::Wildcard => wildcard_to_regex(&action.pattern),
-            MatchType::Regexp => action.pattern.clone(),
-        };
-
-        // Try to compile and match the regex (case-insensitive)
-        if let Ok(regex) = RegexBuilder::new(&regex_pattern)
-            .case_insensitive(true)
-            .build()
-        {
-            if let Some(caps) = regex.captures(&plain_line) {
-                // Extract capture groups: $0 is full match, $1-$9 are groups
-                let captures: Vec<&str> = caps.iter()
-                    .map(|m| m.map(|m| m.as_str()).unwrap_or(""))
-                    .collect();
-
-                let commands = split_action_commands(&action.command);
-                let should_gag = commands.iter().any(|cmd|
-                    cmd.eq_ignore_ascii_case("/gag") || cmd.to_lowercase().starts_with("/gag ")
-                );
-
-                // Filter out /gag and substitute captures in commands
-                let filtered_commands: Vec<String> = commands.into_iter()
-                    .filter(|cmd| !cmd.eq_ignore_ascii_case("/gag") && !cmd.to_lowercase().starts_with("/gag "))
-                    .map(|cmd| substitute_pattern_captures(&cmd, &captures))
-                    .collect();
-
-                return Some(ActionTriggerResult {
-                    should_gag,
-                    commands: filtered_commands,
-                });
-            }
-        }
-    }
-
-    None
-}
-
-/// Check if a line matches any action pattern for the given world (for highlighting)
-/// Returns true if the line matches any action's pattern
-fn line_matches_action(
-    line: &str,
-    world_name: &str,
-    actions: &[Action],
-) -> bool {
-    // Strip ANSI codes for pattern matching
-    let plain_line = strip_ansi_codes(line);
-
-    for action in actions {
-        // Skip actions without patterns (those are manual /name only)
-        if action.pattern.is_empty() {
-            continue;
-        }
-
-        // Check if world matches (empty = all worlds)
-        if !action.world.is_empty() && !action.world.eq_ignore_ascii_case(world_name) {
-            continue;
-        }
-
-        // Convert pattern based on match type
-        let regex_pattern = match action.match_type {
-            MatchType::Wildcard => wildcard_to_regex(&action.pattern),
-            MatchType::Regexp => action.pattern.clone(),
-        };
-
-        // Try to compile and match the regex (case-insensitive)
-        if let Ok(regex) = RegexBuilder::new(&regex_pattern)
-            .case_insensitive(true)
-            .build()
-        {
-            if regex.is_match(&plain_line) {
-                return true;
-            }
-        }
-    }
-
-    false
-}
-
 #[cfg(all(unix, not(target_os = "android")))]
 const RELOAD_FDS_ENV: &str = "CLAY_RELOAD_FDS";
 const CRASH_COUNT_ENV: &str = "CLAY_CRASH_COUNT";
@@ -2026,7 +841,7 @@ fn crash_restart() {
         let app = unsafe { &*app_ptr };
 
         // Try to save state
-        if let Err(e) = save_reload_state(app) {
+        if let Err(e) = persistence::save_reload_state(app) {
             eprintln!("Failed to save state during crash: {}", e);
         }
 
@@ -2097,18 +912,18 @@ fn setup_crash_handler() {
 }
 
 /// Get current time as seconds since Unix epoch (for WebSocket timestamps)
-fn current_timestamp_secs() -> u64 {
+pub fn current_timestamp_secs() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs()
 }
 
 /// Output line with timestamp for F2/show tags feature
 #[derive(Clone)]
-struct OutputLine {
-    text: String,
-    timestamp: SystemTime,
-    from_server: bool,  // true if from MUD server, false if client-generated
-    gagged: bool,       // true if line was gagged by an action (only shown with F2)
-    seq: u64,           // Unique sequential number within the world (for debugging out-of-order issues)
+pub struct OutputLine {
+    pub text: String,
+    pub timestamp: SystemTime,
+    pub from_server: bool,  // true if from MUD server, false if client-generated
+    pub gagged: bool,       // true if line was gagged by an action (only shown with F2)
+    pub seq: u64,           // Unique sequential number within the world (for debugging out-of-order issues)
 }
 
 /// Maximum characters per output line (prevents performance issues with extremely long lines)
@@ -2205,7 +1020,7 @@ impl CachedNow {
     }
 }
 
-struct World {
+pub struct World {
     name: String,
     output_lines: Vec<OutputLine>,
     scroll_offset: usize,
@@ -2697,69 +1512,71 @@ impl World {
     }
 }
 
-struct App {
-    worlds: Vec<World>,
-    current_world_index: usize,
-    previous_world_index: Option<usize>, // For Alt+w fallback when no unseen/pending
-    input: InputArea,
-    input_height: u16,
-    output_height: u16,
-    output_width: u16,
-    spell_checker: SpellChecker,
-    spell_state: SpellState,
-    last_input_was_delete: bool, // Track if last input action was backspace/delete (for spell check)
-    skip_temp_conversion: Option<String>, // Temperature to skip re-converting (after user undid conversion)
-    cached_misspelled: Vec<(usize, usize)>, // Cached misspelled word ranges (char positions)
-    suggestion_message: Option<String>,
-    settings: Settings,
-    confirm_dialog: ConfirmDialog,
-    filter_popup: FilterPopup,
+pub struct App {
+    pub worlds: Vec<World>,
+    pub current_world_index: usize,
+    pub previous_world_index: Option<usize>, // For Alt+w fallback when no unseen/pending
+    pub input: InputArea,
+    pub input_height: u16,
+    pub output_height: u16,
+    pub output_width: u16,
+    pub spell_checker: SpellChecker,
+    pub spell_state: SpellState,
+    pub last_input_was_delete: bool, // Track if last input action was backspace/delete (for spell check)
+    pub skip_temp_conversion: Option<String>, // Temperature to skip re-converting (after user undid conversion)
+    pub cached_misspelled: Vec<(usize, usize)>, // Cached misspelled word ranges (char positions)
+    pub suggestion_message: Option<String>,
+    pub settings: Settings,
+    pub confirm_dialog: ConfirmDialog,
+    pub filter_popup: FilterPopup,
     /// New unified popup manager (gradual migration from old popup types)
-    popup_manager: popup::PopupManager,
-    last_ctrl_c: Option<std::time::Instant>,
-    last_escape: Option<std::time::Instant>, // For Escape+key sequences (Alt emulation)
-    show_tags: bool, // F2 toggles - false = hide tags (default), true = show tags
-    highlight_actions: bool, // F8 toggles - highlight lines matching action patterns
+    pub popup_manager: popup::PopupManager,
+    pub last_ctrl_c: Option<std::time::Instant>,
+    pub last_escape: Option<std::time::Instant>, // For Escape+key sequences (Alt emulation)
+    pub show_tags: bool, // F2 toggles - false = hide tags (default), true = show tags
+    pub highlight_actions: bool, // F8 toggles - highlight lines matching action patterns
     // WebSocket server (ws:// or wss:// depending on web_secure setting)
-    ws_server: Option<WebSocketServer>,
+    pub ws_server: Option<WebSocketServer>,
     // HTTP web interface server (no TLS)
-    http_server: Option<HttpServer>,
+    pub http_server: Option<HttpServer>,
     // HTTPS web interface server
     #[cfg(feature = "native-tls-backend")]
-    https_server: Option<HttpsServer>,
+    pub https_server: Option<HttpsServer>,
     #[cfg(feature = "rustls-backend")]
-    https_server: Option<HttpsServer>,
+    pub https_server: Option<HttpsServer>,
     // Track if popup was visible last frame (for terminal clear on transition)
-    popup_was_visible: bool,
+    pub popup_was_visible: bool,
     /// Cache of each WS client's view state (for activity indicator and more-mode)
     /// Maps client_id -> ClientViewState (world_index + visible_lines)
-    ws_client_worlds: std::collections::HashMap<u64, ClientViewState>,
+    pub ws_client_worlds: std::collections::HashMap<u64, ClientViewState>,
     /// True if this is the master client (runs WS server or WS disabled).
     /// Only master should save settings or initiate connections.
-    is_master: bool,
+    pub is_master: bool,
     /// True if this session started from a hot reload (suppress server startup messages)
-    is_reload: bool,
+    pub is_reload: bool,
     /// True if the output area needs to be redrawn (optimization to avoid unnecessary redraws)
-    needs_output_redraw: bool,
+    pub needs_output_redraw: bool,
     /// True if terminal needs full clear (for Ctrl+L redraw in --console mode)
-    needs_terminal_clear: bool,
+    pub needs_terminal_clear: bool,
     /// True if running in multiuser mode (--multiuser flag)
-    multiuser_mode: bool,
+    pub multiuser_mode: bool,
     /// User accounts (multiuser mode only)
-    users: Vec<User>,
+    pub users: Vec<User>,
     /// Ban list for HTTP/WebSocket security
-    ban_list: BanList,
+    pub ban_list: BanList,
     /// Per-user connections in multiuser mode: (world_index, username) -> UserConnection
-    user_connections: std::collections::HashMap<(usize, String), UserConnection>,
+    pub user_connections: std::collections::HashMap<(usize, String), UserConnection>,
     /// TinyFugue scripting engine
-    tf_engine: tf::TfEngine,
+    pub tf_engine: tf::TfEngine,
     // PROXY DEBUG: Timestamp when "think proxy" was sent, triggers reload after 2 seconds
     // TODO: Remove once proxy issues are resolved
-    proxy_debug_reload_at: Option<std::time::Instant>,
+    pub proxy_debug_reload_at: Option<std::time::Instant>,
     /// Remote client mode: WebSocket transmitter for sending commands to server
-    ws_client_tx: Option<mpsc::UnboundedSender<WsMessage>>,
+    pub ws_client_tx: Option<mpsc::UnboundedSender<WsMessage>>,
     /// Activity count from server (used in remote client mode, i.e. --console)
-    server_activity_count: usize,
+    pub server_activity_count: usize,
+    /// Master GUI mode: channel to send messages to the embedded GUI
+    pub gui_tx: Option<mpsc::UnboundedSender<WsMessage>>,
 }
 
 impl App {
@@ -2806,8 +1623,9 @@ impl App {
             proxy_debug_reload_at: None, // PROXY DEBUG: TODO remove
             ws_client_tx: None, // Set when running as remote client (--console mode)
             server_activity_count: 0, // Activity count from server (remote client mode)
+            gui_tx: None, // Set when running in master GUI mode (--gui)
         }
-        // Note: No initial world created here - it will be created after load_settings()
+        // Note: No initial world created here - it will be created after persistence::load_settings()
         // if no worlds are configured
     }
 
@@ -3047,7 +1865,7 @@ impl App {
                 }
             })
             .map(|(idx, a)| {
-                let status = if a.enabled { "[✓]" } else { "[ ]" };
+                let status = if a.enabled { "[x]" } else { "[ ]" };
                 let world_part = if a.world.is_empty() {
                     String::new()
                 } else {
@@ -3717,8 +2535,12 @@ impl App {
         self.needs_output_redraw = true;
     }
 
-    /// Broadcast a message to all authenticated WebSocket clients
+    /// Broadcast a message to all authenticated WebSocket clients and the embedded GUI (if any)
     fn ws_broadcast(&self, msg: WsMessage) {
+        // Send to embedded GUI channel (master GUI mode)
+        if let Some(ref tx) = self.gui_tx {
+            let _ = tx.send(msg.clone());
+        }
         // Broadcast to WebSocket server
         if let Some(ref server) = self.ws_server {
             let clients = server.clients.clone();
@@ -4631,12 +3453,12 @@ impl UserConnection {
     }
 }
 
-fn get_settings_path() -> PathBuf {
+pub fn get_settings_path() -> PathBuf {
     let home = get_home_dir();
     PathBuf::from(home).join(clay_filename("clay.dat"))
 }
 
-fn get_multiuser_settings_path() -> PathBuf {
+pub fn get_multiuser_settings_path() -> PathBuf {
     let home = get_home_dir();
     PathBuf::from(home).join(clay_filename("clay.multiuser.dat"))
 }
@@ -4671,1723 +3493,6 @@ fn debug_log(debug_enabled: bool, message: &str) {
             eprintln!("Failed to open debug log {:?}: {}", path, e);
         }
     }
-}
-
-/// Encryption key for password storage (padded to 32 bytes for AES-256)
-const PASSWORD_ENCRYPTION_KEY: &[u8; 32] = b"nonsupersecretpassword#\0\0\0\0\0\0\0\0\0";
-
-/// Encrypt a password using AES-256-GCM and return base64-encoded result
-fn encrypt_password(password: &str) -> String {
-    if password.is_empty() {
-        return String::new();
-    }
-
-    let cipher = Aes256Gcm::new(PASSWORD_ENCRYPTION_KEY.into());
-
-    // Use a fixed nonce derived from the password length (not cryptographically ideal,
-    // but acceptable for this obfuscation use case with a known key)
-    let mut nonce_bytes = [0u8; 12];
-    nonce_bytes[0] = (password.len() & 0xFF) as u8;
-    nonce_bytes[1] = ((password.len() >> 8) & 0xFF) as u8;
-    // Add some variation based on first few chars
-    for (i, b) in password.bytes().take(10).enumerate() {
-        nonce_bytes[2 + i] = b;
-    }
-    let nonce = Nonce::from_slice(&nonce_bytes);
-
-    match cipher.encrypt(nonce, password.as_bytes()) {
-        Ok(ciphertext) => {
-            // Prepend nonce to ciphertext and base64 encode
-            let mut combined = nonce_bytes.to_vec();
-            combined.extend(ciphertext);
-            format!("ENC:{}", BASE64.encode(&combined))
-        }
-        Err(_) => {
-            // Fallback to plain (shouldn't happen)
-            password.to_string()
-        }
-    }
-}
-
-/// Decrypt a password. Returns the original string if it's not encrypted or decryption fails.
-fn decrypt_password(stored: &str) -> String {
-    if stored.is_empty() {
-        return String::new();
-    }
-
-    // Check if it's an encrypted password
-    if !stored.starts_with("ENC:") {
-        // Not encrypted, return as-is (legacy plain password)
-        return stored.to_string();
-    }
-
-    let encoded = &stored[4..]; // Skip "ENC:" prefix
-
-    let combined = match BASE64.decode(encoded) {
-        Ok(data) => data,
-        Err(_) => return stored.to_string(), // Invalid base64, treat as plain
-    };
-
-    if combined.len() < 12 {
-        // Too short to contain nonce, treat as plain
-        return stored.to_string();
-    }
-
-    let (nonce_bytes, ciphertext) = combined.split_at(12);
-    let nonce = Nonce::from_slice(nonce_bytes);
-    let cipher = Aes256Gcm::new(PASSWORD_ENCRYPTION_KEY.into());
-
-    match cipher.decrypt(nonce, ciphertext) {
-        Ok(plaintext) => String::from_utf8_lossy(&plaintext).to_string(),
-        Err(_) => {
-            // Decryption failed - might be a plain password that happens to start with "ENC:"
-            // This is unlikely but we handle it gracefully
-            stored.to_string()
-        }
-    }
-}
-
-fn save_settings(app: &App) -> io::Result<()> {
-    // Only master client should save settings
-    if !app.is_master {
-        return Ok(());
-    }
-    let path = get_settings_path();
-    let mut file = std::fs::File::create(&path)?;
-
-    // Save global settings
-    writeln!(file, "[global]")?;
-    writeln!(file, "more_mode={}", app.settings.more_mode_enabled)?;
-    writeln!(file, "spell_check={}", app.settings.spell_check_enabled)?;
-    writeln!(file, "temp_convert={}", app.settings.temp_convert_enabled)?;
-    writeln!(file, "world_switch_mode={}", app.settings.world_switch_mode.name())?;
-    writeln!(file, "show_tags={}", app.show_tags)?;
-    writeln!(file, "debug_enabled={}", app.settings.debug_enabled)?;
-    writeln!(file, "ansi_music_enabled={}", app.settings.ansi_music_enabled)?;
-    writeln!(file, "input_height={}", app.input_height)?;
-    writeln!(file, "theme={}", app.settings.theme.name())?;
-    writeln!(file, "gui_theme={}", app.settings.gui_theme.name())?;
-    writeln!(file, "gui_transparency={}", app.settings.gui_transparency)?;
-    writeln!(file, "color_offset_percent={}", app.settings.color_offset_percent)?;
-    writeln!(file, "font_name={}", app.settings.font_name)?;
-    writeln!(file, "font_size={}", app.settings.font_size)?;
-    writeln!(file, "web_font_size_phone={}", app.settings.web_font_size_phone)?;
-    writeln!(file, "web_font_size_tablet={}", app.settings.web_font_size_tablet)?;
-    writeln!(file, "web_font_size_desktop={}", app.settings.web_font_size_desktop)?;
-    writeln!(file, "web_secure={}", app.settings.web_secure)?;
-    writeln!(file, "http_enabled={}", app.settings.http_enabled)?;
-    writeln!(file, "http_port={}", app.settings.http_port)?;
-    writeln!(file, "ws_enabled={}", app.settings.ws_enabled)?;
-    writeln!(file, "ws_port={}", app.settings.ws_port)?;
-    if !app.settings.websocket_password.is_empty() {
-        writeln!(file, "websocket_password={}", encrypt_password(&app.settings.websocket_password))?;
-    }
-    if !app.settings.websocket_allow_list.is_empty() {
-        writeln!(file, "websocket_allow_list={}", app.settings.websocket_allow_list)?;
-    }
-    if !app.settings.websocket_cert_file.is_empty() {
-        writeln!(file, "websocket_cert_file={}", app.settings.websocket_cert_file)?;
-    }
-    if !app.settings.websocket_key_file.is_empty() {
-        writeln!(file, "websocket_key_file={}", app.settings.websocket_key_file)?;
-    }
-    writeln!(file, "tls_proxy_enabled={}", app.settings.tls_proxy_enabled)?;
-    if !app.settings.dictionary_path.is_empty() {
-        writeln!(file, "dictionary_path={}", app.settings.dictionary_path)?;
-    }
-
-    // Save each world's settings (skip unconfigured worlds that have no connection info)
-    for world in &app.worlds {
-        let has_mud_config = !world.settings.hostname.is_empty();
-        let has_slack_config = !world.settings.slack_token.is_empty();
-        let has_discord_config = !world.settings.discord_token.is_empty();
-        if !has_mud_config && !has_slack_config && !has_discord_config {
-            continue; // Don't persist unconfigured worlds
-        }
-        writeln!(file)?;
-        writeln!(file, "[world:{}]", world.name)?;
-        writeln!(file, "world_type={}", world.settings.world_type.name())?;
-        // MUD settings
-        writeln!(file, "hostname={}", world.settings.hostname)?;
-        writeln!(file, "port={}", world.settings.port)?;
-        writeln!(file, "user={}", world.settings.user)?;
-        writeln!(file, "password={}", encrypt_password(&world.settings.password))?;
-        writeln!(file, "use_ssl={}", world.settings.use_ssl)?;
-        writeln!(file, "encoding={}", world.settings.encoding.name())?;
-        writeln!(file, "auto_connect_type={}", world.settings.auto_connect_type.name())?;
-        writeln!(file, "keep_alive_type={}", world.settings.keep_alive_type.name())?;
-        if !world.settings.keep_alive_cmd.is_empty() {
-            writeln!(file, "keep_alive_cmd={}", world.settings.keep_alive_cmd)?;
-        }
-        if world.settings.log_enabled {
-            writeln!(file, "log_enabled=true")?;
-        }
-        // Slack settings
-        if !world.settings.slack_token.is_empty() {
-            writeln!(file, "slack_token={}", encrypt_password(&world.settings.slack_token))?;
-        }
-        if !world.settings.slack_channel.is_empty() {
-            writeln!(file, "slack_channel={}", world.settings.slack_channel)?;
-        }
-        if !world.settings.slack_workspace.is_empty() {
-            writeln!(file, "slack_workspace={}", world.settings.slack_workspace)?;
-        }
-        // Discord settings
-        if !world.settings.discord_token.is_empty() {
-            writeln!(file, "discord_token={}", encrypt_password(&world.settings.discord_token))?;
-        }
-        if !world.settings.discord_guild.is_empty() {
-            writeln!(file, "discord_guild={}", world.settings.discord_guild)?;
-        }
-        if !world.settings.discord_channel.is_empty() {
-            writeln!(file, "discord_channel={}", world.settings.discord_channel)?;
-        }
-        if !world.settings.discord_dm_user.is_empty() {
-            writeln!(file, "discord_dm_user={}", world.settings.discord_dm_user)?;
-        }
-    }
-
-    // Save actions (by name, escaping special characters)
-    for action in app.settings.actions.iter() {
-        writeln!(file)?;
-        // Escape special chars in name for section header: ] [ = \
-        let escaped_name = action.name
-            .replace('\\', "\\\\")
-            .replace(']', "\\]")
-            .replace('[', "\\[")
-            .replace('=', "\\e");
-        writeln!(file, "[action:{}]", escaped_name)?;
-        if !action.world.is_empty() {
-            writeln!(file, "world={}", action.world)?;
-        }
-        // Only save match_type if not the default (regexp)
-        if action.match_type != MatchType::Regexp {
-            writeln!(file, "match_type={}", action.match_type.as_str().to_lowercase())?;
-        }
-        if !action.pattern.is_empty() {
-            // Escape newlines and equals signs in pattern
-            writeln!(file, "pattern={}", action.pattern.replace('\\', "\\\\").replace('=', "\\e").replace('\n', "\\n"))?;
-        }
-        if !action.command.is_empty() {
-            // Escape newlines and equals signs in command
-            writeln!(file, "command={}", action.command.replace('\\', "\\\\").replace('=', "\\e").replace('\n', "\\n"))?;
-        }
-        // Only save enabled if not the default (true)
-        if !action.enabled {
-            writeln!(file, "enabled=false")?;
-        }
-    }
-
-    // Save permanent bans
-    let permanent_bans = app.ban_list.get_permanent_bans();
-    if !permanent_bans.is_empty() {
-        writeln!(file)?;
-        writeln!(file, "[banned_hosts]")?;
-        for ip in permanent_bans {
-            writeln!(file, "ip={}", ip)?;
-        }
-    }
-
-    // Save TF global variables
-    if !app.tf_engine.global_vars.is_empty() {
-        writeln!(file)?;
-        writeln!(file, "[tf_globals]")?;
-        for (name, value) in &app.tf_engine.global_vars {
-            // Escape special characters in value
-            let val_str = value.to_string_value()
-                .replace('\\', "\\\\")
-                .replace('=', "\\e")
-                .replace('\n', "\\n");
-            writeln!(file, "{}={}", name, val_str)?;
-        }
-    }
-
-    Ok(())
-}
-
-fn load_settings(app: &mut App) -> io::Result<()> {
-    let path = get_settings_path();
-    if !path.exists() {
-        return Ok(());
-    }
-
-    let file = std::fs::File::open(&path)?;
-    let reader = std::io::BufReader::new(file);
-
-    let mut current_world: Option<String> = None;
-    let mut current_action: Option<usize> = None;
-    let mut in_banned_hosts = false;
-    let mut in_tf_globals = false;
-
-    for line in reader.lines() {
-        let line = line?;
-        let line = line.trim();
-
-        if line.is_empty() {
-            continue;
-        }
-
-        if line.starts_with("[global]") {
-            current_world = None;
-            current_action = None;
-            in_banned_hosts = false;
-            in_tf_globals = false;
-            continue;
-        }
-
-        if line.starts_with("[banned_hosts]") {
-            current_world = None;
-            current_action = None;
-            in_banned_hosts = true;
-            in_tf_globals = false;
-            continue;
-        }
-
-        if line.starts_with("[tf_globals]") {
-            current_world = None;
-            current_action = None;
-            in_banned_hosts = false;
-            in_tf_globals = true;
-            continue;
-        }
-
-        if line.starts_with("[world:") && line.ends_with(']') {
-            let name = &line[7..line.len() - 1];
-            // Find or create world
-            let idx = app.find_or_create_world(name);
-            current_world = Some(app.worlds[idx].name.clone());
-            current_action = None;
-            in_banned_hosts = false;
-            in_tf_globals = false;
-            continue;
-        }
-
-        if line.starts_with("[action:") && line.ends_with(']') {
-            // Parse action section - supports both old format [action:NUMBER] and new format [action:NAME]
-            current_world = None;
-            in_banned_hosts = false;
-            in_tf_globals = false;
-            let section_content = &line[8..line.len() - 1]; // Extract between "[action:" and "]"
-
-            // Unescape the section content (for new format names with special chars)
-            let unescaped = section_content
-                .replace("\\]", "]")
-                .replace("\\[", "[")
-                .replace("\\e", "=")
-                .replace("\\\\", "\\");
-
-            // Check if it's old format (pure number) or new format (name)
-            let is_old_format = unescaped.chars().all(|c| c.is_ascii_digit());
-
-            if is_old_format {
-                // Old format: create new action, will get name from name= field
-                app.settings.actions.push(Action::new());
-                current_action = Some(app.settings.actions.len() - 1);
-            } else {
-                // New format: look for existing action with this name or create new
-                let action_name = unescaped;
-                if let Some(idx) = app.settings.actions.iter().position(|a| a.name == action_name) {
-                    current_action = Some(idx);
-                } else {
-                    let mut new_action = Action::new();
-                    new_action.name = action_name;
-                    app.settings.actions.push(new_action);
-                    current_action = Some(app.settings.actions.len() - 1);
-                }
-            }
-            continue;
-        }
-
-        if let Some(eq_pos) = line.find('=') {
-            let key = &line[..eq_pos];
-            let value = &line[eq_pos + 1..];
-
-            // Check for banned hosts section
-            if in_banned_hosts {
-                if key == "ip" && !value.is_empty() {
-                    app.ban_list.add_permanent_ban(value);
-                }
-                continue;
-            }
-
-            // Check for TF globals section
-            if in_tf_globals {
-                // Unescape the value
-                let unescaped = value
-                    .replace("\\n", "\n")
-                    .replace("\\e", "=")
-                    .replace("\\\\", "\\");
-                app.tf_engine.set_global(key, tf::TfValue::from(unescaped));
-                continue;
-            }
-
-            // Check for action settings first (current_action takes priority)
-            if let Some(action_idx) = current_action {
-                // Action settings
-                if let Some(action) = app.settings.actions.get_mut(action_idx) {
-                    // Helper to unescape saved strings
-                    fn unescape_action_value(s: &str) -> String {
-                        s.replace("\\n", "\n").replace("\\e", "=").replace("\\\\", "\\")
-                    }
-                    match key {
-                        "name" => action.name = value.to_string(),
-                        "world" => action.world = value.to_string(),
-                        "match_type" => action.match_type = MatchType::parse(value),
-                        "pattern" => action.pattern = unescape_action_value(value),
-                        "command" => action.command = unescape_action_value(value),
-                        "enabled" => action.enabled = value != "false",
-                        _ => {}
-                    }
-                }
-            } else if current_world.is_none() {
-                // Global settings
-                match key {
-                    "more_mode" => {
-                        app.settings.more_mode_enabled = value == "true";
-                    }
-                    "spell_check" => {
-                        app.settings.spell_check_enabled = value == "true";
-                    }
-                    "temp_convert" => {
-                        app.settings.temp_convert_enabled = value == "true";
-                    }
-                    "pending_first" => {
-                        // Backward compatibility: pending_first=true -> UnseenFirst
-                        app.settings.world_switch_mode = if value == "true" {
-                            WorldSwitchMode::UnseenFirst
-                        } else {
-                            WorldSwitchMode::Alphabetical
-                        };
-                    }
-                    "world_switch_mode" => {
-                        app.settings.world_switch_mode = WorldSwitchMode::from_name(value);
-                    }
-                    "debug_enabled" => {
-                        app.settings.debug_enabled = value == "true";
-                    }
-                    "ansi_music_enabled" => {
-                        app.settings.ansi_music_enabled = value == "true";
-                    }
-                    "input_height" => {
-                        if let Ok(h) = value.parse::<u16>() {
-                            app.input_height = h.clamp(1, 15);
-                            app.input.visible_height = app.input_height;
-                        }
-                    }
-                    "theme" => {
-                        app.settings.theme = Theme::from_name(value);
-                    }
-                    "gui_theme" => {
-                        app.settings.gui_theme = Theme::from_name(value);
-                    }
-                    "font_name" => {
-                        app.settings.font_name = value.to_string();
-                    }
-                    "font_size" => {
-                        if let Ok(s) = value.parse::<f32>() {
-                            app.settings.font_size = s.clamp(8.0, 48.0);
-                        }
-                    }
-                    // Backward compat: old single web_font_size sets all three
-                    "web_font_size" => {
-                        if let Ok(s) = value.parse::<f32>() {
-                            let clamped = s.clamp(8.0, 48.0);
-                            app.settings.web_font_size_phone = clamped;
-                            app.settings.web_font_size_tablet = clamped;
-                            app.settings.web_font_size_desktop = clamped;
-                        }
-                    }
-                    "web_font_size_phone" => {
-                        if let Ok(s) = value.parse::<f32>() {
-                            app.settings.web_font_size_phone = s.clamp(8.0, 48.0);
-                        }
-                    }
-                    "web_font_size_tablet" => {
-                        if let Ok(s) = value.parse::<f32>() {
-                            app.settings.web_font_size_tablet = s.clamp(8.0, 48.0);
-                        }
-                    }
-                    "web_font_size_desktop" => {
-                        if let Ok(s) = value.parse::<f32>() {
-                            app.settings.web_font_size_desktop = s.clamp(8.0, 48.0);
-                        }
-                    }
-                    "gui_transparency" => {
-                        if let Ok(t) = value.parse::<f32>() {
-                            app.settings.gui_transparency = t.clamp(0.3, 1.0);
-                        }
-                    }
-                    "color_offset_percent" => {
-                        if let Ok(p) = value.parse::<u8>() {
-                            app.settings.color_offset_percent = p.min(100);
-                        }
-                    }
-                    "web_secure" => {
-                        app.settings.web_secure = value == "true";
-                    }
-                    "ws_enabled" => {
-                        app.settings.ws_enabled = value == "true";
-                    }
-                    "ws_port" => {
-                        if let Ok(p) = value.parse::<u16>() {
-                            app.settings.ws_port = p;
-                        }
-                    }
-                    // Legacy: websocket_enabled maps to ws_enabled
-                    "websocket_enabled" => {
-                        app.settings.ws_enabled = value == "true";
-                    }
-                    // Legacy: websocket_port maps to ws_port
-                    "websocket_port" => {
-                        if let Ok(p) = value.parse::<u16>() {
-                            app.settings.ws_port = p;
-                        }
-                    }
-                    // Legacy: websocket_use_tls maps to web_secure
-                    "websocket_use_tls" => {
-                        app.settings.web_secure = value == "true";
-                    }
-                    "websocket_password" => {
-                        app.settings.websocket_password = decrypt_password(value);
-                    }
-                    "websocket_allow_list" => {
-                        app.settings.websocket_allow_list = value.to_string();
-                    }
-                    "websocket_cert_file" => {
-                        app.settings.websocket_cert_file = value.to_string();
-                    }
-                    "websocket_key_file" => {
-                        app.settings.websocket_key_file = value.to_string();
-                    }
-                    "http_enabled" => {
-                        app.settings.http_enabled = value == "true";
-                    }
-                    "http_port" => {
-                        if let Ok(p) = value.parse::<u16>() {
-                            app.settings.http_port = p;
-                        }
-                    }
-                    // Legacy fields - map https to http when web_secure, ws_nonsecure to ws when !web_secure
-                    "https_enabled" => {
-                        // If https was enabled in old config, set http_enabled and web_secure
-                        if value == "true" {
-                            app.settings.http_enabled = true;
-                            app.settings.web_secure = true;
-                        }
-                    }
-                    "https_port" => {
-                        // Legacy: https_port was separate, now http_port is used for both
-                        if let Ok(p) = value.parse::<u16>() {
-                            // Only use https_port if web_secure is set
-                            if app.settings.web_secure {
-                                app.settings.http_port = p;
-                            }
-                        }
-                    }
-                    "ws_nonsecure_enabled" => {
-                        // Legacy: ws_nonsecure maps to ws_enabled when not secure
-                        if value == "true" && !app.settings.web_secure {
-                            app.settings.ws_enabled = true;
-                        }
-                    }
-                    "ws_nonsecure_port" => {
-                        // Legacy: ws_nonsecure_port was separate, now ws_port is used for both
-                        if let Ok(p) = value.parse::<u16>() {
-                            if !app.settings.web_secure {
-                                app.settings.ws_port = p;
-                            }
-                        }
-                    }
-                    // Legacy: ignore global encoding, it's now per-world
-                    "encoding" => {}
-                    "tls_proxy_enabled" => {
-                        app.settings.tls_proxy_enabled = value == "true";
-                    }
-                    "dictionary_path" => {
-                        app.settings.dictionary_path = value.to_string();
-                    }
-                    _ => {}
-                }
-            } else if let Some(ref world_name) = current_world {
-                // Find the world and update its settings
-                if let Some(world) = app.worlds.iter_mut().find(|w| &w.name == world_name) {
-                    match key {
-                        "world_type" => world.settings.world_type = WorldType::from_name(value),
-                        "hostname" => world.settings.hostname = value.to_string(),
-                        "port" => world.settings.port = value.to_string(),
-                        "user" => world.settings.user = value.to_string(),
-                        "password" => world.settings.password = decrypt_password(value),
-                        "use_ssl" => world.settings.use_ssl = value == "true",
-                        "log_enabled" => world.settings.log_enabled = value == "true",
-                        "log_file" => world.settings.log_enabled = true, // Backward compat: old log_file setting enables logging
-                        "encoding" => {
-                            world.settings.encoding = match value {
-                                "latin1" => Encoding::Latin1,
-                                "fansi" => Encoding::Fansi,
-                                _ => Encoding::Utf8,
-                            };
-                        }
-                        "auto_connect_type" => {
-                            world.settings.auto_connect_type = AutoConnectType::from_name(value);
-                        }
-                        "keep_alive_type" => {
-                            world.settings.keep_alive_type = KeepAliveType::from_name(value);
-                        }
-                        "keep_alive_cmd" => {
-                            world.settings.keep_alive_cmd = value.to_string();
-                        }
-                        // Slack settings
-                        "slack_token" => world.settings.slack_token = decrypt_password(value),
-                        "slack_channel" => world.settings.slack_channel = value.to_string(),
-                        "slack_workspace" => world.settings.slack_workspace = value.to_string(),
-                        // Discord settings
-                        "discord_token" => world.settings.discord_token = decrypt_password(value),
-                        "discord_guild" => world.settings.discord_guild = value.to_string(),
-                        "discord_channel" => world.settings.discord_channel = value.to_string(),
-                        "discord_dm_user" => world.settings.discord_dm_user = value.to_string(),
-                        _ => {}
-                    }
-                }
-            }
-        }
-    }
-
-    Ok(())
-}
-
-/// Load settings for multiuser mode from ~/.clay.multiuser.dat
-fn load_multiuser_settings(app: &mut App) -> io::Result<()> {
-    let path = get_multiuser_settings_path();
-    if !path.exists() {
-        return Err(io::Error::new(io::ErrorKind::NotFound, "Multiuser settings file not found"));
-    }
-
-    let file = std::fs::File::open(&path)?;
-    let reader = std::io::BufReader::new(file);
-
-    let mut current_world: Option<String> = None;
-    let mut current_action: Option<usize> = None;
-    let mut current_user: Option<String> = None;
-    let mut in_banned_hosts = false;
-
-    for line in reader.lines() {
-        let line = line?;
-        let line = line.trim();
-
-        if line.is_empty() {
-            continue;
-        }
-
-        if line.starts_with("[global]") {
-            current_world = None;
-            current_action = None;
-            current_user = None;
-            in_banned_hosts = false;
-            continue;
-        }
-
-        if line.starts_with("[banned_hosts]") {
-            current_world = None;
-            current_action = None;
-            current_user = None;
-            in_banned_hosts = true;
-            continue;
-        }
-
-        // Parse [user:NAME] sections
-        if line.starts_with("[user:") && line.ends_with(']') {
-            let name = &line[6..line.len() - 1];
-            // Unescape the name
-            let unescaped = name
-                .replace("\\]", "]")
-                .replace("\\[", "[")
-                .replace("\\e", "=")
-                .replace("\\\\", "\\");
-
-            // Create new user or find existing
-            if !app.users.iter().any(|u| u.name == unescaped) {
-                app.users.push(User::new(&unescaped, ""));
-            }
-            current_user = Some(unescaped);
-            current_world = None;
-            current_action = None;
-            in_banned_hosts = false;
-            continue;
-        }
-
-        // Parse [world:NAME:OWNER] sections
-        if line.starts_with("[world:") && line.ends_with(']') {
-            let content = &line[7..line.len() - 1];
-            // Find the last colon to split name:owner
-            if let Some(last_colon) = content.rfind(':') {
-                let name = &content[..last_colon];
-                let owner = &content[last_colon + 1..];
-
-                // Unescape both
-                let name_unescaped = name
-                    .replace("\\:", ":")
-                    .replace("\\]", "]")
-                    .replace("\\[", "[")
-                    .replace("\\e", "=")
-                    .replace("\\\\", "\\");
-                let owner_unescaped = owner
-                    .replace("\\:", ":")
-                    .replace("\\]", "]")
-                    .replace("\\[", "[")
-                    .replace("\\e", "=")
-                    .replace("\\\\", "\\");
-
-                // Find or create world
-                let idx = app.find_or_create_world(&name_unescaped);
-                app.worlds[idx].owner = Some(owner_unescaped);
-                current_world = Some(app.worlds[idx].name.clone());
-            } else {
-                // No owner specified - this will fail validation later
-                let name_unescaped = content
-                    .replace("\\]", "]")
-                    .replace("\\[", "[")
-                    .replace("\\e", "=")
-                    .replace("\\\\", "\\");
-                let idx = app.find_or_create_world(&name_unescaped);
-                current_world = Some(app.worlds[idx].name.clone());
-            }
-            current_action = None;
-            current_user = None;
-            in_banned_hosts = false;
-            continue;
-        }
-
-        // Parse [action:NAME:OWNER] sections
-        if line.starts_with("[action:") && line.ends_with(']') {
-            let content = &line[8..line.len() - 1];
-            // Find the last colon to split name:owner
-            if let Some(last_colon) = content.rfind(':') {
-                let name = &content[..last_colon];
-                let owner = &content[last_colon + 1..];
-
-                // Unescape both
-                let name_unescaped = name
-                    .replace("\\:", ":")
-                    .replace("\\]", "]")
-                    .replace("\\[", "[")
-                    .replace("\\e", "=")
-                    .replace("\\\\", "\\");
-                let owner_unescaped = owner
-                    .replace("\\:", ":")
-                    .replace("\\]", "]")
-                    .replace("\\[", "[")
-                    .replace("\\e", "=")
-                    .replace("\\\\", "\\");
-
-                // Find or create action
-                if let Some(idx) = app.settings.actions.iter().position(|a| a.name == name_unescaped) {
-                    app.settings.actions[idx].owner = Some(owner_unescaped);
-                    current_action = Some(idx);
-                } else {
-                    let mut new_action = Action::new();
-                    new_action.name = name_unescaped;
-                    new_action.owner = Some(owner_unescaped);
-                    app.settings.actions.push(new_action);
-                    current_action = Some(app.settings.actions.len() - 1);
-                }
-            } else {
-                // No owner specified - this will fail validation later
-                let name_unescaped = content
-                    .replace("\\]", "]")
-                    .replace("\\[", "[")
-                    .replace("\\e", "=")
-                    .replace("\\\\", "\\");
-
-                if let Some(idx) = app.settings.actions.iter().position(|a| a.name == name_unescaped) {
-                    current_action = Some(idx);
-                } else {
-                    let mut new_action = Action::new();
-                    new_action.name = name_unescaped;
-                    app.settings.actions.push(new_action);
-                    current_action = Some(app.settings.actions.len() - 1);
-                }
-            }
-            current_world = None;
-            current_user = None;
-            in_banned_hosts = false;
-            continue;
-        }
-
-        if let Some(eq_pos) = line.find('=') {
-            let key = &line[..eq_pos];
-            let value = &line[eq_pos + 1..];
-
-            // Banned hosts section
-            if in_banned_hosts {
-                if key == "ip" && !value.is_empty() {
-                    app.ban_list.add_permanent_ban(value);
-                }
-                continue;
-            }
-
-            // User settings
-            if let Some(ref user_name) = current_user {
-                if let Some(user) = app.users.iter_mut().find(|u| &u.name == user_name) {
-                    if key == "password" {
-                        user.password = decrypt_password(value);
-                    }
-                }
-            }
-            // Action settings
-            else if let Some(action_idx) = current_action {
-                if let Some(action) = app.settings.actions.get_mut(action_idx) {
-                    fn unescape_action_value(s: &str) -> String {
-                        s.replace("\\n", "\n").replace("\\e", "=").replace("\\\\", "\\")
-                    }
-                    match key {
-                        "name" => action.name = value.to_string(),
-                        "world" => action.world = value.to_string(),
-                        "match_type" => action.match_type = MatchType::parse(value),
-                        "pattern" => action.pattern = unescape_action_value(value),
-                        "command" => action.command = unescape_action_value(value),
-                        "enabled" => action.enabled = value != "false",
-                        _ => {}
-                    }
-                }
-            }
-            // World settings
-            else if let Some(ref world_name) = current_world {
-                if let Some(world) = app.worlds.iter_mut().find(|w| &w.name == world_name) {
-                    match key {
-                        "world_type" => world.settings.world_type = WorldType::from_name(value),
-                        "hostname" => world.settings.hostname = value.to_string(),
-                        "port" => world.settings.port = value.to_string(),
-                        "user" => world.settings.user = value.to_string(),
-                        "password" => world.settings.password = decrypt_password(value),
-                        "use_ssl" => world.settings.use_ssl = value == "true",
-                        "log_enabled" => world.settings.log_enabled = value == "true",
-                        "encoding" => {
-                            world.settings.encoding = match value {
-                                "latin1" => Encoding::Latin1,
-                                "fansi" => Encoding::Fansi,
-                                _ => Encoding::Utf8,
-                            };
-                        }
-                        "auto_connect_type" => {
-                            world.settings.auto_connect_type = AutoConnectType::from_name(value);
-                        }
-                        "keep_alive_type" => {
-                            world.settings.keep_alive_type = KeepAliveType::from_name(value);
-                        }
-                        "keep_alive_cmd" => {
-                            world.settings.keep_alive_cmd = value.to_string();
-                        }
-                        _ => {}
-                    }
-                }
-            }
-            // Global settings
-            else {
-                match key {
-                    "ws_enabled" => app.settings.ws_enabled = value == "true",
-                    "ws_port" => {
-                        if let Ok(p) = value.parse::<u16>() {
-                            app.settings.ws_port = p;
-                        }
-                    }
-                    "websocket_password" => app.settings.websocket_password = decrypt_password(value),
-                    "websocket_allow_list" => app.settings.websocket_allow_list = value.to_string(),
-                    "websocket_cert_file" => app.settings.websocket_cert_file = value.to_string(),
-                    "websocket_key_file" => app.settings.websocket_key_file = value.to_string(),
-                    "web_secure" => app.settings.web_secure = value == "true",
-                    "http_enabled" => app.settings.http_enabled = value == "true",
-                    "http_port" => {
-                        if let Ok(p) = value.parse::<u16>() {
-                            app.settings.http_port = p;
-                        }
-                    }
-                    _ => {}
-                }
-            }
-        }
-    }
-
-    Ok(())
-}
-
-/// Save settings for multiuser mode to ~/.clay.multiuser.dat
-fn save_multiuser_settings(app: &App) -> io::Result<()> {
-    let path = get_multiuser_settings_path();
-    let mut file = std::fs::File::create(&path)?;
-
-    // [global] section
-    writeln!(file, "[global]")?;
-    writeln!(file, "ws_enabled={}", app.settings.ws_enabled)?;
-    writeln!(file, "ws_port={}", app.settings.ws_port)?;
-    if !app.settings.websocket_password.is_empty() {
-        writeln!(file, "websocket_password={}", encrypt_password(&app.settings.websocket_password))?;
-    }
-    if !app.settings.websocket_allow_list.is_empty() {
-        writeln!(file, "websocket_allow_list={}", app.settings.websocket_allow_list)?;
-    }
-    if !app.settings.websocket_cert_file.is_empty() {
-        writeln!(file, "websocket_cert_file={}", app.settings.websocket_cert_file)?;
-    }
-    if !app.settings.websocket_key_file.is_empty() {
-        writeln!(file, "websocket_key_file={}", app.settings.websocket_key_file)?;
-    }
-    writeln!(file, "web_secure={}", app.settings.web_secure)?;
-    writeln!(file, "http_enabled={}", app.settings.http_enabled)?;
-    writeln!(file, "http_port={}", app.settings.http_port)?;
-
-    // [user:NAME] sections
-    for user in &app.users {
-        writeln!(file)?;
-        let escaped_name = user.name
-            .replace('\\', "\\\\")
-            .replace(']', "\\]")
-            .replace('[', "\\[")
-            .replace('=', "\\e")
-            .replace(':', "\\:");
-        writeln!(file, "[user:{}]", escaped_name)?;
-        writeln!(file, "password={}", encrypt_password(&user.password))?;
-    }
-
-    // [world:NAME:OWNER] sections
-    for world in &app.worlds {
-        if let Some(ref owner) = world.owner {
-            writeln!(file)?;
-            let escaped_name = world.name
-                .replace('\\', "\\\\")
-                .replace(']', "\\]")
-                .replace('[', "\\[")
-                .replace('=', "\\e")
-                .replace(':', "\\:");
-            let escaped_owner = owner
-                .replace('\\', "\\\\")
-                .replace(']', "\\]")
-                .replace('[', "\\[")
-                .replace('=', "\\e")
-                .replace(':', "\\:");
-            writeln!(file, "[world:{}:{}]", escaped_name, escaped_owner)?;
-            writeln!(file, "world_type={}", world.settings.world_type.name())?;
-            writeln!(file, "hostname={}", world.settings.hostname)?;
-            writeln!(file, "port={}", world.settings.port)?;
-            if !world.settings.user.is_empty() {
-                writeln!(file, "user={}", world.settings.user)?;
-            }
-            if !world.settings.password.is_empty() {
-                writeln!(file, "password={}", encrypt_password(&world.settings.password))?;
-            }
-            writeln!(file, "use_ssl={}", world.settings.use_ssl)?;
-            writeln!(file, "log_enabled={}", world.settings.log_enabled)?;
-            writeln!(file, "encoding={}", world.settings.encoding.name())?;
-            writeln!(file, "auto_connect_type={}", world.settings.auto_connect_type.name())?;
-            writeln!(file, "keep_alive_type={}", world.settings.keep_alive_type.name())?;
-            if !world.settings.keep_alive_cmd.is_empty() {
-                writeln!(file, "keep_alive_cmd={}", world.settings.keep_alive_cmd)?;
-            }
-            // Slack settings
-            if !world.settings.slack_token.is_empty() {
-                writeln!(file, "slack_token={}", encrypt_password(&world.settings.slack_token))?;
-            }
-            if !world.settings.slack_channel.is_empty() {
-                writeln!(file, "slack_channel={}", world.settings.slack_channel)?;
-            }
-            if !world.settings.slack_workspace.is_empty() {
-                writeln!(file, "slack_workspace={}", world.settings.slack_workspace)?;
-            }
-            // Discord settings
-            if !world.settings.discord_token.is_empty() {
-                writeln!(file, "discord_token={}", encrypt_password(&world.settings.discord_token))?;
-            }
-            if !world.settings.discord_guild.is_empty() {
-                writeln!(file, "discord_guild={}", world.settings.discord_guild)?;
-            }
-            if !world.settings.discord_channel.is_empty() {
-                writeln!(file, "discord_channel={}", world.settings.discord_channel)?;
-            }
-            if !world.settings.discord_dm_user.is_empty() {
-                writeln!(file, "discord_dm_user={}", world.settings.discord_dm_user)?;
-            }
-        }
-    }
-
-    // [action:NAME:OWNER] sections
-    for action in &app.settings.actions {
-        if let Some(ref owner) = action.owner {
-            writeln!(file)?;
-            let escaped_name = action.name
-                .replace('\\', "\\\\")
-                .replace(']', "\\]")
-                .replace('[', "\\[")
-                .replace('=', "\\e")
-                .replace(':', "\\:");
-            let escaped_owner = owner
-                .replace('\\', "\\\\")
-                .replace(']', "\\]")
-                .replace('[', "\\[")
-                .replace('=', "\\e")
-                .replace(':', "\\:");
-            writeln!(file, "[action:{}:{}]", escaped_name, escaped_owner)?;
-            if !action.world.is_empty() {
-                writeln!(file, "world={}", action.world)?;
-            }
-            writeln!(file, "match_type={}", action.match_type.as_str().to_lowercase())?;
-            // Escape special chars in pattern and command
-            let escaped_pattern = action.pattern
-                .replace('\\', "\\\\")
-                .replace('=', "\\e")
-                .replace('\n', "\\n");
-            let escaped_command = action.command
-                .replace('\\', "\\\\")
-                .replace('=', "\\e")
-                .replace('\n', "\\n");
-            writeln!(file, "pattern={}", escaped_pattern)?;
-            writeln!(file, "command={}", escaped_command)?;
-            if !action.enabled {
-                writeln!(file, "enabled=false")?;
-            }
-        }
-    }
-
-    // [banned_hosts] section
-    let permanent_bans = app.ban_list.get_permanent_bans();
-    if !permanent_bans.is_empty() {
-        writeln!(file)?;
-        writeln!(file, "[banned_hosts]")?;
-        for ip in permanent_bans {
-            writeln!(file, "ip={}", ip)?;
-        }
-    }
-
-    Ok(())
-}
-
-#[cfg(all(unix, not(target_os = "android")))]
-fn save_reload_state(app: &App) -> io::Result<()> {
-    let path = get_reload_state_path();
-    let mut file = std::fs::File::create(&path)?;
-
-    // Save global state
-    writeln!(file, "[reload]")?;
-    writeln!(file, "current_world_index={}", app.current_world_index)?;
-    writeln!(file, "input_height={}", app.input_height)?;
-    writeln!(file, "more_mode={}", app.settings.more_mode_enabled)?;
-    writeln!(file, "spell_check={}", app.settings.spell_check_enabled)?;
-    writeln!(file, "temp_convert={}", app.settings.temp_convert_enabled)?;
-    writeln!(file, "world_switch_mode={}", app.settings.world_switch_mode.name())?;
-    writeln!(file, "debug_enabled={}", app.settings.debug_enabled)?;
-    writeln!(file, "ansi_music_enabled={}", app.settings.ansi_music_enabled)?;
-    writeln!(file, "show_tags={}", app.show_tags)?;
-    writeln!(file, "theme={}", app.settings.theme.name())?;
-    writeln!(file, "gui_theme={}", app.settings.gui_theme.name())?;
-    writeln!(file, "gui_transparency={}", app.settings.gui_transparency)?;
-    writeln!(file, "color_offset_percent={}", app.settings.color_offset_percent)?;
-    writeln!(file, "font_name={}", app.settings.font_name)?;
-    writeln!(file, "font_size={}", app.settings.font_size)?;
-    writeln!(file, "web_font_size_phone={}", app.settings.web_font_size_phone)?;
-    writeln!(file, "web_font_size_tablet={}", app.settings.web_font_size_tablet)?;
-    writeln!(file, "web_font_size_desktop={}", app.settings.web_font_size_desktop)?;
-    writeln!(file, "web_secure={}", app.settings.web_secure)?;
-    writeln!(file, "http_enabled={}", app.settings.http_enabled)?;
-    writeln!(file, "http_port={}", app.settings.http_port)?;
-    writeln!(file, "ws_enabled={}", app.settings.ws_enabled)?;
-    writeln!(file, "ws_port={}", app.settings.ws_port)?;
-    if !app.settings.websocket_password.is_empty() {
-        writeln!(file, "websocket_password={}", encrypt_password(&app.settings.websocket_password))?;
-    }
-    if !app.settings.websocket_allow_list.is_empty() {
-        writeln!(file, "websocket_allow_list={}", app.settings.websocket_allow_list)?;
-    }
-    // Get whitelisted_host from running server, or from settings
-    let whitelisted_host = if let Some(ref server) = app.ws_server {
-        server.get_whitelisted_host()
-    } else {
-        app.settings.websocket_whitelisted_host.clone()
-    };
-    if let Some(ref host) = whitelisted_host {
-        writeln!(file, "websocket_whitelisted_host={}", host)?;
-    }
-    if !app.settings.websocket_cert_file.is_empty() {
-        writeln!(file, "websocket_cert_file={}", app.settings.websocket_cert_file)?;
-    }
-    if !app.settings.websocket_key_file.is_empty() {
-        writeln!(file, "websocket_key_file={}", app.settings.websocket_key_file)?;
-    }
-    writeln!(file, "tls_proxy_enabled={}", app.settings.tls_proxy_enabled)?;
-    if !app.settings.dictionary_path.is_empty() {
-        writeln!(file, "dictionary_path={}", app.settings.dictionary_path)?;
-    }
-
-    // Save input history (base64 encode each line to handle special chars)
-    writeln!(file, "history_count={}", app.input.history.len())?;
-    for (i, hist) in app.input.history.iter().enumerate() {
-        // Simple escape: replace newlines and = with escape sequences
-        let escaped = hist.replace('\\', "\\\\").replace('\n', "\\n").replace('=', "\\e");
-        writeln!(file, "history_{}={}", i, escaped)?;
-    }
-
-    // Save each world's state
-    writeln!(file, "world_count={}", app.worlds.len())?;
-    for (idx, world) in app.worlds.iter().enumerate() {
-        writeln!(file)?;
-        writeln!(file, "[world_state:{}]", idx)?;
-        writeln!(file, "name={}", world.name.replace('=', "\\e"))?;
-        writeln!(file, "scroll_offset={}", world.scroll_offset)?;
-        writeln!(file, "connected={}", world.connected)?;
-        writeln!(file, "unseen_lines={}", world.unseen_lines)?;
-        writeln!(file, "paused={}", world.paused)?;
-        writeln!(file, "lines_since_pause={}", world.lines_since_pause)?;
-        writeln!(file, "is_tls={}", world.is_tls)?;
-        writeln!(file, "was_connected={}", world.was_connected)?;
-        writeln!(file, "telnet_mode={}", world.telnet_mode)?;
-        writeln!(file, "uses_wont_echo_prompt={}", world.uses_wont_echo_prompt)?;
-        writeln!(file, "next_seq={}", world.next_seq)?;
-        if !world.prompt.is_empty() {
-            writeln!(file, "prompt={}", world.prompt.replace('=', "\\e"))?;
-        }
-
-        // Socket fd if connected (will be passed via env var separately)
-        if let Some(fd) = world.socket_fd {
-            writeln!(file, "socket_fd={}", fd)?;
-        }
-
-        // TLS proxy info (for connection preservation over hot reload)
-        if let Some(proxy_pid) = world.proxy_pid {
-            writeln!(file, "proxy_pid={}", proxy_pid)?;
-        }
-        if let Some(ref proxy_socket_path) = world.proxy_socket_path {
-            writeln!(file, "proxy_socket_path={}", proxy_socket_path.display())?;
-        }
-
-        // World settings
-        writeln!(file, "world_type={}", world.settings.world_type.name())?;
-        writeln!(file, "hostname={}", world.settings.hostname)?;
-        writeln!(file, "port={}", world.settings.port)?;
-        writeln!(file, "user={}", world.settings.user.replace('=', "\\e"))?;
-        writeln!(file, "password={}", world.settings.password.replace('=', "\\e"))?;
-        writeln!(file, "use_ssl={}", world.settings.use_ssl)?;
-        writeln!(file, "encoding={}", world.settings.encoding.name())?;
-        writeln!(file, "auto_connect_type={}", world.settings.auto_connect_type.name())?;
-        writeln!(file, "keep_alive_type={}", world.settings.keep_alive_type.name())?;
-        if !world.settings.keep_alive_cmd.is_empty() {
-            writeln!(file, "keep_alive_cmd={}", world.settings.keep_alive_cmd.replace('=', "\\e"))?;
-        }
-        if world.settings.log_enabled {
-            writeln!(file, "log_enabled=true")?;
-        }
-        // Slack settings
-        if !world.settings.slack_token.is_empty() {
-            writeln!(file, "slack_token={}", world.settings.slack_token.replace('=', "\\e"))?;
-        }
-        if !world.settings.slack_channel.is_empty() {
-            writeln!(file, "slack_channel={}", world.settings.slack_channel.replace('=', "\\e"))?;
-        }
-        if !world.settings.slack_workspace.is_empty() {
-            writeln!(file, "slack_workspace={}", world.settings.slack_workspace.replace('=', "\\e"))?;
-        }
-        // Discord settings
-        if !world.settings.discord_token.is_empty() {
-            writeln!(file, "discord_token={}", world.settings.discord_token.replace('=', "\\e"))?;
-        }
-        if !world.settings.discord_guild.is_empty() {
-            writeln!(file, "discord_guild={}", world.settings.discord_guild.replace('=', "\\e"))?;
-        }
-        if !world.settings.discord_channel.is_empty() {
-            writeln!(file, "discord_channel={}", world.settings.discord_channel.replace('=', "\\e"))?;
-        }
-        if !world.settings.discord_dm_user.is_empty() {
-            writeln!(file, "discord_dm_user={}", world.settings.discord_dm_user.replace('=', "\\e"))?;
-        }
-
-        // Output lines count (we'll save the actual lines separately due to size)
-        writeln!(file, "output_count={}", world.output_lines.len())?;
-        writeln!(file, "pending_count={}", world.pending_lines.len())?;
-    }
-
-    // Save output lines in a separate section (can be large)
-    // Format: timestamp_secs|flags|seq|escaped_text
-    // Flags: s = from_server (omit if false), g = gagged (omit if false)
-    for (idx, world) in app.worlds.iter().enumerate() {
-        writeln!(file)?;
-        writeln!(file, "[output:{}]", idx)?;
-        for line in &world.output_lines {
-            let ts_secs = line.timestamp.duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
-            let mut flags = String::new();
-            if line.from_server { flags.push('s'); }
-            if line.gagged { flags.push('g'); }
-            let escaped = line.text.replace('\\', "\\\\").replace('\n', "\\n");
-            writeln!(file, "{}|{}|{}|{}", ts_secs, flags, line.seq, escaped)?;
-        }
-        writeln!(file, "[pending:{}]", idx)?;
-        for line in &world.pending_lines {
-            let ts_secs = line.timestamp.duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
-            let mut flags = String::new();
-            if line.from_server { flags.push('s'); }
-            if line.gagged { flags.push('g'); }
-            let escaped = line.text.replace('\\', "\\\\").replace('\n', "\\n");
-            writeln!(file, "{}|{}|{}|{}", ts_secs, flags, line.seq, escaped)?;
-        }
-    }
-
-    // Save actions (by name, escaping special characters)
-    for action in app.settings.actions.iter() {
-        writeln!(file)?;
-        // Escape special chars in name for section header: ] [ = \
-        let escaped_name = action.name
-            .replace('\\', "\\\\")
-            .replace(']', "\\]")
-            .replace('[', "\\[")
-            .replace('=', "\\e");
-        writeln!(file, "[action:{}]", escaped_name)?;
-        if !action.world.is_empty() {
-            writeln!(file, "world={}", action.world)?;
-        }
-        // Only save match_type if not the default (regexp)
-        if action.match_type != MatchType::Regexp {
-            writeln!(file, "match_type={}", action.match_type.as_str().to_lowercase())?;
-        }
-        if !action.pattern.is_empty() {
-            writeln!(file, "pattern={}", action.pattern.replace('\\', "\\\\").replace('=', "\\e").replace('\n', "\\n"))?;
-        }
-        if !action.command.is_empty() {
-            writeln!(file, "command={}", action.command.replace('\\', "\\\\").replace('=', "\\e").replace('\n', "\\n"))?;
-        }
-        if !action.enabled {
-            writeln!(file, "enabled=false")?;
-        }
-    }
-
-    Ok(())
-}
-
-fn unescape_string(s: &str) -> String {
-    let mut result = String::new();
-    let mut chars = s.chars().peekable();
-    while let Some(c) = chars.next() {
-        if c == '\\' {
-            match chars.next() {
-                Some('n') => result.push('\n'),
-                Some('e') => result.push('='),
-                Some('\\') => result.push('\\'),
-                Some(other) => {
-                    result.push('\\');
-                    result.push(other);
-                }
-                None => result.push('\\'),
-            }
-        } else {
-            result.push(c);
-        }
-    }
-    result
-}
-
-fn load_reload_state(app: &mut App) -> io::Result<bool> {
-    debug_log(true, "LOAD_STATE: Starting load_reload_state");
-    let path = get_reload_state_path();
-    if !path.exists() {
-        debug_log(true, "LOAD_STATE: No state file found");
-        return Ok(false);
-    }
-
-    debug_log(true, &format!("LOAD_STATE: Reading state file: {:?}", path));
-    let content = std::fs::read_to_string(&path)?;
-    let lines: Vec<&str> = content.lines().collect();
-    debug_log(true, &format!("LOAD_STATE: State file has {} lines", lines.len()));
-
-    // Parse the reload state
-    let mut current_section = String::new();
-    let mut current_world_idx: Option<usize> = None;
-    let mut output_world_idx: Option<usize> = None;
-    let mut pending_world_idx: Option<usize> = None;
-    let mut current_action_idx: Option<usize> = None;
-
-    // Temporary storage for world data
-    struct TempWorld {
-        name: String,
-        output_lines: Vec<OutputLine>,
-        scroll_offset: usize,
-        connected: bool,
-        #[cfg(unix)]
-        socket_fd: Option<RawFd>,
-        #[cfg(not(unix))]
-        socket_fd: Option<i64>,
-        proxy_pid: Option<u32>,
-        proxy_socket_path: Option<PathBuf>,
-        unseen_lines: usize,
-        paused: bool,
-        pending_lines: Vec<OutputLine>,
-        lines_since_pause: usize,
-        is_tls: bool,
-        was_connected: bool,
-        telnet_mode: bool,
-        uses_wont_echo_prompt: bool,
-        prompt: String,
-        settings: WorldSettings,
-        next_seq: u64,
-    }
-
-    // Parse a saved output/pending line with timestamp
-    // Newest format: timestamp_secs|flags|seq|text (flags: s=from_server, g=gagged)
-    // Older format: timestamp_secs|flags|text (flags: s=from_server, g=gagged) - seq=0
-    // Old format: timestamp_secs|text (for backward compatibility) - seq=0
-    fn parse_timestamped_line(line: &str) -> OutputLine {
-        let parts: Vec<&str> = line.splitn(4, '|').collect();
-
-        if parts.len() >= 2 {
-            if let Ok(ts_secs) = parts[0].parse::<u64>() {
-                let timestamp = UNIX_EPOCH + Duration::from_secs(ts_secs);
-
-                if parts.len() == 4 {
-                    // Newest format: timestamp|flags|seq|text
-                    let flags = parts[1];
-                    let seq = parts[2].parse::<u64>().unwrap_or(0);
-                    let text = unescape_string(parts[3]);
-                    let from_server = flags.contains('s');
-                    let gagged = flags.contains('g');
-                    return OutputLine {
-                        text,
-                        timestamp,
-                        from_server,
-                        gagged,
-                        seq,
-                    };
-                } else if parts.len() == 3 {
-                    // Older format: timestamp|flags|text (no seq)
-                    let flags = parts[1];
-                    let text = unescape_string(parts[2]);
-                    let from_server = flags.contains('s');
-                    let gagged = flags.contains('g');
-                    return OutputLine {
-                        text,
-                        timestamp,
-                        from_server,
-                        gagged,
-                        seq: 0,
-                    };
-                } else {
-                    // Old format: timestamp|text (assume from_server=true for compatibility)
-                    return OutputLine {
-                        text: unescape_string(parts[1]),
-                        timestamp,
-                        from_server: true,
-                        gagged: false,
-                        seq: 0,
-                    };
-                }
-            }
-        }
-        // Fallback: no timestamp in old format, use current time
-        OutputLine::new(unescape_string(line), 0)
-    }
-
-    let mut temp_worlds: Vec<TempWorld> = Vec::new();
-
-    for line in lines {
-        // Check for section headers FIRST (before output/pending line handling)
-        // This prevents section headers from being added as output lines
-        let trimmed = line.trim();
-        if trimmed.starts_with('[') && trimmed.ends_with(']') {
-            let section = &trimmed[1..trimmed.len() - 1];
-            if section == "reload" {
-                current_section = "reload".to_string();
-            } else if let Some(suffix) = section.strip_prefix("world_state:") {
-                let idx: usize = suffix.parse().unwrap_or(0);
-                current_section = "world_state".to_string();
-                current_world_idx = Some(idx);
-                // Ensure we have enough temp worlds
-                while temp_worlds.len() <= idx {
-                    temp_worlds.push(TempWorld {
-                        name: String::new(),
-                        output_lines: Vec::new(),
-                        scroll_offset: 0,
-                        connected: false,
-                        socket_fd: None,
-                        proxy_pid: None,
-                        proxy_socket_path: None,
-                        unseen_lines: 0,
-                        paused: false,
-                        pending_lines: Vec::new(),
-                        lines_since_pause: 0,
-                        is_tls: false,
-                        was_connected: false,
-                        telnet_mode: false,
-                        uses_wont_echo_prompt: false,
-                        prompt: String::new(),
-                        settings: WorldSettings::default(),
-                        next_seq: 0,
-                    });
-                }
-            } else if let Some(suffix) = section.strip_prefix("output:") {
-                let idx: usize = suffix.parse().unwrap_or(0);
-                current_section = "output".to_string();
-                output_world_idx = Some(idx);
-                pending_world_idx = None;
-            } else if let Some(suffix) = section.strip_prefix("pending:") {
-                let idx: usize = suffix.parse().unwrap_or(0);
-                current_section = "pending".to_string();
-                pending_world_idx = Some(idx);
-                output_world_idx = None;
-            } else if let Some(suffix) = section.strip_prefix("action:") {
-                // Parse action section - supports both old format [action:NUMBER] and new format [action:NAME]
-                current_section = "action".to_string();
-
-                // Unescape the section content (for new format names with special chars)
-                let unescaped = suffix
-                    .replace("\\]", "]")
-                    .replace("\\[", "[")
-                    .replace("\\e", "=")
-                    .replace("\\\\", "\\");
-
-                // Check if it's old format (pure number) or new format (name)
-                let is_old_format = unescaped.chars().all(|c| c.is_ascii_digit());
-
-                if is_old_format {
-                    // Old format: create new action, will get name from name= field
-                    app.settings.actions.push(Action::new());
-                    current_action_idx = Some(app.settings.actions.len() - 1);
-                } else {
-                    // New format: look for existing action with this name or create new
-                    let action_name = unescaped;
-                    if let Some(idx) = app.settings.actions.iter().position(|a| a.name == action_name) {
-                        current_action_idx = Some(idx);
-                    } else {
-                        let mut new_action = Action::new();
-                        new_action.name = action_name;
-                        app.settings.actions.push(new_action);
-                        current_action_idx = Some(app.settings.actions.len() - 1);
-                    }
-                }
-            }
-            continue;
-        }
-
-        // Handle output/pending lines without trimming to preserve leading spaces
-        // Skip empty lines (blank line separators between [output:] and [pending:] sections)
-        if current_section == "output" {
-            if let Some(idx) = output_world_idx {
-                if idx < temp_worlds.len() && !line.is_empty() {
-                    temp_worlds[idx].output_lines.push(parse_timestamped_line(line));
-                }
-            }
-            continue;
-        }
-        if current_section == "pending" {
-            if let Some(idx) = pending_world_idx {
-                if idx < temp_worlds.len() && !line.is_empty() {
-                    temp_worlds[idx].pending_lines.push(parse_timestamped_line(line));
-                }
-            }
-            continue;
-        }
-
-        // For non-output sections, trim whitespace
-        let line = trimmed;
-        if line.is_empty() {
-            continue;
-        }
-
-        // Parse key=value
-        if let Some(eq_pos) = line.find('=') {
-            let key = &line[..eq_pos];
-            let value = &line[eq_pos + 1..];
-
-            if current_section == "reload" {
-                match key {
-                    "current_world_index" => {
-                        app.current_world_index = value.parse().unwrap_or(0);
-                    }
-                    "input_height" => {
-                        app.input_height = value.parse().unwrap_or(3);
-                        app.input.visible_height = app.input_height;
-                    }
-                    "more_mode" => {
-                        app.settings.more_mode_enabled = value == "true";
-                    }
-                    "spell_check" => {
-                        app.settings.spell_check_enabled = value == "true";
-                    }
-                    "temp_convert" => {
-                        app.settings.temp_convert_enabled = value == "true";
-                    }
-                    "pending_first" => {
-                        // Backward compatibility: pending_first=true -> UnseenFirst
-                        app.settings.world_switch_mode = if value == "true" {
-                            WorldSwitchMode::UnseenFirst
-                        } else {
-                            WorldSwitchMode::Alphabetical
-                        };
-                    }
-                    "world_switch_mode" => {
-                        app.settings.world_switch_mode = WorldSwitchMode::from_name(value);
-                    }
-                    "debug_enabled" => {
-                        app.settings.debug_enabled = value == "true";
-                    }
-                    "ansi_music_enabled" => {
-                        app.settings.ansi_music_enabled = value == "true";
-                    }
-                    "show_tags" => {
-                        app.show_tags = value == "true";
-                    }
-                    "theme" => {
-                        app.settings.theme = Theme::from_name(value);
-                    }
-                    "gui_theme" => {
-                        app.settings.gui_theme = Theme::from_name(value);
-                    }
-                    "font_name" => {
-                        app.settings.font_name = value.to_string();
-                    }
-                    "font_size" => {
-                        if let Ok(s) = value.parse::<f32>() {
-                            app.settings.font_size = s.clamp(8.0, 48.0);
-                        }
-                    }
-                    // Backward compat: old single web_font_size sets all three
-                    "web_font_size" => {
-                        if let Ok(s) = value.parse::<f32>() {
-                            let clamped = s.clamp(8.0, 48.0);
-                            app.settings.web_font_size_phone = clamped;
-                            app.settings.web_font_size_tablet = clamped;
-                            app.settings.web_font_size_desktop = clamped;
-                        }
-                    }
-                    "web_font_size_phone" => {
-                        if let Ok(s) = value.parse::<f32>() {
-                            app.settings.web_font_size_phone = s.clamp(8.0, 48.0);
-                        }
-                    }
-                    "web_font_size_tablet" => {
-                        if let Ok(s) = value.parse::<f32>() {
-                            app.settings.web_font_size_tablet = s.clamp(8.0, 48.0);
-                        }
-                    }
-                    "web_font_size_desktop" => {
-                        if let Ok(s) = value.parse::<f32>() {
-                            app.settings.web_font_size_desktop = s.clamp(8.0, 48.0);
-                        }
-                    }
-                    "gui_transparency" => {
-                        if let Ok(t) = value.parse::<f32>() {
-                            app.settings.gui_transparency = t.clamp(0.3, 1.0);
-                        }
-                    }
-                    "color_offset_percent" => {
-                        if let Ok(p) = value.parse::<u8>() {
-                            app.settings.color_offset_percent = p.min(100);
-                        }
-                    }
-                    "web_secure" => {
-                        app.settings.web_secure = value == "true";
-                    }
-                    "ws_enabled" => {
-                        app.settings.ws_enabled = value == "true";
-                    }
-                    "ws_port" => {
-                        if let Ok(p) = value.parse::<u16>() {
-                            app.settings.ws_port = p;
-                        }
-                    }
-                    // Legacy: websocket_enabled maps to ws_enabled
-                    "websocket_enabled" => {
-                        app.settings.ws_enabled = value == "true";
-                    }
-                    // Legacy: websocket_port maps to ws_port
-                    "websocket_port" => {
-                        if let Ok(p) = value.parse::<u16>() {
-                            app.settings.ws_port = p;
-                        }
-                    }
-                    // Legacy: websocket_use_tls maps to web_secure
-                    "websocket_use_tls" => {
-                        app.settings.web_secure = value == "true";
-                    }
-                    "websocket_password" => {
-                        app.settings.websocket_password = decrypt_password(value);
-                    }
-                    "websocket_allow_list" => {
-                        app.settings.websocket_allow_list = value.to_string();
-                    }
-                    "websocket_whitelisted_host" => {
-                        app.settings.websocket_whitelisted_host = Some(value.to_string());
-                    }
-                    "websocket_cert_file" => {
-                        app.settings.websocket_cert_file = value.to_string();
-                    }
-                    "websocket_key_file" => {
-                        app.settings.websocket_key_file = value.to_string();
-                    }
-                    "http_enabled" => {
-                        app.settings.http_enabled = value == "true";
-                    }
-                    "http_port" => {
-                        if let Ok(p) = value.parse::<u16>() {
-                            app.settings.http_port = p;
-                        }
-                    }
-                    // Legacy fields
-                    "https_enabled" => {
-                        if value == "true" {
-                            app.settings.http_enabled = true;
-                            app.settings.web_secure = true;
-                        }
-                    }
-                    "https_port" => {
-                        if let Ok(p) = value.parse::<u16>() {
-                            if app.settings.web_secure {
-                                app.settings.http_port = p;
-                            }
-                        }
-                    }
-                    "ws_nonsecure_enabled" => {
-                        if value == "true" && !app.settings.web_secure {
-                            app.settings.ws_enabled = true;
-                        }
-                    }
-                    "ws_nonsecure_port" => {
-                        if let Ok(p) = value.parse::<u16>() {
-                            if !app.settings.web_secure {
-                                app.settings.ws_port = p;
-                            }
-                        }
-                    }
-                    // Legacy: ignore global encoding, it's now per-world
-                    "encoding" => {}
-                    "tls_proxy_enabled" => {
-                        app.settings.tls_proxy_enabled = value == "true";
-                    }
-                    "dictionary_path" => {
-                        app.settings.dictionary_path = value.to_string();
-                    }
-                    "history_count" | "world_count" => {
-                        // These are informational, not needed for parsing
-                    }
-                    k if k.starts_with("history_") => {
-                        app.input.history.push(unescape_string(value));
-                    }
-                    _ => {}
-                }
-            } else if current_section == "world_state" {
-                if let Some(idx) = current_world_idx {
-                    if idx < temp_worlds.len() {
-                        let tw = &mut temp_worlds[idx];
-                        match key {
-                            "name" => tw.name = unescape_string(value),
-                            "scroll_offset" => tw.scroll_offset = value.parse().unwrap_or(0),
-                            "connected" => tw.connected = value == "true",
-                            "unseen_lines" => tw.unseen_lines = value.parse().unwrap_or(0),
-                            "paused" => tw.paused = value == "true",
-                            "lines_since_pause" => tw.lines_since_pause = value.parse().unwrap_or(0),
-                            "is_tls" => tw.is_tls = value == "true",
-                            "was_connected" => tw.was_connected = value == "true",
-                            "telnet_mode" => tw.telnet_mode = value == "true",
-                            "uses_wont_echo_prompt" => tw.uses_wont_echo_prompt = value == "true",
-                            "prompt" => {
-                                // Prompts always end with a single trailing space (normalized on receive)
-                                // but trailing spaces are trimmed during file parsing, so add it back
-                                let p = unescape_string(value);
-                                tw.prompt = if p.is_empty() { p } else { format!("{} ", p.trim_end()) };
-                            }
-                            "socket_fd" => tw.socket_fd = value.parse().ok(),
-                            "proxy_pid" => tw.proxy_pid = value.parse().ok(),
-                            "proxy_socket_path" => tw.proxy_socket_path = Some(PathBuf::from(value)),
-                            "next_seq" => tw.next_seq = value.parse().unwrap_or(0),
-                            "world_type" => tw.settings.world_type = WorldType::from_name(value),
-                            "hostname" => tw.settings.hostname = value.to_string(),
-                            "port" => tw.settings.port = value.to_string(),
-                            "user" => tw.settings.user = unescape_string(value),
-                            "password" => tw.settings.password = unescape_string(value),
-                            "use_ssl" => tw.settings.use_ssl = value == "true",
-                            "log_enabled" => tw.settings.log_enabled = value == "true",
-                            "log_file" => tw.settings.log_enabled = true, // Backward compat
-                            "encoding" => {
-                                tw.settings.encoding = match value {
-                                    "latin1" => Encoding::Latin1,
-                                    "fansi" => Encoding::Fansi,
-                                    _ => Encoding::Utf8,
-                                };
-                            }
-                            "auto_connect_type" => {
-                                tw.settings.auto_connect_type = AutoConnectType::from_name(value);
-                            }
-                            "keep_alive_type" => {
-                                tw.settings.keep_alive_type = KeepAliveType::from_name(value);
-                            }
-                            "keep_alive_cmd" => {
-                                tw.settings.keep_alive_cmd = value.replace("\\e", "=");
-                            }
-                            // Slack settings
-                            "slack_token" => tw.settings.slack_token = unescape_string(value),
-                            "slack_channel" => tw.settings.slack_channel = unescape_string(value),
-                            "slack_workspace" => tw.settings.slack_workspace = unescape_string(value),
-                            // Discord settings
-                            "discord_token" => tw.settings.discord_token = unescape_string(value),
-                            "discord_guild" => tw.settings.discord_guild = unescape_string(value),
-                            "discord_channel" => tw.settings.discord_channel = unescape_string(value),
-                            "discord_dm_user" => tw.settings.discord_dm_user = unescape_string(value),
-                            _ => {}
-                        }
-                    }
-                }
-            } else if current_section == "action" {
-                // Action settings
-                if let Some(action_idx) = current_action_idx {
-                    if let Some(action) = app.settings.actions.get_mut(action_idx) {
-                        // Helper to unescape saved strings
-                        fn unescape_action_value(s: &str) -> String {
-                            s.replace("\\n", "\n").replace("\\e", "=").replace("\\\\", "\\")
-                        }
-                        match key {
-                            "name" => action.name = value.to_string(),
-                            "world" => action.world = value.to_string(),
-                            "match_type" => action.match_type = MatchType::parse(value),
-                            "pattern" => action.pattern = unescape_action_value(value),
-                            "command" => action.command = unescape_action_value(value),
-                            "enabled" => action.enabled = value != "false",
-                            _ => {}
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    // Convert temp worlds to real worlds
-    app.worlds.clear();
-    for tw in temp_worlds {
-        let mut world = World::new(&tw.name);
-        world.output_lines = tw.output_lines;
-        world.scroll_offset = tw.scroll_offset;
-        world.connected = tw.connected;
-        world.unseen_lines = tw.unseen_lines;
-        world.paused = tw.paused;
-        world.pending_lines = tw.pending_lines;
-        world.lines_since_pause = tw.lines_since_pause;
-        world.is_tls = tw.is_tls;
-        world.was_connected = tw.was_connected;
-        world.telnet_mode = tw.telnet_mode;
-        world.uses_wont_echo_prompt = tw.uses_wont_echo_prompt;
-        world.prompt = tw.prompt;
-        world.socket_fd = tw.socket_fd;
-        world.proxy_pid = tw.proxy_pid;
-        world.proxy_socket_path = tw.proxy_socket_path;
-        world.settings = tw.settings;
-        world.next_seq = tw.next_seq;
-        // Leave timing fields as None for connected worlds after reload
-        // This triggers immediate keepalive since we don't know how long connection was idle
-        app.worlds.push(world);
-    }
-
-    // Note: Don't create initial world here - let ensure_has_world() handle it after
-    // settings are fully loaded, to avoid creating unnecessary "clay" world
-
-    // Validate current_world_index
-    if app.current_world_index >= app.worlds.len() {
-        app.current_world_index = 0;
-    }
-
-    // Clean up the reload state file
-    let _ = std::fs::remove_file(&path);
-
-    Ok(true)
 }
 
 // Hot reload helper - not available on Android/Termux
@@ -6428,7 +3533,7 @@ fn is_process_alive(_pid: u32) -> bool {
 /// Reap any zombie child processes to prevent defunct processes from accumulating.
 /// This should be called periodically from the main event loop.
 #[cfg(all(unix, not(target_os = "android")))]
-fn reap_zombie_children() {
+pub fn reap_zombie_children() {
     // Call waitpid with -1 (any child) and WNOHANG (don't block) to reap zombies
     // Keep calling until no more zombies are found
     unsafe {
@@ -6770,7 +3875,7 @@ fn exec_reload(app: &App) -> io::Result<()> {
 
     // Save the current state
     debug_log(true, "RELOAD: Saving state...");
-    save_reload_state(app)?;
+    persistence::save_reload_state(app)?;
     debug_log(true, "RELOAD: State saved successfully");
 
     // Collect socket fds that need to survive exec
@@ -6815,8486 +3920,6 @@ fn exec_reload(app: &App) -> io::Result<()> {
 
     // If we get here, exec failed
     Err(io::Error::other(format!("exec failed: {} (path: {})", err, exe.display())))
-}
-
-// ============================================================================
-// Remote GUI Client (feature = "remote-gui")
-// ============================================================================
-
-#[cfg(all(feature = "remote-gui", not(target_os = "android")))]
-mod remote_gui {
-    use super::*;
-    use egui::{Color32, ScrollArea, TextEdit};
-    use tokio_tungstenite::{connect_async, tungstenite::Message as WsRawMessage};
-
-    /// Cached "now" time for batch timestamp formatting in GUI
-    struct GuiCachedNow;
-
-    impl GuiCachedNow {
-        fn new() -> Self {
-            Self
-        }
-    }
-
-    /// World settings for remote GUI
-    #[derive(Clone, Default)]
-    pub struct RemoteWorldSettings {
-        pub hostname: String,
-        pub port: String,
-        pub user: String,
-        pub password: String,
-        pub use_ssl: bool,
-        pub log_enabled: bool,
-        pub encoding: String,
-        pub auto_login: String,
-        pub keep_alive_type: String,
-        pub keep_alive_cmd: String,
-    }
-
-    /// State for a remote world
-    #[derive(Clone)]
-    pub struct RemoteWorld {
-        pub name: String,
-        pub connected: bool,
-        pub output_lines: Vec<TimestampedLine>,
-        pub prompt: String,
-        pub settings: RemoteWorldSettings,
-        pub unseen_lines: usize,
-        pub pending_count: usize,  // Server's pending line count (for synchronized more-mode)
-        // Timing info (seconds since event, None if never)
-        pub last_send_secs: Option<u64>,
-        pub last_recv_secs: Option<u64>,
-        pub last_nop_secs: Option<u64>,
-        // Partial line handling (for lines split across multiple WebSocket messages)
-        pub partial_line: String,
-        // Whether to show centered splash screen
-        pub showing_splash: bool,
-    }
-
-    /// Which popup is currently open
-    #[derive(PartialEq, Clone)]
-    enum PopupState {
-        None,
-        ConnectedWorlds,  // Combined world selector and connected worlds list
-        WorldEditor(usize),  // world index being edited
-        WorldConfirmDelete(usize),  // world index to delete
-        Setup,
-        Web,  // /web - web settings (HTTP/HTTPS/WS)
-        Font,
-        Help,
-        Menu,  // /menu - popup to select windows
-        ActionsList,           // Actions list (first window)
-        ActionEditor(usize),   // Action editor (second window) - index of action being edited
-        ActionConfirmDelete,   // Delete confirmation dialog
-        DebugText,             // Debug popup showing raw ANSI codes
-    }
-
-    /// Remote GUI client application state
-    /// GUI Theme - mirrors the TUI Theme but with egui colors
-    #[derive(Clone, Copy, PartialEq)]
-    enum GuiTheme {
-        Dark,
-        Light,
-    }
-
-    #[allow(dead_code)]
-    impl GuiTheme {
-        fn from_name(name: &str) -> Self {
-            match name {
-                "light" => GuiTheme::Light,
-                _ => GuiTheme::Dark,
-            }
-        }
-
-        fn name(&self) -> &'static str {
-            match self {
-                GuiTheme::Dark => "Dark",
-                GuiTheme::Light => "Light",
-            }
-        }
-
-        fn next(&self) -> Self {
-            match self {
-                GuiTheme::Dark => GuiTheme::Light,
-                GuiTheme::Light => GuiTheme::Dark,
-            }
-        }
-
-        fn is_dark(&self) -> bool {
-            matches!(self, GuiTheme::Dark)
-        }
-
-        fn to_string_value(self) -> String {
-            match self {
-                GuiTheme::Dark => "dark".to_string(),
-                GuiTheme::Light => "light".to_string(),
-            }
-        }
-
-        // Background hierarchy (deep -> base -> surface -> elevated -> hover)
-        fn bg_deep(&self) -> Color32 {
-            match self {
-                GuiTheme::Dark => Color32::from_rgb(8, 8, 10),
-                GuiTheme::Light => Color32::from_rgb(255, 255, 255),
-            }
-        }
-
-        fn bg(&self) -> Color32 {
-            match self {
-                GuiTheme::Dark => Color32::from_rgb(13, 17, 28),
-                GuiTheme::Light => Color32::from_rgb(250, 250, 250),
-            }
-        }
-
-        fn bg_surface(&self) -> Color32 {
-            match self {
-                GuiTheme::Dark => Color32::from_rgb(20, 20, 24),
-                GuiTheme::Light => Color32::from_rgb(245, 245, 245),
-            }
-        }
-
-        fn bg_elevated(&self) -> Color32 {
-            match self {
-                GuiTheme::Dark => Color32::from_rgb(26, 26, 31),
-                GuiTheme::Light => Color32::from_rgb(240, 240, 240),
-            }
-        }
-
-        fn bg_hover(&self) -> Color32 {
-            match self {
-                GuiTheme::Dark => Color32::from_rgb(34, 34, 40),
-                GuiTheme::Light => Color32::from_rgb(230, 230, 230),
-            }
-        }
-
-        // Text hierarchy (primary -> secondary -> muted -> dim)
-        fn fg(&self) -> Color32 {
-            match self {
-                GuiTheme::Dark => Color32::from_rgb(228, 228, 231),
-                GuiTheme::Light => Color32::BLACK,
-            }
-        }
-
-        fn fg_secondary(&self) -> Color32 {
-            match self {
-                GuiTheme::Dark => Color32::from_rgb(161, 161, 170),
-                GuiTheme::Light => Color32::from_rgb(80, 80, 80),
-            }
-        }
-
-        fn fg_muted(&self) -> Color32 {
-            match self {
-                GuiTheme::Dark => Color32::from_rgb(113, 113, 122),
-                GuiTheme::Light => Color32::from_rgb(120, 120, 120),
-            }
-        }
-
-        fn fg_dim(&self) -> Color32 {
-            match self {
-                GuiTheme::Dark => Color32::from_rgb(82, 82, 91),
-                GuiTheme::Light => Color32::DARK_GRAY,
-            }
-        }
-
-        // Accent colors
-        fn accent(&self) -> Color32 {
-            match self {
-                GuiTheme::Dark => Color32::from_rgb(34, 211, 238),  // Softer cyan
-                GuiTheme::Light => Color32::from_rgb(0, 100, 180),
-            }
-        }
-
-        fn accent_dim(&self) -> Color32 {
-            match self {
-                GuiTheme::Dark => Color32::from_rgb(8, 145, 178),
-                GuiTheme::Light => Color32::from_rgb(0, 80, 140),
-            }
-        }
-
-        fn highlight(&self) -> Color32 {
-            match self {
-                GuiTheme::Dark => Color32::from_rgb(251, 191, 36),  // Amber
-                GuiTheme::Light => Color32::from_rgb(180, 100, 0),
-            }
-        }
-
-        fn success(&self) -> Color32 {
-            match self {
-                GuiTheme::Dark => Color32::from_rgb(74, 222, 128),  // Softer green
-                GuiTheme::Light => Color32::from_rgb(0, 128, 0),
-            }
-        }
-
-        fn error(&self) -> Color32 {
-            match self {
-                GuiTheme::Dark => Color32::from_rgb(248, 113, 113),  // Softer red
-                GuiTheme::Light => Color32::from_rgb(180, 0, 0),
-            }
-        }
-
-        fn error_dim(&self) -> Color32 {
-            match self {
-                GuiTheme::Dark => Color32::from_rgb(239, 68, 68),
-                GuiTheme::Light => Color32::from_rgb(200, 0, 0),
-            }
-        }
-
-        // Borders
-        fn border_subtle(&self) -> Color32 {
-            match self {
-                GuiTheme::Dark => Color32::from_rgba_unmultiplied(255, 255, 255, 15),
-                GuiTheme::Light => Color32::from_rgba_unmultiplied(0, 0, 0, 15),
-            }
-        }
-
-        fn border_medium(&self) -> Color32 {
-            match self {
-                GuiTheme::Dark => Color32::from_rgba_unmultiplied(255, 255, 255, 26),
-                GuiTheme::Light => Color32::from_rgba_unmultiplied(0, 0, 0, 26),
-            }
-        }
-
-        fn panel_bg(&self) -> Color32 {
-            self.bg_surface()
-        }
-
-        fn button_bg(&self) -> Color32 {
-            self.bg_hover()
-        }
-
-        fn selection_bg(&self) -> Color32 {
-            match self {
-                GuiTheme::Dark => Color32::from_rgb(0, 64, 128),
-                GuiTheme::Light => Color32::from_rgb(180, 200, 230),
-            }
-        }
-
-        fn prompt(&self) -> Color32 {
-            self.accent()
-        }
-
-        fn link(&self) -> Color32 {
-            match self {
-                GuiTheme::Dark => Color32::from_rgb(100, 149, 237),
-                GuiTheme::Light => Color32::from_rgb(0, 0, 238),
-            }
-        }
-    }
-
-    /// Wrapper to mimic TextEdit output for custom text rendering
-    struct TextEditOutputWrapper {
-        response: egui::Response,
-        galley: std::sync::Arc<egui::Galley>,
-        cursor_range: Option<egui::text_edit::CursorRange>,
-        galley_pos: egui::Pos2,
-    }
-
-    pub struct RemoteGuiApp {
-        /// WebSocket URL
-        ws_url: String,
-        /// Password for authentication
-        password: String,
-        /// Whether we're connected to the server
-        connected: bool,
-        /// Whether we're authenticated
-        authenticated: bool,
-        /// Error message to display
-        error_message: Option<String>,
-        /// Worlds received from server
-        worlds: Vec<RemoteWorld>,
-        /// Currently selected world index
-        current_world: usize,
-        /// Input buffer for commands
-        input_buffer: String,
-        /// Previous input buffer length (for detecting deletes vs inserts)
-        prev_input_len: usize,
-        /// Temperature to skip re-converting (after user undid conversion)
-        skip_temp_conversion: Option<String>,
-        /// Command completion state - last partial command that was completed
-        completion_prefix: String,
-        /// Command completion state - index of last match used
-        completion_index: usize,
-        /// Channel for sending messages to WebSocket
-        ws_tx: Option<mpsc::UnboundedSender<WsMessage>>,
-        /// Channel for receiving messages from WebSocket
-        ws_rx: Option<mpsc::UnboundedReceiver<WsMessage>>,
-        /// Runtime handle for async operations
-        runtime: tokio::runtime::Handle,
-        /// Flag indicating password was submitted
-        password_submitted: bool,
-        /// Flag indicating we've attempted auto-connect for allow list
-        auto_connect_attempted: bool,
-        /// Time when connection was established (for allow list timeout)
-        connect_time: Option<std::time::Instant>,
-        /// Current popup state
-        popup_state: PopupState,
-        /// Selected item in menu popup
-        menu_selected: usize,
-        /// Selected world in world list popup
-        world_list_selected: usize,
-        /// Filter text for worlds popup
-        connected_worlds_filter: String,
-        /// Only show connected worlds toggle
-        only_connected_worlds: bool,
-        /// Temp fields for world editor
-        edit_name: String,
-        edit_hostname: String,
-        edit_port: String,
-        edit_user: String,
-        edit_password: String,
-        edit_ssl: bool,
-        edit_log_enabled: bool,
-        edit_encoding: Encoding,
-        edit_auto_login: AutoConnectType,
-        edit_keep_alive_type: KeepAliveType,
-        edit_keep_alive_cmd: String,
-        /// Input area height in lines
-        input_height: u16,
-        /// Console theme (for TUI on server)
-        console_theme: GuiTheme,
-        /// GUI theme (local)
-        theme: GuiTheme,
-        /// Font name (empty for system default)
-        font_name: String,
-        /// Font size in points
-        font_size: f32,
-        /// Web interface font sizes (passed through to web clients)
-        web_font_size_phone: f32,
-        web_font_size_tablet: f32,
-        web_font_size_desktop: f32,
-        /// Temp field for font editor
-        edit_font_name: String,
-        /// Temp field for font size editor
-        edit_font_size: String,
-        /// Last loaded font name (to avoid reloading)
-        loaded_font_name: String,
-        /// Command history
-        command_history: Vec<String>,
-        /// Current position in command history (0 = current input, 1+ = history)
-        history_index: usize,
-        /// Saved input when browsing history
-        saved_input: String,
-        /// Manual scroll offset for output (None = auto-scroll to bottom)
-        scroll_offset: Option<f32>,
-        /// Maximum scroll offset (content height - viewport height)
-        scroll_max_offset: f32,
-        /// Show MUD tags
-        show_tags: bool,
-        /// Highlight lines matching action patterns
-        highlight_actions: bool,
-        /// More mode enabled (pause on overflow)
-        more_mode: bool,
-        /// Spell check enabled
-        spell_check_enabled: bool,
-        /// Temperature conversion enabled
-        temp_convert_enabled: bool,
-        /// Filter text for output
-        filter_text: String,
-        /// Whether filter popup is open
-        filter_active: bool,
-        /// WebSocket allow list (CSV of hosts that can connect without password)
-        ws_allow_list: String,
-        /// Web secure protocol (true = https/wss, false = http/ws)
-        web_secure: bool,
-        /// HTTP/HTTPS server enabled
-        http_enabled: bool,
-        /// HTTP/HTTPS server port
-        http_port: u16,
-        /// WS/WSS server enabled
-        ws_enabled: bool,
-        /// WS/WSS server port
-        ws_port: u16,
-        /// TLS certificate file path
-        ws_cert_file: String,
-        /// TLS key file path
-        ws_key_file: String,
-        /// World switching mode (Unseen First or Alphabetical)
-        world_switch_mode: WorldSwitchMode,
-        /// Debug logging enabled (synced from server, not used locally)
-        debug_enabled: bool,
-        /// Spell checker for input validation
-        spell_checker: SpellChecker,
-        /// Spell check state (suggestions, current word, etc.)
-        spell_state: SpellState,
-        /// Message about spell suggestions
-        suggestion_message: Option<String>,
-        /// Actions synced from server
-        actions: Vec<Action>,
-        /// Selected action index in actions list
-        actions_selected: usize,
-        /// Filter text for actions list
-        actions_list_filter: String,
-        /// Action editor temp fields
-        edit_action_name: String,
-        edit_action_world: String,
-        edit_action_match_type: MatchType,
-        edit_action_pattern: String,
-        edit_action_command: String,
-        edit_action_enabled: bool,
-        /// Action error message
-        action_error: Option<String>,
-        /// Debug text for showing raw ANSI codes
-        debug_text: String,
-        /// Window transparency (0.0 = fully transparent, 1.0 = fully opaque)
-        transparency: f32,
-        /// Original transparency when setup popup opened (for cancel/revert)
-        original_transparency: Option<f32>,
-        /// Color offset percentage (0 = disabled, 1-100 = adjustment percentage)
-        color_offset_percent: u8,
-        /// ANSI music enabled
-        ansi_music_enabled: bool,
-        /// TLS proxy enabled (for connection preservation over hot reload)
-        tls_proxy_enabled: bool,
-        /// Custom dictionary path for spell checking
-        dictionary_path: String,
-        /// Audio output stream (must stay alive for audio to play)
-        #[cfg(all(feature = "rodio", not(target_os = "android")))]
-        audio_stream: Option<rodio::OutputStream>,
-        /// Audio output stream handle for playing sounds
-        #[cfg(all(feature = "rodio", not(target_os = "android")))]
-        audio_stream_handle: Option<rodio::OutputStreamHandle>,
-        /// Text selection start cursor (character index) per world
-        selection_start: Option<usize>,
-        /// Text selection end cursor (character index) per world - updated during drag
-        selection_end: Option<usize>,
-        /// Whether we're currently dragging a selection
-        selection_dragging: bool,
-        /// Approximate number of lines visible in output area (for more-mode)
-        output_visible_lines: usize,
-        /// Last sent view state (world_index, visible_lines) to avoid redundant messages
-        last_sent_view_state: Option<(usize, usize)>,
-        /// Activity count from server (number of worlds with unseen/pending output)
-        server_activity_count: usize,
-        /// Unified popup state for new popup system
-        unified_popup: Option<crate::popup::PopupState>,
-    }
-
-    /// Square wave audio source for ANSI music playback
-    #[cfg(all(feature = "rodio", not(target_os = "android")))]
-    struct SquareWaveSource {
-        sample_rate: u32,
-        frequency: f32,
-        duration_samples: usize,
-        current_sample: usize,
-    }
-
-    #[cfg(all(feature = "rodio", not(target_os = "android")))]
-    impl SquareWaveSource {
-        fn new(frequency: f32, duration_ms: u32, sample_rate: u32) -> Self {
-            let duration_samples = (sample_rate as f32 * duration_ms as f32 / 1000.0) as usize;
-            Self {
-                sample_rate,
-                frequency,
-                duration_samples,
-                current_sample: 0,
-            }
-        }
-    }
-
-    #[cfg(all(feature = "rodio", not(target_os = "android")))]
-    impl Iterator for SquareWaveSource {
-        type Item = f32;
-
-        fn next(&mut self) -> Option<Self::Item> {
-            if self.current_sample >= self.duration_samples {
-                return None;
-            }
-
-            let t = self.current_sample as f32 / self.sample_rate as f32;
-            let sample = if self.frequency > 0.0 {
-                // Square wave: sign of sine wave
-                let phase = (t * self.frequency * 2.0 * std::f32::consts::PI).sin();
-                if phase >= 0.0 { 0.15 } else { -0.15 }  // Low volume to not be too loud
-            } else {
-                0.0  // Rest/silence
-            };
-
-            self.current_sample += 1;
-            Some(sample)
-        }
-    }
-
-    #[cfg(all(feature = "rodio", not(target_os = "android")))]
-    impl rodio::Source for SquareWaveSource {
-        fn current_frame_len(&self) -> Option<usize> {
-            Some(self.duration_samples - self.current_sample)
-        }
-
-        fn channels(&self) -> u16 {
-            1  // Mono
-        }
-
-        fn sample_rate(&self) -> u32 {
-            self.sample_rate
-        }
-
-        fn total_duration(&self) -> Option<std::time::Duration> {
-            Some(std::time::Duration::from_millis(
-                (self.duration_samples as f32 / self.sample_rate as f32 * 1000.0) as u64
-            ))
-        }
-    }
-
-    /// Discord emoji segment for rendering
-    #[derive(Debug, Clone)]
-    enum DiscordSegment {
-        Text(String),
-        Emoji { name: String, id: String, animated: bool },
-        ColoredSquare(egui::Color32),
-    }
-
-    impl RemoteGuiApp {
-        pub fn new(ws_url: String, runtime: tokio::runtime::Handle) -> Self {
-            Self {
-                ws_url,
-                password: String::new(),
-                connected: false,
-                authenticated: false,
-                error_message: None,
-                worlds: Vec::new(),
-                current_world: 0,
-                input_buffer: String::new(),
-                prev_input_len: 0,
-                skip_temp_conversion: None,
-                completion_prefix: String::new(),
-                completion_index: 0,
-                ws_tx: None,
-                ws_rx: None,
-                runtime,
-                password_submitted: false,
-                auto_connect_attempted: false,
-                connect_time: None,
-                popup_state: PopupState::None,
-                menu_selected: 0,
-                world_list_selected: 0,
-                connected_worlds_filter: String::new(),
-                only_connected_worlds: false,
-                edit_name: String::new(),
-                edit_hostname: String::new(),
-                edit_port: String::new(),
-                edit_user: String::new(),
-                edit_password: String::new(),
-                edit_ssl: false,
-                edit_log_enabled: false,
-                edit_encoding: Encoding::Utf8,
-                edit_auto_login: AutoConnectType::Connect,
-                edit_keep_alive_type: KeepAliveType::Nop,
-                edit_keep_alive_cmd: String::new(),
-                input_height: 3,
-                console_theme: GuiTheme::Dark,
-                theme: GuiTheme::Dark,
-                font_name: String::new(),
-                font_size: 14.0,
-                web_font_size_phone: 10.0,
-                web_font_size_tablet: 14.0,
-                web_font_size_desktop: 18.0,
-                edit_font_name: String::new(),
-                edit_font_size: String::from("14.0"),
-                loaded_font_name: String::from("__uninitialized__"),
-                command_history: Vec::new(),
-                history_index: 0,
-                saved_input: String::new(),
-                scroll_offset: None,
-                scroll_max_offset: 0.0,
-                show_tags: false,
-                highlight_actions: false,
-                more_mode: true,
-                spell_check_enabled: true,
-                temp_convert_enabled: false,
-                filter_text: String::new(),
-                filter_active: false,
-                ws_allow_list: String::new(),
-                web_secure: false,
-                http_enabled: false,
-                http_port: 9000,
-                ws_enabled: false,
-                ws_port: 9001,
-                ws_cert_file: String::new(),
-                ws_key_file: String::new(),
-                world_switch_mode: WorldSwitchMode::UnseenFirst,
-                debug_enabled: false,
-                spell_checker: SpellChecker::new(""),
-                spell_state: SpellState::new(),
-                suggestion_message: None,
-                actions: Vec::new(),
-                actions_selected: 0,
-                actions_list_filter: String::new(),
-                edit_action_name: String::new(),
-                edit_action_world: String::new(),
-                edit_action_match_type: MatchType::Regexp,
-                edit_action_pattern: String::new(),
-                edit_action_command: String::new(),
-                edit_action_enabled: true,
-                action_error: None,
-                debug_text: String::new(),
-                transparency: 1.0,
-                original_transparency: None,
-                color_offset_percent: 0,
-                ansi_music_enabled: true,
-                tls_proxy_enabled: false,
-                dictionary_path: String::new(),
-                #[cfg(all(feature = "rodio", not(target_os = "android")))]
-                audio_stream: None,
-                #[cfg(all(feature = "rodio", not(target_os = "android")))]
-                audio_stream_handle: None,
-                selection_start: None,
-                selection_end: None,
-                selection_dragging: false,
-                output_visible_lines: 20,  // Default, updated during rendering
-                last_sent_view_state: None,
-                server_activity_count: 0,
-                unified_popup: None,
-            }
-        }
-
-        /// Initialize audio output for ANSI music playback
-        #[cfg(all(feature = "rodio", not(target_os = "android")))]
-        fn init_audio(&mut self) {
-            if self.audio_stream.is_none() {
-                match rodio::OutputStream::try_default() {
-                    Ok((stream, handle)) => {
-                        self.audio_stream = Some(stream);
-                        self.audio_stream_handle = Some(handle);
-                    }
-                    Err(_) => {
-                        // Audio initialization failed - music will be silently disabled
-                    }
-                }
-            }
-        }
-
-        /// Play ANSI music notes
-        #[cfg(all(feature = "rodio", not(target_os = "android")))]
-        fn play_ansi_music(&mut self, notes: &[crate::ansi_music::MusicNote]) {
-            if !self.ansi_music_enabled || notes.is_empty() {
-                return;
-            }
-
-            // Initialize audio if not already done
-            self.init_audio();
-
-            if let Some(handle) = &self.audio_stream_handle {
-                // Create a sink for sequential playback
-                if let Ok(sink) = rodio::Sink::try_new(handle) {
-                    for note in notes {
-                        let source = SquareWaveSource::new(note.frequency, note.duration_ms, 44100);
-                        sink.append(source);
-                    }
-                    // Detach the sink so it plays in the background
-                    sink.detach();
-                }
-            }
-        }
-
-        /// Play ANSI music notes (no-op when rodio is not available)
-        #[cfg(any(not(feature = "rodio"), target_os = "android"))]
-        fn play_ansi_music(&mut self, _notes: &[crate::ansi_music::MusicNote]) {
-            // Audio playback disabled - rodio feature not enabled
-        }
-
-        /// Open the world selector popup
-        fn open_world_selector_unified(&mut self) {
-            self.popup_state = PopupState::ConnectedWorlds;
-            self.world_list_selected = self.current_world;
-            self.only_connected_worlds = false;
-        }
-
-        /// Open the actions list popup using unified system
-        fn open_actions_list_unified(&mut self) {
-            use crate::popup::definitions::actions::*;
-
-            let actions: Vec<ActionInfo> = self.actions.iter()
-                .map(|a| ActionInfo {
-                    name: a.name.clone(),
-                    world: a.world.clone(),
-                    pattern: a.pattern.clone(),
-                    enabled: a.enabled,
-                })
-                .collect();
-
-            let visible_height = 10.min(actions.len().max(3));
-            let def = create_actions_list_popup(&actions, visible_height);
-            self.unified_popup = Some(crate::popup::PopupState::new(def));
-        }
-
-        /// Open the connections popup using unified system
-        fn open_connections_unified(&mut self) {
-            use crate::popup::definitions::connections::*;
-
-            let connections: Vec<ConnectionInfo> = self.worlds.iter().enumerate()
-                .map(|(idx, w)| {
-                    let last_send = w.last_send_secs.map(|s| format_elapsed(Some(s))).unwrap_or_else(|| "-".to_string());
-                    let last_recv = w.last_recv_secs.map(|s| format_elapsed(Some(s))).unwrap_or_else(|| "-".to_string());
-                    let ka_next = format_next_nop(w.last_send_secs, w.last_recv_secs);
-
-                    ConnectionInfo {
-                        name: w.name.clone(),
-                        is_current: idx == self.current_world,
-                        is_connected: w.connected,
-                        is_ssl: w.settings.use_ssl,
-                        is_proxy: false,
-                        unseen_lines: w.unseen_lines,
-                        last_send,
-                        last_recv,
-                        ka_next,
-                    }
-                })
-                .collect();
-
-            let visible_height = 10.min(connections.iter().filter(|c| c.is_connected).count().max(3));
-            let def = create_connections_popup(&connections, visible_height);
-            self.unified_popup = Some(crate::popup::PopupState::new(def));
-        }
-
-        /// Try to find a system font file by name
-        fn find_system_font(font_name: &str) -> Option<Vec<u8>> {
-            // Common font directories on Linux
-            let font_dirs = [
-                "/usr/share/fonts",
-                "/usr/local/share/fonts",
-                "~/.fonts",
-                "~/.local/share/fonts",
-            ];
-
-            // Map font names to common file names
-            let file_patterns: &[&str] = match font_name {
-                "Monospace" => &["DejaVuSansMono.ttf", "LiberationMono-Regular.ttf", "UbuntuMono-R.ttf"],
-                "DejaVu Sans Mono" => &["DejaVuSansMono.ttf"],
-                "Liberation Mono" => &["LiberationMono-Regular.ttf"],
-                "Ubuntu Mono" => &["UbuntuMono-R.ttf", "UbuntuMono-Regular.ttf"],
-                "Fira Code" => &["FiraCode-Regular.ttf", "FiraCode-Retina.ttf"],
-                "Source Code Pro" => &["SourceCodePro-Regular.ttf", "SourceCodePro-Regular.otf"],
-                "JetBrains Mono" => &["JetBrainsMono-Regular.ttf", "JetBrainsMono[wght].ttf"],
-                "Hack" => &["Hack-Regular.ttf"],
-                "Inconsolata" => &["Inconsolata-Regular.ttf", "Inconsolata.ttf"],
-                "Courier New" => &["cour.ttf", "CourierNew.ttf"],
-                "Consolas" => &["consola.ttf", "Consolas.ttf"],
-                _ => &[],
-            };
-
-            // Search for font files
-            for dir in &font_dirs {
-                let dir_path = if dir.starts_with('~') {
-                    if let Some(home) = std::env::var_os("HOME") {
-                        std::path::PathBuf::from(home).join(&dir[2..])
-                    } else {
-                        continue;
-                    }
-                } else {
-                    std::path::PathBuf::from(dir)
-                };
-
-                if !dir_path.exists() {
-                    continue;
-                }
-
-                // Recursively search for font files
-                fn search_dir(dir: &std::path::Path, patterns: &[&str]) -> Option<Vec<u8>> {
-                    if let Ok(entries) = std::fs::read_dir(dir) {
-                        for entry in entries.flatten() {
-                            let path = entry.path();
-                            if path.is_dir() {
-                                if let Some(data) = search_dir(&path, patterns) {
-                                    return Some(data);
-                                }
-                            } else if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
-                                for pattern in patterns {
-                                    if name.eq_ignore_ascii_case(pattern) {
-                                        if let Ok(data) = std::fs::read(&path) {
-                                            return Some(data);
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    None
-                }
-
-                if let Some(data) = search_dir(&dir_path, file_patterns) {
-                    return Some(data);
-                }
-            }
-
-            None
-        }
-
-        fn connect_websocket(&mut self) {
-            // Determine URL scheme - if ws_url starts with wss:// or ws://, use as-is
-            // Otherwise, try wss:// (secure) by default
-            let url = if self.ws_url.starts_with("ws://") || self.ws_url.starts_with("wss://") {
-                self.ws_url.clone()
-            } else {
-                // Default to wss:// for security
-                format!("wss://{}", self.ws_url)
-            };
-
-            let (tx, rx) = mpsc::unbounded_channel::<WsMessage>();
-            let (out_tx, mut out_rx) = mpsc::unbounded_channel::<WsMessage>();
-
-            self.ws_tx = Some(out_tx);
-            self.ws_rx = Some(rx);
-
-            let password_hash = hash_password(&self.password);
-            let password_submitted = self.password_submitted;
-            let ws_url_for_fallback = self.ws_url.clone();
-
-            self.runtime.spawn(async move {
-                // Try to connect - for wss:// we need to configure TLS
-                #[cfg(feature = "native-tls-backend")]
-                let connect_result = if url.starts_with("wss://") {
-                    // Create a TLS connector that accepts self-signed certificates
-                    let tls_connector = native_tls::TlsConnector::builder()
-                        .danger_accept_invalid_certs(true)
-                        .danger_accept_invalid_hostnames(true)
-                        .build()
-                        .map_err(|e| tokio_tungstenite::tungstenite::Error::Tls(
-                            tokio_tungstenite::tungstenite::error::TlsError::Native(e)
-                        ));
-
-                    match tls_connector {
-                        Ok(connector) => {
-                            let connector = tokio_tungstenite::Connector::NativeTls(connector);
-                            tokio_tungstenite::connect_async_tls_with_config(
-                                &url,
-                                None,
-                                false,
-                                Some(connector),
-                            ).await.map(|(ws, resp)| (ws, resp))
-                        }
-                        Err(e) => Err(e),
-                    }
-                } else {
-                    connect_async(&url).await
-                };
-
-                // Without native-tls, only ws:// is supported
-                #[cfg(not(feature = "native-tls-backend"))]
-                let connect_result = {
-                    // For rustls backend, fall back to ws://
-                    let ws_url = if url.starts_with("wss://") {
-                        format!("ws://{}", ws_url_for_fallback)
-                    } else {
-                        url.clone()
-                    };
-                    connect_async(&ws_url).await
-                };
-
-                // If wss:// failed and we defaulted to it, try ws:// as fallback
-                #[cfg(feature = "native-tls-backend")]
-                let connect_result = match connect_result {
-                    Ok(result) => Ok(result),
-                    Err(_e) if url.starts_with("wss://") && !ws_url_for_fallback.starts_with("wss://") => {
-                        // Try ws:// fallback
-                        let fallback_url = format!("ws://{}", ws_url_for_fallback);
-                        connect_async(&fallback_url).await
-                    }
-                    Err(e) => Err(e),
-                };
-
-                match connect_result {
-                    Ok((ws_stream, _)) => {
-                        use futures::SinkExt;
-                        let (mut ws_sink, mut ws_source) = ws_stream.split();
-
-                        // Send auth request if password was submitted
-                        if password_submitted {
-                            let auth_msg = WsMessage::AuthRequest { username: None, password_hash };
-                            if let Ok(json) = serde_json::to_string(&auth_msg) {
-                                let _ = ws_sink.send(WsRawMessage::Text(json)).await;
-                            }
-                        }
-
-                        // Spawn sender task
-                        let mut ws_sink = ws_sink;
-                        tokio::spawn(async move {
-                            while let Some(msg) = out_rx.recv().await {
-                                if let Ok(json) = serde_json::to_string(&msg) {
-                                    if ws_sink.send(WsRawMessage::Text(json)).await.is_err() {
-                                        break;
-                                    }
-                                }
-                            }
-                        });
-
-                        // Receive messages
-                        while let Some(msg_result) = ws_source.next().await {
-                            match msg_result {
-                                Ok(WsRawMessage::Text(text)) => {
-                                    if let Ok(ws_msg) = serde_json::from_str::<WsMessage>(&text) {
-                                        if tx.send(ws_msg).is_err() {
-                                            break;
-                                        }
-                                    }
-                                }
-                                Ok(WsRawMessage::Close(_)) => break,
-                                Err(_) => break,
-                                _ => {}
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        let _ = tx.send(WsMessage::AuthResponse {
-                            success: false,
-                            error: Some(format!("Connection failed: {}", e)),
-                            username: None,
-                            multiuser_mode: false,
-                        });
-                    }
-                }
-            });
-
-            self.connected = true;
-            self.connect_time = Some(std::time::Instant::now());
-        }
-
-        /// Send authentication request with current password
-        fn send_auth(&mut self) {
-            if let Some(ref tx) = self.ws_tx {
-                let password_hash = hash_password(&self.password);
-                let _ = tx.send(WsMessage::AuthRequest { username: None, password_hash });
-            }
-        }
-
-        fn process_messages(&mut self) {
-            // Collect deferred actions to avoid borrow issues
-            let mut deferred_switch: Option<usize> = None;
-            let mut deferred_connect: Option<usize> = None;
-            let mut deferred_edit: Option<usize> = None;
-            let mut deferred_music: Vec<crate::ansi_music::MusicNote> = Vec::new();
-            let mut deferred_open_actions = false;
-            let deferred_open_connections = false;
-
-            if let Some(ref mut rx) = self.ws_rx {
-                while let Ok(msg) = rx.try_recv() {
-                    match msg {
-                        WsMessage::AuthResponse { success, error, .. } => {
-                            if success {
-                                self.authenticated = true;
-                                self.error_message = None;
-                            } else {
-                                self.error_message = error;
-                                self.authenticated = false;
-                            }
-                        }
-                        WsMessage::InitialState { worlds, current_world_index, settings, actions, .. } => {
-                            // Track if this is first InitialState or a resync
-                            let is_resync = !self.worlds.is_empty();
-                            self.worlds = worlds.into_iter().map(|w| {
-                                // Calculate pending count (for synchronized more-mode indicator)
-                                let pending_count = if !w.pending_lines_ts.is_empty() {
-                                    w.pending_lines_ts.len()
-                                } else {
-                                    w.pending_lines.len()
-                                };
-                                RemoteWorld {
-                                name: w.name,
-                                connected: w.connected,
-                                // For synchronized more-mode: only use output_lines, NOT pending_lines
-                                // Pending lines will be sent as ServerData when released
-                                output_lines: {
-                                    if !w.output_lines_ts.is_empty() {
-                                        w.output_lines_ts
-                                    } else {
-                                        // Fallback for old protocol: use current time
-                                        let now = current_timestamp_secs();
-                                        w.output_lines.into_iter().enumerate().map(|(i, text)| TimestampedLine { text, ts: now, gagged: false, from_server: true, seq: i as u64 }).collect()
-                                    }
-                                },
-                                prompt: w.prompt,
-                                settings: RemoteWorldSettings {
-                                    hostname: w.settings.hostname,
-                                    port: w.settings.port,
-                                    user: w.settings.user,
-                                    password: decrypt_password(&w.settings.password),
-                                    use_ssl: w.settings.use_ssl,
-                                    log_enabled: w.settings.log_enabled,
-                                    encoding: w.settings.encoding,
-                                    auto_login: w.settings.auto_connect_type,
-                                    keep_alive_type: w.keep_alive_type.clone(),
-                                    keep_alive_cmd: w.settings.keep_alive_cmd.clone(),
-                                },
-                                unseen_lines: w.unseen_lines,  // Use server's centralized unseen tracking
-                                pending_count,
-                                last_send_secs: w.last_send_secs,
-                                last_recv_secs: w.last_recv_secs,
-                                last_nop_secs: w.last_nop_secs,
-                                partial_line: String::new(),
-                                showing_splash: w.showing_splash,
-                            }}).collect();
-                            // On first InitialState, use server's world index
-                            // On resync, preserve current world (bounded by new world count)
-                            if !is_resync {
-                                self.current_world = current_world_index;
-                            } else if self.current_world >= self.worlds.len() {
-                                self.current_world = self.worlds.len().saturating_sub(1);
-                            }
-                            self.console_theme = GuiTheme::from_name(&settings.console_theme);
-                            self.theme = GuiTheme::from_name(&settings.gui_theme);
-                            self.font_name = settings.font_name;
-                            self.font_size = settings.font_size;
-                            self.web_font_size_phone = settings.web_font_size_phone;
-                            self.web_font_size_tablet = settings.web_font_size_tablet;
-                            self.web_font_size_desktop = settings.web_font_size_desktop;
-                            self.transparency = settings.gui_transparency;
-                            self.color_offset_percent = settings.color_offset_percent;
-                            self.ws_allow_list = settings.ws_allow_list;
-                            self.web_secure = settings.web_secure;
-                            self.http_enabled = settings.http_enabled;
-                            self.http_port = settings.http_port;
-                            self.ws_enabled = settings.ws_enabled;
-                            self.ws_port = settings.ws_port;
-                            self.ws_cert_file = settings.ws_cert_file;
-                            self.ws_key_file = settings.ws_key_file;
-                            self.world_switch_mode = WorldSwitchMode::from_name(&settings.world_switch_mode);
-                            self.debug_enabled = settings.debug_enabled;
-                            self.more_mode = settings.more_mode_enabled;
-                            self.spell_check_enabled = settings.spell_check_enabled;
-                            self.temp_convert_enabled = settings.temp_convert_enabled;
-                            self.show_tags = settings.show_tags;
-                            self.ansi_music_enabled = settings.ansi_music_enabled;
-                            self.tls_proxy_enabled = settings.tls_proxy_enabled;
-                            self.dictionary_path = settings.dictionary_path.clone();
-                            self.actions = actions;
-                            // Send initial view state for synchronized more-mode
-                            if let Some(ref tx) = self.ws_tx {
-                                let _ = tx.send(WsMessage::UpdateViewState {
-                                    world_index: self.current_world,
-                                    visible_lines: self.output_visible_lines,
-                                });
-                                self.last_sent_view_state = Some((self.current_world, self.output_visible_lines));
-                            }
-                        }
-                        WsMessage::ServerData { world_index, data, is_viewed: _, ts, from_server } => {
-                            if world_index < self.worlds.len() {
-                                let world = &mut self.worlds[world_index];
-
-                                // Clear splash screen when real server data arrives
-                                if world.showing_splash {
-                                    world.showing_splash = false;
-                                    world.output_lines.clear();
-                                }
-
-                                // Combine with any partial line from previous message
-                                let combined = if world.partial_line.is_empty() {
-                                    data.clone()
-                                } else {
-                                    let mut s = std::mem::take(&mut world.partial_line);
-                                    s.push_str(&data);
-                                    s
-                                };
-
-                                // Check if data ends with newline (complete line) or not (partial)
-                                let ends_with_newline = combined.ends_with('\n');
-
-                                // Split into lines
-                                let lines: Vec<&str> = combined.lines().collect();
-                                let line_count = lines.len();
-
-                                for (i, line) in lines.into_iter().enumerate() {
-                                    let is_last = i == line_count - 1;
-
-                                    if is_last && !ends_with_newline {
-                                        // Last line without trailing newline - it's a partial
-                                        world.partial_line = line.to_string();
-                                    } else {
-                                        // Skip lines that are only ANSI codes (cursor control garbage)
-                                        if is_ansi_only_line(line) {
-                                            continue;
-                                        }
-                                        // Complete line - add to output
-                                        // Truncate very long lines to prevent performance issues
-                                        let text = if line.len() > MAX_LINE_LENGTH {
-                                            let mut truncate_at = MAX_LINE_LENGTH;
-                                            while truncate_at > 0 && !line.is_char_boundary(truncate_at) {
-                                                truncate_at -= 1;
-                                            }
-                                            format!("{}\x1b[0m\x1b[33m... [truncated]\x1b[0m", &line[..truncate_at])
-                                        } else {
-                                            line.to_string()
-                                        };
-                                        // All lines go to output_lines - server controls more-mode via pending_count
-                                        let seq = world.output_lines.len() as u64;
-                                        world.output_lines.push(TimestampedLine { text, ts, gagged: false, from_server, seq });
-                                    }
-                                }
-
-                                // Note: Don't track unseen_lines locally - server handles centralized tracking
-                                // and will broadcast UnseenUpdate/UnseenCleared when counts change
-                            }
-                        }
-                        WsMessage::WorldConnected { world_index, name } => {
-                            if world_index < self.worlds.len() {
-                                self.worlds[world_index].connected = true;
-                                self.worlds[world_index].name = name;
-                            }
-                        }
-                        WsMessage::WorldDisconnected { world_index } => {
-                            if world_index < self.worlds.len() {
-                                self.worlds[world_index].connected = false;
-                            }
-                        }
-                        WsMessage::WorldFlushed { world_index } => {
-                            if world_index < self.worlds.len() {
-                                self.worlds[world_index].output_lines.clear();
-                                self.worlds[world_index].pending_count = 0;
-                                self.worlds[world_index].partial_line.clear();
-                            }
-                        }
-                        WsMessage::AnsiMusic { world_index: _, notes } => {
-                            // Defer playing music to avoid borrow issues
-                            deferred_music.extend(notes);
-                        }
-                        WsMessage::WorldRemoved { world_index } => {
-                            if world_index < self.worlds.len() {
-                                self.worlds.remove(world_index);
-                                // Adjust current_world if needed
-                                if self.current_world >= self.worlds.len() {
-                                    self.current_world = self.worlds.len().saturating_sub(1);
-                                } else if self.current_world > world_index {
-                                    self.current_world -= 1;
-                                }
-                                // Adjust world_list_selected if needed
-                                if self.world_list_selected >= self.worlds.len() {
-                                    self.world_list_selected = self.worlds.len().saturating_sub(1);
-                                } else if self.world_list_selected > world_index {
-                                    self.world_list_selected -= 1;
-                                }
-                            }
-                        }
-                        WsMessage::WorldSwitched { new_index } => {
-                            self.current_world = new_index;
-                            // Mark seen when switching to a world
-                            if new_index < self.worlds.len() {
-                                self.worlds[new_index].unseen_lines = 0;
-                            }
-                        }
-                        WsMessage::PromptUpdate { world_index, prompt } => {
-                            if world_index < self.worlds.len() {
-                                self.worlds[world_index].prompt = prompt;
-                            }
-                        }
-                        WsMessage::WorldSettingsUpdated { world_index, settings, name } => {
-                            // Update local world settings from server confirmation
-                            if world_index < self.worlds.len() {
-                                self.worlds[world_index].name = name;
-                                self.worlds[world_index].settings.hostname = settings.hostname;
-                                self.worlds[world_index].settings.port = settings.port;
-                                self.worlds[world_index].settings.user = settings.user;
-                                self.worlds[world_index].settings.use_ssl = settings.use_ssl;
-                                self.worlds[world_index].settings.keep_alive_type = settings.keep_alive_type;
-                                self.worlds[world_index].settings.keep_alive_cmd = settings.keep_alive_cmd;
-                            }
-                        }
-                        WsMessage::GlobalSettingsUpdated { settings, input_height } => {
-                            // Update local global settings from server confirmation
-                            self.console_theme = GuiTheme::from_name(&settings.console_theme);
-                            self.theme = GuiTheme::from_name(&settings.gui_theme);
-                            self.input_height = input_height;
-                            self.font_name = settings.font_name;
-                            self.font_size = settings.font_size;
-                            self.web_font_size_phone = settings.web_font_size_phone;
-                            self.web_font_size_tablet = settings.web_font_size_tablet;
-                            self.web_font_size_desktop = settings.web_font_size_desktop;
-                            self.transparency = settings.gui_transparency;
-                            self.color_offset_percent = settings.color_offset_percent;
-                            self.ws_allow_list = settings.ws_allow_list;
-                            self.web_secure = settings.web_secure;
-                            self.http_enabled = settings.http_enabled;
-                            self.http_port = settings.http_port;
-                            self.ws_enabled = settings.ws_enabled;
-                            self.ws_port = settings.ws_port;
-                            self.ws_cert_file = settings.ws_cert_file;
-                            self.ws_key_file = settings.ws_key_file;
-                            self.world_switch_mode = WorldSwitchMode::from_name(&settings.world_switch_mode);
-                            self.debug_enabled = settings.debug_enabled;
-                            self.more_mode = settings.more_mode_enabled;
-                            self.spell_check_enabled = settings.spell_check_enabled;
-                            self.temp_convert_enabled = settings.temp_convert_enabled;
-                            self.show_tags = settings.show_tags;
-                            self.ansi_music_enabled = settings.ansi_music_enabled;
-                            self.tls_proxy_enabled = settings.tls_proxy_enabled;
-                            self.dictionary_path = settings.dictionary_path.clone();
-                        }
-                        WsMessage::PendingLinesUpdate { world_index, count } => {
-                            // Update pending count for world
-                            if world_index < self.worlds.len() {
-                                self.worlds[world_index].pending_count = count;
-                            }
-                        }
-                        WsMessage::PendingReleased { world_index, count: _ } => {
-                            // Server/another client released pending lines
-                            // GUI shows all data immediately, so just log for debugging
-                            // pending_count update comes via PendingLinesUpdate
-                            let _ = world_index; // suppress unused warning
-                        }
-                        WsMessage::WorldStateResponse { world_index, pending_count, prompt, scroll_offset: _, recent_lines: _ } => {
-                            // Response to RequestWorldState - update state for the world
-                            if world_index < self.worlds.len() && world_index == self.current_world {
-                                self.worlds[world_index].pending_count = pending_count;
-                                self.worlds[world_index].prompt = prompt;
-                            }
-                        }
-                        WsMessage::ActionsUpdated { actions } => {
-                            // Update local actions from server
-                            self.actions = actions;
-                        }
-                        WsMessage::UnseenCleared { world_index } => {
-                            // Another client (console or web) has viewed this world
-                            if world_index < self.worlds.len() {
-                                self.worlds[world_index].unseen_lines = 0;
-                            }
-                        }
-                        WsMessage::UnseenUpdate { world_index, count } => {
-                            // Server's unseen count changed - update our copy
-                            if world_index < self.worlds.len() {
-                                self.worlds[world_index].unseen_lines = count;
-                            }
-                        }
-                        WsMessage::ActivityUpdate { count } => {
-                            // Server's activity count changed - just display it
-                            self.server_activity_count = count;
-                        }
-                        WsMessage::CalculatedWorld { index: Some(idx) } => {
-                            // Server calculated the next/prev world for us
-                            if idx < self.worlds.len() && idx != self.current_world {
-                                self.current_world = idx;
-                                self.worlds[idx].unseen_lines = 0;
-                                self.scroll_offset = None; // Reset scroll
-                                // Notify server and request current state
-                                if let Some(ref tx) = self.ws_tx {
-                                    let _ = tx.send(WsMessage::MarkWorldSeen { world_index: idx });
-                                    let _ = tx.send(WsMessage::RequestWorldState { world_index: idx });
-                                }
-                            }
-                        }
-                        WsMessage::CalculatedWorld { index: None } => {}
-                        WsMessage::ExecuteLocalCommand { command } => {
-                            // Server wants us to execute a command locally (from action)
-                            let parsed = parse_command(&command);
-                            match parsed {
-                                Command::WorldSelector => {
-                                    self.popup_state = PopupState::ConnectedWorlds;
-                                    self.world_list_selected = self.current_world;
-                                    self.only_connected_worlds = false;
-                                }
-                                Command::WorldsList => {
-                                    // Output connected worlds list as text
-                                    let worlds_info: Vec<super::util::WorldListInfo> = self.worlds.iter().enumerate().map(|(idx, world)| {
-                                        super::util::WorldListInfo {
-                                            name: world.name.clone(),
-                                            connected: world.connected,
-                                            is_current: idx == self.current_world,
-                                            is_ssl: world.settings.use_ssl,
-                                            is_proxy: false,  // GUI doesn't have access to proxy state
-                                            unseen_lines: world.unseen_lines,
-                                            last_send_secs: world.last_send_secs,
-                                            last_recv_secs: world.last_recv_secs,
-                                            last_nop_secs: world.last_nop_secs,
-                                            next_nop_secs: None,
-                                        }
-                                    }).collect();
-                                    let output = super::util::format_worlds_list(&worlds_info);
-                                    let ts = super::current_timestamp_secs();
-                                    if self.current_world < self.worlds.len() {
-                                        for line in output.lines() {
-                                            let seq = self.worlds[self.current_world].output_lines.len() as u64;
-                                            self.worlds[self.current_world].output_lines.push(TimestampedLine {
-                                                text: line.to_string(),
-                                                ts,
-                                                gagged: false,
-                                                from_server: false,
-                                                seq,
-                                            });
-                                        }
-                                    }
-                                }
-                                Command::WorldSwitch { ref name } | Command::WorldConnectNoLogin { ref name } => {
-                                    // Switch to world locally, connect if needed
-                                    if let Some(idx) = self.worlds.iter().position(|w| w.name.eq_ignore_ascii_case(name)) {
-                                        self.current_world = idx;
-                                        deferred_switch = Some(idx);
-                                        if !self.worlds[idx].connected {
-                                            deferred_connect = Some(idx);
-                                        }
-                                    }
-                                    // If world not found, ignore (don't send to server to avoid console switch)
-                                }
-                                Command::WorldEdit { ref name } => {
-                                    // Open editor for world (deferred to avoid borrow issues)
-                                    if let Some(ref name) = name {
-                                        if let Some(idx) = self.worlds.iter().position(|w| w.name.eq_ignore_ascii_case(name)) {
-                                            deferred_edit = Some(idx);
-                                        }
-                                    } else {
-                                        // Edit current world
-                                        deferred_edit = Some(self.current_world);
-                                    }
-                                }
-                                Command::Help => {
-                                    self.popup_state = PopupState::Help;
-                                }
-                                Command::Version => {
-                                    let ts = super::current_timestamp_secs();
-                                    if self.current_world < self.worlds.len() {
-                                        let seq = self.worlds[self.current_world].output_lines.len() as u64;
-                                        self.worlds[self.current_world].output_lines.push(
-                                            TimestampedLine { text: super::get_version_string(), ts, gagged: false, from_server: false, seq }
-                                        );
-                                    }
-                                }
-                                Command::Menu => {
-                                    self.popup_state = PopupState::Menu;
-                                    self.menu_selected = 0;
-                                }
-                                Command::Setup => {
-                                    self.popup_state = PopupState::Setup;
-                                }
-                                Command::Actions { .. } => {
-                                    deferred_open_actions = true;
-                                }
-                                Command::Disconnect => {
-                                    // Send disconnect to server (this is safe, won't affect console's world)
-                                    if let Some(ref tx) = self.ws_tx {
-                                        let _ = tx.send(WsMessage::DisconnectWorld { world_index: self.current_world });
-                                    }
-                                }
-                                Command::Connect { .. } => {
-                                    // Connect current world
-                                    deferred_connect = Some(self.current_world);
-                                }
-                                _ => {
-                                    // For other commands (like /send), send to server
-                                    // Be careful: some commands like WorldSwitch would switch console
-                                    // so we handle those explicitly above
-                                    if let Some(ref tx) = self.ws_tx {
-                                        let _ = tx.send(WsMessage::SendCommand {
-                                            world_index: self.current_world,
-                                            command,
-                                        });
-                                    }
-                                }
-                            }
-                        }
-                        WsMessage::BanListResponse { .. } => {
-                            // Ban list received - output is already displayed via ServerData
-                        }
-                        WsMessage::UnbanResult { .. } => {
-                            // Unban result received - output is already displayed via ServerData
-                        }
-                        _ => {}
-                    }
-                }
-            }
-
-            // Execute deferred actions after the borrow is released
-            if let Some(idx) = deferred_switch {
-                self.switch_world(idx);
-            }
-            if let Some(idx) = deferred_connect {
-                self.connect_world(idx);
-            }
-            if let Some(idx) = deferred_edit {
-                self.open_world_editor(idx);
-            }
-            if !deferred_music.is_empty() {
-                self.play_ansi_music(&deferred_music);
-            }
-            if deferred_open_actions {
-                self.open_actions_list_unified();
-            }
-            if deferred_open_connections {
-                self.open_connections_unified();
-            }
-        }
-
-        fn send_command(&mut self, world_index: usize, command: String) {
-            // Store in command history (avoid duplicates of last command)
-            if !command.is_empty()
-                && self.command_history.last().map(|s| s.as_str()) != Some(&command)
-            {
-                self.command_history.push(command.clone());
-            }
-            // Reset history navigation
-            self.history_index = 0;
-            self.saved_input.clear();
-
-            if let Some(ref tx) = self.ws_tx {
-                let _ = tx.send(WsMessage::SendCommand { world_index, command });
-            }
-        }
-
-        fn switch_world(&mut self, world_index: usize) {
-            // Only send MarkWorldSeen to clear unseen count on server
-            // Don't send SwitchWorld - that would switch the console too
-            // GUI switching is local only (same as web interface)
-            if let Some(ref tx) = self.ws_tx {
-                let _ = tx.send(WsMessage::MarkWorldSeen { world_index });
-                // Request current state for this world (more indicator, prompt, etc)
-                let _ = tx.send(WsMessage::RequestWorldState { world_index });
-            }
-        }
-
-        fn connect_world(&mut self, world_index: usize) {
-            if let Some(ref tx) = self.ws_tx {
-                let _ = tx.send(WsMessage::ConnectWorld { world_index });
-            }
-        }
-
-        fn disconnect_world(&mut self, world_index: usize) {
-            if let Some(ref tx) = self.ws_tx {
-                let _ = tx.send(WsMessage::DisconnectWorld { world_index });
-            }
-        }
-
-        /// Find all misspelled words in the input buffer (excluding word at cursor)
-        fn find_misspelled_words(&self) -> Vec<(usize, usize)> {
-            let mut misspelled = Vec::new();
-            let chars: Vec<char> = self.input_buffer.chars().collect();
-            let mut i = 0;
-
-            // Helper to check if a character at position is part of a word
-            // (alphabetic, or apostrophe between alphabetic characters)
-            let is_word_char = |pos: usize| -> bool {
-                if pos >= chars.len() {
-                    return false;
-                }
-                let c = chars[pos];
-                if c.is_alphabetic() {
-                    return true;
-                }
-                // Include apostrophe if between alphabetic characters (contractions)
-                if c == '\'' {
-                    let has_alpha_before = pos > 0 && chars[pos - 1].is_alphabetic();
-                    let has_alpha_after = pos + 1 < chars.len() && chars[pos + 1].is_alphabetic();
-                    return has_alpha_before && has_alpha_after;
-                }
-                false
-            };
-
-            // Simple cursor position estimate (egui doesn't expose cursor position easily)
-            // We'll just check all words since we can't know where the cursor is during input_mut
-            let cursor_char_pos = chars.len(); // Assume cursor at end for now
-
-            // Helper to check if a word is clearly finished (followed by space or clear punctuation)
-            let is_word_complete = |end_pos: usize| -> bool {
-                if end_pos >= chars.len() {
-                    // Word at end of input - NOT complete if cursor is right at the end (still typing)
-                    return cursor_char_pos != end_pos;
-                }
-                let next_char = chars[end_pos];
-                // Word is complete if followed by whitespace or clear punctuation
-                next_char.is_whitespace() || matches!(next_char, '.' | ',' | '!' | '?' | ';' | ':' | ')' | ']' | '}' | '"')
-            };
-
-            while i < chars.len() {
-                // Skip non-word characters
-                while i < chars.len() && !chars[i].is_alphabetic() {
-                    i += 1;
-                }
-                if i >= chars.len() {
-                    break;
-                }
-
-                let start = i;
-                // Continue while we have word characters (including internal apostrophes)
-                while i < chars.len() && is_word_char(i) {
-                    i += 1;
-                }
-                let end = i;
-
-                let word: String = chars[start..end].iter().collect();
-                // Don't check if cursor is inside the word (actively typing)
-                // Note: end is the first position after the word, so use < not <=
-                let cursor_in_word = cursor_char_pos >= start && cursor_char_pos < end;
-                // Only check words that are clearly complete (followed by separator or at end of input)
-                let word_complete = is_word_complete(end);
-
-                if !cursor_in_word && word_complete && !self.spell_checker.is_valid(&word) {
-                    misspelled.push((start, end));
-                }
-            }
-
-            misspelled
-        }
-
-        /// Check for temperature patterns and convert them when followed by a separator.
-        /// Patterns: 32F, 32f, 100C, 100c, 32°F, 32.5F, -10C, etc.
-        /// When detected, inserts conversion in parentheses: "32F " -> "32F(0C) "
-        fn check_temp_conversion(&mut self) {
-            // Only convert temperatures when enabled
-            if !self.temp_convert_enabled {
-                return;
-            }
-
-            let current_len = self.input_buffer.len();
-            // Don't convert when user is deleting - allows undoing conversion
-            if current_len <= self.prev_input_len {
-                self.prev_input_len = current_len;
-                return;
-            }
-            self.prev_input_len = current_len;
-
-            let chars: Vec<char> = self.input_buffer.chars().collect();
-            if chars.is_empty() {
-                return;
-            }
-
-            // Check if we just typed a separator after a temperature
-            let last_char = chars[chars.len() - 1];
-            if !last_char.is_whitespace() && !matches!(last_char, '.' | ',' | '!' | '?' | ';' | ':' | ')' | ']' | '}') {
-                // Non-separator typed - clear skip so next temperature can convert
-                self.skip_temp_conversion = None;
-                return;
-            }
-
-            // Look backwards for a temperature pattern before the separator
-            // Pattern: optional minus, digits, optional decimal+digits, optional °, F or C
-            let end = chars.len() - 1; // Position of the separator
-            if end == 0 {
-                return;
-            }
-
-            // Find the F/C unit character
-            let unit_pos = end - 1;
-            let unit_char = chars[unit_pos].to_ascii_uppercase();
-            if unit_char != 'F' && unit_char != 'C' {
-                return;
-            }
-
-            // Check for optional degree symbol before the unit
-            let mut num_end = unit_pos;
-            if num_end > 0 && chars[num_end - 1] == '°' {
-                num_end -= 1;
-            }
-
-            // Find the start of the number (digits, optional decimal, optional leading minus)
-            let mut num_start = num_end;
-            let mut found_digit = false;
-            let mut found_decimal = false;
-
-            while num_start > 0 {
-                let c = chars[num_start - 1];
-                if c.is_ascii_digit() {
-                    found_digit = true;
-                    num_start -= 1;
-                } else if c == '.' && !found_decimal {
-                    found_decimal = true;
-                    num_start -= 1;
-                } else if c == '-' && num_start == num_end - (if found_decimal { 2 } else { 1 }) + 1 {
-                    // Only allow minus at the very start of the number
-                    num_start -= 1;
-                    break;
-                } else {
-                    break;
-                }
-            }
-
-            // Check we have at least one digit
-            if !found_digit {
-                return;
-            }
-
-            // Make sure the character before the number isn't part of the "word"
-            // (e.g., "abc32F" shouldn't trigger, but "test 32F" should)
-            if num_start > 0 {
-                let prev_char = chars[num_start - 1];
-                if prev_char.is_alphanumeric() || prev_char == '_' {
-                    return;
-                }
-            }
-
-            // Build the full temperature string (e.g., "21F", "-5.5°C")
-            let temp_str: String = chars[num_start..=unit_pos].iter().collect();
-
-            // Check if this temperature was already converted and undone - skip if so
-            if let Some(ref skip) = self.skip_temp_conversion {
-                if skip == &temp_str {
-                    return;
-                }
-            }
-
-            // Parse the number
-            let num_str: String = chars[num_start..num_end].iter().collect();
-            let temp: f64 = match num_str.parse() {
-                Ok(t) => t,
-                Err(_) => return,
-            };
-
-            // Convert temperature
-            let (converted, converted_unit) = if unit_char == 'F' {
-                // Fahrenheit to Celsius: (F - 32) * 5/9
-                ((temp - 32.0) * 5.0 / 9.0, 'C')
-            } else {
-                // Celsius to Fahrenheit: C * 9/5 + 32
-                (temp * 9.0 / 5.0 + 32.0, 'F')
-            };
-
-            // Format the conversion - use integer if whole number, else one decimal
-            // No space before the parenthesis - the separator the user typed goes after
-            let converted_str = if (converted - converted.round()).abs() < 0.05 {
-                format!("({:.0}{})", converted, converted_unit)
-            } else {
-                format!("({:.1}{})", converted, converted_unit)
-            };
-
-            // Remember this temperature so we don't re-convert if user undoes it
-            self.skip_temp_conversion = Some(temp_str);
-
-            // Insert the conversion before the separator
-            // Build new buffer: [before separator] + conversion + [separator]
-            let before_sep: String = chars[..end].iter().collect();
-            let sep: String = chars[end..].iter().collect();
-            self.input_buffer = format!("{}{}{}", before_sep, converted_str, sep);
-            // Update prev_input_len to reflect new length after conversion
-            self.prev_input_len = self.input_buffer.len();
-        }
-
-        /// Get the word at or before the cursor position
-        fn current_word(&self) -> Option<(usize, usize, String)> {
-            let chars: Vec<char> = self.input_buffer.chars().collect();
-            if chars.is_empty() {
-                return None;
-            }
-
-            // Helper to check if a character at position is part of a word
-            let is_word_char = |pos: usize| -> bool {
-                if pos >= chars.len() {
-                    return false;
-                }
-                let c = chars[pos];
-                if c.is_alphabetic() {
-                    return true;
-                }
-                // Include apostrophe if between alphabetic characters
-                if c == '\'' {
-                    let has_alpha_before = pos > 0 && chars[pos - 1].is_alphabetic();
-                    let has_alpha_after = pos + 1 < chars.len() && chars[pos + 1].is_alphabetic();
-                    return has_alpha_before && has_alpha_after;
-                }
-                false
-            };
-
-            // Assume cursor is at end of input (egui limitation)
-            let cursor_pos = chars.len();
-            if cursor_pos == 0 {
-                return None;
-            }
-
-            // Find word boundaries around cursor
-            let mut start = cursor_pos.saturating_sub(1);
-            while start > 0 && is_word_char(start - 1) {
-                start -= 1;
-            }
-
-            let mut end = cursor_pos;
-
-            // If cursor is on a non-word character (e.g., space after word),
-            // look backwards to find the previous word
-            if !chars[start].is_alphabetic() {
-                // Look back to find the last alphabetic character
-                let mut prev_end = start;
-                while prev_end > 0 && !chars[prev_end - 1].is_alphabetic() {
-                    prev_end -= 1;
-                }
-                if prev_end == 0 && (chars.is_empty() || !chars[0].is_alphabetic()) {
-                    return None;
-                }
-                // Now find the start of this word
-                end = prev_end;
-                start = prev_end;
-                while start > 0 && is_word_char(start - 1) {
-                    start -= 1;
-                }
-            } else {
-                while end < chars.len() && is_word_char(end) {
-                    end += 1;
-                }
-            }
-
-            let word: String = chars[start..end].iter().collect();
-            if word.is_empty() {
-                return None;
-            }
-
-            Some((start, end, word))
-        }
-
-        /// Handle Ctrl+Q spell check
-        fn handle_spell_check(&mut self) -> Option<String> {
-            if !self.spell_state.showing_suggestions {
-                // First press - find misspelled word and show suggestions
-                if let Some((start, end, word)) = self.current_word() {
-                    if !self.spell_checker.is_valid(&word) {
-                        let mut suggestions = self.spell_checker.suggestions(&word, 6);
-                        if !suggestions.is_empty() {
-                            self.spell_state.original_word = word.clone();
-                            suggestions.push(word); // Add original at end for cycling back
-
-                            let display_suggestions: Vec<_> = suggestions[..suggestions.len()-1].to_vec();
-                            let message = format!(
-                                "Suggestions for '{}': {}",
-                                self.spell_state.original_word,
-                                display_suggestions.join(", ")
-                            );
-
-                            self.spell_state.suggestions = suggestions;
-                            self.spell_state.suggestion_index = 0;
-                            self.spell_state.word_start = start;
-                            self.spell_state.word_end = end;
-                            self.spell_state.showing_suggestions = true;
-                            self.suggestion_message = Some(format!(
-                                "Press Ctrl+Q to cycle: {}",
-                                self.spell_state.suggestions[0]
-                            ));
-                            return Some(message);
-                        }
-                    }
-                }
-            } else if !self.spell_state.suggestions.is_empty() {
-                // Subsequent press - cycle and apply suggestions
-                let replacement = self.spell_state.suggestions[self.spell_state.suggestion_index].clone();
-
-                // Replace word in input buffer
-                let chars: Vec<char> = self.input_buffer.chars().collect();
-                let before: String = chars[..self.spell_state.word_start].iter().collect();
-                let after: String = if self.spell_state.word_end < chars.len() {
-                    chars[self.spell_state.word_end..].iter().collect()
-                } else {
-                    String::new()
-                };
-                self.input_buffer = format!("{}{}{}", before, replacement, after);
-
-                // Update word end position
-                self.spell_state.word_end = self.spell_state.word_start + replacement.chars().count();
-                self.spell_state.suggestion_index =
-                    (self.spell_state.suggestion_index + 1) % self.spell_state.suggestions.len();
-
-                let next_word = &self.spell_state.suggestions[self.spell_state.suggestion_index];
-                if next_word == &self.spell_state.original_word {
-                    self.suggestion_message = Some(format!(
-                        "Applied '{}'. Next: '{}' (original)",
-                        replacement, next_word
-                    ));
-                } else {
-                    self.suggestion_message = Some(format!(
-                        "Applied '{}'. Next: '{}'",
-                        replacement, next_word
-                    ));
-                }
-            }
-            None
-        }
-
-        /// Reset spell state when cursor moves away from word
-        fn reset_spell_state(&mut self) {
-            self.spell_state.reset();
-            self.suggestion_message = None;
-        }
-
-        fn update_world_settings(&mut self, world_index: usize) {
-            if let Some(ref tx) = self.ws_tx {
-                let _ = tx.send(WsMessage::UpdateWorldSettings {
-                    world_index,
-                    name: self.edit_name.clone(),
-                    hostname: self.edit_hostname.clone(),
-                    port: self.edit_port.clone(),
-                    user: self.edit_user.clone(),
-                    password: self.edit_password.clone(),
-                    use_ssl: self.edit_ssl,
-                    log_enabled: self.edit_log_enabled,
-                    encoding: self.edit_encoding.name().to_string(),
-                    auto_login: self.edit_auto_login.name().to_string(),
-                    keep_alive_type: self.edit_keep_alive_type.name().to_string(),
-                    keep_alive_cmd: self.edit_keep_alive_cmd.clone(),
-                });
-            }
-        }
-
-        fn update_global_settings(&mut self) {
-            if let Some(ref tx) = self.ws_tx {
-                let _ = tx.send(WsMessage::UpdateGlobalSettings {
-                    more_mode_enabled: self.more_mode,
-                    spell_check_enabled: self.spell_check_enabled,
-                    temp_convert_enabled: self.temp_convert_enabled,
-                    world_switch_mode: self.world_switch_mode.name().to_string(),
-                    show_tags: self.show_tags,
-                    debug_enabled: self.debug_enabled,
-                    ansi_music_enabled: self.ansi_music_enabled,
-                    console_theme: self.console_theme.to_string_value(),
-                    gui_theme: self.theme.to_string_value(),
-                    gui_transparency: self.transparency,
-                    color_offset_percent: self.color_offset_percent,
-                    input_height: self.input_height,
-                    font_name: self.font_name.clone(),
-                    font_size: self.font_size,
-                    web_font_size_phone: self.web_font_size_phone,
-                    web_font_size_tablet: self.web_font_size_tablet,
-                    web_font_size_desktop: self.web_font_size_desktop,
-                    ws_allow_list: self.ws_allow_list.clone(),
-                    web_secure: self.web_secure,
-                    http_enabled: self.http_enabled,
-                    http_port: self.http_port,
-                    ws_enabled: self.ws_enabled,
-                    ws_port: self.ws_port,
-                    ws_cert_file: self.ws_cert_file.clone(),
-                    ws_key_file: self.ws_key_file.clone(),
-                    tls_proxy_enabled: self.tls_proxy_enabled,
-                    dictionary_path: self.dictionary_path.clone(),
-                });
-            }
-        }
-
-        fn update_actions(&mut self) {
-            if let Some(ref tx) = self.ws_tx {
-                let _ = tx.send(WsMessage::UpdateActions {
-                    actions: self.actions.clone(),
-                });
-            }
-        }
-
-        fn open_world_editor(&mut self, world_index: usize) {
-            if let Some(world) = self.worlds.get(world_index) {
-                self.edit_name = world.name.clone();
-                self.edit_hostname = world.settings.hostname.clone();
-                self.edit_port = world.settings.port.clone();
-                self.edit_user = world.settings.user.clone();
-                self.edit_password = world.settings.password.clone();
-                self.edit_ssl = world.settings.use_ssl;
-                self.edit_log_enabled = world.settings.log_enabled;
-                self.edit_encoding = match world.settings.encoding.as_str() {
-                    "latin1" => Encoding::Latin1,
-                    "fansi" => Encoding::Fansi,
-                    _ => Encoding::Utf8,
-                };
-                self.edit_auto_login = AutoConnectType::from_name(&world.settings.auto_login);
-                self.edit_keep_alive_type = KeepAliveType::from_name(&world.settings.keep_alive_type);
-                self.edit_keep_alive_cmd = world.settings.keep_alive_cmd.clone();
-                self.popup_state = PopupState::WorldEditor(world_index);
-            }
-        }
-
-        /// Strip ANSI escape codes for clipboard copy
-        fn strip_ansi_for_copy(text: &str) -> String {
-            let mut result = String::new();
-            let mut chars = text.chars().peekable();
-
-            while let Some(c) = chars.next() {
-                if c == '\x1b' {
-                    // Skip escape sequence
-                    if chars.peek() == Some(&'[') {
-                        chars.next(); // consume '['
-                        // Skip until we hit a letter
-                        while let Some(&sc) = chars.peek() {
-                            chars.next();
-                            if sc.is_ascii_alphabetic() {
-                                break;
-                            }
-                        }
-                    }
-                } else {
-                    result.push(c);
-                }
-            }
-
-            result
-        }
-
-        /// Format timestamp for GUI display
-        /// Same day: HH:MM>
-        /// Previous days: DD/MM HH:MM>
-        #[allow(dead_code)]
-        fn format_timestamp_gui(ts: u64) -> String {
-            Self::format_timestamp_gui_cached(ts, &GuiCachedNow::new())
-        }
-
-        /// Format timestamp using cached "now" value for batch rendering
-        fn format_timestamp_gui_cached(ts: u64, _now: &GuiCachedNow) -> String {
-            let lt = local_time_from_epoch(ts as i64);
-
-            // Always show day/month for debugging ordering issues
-            format!("{:02}/{:02} {:02}:{:02}>", lt.day, lt.month, lt.hour, lt.minute)
-        }
-
-        /// Strip MUD tags like [channel:] or [channel(player)] from start of line
-        fn strip_mud_tags(text: &str) -> String {
-            let trimmed = text.trim_start();
-            if trimmed.starts_with('[') {
-                // Find the closing bracket
-                if let Some(end) = trimmed.find(']') {
-                    let tag = &trimmed[1..end];
-                    // Check if it looks like a MUD tag (contains : or parentheses)
-                    if tag.contains(':') || tag.contains('(') {
-                        // Return the rest of the line, preserving original leading whitespace
-                        let leading_ws = text.len() - trimmed.len();
-                        let after_tag = &trimmed[end + 1..];
-                        // Trim one space after tag if present
-                        let after_tag = after_tag.strip_prefix(' ').unwrap_or(after_tag);
-                        return format!("{}{}", &text[..leading_ws], after_tag);
-                    }
-                }
-            }
-            text.to_string()
-        }
-
-        /// Strip MUD tags from ANSI text while preserving color codes
-        fn strip_mud_tags_ansi(text: &str) -> String {
-            // First, find any leading whitespace
-            let trimmed = text.trim_start();
-            let leading_ws_len = text.len() - trimmed.len();
-            let leading_ws = &text[..leading_ws_len];
-
-            // Check if line starts with [ (possibly after ANSI codes)
-            // Need to skip ANSI codes to find the actual start
-            let mut chars = trimmed.chars().peekable();
-            let mut ansi_prefix = String::new();
-            let mut in_ansi = false;
-
-            while let Some(c) = chars.next() {
-                if c == '\x1b' && chars.peek() == Some(&'[') {
-                    ansi_prefix.push(c);
-                    in_ansi = true;
-                } else if in_ansi {
-                    ansi_prefix.push(c);
-                    if c.is_ascii_alphabetic() {
-                        in_ansi = false;
-                    }
-                } else if c == '[' {
-                    // Found the start of a potential tag
-                    // Look for closing bracket
-                    let rest: String = chars.collect();
-                    if let Some(end) = rest.find(']') {
-                        let tag = &rest[..end];
-                        if tag.contains(':') || tag.contains('(') {
-                            // It's a MUD tag, skip it
-                            let after_tag = &rest[end + 1..];
-                            let after_tag = after_tag.strip_prefix(' ').unwrap_or(after_tag);
-                            return format!("{}{}{}", leading_ws, ansi_prefix, after_tag);
-                        } else {
-                            // Not a MUD tag, return original
-                            return text.to_string();
-                        }
-                    } else {
-                        return text.to_string();
-                    }
-                } else {
-                    // Not a tag start, return original
-                    return text.to_string();
-                }
-            }
-            text.to_string()
-        }
-
-        /// Convert 256-color palette index to RGB
-        fn color256_to_rgb(n: u8, is_light_theme: bool) -> (u8, u8, u8) {
-            match n {
-                // Standard colors (0-7) - Xubuntu Dark palette
-                0 => (0, 0, 0),           // Black #000000
-                1 => (170, 0, 0),         // Red #aa0000
-                2 => (68, 170, 68),       // Green #44aa44
-                3 => if is_light_theme { (128, 64, 0) } else { (170, 85, 0) },  // Yellow #aa5500
-                4 => (0, 57, 170),        // Blue #0039aa
-                5 => (170, 34, 170),      // Magenta #aa22aa
-                6 => (26, 146, 170),      // Cyan #1a92aa
-                7 => if is_light_theme { (80, 80, 80) } else { (170, 170, 170) }, // White #aaaaaa
-                // High-intensity colors (8-15) - Xubuntu Dark palette
-                8 => (119, 119, 119),     // Bright Black #777777
-                9 => (255, 135, 135),     // Bright Red #ff8787
-                10 => (76, 230, 76),      // Bright Green #4ce64c
-                11 => if is_light_theme { (167, 163, 33) } else { (222, 216, 44) }, // Bright Yellow #ded82c
-                12 => (41, 95, 204),      // Bright Blue #295fcc
-                13 => (204, 88, 204),     // Bright Magenta #cc58cc
-                14 => (76, 204, 230),     // Bright Cyan #4ccce6
-                15 => if is_light_theme { (40, 40, 40) } else { (255, 255, 255) }, // Bright White #ffffff
-                // 216 colors (16-231): 6x6x6 color cube
-                // Standard xterm palette uses: 0, 95, 135, 175, 215, 255
-                16..=231 => {
-                    const CUBE_VALUES: [u8; 6] = [0, 95, 135, 175, 215, 255];
-                    let n = n - 16;
-                    let r = CUBE_VALUES[((n / 36) % 6) as usize];
-                    let g = CUBE_VALUES[((n / 6) % 6) as usize];
-                    let b = CUBE_VALUES[(n % 6) as usize];
-                    (r, g, b)
-                }
-                // Grayscale (232-255): 24 shades
-                232..=255 => {
-                    let gray = 8 + (n - 232) * 10;
-                    (gray, gray, gray)
-                }
-            }
-        }
-
-        /// Blend two colors with a given weight (0.0 = all bg, 1.0 = all fg)
-        fn blend_colors(fg: egui::Color32, bg: egui::Color32, fg_weight: f32) -> egui::Color32 {
-            let bg_weight = 1.0 - fg_weight;
-            egui::Color32::from_rgb(
-                (fg.r() as f32 * fg_weight + bg.r() as f32 * bg_weight).round() as u8,
-                (fg.g() as f32 * fg_weight + bg.g() as f32 * bg_weight).round() as u8,
-                (fg.b() as f32 * fg_weight + bg.b() as f32 * bg_weight).round() as u8,
-            )
-        }
-
-        /// Adjust foreground color for contrast when it's too similar to background.
-        /// color_offset_percent: 0 = disabled, 1-100 = threshold and adjustment percentage
-        fn adjust_fg_for_contrast(
-            fg: egui::Color32,
-            bg: egui::Color32,
-            theme_bg: egui::Color32,
-            color_offset_percent: u8,
-        ) -> egui::Color32 {
-            if color_offset_percent == 0 {
-                return fg;
-            }
-
-            // Calculate effective background (use theme_bg if transparent)
-            let effective_bg = if bg == egui::Color32::TRANSPARENT {
-                theme_bg
-            } else {
-                bg
-            };
-
-            // Calculate color distance (simple RGB distance)
-            let dr = (fg.r() as i32 - effective_bg.r() as i32).abs();
-            let dg = (fg.g() as i32 - effective_bg.g() as i32).abs();
-            let db = (fg.b() as i32 - effective_bg.b() as i32).abs();
-            let distance = dr + dg + db;
-
-            // Threshold for "too similar" - scale by color_offset_percent
-            // At 100%, colors within distance 150 are adjusted
-            let threshold = (150 * color_offset_percent as i32) / 100;
-
-            if distance >= threshold {
-                return fg; // Colors are different enough
-            }
-
-            // Calculate background brightness to determine if bg is light or dark
-            let bg_brightness = (effective_bg.r() as u32 + effective_bg.g() as u32 + effective_bg.b() as u32) / 3;
-            let is_bg_dark = bg_brightness < 128;
-
-            // Adjustment amount based on color_offset_percent
-            let adjustment = (color_offset_percent as i32 * 2).min(200); // Max 200 adjustment
-
-            // If background is dark, lighten foreground; if light, darken foreground
-            if is_bg_dark {
-                egui::Color32::from_rgb(
-                    (fg.r() as i32 + adjustment).min(255) as u8,
-                    (fg.g() as i32 + adjustment).min(255) as u8,
-                    (fg.b() as i32 + adjustment).min(255) as u8,
-                )
-            } else {
-                egui::Color32::from_rgb(
-                    (fg.r() as i32 - adjustment).max(0) as u8,
-                    (fg.g() as i32 - adjustment).max(0) as u8,
-                    (fg.b() as i32 - adjustment).max(0) as u8,
-                )
-            }
-        }
-
-        /// Append a segment to job, processing shade characters for proper color blending
-        fn append_segment_with_shades(
-            segment: &str,
-            font_id: &egui::FontId,
-            fg_color: egui::Color32,
-            bg_color: egui::Color32,
-            theme_bg: egui::Color32,
-            color_offset_percent: u8,
-            job: &mut egui::text::LayoutJob,
-        ) {
-            // Apply color contrast adjustment if enabled
-            let fg_color = Self::adjust_fg_for_contrast(fg_color, bg_color, theme_bg, color_offset_percent);
-
-            // If no shade characters, just append normally
-            if !segment.chars().any(|c| c == '░' || c == '▒' || c == '▓') {
-                job.append(segment, 0.0, egui::TextFormat {
-                    font_id: font_id.clone(),
-                    color: fg_color,
-                    background: bg_color,
-                    ..Default::default()
-                });
-                return;
-            }
-
-            // Use explicit background if set, otherwise use theme background for blending
-            let blend_bg = if bg_color == egui::Color32::TRANSPARENT {
-                theme_bg
-            } else {
-                bg_color
-            };
-
-            // Process shade characters - group consecutive chars by their type
-            let mut current_run = String::new();
-            let mut current_is_shade: Option<char> = None;
-
-            for c in segment.chars() {
-                let shade_type = match c {
-                    '░' | '▒' | '▓' => Some(c),
-                    _ => None,
-                };
-
-                if shade_type != current_is_shade && !current_run.is_empty() {
-                    // Flush current run
-                    if let Some(shade_char) = current_is_shade {
-                        // Shade run - use blended color for background
-                        // The background rectangles will provide the visual color
-                        let blended_color = match shade_char {
-                            '░' => Self::blend_colors(fg_color, blend_bg, 0.25),
-                            '▒' => Self::blend_colors(fg_color, blend_bg, 0.50),
-                            '▓' => Self::blend_colors(fg_color, blend_bg, 0.75),
-                            _ => fg_color,
-                        };
-                        // Use spaces - the background rectangle painting will provide the color
-                        let spaces: String = current_run.chars().map(|_| ' ').collect();
-                        job.append(&spaces, 0.0, egui::TextFormat {
-                            font_id: font_id.clone(),
-                            color: blended_color,
-                            background: blended_color,
-                            ..Default::default()
-                        });
-                    } else {
-                        // Regular run
-                        job.append(&current_run, 0.0, egui::TextFormat {
-                            font_id: font_id.clone(),
-                            color: fg_color,
-                            background: bg_color,
-                            ..Default::default()
-                        });
-                    }
-                    current_run.clear();
-                }
-
-                current_run.push(c);
-                current_is_shade = shade_type;
-            }
-
-            // Flush final run
-            if !current_run.is_empty() {
-                if let Some(shade_char) = current_is_shade {
-                    let blended_color = match shade_char {
-                        '░' => Self::blend_colors(fg_color, blend_bg, 0.25),
-                        '▒' => Self::blend_colors(fg_color, blend_bg, 0.50),
-                        '▓' => Self::blend_colors(fg_color, blend_bg, 0.75),
-                        _ => fg_color,
-                    };
-                    // Use spaces - the background rectangle painting will provide the color
-                    let spaces: String = current_run.chars().map(|_| ' ').collect();
-                    job.append(&spaces, 0.0, egui::TextFormat {
-                        font_id: font_id.clone(),
-                        color: blended_color,
-                        background: blended_color,
-                        ..Default::default()
-                    });
-                } else {
-                    job.append(&current_run, 0.0, egui::TextFormat {
-                        font_id: font_id.clone(),
-                        color: fg_color,
-                        background: bg_color,
-                        ..Default::default()
-                    });
-                }
-            }
-        }
-
-        /// Append ANSI-colored text to an existing LayoutJob
-        fn append_ansi_to_job(text: &str, default_color: egui::Color32, font_id: egui::FontId, job: &mut egui::text::LayoutJob, is_light_theme: bool, color_offset_percent: u8) {
-            // Debug: log ANSI sequences and resulting colors
-            static DEBUG_COUNT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-            let debug_this = DEBUG_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 5 && text.contains('\x1b');
-
-            // Theme background for shade character blending
-            let theme_bg = if is_light_theme {
-                egui::Color32::from_rgb(255, 255, 255)
-            } else {
-                egui::Color32::from_rgb(13, 17, 23)  // Dark theme background
-            };
-
-            let mut current_color = default_color;
-            let mut current_bg = egui::Color32::TRANSPARENT;
-            let mut bold = false;
-            let mut chars = text.chars().peekable();
-            let mut segment = String::new();
-
-            while let Some(c) = chars.next() {
-                if c == '\x1b' && chars.peek() == Some(&'[') {
-                    // Flush current segment
-                    if !segment.is_empty() {
-                        Self::append_segment_with_shades(&segment, &font_id, current_color, current_bg, theme_bg, color_offset_percent, job);
-                        segment.clear();
-                    }
-
-                    // Parse escape sequence
-                    chars.next(); // consume '['
-                    let mut code = String::new();
-                    let mut terminator = ' ';
-                    while let Some(&sc) = chars.peek() {
-                        if sc.is_ascii_alphabetic() || sc == '@' || sc == '`' || sc == '~' {
-                            terminator = sc;
-                            chars.next();
-                            break;
-                        }
-                        chars.next();
-                        code.push(sc);
-                    }
-
-                    // Only parse SGR codes (sequences ending in 'm')
-                    // Skip other CSI sequences (cursor movement, screen clearing, etc.)
-                    if terminator != 'm' {
-                        continue;
-                    }
-
-                    // Debug: log the SGR code
-                    if debug_this {
-                        use std::io::Write;
-                        if let Ok(mut f) = std::fs::OpenOptions::new()
-                            .create(true).append(true)
-                            .open("/tmp/clay_gui_debug.log")
-                        {
-                            let _ = writeln!(f, "SGR code: [{}m", code);
-                        }
-                    }
-
-                    // Parse SGR codes (semicolon-separated)
-                    let parts: Vec<&str> = code.split(';').collect();
-                    let mut i = 0;
-                    while i < parts.len() {
-                        match parts[i].parse::<u8>().unwrap_or(0) {
-                            0 => { current_color = default_color; current_bg = egui::Color32::TRANSPARENT; bold = false; }
-                            1 => bold = true,
-                            22 => bold = false,
-                            // Standard foreground colors (30-37) - Xubuntu Dark palette
-                            30 => current_color = egui::Color32::from_rgb(0, 0, 0),       // Black #000000
-                            31 => current_color = egui::Color32::from_rgb(170, 0, 0),     // Red #aa0000
-                            32 => current_color = egui::Color32::from_rgb(68, 170, 68),   // Green #44aa44
-                            33 => current_color = if is_light_theme {
-                                egui::Color32::from_rgb(128, 64, 0)  // Darker orange for light theme
-                            } else {
-                                egui::Color32::from_rgb(170, 85, 0)  // Yellow #aa5500
-                            },
-                            34 => current_color = if is_light_theme {
-                                egui::Color32::from_rgb(0, 43, 128)      // Darker blue for light theme
-                            } else {
-                                egui::Color32::from_rgb(0, 57, 170)      // Blue #0039aa
-                            },
-                            35 => current_color = egui::Color32::from_rgb(170, 34, 170),  // Magenta #aa22aa
-                            36 => current_color = egui::Color32::from_rgb(26, 146, 170),  // Cyan #1a92aa
-                            37 => current_color = if is_light_theme {
-                                egui::Color32::from_rgb(80, 80, 80)  // Dark gray for light theme
-                            } else {
-                                egui::Color32::from_rgb(170, 170, 170)  // White #aaaaaa
-                            },
-                            39 => current_color = default_color,
-                            // Bright/high-intensity foreground colors (90-97) - Xubuntu Dark palette
-                            90 => current_color = egui::Color32::from_rgb(119, 119, 119), // Bright Black #777777
-                            91 => current_color = egui::Color32::from_rgb(255, 135, 135), // Bright Red #ff8787
-                            92 => current_color = egui::Color32::from_rgb(76, 230, 76),   // Bright Green #4ce64c
-                            93 => current_color = if is_light_theme {
-                                egui::Color32::from_rgb(167, 163, 33)  // Darker lime for light theme
-                            } else {
-                                egui::Color32::from_rgb(222, 216, 44)  // Bright Yellow #ded82c
-                            },
-                            94 => current_color = egui::Color32::from_rgb(41, 95, 204),   // Bright Blue #295fcc
-                            95 => current_color = egui::Color32::from_rgb(204, 88, 204),  // Bright Magenta #cc58cc
-                            96 => current_color = egui::Color32::from_rgb(76, 204, 230),  // Bright Cyan #4ccce6
-                            97 => current_color = if is_light_theme {
-                                egui::Color32::from_rgb(40, 40, 40)  // Near black for light theme
-                            } else {
-                                egui::Color32::from_rgb(255, 255, 255)  // Bright White #ffffff
-                            },
-                            // Extended foreground color modes
-                            38 => {
-                                // 38;5;n = 256-color, 38;2;r;g;b = 24-bit RGB
-                                if i + 1 < parts.len() {
-                                    match parts[i + 1].parse::<u8>().unwrap_or(0) {
-                                        5 => {
-                                            // 256-color mode: 38;5;n
-                                            if i + 2 < parts.len() {
-                                                if let Ok(n) = parts[i + 2].parse::<u8>() {
-                                                    let (r, g, b) = Self::color256_to_rgb(n, is_light_theme);
-                                                    current_color = egui::Color32::from_rgb(r, g, b);
-                                                }
-                                                i += 2;
-                                            }
-                                        }
-                                        2 => {
-                                            // 24-bit RGB mode: 38;2;r;g;b
-                                            if i + 4 < parts.len() {
-                                                let r = parts[i + 2].parse::<u8>().unwrap_or(0);
-                                                let g = parts[i + 3].parse::<u8>().unwrap_or(0);
-                                                let b = parts[i + 4].parse::<u8>().unwrap_or(0);
-                                                current_color = egui::Color32::from_rgb(r, g, b);
-                                                i += 4;
-                                            }
-                                        }
-                                        _ => {}
-                                    }
-                                }
-                            }
-                            // Standard background colors (40-47) - Xubuntu Dark palette
-                            40 => current_bg = egui::Color32::from_rgb(0, 0, 0),       // Black #000000
-                            41 => current_bg = egui::Color32::from_rgb(170, 0, 0),     // Red #aa0000
-                            42 => current_bg = egui::Color32::from_rgb(68, 170, 68),   // Green #44aa44
-                            43 => current_bg = egui::Color32::from_rgb(170, 85, 0),    // Yellow #aa5500
-                            44 => current_bg = egui::Color32::from_rgb(0, 57, 170),    // Blue #0039aa
-                            45 => current_bg = egui::Color32::from_rgb(170, 34, 170),  // Magenta #aa22aa
-                            46 => current_bg = egui::Color32::from_rgb(26, 146, 170),  // Cyan #1a92aa
-                            47 => current_bg = egui::Color32::from_rgb(170, 170, 170), // White #aaaaaa
-                            49 => current_bg = egui::Color32::TRANSPARENT,             // Default background
-                            // Extended background color modes
-                            48 => {
-                                // 48;5;n = 256-color, 48;2;r;g;b = 24-bit RGB
-                                if i + 1 < parts.len() {
-                                    match parts[i + 1].parse::<u8>().unwrap_or(0) {
-                                        5 => {
-                                            // 256-color mode: 48;5;n
-                                            if i + 2 < parts.len() {
-                                                if let Ok(n) = parts[i + 2].parse::<u8>() {
-                                                    let (r, g, b) = Self::color256_to_rgb(n, is_light_theme);
-                                                    current_bg = egui::Color32::from_rgb(r, g, b);
-                                                }
-                                                i += 2;
-                                            }
-                                        }
-                                        2 => {
-                                            // 24-bit RGB mode: 48;2;r;g;b
-                                            if i + 4 < parts.len() {
-                                                let r = parts[i + 2].parse::<u8>().unwrap_or(0);
-                                                let g = parts[i + 3].parse::<u8>().unwrap_or(0);
-                                                let b = parts[i + 4].parse::<u8>().unwrap_or(0);
-                                                current_bg = egui::Color32::from_rgb(r, g, b);
-                                                i += 4;
-                                            }
-                                        }
-                                        _ => {}
-                                    }
-                                }
-                            }
-                            // Bright/high-intensity background colors (100-107) - Xubuntu Dark palette
-                            100 => current_bg = egui::Color32::from_rgb(119, 119, 119), // Bright Black #777777
-                            101 => current_bg = egui::Color32::from_rgb(255, 135, 135), // Bright Red #ff8787
-                            102 => current_bg = egui::Color32::from_rgb(76, 230, 76),   // Bright Green #4ce64c
-                            103 => current_bg = egui::Color32::from_rgb(222, 216, 44),  // Bright Yellow #ded82c
-                            104 => current_bg = egui::Color32::from_rgb(41, 95, 204),   // Bright Blue #295fcc
-                            105 => current_bg = egui::Color32::from_rgb(204, 88, 204),  // Bright Magenta #cc58cc
-                            106 => current_bg = egui::Color32::from_rgb(76, 204, 230),  // Bright Cyan #4ccce6
-                            107 => current_bg = egui::Color32::from_rgb(255, 255, 255), // Bright White #ffffff
-                            _ => {}
-                        }
-                        i += 1;
-                    }
-
-                    // Debug: log resulting color after parsing all SGR codes
-                    if debug_this {
-                        use std::io::Write;
-                        if let Ok(mut f) = std::fs::OpenOptions::new()
-                            .create(true).append(true)
-                            .open("/tmp/clay_gui_debug.log")
-                        {
-                            let _ = writeln!(f, "  -> color: rgb({},{},{}), bold: {}",
-                                current_color.r(), current_color.g(), current_color.b(), bold);
-                        }
-                    }
-                } else {
-                    // Check for colored square emoji and render as colored blocks
-                    if let Some((r, g, b)) = Self::colored_square_rgb(c) {
-                        // Flush current segment first
-                        if !segment.is_empty() {
-                            Self::append_segment_with_shades(&segment, &font_id, current_color, current_bg, theme_bg, color_offset_percent, job);
-                            segment.clear();
-                        }
-                        // Add two block characters with the emoji's color
-                        let square_color = egui::Color32::from_rgb(r, g, b);
-                        job.append(
-                            "██",
-                            0.0,
-                            egui::TextFormat {
-                                font_id: font_id.clone(),
-                                color: square_color,
-                                background: current_bg,
-                                ..Default::default()
-                            },
-                        );
-                    } else {
-                        segment.push(c);
-                    }
-                }
-            }
-
-            // Flush remaining segment
-            if !segment.is_empty() {
-                Self::append_segment_with_shades(&segment, &font_id, current_color, current_bg, theme_bg, color_offset_percent, job);
-            }
-        }
-
-        /// Get the RGB color for a colored square emoji
-        fn colored_square_rgb(c: char) -> Option<(u8, u8, u8)> {
-            match c {
-                '🟥' => Some((0xDD, 0x2E, 0x44)),
-                '🟧' => Some((0xF4, 0x90, 0x0C)),
-                '🟨' => Some((0xFD, 0xCB, 0x58)),
-                '🟩' => Some((0x78, 0xB1, 0x59)),
-                '🟦' => Some((0x55, 0xAC, 0xEE)),
-                '🟪' => Some((0xAA, 0x8E, 0xD6)),
-                '🟫' => Some((0xA0, 0x6A, 0x42)),
-                '⬛' => Some((0x31, 0x37, 0x3D)),
-                '⬜' => Some((0xE6, 0xE7, 0xE8)),
-                _ => None,
-            }
-        }
-
-        /// Find URLs in text and return their character positions (not byte positions)
-        /// Returns (start_char_idx, end_char_idx, url_string)
-        fn find_urls(text: &str) -> Vec<(usize, usize, String)> {
-            let mut urls = Vec::new();
-            let chars: Vec<char> = text.chars().collect();
-            let mut i = 0;
-
-            while i < chars.len() {
-                // Look for http:// or https://
-                let remaining: String = chars[i..].iter().collect();
-                let http_pos = remaining.find("http://");
-                let https_pos = remaining.find("https://");
-
-                // Find earliest match (in bytes), then convert to char position
-                let byte_pos = match (http_pos, https_pos) {
-                    (Some(h), Some(hs)) => Some(h.min(hs)),
-                    (Some(h), None) => Some(h),
-                    (None, Some(hs)) => Some(hs),
-                    (None, None) => None,
-                };
-
-                if let Some(byte_offset) = byte_pos {
-                    // Convert byte offset to char offset within remaining
-                    let char_offset = remaining[..byte_offset].chars().count();
-                    let start = i + char_offset;
-
-                    // Find end of URL (whitespace or certain punctuation)
-                    let mut end = start;
-                    while end < chars.len() {
-                        let c = chars[end];
-                        if c.is_whitespace() || c == '>' || c == '"' || c == '\'' || c == ')' || c == ']' {
-                            break;
-                        }
-                        end += 1;
-                    }
-
-                    if end > start {
-                        let url: String = chars[start..end].iter().collect();
-                        urls.push((start, end, url));
-                    }
-                    i = end;
-                } else {
-                    break;
-                }
-            }
-            urls
-        }
-
-        /// Open a URL in the default browser
-        fn open_url(url: &str) {
-            #[cfg(target_os = "linux")]
-            {
-                let _ = std::process::Command::new("xdg-open")
-                    .arg(url)
-                    .spawn();
-            }
-            #[cfg(target_os = "android")]
-            {
-                let _ = std::process::Command::new("xdg-open")
-                    .arg(url)
-                    .spawn();
-            }
-            #[cfg(target_os = "macos")]
-            {
-                let _ = std::process::Command::new("open")
-                    .arg(url)
-                    .spawn();
-            }
-            #[cfg(target_os = "windows")]
-            {
-                let _ = std::process::Command::new("cmd")
-                    .args(["/C", "start", url])
-                    .spawn();
-            }
-        }
-
-        /// Get color for a colored square emoji, if it is one
-        fn colored_square_color(c: char) -> Option<egui::Color32> {
-            match c {
-                '🟥' => Some(egui::Color32::from_rgb(0xDD, 0x2E, 0x44)), // Red
-                '🟧' => Some(egui::Color32::from_rgb(0xF4, 0x90, 0x0C)), // Orange
-                '🟨' => Some(egui::Color32::from_rgb(0xFD, 0xCB, 0x58)), // Yellow
-                '🟩' => Some(egui::Color32::from_rgb(0x78, 0xB1, 0x59)), // Green
-                '🟦' => Some(egui::Color32::from_rgb(0x55, 0xAC, 0xEE)), // Blue
-                '🟪' => Some(egui::Color32::from_rgb(0xAA, 0x8E, 0xD6)), // Purple
-                '🟫' => Some(egui::Color32::from_rgb(0xA0, 0x6A, 0x42)), // Brown
-                '⬛' => Some(egui::Color32::from_rgb(0x31, 0x37, 0x3D)), // Black
-                '⬜' => Some(egui::Color32::from_rgb(0xE6, 0xE7, 0xE8)), // White
-                _ => None,
-            }
-        }
-
-        /// Parse text into segments of plain text, Discord emojis, and colored squares
-        fn parse_discord_segments(text: &str) -> Vec<DiscordSegment> {
-            use regex::Regex;
-            use std::sync::OnceLock;
-
-            static RE: OnceLock<Regex> = OnceLock::new();
-            let re = RE.get_or_init(|| {
-                Regex::new(r"<(a?):([^:]+):(\d+)>").unwrap()
-            });
-
-            // First pass: handle Discord custom emoji
-            let mut temp_segments: Vec<DiscordSegment> = Vec::new();
-            let mut last_end = 0;
-
-            for cap in re.captures_iter(text) {
-                let m = cap.get(0).unwrap();
-                if m.start() > last_end {
-                    temp_segments.push(DiscordSegment::Text(text[last_end..m.start()].to_string()));
-                }
-                let animated = &cap[1] == "a";
-                let name = cap[2].to_string();
-                let id = cap[3].to_string();
-                temp_segments.push(DiscordSegment::Emoji { name, id, animated });
-                last_end = m.end();
-            }
-
-            if last_end < text.len() {
-                temp_segments.push(DiscordSegment::Text(text[last_end..].to_string()));
-            }
-
-            if temp_segments.is_empty() {
-                temp_segments.push(DiscordSegment::Text(text.to_string()));
-            }
-
-            // Second pass: split Text segments to extract colored square emoji
-            let mut segments: Vec<DiscordSegment> = Vec::new();
-            for seg in temp_segments {
-                match seg {
-                    DiscordSegment::Text(txt) => {
-                        // Split text at colored square emoji
-                        let mut current_text = String::new();
-                        for c in txt.chars() {
-                            if let Some(color) = Self::colored_square_color(c) {
-                                if !current_text.is_empty() {
-                                    segments.push(DiscordSegment::Text(current_text.clone()));
-                                    current_text.clear();
-                                }
-                                segments.push(DiscordSegment::ColoredSquare(color));
-                            } else {
-                                current_text.push(c);
-                            }
-                        }
-                        if !current_text.is_empty() {
-                            segments.push(DiscordSegment::Text(current_text));
-                        }
-                    }
-                    other => segments.push(other),
-                }
-            }
-
-            if segments.is_empty() {
-                segments.push(DiscordSegment::Text(String::new()));
-            }
-
-            segments
-        }
-
-        /// Check if text contains Discord custom emojis (not colored squares)
-        /// Colored squares are now handled in the non-emoji path for better selection support
-        fn has_discord_emojis(text: &str) -> bool {
-            // Only use emoji rendering path for actual Discord custom emojis
-            // Colored squares are rendered as colored blocks in the LayoutJob path
-            text.contains("<:") || text.contains("<a:")
-        }
-
-        /// Insert zero-width spaces after break characters in long words (>15 chars)
-        /// Break characters: [ ] ( ) , \ / - & = ? and spaces
-        /// Note: '.' is excluded because it breaks filenames (image.png) and domains awkwardly
-        /// Skips ANSI escape sequences to avoid corrupting them
-        fn insert_word_breaks(text: &str) -> String {
-            const ZWSP: char = '\u{200B}'; // Zero-width space
-            const BREAK_CHARS: &[char] = &['[', ']', '(', ')', ',', '\\', '/', '-', '&', '=', '?', '.', ';', ' '];
-            const MIN_WORD_LEN: usize = 15;
-
-            let mut result = String::with_capacity(text.len() * 2);
-            let mut word_len = 0;
-            let mut chars = text.chars().peekable();
-
-            while let Some(c) = chars.next() {
-                result.push(c);
-
-                // Skip ANSI escape sequences entirely
-                if c == '\x1b' && chars.peek() == Some(&'[') {
-                    // Consume the '['
-                    if let Some(bracket) = chars.next() {
-                        result.push(bracket);
-                    }
-                    // Consume until we hit the terminator (alphabetic or ~)
-                    while let Some(&sc) = chars.peek() {
-                        result.push(chars.next().unwrap());
-                        if sc.is_ascii_alphabetic() || sc == '~' {
-                            break;
-                        }
-                    }
-                    continue;
-                }
-
-                if c.is_whitespace() {
-                    word_len = 0;
-                } else {
-                    word_len += 1;
-                    // Insert break opportunity after break chars in long words
-                    if word_len > MIN_WORD_LEN && BREAK_CHARS.contains(&c) {
-                        result.push(ZWSP);
-                    }
-                }
-            }
-
-            result
-        }
-
-        /// Render a line with inline Discord emoji images and clickable URLs
-        fn render_line_with_emojis(
-            ui: &mut egui::Ui,
-            text: &str,
-            default_color: egui::Color32,
-            font_id: &egui::FontId,
-            is_light_theme: bool,
-            link_color: egui::Color32,
-            color_offset_percent: u8,
-        ) {
-            let segments = Self::parse_discord_segments(text);
-            let available_width = ui.available_width();
-
-            // Check if this line has Discord emoji or colored squares
-            let has_special = segments.iter().any(|s| matches!(s, DiscordSegment::Emoji { .. } | DiscordSegment::ColoredSquare(_)));
-
-            if has_special {
-                // Use horizontal_wrapped for lines with emoji/colored squares
-                // URL clicking won't work here, but emoji will render correctly
-                ui.horizontal_wrapped(|ui| {
-                    ui.spacing_mut().item_spacing.x = 0.0;
-                    for segment in segments {
-                        match segment {
-                            DiscordSegment::Text(txt) => {
-                                let txt_with_breaks = Self::insert_word_breaks(&txt);
-                                let mut job = egui::text::LayoutJob {
-                                    wrap: egui::text::TextWrapping {
-                                        max_width: available_width,
-                                        ..Default::default()
-                                    },
-                                    ..Default::default()
-                                };
-                                Self::append_ansi_to_job(&txt_with_breaks, default_color, font_id.clone(), &mut job, is_light_theme, color_offset_percent);
-                                let galley = ui.fonts(|f| f.layout_job(job));
-                                ui.label(galley);
-                            }
-                            DiscordSegment::Emoji { name, id, animated } => {
-                                let ext = if animated { "gif" } else { "png" };
-                                let url = format!("https://cdn.discordapp.com/emojis/{}.{}", id, ext);
-                                let image = egui::Image::from_uri(&url)
-                                    .fit_to_exact_size(egui::vec2(font_id.size * 1.2, font_id.size * 1.2));
-                                ui.add(image).on_hover_text(format!(":{}:", name));
-                            }
-                            DiscordSegment::ColoredSquare(color) => {
-                                let size = font_id.size * 1.1;
-                                let (rect, _response) = ui.allocate_exact_size(
-                                    egui::vec2(size, size),
-                                    egui::Sense::hover()
-                                );
-                                if ui.is_rect_visible(rect) {
-                                    ui.painter().rect_filled(rect, 2.0, color);
-                                }
-                            }
-                        }
-                    }
-                });
-            } else {
-                // No emoji/colored squares - use LayoutJob with clickable URLs
-                let mut job = egui::text::LayoutJob {
-                    wrap: egui::text::TextWrapping {
-                        max_width: available_width,
-                        ..Default::default()
-                    },
-                    ..Default::default()
-                };
-
-                // Track URL positions in the final job text (character indices)
-                let mut url_ranges: Vec<(usize, usize, String)> = Vec::new();
-
-                for segment in &segments {
-                    if let DiscordSegment::Text(txt) = segment {
-                        let urls = Self::find_urls(txt);
-                        if urls.is_empty() {
-                            let txt_with_breaks = Self::insert_word_breaks(txt);
-                            Self::append_ansi_to_job(&txt_with_breaks, default_color, font_id.clone(), &mut job, is_light_theme, color_offset_percent);
-                        } else {
-                            let char_to_byte: Vec<usize> = txt.char_indices().map(|(i, _)| i).collect();
-                            let txt_char_count = char_to_byte.len();
-                            let mut last_end_char = 0;
-
-                            for (start_char, end_char, url) in urls {
-                                if start_char > last_end_char {
-                                    let start_byte = char_to_byte.get(last_end_char).copied().unwrap_or(0);
-                                    let end_byte = char_to_byte.get(start_char).copied().unwrap_or(txt.len());
-                                    let before = Self::insert_word_breaks(&txt[start_byte..end_byte]);
-                                    Self::append_ansi_to_job(&before, default_color, font_id.clone(), &mut job, is_light_theme, color_offset_percent);
-                                }
-
-                                let clean_url = Self::strip_ansi_for_copy(&url);
-                                let url_with_breaks = Self::insert_word_breaks(&clean_url);
-                                let url_start = job.text.chars().count();
-                                job.append(&url_with_breaks, 0.0, egui::TextFormat {
-                                    font_id: font_id.clone(),
-                                    color: link_color,
-                                    underline: egui::Stroke::new(1.0, link_color),
-                                    ..Default::default()
-                                });
-                                let url_end = job.text.chars().count();
-                                let final_url = clean_url.replace('\u{200B}', "");
-                                url_ranges.push((url_start, url_end, final_url));
-
-                                last_end_char = end_char;
-                            }
-
-                            if last_end_char < txt_char_count {
-                                let start_byte = char_to_byte.get(last_end_char).copied().unwrap_or(txt.len());
-                                let after = Self::insert_word_breaks(&txt[start_byte..]);
-                                Self::append_ansi_to_job(&after, default_color, font_id.clone(), &mut job, is_light_theme, color_offset_percent);
-                            }
-                        }
-                    }
-                }
-
-                let galley = ui.fonts(|f| f.layout_job(job));
-                // Allocate space with click_and_drag to allow text selection
-                let (rect, _response) = ui.allocate_exact_size(galley.size(), egui::Sense::click_and_drag());
-                let text_pos = rect.min;
-
-                // Paint the galley
-                ui.painter().galley(text_pos, galley.clone());
-
-                // Check for clicks and hovers using global input state
-                let pointer_pos = ui.input(|i| i.pointer.interact_pos());
-                let hover_pos = ui.input(|i| i.pointer.hover_pos());
-                let primary_clicked = ui.input(|i| i.pointer.primary_clicked());
-
-                // Handle URL clicks - check if click is within our rect
-                if primary_clicked && !url_ranges.is_empty() {
-                    if let Some(pos) = pointer_pos {
-                        if rect.contains(pos) {
-                            let relative_pos = pos - text_pos;
-                            let cursor = galley.cursor_from_pos(relative_pos);
-                            let click_char = cursor.ccursor.index;
-
-                            for (start, end, url) in &url_ranges {
-                                if click_char >= *start && click_char < *end {
-                                    // Strip zero-width spaces that were inserted for word breaking
-                                    let clean_url = url.replace('\u{200B}', "");
-                                    Self::open_url(&clean_url);
-                                    break;
-                                }
-                            }
-                        }
-                    }
-                }
-
-                // Show pointer cursor when hovering over URLs
-                if let Some(pos) = hover_pos {
-                    if rect.contains(pos) {
-                        let relative_pos = pos - text_pos;
-                        let cursor = galley.cursor_from_pos(relative_pos);
-                        let hover_char = cursor.ccursor.index;
-
-                        for (start, end, _) in &url_ranges {
-                            if hover_char >= *start && hover_char < *end {
-                                ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
-                                break;
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    impl eframe::App for RemoteGuiApp {
-        fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-            // Skip rendering until screen has valid dimensions
-            // This prevents NaN panics from egui layout calculations on startup
-            let screen = ctx.screen_rect();
-            if screen.width() <= 0.0 || screen.height() <= 0.0 ||
-               screen.width().is_nan() || screen.height().is_nan() ||
-               !screen.width().is_finite() || !screen.height().is_finite() {
-                ctx.request_repaint();
-                return;
-            }
-
-            // Process incoming WebSocket messages
-            self.process_messages();
-
-            // Apply theme to egui visuals
-            let theme = self.theme;
-            let mut visuals = if theme == GuiTheme::Dark {
-                egui::Visuals::dark()
-            } else {
-                egui::Visuals::light()
-            };
-
-            // Customize based on our theme
-            // NOTE: Do NOT set override_text_color as it overrides LayoutJob colors!
-            visuals.override_text_color = None;
-            // Apply transparency to panel and window fills
-            let alpha = (self.transparency * 255.0) as u8;
-            let panel_bg = theme.panel_bg();
-            visuals.panel_fill = egui::Color32::from_rgba_unmultiplied(panel_bg.r(), panel_bg.g(), panel_bg.b(), alpha);
-            visuals.window_fill = egui::Color32::from_rgba_unmultiplied(panel_bg.r(), panel_bg.g(), panel_bg.b(), alpha);
-            visuals.widgets.noninteractive.bg_fill = theme.button_bg();
-            visuals.widgets.inactive.bg_fill = theme.button_bg();
-            visuals.widgets.hovered.bg_fill = theme.selection_bg();
-            visuals.widgets.active.bg_fill = theme.selection_bg();
-            visuals.selection.bg_fill = theme.selection_bg();
-            // Set proper foreground strokes for buttons/widgets to be visible
-            let fg_stroke = egui::Stroke::new(1.0, theme.fg());
-            visuals.widgets.noninteractive.fg_stroke = fg_stroke;
-            visuals.widgets.inactive.fg_stroke = fg_stroke;
-            visuals.widgets.hovered.fg_stroke = fg_stroke;
-            visuals.widgets.active.fg_stroke = fg_stroke;
-            ctx.set_visuals(visuals);
-
-            // Make scrollbars always visible and solid (not floating)
-            let mut style = (*ctx.style()).clone();
-            style.spacing.scroll = egui::style::ScrollStyle {
-                floating: false,  // Solid scrollbar, always takes space
-                bar_width: 10.0,
-                handle_min_length: 20.0,
-                bar_inner_margin: 2.0,
-                bar_outer_margin: 2.0,
-                ..Default::default()
-            };
-            // Reduce spacing for tighter text layout (helps with ASCII art)
-            style.spacing.item_spacing.y = 0.0;
-            ctx.set_style(style);
-
-            // Load custom font if font name changed
-            if self.loaded_font_name != self.font_name {
-                self.loaded_font_name = self.font_name.clone();
-
-                let mut fonts = egui::FontDefinitions::default();
-
-                if !self.font_name.is_empty() {
-                    // Try to load the system font
-                    if let Some(font_data) = Self::find_system_font(&self.font_name) {
-                        // Add the custom font with tweaks for tighter line spacing (ASCII art)
-                        let font_data = egui::FontData::from_owned(font_data).tweak(
-                            egui::FontTweak {
-                                scale: 1.05,              // Slightly larger to fill row height
-                                y_offset_factor: -0.02,   // Move up slightly to reduce gaps
-                                y_offset: 0.0,
-                                baseline_offset_factor: 0.0,
-                            }
-                        );
-                        fonts.font_data.insert(
-                            "custom_mono".to_owned(),
-                            font_data,
-                        );
-
-                        // Make it the first priority for monospace
-                        fonts.families
-                            .entry(egui::FontFamily::Monospace)
-                            .or_default()
-                            .insert(0, "custom_mono".to_owned());
-
-                        // Also use for proportional text
-                        fonts.families
-                            .entry(egui::FontFamily::Proportional)
-                            .or_default()
-                            .insert(0, "custom_mono".to_owned());
-                    }
-                }
-                // Load symbol fonts for Unicode/emoji coverage
-                // NotoSansSymbols2 has geometric shapes including colored square emoji
-                let symbol_fonts: &[(&str, &str)] = &[
-                    ("symbols2", "/usr/share/fonts/truetype/noto/NotoSansSymbols2-Regular.ttf"),
-                    ("symbols", "/usr/share/fonts/truetype/noto/NotoSansSymbols-Regular.ttf"),
-                    ("symbola", "/usr/share/fonts/truetype/ancient-scripts/Symbola_hint.ttf"),
-                ];
-                for (name, path) in symbol_fonts {
-                    if let Ok(font_data) = std::fs::read(path) {
-                        fonts.font_data.insert(
-                            (*name).to_owned(),
-                            egui::FontData::from_owned(font_data),
-                        );
-                        fonts.families
-                            .entry(egui::FontFamily::Monospace)
-                            .or_default()
-                            .push((*name).to_owned());
-                        fonts.families
-                            .entry(egui::FontFamily::Proportional)
-                            .or_default()
-                            .push((*name).to_owned());
-                    }
-                }
-
-                ctx.set_fonts(fonts);
-            }
-
-            // Apply font size to monospace text style
-            let mut style = (*ctx.style()).clone();
-            if let Some(font_id) = style.text_styles.get_mut(&egui::TextStyle::Monospace) {
-                font_id.size = self.font_size;
-            }
-            // Also apply to body text
-            if let Some(font_id) = style.text_styles.get_mut(&egui::TextStyle::Body) {
-                font_id.size = self.font_size;
-            }
-            ctx.set_style(style);
-
-            // Request repaint to keep polling messages
-            ctx.request_repaint();
-
-            if !self.connected || !self.authenticated {
-                // Show login dialog with dog and Clay branding
-                egui::CentralPanel::default()
-                    .frame(egui::Frame::none().fill(theme.bg_deep()))
-                    .show(ctx, |ui| {
-                    ui.vertical_centered(|ui| {
-                        ui.add_space(30.0);
-
-                        // Clay logo image (clay2.png scaled to ~200px wide, preserving aspect ratio)
-                        let splash_image = egui::Image::from_bytes(
-                            "bytes://clay_splash",
-                            include_bytes!("../clay2.png"),
-                        ).fit_to_exact_size(egui::vec2(200.0, 200.0));
-                        ui.add(splash_image);
-
-                        let tagline_color = egui::Color32::from_rgb(0xff, 0x87, 0xff);  // 213
-                        ui.add_space(5.0);
-                        ui.label(egui::RichText::new("A 90dies mud client written today").color(tagline_color).italics());
-                        ui.add_space(5.0);
-                        ui.label(egui::RichText::new("/help for how to use clay").color(theme.fg_muted()));
-                        ui.add_space(20.0);
-
-                        // Auto-connect on first frame to check if allow list grants access
-                        if !self.auto_connect_attempted && !self.connected {
-                            self.auto_connect_attempted = true;
-                            self.connect_websocket();
-                        }
-
-                        // Check if we're still waiting for allow list response (500ms timeout)
-                        let allow_list_timeout = std::time::Duration::from_millis(500);
-                        let still_checking_allow_list = self.connected
-                            && !self.authenticated
-                            && !self.password_submitted
-                            && self.connect_time.is_some_and(|t| t.elapsed() < allow_list_timeout);
-
-                        // Login card with Frame
-                        egui::Frame::none()
-                            .fill(theme.bg_surface())
-                            .stroke(egui::Stroke::new(1.0, theme.border_subtle()))
-                            .rounding(egui::Rounding::same(8.0))
-                            .inner_margin(egui::Margin::same(20.0))
-                            .show(ui, |ui| {
-                                // Server address
-                                ui.label(egui::RichText::new(format!("Connecting to {}", self.ws_url))
-                                    .color(theme.fg_muted())
-                                    .size(11.0));
-                                ui.add_space(16.0);
-
-                                // Show connection status or password prompt
-                                if still_checking_allow_list {
-                                    ui.label(egui::RichText::new("Checking allow list...")
-                                        .color(theme.fg_secondary()));
-                                    ui.add_space(10.0);
-                                    // Request repaint to update when timeout expires
-                                    ctx.request_repaint();
-                                }
-
-                                // Password label - left justified with field
-                                ui.allocate_ui_with_layout(
-                                    egui::vec2(280.0, 14.0),
-                                    egui::Layout::left_to_right(egui::Align::Center),
-                                    |ui| {
-                                        ui.label(egui::RichText::new("PASSWORD")
-                                            .color(theme.fg_muted())
-                                            .size(10.0));
-                                    }
-                                );
-                                ui.add_space(4.0);
-
-                                // Password input with custom styling
-                                let password_edit = TextEdit::singleline(&mut self.password)
-                                    .password(true)
-                                    .desired_width(280.0)
-                                    .margin(egui::vec2(12.0, 8.0));
-                                let response = ui.add(password_edit);
-
-                                if response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
-                                    self.password_submitted = true;
-                                    if self.connected {
-                                        self.send_auth();
-                                    } else {
-                                        self.connect_websocket();
-                                    }
-                                }
-
-                                ui.add_space(15.0);
-
-                                // Connect button - styled as primary, right justified with password field
-                                let button_size = egui::vec2(80.0, 32.0);
-                                ui.allocate_ui_with_layout(
-                                    egui::vec2(280.0, button_size.y),
-                                    egui::Layout::right_to_left(egui::Align::Center),
-                                    |ui| {
-                                        let button = egui::Button::new(
-                                            egui::RichText::new("CONNECT")
-                                                .color(theme.bg_deep())
-                                                .strong()
-                                                .size(11.0)
-                                        )
-                                        .fill(theme.accent_dim())
-                                        .stroke(egui::Stroke::NONE)
-                                        .rounding(egui::Rounding::same(4.0));
-
-                                        if ui.add_sized(button_size, button).clicked() {
-                                            self.password_submitted = true;
-                                            if self.connected {
-                                                self.send_auth();
-                                            } else {
-                                                self.connect_websocket();
-                                            }
-                                        }
-                                    }
-                                );
-
-                                // Error message
-                                if let Some(ref err) = self.error_message {
-                                    ui.add_space(12.0);
-                                    ui.label(egui::RichText::new(err.as_str())
-                                        .color(theme.error())
-                                        .size(12.0));
-                                }
-                            });
-                    });
-                });
-            } else {
-                // Show main interface with menu bar
-                let mut action: Option<&str> = None;
-                let mut cursor_home = false;
-
-                // Handle keyboard shortcuts (only when no popup is open)
-                if self.popup_state == PopupState::None && !self.filter_active {
-                    let switch_world: Option<usize> = None;
-                    let mut history_action: Option<i32> = None; // -1 = prev, 1 = next
-                    let mut scroll_action: Option<i32> = None; // -1 = up, 1 = down
-                    let mut clear_input = false;
-                    let mut delete_word = false;
-                    let mut resize_input: i32 = 0;
-                    let mut tab_complete = false;
-
-                    // Use input_mut to consume events before widgets get them
-                    ctx.input_mut(|i| {
-                        // Ctrl+key shortcuts
-                        if i.modifiers.ctrl {
-                            if i.consume_key(egui::Modifiers::CTRL, egui::Key::L) {
-                                action = Some("world_list");
-                            } else if i.consume_key(egui::Modifiers::CTRL, egui::Key::E) {
-                                action = Some("edit_current");
-                            } else if i.consume_key(egui::Modifiers::CTRL, egui::Key::S) {
-                                action = Some("setup");
-                            } else if i.consume_key(egui::Modifiers::CTRL, egui::Key::U) {
-                                // Ctrl+U - clear input (like console)
-                                clear_input = true;
-                            } else if i.consume_key(egui::Modifiers::CTRL, egui::Key::O) {
-                                action = Some("connect");
-                            } else if i.consume_key(egui::Modifiers::CTRL, egui::Key::D) {
-                                action = Some("disconnect");
-                            } else if i.consume_key(egui::Modifiers::CTRL, egui::Key::P) {
-                                // Ctrl+P - previous command history
-                                history_action = Some(-1);
-                            } else if i.consume_key(egui::Modifiers::CTRL, egui::Key::N) {
-                                // Ctrl+N - next command history
-                                history_action = Some(1);
-                            } else if i.consume_key(egui::Modifiers::CTRL, egui::Key::W) {
-                                // Ctrl+W - delete word before cursor
-                                delete_word = true;
-                            } else if i.consume_key(egui::Modifiers::CTRL, egui::Key::Q) {
-                                // Ctrl+Q - spell check
-                                action = Some("spell_check");
-                            } else if i.consume_key(egui::Modifiers::CTRL, egui::Key::A) {
-                                // Ctrl+A - move cursor to beginning of line
-                                cursor_home = true;
-                            }
-                        } else if i.modifiers.alt {
-                            // Alt+Up/Down - resize input area
-                            if i.consume_key(egui::Modifiers::ALT, egui::Key::ArrowUp) {
-                                resize_input = -1;
-                            } else if i.consume_key(egui::Modifiers::ALT, egui::Key::ArrowDown) {
-                                resize_input = 1;
-                            }
-                            // Note: Ctrl+Up/Down are handled by first ctrl block, letting egui TextEdit
-                            // handle cursor movement in multi-line input if not consumed
-                        } else {
-                            // Non-modified keys - consume to prevent widgets from handling
-                            if i.consume_key(egui::Modifiers::NONE, egui::Key::PageUp) {
-                                scroll_action = Some(-1);
-                            } else if i.consume_key(egui::Modifiers::NONE, egui::Key::PageDown) {
-                                scroll_action = Some(1);
-                            } else if i.consume_key(egui::Modifiers::NONE, egui::Key::F2) {
-                                // F2 - toggle MUD tag display
-                                self.show_tags = !self.show_tags;
-                            } else if i.consume_key(egui::Modifiers::NONE, egui::Key::F4) {
-                                // F4 - toggle filter popup
-                                self.filter_active = true;
-                                self.filter_text.clear();
-                            } else if i.consume_key(egui::Modifiers::NONE, egui::Key::F8) {
-                                // F8 - toggle action pattern highlighting
-                                self.highlight_actions = !self.highlight_actions;
-                            } else if i.consume_key(egui::Modifiers::NONE, egui::Key::Tab) {
-                                // Tab - command completion if input starts with / or #
-                                // Otherwise release pending lines or scroll down if viewing history
-                                if self.input_buffer.starts_with('/') || self.input_buffer.starts_with('#') {
-                                    tab_complete = true;
-                                } else if self.current_world < self.worlds.len()
-                                    && self.worlds[self.current_world].pending_count > 0
-                                {
-                                    // Send ReleasePending to server with this client's visible line count
-                                    // Server will release lines and broadcast to all clients
-                                    let release_count = self.output_visible_lines.saturating_sub(2).max(1);
-                                    if let Some(ref tx) = self.ws_tx {
-                                        let _ = tx.send(WsMessage::ReleasePending {
-                                            world_index: self.current_world,
-                                            count: release_count,
-                                        });
-                                    }
-                                    // Scroll to bottom
-                                    self.scroll_offset = None;
-                                } else if self.scroll_offset.is_some() {
-                                    // Viewing history - scroll down like PgDn
-                                    if let Some(offset) = self.scroll_offset {
-                                        let new_offset = offset + 300.0;
-                                        if new_offset >= self.scroll_max_offset - 10.0 {
-                                            self.scroll_offset = None; // Snap to bottom
-                                        } else {
-                                            self.scroll_offset = Some(new_offset);
-                                        }
-                                    }
-                                }
-                            }
-
-                            // Up/Down arrow - request world switch from server
-                            // Server calculates using centralized unseen tracking
-                            if i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowUp) {
-                                if let Some(ref tx) = self.ws_tx {
-                                    let _ = tx.send(WsMessage::CalculatePrevWorld { current_index: self.current_world });
-                                }
-                            } else if i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowDown) {
-                                if let Some(ref tx) = self.ws_tx {
-                                    let _ = tx.send(WsMessage::CalculateNextWorld { current_index: self.current_world });
-                                }
-                            }
-                        }
-                    });
-
-                    // Apply clear input
-                    if clear_input {
-                        self.input_buffer.clear();
-                        self.history_index = 0;
-                    }
-
-                    // Apply delete word
-                    if delete_word && !self.input_buffer.is_empty() {
-                        // Delete one word before cursor (end of buffer)
-                        // First, skip any trailing whitespace
-                        while self.input_buffer.ends_with(|c: char| c.is_whitespace()) {
-                            self.input_buffer.pop();
-                        }
-                        // Then delete the word (non-whitespace characters)
-                        while !self.input_buffer.is_empty()
-                            && !self.input_buffer.ends_with(|c: char| c.is_whitespace())
-                        {
-                            self.input_buffer.pop();
-                        }
-                    }
-
-                    // Apply tab completion
-                    let is_cmd_prefix = self.input_buffer.starts_with('/') || self.input_buffer.starts_with('#');
-                    if tab_complete && is_cmd_prefix {
-                        // Get the partial command (everything up to first space)
-                        let input = self.input_buffer.clone();
-                        let (partial, args) = if let Some(space_pos) = input.find(' ') {
-                            (&input[..space_pos], &input[space_pos..])
-                        } else {
-                            (input.as_str(), "")
-                        };
-
-                        let matches = if input.starts_with('#') {
-                            // TF commands
-                            let tf_commands = vec![
-                                "#set", "#unset", "#let", "#echo", "#send", "#beep", "#quote",
-                                "#expr", "#test", "#eval", "#if", "#elseif", "#else", "#endif",
-                                "#while", "#done", "#for", "#break", "#def", "#undef", "#undefn",
-                                "#undeft", "#list", "#purge", "#bind", "#unbind", "#load", "#save",
-                                "#lcd", "#time", "#version", "#help", "#ps", "#kill", "#sh", "#recall",
-                                "#setenv", "#listvar",
-                            ];
-                            let partial_lower = partial.to_lowercase();
-                            let mut m: Vec<String> = tf_commands.iter()
-                                .filter(|cmd| cmd.to_lowercase().starts_with(&partial_lower))
-                                .map(|s| s.to_string())
-                                .collect();
-                            m.sort();
-                            m.dedup();
-                            m
-                        } else {
-                            // Clay / commands: internal commands + manual actions
-                            let internal_commands = vec![
-                                "/help", "/version", "/disconnect", "/dc", "/send", "/worlds", "/connections",
-                                "/setup", "/web", "/actions", "/keepalive", "/reload", "/quit", "/gag", "/testmusic", "/debug", "/dump",
-                            ];
-
-                            // Get manual actions (empty pattern)
-                            let manual_actions: Vec<String> = self.actions.iter()
-                                .filter(|a| a.pattern.is_empty())
-                                .map(|a| format!("/{}", a.name))
-                                .collect();
-
-                            // Find all matches
-                            let partial_lower = partial.to_lowercase();
-                            let mut m: Vec<String> = internal_commands.iter()
-                                .filter(|cmd| cmd.to_lowercase().starts_with(&partial_lower))
-                                .map(|s| s.to_string())
-                                .collect();
-                            m.extend(manual_actions.iter()
-                                .filter(|cmd| cmd.to_lowercase().starts_with(&partial_lower))
-                                .cloned());
-                            m.sort();
-                            m.dedup();
-                            m
-                        };
-
-                        if !matches.is_empty() {
-                            // Find next match index
-                            let next_idx = if partial.to_lowercase() == self.completion_prefix.to_lowercase() {
-                                // Cycle to next match
-                                (self.completion_index + 1) % matches.len()
-                            } else {
-                                // Find current match if we're already on a completed command
-                                matches.iter()
-                                    .position(|m| m.eq_ignore_ascii_case(partial))
-                                    .map(|idx| (idx + 1) % matches.len())
-                                    .unwrap_or(0)
-                            };
-
-                            // Update completion state
-                            self.completion_prefix = partial.to_string();
-                            self.completion_index = next_idx;
-
-                            // Replace input with completion
-                            self.input_buffer = format!("{}{}", matches[next_idx], args);
-                        }
-                    }
-
-                    // Apply input resize
-                    if resize_input != 0 {
-                        let new_height = (self.input_height as i32 + resize_input).clamp(1, 15) as u16;
-                        self.input_height = new_height;
-                    }
-
-                    // Apply history navigation
-                    if let Some(dir) = history_action {
-                        if dir < 0 {
-                            // Previous (older)
-                            if self.history_index == 0 && !self.command_history.is_empty() {
-                                self.saved_input = self.input_buffer.clone();
-                                self.history_index = 1;
-                                self.input_buffer = self.command_history[self.command_history.len() - 1].clone();
-                            } else if self.history_index > 0 && self.history_index < self.command_history.len() {
-                                self.history_index += 1;
-                                let idx = self.command_history.len() - self.history_index;
-                                self.input_buffer = self.command_history[idx].clone();
-                            }
-                        } else {
-                            // Next (newer)
-                            if self.history_index > 1 {
-                                self.history_index -= 1;
-                                let idx = self.command_history.len() - self.history_index;
-                                self.input_buffer = self.command_history[idx].clone();
-                            } else if self.history_index == 1 {
-                                self.history_index = 0;
-                                self.input_buffer = std::mem::take(&mut self.saved_input);
-                            }
-                        }
-                    }
-
-                    // Apply world switch (GUI-local only, doesn't affect console)
-                    if let Some(new_world) = switch_world {
-                        if new_world != self.current_world && new_world < self.worlds.len() {
-                            self.current_world = new_world;
-                            self.worlds[new_world].unseen_lines = 0;
-                            self.scroll_offset = None; // Reset scroll
-                            // Notify server and request current state
-                            if let Some(ref tx) = self.ws_tx {
-                                let _ = tx.send(WsMessage::MarkWorldSeen { world_index: new_world });
-                                let _ = tx.send(WsMessage::RequestWorldState { world_index: new_world });
-                            }
-                        }
-                    }
-
-                    // Handle scroll action (will be used by scroll area)
-                    // In egui, scroll_offset is from the TOP, so:
-                    // - PageUp = decrease offset (scroll towards top/older content)
-                    // - PageDown = increase offset (scroll towards bottom/newer content)
-                    if let Some(dir) = scroll_action {
-                        if dir < 0 {
-                            // Scroll up (PageUp) - decrease offset to show older content
-                            if let Some(offset) = self.scroll_offset {
-                                let new_offset = (offset - 300.0).max(0.0);
-                                self.scroll_offset = Some(new_offset);
-                            } else {
-                                // Currently at bottom, start scrolling up from max offset
-                                let new_offset = (self.scroll_max_offset - 300.0).max(0.0);
-                                self.scroll_offset = Some(new_offset);
-                            }
-                        } else {
-                            // Scroll down (PageDown) - increase offset to show newer content
-                            if let Some(offset) = self.scroll_offset {
-                                let new_offset = offset + 300.0;
-                                // If we're within one page of the bottom, snap to bottom
-                                if new_offset >= self.scroll_max_offset - 10.0 {
-                                    self.scroll_offset = None;
-                                } else {
-                                    self.scroll_offset = Some(new_offset);
-                                }
-                            }
-                            // If scroll_offset is None, we're already at bottom, nothing to do
-                        }
-                    }
-                }
-
-                // Handle filter popup escape
-                if self.filter_active {
-                    ctx.input(|i| {
-                        if i.key_pressed(egui::Key::Escape) || i.key_pressed(egui::Key::F4) {
-                            self.filter_active = false;
-                            self.filter_text.clear();
-                        }
-                    });
-                }
-
-                let alpha = (self.transparency * 255.0) as u8;
-                let menu_bg = theme.panel_bg();
-                let menu_bg_transparent = egui::Color32::from_rgba_unmultiplied(menu_bg.r(), menu_bg.g(), menu_bg.b(), alpha);
-                egui::TopBottomPanel::top("menu_bar")
-                    .frame(egui::Frame::none()
-                        .fill(menu_bg_transparent)
-                        .inner_margin(egui::Margin::symmetric(4.0, 5.0))  // 3px extra padding top/bottom
-                        .stroke(egui::Stroke::NONE))
-                    .show(ctx, |ui| {
-                    ui.horizontal_centered(|ui| {
-                        // Paw menu icon - SVG matching web interface
-                        const PAW_SVG: &[u8] = br##"<svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 48.839 48.839"><path fill="#c0c0c0" d="M39.041,36.843c2.054,3.234,3.022,4.951,3.022,6.742c0,3.537-2.627,5.252-6.166,5.252c-1.56,0-2.567-0.002-5.112-1.326c0,0-1.649-1.509-5.508-1.354c-3.895-0.154-5.545,1.373-5.545,1.373c-2.545,1.323-3.516,1.309-5.074,1.309c-3.539,0-6.168-1.713-6.168-5.252c0-1.791,0.971-3.506,3.024-6.742c0,0,3.881-6.445,7.244-9.477c2.43-2.188,5.973-2.18,5.973-2.18h1.093v-0.001c0,0,3.698-0.009,5.976,2.181C35.059,30.51,39.041,36.844,39.041,36.843z M16.631,20.878c3.7,0,6.699-4.674,6.699-10.439S20.331,0,16.631,0S9.932,4.674,9.932,10.439S12.931,20.878,16.631,20.878z M10.211,30.988c2.727-1.259,3.349-5.723,1.388-9.971s-5.761-6.672-8.488-5.414s-3.348,5.723-1.388,9.971C3.684,29.822,7.484,32.245,10.211,30.988z M32.206,20.878c3.7,0,6.7-4.674,6.7-10.439S35.906,0,32.206,0s-6.699,4.674-6.699,10.439C25.507,16.204,28.506,20.878,32.206,20.878z M45.727,15.602c-2.728-1.259-6.527,1.165-8.488,5.414s-1.339,8.713,1.389,9.972c2.728,1.258,6.527-1.166,8.488-5.414S48.455,16.861,45.727,15.602z"/></svg>"##;
-                        let paw_size = 24.0;  // 20% bigger than 20.0
-                        let paw_image = egui::Image::from_bytes("bytes://paw_icon.svg", PAW_SVG)
-                            .fit_to_exact_size(egui::vec2(paw_size, paw_size));
-                        ui.menu_image_button(paw_image, |ui| {
-                            // First segment - alphabetical
-                            if ui.button("Actions").clicked() {
-                                action = Some("actions");
-                                ui.close_menu();
-                            }
-                            if ui.button("Font").clicked() {
-                                action = Some("font");
-                                ui.close_menu();
-                            }
-                            if ui.button("Settings").clicked() {
-                                action = Some("setup");
-                                ui.close_menu();
-                            }
-                            if ui.button("Web").clicked() {
-                                action = Some("web");
-                                ui.close_menu();
-                            }
-                            if ui.button("Worlds").clicked() {
-                                action = Some("world_selector");
-                                ui.close_menu();
-                            }
-                            ui.separator();
-                            // Second segment - alphabetical
-                            if ui.button("Toggle Highlight").clicked() {
-                                action = Some("toggle_highlight");
-                                ui.close_menu();
-                            }
-                            if ui.button("Toggle Tags").clicked() {
-                                action = Some("toggle_tags");
-                                ui.close_menu();
-                            }
-                            ui.separator();
-                            // Third segment
-                            if ui.button("Resync").clicked() {
-                                action = Some("resync");
-                                ui.close_menu();
-                            }
-                        });
-
-                        // Font size slider on the right side of menu bar
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            // Define the 4 font size positions
-                            const FONT_SIZES: [f32; 4] = [8.5, 12.0, 14.0, 18.0];
-
-                            // Find current position (0-3)
-                            let current_pos = FONT_SIZES.iter()
-                                .position(|&s| (s - self.font_size).abs() < 0.5)
-                                .unwrap_or(2) as i32;
-
-                            let label_color = egui::Color32::from_gray(128);
-
-                            // Slider dimensions
-                            let slider_width = 80.0;
-                            let slider_height = 20.0;
-                            let label_spacing = 4.0;
-
-                            // Allocate space for: large A + slider + small A
-                            let total_width = 14.0 + label_spacing + slider_width + label_spacing + 8.0;
-                            let (total_rect, response) = ui.allocate_exact_size(
-                                egui::vec2(total_width, slider_height),
-                                egui::Sense::click_and_drag()
-                            );
-
-                            // Calculate positions (RTL: large A on right, small A on left)
-                            let small_a_x = total_rect.left() + 4.0;
-                            let slider_left = total_rect.left() + 8.0 + label_spacing;
-                            let slider_right = slider_left + slider_width;
-                            let large_a_x = slider_right + label_spacing;
-                            let rect = egui::Rect::from_min_max(
-                                egui::pos2(slider_left, total_rect.top()),
-                                egui::pos2(slider_right, total_rect.bottom())
-                            );
-
-                            if ui.is_rect_visible(total_rect) {
-                                let painter = ui.painter();
-
-                                // Draw triangle background (point on left, tall on right)
-                                let triangle_color = if theme.is_dark() {
-                                    egui::Color32::from_gray(60)
-                                } else {
-                                    egui::Color32::from_gray(180)
-                                };
-
-                                let triangle_points = vec![
-                                    egui::pos2(rect.left() + 2.0, rect.bottom() - 2.0),  // Bottom left
-                                    egui::pos2(rect.right() - 2.0, rect.bottom() - 2.0), // Bottom right
-                                    egui::pos2(rect.right() - 2.0, rect.top() + 2.0),    // Top right
-                                ];
-                                painter.add(egui::Shape::convex_polygon(
-                                    triangle_points,
-                                    triangle_color,
-                                    egui::Stroke::NONE,
-                                ));
-
-                                // Draw slider handle
-                                let handle_x = rect.left() + 6.0 + (current_pos as f32) * ((slider_width - 12.0) / 3.0);
-                                let handle_color = if theme.is_dark() {
-                                    egui::Color32::from_rgb(100, 180, 255)
-                                } else {
-                                    egui::Color32::from_rgb(50, 120, 200)
-                                };
-
-                                painter.circle_filled(
-                                    egui::pos2(handle_x, rect.center().y),
-                                    6.0,
-                                    handle_color
-                                );
-
-                                // Draw A labels aligned with bottom of slider
-                                let label_y = rect.bottom() - 2.0;
-
-                                // Small A on left
-                                painter.text(
-                                    egui::pos2(small_a_x, label_y),
-                                    egui::Align2::LEFT_BOTTOM,
-                                    "A",
-                                    egui::FontId::proportional(8.0),
-                                    label_color,
-                                );
-
-                                // Large A on right
-                                painter.text(
-                                    egui::pos2(large_a_x, label_y),
-                                    egui::Align2::LEFT_BOTTOM,
-                                    "A",
-                                    egui::FontId::proportional(14.0),
-                                    label_color,
-                                );
-                            }
-
-                            // Handle clicks and drags on the slider area
-                            if response.clicked() || response.dragged() {
-                                if let Some(pos) = response.interact_pointer_pos() {
-                                    if pos.x >= rect.left() && pos.x <= rect.right() {
-                                        let rel_x = pos.x - rect.left() - 6.0;
-                                        let step_width = (slider_width - 12.0) / 3.0;
-                                        let new_pos = ((rel_x / step_width).round() as i32).clamp(0, 3);
-                                        let new_size = FONT_SIZES[new_pos as usize];
-                                        if (new_size - self.font_size).abs() > 0.5 {
-                                            self.font_size = new_size;
-                                            action = Some("font_changed");
-                                        }
-                                    }
-                                }
-                            }
-                        });
-                    });
-                });
-
-                // Handle menu actions
-                match action {
-                    Some("world_list") => {
-                        self.popup_state = PopupState::ConnectedWorlds;
-                        self.world_list_selected = self.current_world;
-                        self.only_connected_worlds = false;
-                    }
-                    Some("connected_worlds") => {
-                        self.open_connections_unified();
-                    }
-                    Some("world_selector") => {
-                        self.popup_state = PopupState::ConnectedWorlds;
-                        self.world_list_selected = self.current_world;
-                        self.only_connected_worlds = false;
-                    }
-                    Some("actions") => {
-                        self.open_actions_list_unified();
-                    }
-                    Some("edit_current") => self.open_world_editor(self.current_world),
-                    Some("setup") => self.popup_state = PopupState::Setup,
-                    Some("web") => self.popup_state = PopupState::Web,
-                    Some("font") => {
-                        self.edit_font_name = self.font_name.clone();
-                        self.edit_font_size = self.font_size.to_string();
-                        self.popup_state = PopupState::Font;
-                    }
-                    Some("font_changed") => {
-                        // Font size was changed via S/M/L buttons - update server settings
-                        self.update_global_settings();
-                    }
-                    Some("connect") => self.connect_world(self.current_world),
-                    Some("disconnect") => self.disconnect_world(self.current_world),
-                    Some("toggle_tags") => self.show_tags = !self.show_tags,
-                    Some("toggle_highlight") => self.highlight_actions = !self.highlight_actions,
-                    Some("resync") => {
-                        // Request full state resync from server
-                        if let Some(ref ws_tx) = self.ws_tx {
-                            let _ = ws_tx.send(WsMessage::RequestState);
-                        }
-                    }
-                    Some("spell_check") => {
-                        if let Some(message) = self.handle_spell_check() {
-                            // Add suggestion message to current world's output
-                            if let Some(world) = self.worlds.get_mut(self.current_world) {
-                                let seq = world.output_lines.len() as u64;
-                                world.output_lines.push(TimestampedLine {
-                                    text: message,
-                                    ts: current_timestamp_secs(),
-                                    gagged: false,
-                                    from_server: false,
-                                    seq,
-                                });
-                            }
-                        }
-                    }
-                    Some("help") => self.popup_state = PopupState::Help,
-                    _ => {}
-                }
-
-                // Input area at bottom (full width)
-                let input_height = self.input_height as f32 * 16.0 + 8.0;
-                let prompt_text = self.worlds.get(self.current_world)
-                    .map(|w| Self::strip_ansi_for_copy(&w.prompt))
-                    .unwrap_or_default();
-
-                let input_bg = theme.bg();
-                let input_bg_transparent = egui::Color32::from_rgba_unmultiplied(input_bg.r(), input_bg.g(), input_bg.b(), alpha);
-                egui::TopBottomPanel::bottom("input_panel")
-                    .exact_height(input_height)
-                    .frame(egui::Frame::none()
-                        .fill(input_bg_transparent)
-                        .inner_margin(egui::Margin::same(2.0))
-                        .stroke(egui::Stroke::NONE))
-                    .show(ctx, |ui| {
-                        ui.spacing_mut().item_spacing.x = 0.0; // Remove horizontal spacing
-
-                        // Text input takes full area
-                        // Build layout job with spell check coloring (misspelled words in red)
-                        let input_id = egui::Id::new("main_input");
-                        let misspelled = self.find_misspelled_words();
-                        let font_id = egui::FontId::monospace(self.font_size);
-                        let default_color = theme.fg();
-                        let line_height = 16.0_f32; // Approximate line height for scrolling calc
-
-                        // Build layouter using actual text parameter (not pre-computed job)
-                        // This ensures cursor positioning works correctly when text changes
-                        let misspelled_ranges = misspelled;
-                        let layouter_font_id = font_id.clone();
-                        let layouter_default_color = default_color;
-
-                        // Calculate prompt width for offset
-                        let prompt_width = if !prompt_text.is_empty() {
-                            ui.fonts(|f| f.glyph_width(&egui::FontId::monospace(self.font_size), ' ')) * prompt_text.len() as f32
-                        } else {
-                            0.0
-                        };
-
-                        // Use ScrollArea to handle scrolling, with manual scroll-to-cursor
-                        let available_height = ui.available_height();
-                        let scroll_id = egui::Id::new("input_scroll_area");
-
-                        let mut scroll_to_y: Option<f32> = None;
-
-                        let scroll_output = egui::ScrollArea::vertical()
-                            .id_source(scroll_id)
-                            .max_height(available_height)
-                            .auto_shrink([false, false])
-                            .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden)
-                            .show(ui, |ui| {
-                            ui.horizontal_top(|ui| {
-                                // Show prompt if present (cyan colored like TUI)
-                                if !prompt_text.is_empty() {
-                                    ui.label(egui::RichText::new(&prompt_text)
-                                        .monospace()
-                                        .color(theme.prompt()));
-                                }
-
-                                let available_width = ui.available_width();
-                                let response = ui.add(
-                                    TextEdit::multiline(&mut self.input_buffer)
-                                        .font(egui::TextStyle::Monospace)
-                                        .desired_width(available_width)
-                                        .margin(egui::vec2(0.0, 0.0))
-                                        .frame(false)
-                                        .id(input_id)
-                                        .layouter(&mut |_ui, text, wrap_width| {
-                                            // Build layout job from actual text parameter
-                                            let mut job = egui::text::LayoutJob::default();
-                                            let chars: Vec<char> = text.chars().collect();
-                                            let mut pos = 0;
-
-                                            // Use misspelled ranges (may be slightly stale for one frame)
-                                            let mut ranges = misspelled_ranges.clone();
-                                            ranges.sort_by_key(|(start, _)| *start);
-
-                                            for (start, end) in ranges {
-                                                if start >= chars.len() || end > chars.len() {
-                                                    continue; // Skip stale ranges
-                                                }
-                                                // Add normal text before misspelled word
-                                                if pos < start {
-                                                    let normal_text: String = chars[pos..start].iter().collect();
-                                                    job.append(&normal_text, 0.0, egui::TextFormat {
-                                                        font_id: layouter_font_id.clone(),
-                                                        color: layouter_default_color,
-                                                        ..Default::default()
-                                                    });
-                                                }
-                                                // Add misspelled word in red
-                                                let misspelled_text: String = chars[start..end].iter().collect();
-                                                job.append(&misspelled_text, 0.0, egui::TextFormat {
-                                                    font_id: layouter_font_id.clone(),
-                                                    color: egui::Color32::RED,
-                                                    ..Default::default()
-                                                });
-                                                pos = end;
-                                            }
-                                            // Add remaining text
-                                            if pos < chars.len() {
-                                                let remaining: String = chars[pos..].iter().collect();
-                                                job.append(&remaining, 0.0, egui::TextFormat {
-                                                    font_id: layouter_font_id.clone(),
-                                                    color: layouter_default_color,
-                                                    ..Default::default()
-                                                });
-                                            }
-                                            // Handle empty text
-                                            if chars.is_empty() {
-                                                job.append("", 0.0, egui::TextFormat {
-                                                    font_id: layouter_font_id.clone(),
-                                                    color: layouter_default_color,
-                                                    ..Default::default()
-                                                });
-                                            }
-
-                                            job.wrap = egui::text::TextWrapping {
-                                                max_width: wrap_width,
-                                                ..Default::default()
-                                            };
-                                            _ui.fonts(|f| f.layout_job(job))
-                                        })
-                                );
-                                response
-                            }).inner
-                        });
-
-                        let response = scroll_output.inner;
-
-                        // Check for temperature conversion when input changes
-                        if response.changed() {
-                            self.check_temp_conversion();
-                        }
-
-                        // Calculate cursor position and scroll to it if needed
-                        if response.has_focus() {
-                            if let Some(state) = egui::TextEdit::load_state(ctx, input_id) {
-                                if let Some(cursor_range) = state.ccursor_range() {
-                                    // Estimate cursor Y position based on character position
-                                    // Count newlines before cursor to estimate line number
-                                    let cursor_pos = cursor_range.primary.index;
-                                    let text_before_cursor: String = self.input_buffer.chars().take(cursor_pos).collect();
-                                    let lines_before = text_before_cursor.matches('\n').count();
-                                    // Also account for wrapped lines (rough estimate)
-                                    let wrap_width = ui.available_width() - prompt_width;
-                                    let char_width = ui.fonts(|f| f.glyph_width(&egui::FontId::monospace(self.font_size), 'M'));
-                                    let chars_per_line = (wrap_width / char_width).max(1.0) as usize;
-                                    let wrapped_lines: usize = text_before_cursor.lines()
-                                        .map(|line| (line.len() / chars_per_line.max(1)).max(0))
-                                        .sum();
-                                    let cursor_line = lines_before + wrapped_lines;
-                                    let cursor_y = cursor_line as f32 * line_height;
-
-                                    // Check if cursor is outside visible area
-                                    let scroll_offset = scroll_output.state.offset.y;
-                                    let visible_top = scroll_offset;
-                                    let visible_bottom = scroll_offset + available_height - line_height;
-
-                                    if cursor_y < visible_top {
-                                        scroll_to_y = Some(cursor_y);
-                                    } else if cursor_y > visible_bottom {
-                                        scroll_to_y = Some(cursor_y - available_height + line_height * 2.0);
-                                    }
-                                }
-                            }
-                        }
-
-                        // Apply scroll adjustment if needed
-                        if let Some(target_y) = scroll_to_y {
-                            let mut scroll_state = scroll_output.state;
-                            scroll_state.offset.y = target_y.max(0.0);
-                            scroll_state.store(ctx, scroll_output.id);
-                        }
-
-                        // Always keep cursor visible in input area when no popup is open
-                        // But don't steal focus if user is selecting text with mouse
-                        if !response.has_focus() && self.popup_state == PopupState::None && !self.filter_active {
-                            let mouse_down = ctx.input(|i| i.pointer.any_down());
-                            let typed_text: Option<String> = ctx.input(|i| {
-                                // Find any text that was typed
-                                for e in &i.events {
-                                    if let egui::Event::Text(text) = e {
-                                        return Some(text.clone());
-                                    }
-                                }
-                                None
-                            });
-
-                            // Request focus if mouse isn't being held (not selecting text)
-                            // or if user started typing
-                            if !mouse_down || typed_text.is_some() {
-                                response.request_focus();
-                            }
-
-                            if let Some(text) = typed_text {
-                                // Add the typed text to input buffer
-                                self.input_buffer.push_str(&text);
-                                // Set cursor position to end of buffer (create state if needed)
-                                let mut state = egui::TextEdit::load_state(ctx, input_id)
-                                    .unwrap_or_default();
-                                let ccursor = egui::text::CCursor::new(self.input_buffer.len());
-                                state.set_ccursor_range(Some(egui::text::CCursorRange::one(ccursor)));
-                                state.store(ctx, input_id);
-                            }
-                        }
-
-                        // Apply cursor_home (Ctrl+A)
-                        if cursor_home {
-                            let mut state = egui::TextEdit::load_state(ctx, input_id)
-                                .unwrap_or_default();
-                            let ccursor = egui::text::CCursor::new(0);
-                            state.set_ccursor_range(Some(egui::text::CCursorRange::one(ccursor)));
-                            state.store(ctx, input_id);
-                        }
-
-                        // Send on Enter (with or without Shift)
-                        if response.has_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
-                            // Remove all newlines from the command (cursor in middle causes TextEdit to insert newline)
-                            let cmd: String = std::mem::take(&mut self.input_buffer)
-                                .chars()
-                                .filter(|c| *c != '\n')
-                                .collect();
-                            // Reset spell state when sending command
-                            self.reset_spell_state();
-                            if !cmd.is_empty() {
-                                // Use shared command parsing
-                                let parsed = super::parse_command(&cmd);
-
-                                // Handle local GUI popup commands
-                                match parsed {
-                                    super::Command::Setup => {
-                                        self.popup_state = PopupState::Setup;
-                                    }
-                                    super::Command::Web => {
-                                        self.popup_state = PopupState::Web;
-                                    }
-                                    super::Command::WorldSelector => {
-                                        self.popup_state = PopupState::ConnectedWorlds;
-                                        self.world_list_selected = self.current_world;
-                                        self.only_connected_worlds = false;
-                                    }
-                                    super::Command::WorldsList => {
-                                        // Output connected worlds list as text
-                                        let worlds_info: Vec<super::util::WorldListInfo> = self.worlds.iter().enumerate().map(|(idx, world)| {
-                                            super::util::WorldListInfo {
-                                                name: world.name.clone(),
-                                                connected: world.connected,
-                                                is_current: idx == self.current_world,
-                                                is_ssl: world.settings.use_ssl,
-                                                is_proxy: false,  // GUI doesn't have access to proxy state
-                                                unseen_lines: world.unseen_lines,
-                                                last_send_secs: world.last_send_secs,
-                                                last_recv_secs: world.last_recv_secs,
-                                                last_nop_secs: world.last_nop_secs,
-                                                next_nop_secs: None,
-                                            }
-                                        }).collect();
-                                        let output = super::util::format_worlds_list(&worlds_info);
-                                        let ts = super::current_timestamp_secs();
-                                        if self.current_world < self.worlds.len() {
-                                            for line in output.lines() {
-                                                let seq = self.worlds[self.current_world].output_lines.len() as u64;
-                                                self.worlds[self.current_world].output_lines.push(TimestampedLine {
-                                                    text: line.to_string(),
-                                                    ts,
-                                                    gagged: false,
-                                                    from_server: false,
-                                                    seq,
-                                                });
-                                            }
-                                        }
-                                    }
-                                    super::Command::Help => {
-                                        self.popup_state = PopupState::Help;
-                                    }
-                                    super::Command::Version => {
-                                        let ts = current_timestamp_secs();
-                                        if self.current_world < self.worlds.len() {
-                                            let seq = self.worlds[self.current_world].output_lines.len() as u64;
-                                            self.worlds[self.current_world].output_lines.push(
-                                                TimestampedLine { text: super::get_version_string(), ts, gagged: false, from_server: false, seq }
-                                            );
-                                        }
-                                    }
-                                    super::Command::Menu => {
-                                        self.popup_state = PopupState::Menu;
-                                        self.menu_selected = 0;
-                                    }
-                                    super::Command::Actions { .. } => {
-                                        self.open_actions_list_unified();
-                                    }
-                                    super::Command::WorldEdit { name } => {
-                                        // Open world editor
-                                        let idx = if let Some(ref world_name) = name {
-                                            self.worlds.iter().position(|w| w.name.eq_ignore_ascii_case(world_name))
-                                                .unwrap_or(self.current_world)
-                                        } else {
-                                            self.current_world
-                                        };
-                                        self.open_world_editor(idx);
-                                    }
-                                    super::Command::WorldSwitch { ref name } => {
-                                        // /worlds <name> - switch to world, connect if not connected
-                                        if let Some(idx) = self.worlds.iter().position(|w| w.name.eq_ignore_ascii_case(name)) {
-                                            // Switch locally
-                                            self.current_world = idx;
-                                            // If not connected, send connect command to server
-                                            if !self.worlds[idx].connected {
-                                                self.connect_world(idx);
-                                            }
-                                        } else {
-                                            // World not found - show error locally (red % prefix)
-                                            let ts = current_timestamp_secs();
-                                            if self.current_world < self.worlds.len() {
-                                                let seq = self.worlds[self.current_world].output_lines.len() as u64;
-                                                self.worlds[self.current_world].output_lines.push(
-                                                    TimestampedLine { text: format!("✨ World '{}' not found.", name), ts, gagged: false, from_server: false, seq }
-                                                );
-                                            }
-                                        }
-                                    }
-                                    super::Command::WorldConnectNoLogin { ref name } => {
-                                        // /worlds -l <name> - switch to world, connect without auto-login
-                                        if let Some(idx) = self.worlds.iter().position(|w| w.name.eq_ignore_ascii_case(name)) {
-                                            self.current_world = idx;
-                                            if !self.worlds[idx].connected {
-                                                // Send the command to server (it handles -l flag)
-                                                self.send_command(idx, cmd);
-                                            }
-                                        } else {
-                                            // World not found - show error locally (red % prefix)
-                                            let ts = current_timestamp_secs();
-                                            if self.current_world < self.worlds.len() {
-                                                let seq = self.worlds[self.current_world].output_lines.len() as u64;
-                                                self.worlds[self.current_world].output_lines.push(
-                                                    TimestampedLine { text: format!("✨ World '{}' not found.", name), ts, gagged: false, from_server: false, seq }
-                                                );
-                                            }
-                                        }
-                                    }
-                                    _ => {
-                                        // Check for /font which is GUI-specific
-                                        if cmd.trim().eq_ignore_ascii_case("/font") {
-                                            self.edit_font_name = self.font_name.clone();
-                                            self.edit_font_size = format!("{:.1}", self.font_size);
-                                            self.popup_state = PopupState::Font;
-                                        } else {
-                                            // Send other commands to server
-                                            self.send_command(self.current_world, cmd);
-                                        }
-                                    }
-                                }
-                            }
-                        }
-
-                        // Show suggestion message if present
-                        if let Some(ref msg) = self.suggestion_message {
-                            ui.label(egui::RichText::new(msg).color(theme.prompt()).monospace());
-                        }
-                    });
-
-                // Separator bar (matches TUI style)
-                let separator_bg = match theme {
-                    GuiTheme::Dark => egui::Color32::from_rgb(40, 40, 40),
-                    GuiTheme::Light => egui::Color32::from_rgb(200, 200, 200),  // Darker for light theme
-                };
-                let separator_bg_transparent = egui::Color32::from_rgba_unmultiplied(separator_bg.r(), separator_bg.g(), separator_bg.b(), alpha);
-                egui::TopBottomPanel::bottom("separator_bar")
-                    .exact_height(20.0)
-                    .frame(egui::Frame::none()
-                        .fill(separator_bg_transparent)
-                        .inner_margin(egui::Margin::same(0.0))
-                        .stroke(egui::Stroke::NONE))
-                    .show(ctx, |ui| {
-                        ui.horizontal(|ui| {
-                            // Get current world info
-                            let world_name = self.worlds.get(self.current_world)
-                                .map(|w| w.name.as_str())
-                                .unwrap_or("---");
-                            let connected = self.worlds.get(self.current_world)
-                                .map(|w| w.connected)
-                                .unwrap_or(false);
-
-                            // Use server's activity count (console broadcasts this value)
-                            let activity_count = self.server_activity_count;
-
-                            // Status indicator (Hist/More or spaces)
-                            // Priority: Hist (when scrolled back) > More (when paused) > spaces
-                            let server_pending_count = self.worlds.get(self.current_world)
-                                .map(|w| w.pending_count)
-                                .unwrap_or(0);
-
-                            // Check if scrolled back (scroll_offset is Some when not at bottom)
-                            let is_scrolled_back = self.scroll_offset.is_some();
-
-                            if is_scrolled_back {
-                                // Show Hist indicator when scrolled back (takes precedence)
-                                // Calculate approximate lines from bottom based on scroll offset
-                                let lines_back = self.scroll_offset
-                                    .map(|offset| (offset / 20.0).max(1.0) as usize) // Rough estimate
-                                    .unwrap_or(0);
-                                let count_str = if lines_back >= 10000 {
-                                    format!("{:>4}K", lines_back / 1000)
-                                } else {
-                                    format!("{:>4}", lines_back)
-                                };
-                                let status_text = format!("Hist:{}", count_str);
-                                ui.label(egui::RichText::new(status_text)
-                                    .monospace()
-                                    .color(egui::Color32::BLACK)
-                                    .background_color(egui::Color32::from_rgb(0xf8, 0x53, 0x49))); // Red background
-                            } else if server_pending_count > 0 {
-                                // Show More indicator when paused with pending lines
-                                let count_str = if server_pending_count >= 10000 {
-                                    format!("{:>4}K", server_pending_count / 1000)
-                                } else {
-                                    format!("{:>4}", server_pending_count)
-                                };
-                                let status_text = format!("More:{}", count_str);
-                                ui.label(egui::RichText::new(status_text)
-                                    .monospace()
-                                    .color(egui::Color32::BLACK)
-                                    .background_color(egui::Color32::from_rgb(0xf8, 0x53, 0x49))); // Red background
-                            } else {
-                                // Status area - spaces when no indicator
-                                let status_text = "          ";
-                                ui.label(egui::RichText::new(status_text).monospace());
-                            }
-
-                            // Connection status ball (green = connected, red = disconnected)
-                            let (status_ball, ball_color) = if connected {
-                                ("●", egui::Color32::from_rgb(0x3f, 0xb9, 0x50)) // Green
-                            } else {
-                                ("●", egui::Color32::from_rgb(0xf8, 0x53, 0x49)) // Red
-                            };
-                            ui.label(egui::RichText::new(status_ball).color(ball_color));
-
-                            // World name (bold)
-                            ui.label(egui::RichText::new(world_name).monospace().strong().color(theme.fg()));
-
-                            // Tag indicator (only shown when F2 toggled to show tags)
-                            if self.show_tags {
-                                ui.label(egui::RichText::new(" [tag]").monospace().color(theme.prompt()));
-                            }
-
-                            // Activity indicator with hover tooltip
-                            if activity_count > 0 {
-                                ui.label(egui::RichText::new(" ").monospace().color(theme.fg_dim()));
-                                let activity_label = ui.label(egui::RichText::new(format!("(Activity: {})", activity_count))
-                                    .monospace().color(theme.highlight()));
-                                // Show hover popup with list of worlds that have activity
-                                activity_label.on_hover_ui(|ui| {
-                                    ui.label(egui::RichText::new("Worlds with activity:").strong());
-                                    for (i, w) in self.worlds.iter().enumerate() {
-                                        if i != self.current_world && (w.unseen_lines > 0 || w.pending_count > 0) {
-                                            if w.pending_count > 0 && w.unseen_lines > 0 {
-                                                ui.label(format!("{}: {} unseen, {} pending", w.name, w.unseen_lines, w.pending_count));
-                                            } else if w.pending_count > 0 {
-                                                ui.label(format!("{}: {} pending", w.name, w.pending_count));
-                                            } else {
-                                                ui.label(format!("{}: {} unseen", w.name, w.unseen_lines));
-                                            }
-                                        }
-                                    }
-                                });
-                            }
-
-                            // Spacer with underscore-style fill
-                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                // Current time (H:MM) in 12-hour format
-                                let lt = local_time_now();
-                                let hours_24 = lt.hour as u32;
-                                let mins = lt.minute as u32;
-                                // Convert to 12-hour format
-                                let hours = if hours_24 == 0 {
-                                    12
-                                } else if hours_24 <= 12 {
-                                    hours_24
-                                } else {
-                                    hours_24 - 12
-                                };
-                                ui.label(egui::RichText::new(format!("{}:{:02}", hours, mins))
-                                    .monospace().color(theme.accent()));
-                            });
-                        });
-                    });
-
-                // Filter popup (F4) - separate OS window
-                if self.filter_active {
-                    let mut should_close = false;
-                    let mut filter_text = self.filter_text.clone();
-
-                    ctx.show_viewport_immediate(
-                        egui::ViewportId::from_hash_of("filter_window"),
-                        egui::ViewportBuilder::default()
-                            .with_title("Filter - Clay MUD Client")
-                            .with_inner_size([300.0, 60.0]),
-                        |ctx, _class| {
-                            egui::CentralPanel::default().show(ctx, |ui| {
-                                if ui.input(|i| i.key_pressed(egui::Key::Escape)) ||
-                                   ui.input(|i| i.key_pressed(egui::Key::F4)) ||
-                                   ui.input(|i| i.viewport().close_requested()) {
-                                    should_close = true;
-                                }
-
-                                ui.horizontal(|ui| {
-                                    ui.label("Filter:");
-                                    let response = ui.text_edit_singleline(&mut filter_text);
-                                    response.request_focus();
-                                });
-                            });
-                        },
-                    );
-
-                    self.filter_text = filter_text;
-                    if should_close {
-                        self.filter_active = false;
-                        self.filter_text.clear();
-                    }
-                }
-
-                // Main output area with scrollbar (no frame/border/margin)
-                let bg = theme.bg();
-                let alpha = (self.transparency * 255.0) as u8;
-                let transparent_bg = egui::Color32::from_rgba_unmultiplied(bg.r(), bg.g(), bg.b(), alpha);
-                egui::CentralPanel::default()
-                    .frame(egui::Frame::none()
-                        .fill(transparent_bg)
-                        .inner_margin(egui::Margin::same(0.0))
-                        .stroke(egui::Stroke::NONE))
-                    .show(ctx, |ui| {
-                    if let Some(world) = self.worlds.get(self.current_world) {
-                        // Check if showing splash screen - render centered image instead of output
-                        if world.showing_splash {
-                            // Center the splash content vertically and horizontally
-                            ui.vertical_centered(|ui| {
-                                let available_height = ui.available_height();
-                                // Calculate vertical centering (image ~200px + text ~60px)
-                                let content_height = 280.0;
-                                let top_padding = (available_height - content_height).max(0.0) / 2.0;
-                                ui.add_space(top_padding);
-
-                                // Clay logo image
-                                let splash_image = egui::Image::from_bytes(
-                                    "bytes://clay_splash",
-                                    include_bytes!("../clay2.png"),
-                                ).fit_to_exact_size(egui::vec2(200.0, 200.0));
-                                ui.add(splash_image);
-
-                                let tagline_color = egui::Color32::from_rgb(0xff, 0x87, 0xff);  // 213
-                                ui.add_space(5.0);
-                                ui.label(egui::RichText::new("A 90dies mud client written today").color(tagline_color).italics());
-                                ui.add_space(5.0);
-                                ui.label(egui::RichText::new("/help for how to use clay").color(theme.fg_muted()));
-                            });
-                            return;  // Skip regular output rendering
-                        }
-
-                        // Cache "now" for timestamp formatting - compute once per frame
-                        let cached_now = GuiCachedNow::new();
-
-                        // Keep original lines with ANSI for coloring
-                        let colored_lines: Vec<&TimestampedLine> = world.output_lines.iter()
-                            .filter(|line| {
-                                // Skip gagged lines unless show_tags is enabled (F2)
-                                if line.gagged && !self.show_tags {
-                                    return false;
-                                }
-                                // Apply filter if active (filter on stripped text)
-                                if self.filter_active && !self.filter_text.is_empty() {
-                                    let stripped = Self::strip_ansi_for_copy(&line.text);
-                                    // Check if pattern has wildcards
-                                    let has_wildcards = self.filter_text.contains('*') || self.filter_text.contains('?');
-                                    if has_wildcards {
-                                        // Use wildcard matching
-                                        if let Some(regex) = filter_wildcard_to_regex(&self.filter_text) {
-                                            regex.is_match(&stripped)
-                                        } else {
-                                            false // Invalid regex
-                                        }
-                                    } else {
-                                        // Simple substring match
-                                        stripped.to_lowercase().contains(&self.filter_text.to_lowercase())
-                                    }
-                                } else {
-                                    true
-                                }
-                            })
-                            .collect();
-
-                        // Build plain text version for selection (strip ANSI codes and empty lines)
-                        let lines: Vec<String> = colored_lines.iter()
-                            .map(|line| {
-                                let stripped = Self::strip_ansi_for_copy(&line.text);
-                                if self.show_tags {
-                                    // Add timestamp prefix when showing tags
-                                    // Convert temperatures only if enabled
-                                    let ts_prefix = Self::format_timestamp_gui_cached(line.ts, &cached_now);
-                                    let with_temps = if self.temp_convert_enabled {
-                                        convert_temperatures(&stripped)
-                                    } else {
-                                        stripped.clone()
-                                    };
-                                    format!("{} {}", ts_prefix, with_temps)
-                                } else {
-                                    // Strip MUD tags like [channel:] or [channel(player)]
-                                    Self::strip_mud_tags(&stripped)
-                                }
-                            })
-                            .collect();
-                        let plain_text: String = lines.join("\n");
-
-                        // Build combined LayoutJob with ANSI colors
-                        let default_color = theme.fg();
-                        let font_id = egui::FontId::monospace(self.font_size);
-                        let combined_job = egui::text::LayoutJob {
-                            wrap: egui::text::TextWrapping {
-                                max_width: ui.available_width(),
-                                ..Default::default()
-                            },
-                            ..Default::default()
-                        };
-
-                        // Check if any line has Discord emojis
-                        let has_any_discord_emojis = colored_lines.iter()
-                            .any(|line| Self::has_discord_emojis(&line.text));
-
-                        // Build display lines for both paths
-                        let world_name = &world.name;
-                        let highlight_actions = self.highlight_actions;
-                        let actions = &self.actions;
-                        let display_lines: Vec<String> = colored_lines.iter().map(|line| {
-                            let base_line = if self.show_tags {
-                                let ts_prefix = Self::format_timestamp_gui_cached(line.ts, &cached_now);
-                                // Convert temperatures only if enabled
-                                let with_temps = if self.temp_convert_enabled {
-                                    convert_temperatures(&line.text)
-                                } else {
-                                    line.text.clone()
-                                };
-                                format!("\x1b[36m{}\x1b[0m {}", ts_prefix, with_temps)
-                            } else {
-                                Self::strip_mud_tags_ansi(&line.text)
-                            };
-                            // Apply action highlighting if enabled
-                            if highlight_actions && line_matches_action(&line.text, world_name, actions) {
-                                // Dark yellow/brown background (same as console: 48;5;58)
-                                let bg_code = "\x1b[48;5;58m";
-                                // Replace any resets to preserve background
-                                let highlighted = base_line.replace("\x1b[0m", &format!("\x1b[0m{}", bg_code));
-                                format!("{}{}\x1b[0m", bg_code, highlighted)
-                            } else {
-                                base_line
-                            }
-                        }).collect();
-
-                        let is_light_theme = matches!(theme, GuiTheme::Light);
-
-                        // Build combined LayoutJob from display_lines
-                        let mut combined_job = combined_job;
-                        if !has_any_discord_emojis {
-                            for (i, display_line) in display_lines.iter().enumerate() {
-                                let line_text = convert_discord_emojis(display_line);
-                                // Apply word breaks for long words
-                                let line_text = Self::insert_word_breaks(&line_text);
-                                Self::append_ansi_to_job(&line_text, default_color, font_id.clone(), &mut combined_job, is_light_theme, self.color_offset_percent);
-
-                                if i < display_lines.len() - 1 {
-                                    combined_job.append("\n", 0.0, egui::TextFormat {
-                                        font_id: font_id.clone(),
-                                        color: default_color,
-                                        ..Default::default()
-                                    });
-                                }
-                            }
-                        }
-
-                        // Calculate approximate visible lines based on available height and font size
-                        // This is used for more-mode triggering
-                        let line_height = self.font_size * 1.3; // Approximate line height with some spacing
-                        let available_height_for_output = ui.available_height();
-                        let estimated_visible_lines = (available_height_for_output / line_height).max(5.0) as usize;
-                        self.output_visible_lines = estimated_visible_lines;
-
-                        // Send UpdateViewState if view changed (world or visible lines)
-                        let current_state = (self.current_world, self.output_visible_lines);
-                        if self.last_sent_view_state != Some(current_state) {
-                            if let Some(ref tx) = self.ws_tx {
-                                let _ = tx.send(WsMessage::UpdateViewState {
-                                    world_index: self.current_world,
-                                    visible_lines: self.output_visible_lines,
-                                });
-                                self.last_sent_view_state = Some(current_state);
-                            }
-                        }
-
-                        // Use a unique ID per world to ensure scroll state is preserved per-world
-                        let scroll_id = egui::Id::new(format!("output_scroll_{}", self.current_world));
-                        let stick_to_bottom = self.scroll_offset.is_none() && !self.filter_active;
-
-                        // Apply scroll offset if set (from PageUp/PageDown)
-                        let scroll_delta = self.scroll_offset.take();
-
-                        let mut scroll_area = ScrollArea::vertical()
-                            .id_source(scroll_id)
-                            .auto_shrink([false; 2])
-                            .stick_to_bottom(stick_to_bottom)
-                            .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysVisible);
-
-                        // If we have a scroll delta, apply it
-                        if let Some(delta) = scroll_delta {
-                            scroll_area = scroll_area.vertical_scroll_offset(delta);
-                        }
-
-                        // Clone the job for the custom rendering
-                        let layout_job = combined_job.clone();
-
-                        // Debug: log LayoutJob info
-                        static DEBUG_ONCE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-                        if !DEBUG_ONCE.swap(true, std::sync::atomic::Ordering::Relaxed) {
-                            use std::io::Write;
-                            if let Ok(mut f) = std::fs::OpenOptions::new()
-                                .create(true).append(true)
-                                .open("/tmp/clay_gui_debug.log")
-                            {
-                                let _ = writeln!(f, "=== LayoutJob Debug ===");
-                                let _ = writeln!(f, "plain_text len: {}", plain_text.len());
-                                let _ = writeln!(f, "layout_job.text len: {}", layout_job.text.len());
-                                let _ = writeln!(f, "layout_job.sections: {}", layout_job.sections.len());
-                                let _ = writeln!(f, "texts_match: {}", plain_text == layout_job.text);
-                                // Log first few sections with colors
-                                for (i, section) in layout_job.sections.iter().take(10).enumerate() {
-                                    let _ = writeln!(f, "  Section {}: byte_range={:?}, color=({},{},{},{})",
-                                        i, section.byte_range,
-                                        section.format.color.r(), section.format.color.g(),
-                                        section.format.color.b(), section.format.color.a());
-                                }
-                                // Log first 200 chars of each
-                                let _ = writeln!(f, "plain_text first 200: {:?}", plain_text.chars().take(200).collect::<String>());
-                                let _ = writeln!(f, "layout_job.text first 200: {:?}", layout_job.text.chars().take(200).collect::<String>());
-                            }
-                        }
-
-                        // Clone values needed in the closure
-                        let has_emojis = has_any_discord_emojis;
-                        let emoji_lines = display_lines.clone();
-                        let emoji_font_id = font_id.clone();
-                        let emoji_default_color = default_color;
-                        let emoji_is_light = matches!(theme, GuiTheme::Light);
-                        let emoji_link_color = theme.link();
-                        let emoji_plain_text = plain_text.clone();
-                        let emoji_color_offset = self.color_offset_percent;
-
-                        let scroll_output = scroll_area.show(ui, |ui| {
-                                ui.set_width(ui.available_width());
-                                // Remove vertical spacing between widgets
-                                ui.spacing_mut().item_spacing.y = 0.0;
-
-                                // Use different rendering path for Discord emojis
-                                if has_emojis {
-                                    // Render each line with inline emoji images
-                                    for line in &emoji_lines {
-                                        Self::render_line_with_emojis(
-                                            ui,
-                                            line,
-                                            emoji_default_color,
-                                            &emoji_font_id,
-                                            emoji_is_light,
-                                            emoji_link_color,
-                                            emoji_color_offset,
-                                        );
-                                    }
-
-                                    // Add context menu for copy functionality
-                                    // Use Sense::hover() instead of Sense::click() to avoid capturing primary clicks
-                                    // that should go to the Link widgets for URL clicking
-                                    let text_for_copy = emoji_plain_text.clone();
-                                    ui.interact(ui.min_rect(), egui::Id::new("emoji_output_ctx"), egui::Sense::hover())
-                                        .context_menu(|ui| {
-                                            if ui.button("Copy All").clicked() {
-                                                ui.ctx().copy_text(text_for_copy.clone());
-                                                ui.close_menu();
-                                            }
-                                        });
-
-                                    return; // Skip the TextEdit path
-                                }
-
-                                // Custom rendering: paint backgrounds first, then text
-                                // This ensures backgrounds fill full row height without gaps
-
-                                // Layout the text WITH TRANSPARENT BACKGROUNDS
-                                // We'll paint our own full-height backgrounds using bg_color_map
-                                let mut job = layout_job.clone();
-                                job.wrap.max_width = ui.available_width();
-                                // Clear backgrounds from the job so galley won't paint short backgrounds
-                                for section in &mut job.sections {
-                                    section.format.background = egui::Color32::TRANSPARENT;
-                                }
-                                let galley = ui.fonts(|f| f.layout_job(job));
-
-                                // Allocate space for the galley
-                                let (alloc_response, painter) = ui.allocate_painter(
-                                    galley.size(),
-                                    egui::Sense::click_and_drag()
-                                );
-                                let text_pos = alloc_response.rect.min;
-
-                                // Handle text selection with mouse
-                                let pointer_pos = ui.input(|i| i.pointer.interact_pos());
-                                // Get the position where the press started (not current position)
-                                let press_origin = ui.input(|i| i.pointer.press_origin());
-
-                                // Handle selection start on primary click
-                                if alloc_response.drag_started_by(egui::PointerButton::Primary) {
-                                    // Use press_origin for accurate selection start position
-                                    if let Some(pos) = press_origin {
-                                        let relative_pos = pos - text_pos;
-                                        let cursor = galley.cursor_from_pos(relative_pos);
-                                        // Subtract 1 so clicking on a character includes it in selection
-                                        let idx = cursor.ccursor.index.saturating_sub(1);
-                                        self.selection_start = Some(idx);
-                                        self.selection_end = Some(cursor.ccursor.index);
-                                        self.selection_dragging = true;
-                                    }
-                                }
-
-                                // Clear selection on single click without drag
-                                if alloc_response.clicked_by(egui::PointerButton::Primary) && !self.selection_dragging {
-                                    self.selection_start = None;
-                                    self.selection_end = None;
-                                }
-
-                                // Handle selection update during drag
-                                if self.selection_dragging && alloc_response.dragged_by(egui::PointerButton::Primary) {
-                                    if let Some(pos) = pointer_pos {
-                                        let relative_pos = pos - text_pos;
-                                        let cursor = galley.cursor_from_pos(relative_pos);
-                                        self.selection_end = Some(cursor.ccursor.index);
-                                    }
-                                }
-
-                                // Handle selection end on release
-                                if alloc_response.drag_released() {
-                                    self.selection_dragging = false;
-                                }
-
-                                // Find URLs in the galley text for click handling
-                                let galley_text = galley.text();
-                                let url_ranges = Self::find_urls(galley_text);
-
-                                // Handle URL clicks - on single click (not drag), check if clicking on URL
-                                if alloc_response.clicked_by(egui::PointerButton::Primary) {
-                                    if let Some(pos) = pointer_pos {
-                                        let relative_pos = pos - text_pos;
-                                        let cursor = galley.cursor_from_pos(relative_pos);
-                                        let click_char = cursor.ccursor.index;
-
-                                        for (start, end, url) in &url_ranges {
-                                            if click_char >= *start && click_char < *end {
-                                                // Strip zero-width spaces that were inserted for word breaking
-                                                let clean_url = url.replace('\u{200B}', "");
-                                                Self::open_url(&clean_url);
-                                                break;
-                                            }
-                                        }
-                                    }
-                                }
-
-                                // Show pointer cursor when hovering over URLs
-                                let hover_pos = ui.input(|i| i.pointer.hover_pos());
-                                if let Some(pos) = hover_pos {
-                                    if alloc_response.rect.contains(pos) {
-                                        let relative_pos = pos - text_pos;
-                                        let cursor = galley.cursor_from_pos(relative_pos);
-                                        let hover_char = cursor.ccursor.index;
-
-                                        for (start, end, _) in &url_ranges {
-                                            if hover_char >= *start && hover_char < *end {
-                                                ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
-                                                break;
-                                            }
-                                        }
-                                    }
-                                }
-
-                                // First pass: paint full-height background rectangles per glyph
-                                let rows = &galley.rows;
-
-                                for (row_idx, row) in rows.iter().enumerate() {
-                                    let row_top = text_pos.y + row.rect.top();
-                                    // Extend to next row's top, or use current bottom for last row
-                                    let row_bottom = if row_idx + 1 < rows.len() {
-                                        text_pos.y + rows[row_idx + 1].rect.top()
-                                    } else {
-                                        text_pos.y + row.rect.bottom()
-                                    };
-
-                                    for glyph in &row.glyphs {
-                                        // Use the glyph's section to get the background color
-                                        let section_idx = glyph.section_index as usize;
-                                        if section_idx < layout_job.sections.len() {
-                                            let bg = layout_job.sections[section_idx].format.background;
-                                            if bg != egui::Color32::TRANSPARENT {
-                                                let glyph_rect = egui::Rect::from_min_max(
-                                                    egui::pos2(text_pos.x + glyph.pos.x, row_top),
-                                                    egui::pos2(text_pos.x + glyph.pos.x + glyph.size.x, row_bottom),
-                                                );
-                                                painter.rect_filled(glyph_rect, 0.0, bg);
-                                            }
-                                        }
-                                    }
-                                }
-
-                                // Paint selection highlighting using galley's cursor positioning
-                                let selection_color = egui::Color32::from_rgba_unmultiplied(100, 100, 255, 100);
-                                if let (Some(sel_start), Some(sel_end)) = (self.selection_start, self.selection_end) {
-                                    let (start, end) = if sel_start <= sel_end {
-                                        (sel_start, sel_end)
-                                    } else {
-                                        (sel_end, sel_start)
-                                    };
-
-                                    if start != end {
-                                        // Get cursors for selection bounds
-                                        let start_cursor = galley.from_ccursor(egui::text::CCursor::new(start));
-                                        let end_cursor = galley.from_ccursor(egui::text::CCursor::new(end));
-
-                                        // Paint selection row by row
-                                        let start_row = start_cursor.rcursor.row;
-                                        let end_row = end_cursor.rcursor.row;
-
-                                        for row_idx in start_row..=end_row {
-                                            if row_idx >= rows.len() {
-                                                break;
-                                            }
-                                            let row = &rows[row_idx];
-                                            let row_top = text_pos.y + row.rect.top();
-                                            let row_bottom = if row_idx + 1 < rows.len() {
-                                                text_pos.y + rows[row_idx + 1].rect.top()
-                                            } else {
-                                                text_pos.y + row.rect.bottom()
-                                            };
-
-                                            // Determine x bounds for this row
-                                            let start_x = if row_idx == start_row {
-                                                let pos = galley.pos_from_cursor(&start_cursor);
-                                                text_pos.x + pos.min.x
-                                            } else {
-                                                text_pos.x + row.rect.left()
-                                            };
-
-                                            let end_x = if row_idx == end_row {
-                                                let pos = galley.pos_from_cursor(&end_cursor);
-                                                text_pos.x + pos.min.x
-                                            } else {
-                                                text_pos.x + row.rect.right()
-                                            };
-
-                                            if end_x > start_x {
-                                                let sel_rect = egui::Rect::from_min_max(
-                                                    egui::pos2(start_x, row_top),
-                                                    egui::pos2(end_x, row_bottom),
-                                                );
-                                                painter.rect_filled(sel_rect, 0.0, selection_color);
-                                            }
-                                        }
-                                    }
-                                }
-
-                                // Paint the text on top
-                                painter.galley(text_pos, galley.clone());
-
-                                // Build cursor_range if we have a selection
-                                let cursor_range = if let (Some(sel_start), Some(sel_end)) = (self.selection_start, self.selection_end) {
-                                    if sel_start != sel_end {
-                                        let primary_ccursor = egui::text::CCursor::new(sel_start);
-                                        let secondary_ccursor = egui::text::CCursor::new(sel_end);
-                                        Some(egui::text_edit::CursorRange {
-                                            primary: galley.from_ccursor(primary_ccursor),
-                                            secondary: galley.from_ccursor(secondary_ccursor),
-                                        })
-                                    } else {
-                                        None
-                                    }
-                                } else {
-                                    None
-                                };
-
-                                // Wrap in a struct to match TextEdit response interface
-                                let response = TextEditOutputWrapper {
-                                    response: alloc_response,
-                                    galley,
-                                    cursor_range,
-                                    galley_pos: text_pos,
-                                };
-
-                                // Store selection in egui memory on every frame when there is one
-                                // This ensures we have it captured before any click clears it
-                                // Skip storage on secondary click to preserve existing selection
-                                // Use world-specific selection IDs to avoid conflicts when switching worlds
-                                let selection_id = egui::Id::new(format!("output_selection_{}", self.current_world));
-                                let selection_range_id = egui::Id::new(format!("output_selection_range_{}", self.current_world));
-                                let selection_raw_id = egui::Id::new(format!("output_selection_raw_{}", self.current_world));
-                                let is_secondary_click = response.response.secondary_clicked();
-                                if !is_secondary_click {
-                                if let Some(cursor_range) = response.cursor_range {
-                                    if cursor_range.primary != cursor_range.secondary {
-                                        let start_char = cursor_range.primary.ccursor.index.min(cursor_range.secondary.ccursor.index);
-                                        let end_char = cursor_range.primary.ccursor.index.max(cursor_range.secondary.ccursor.index);
-                                        // Convert character indices to byte indices for proper UTF-8 slicing
-                                        let galley_text = response.galley.text();
-                                        let start_byte = galley_text.char_indices().nth(start_char).map(|(i, _)| i).unwrap_or(galley_text.len());
-                                        let end_byte = galley_text.char_indices().nth(end_char).map(|(i, _)| i).unwrap_or(galley_text.len());
-                                        let selected = galley_text[start_byte..end_byte].to_string();
-
-                                        // Extract the selected portion from raw lines, preserving ANSI codes
-                                        // Helper to extract visible char range from raw text with ANSI
-                                        fn extract_raw_selection(raw: &str, vis_start: usize, vis_end: usize) -> String {
-                                            let mut result = String::new();
-                                            let mut vis_pos = 0;
-                                            let mut chars = raw.chars().peekable();
-
-                                            while let Some(c) = chars.next() {
-                                                if c == '\x1b' {
-                                                    // Start of ANSI sequence - include it if we're in selection
-                                                    let mut seq = String::from(c);
-                                                    while let Some(&next) = chars.peek() {
-                                                        seq.push(chars.next().unwrap());
-                                                        if next.is_ascii_alphabetic() {
-                                                            break;
-                                                        }
-                                                    }
-                                                    if vis_pos >= vis_start && vis_pos < vis_end {
-                                                        result.push_str(&seq);
-                                                    }
-                                                } else {
-                                                    // Visible character
-                                                    if vis_pos >= vis_start && vis_pos < vis_end {
-                                                        result.push(c);
-                                                    }
-                                                    vis_pos += 1;
-                                                    if vis_pos >= vis_end {
-                                                        break;
-                                                    }
-                                                }
-                                            }
-                                            result
-                                        }
-
-                                        // Build selection from raw lines
-                                        let mut raw_selected_parts = Vec::new();
-                                        let mut char_pos = 0;
-                                        for (i, galley_line) in galley_text.lines().enumerate() {
-                                            let line_start = char_pos;
-                                            let line_end = char_pos + galley_line.chars().count();
-
-                                            // Check if this line overlaps with selection
-                                            if line_end > start_char && line_start < end_char {
-                                                if let Some(ts_line) = colored_lines.get(i) {
-                                                    // Calculate visible char range within this line
-                                                    let sel_start_in_line = start_char.saturating_sub(line_start);
-                                                    let sel_end_in_line = (end_char - line_start).min(galley_line.chars().count());
-
-                                                    let raw_part = extract_raw_selection(
-                                                        &ts_line.text,
-                                                        sel_start_in_line,
-                                                        sel_end_in_line
-                                                    );
-                                                    if !raw_part.is_empty() {
-                                                        raw_selected_parts.push(raw_part);
-                                                    }
-                                                }
-                                            }
-                                            char_pos = line_end + 1; // +1 for newline
-                                        }
-                                        let raw_text = raw_selected_parts.join("\n").replace('\x1b', "<esc>");
-
-                                        // Always store selection text, range, and raw lines when we have one
-                                        ui.ctx().data_mut(|d| {
-                                            d.insert_temp(selection_id, selected);
-                                            d.insert_temp(selection_range_id, (start_char, end_char));
-                                            d.insert_temp(selection_raw_id, raw_text);
-                                        });
-                                    }
-                                }
-                                } // end if !is_secondary_click
-                                // Handle clicks - check for URL clicks and clear selection
-                                if response.response.clicked() {
-                                    if let Some(cursor_range) = response.cursor_range {
-                                        if cursor_range.primary == cursor_range.secondary {
-                                            let click_pos = cursor_range.primary.ccursor.index;
-
-                                            // Check if clicking on a URL
-                                            // Use galley text (not plain_text) to match cursor positions
-                                            let galley_text = response.galley.text();
-                                            let urls = Self::find_urls(galley_text);
-                                            let mut url_clicked = false;
-                                            for (start, end, url) in urls {
-                                                if click_pos >= start && click_pos <= end {
-                                                    // Strip zero-width spaces that were inserted for word breaking
-                                                    let clean_url = url.replace('\u{200B}', "");
-                                                    Self::open_url(&clean_url);
-                                                    url_clicked = true;
-                                                    break;
-                                                }
-                                            }
-
-                                            // Clear selection if not clicking a URL
-                                            if !url_clicked {
-                                                ui.ctx().data_mut(|d| {
-                                                    d.remove::<String>(selection_id);
-                                                    d.remove::<(usize, usize)>(selection_range_id);
-                                                    d.remove::<String>(selection_raw_id);
-                                                });
-                                            }
-                                        }
-                                    } else {
-                                        ui.ctx().data_mut(|d| {
-                                            d.remove::<String>(selection_id);
-                                            d.remove::<(usize, usize)>(selection_range_id);
-                                            d.remove::<String>(selection_raw_id);
-                                        });
-                                    }
-                                }
-
-                                // Always draw custom selection highlight when we have a stored selection
-                                // This ensures no flicker when context menu opens/closes
-                                {
-                                    if let Some((start, end)) = ui.ctx().data(|d| d.get_temp::<(usize, usize)>(selection_range_id)) {
-                                        let galley = &response.galley;
-                                        let text_pos = response.galley_pos;
-
-                                        // Get cursor positions for start and end
-                                        let start_cursor = galley.from_ccursor(egui::text::CCursor::new(start));
-                                        let end_cursor = galley.from_ccursor(egui::text::CCursor::new(end));
-
-                                        // Draw selection rectangles for each row in the selection
-                                        let selection_color = egui::Color32::from_rgba_unmultiplied(100, 100, 200, 100);
-                                        let painter = ui.painter();
-
-                                        for row_idx in start_cursor.rcursor.row..=end_cursor.rcursor.row {
-                                            if let Some(row) = galley.rows.get(row_idx) {
-                                                let row_start = if row_idx == start_cursor.rcursor.row {
-                                                    galley.pos_from_cursor(&start_cursor).min.x
-                                                } else {
-                                                    row.rect.left()
-                                                };
-                                                let row_end = if row_idx == end_cursor.rcursor.row {
-                                                    galley.pos_from_cursor(&end_cursor).min.x
-                                                } else {
-                                                    row.rect.right()
-                                                };
-
-                                                let rect = egui::Rect::from_min_max(
-                                                    egui::pos2(text_pos.x + row_start, text_pos.y + row.rect.top()),
-                                                    egui::pos2(text_pos.x + row_end, text_pos.y + row.rect.bottom()),
-                                                );
-                                                painter.rect_filled(rect, 0.0, selection_color);
-                                            }
-                                        }
-                                    }
-                                }
-
-                                // Draw URL underlines and handle hover cursor
-                                {
-                                    // Use galley text (not plain_text) to match cursor positions
-                                    let galley = &response.galley;
-                                    let galley_text = galley.text();
-                                    let urls = Self::find_urls(galley_text);
-
-                                    if !urls.is_empty() {
-                                        let text_pos = response.galley_pos;
-                                        let painter = ui.painter();
-                                        let link_color = theme.link();
-                                        let hover_pos = ui.input(|i| i.pointer.hover_pos());
-
-                                        for (start, end, _url) in &urls {
-                                            let start_cursor = galley.from_ccursor(egui::text::CCursor::new(*start));
-                                            let end_cursor = galley.from_ccursor(egui::text::CCursor::new(*end));
-
-                                            // Draw underline for each row the URL spans
-                                            for row_idx in start_cursor.rcursor.row..=end_cursor.rcursor.row {
-                                                if let Some(row) = galley.rows.get(row_idx) {
-                                                    let row_start = if row_idx == start_cursor.rcursor.row {
-                                                        galley.pos_from_cursor(&start_cursor).min.x
-                                                    } else {
-                                                        row.rect.left()
-                                                    };
-                                                    let row_end = if row_idx == end_cursor.rcursor.row {
-                                                        galley.pos_from_cursor(&end_cursor).min.x
-                                                    } else {
-                                                        row.rect.right()
-                                                    };
-
-                                                    // Create rect for this URL segment
-                                                    let url_rect = egui::Rect::from_min_max(
-                                                        egui::pos2(text_pos.x + row_start, text_pos.y + row.rect.top()),
-                                                        egui::pos2(text_pos.x + row_end, text_pos.y + row.rect.bottom()),
-                                                    );
-
-                                                    // Check if mouse is hovering over this URL segment
-                                                    if let Some(pos) = hover_pos {
-                                                        if url_rect.contains(pos) {
-                                                            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
-                                                        }
-                                                    }
-
-                                                    // Draw underline at bottom of text
-                                                    let y = text_pos.y + row.rect.bottom() - 1.0;
-                                                    painter.line_segment(
-                                                        [egui::pos2(text_pos.x + row_start, y), egui::pos2(text_pos.x + row_end, y)],
-                                                        egui::Stroke::new(1.0, link_color),
-                                                    );
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-
-                                // Right-click context menu
-                                let plain_text_for_menu = plain_text.clone();
-                                let debug_request_id = egui::Id::new("debug_text_request");
-
-                                response.response.context_menu(|ui| {
-                                    // Get stored selection from egui memory
-                                    let stored_selection: Option<String> = ui.ctx().data(|d| d.get_temp(selection_id));
-                                    let stored_raw: Option<String> = ui.ctx().data(|d| d.get_temp(selection_raw_id));
-
-                                    // Show Copy button if there's stored selected text
-                                    if let Some(ref selected) = stored_selection {
-                                        if ui.button("Copy").clicked() {
-                                            ui.ctx().copy_text(selected.clone());
-                                            ui.close_menu();
-                                        }
-                                    }
-                                    if ui.button("Copy All").clicked() {
-                                        ui.ctx().copy_text(plain_text_for_menu.clone());
-                                        ui.close_menu();
-                                    }
-                                    ui.separator();
-                                    // Debug option - show raw ANSI codes
-                                    if let Some(raw_text) = stored_raw {
-                                        if ui.button("Debug Selection").clicked() {
-                                            // Store in egui memory for retrieval outside closure
-                                            ui.ctx().data_mut(|d| d.insert_temp(debug_request_id, raw_text));
-                                            ui.close_menu();
-                                        }
-                                    }
-                                });
-                                // Check if debug was requested
-                                let debug_request: Option<String> = ui.ctx().data(|d| {
-                                    d.get_temp::<String>(debug_request_id)
-                                });
-                                if let Some(debug_text) = debug_request {
-                                    self.debug_text = debug_text;
-                                    self.popup_state = PopupState::DebugText;
-                                    ui.ctx().data_mut(|d| { d.remove::<String>(debug_request_id); });
-                                }
-                            });
-
-                        // Track actual scroll position from scroll area state
-                        let content_size = scroll_output.content_size.y;
-                        let viewport_height = scroll_output.inner_rect.height();
-                        let max_offset = (content_size - viewport_height).max(0.0);
-                        let current_offset = scroll_output.state.offset.y;
-
-                        // Save max offset for PageUp/PageDown calculations
-                        self.scroll_max_offset = max_offset;
-
-                        // Update our tracked offset based on actual scroll position
-                        if current_offset >= max_offset - 1.0 {
-                            // At or near bottom
-                            self.scroll_offset = None;
-                        } else if self.scroll_offset.is_some() {
-                            // Clamp our tracked offset to valid range
-                            self.scroll_offset = Some(current_offset.clamp(0.0, max_offset));
-                        }
-                    }
-                });
-
-                // Popup windows
-                let mut close_popup = false;
-                let mut popup_action: Option<(&str, usize)> = None;
-
-                // Worlds popup (combined world selector and connected worlds list) - separate OS window
-                if self.popup_state == PopupState::ConnectedWorlds {
-                    let mut should_close = false;
-                    let mut selected = self.world_list_selected;
-                    let mut connect_world: Option<usize> = None;
-                    let mut edit_world: Option<usize> = None;
-                    let mut add_world = false;
-                    let mut toggle_only_connected = false;
-                    let worlds_clone = self.worlds.clone();
-                    let current_world = self.current_world;
-
-                    let only_connected = self.only_connected_worlds;
-                    let window_title = if only_connected { "Worlds List" } else { "World Selector" };
-
-                    ctx.show_viewport_immediate(
-                        egui::ViewportId::from_hash_of("connected_worlds_window"),
-                        egui::ViewportBuilder::default()
-                            .with_title(window_title)
-                            .with_inner_size([640.0, 352.0]),
-                        |ctx, _class| {
-                            // Apply popup styling
-                            ctx.style_mut(|style| {
-                                style.visuals.window_fill = theme.bg_elevated();
-                                style.visuals.panel_fill = theme.bg_elevated();
-                                style.visuals.window_stroke = egui::Stroke::NONE;
-                                style.visuals.window_shadow = egui::epaint::Shadow::NONE;
-
-                                let widget_bg = theme.bg_deep();
-                                let widget_rounding = egui::Rounding::same(4.0);
-
-                                style.visuals.widgets.noninteractive.bg_fill = widget_bg;
-                                style.visuals.widgets.noninteractive.bg_stroke = egui::Stroke::NONE;
-                                style.visuals.widgets.noninteractive.fg_stroke = egui::Stroke::NONE;
-                                style.visuals.widgets.noninteractive.rounding = widget_rounding;
-                                style.visuals.widgets.noninteractive.weak_bg_fill = widget_bg;
-
-                                style.visuals.widgets.inactive.bg_fill = theme.bg_hover();
-                                style.visuals.widgets.inactive.bg_stroke = egui::Stroke::NONE;
-                                style.visuals.widgets.inactive.fg_stroke = egui::Stroke::NONE;
-                                style.visuals.widgets.inactive.rounding = widget_rounding;
-                                style.visuals.widgets.inactive.weak_bg_fill = theme.bg_hover();
-
-                                style.visuals.widgets.hovered.bg_fill = theme.bg_hover();
-                                style.visuals.widgets.hovered.bg_stroke = egui::Stroke::NONE;
-                                style.visuals.widgets.hovered.fg_stroke = egui::Stroke::NONE;
-                                style.visuals.widgets.hovered.rounding = widget_rounding;
-                                style.visuals.widgets.hovered.weak_bg_fill = theme.bg_hover();
-
-                                style.visuals.widgets.active.bg_fill = theme.accent_dim();
-                                style.visuals.widgets.active.bg_stroke = egui::Stroke::NONE;
-                                style.visuals.widgets.active.fg_stroke = egui::Stroke::NONE;
-                                style.visuals.widgets.active.rounding = widget_rounding;
-                                style.visuals.widgets.active.weak_bg_fill = theme.accent_dim();
-
-                                style.visuals.widgets.open.bg_fill = theme.bg_hover();
-                                style.visuals.widgets.open.bg_stroke = egui::Stroke::NONE;
-                                style.visuals.widgets.open.fg_stroke = egui::Stroke::NONE;
-                                style.visuals.widgets.open.rounding = widget_rounding;
-                                style.visuals.widgets.open.weak_bg_fill = theme.bg_hover();
-
-                                style.visuals.selection.bg_fill = Color32::from_rgba_unmultiplied(34, 211, 238, 38);
-                                style.visuals.selection.stroke = egui::Stroke::NONE;
-                                style.visuals.extreme_bg_color = widget_bg;
-                            });
-
-                            if ctx.input(|i| i.key_pressed(egui::Key::Escape)) ||
-                               ctx.input(|i| i.viewport().close_requested()) {
-                                should_close = true;
-                            }
-
-                            // Bottom panel for buttons
-                            egui::TopBottomPanel::bottom("connected_worlds_buttons")
-                                .exact_height(44.0)
-                                .frame(egui::Frame::none()
-                                    .fill(theme.bg_surface())
-                                    .stroke(egui::Stroke::NONE)
-                                    .inner_margin(egui::Margin { left: 16.0, right: 17.0, top: 8.0, bottom: 8.0 }))
-                                .show(ctx, |ui| {
-                                    ui.horizontal(|ui| {
-                                        ui.spacing_mut().item_spacing = egui::vec2(8.0, 0.0);
-
-                                        // Left side: Connected toggle
-                                        ui.label(egui::RichText::new("Connected")
-                                            .size(11.0)
-                                            .color(theme.fg_secondary())
-                                            .family(egui::FontFamily::Monospace));
-
-                                        // Toggle switch (like SSL toggle in world editor)
-                                        let toggle_width = 36.0;
-                                        let toggle_height = 18.0;
-                                        let toggle_rect = ui.allocate_space(egui::vec2(toggle_width, toggle_height)).1;
-                                        let toggle_response = ui.interact(toggle_rect, ui.id().with("only_connected_toggle"), egui::Sense::click());
-
-                                        // Draw toggle background
-                                        let toggle_bg = if only_connected { theme.accent_dim() } else { theme.bg_deep() };
-                                        ui.painter().rect_filled(toggle_rect, egui::Rounding::same(toggle_height / 2.0), toggle_bg);
-
-                                        // Draw toggle knob
-                                        let knob_radius = (toggle_height - 4.0) / 2.0;
-                                        let knob_x = if only_connected {
-                                            toggle_rect.right() - knob_radius - 2.0
-                                        } else {
-                                            toggle_rect.left() + knob_radius + 2.0
-                                        };
-                                        let knob_color = if only_connected { theme.bg_deep() } else { theme.fg_muted() };
-                                        ui.painter().circle_filled(egui::pos2(knob_x, toggle_rect.center().y), knob_radius, knob_color);
-
-                                        if toggle_response.clicked() {
-                                            toggle_only_connected = true;
-                                        }
-
-                                        // Spacer to push buttons to right
-                                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                            ui.spacing_mut().item_spacing = egui::vec2(8.0, 0.0);
-
-                                            // Close button
-                                            if ui.add(egui::Button::new(
-                                                egui::RichText::new("CLOSE").size(11.0).color(theme.fg_secondary()).family(egui::FontFamily::Monospace))
-                                                .fill(theme.bg_hover())
-                                                .stroke(egui::Stroke::new(1.0, theme.border_medium()))
-                                                .rounding(egui::Rounding::same(4.0))
-                                                .min_size(egui::vec2(70.0, 28.0))
-                                            ).clicked() {
-                                                should_close = true;
-                                            }
-
-                                            // Connect button (primary)
-                                            if ui.add(egui::Button::new(
-                                                egui::RichText::new("CONNECT").size(11.0).color(theme.bg_deep()).strong().family(egui::FontFamily::Monospace))
-                                                .fill(theme.accent_dim())
-                                                .stroke(egui::Stroke::NONE)
-                                                .rounding(egui::Rounding::same(4.0))
-                                                .min_size(egui::vec2(80.0, 28.0))
-                                            ).clicked() {
-                                                connect_world = Some(selected);
-                                                should_close = true;
-                                            }
-
-                                            // Edit button
-                                            if ui.add(egui::Button::new(
-                                                egui::RichText::new("EDIT").size(11.0).color(theme.fg_secondary()).family(egui::FontFamily::Monospace))
-                                                .fill(theme.bg_hover())
-                                                .stroke(egui::Stroke::new(1.0, theme.border_medium()))
-                                                .rounding(egui::Rounding::same(4.0))
-                                                .min_size(egui::vec2(60.0, 28.0))
-                                            ).clicked() {
-                                                edit_world = Some(selected);
-                                            }
-
-                                            // Add button
-                                            if ui.add(egui::Button::new(
-                                                egui::RichText::new("ADD").size(11.0).color(theme.fg_secondary()).family(egui::FontFamily::Monospace))
-                                                .fill(theme.bg_hover())
-                                                .stroke(egui::Stroke::new(1.0, theme.border_medium()))
-                                                .rounding(egui::Rounding::same(4.0))
-                                                .min_size(egui::vec2(60.0, 28.0))
-                                            ).clicked() {
-                                                add_world = true;
-                                            }
-                                        });
-                                    });
-                                });
-
-                            egui::CentralPanel::default()
-                                .frame(egui::Frame::none()
-                                    .fill(theme.bg_elevated())
-                                    .inner_margin(egui::Margin::same(16.0)))
-                                .show(ctx, |ui| {
-                                    // Filter input
-                                    let filter_rect = ui.allocate_space(egui::vec2(ui.available_width(), 28.0)).1;
-                                    ui.painter().rect_filled(filter_rect, egui::Rounding::same(4.0), theme.bg_deep());
-                                    let filter_inner = filter_rect.shrink2(egui::vec2(8.0, 4.0));
-                                    let mut filter_ui = ui.child_ui(filter_inner, egui::Layout::left_to_right(egui::Align::Center));
-                                    let filter_edit = TextEdit::singleline(&mut self.connected_worlds_filter)
-                                        .frame(false)
-                                        .hint_text(egui::RichText::new("Filter worlds...").color(theme.fg_dim()))
-                                        .desired_width(filter_inner.width())
-                                        .text_color(theme.fg())
-                                        .font(egui::FontId::monospace(12.0));
-                                    filter_ui.add(filter_edit);
-                                    ui.add_space(12.0);
-
-                                    // Table header row
-                                    let row_height = 24.0;
-                                    let col_widths = [180.0, 180.0, 60.0, 80.0]; // World, Hostname, Port, User
-                                    let header_rect = ui.allocate_space(egui::vec2(ui.available_width(), row_height)).1;
-                                    let header_y = header_rect.center().y;
-                                    // World header aligned with text after status dot (4 + 14 = 18)
-                                    ui.painter().text(
-                                        egui::pos2(header_rect.left() + 18.0, header_y),
-                                        egui::Align2::LEFT_CENTER,
-                                        "World",
-                                        egui::FontId::monospace(11.0),
-                                        theme.fg_muted());
-                                    ui.painter().text(
-                                        egui::pos2(header_rect.left() + col_widths[0], header_y),
-                                        egui::Align2::LEFT_CENTER,
-                                        "Hostname",
-                                        egui::FontId::monospace(11.0),
-                                        theme.fg_muted());
-                                    ui.painter().text(
-                                        egui::pos2(header_rect.left() + col_widths[0] + col_widths[1], header_y),
-                                        egui::Align2::LEFT_CENTER,
-                                        "Port",
-                                        egui::FontId::monospace(11.0),
-                                        theme.fg_muted());
-                                    ui.painter().text(
-                                        egui::pos2(header_rect.left() + col_widths[0] + col_widths[1] + col_widths[2], header_y),
-                                        egui::Align2::LEFT_CENTER,
-                                        "User",
-                                        egui::FontId::monospace(11.0),
-                                        theme.fg_muted());
-
-                                    ui.add_space(4.0);
-                                    ui.add(egui::Separator::default().spacing(0.0));
-                                    ui.add_space(4.0);
-
-                                    // Build filtered list of worlds
-                                    let filter_lower = self.connected_worlds_filter.to_lowercase();
-                                    let filtered_worlds: Vec<(usize, &RemoteWorld)> = worlds_clone.iter()
-                                        .enumerate()
-                                        .filter(|(_, w)| !only_connected || w.connected)
-                                        .filter(|(_, w)| {
-                                            if filter_lower.is_empty() {
-                                                true
-                                            } else {
-                                                w.name.to_lowercase().contains(&filter_lower) ||
-                                                w.settings.hostname.to_lowercase().contains(&filter_lower) ||
-                                                w.settings.user.to_lowercase().contains(&filter_lower)
-                                            }
-                                        })
-                                        .collect();
-
-                                    let empty_message = if only_connected { "No worlds connected." } else { "No worlds found." };
-                                    if filtered_worlds.is_empty() {
-                                        ui.add_space(8.0);
-                                        ui.label(egui::RichText::new(empty_message)
-                                            .size(12.0)
-                                            .color(theme.fg_muted())
-                                            .family(egui::FontFamily::Monospace));
-                                    } else {
-                                        ScrollArea::vertical().auto_shrink([false; 2]).show(ui, |ui| {
-                                            for (idx, world) in filtered_worlds.iter() {
-                                                let is_current = *idx == current_world;
-                                                let is_selected = *idx == selected;
-
-                                                // Full row as a clickable area
-                                                let row_rect = ui.allocate_space(egui::vec2(ui.available_width(), row_height)).1;
-                                                let response = ui.interact(row_rect, ui.id().with(idx), egui::Sense::click());
-
-                                                // Draw selection/hover background for full row
-                                                if is_selected {
-                                                    ui.painter().rect_filled(row_rect, egui::Rounding::same(2.0),
-                                                        Color32::from_rgba_unmultiplied(34, 211, 238, 38));
-                                                } else if response.hovered() {
-                                                    ui.painter().rect_filled(row_rect, egui::Rounding::same(2.0), theme.bg_hover());
-                                                }
-
-                                                if response.clicked() {
-                                                    selected = *idx;
-                                                }
-
-                                                // Draw row content
-                                                let mut col_x = row_rect.left() + 4.0;
-                                                let text_y = row_rect.center().y;
-
-                                                // World column with status dot and current marker
-                                                let status_color = if world.connected { theme.success() } else { theme.fg_dim() };
-                                                let dot_rect = egui::Rect::from_center_size(
-                                                    egui::pos2(col_x + 4.0, text_y),
-                                                    egui::vec2(6.0, 6.0));
-                                                ui.painter().circle_filled(dot_rect.center(), 3.0, status_color);
-                                                col_x += 14.0;
-
-                                                let current_marker = if is_current { "* " } else { "" };
-                                                let name_color = if is_current { theme.accent() } else if is_selected { theme.fg() } else { theme.fg_secondary() };
-                                                ui.painter().text(
-                                                    egui::pos2(col_x, text_y),
-                                                    egui::Align2::LEFT_CENTER,
-                                                    format!("{}{}", current_marker, world.name),
-                                                    egui::FontId::monospace(12.0),
-                                                    name_color);
-                                                col_x = row_rect.left() + col_widths[0];
-
-                                                // Hostname column
-                                                ui.painter().text(
-                                                    egui::pos2(col_x, text_y),
-                                                    egui::Align2::LEFT_CENTER,
-                                                    &world.settings.hostname,
-                                                    egui::FontId::monospace(12.0),
-                                                    theme.fg_secondary());
-                                                col_x += col_widths[1];
-
-                                                // Port column
-                                                ui.painter().text(
-                                                    egui::pos2(col_x, text_y),
-                                                    egui::Align2::LEFT_CENTER,
-                                                    &world.settings.port,
-                                                    egui::FontId::monospace(12.0),
-                                                    theme.fg_secondary());
-                                                col_x += col_widths[2];
-
-                                                // User column
-                                                let user_text = if world.settings.user.is_empty() { "—" } else { &world.settings.user };
-                                                ui.painter().text(
-                                                    egui::pos2(col_x, text_y),
-                                                    egui::Align2::LEFT_CENTER,
-                                                    user_text,
-                                                    egui::FontId::monospace(12.0),
-                                                    theme.fg_secondary());
-                                            }
-                                        });
-                                    }
-                                });
-                        },
-                    );
-
-                    self.world_list_selected = selected;
-                    if toggle_only_connected {
-                        self.only_connected_worlds = !self.only_connected_worlds;
-                    }
-                    if let Some(idx) = connect_world {
-                        popup_action = Some(("connect", idx));
-                    }
-                    if let Some(idx) = edit_world {
-                        popup_action = Some(("edit", idx));
-                    }
-                    if add_world {
-                        popup_action = Some(("add", 0));
-                    }
-                    if should_close {
-                        close_popup = true;
-                    }
-                }
-
-                // World Editor popup (separate OS window)
-                if let PopupState::WorldEditor(world_idx) = self.popup_state {
-                    let mut should_close = false;
-                    let mut should_save = false;
-                    let mut should_connect = false;
-                    let mut should_delete = false;
-
-                    // Copy mutable state for viewport
-                    let mut edit_name = self.edit_name.clone();
-                    let mut edit_hostname = self.edit_hostname.clone();
-                    let mut edit_port = self.edit_port.clone();
-                    let mut edit_user = self.edit_user.clone();
-                    let mut edit_password = self.edit_password.clone();
-                    let mut edit_ssl = self.edit_ssl;
-                    let mut edit_log_enabled = self.edit_log_enabled;
-                    let mut edit_encoding = self.edit_encoding;
-                    let mut edit_auto_login = self.edit_auto_login;
-                    let mut edit_keep_alive_type = self.edit_keep_alive_type;
-                    let mut edit_keep_alive_cmd = self.edit_keep_alive_cmd.clone();
-                    let can_delete = self.worlds.len() > 1;
-
-                    // Dynamic height based on whether keep-alive cmd is shown
-                    let popup_height = if edit_keep_alive_type == KeepAliveType::Custom { 480.0 } else { 440.0 };
-
-                    ctx.show_viewport_immediate(
-                        egui::ViewportId::from_hash_of("world_editor_window"),
-                        egui::ViewportBuilder::default()
-                            .with_title("World Editor")
-                            .with_inner_size([440.0, popup_height]),
-                        |ctx, _class| {
-                            // Apply popup styling - remove ALL strokes everywhere
-                            ctx.style_mut(|style| {
-                                style.visuals.window_fill = theme.bg_elevated();
-                                style.visuals.panel_fill = theme.bg_elevated();
-                                style.visuals.window_stroke = egui::Stroke::NONE;
-                                style.visuals.window_shadow = egui::epaint::Shadow::NONE;
-
-                                let widget_bg = theme.bg_deep();
-                                let widget_rounding = egui::Rounding::same(4.0);
-
-                                // All widget states: NO stroke anywhere
-                                style.visuals.widgets.noninteractive.bg_fill = widget_bg;
-                                style.visuals.widgets.noninteractive.bg_stroke = egui::Stroke::NONE;
-                                style.visuals.widgets.noninteractive.fg_stroke = egui::Stroke::NONE;
-                                style.visuals.widgets.noninteractive.rounding = widget_rounding;
-                                style.visuals.widgets.noninteractive.weak_bg_fill = widget_bg;
-
-                                style.visuals.widgets.inactive.bg_fill = widget_bg;
-                                style.visuals.widgets.inactive.bg_stroke = egui::Stroke::NONE;
-                                style.visuals.widgets.inactive.fg_stroke = egui::Stroke::NONE;
-                                style.visuals.widgets.inactive.rounding = widget_rounding;
-                                style.visuals.widgets.inactive.expansion = 0.0;
-                                style.visuals.widgets.inactive.weak_bg_fill = widget_bg;
-
-                                style.visuals.widgets.hovered.bg_fill = widget_bg;
-                                style.visuals.widgets.hovered.bg_stroke = egui::Stroke::NONE;
-                                style.visuals.widgets.hovered.fg_stroke = egui::Stroke::NONE;
-                                style.visuals.widgets.hovered.rounding = widget_rounding;
-                                style.visuals.widgets.hovered.expansion = 0.0;
-                                style.visuals.widgets.hovered.weak_bg_fill = widget_bg;
-
-                                style.visuals.widgets.active.bg_fill = widget_bg;
-                                style.visuals.widgets.active.bg_stroke = egui::Stroke::NONE;
-                                style.visuals.widgets.active.fg_stroke = egui::Stroke::NONE;
-                                style.visuals.widgets.active.rounding = widget_rounding;
-                                style.visuals.widgets.active.expansion = 0.0;
-                                style.visuals.widgets.active.weak_bg_fill = widget_bg;
-
-                                style.visuals.widgets.open.bg_fill = widget_bg;
-                                style.visuals.widgets.open.bg_stroke = egui::Stroke::NONE;
-                                style.visuals.widgets.open.fg_stroke = egui::Stroke::NONE;
-                                style.visuals.widgets.open.rounding = widget_rounding;
-                                style.visuals.widgets.open.expansion = 0.0;
-                                style.visuals.widgets.open.weak_bg_fill = widget_bg;
-
-                                // Selection highlight - no stroke
-                                style.visuals.selection.bg_fill = Color32::from_rgba_unmultiplied(34, 211, 238, 38);
-                                style.visuals.selection.stroke = egui::Stroke::NONE;
-
-                                // Text edit - no cursor stroke
-                                style.visuals.extreme_bg_color = widget_bg;
-                                style.visuals.text_cursor = egui::Stroke::new(1.0, theme.fg());
-                            });
-
-                            if ctx.input(|i| i.key_pressed(egui::Key::Escape)) ||
-                               ctx.input(|i| i.viewport().close_requested()) {
-                                should_close = true;
-                            }
-
-                            // Bottom panel for buttons (right margin reduced to move buttons right)
-                            egui::TopBottomPanel::bottom("world_editor_buttons")
-                                .exact_height(48.0)
-                                .frame(egui::Frame::none()
-                                    .fill(theme.bg_surface())
-                                    .stroke(egui::Stroke::new(1.0, theme.border_subtle()))
-                                    .inner_margin(egui::Margin { left: 16.0, right: 1.0, top: 10.0, bottom: 10.0 }))
-                                .show(ctx, |ui| {
-                                    ui.horizontal(|ui| {
-                                        ui.spacing_mut().item_spacing = egui::vec2(8.0, 0.0);
-
-                                        // Delete button (danger, left side)
-                                        if can_delete
-                                            && ui.add(egui::Button::new(
-                                                egui::RichText::new("Delete").size(11.0).color(theme.error()))
-                                                .fill(Color32::TRANSPARENT)
-                                                .stroke(egui::Stroke::new(1.0, theme.error_dim()))
-                                                .rounding(egui::Rounding::same(4.0))
-                                                .min_size(egui::vec2(70.0, 28.0))
-                                            ).clicked() {
-                                                should_delete = true;
-                                            }
-
-                                        // Spacer to push remaining buttons to the right
-                                        let remaining = ui.available_width() - 240.0; // 3 buttons * 70 + spacing
-                                        if remaining > 0.0 {
-                                            ui.add_space(remaining);
-                                        }
-
-                                        // Cancel button
-                                        if ui.add(egui::Button::new(
-                                            egui::RichText::new("Cancel").size(11.0).color(theme.fg_secondary()))
-                                            .fill(theme.bg_hover())
-                                            .stroke(egui::Stroke::new(1.0, theme.border_medium()))
-                                            .rounding(egui::Rounding::same(4.0))
-                                            .min_size(egui::vec2(70.0, 28.0))
-                                        ).clicked() {
-                                            should_close = true;
-                                        }
-
-                                        // Connect button
-                                        if ui.add(egui::Button::new(
-                                            egui::RichText::new("Connect").size(11.0).color(theme.fg_secondary()))
-                                            .fill(theme.bg_hover())
-                                            .stroke(egui::Stroke::new(1.0, theme.border_medium()))
-                                            .rounding(egui::Rounding::same(4.0))
-                                            .min_size(egui::vec2(70.0, 28.0))
-                                        ).clicked() {
-                                            should_save = true;
-                                            should_connect = true;
-                                        }
-
-                                        // Save button (primary)
-                                        if ui.add(egui::Button::new(
-                                            egui::RichText::new("Save").size(11.0).color(theme.bg_deep()).strong())
-                                            .fill(theme.accent_dim())
-                                            .stroke(egui::Stroke::NONE)
-                                            .rounding(egui::Rounding::same(4.0))
-                                            .min_size(egui::vec2(70.0, 28.0))
-                                        ).clicked() {
-                                            should_save = true;
-                                        }
-                                    });
-                                });
-
-                            egui::CentralPanel::default()
-                                .frame(egui::Frame::none()
-                                    .fill(theme.bg_elevated())
-                                    .inner_margin(egui::Margin { left: 20.0, right: 16.0, top: 20.0, bottom: 20.0 }))
-                                .show(ctx, |ui| {
-                                    // Header
-                                    ui.label(egui::RichText::new("WORLD EDITOR")
-                                        .size(10.0)
-                                        .color(theme.fg_muted())
-                                        .strong());
-                                    ui.add_space(16.0);
-
-                                    // Layout dimensions
-                                    let label_width = 100.0;
-                                    let label_spacing = 12.0;
-                                    let row_height = 28.0;
-                                    // input_width will be calculated dynamically using available_width()
-
-                                    // Helper to draw chevron (down arrow) like mockup SVG
-                                    let draw_chevron = |painter: &egui::Painter, center: egui::Pos2, color: Color32| {
-                                        // Chevron: two lines from top corners to bottom center
-                                        // Similar to SVG path "M6 9l6 6 6-6" scaled to fit
-                                        let half_width = 5.0;
-                                        let half_height = 3.0;
-                                        let stroke = egui::Stroke::new(1.5, color);
-                                        // Left line: top-left to bottom-center
-                                        painter.line_segment(
-                                            [egui::pos2(center.x - half_width, center.y - half_height),
-                                             egui::pos2(center.x, center.y + half_height)],
-                                            stroke
-                                        );
-                                        // Right line: top-right to bottom-center
-                                        painter.line_segment(
-                                            [egui::pos2(center.x + half_width, center.y - half_height),
-                                             egui::pos2(center.x, center.y + half_height)],
-                                            stroke
-                                        );
-                                    };
-
-                                    // Helper macro-like closure for form rows
-                                    let form_row = |ui: &mut egui::Ui, label: &str, add_widget: &mut dyn FnMut(&mut egui::Ui)| {
-                                        ui.horizontal(|ui| {
-                                            ui.spacing_mut().item_spacing = egui::vec2(0.0, 0.0);
-                                            ui.set_height(row_height);
-                                            // Right-aligned label
-                                            ui.allocate_ui_with_layout(
-                                                egui::vec2(label_width, row_height),
-                                                egui::Layout::right_to_left(egui::Align::Center),
-                                                |ui| {
-                                                    ui.label(egui::RichText::new(label.to_uppercase())
-                                                        .size(10.0)
-                                                        .color(theme.fg_muted()));
-                                                }
-                                            );
-                                            ui.add_space(label_spacing);
-                                            add_widget(ui);
-                                        });
-                                        ui.add_space(6.0);
-                                    };
-
-                                    // Helper to create styled text input - uses available width or fixed
-                                    // NO BORDERS - just background fill
-                                    let styled_text_input = |ui: &mut egui::Ui, text: &mut String, fixed_width: Option<f32>, id_salt: &str| {
-                                        let width = fixed_width.unwrap_or_else(|| ui.available_width());
-                                        let field_id = ui.id().with(id_salt);
-                                        let field_rect = ui.allocate_space(egui::vec2(width, row_height)).1;
-                                        let _response = ui.interact(field_rect, field_id, egui::Sense::click());
-
-                                        // Draw background only - NO border
-                                        ui.painter().rect_filled(field_rect, egui::Rounding::same(4.0), theme.bg_deep());
-
-                                        // Inner text edit area (no frame, no background)
-                                        let inner_rect = field_rect.shrink2(egui::vec2(8.0, 4.0));
-                                        let mut child_ui = ui.child_ui(inner_rect, egui::Layout::left_to_right(egui::Align::Center));
-                                        let text_edit = TextEdit::singleline(text)
-                                            .frame(false)
-                                            .desired_width(inner_rect.width())
-                                            .text_color(theme.fg())
-                                            .font(egui::FontId::monospace(11.0));
-                                        child_ui.add(text_edit);
-                                    };
-
-                                    // Name (full width)
-                                    form_row(ui, "Name", &mut |ui| {
-                                        styled_text_input(ui, &mut edit_name, None, "name_input");
-                                    });
-
-                                    // Hostname (full width)
-                                    form_row(ui, "Hostname", &mut |ui| {
-                                        styled_text_input(ui, &mut edit_hostname, None, "hostname_input");
-                                    });
-
-                                    // Port (fixed width)
-                                    form_row(ui, "Port", &mut |ui| {
-                                        styled_text_input(ui, &mut edit_port, Some(80.0), "port_input");
-                                    });
-
-                                    // User (full width)
-                                    form_row(ui, "User", &mut |ui| {
-                                        styled_text_input(ui, &mut edit_user, None, "user_input");
-                                    });
-
-                                    // Password (full width, not masked)
-                                    form_row(ui, "Password", &mut |ui| {
-                                        styled_text_input(ui, &mut edit_password, None, "password_input");
-                                    });
-
-                                    // Use SSL (toggle)
-                                    form_row(ui, "Use SSL", &mut |ui| {
-                                        // Toggle switch style
-                                        let (toggle_bg, toggle_border, knob_pos) = if edit_ssl {
-                                            (theme.accent_dim(), theme.accent_dim(), 18.0)
-                                        } else {
-                                            (theme.bg_deep(), theme.border_medium(), 3.0)
-                                        };
-
-                                        let toggle_rect = ui.allocate_space(egui::vec2(36.0, 20.0));
-                                        let response = ui.interact(toggle_rect.1, ui.id().with("ssl_toggle"), egui::Sense::click());
-
-                                        if response.clicked() {
-                                            edit_ssl = !edit_ssl;
-                                        }
-
-                                        // Draw toggle background
-                                        ui.painter().rect_filled(
-                                            toggle_rect.1,
-                                            egui::Rounding::same(10.0),
-                                            toggle_bg
-                                        );
-                                        ui.painter().rect_stroke(
-                                            toggle_rect.1,
-                                            egui::Rounding::same(10.0),
-                                            egui::Stroke::new(1.0, toggle_border)
-                                        );
-
-                                        // Draw knob
-                                        let knob_color = if edit_ssl { theme.bg_deep() } else { theme.fg_muted() };
-                                        let knob_center = egui::pos2(
-                                            toggle_rect.1.min.x + knob_pos + 7.0,
-                                            toggle_rect.1.center().y
-                                        );
-                                        ui.painter().circle_filled(knob_center, 7.0, knob_color);
-                                    });
-
-                                    // Logging (toggle)
-                                    form_row(ui, "Logging", &mut |ui| {
-                                        // Toggle switch style
-                                        let (toggle_bg, toggle_border, knob_pos) = if edit_log_enabled {
-                                            (theme.accent_dim(), theme.accent_dim(), 18.0)
-                                        } else {
-                                            (theme.bg_deep(), theme.border_medium(), 3.0)
-                                        };
-
-                                        let toggle_rect = ui.allocate_space(egui::vec2(36.0, 20.0));
-                                        let response = ui.interact(toggle_rect.1, ui.id().with("log_toggle"), egui::Sense::click());
-
-                                        if response.clicked() {
-                                            edit_log_enabled = !edit_log_enabled;
-                                        }
-
-                                        // Draw toggle background
-                                        ui.painter().rect_filled(
-                                            toggle_rect.1,
-                                            egui::Rounding::same(10.0),
-                                            toggle_bg
-                                        );
-                                        ui.painter().rect_stroke(
-                                            toggle_rect.1,
-                                            egui::Rounding::same(10.0),
-                                            egui::Stroke::new(1.0, toggle_border)
-                                        );
-
-                                        // Draw knob
-                                        let knob_color = if edit_log_enabled { theme.bg_deep() } else { theme.fg_muted() };
-                                        let knob_center = egui::pos2(
-                                            toggle_rect.1.min.x + knob_pos + 7.0,
-                                            toggle_rect.1.center().y
-                                        );
-                                        ui.painter().circle_filled(knob_center, 7.0, knob_color);
-                                    });
-
-                                    // Encoding (custom styled dropdown, full width, NO border)
-                                    form_row(ui, "Encoding", &mut |ui| {
-                                        let dropdown_id = ui.id().with("encoding_dropdown");
-                                        let _is_open = ui.memory(|mem| mem.is_popup_open(dropdown_id));
-                                        let dropdown_width = ui.available_width();
-
-                                        let button_rect = ui.allocate_space(egui::vec2(dropdown_width, row_height)).1;
-                                        let response = ui.interact(button_rect, dropdown_id.with("button"), egui::Sense::click());
-
-                                        // Background only - NO border
-                                        ui.painter().rect_filled(button_rect, egui::Rounding::same(4.0), theme.bg_deep());
-
-                                        ui.painter().text(
-                                            egui::pos2(button_rect.min.x + 12.0, button_rect.center().y),
-                                            egui::Align2::LEFT_CENTER,
-                                            edit_encoding.name(),
-                                            egui::FontId::monospace(11.0),
-                                            theme.fg()
-                                        );
-
-                                        draw_chevron(ui.painter(), egui::pos2(button_rect.max.x - 16.0, button_rect.center().y), theme.fg_muted());
-
-                                        if response.clicked() {
-                                            ui.memory_mut(|mem| mem.toggle_popup(dropdown_id));
-                                        }
-
-                                        egui::popup_below_widget(ui, dropdown_id, &response, |ui| {
-                                            ui.set_min_width(dropdown_width);
-                                            ui.style_mut().visuals.widgets.inactive.fg_stroke = egui::Stroke::new(1.0, theme.fg());
-                                            ui.style_mut().visuals.widgets.hovered.fg_stroke = egui::Stroke::new(1.0, theme.fg());
-                                            ui.style_mut().visuals.widgets.active.fg_stroke = egui::Stroke::new(1.0, theme.fg());
-                                            if ui.selectable_label(edit_encoding == Encoding::Utf8,
-                                                egui::RichText::new("UTF-8").size(11.0).color(theme.fg()).family(egui::FontFamily::Monospace)).clicked() {
-                                                edit_encoding = Encoding::Utf8;
-                                                ui.memory_mut(|mem| mem.close_popup());
-                                            }
-                                            if ui.selectable_label(edit_encoding == Encoding::Latin1,
-                                                egui::RichText::new("Latin-1").size(11.0).color(theme.fg()).family(egui::FontFamily::Monospace)).clicked() {
-                                                edit_encoding = Encoding::Latin1;
-                                                ui.memory_mut(|mem| mem.close_popup());
-                                            }
-                                            if ui.selectable_label(edit_encoding == Encoding::Fansi,
-                                                egui::RichText::new("FANSI").size(11.0).color(theme.fg()).family(egui::FontFamily::Monospace)).clicked() {
-                                                edit_encoding = Encoding::Fansi;
-                                                ui.memory_mut(|mem| mem.close_popup());
-                                            }
-                                        });
-                                    });
-
-                                    // Auto Login (custom styled dropdown, full width, NO border)
-                                    form_row(ui, "Auto Login", &mut |ui| {
-                                        let dropdown_id = ui.id().with("auto_login_dropdown");
-                                        let _is_open = ui.memory(|mem| mem.is_popup_open(dropdown_id));
-                                        let dropdown_width = ui.available_width();
-
-                                        let button_rect = ui.allocate_space(egui::vec2(dropdown_width, row_height)).1;
-                                        let response = ui.interact(button_rect, dropdown_id.with("button"), egui::Sense::click());
-
-                                        // Background only - NO border
-                                        ui.painter().rect_filled(button_rect, egui::Rounding::same(4.0), theme.bg_deep());
-
-                                        ui.painter().text(
-                                            egui::pos2(button_rect.min.x + 12.0, button_rect.center().y),
-                                            egui::Align2::LEFT_CENTER,
-                                            edit_auto_login.name(),
-                                            egui::FontId::monospace(11.0),
-                                            theme.fg()
-                                        );
-
-                                        draw_chevron(ui.painter(), egui::pos2(button_rect.max.x - 16.0, button_rect.center().y), theme.fg_muted());
-
-                                        if response.clicked() {
-                                            ui.memory_mut(|mem| mem.toggle_popup(dropdown_id));
-                                        }
-
-                                        egui::popup_below_widget(ui, dropdown_id, &response, |ui| {
-                                            ui.set_min_width(dropdown_width);
-                                            ui.style_mut().visuals.widgets.inactive.fg_stroke = egui::Stroke::new(1.0, theme.fg());
-                                            ui.style_mut().visuals.widgets.hovered.fg_stroke = egui::Stroke::new(1.0, theme.fg());
-                                            ui.style_mut().visuals.widgets.active.fg_stroke = egui::Stroke::new(1.0, theme.fg());
-                                            if ui.selectable_label(edit_auto_login == AutoConnectType::Connect,
-                                                egui::RichText::new("Connect").size(11.0).color(theme.fg()).family(egui::FontFamily::Monospace)).clicked() {
-                                                edit_auto_login = AutoConnectType::Connect;
-                                                ui.memory_mut(|mem| mem.close_popup());
-                                            }
-                                            if ui.selectable_label(edit_auto_login == AutoConnectType::Prompt,
-                                                egui::RichText::new("Prompt").size(11.0).color(theme.fg()).family(egui::FontFamily::Monospace)).clicked() {
-                                                edit_auto_login = AutoConnectType::Prompt;
-                                                ui.memory_mut(|mem| mem.close_popup());
-                                            }
-                                            if ui.selectable_label(edit_auto_login == AutoConnectType::MooPrompt,
-                                                egui::RichText::new("MOO Prompt").size(11.0).color(theme.fg()).family(egui::FontFamily::Monospace)).clicked() {
-                                                edit_auto_login = AutoConnectType::MooPrompt;
-                                                ui.memory_mut(|mem| mem.close_popup());
-                                            }
-                                        });
-                                    });
-
-                                    // Keep Alive (custom styled dropdown, full width, NO border)
-                                    form_row(ui, "Keep Alive", &mut |ui| {
-                                        let dropdown_id = ui.id().with("keep_alive_dropdown");
-                                        let _is_open = ui.memory(|mem| mem.is_popup_open(dropdown_id));
-                                        let dropdown_width = ui.available_width();
-
-                                        let button_rect = ui.allocate_space(egui::vec2(dropdown_width, row_height)).1;
-                                        let response = ui.interact(button_rect, dropdown_id.with("button"), egui::Sense::click());
-
-                                        // Background only - NO border
-                                        ui.painter().rect_filled(button_rect, egui::Rounding::same(4.0), theme.bg_deep());
-
-                                        ui.painter().text(
-                                            egui::pos2(button_rect.min.x + 12.0, button_rect.center().y),
-                                            egui::Align2::LEFT_CENTER,
-                                            edit_keep_alive_type.name(),
-                                            egui::FontId::monospace(11.0),
-                                            theme.fg()
-                                        );
-
-                                        draw_chevron(ui.painter(), egui::pos2(button_rect.max.x - 16.0, button_rect.center().y), theme.fg_muted());
-
-                                        if response.clicked() {
-                                            ui.memory_mut(|mem| mem.toggle_popup(dropdown_id));
-                                        }
-
-                                        egui::popup_below_widget(ui, dropdown_id, &response, |ui| {
-                                            ui.set_min_width(dropdown_width);
-                                            ui.style_mut().visuals.widgets.inactive.fg_stroke = egui::Stroke::new(1.0, theme.fg());
-                                            ui.style_mut().visuals.widgets.hovered.fg_stroke = egui::Stroke::new(1.0, theme.fg());
-                                            ui.style_mut().visuals.widgets.active.fg_stroke = egui::Stroke::new(1.0, theme.fg());
-                                            if ui.selectable_label(edit_keep_alive_type == KeepAliveType::Nop,
-                                                egui::RichText::new("NOP").size(11.0).color(theme.fg()).family(egui::FontFamily::Monospace)).clicked() {
-                                                edit_keep_alive_type = KeepAliveType::Nop;
-                                                ui.memory_mut(|mem| mem.close_popup());
-                                            }
-                                            if ui.selectable_label(edit_keep_alive_type == KeepAliveType::Custom,
-                                                egui::RichText::new("Custom").size(11.0).color(theme.fg()).family(egui::FontFamily::Monospace)).clicked() {
-                                                edit_keep_alive_type = KeepAliveType::Custom;
-                                                ui.memory_mut(|mem| mem.close_popup());
-                                            }
-                                            if ui.selectable_label(edit_keep_alive_type == KeepAliveType::Generic,
-                                                egui::RichText::new("Generic").size(11.0).color(theme.fg()).family(egui::FontFamily::Monospace)).clicked() {
-                                                edit_keep_alive_type = KeepAliveType::Generic;
-                                                ui.memory_mut(|mem| mem.close_popup());
-                                            }
-                                        });
-                                    });
-
-                                    // Only show Keep-Alive CMD when Custom is selected (full width)
-                                    if edit_keep_alive_type == KeepAliveType::Custom {
-                                        form_row(ui, "Keep Alive CMD", &mut |ui| {
-                                            styled_text_input(ui, &mut edit_keep_alive_cmd, None, "keep_alive_cmd_input");
-                                        });
-                                    }
-                            });
-                        },
-                    );
-
-                    // Apply changes back to self
-                    self.edit_name = edit_name;
-                    self.edit_hostname = edit_hostname;
-                    self.edit_port = edit_port;
-                    self.edit_user = edit_user;
-                    self.edit_password = edit_password;
-                    self.edit_ssl = edit_ssl;
-                    self.edit_log_enabled = edit_log_enabled;
-                    self.edit_encoding = edit_encoding;
-                    self.edit_auto_login = edit_auto_login;
-                    self.edit_keep_alive_type = edit_keep_alive_type;
-                    self.edit_keep_alive_cmd = edit_keep_alive_cmd;
-
-                    if should_save {
-                        // Update local world settings and send to server
-                        if let Some(world) = self.worlds.get_mut(world_idx) {
-                            world.name = self.edit_name.clone();
-                            world.settings.hostname = self.edit_hostname.clone();
-                            world.settings.port = self.edit_port.clone();
-                            world.settings.user = self.edit_user.clone();
-                            world.settings.password = self.edit_password.clone();
-                            world.settings.use_ssl = self.edit_ssl;
-                            world.settings.log_enabled = self.edit_log_enabled;
-                            world.settings.encoding = self.edit_encoding.name().to_string();
-                            world.settings.auto_login = self.edit_auto_login.name().to_string();
-                            world.settings.keep_alive_type = self.edit_keep_alive_type.name().to_string();
-                            world.settings.keep_alive_cmd = self.edit_keep_alive_cmd.clone();
-                        }
-                        // Send update to server
-                        self.update_world_settings(world_idx);
-                        if should_connect {
-                            popup_action = Some(("connect", world_idx));
-                        }
-                        close_popup = true;
-                    } else if should_delete {
-                        self.popup_state = PopupState::WorldConfirmDelete(world_idx);
-                    } else if should_close {
-                        close_popup = true;
-                    }
-                }
-
-                // World delete confirmation popup (separate OS window)
-                if let PopupState::WorldConfirmDelete(world_idx) = self.popup_state {
-                    let world_name = self.worlds.get(world_idx)
-                        .map(|w| w.name.clone())
-                        .unwrap_or_default();
-                    let mut should_delete = false;
-                    let mut should_cancel = false;
-
-                    ctx.show_viewport_immediate(
-                        egui::ViewportId::from_hash_of("world_confirm_delete_window"),
-                        egui::ViewportBuilder::default()
-                            .with_title("Confirm Delete")
-                            .with_inner_size([320.0, 140.0]),
-                        |ctx, _class| {
-                            // Apply popup styling
-                            ctx.style_mut(|style| {
-                                style.visuals.window_fill = theme.bg_elevated();
-                                style.visuals.panel_fill = theme.bg_elevated();
-                                style.visuals.window_stroke = egui::Stroke::NONE;
-                                style.visuals.window_shadow = egui::epaint::Shadow::NONE;
-
-                                let widget_bg = theme.bg_deep();
-                                let widget_rounding = egui::Rounding::same(4.0);
-
-                                style.visuals.widgets.noninteractive.bg_fill = widget_bg;
-                                style.visuals.widgets.noninteractive.bg_stroke = egui::Stroke::NONE;
-                                style.visuals.widgets.noninteractive.fg_stroke = egui::Stroke::NONE;
-                                style.visuals.widgets.noninteractive.rounding = widget_rounding;
-                                style.visuals.widgets.noninteractive.weak_bg_fill = widget_bg;
-
-                                style.visuals.widgets.inactive.bg_fill = theme.bg_hover();
-                                style.visuals.widgets.inactive.bg_stroke = egui::Stroke::NONE;
-                                style.visuals.widgets.inactive.fg_stroke = egui::Stroke::NONE;
-                                style.visuals.widgets.inactive.rounding = widget_rounding;
-                                style.visuals.widgets.inactive.weak_bg_fill = theme.bg_hover();
-
-                                style.visuals.widgets.hovered.bg_fill = theme.bg_hover();
-                                style.visuals.widgets.hovered.bg_stroke = egui::Stroke::NONE;
-                                style.visuals.widgets.hovered.fg_stroke = egui::Stroke::NONE;
-                                style.visuals.widgets.hovered.rounding = widget_rounding;
-                                style.visuals.widgets.hovered.weak_bg_fill = theme.bg_hover();
-
-                                style.visuals.widgets.active.bg_fill = theme.accent_dim();
-                                style.visuals.widgets.active.bg_stroke = egui::Stroke::NONE;
-                                style.visuals.widgets.active.fg_stroke = egui::Stroke::NONE;
-                                style.visuals.widgets.active.rounding = widget_rounding;
-                                style.visuals.widgets.active.weak_bg_fill = theme.accent_dim();
-
-                                style.visuals.widgets.open.bg_fill = theme.bg_hover();
-                                style.visuals.widgets.open.bg_stroke = egui::Stroke::NONE;
-                                style.visuals.widgets.open.fg_stroke = egui::Stroke::NONE;
-                                style.visuals.widgets.open.rounding = widget_rounding;
-                                style.visuals.widgets.open.weak_bg_fill = theme.bg_hover();
-
-                                style.visuals.selection.bg_fill = Color32::from_rgba_unmultiplied(34, 211, 238, 38);
-                                style.visuals.selection.stroke = egui::Stroke::NONE;
-                                style.visuals.extreme_bg_color = widget_bg;
-                            });
-
-                            egui::CentralPanel::default()
-                                .frame(egui::Frame::none()
-                                    .fill(theme.bg_elevated())
-                                    .inner_margin(egui::Margin::same(20.0)))
-                                .show(ctx, |ui| {
-                                if ui.input(|i| i.key_pressed(egui::Key::Escape)) ||
-                                   ui.input(|i| i.key_pressed(egui::Key::N)) ||
-                                   ui.input(|i| i.viewport().close_requested()) {
-                                    should_cancel = true;
-                                }
-                                if ui.input(|i| i.key_pressed(egui::Key::Y)) {
-                                    should_delete = true;
-                                }
-
-                                // Header
-                                ui.label(egui::RichText::new("CONFIRM DELETE")
-                                    .size(11.0)
-                                    .color(theme.fg_muted())
-                                    .strong());
-                                ui.add_space(16.0);
-
-                                ui.label(egui::RichText::new(format!("Delete world '{}'?", world_name))
-                                    .color(theme.fg_secondary()));
-                                ui.add_space(20.0);
-
-                                ui.horizontal(|ui| {
-                                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                        ui.spacing_mut().item_spacing = egui::vec2(8.0, 0.0);
-
-                                        // No button
-                                        if ui.add(egui::Button::new(
-                                            egui::RichText::new("No").size(11.0).color(theme.fg_secondary()))
-                                            .fill(theme.bg_hover())
-                                            .stroke(egui::Stroke::new(1.0, theme.border_medium()))
-                                            .rounding(egui::Rounding::same(4.0))
-                                            .min_size(egui::vec2(70.0, 28.0))
-                                        ).clicked() {
-                                            should_cancel = true;
-                                        }
-
-                                        // Yes button (danger)
-                                        if ui.add(egui::Button::new(
-                                            egui::RichText::new("Yes").size(11.0).color(theme.error()))
-                                            .fill(Color32::TRANSPARENT)
-                                            .stroke(egui::Stroke::new(1.0, theme.error_dim()))
-                                            .rounding(egui::Rounding::same(4.0))
-                                            .min_size(egui::vec2(70.0, 28.0))
-                                        ).clicked() {
-                                            should_delete = true;
-                                        }
-                                    });
-                                });
-                            });
-                        },
-                    );
-
-                    if should_delete {
-                        // Delete the world - send request to server
-                        if world_idx < self.worlds.len() && self.worlds.len() > 1 {
-                            if let Some(ref ws_tx) = self.ws_tx {
-                                let msg = WsMessage::DeleteWorld { world_index: world_idx };
-                                let _ = ws_tx.send(msg);
-                            }
-                            // Local removal will happen when server sends WorldRemoved
-                        }
-                        // Return to Worlds popup
-                        self.popup_state = PopupState::ConnectedWorlds;
-                    } else if should_cancel {
-                        // Return to Worlds popup
-                        self.popup_state = PopupState::ConnectedWorlds;
-                    }
-                }
-
-                // Setup popup - separate OS window
-                if self.popup_state == PopupState::Setup {
-                    // Save original transparency when popup first opens
-                    if self.original_transparency.is_none() {
-                        self.original_transparency = Some(self.transparency);
-                    }
-
-                    // Copy state for editing in viewport
-                    let mut more_mode = self.more_mode;
-                    let mut spell_check = self.spell_check_enabled;
-                    let mut temp_convert = self.temp_convert_enabled;
-                    let mut world_switch = self.world_switch_mode;
-                    let debug_enabled = self.debug_enabled;
-                    let mut show_tags = self.show_tags;
-                    let mut ansi_music = self.ansi_music_enabled;
-                    let mut tls_proxy = self.tls_proxy_enabled;
-                    let mut input_height = self.input_height;
-                    let mut gui_theme = self.theme;
-                    let mut transparency = self.transparency;
-                    let mut color_offset = self.color_offset_percent;
-                    let mut color_offset_dec = false;
-                    let mut color_offset_inc = false;
-                    let mut should_close = false;
-                    let mut should_save = false;
-                    let mut should_cancel = false;
-
-                    ctx.show_viewport_immediate(
-                        egui::ViewportId::from_hash_of("setup_window"),
-                        egui::ViewportBuilder::default()
-                            .with_title("Settings")
-                            .with_inner_size([560.0, 420.0]),
-                        |ctx, _class| {
-                            // Apply popup styling - remove all default strokes
-                            ctx.style_mut(|style| {
-                                style.visuals.window_fill = theme.bg_elevated();
-                                style.visuals.panel_fill = theme.bg_elevated();
-                                style.visuals.window_stroke = egui::Stroke::NONE;
-                                style.visuals.window_shadow = egui::epaint::Shadow::NONE;
-
-                                let widget_bg = theme.bg_deep();
-                                let widget_rounding = egui::Rounding::same(4.0);
-
-                                style.visuals.widgets.noninteractive.bg_fill = widget_bg;
-                                style.visuals.widgets.noninteractive.bg_stroke = egui::Stroke::NONE;
-                                style.visuals.widgets.noninteractive.fg_stroke = egui::Stroke::NONE;
-                                style.visuals.widgets.noninteractive.rounding = widget_rounding;
-                                style.visuals.widgets.noninteractive.weak_bg_fill = widget_bg;
-
-                                style.visuals.widgets.inactive.bg_fill = theme.bg_hover();
-                                style.visuals.widgets.inactive.bg_stroke = egui::Stroke::NONE;
-                                style.visuals.widgets.inactive.fg_stroke = egui::Stroke::NONE;
-                                style.visuals.widgets.inactive.rounding = widget_rounding;
-                                style.visuals.widgets.inactive.weak_bg_fill = widget_bg;
-
-                                style.visuals.widgets.hovered.bg_fill = theme.bg_hover();
-                                style.visuals.widgets.hovered.bg_stroke = egui::Stroke::NONE;
-                                style.visuals.widgets.hovered.fg_stroke = egui::Stroke::NONE;
-                                style.visuals.widgets.hovered.rounding = widget_rounding;
-                                style.visuals.widgets.hovered.weak_bg_fill = widget_bg;
-
-                                style.visuals.widgets.active.bg_fill = theme.accent_dim();
-                                style.visuals.widgets.active.bg_stroke = egui::Stroke::NONE;
-                                style.visuals.widgets.active.fg_stroke = egui::Stroke::NONE;
-                                style.visuals.widgets.active.rounding = widget_rounding;
-                                style.visuals.widgets.active.weak_bg_fill = widget_bg;
-
-                                style.visuals.widgets.open.bg_fill = widget_bg;
-                                style.visuals.widgets.open.bg_stroke = egui::Stroke::NONE;
-                                style.visuals.widgets.open.fg_stroke = egui::Stroke::NONE;
-                                style.visuals.widgets.open.rounding = widget_rounding;
-                                style.visuals.widgets.open.weak_bg_fill = widget_bg;
-
-                                style.visuals.selection.bg_fill = Color32::from_rgba_unmultiplied(34, 211, 238, 38);
-                                style.visuals.selection.stroke = egui::Stroke::NONE;
-                                style.visuals.extreme_bg_color = widget_bg;
-                            });
-
-                            if ctx.input(|i| i.key_pressed(egui::Key::Escape)) ||
-                               ctx.input(|i| i.viewport().close_requested()) {
-                                should_cancel = true;
-                                should_close = true;
-                            }
-
-                            // Bottom panel for buttons
-                            egui::TopBottomPanel::bottom("setup_buttons")
-                                .exact_height(68.0)
-                                .frame(egui::Frame::none()
-                                    .fill(theme.bg_elevated())
-                                    .stroke(egui::Stroke::NONE))
-                                .show(ctx, |ui| {
-                                    // Use allocate_ui_with_layout for precise vertical positioning
-                                    let panel_height = ui.available_height();
-                                    let button_height = 28.0;
-                                    let bottom_padding = 20.0;
-                                    let top_padding = panel_height - button_height - bottom_padding;
-
-                                    ui.add_space(top_padding);
-                                    ui.horizontal(|ui| {
-                                        ui.add_space(16.0);  // Left padding
-                                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                            ui.add_space(18.0);  // Right padding
-                                            ui.spacing_mut().item_spacing = egui::vec2(8.0, 0.0);
-
-                                            // Cancel button
-                                            if ui.add(egui::Button::new(
-                                                egui::RichText::new("CANCEL").size(11.0).color(theme.fg_secondary()).family(egui::FontFamily::Monospace))
-                                                .fill(theme.bg_hover())
-                                                .stroke(egui::Stroke::new(1.0, theme.border_medium()))
-                                                .rounding(egui::Rounding::same(4.0))
-                                                .min_size(egui::vec2(70.0, 28.0))
-                                            ).clicked() {
-                                                should_cancel = true;
-                                                should_close = true;
-                                            }
-
-                                            // Save button (primary)
-                                            if ui.add(egui::Button::new(
-                                                egui::RichText::new("SAVE").size(11.0).color(theme.bg_deep()).strong().family(egui::FontFamily::Monospace))
-                                                .fill(theme.accent_dim())
-                                                .stroke(egui::Stroke::NONE)
-                                                .rounding(egui::Rounding::same(4.0))
-                                                .min_size(egui::vec2(70.0, 28.0))
-                                            ).clicked() {
-                                                should_save = true;
-                                                should_close = true;
-                                            }
-                                        });
-                                    });
-                                });
-
-                            egui::CentralPanel::default()
-                                .frame(egui::Frame::none()
-                                    .fill(theme.bg_elevated())
-                                    .inner_margin(egui::Margin { left: 20.0, right: 16.0, top: 20.0, bottom: 16.0 }))
-                                .show(ctx, |ui| {
-                                    // Layout dimensions (matching World Editor)
-                                    let label_width = 110.0;
-                                    let label_spacing = 12.0;
-                                    let row_height = 28.0;
-
-                                    // Helper to draw chevron
-                                    let draw_chevron = |painter: &egui::Painter, center: egui::Pos2, color: Color32| {
-                                        let half_width = 5.0;
-                                        let half_height = 3.0;
-                                        let stroke = egui::Stroke::new(1.5, color);
-                                        painter.line_segment(
-                                            [egui::pos2(center.x - half_width, center.y - half_height),
-                                             egui::pos2(center.x, center.y + half_height)],
-                                            stroke
-                                        );
-                                        painter.line_segment(
-                                            [egui::pos2(center.x + half_width, center.y - half_height),
-                                             egui::pos2(center.x, center.y + half_height)],
-                                            stroke
-                                        );
-                                    };
-
-                                    // Helper for form rows
-                                    let form_row = |ui: &mut egui::Ui, label: &str, add_widget: &mut dyn FnMut(&mut egui::Ui)| {
-                                        ui.horizontal(|ui| {
-                                            ui.spacing_mut().item_spacing = egui::vec2(0.0, 0.0);
-                                            ui.set_height(row_height);
-                                            ui.allocate_ui_with_layout(
-                                                egui::vec2(label_width, row_height),
-                                                egui::Layout::right_to_left(egui::Align::Center),
-                                                |ui| {
-                                                    ui.label(egui::RichText::new(label.to_uppercase())
-                                                        .size(10.0)
-                                                        .color(theme.fg_muted()));
-                                                }
-                                            );
-                                            ui.add_space(label_spacing);
-                                            add_widget(ui);
-                                        });
-                                        ui.add_space(6.0);
-                                    };
-
-                                    // World Switching (dropdown)
-                                    form_row(ui, "World Switching", &mut |ui| {
-                                        let dropdown_id = ui.id().with("world_switch_dropdown");
-                                        let _is_open = ui.memory(|mem| mem.is_popup_open(dropdown_id));
-                                        let dropdown_width = ui.available_width();
-
-                                        let button_rect = ui.allocate_space(egui::vec2(dropdown_width, row_height)).1;
-                                        let response = ui.interact(button_rect, dropdown_id.with("button"), egui::Sense::click());
-
-                                        ui.painter().rect_filled(button_rect, egui::Rounding::same(4.0), theme.bg_deep());
-
-                                        ui.painter().text(
-                                            egui::pos2(button_rect.min.x + 12.0, button_rect.center().y),
-                                            egui::Align2::LEFT_CENTER,
-                                            world_switch.name(),
-                                            egui::FontId::monospace(11.0),
-                                            theme.fg()
-                                        );
-
-                                        draw_chevron(ui.painter(), egui::pos2(button_rect.max.x - 16.0, button_rect.center().y), theme.fg_muted());
-
-                                        if response.clicked() {
-                                            ui.memory_mut(|mem| mem.toggle_popup(dropdown_id));
-                                        }
-
-                                        egui::popup_below_widget(ui, dropdown_id, &response, |ui| {
-                                            ui.set_min_width(dropdown_width);
-                                            ui.style_mut().visuals.widgets.inactive.fg_stroke = egui::Stroke::new(1.0, theme.fg());
-                                            ui.style_mut().visuals.widgets.hovered.fg_stroke = egui::Stroke::new(1.0, theme.fg());
-                                            ui.style_mut().visuals.widgets.active.fg_stroke = egui::Stroke::new(1.0, theme.fg());
-                                            if ui.selectable_label(world_switch == WorldSwitchMode::UnseenFirst,
-                                                egui::RichText::new("Unseen First").size(11.0).color(theme.fg()).family(egui::FontFamily::Monospace)).clicked() {
-                                                world_switch = WorldSwitchMode::UnseenFirst;
-                                                ui.memory_mut(|mem| mem.close_popup());
-                                            }
-                                            if ui.selectable_label(world_switch == WorldSwitchMode::Alphabetical,
-                                                egui::RichText::new("Alphabetical").size(11.0).color(theme.fg()).family(egui::FontFamily::Monospace)).clicked() {
-                                                world_switch = WorldSwitchMode::Alphabetical;
-                                                ui.memory_mut(|mem| mem.close_popup());
-                                            }
-                                        });
-                                    });
-
-                                    // Theme (dropdown)
-                                    form_row(ui, "Theme", &mut |ui| {
-                                        let dropdown_id = ui.id().with("theme_dropdown");
-                                        let _is_open = ui.memory(|mem| mem.is_popup_open(dropdown_id));
-                                        let dropdown_width = ui.available_width();
-
-                                        let button_rect = ui.allocate_space(egui::vec2(dropdown_width, row_height)).1;
-                                        let response = ui.interact(button_rect, dropdown_id.with("button"), egui::Sense::click());
-
-                                        ui.painter().rect_filled(button_rect, egui::Rounding::same(4.0), theme.bg_deep());
-
-                                        let theme_name = match gui_theme {
-                                            GuiTheme::Dark => "Dark",
-                                            GuiTheme::Light => "Light",
-                                        };
-                                        ui.painter().text(
-                                            egui::pos2(button_rect.min.x + 12.0, button_rect.center().y),
-                                            egui::Align2::LEFT_CENTER,
-                                            theme_name,
-                                            egui::FontId::monospace(11.0),
-                                            theme.fg()
-                                        );
-
-                                        draw_chevron(ui.painter(), egui::pos2(button_rect.max.x - 16.0, button_rect.center().y), theme.fg_muted());
-
-                                        if response.clicked() {
-                                            ui.memory_mut(|mem| mem.toggle_popup(dropdown_id));
-                                        }
-
-                                        egui::popup_below_widget(ui, dropdown_id, &response, |ui| {
-                                            ui.set_min_width(dropdown_width);
-                                            ui.style_mut().visuals.widgets.inactive.fg_stroke = egui::Stroke::new(1.0, theme.fg());
-                                            ui.style_mut().visuals.widgets.hovered.fg_stroke = egui::Stroke::new(1.0, theme.fg());
-                                            ui.style_mut().visuals.widgets.active.fg_stroke = egui::Stroke::new(1.0, theme.fg());
-                                            if ui.selectable_label(gui_theme == GuiTheme::Dark,
-                                                egui::RichText::new("Dark").size(11.0).color(theme.fg()).family(egui::FontFamily::Monospace)).clicked() {
-                                                gui_theme = GuiTheme::Dark;
-                                                ui.memory_mut(|mem| mem.close_popup());
-                                            }
-                                            if ui.selectable_label(gui_theme == GuiTheme::Light,
-                                                egui::RichText::new("Light").size(11.0).color(theme.fg()).family(egui::FontFamily::Monospace)).clicked() {
-                                                gui_theme = GuiTheme::Light;
-                                                ui.memory_mut(|mem| mem.close_popup());
-                                            }
-                                        });
-                                    });
-
-                                    ui.add_space(8.0);
-
-                                    // Transparency (right below theme)
-                                    form_row(ui, "Transparency", &mut |ui| {
-                                        let slider_width = ui.available_width();
-                                        let slider_height = row_height;
-                                        let slider_rect = ui.allocate_space(egui::vec2(slider_width, slider_height)).1;
-
-                                        // Draw track background
-                                        let track_rect = egui::Rect::from_center_size(
-                                            slider_rect.center(),
-                                            egui::vec2(slider_width - 20.0, 4.0)
-                                        );
-                                        ui.painter().rect_filled(track_rect, egui::Rounding::same(2.0), theme.bg_deep());
-
-                                        // Calculate knob position
-                                        let knob_x = track_rect.left() + (transparency - 0.3) / 0.7 * track_rect.width();
-                                        let knob_center = egui::pos2(knob_x, slider_rect.center().y);
-
-                                        // Draw filled portion
-                                        let filled_rect = egui::Rect::from_min_max(
-                                            track_rect.min,
-                                            egui::pos2(knob_x, track_rect.max.y)
-                                        );
-                                        ui.painter().rect_filled(filled_rect, egui::Rounding::same(2.0), theme.accent_dim());
-
-                                        // Draw knob
-                                        ui.painter().circle_filled(knob_center, 8.0, theme.accent());
-
-                                        // Handle interaction
-                                        let response = ui.interact(slider_rect, ui.id().with("transparency_slider"), egui::Sense::click_and_drag());
-                                        if response.dragged() || response.clicked() {
-                                            if let Some(pos) = response.interact_pointer_pos() {
-                                                let new_value = ((pos.x - track_rect.left()) / track_rect.width() * 0.7 + 0.3)
-                                                    .clamp(0.3, 1.0);
-                                                transparency = new_value;
-                                            }
-                                        }
-                                    });
-
-                                    // Input Height
-                                    form_row(ui, "Input Height", &mut |ui| {
-                                        ui.spacing_mut().item_spacing = egui::vec2(4.0, 0.0);
-                                        if ui.add(egui::Button::new(
-                                            egui::RichText::new("-").size(11.0).color(theme.fg_secondary()).family(egui::FontFamily::Monospace))
-                                            .fill(theme.bg_deep())
-                                            .stroke(egui::Stroke::NONE)
-                                            .rounding(egui::Rounding::same(4.0))
-                                            .min_size(egui::vec2(28.0, 24.0))
-                                        ).clicked() && input_height > 1 {
-                                            input_height -= 1;
-                                        }
-                                        ui.add_space(4.0);
-                                        // Number display in a styled box
-                                        let num_rect = ui.allocate_space(egui::vec2(40.0, row_height)).1;
-                                        ui.painter().rect_filled(num_rect, egui::Rounding::same(4.0), theme.bg_deep());
-                                        ui.painter().text(
-                                            num_rect.center(),
-                                            egui::Align2::CENTER_CENTER,
-                                            format!("{}", input_height),
-                                            egui::FontId::monospace(11.0),
-                                            theme.fg()
-                                        );
-                                        ui.add_space(4.0);
-                                        if ui.add(egui::Button::new(
-                                            egui::RichText::new("+").size(11.0).color(theme.fg_secondary()).family(egui::FontFamily::Monospace))
-                                            .fill(theme.bg_deep())
-                                            .stroke(egui::Stroke::NONE)
-                                            .rounding(egui::Rounding::same(4.0))
-                                            .min_size(egui::vec2(28.0, 24.0))
-                                        ).clicked() && input_height < 15 {
-                                            input_height += 1;
-                                        }
-                                    });
-
-                                    // Color Offset (0 = off, 5-100 = percentage)
-                                    ui.horizontal(|ui| {
-                                        ui.spacing_mut().item_spacing = egui::vec2(0.0, 0.0);
-                                        ui.set_height(row_height);
-                                        ui.allocate_ui_with_layout(
-                                            egui::vec2(label_width, row_height),
-                                            egui::Layout::right_to_left(egui::Align::Center),
-                                            |ui| {
-                                                ui.label(egui::RichText::new("COLOR OFFSET")
-                                                    .size(10.0)
-                                                    .color(theme.fg_muted()));
-                                            }
-                                        );
-                                        ui.add_space(label_spacing);
-                                        ui.spacing_mut().item_spacing = egui::vec2(4.0, 0.0);
-                                        if ui.add(egui::Button::new(
-                                            egui::RichText::new("-").size(11.0).color(theme.fg_secondary()).family(egui::FontFamily::Monospace))
-                                            .fill(theme.bg_deep())
-                                            .stroke(egui::Stroke::NONE)
-                                            .rounding(egui::Rounding::same(4.0))
-                                            .min_size(egui::vec2(28.0, 24.0))
-                                        ).clicked() {
-                                            color_offset_dec = true;
-                                        }
-                                        ui.add_space(4.0);
-                                        // Number display in a styled box
-                                        let num_rect = ui.allocate_space(egui::vec2(56.0, row_height)).1;
-                                        ui.painter().rect_filled(num_rect, egui::Rounding::same(4.0), theme.bg_deep());
-                                        let label = if color_offset == 0 { "OFF".to_string() } else { format!("{}%", color_offset) };
-                                        ui.painter().text(
-                                            num_rect.center(),
-                                            egui::Align2::CENTER_CENTER,
-                                            label,
-                                            egui::FontId::monospace(11.0),
-                                            theme.fg()
-                                        );
-                                        ui.add_space(4.0);
-                                        if ui.add(egui::Button::new(
-                                            egui::RichText::new("+").size(11.0).color(theme.fg_secondary()).family(egui::FontFamily::Monospace))
-                                            .fill(theme.bg_deep())
-                                            .stroke(egui::Stroke::NONE)
-                                            .rounding(egui::Rounding::same(4.0))
-                                            .min_size(egui::vec2(28.0, 24.0))
-                                        ).clicked() {
-                                            color_offset_inc = true;
-                                        }
-                                    });
-                                    ui.add_space(6.0);
-
-                                    ui.add_space(8.0);
-
-                                    // Toggle switches in two columns
-                                    let switch_width = 44.0;
-                                    let switch_height = 22.0;
-                                    // Use same label_width as form_row for alignment
-                                    let col_total_width = label_width + label_spacing + switch_width + 16.0;
-
-                                    // Helper for toggle column with right-aligned label (same as form_row)
-                                    let toggle_col = |ui: &mut egui::Ui, label: &str, id: &str, enabled: &mut bool| {
-                                        ui.horizontal(|ui| {
-                                            ui.spacing_mut().item_spacing = egui::vec2(0.0, 0.0);
-                                            ui.allocate_ui_with_layout(
-                                                egui::vec2(label_width, row_height),
-                                                egui::Layout::right_to_left(egui::Align::Center),
-                                                |ui| {
-                                                    ui.label(egui::RichText::new(label)
-                                                        .size(10.0)
-                                                        .color(theme.fg_muted()));
-                                                }
-                                            );
-                                            ui.add_space(label_spacing);
-                                            let switch_rect = ui.allocate_space(egui::vec2(switch_width, switch_height)).1;
-                                            let response = ui.interact(switch_rect, ui.id().with(id), egui::Sense::click());
-                                            let track_color = if *enabled { theme.accent_dim() } else { theme.bg_deep() };
-                                            ui.painter().rect_filled(switch_rect, egui::Rounding::same(11.0), track_color);
-                                            let knob_x = if *enabled { switch_rect.right() - 11.0 } else { switch_rect.left() + 11.0 };
-                                            let knob_color = if *enabled { theme.accent() } else { theme.fg_muted() };
-                                            ui.painter().circle_filled(egui::pos2(knob_x, switch_rect.center().y), 7.0, knob_color);
-                                            if response.clicked() { *enabled = !*enabled; }
-                                        });
-                                    };
-
-                                    // Row 1: More Mode | Spell Check
-                                    ui.horizontal(|ui| {
-                                        ui.set_height(row_height);
-                                        ui.allocate_ui(egui::vec2(col_total_width, row_height), |ui| {
-                                            toggle_col(ui, "MORE MODE", "more_mode_toggle", &mut more_mode);
-                                        });
-                                        ui.allocate_ui(egui::vec2(col_total_width, row_height), |ui| {
-                                            toggle_col(ui, "SPELL CHECK", "spell_check_toggle", &mut spell_check);
-                                        });
-                                    });
-                                    ui.add_space(6.0);
-
-                                    // Row 2: Show Tags | ANSI Music
-                                    ui.horizontal(|ui| {
-                                        ui.set_height(row_height);
-                                        ui.allocate_ui(egui::vec2(col_total_width, row_height), |ui| {
-                                            toggle_col(ui, "SHOW TAGS", "show_tags_toggle", &mut show_tags);
-                                        });
-                                        ui.allocate_ui(egui::vec2(col_total_width, row_height), |ui| {
-                                            toggle_col(ui, "ANSI MUSIC", "ansi_music_toggle", &mut ansi_music);
-                                        });
-                                    });
-                                    ui.add_space(6.0);
-
-                                    // Row 3: TLS Proxy | Temp Convert
-                                    ui.horizontal(|ui| {
-                                        ui.set_height(row_height);
-                                        ui.allocate_ui(egui::vec2(col_total_width, row_height), |ui| {
-                                            toggle_col(ui, "TLS PROXY", "tls_proxy_toggle", &mut tls_proxy);
-                                        });
-                                        ui.allocate_ui(egui::vec2(col_total_width, row_height), |ui| {
-                                            toggle_col(ui, "TEMP CONVERT", "temp_convert_toggle", &mut temp_convert);
-                                        });
-                                    });
-                            });
-                        },
-                    );
-
-                    // Handle color offset button clicks (flags set inside viewport closure)
-                    if color_offset_dec && color_offset > 0 {
-                        color_offset = color_offset.saturating_sub(5);
-                    }
-                    if color_offset_inc && color_offset < 100 {
-                        color_offset = (color_offset + 5).min(100);
-                    }
-
-                    // Apply changes back (live preview for transparency)
-                    self.more_mode = more_mode;
-                    self.spell_check_enabled = spell_check;
-                    self.temp_convert_enabled = temp_convert;
-                    self.world_switch_mode = world_switch;
-                    self.debug_enabled = debug_enabled;
-                    self.show_tags = show_tags;
-                    self.ansi_music_enabled = ansi_music;
-                    self.tls_proxy_enabled = tls_proxy;
-                    self.input_height = input_height;
-                    self.theme = gui_theme;
-                    self.transparency = transparency;
-                    self.color_offset_percent = color_offset;
-
-                    if should_save {
-                        self.update_global_settings();
-                        self.original_transparency = None;
-                    }
-                    if should_cancel {
-                        // Revert transparency to original value
-                        if let Some(orig) = self.original_transparency.take() {
-                            self.transparency = orig;
-                        }
-                    }
-                    if should_close {
-                        self.original_transparency = None;
-                        close_popup = true;
-                    }
-                }
-
-                // Web popup (matches console /web) - separate OS window
-                if self.popup_state == PopupState::Web {
-                    let mut should_close = false;
-                    let mut should_save = false;
-
-                    // Copy mutable state for viewport
-                    let mut web_secure = self.web_secure;
-                    let mut http_enabled = self.http_enabled;
-                    let mut http_port = self.http_port;
-                    let mut ws_enabled = self.ws_enabled;
-                    let mut ws_port = self.ws_port;
-                    let mut ws_allow_list = self.ws_allow_list.clone();
-
-                    ctx.show_viewport_immediate(
-                        egui::ViewportId::from_hash_of("web_settings_window"),
-                        egui::ViewportBuilder::default()
-                            .with_title("Web Settings")
-                            .with_inner_size([380.0, 320.0])
-                            .with_resizable(false),
-                        |ctx, _class| {
-                            // Apply popup styling - remove all default strokes
-                            ctx.style_mut(|style| {
-                                style.visuals.window_fill = theme.bg_elevated();
-                                style.visuals.panel_fill = theme.bg_elevated();
-                                style.visuals.window_stroke = egui::Stroke::NONE;
-                                style.visuals.window_shadow = egui::epaint::Shadow::NONE;
-
-                                let widget_bg = theme.bg_deep();
-                                let widget_rounding = egui::Rounding::same(4.0);
-
-                                style.visuals.widgets.noninteractive.bg_fill = widget_bg;
-                                style.visuals.widgets.noninteractive.bg_stroke = egui::Stroke::NONE;
-                                style.visuals.widgets.noninteractive.fg_stroke = egui::Stroke::NONE;
-                                style.visuals.widgets.noninteractive.rounding = widget_rounding;
-                                style.visuals.widgets.noninteractive.weak_bg_fill = widget_bg;
-
-                                style.visuals.widgets.inactive.bg_fill = theme.bg_hover();
-                                style.visuals.widgets.inactive.bg_stroke = egui::Stroke::NONE;
-                                style.visuals.widgets.inactive.fg_stroke = egui::Stroke::NONE;
-                                style.visuals.widgets.inactive.rounding = widget_rounding;
-                                style.visuals.widgets.inactive.weak_bg_fill = widget_bg;
-
-                                style.visuals.widgets.hovered.bg_fill = theme.bg_hover();
-                                style.visuals.widgets.hovered.bg_stroke = egui::Stroke::NONE;
-                                style.visuals.widgets.hovered.fg_stroke = egui::Stroke::NONE;
-                                style.visuals.widgets.hovered.rounding = widget_rounding;
-                                style.visuals.widgets.hovered.weak_bg_fill = widget_bg;
-
-                                style.visuals.widgets.active.bg_fill = theme.accent_dim();
-                                style.visuals.widgets.active.bg_stroke = egui::Stroke::NONE;
-                                style.visuals.widgets.active.fg_stroke = egui::Stroke::NONE;
-                                style.visuals.widgets.active.rounding = widget_rounding;
-                                style.visuals.widgets.active.weak_bg_fill = widget_bg;
-
-                                style.visuals.widgets.open.bg_fill = widget_bg;
-                                style.visuals.widgets.open.bg_stroke = egui::Stroke::NONE;
-                                style.visuals.widgets.open.fg_stroke = egui::Stroke::NONE;
-                                style.visuals.widgets.open.rounding = widget_rounding;
-                                style.visuals.widgets.open.weak_bg_fill = widget_bg;
-
-                                style.visuals.selection.bg_fill = Color32::from_rgba_unmultiplied(34, 211, 238, 38);
-                                style.visuals.selection.stroke = egui::Stroke::NONE;
-                                style.visuals.extreme_bg_color = widget_bg;
-                            });
-
-                            if ctx.input(|i| i.key_pressed(egui::Key::Escape)) ||
-                               ctx.input(|i| i.viewport().close_requested()) {
-                                should_close = true;
-                            }
-
-                            // Bottom panel for buttons - use allocate_space for precise positioning
-                            egui::TopBottomPanel::bottom("web_settings_buttons")
-                                .exact_height(65.0)
-                                .frame(egui::Frame::none().fill(theme.bg_elevated()))
-                                .show(ctx, |ui| {
-                                    ui.vertical(|ui| {
-                                        // Top padding (space between content and buttons)
-                                        ui.add_space(15.0);
-
-                                        // Buttons row
-                                        ui.horizontal(|ui| {
-                                            ui.add_space(16.0); // left padding
-
-                                            // Spacer to push buttons right
-                                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                                ui.add_space(18.0); // right padding
-
-                                                // Save button (primary) - rightmost
-                                                if ui.add(egui::Button::new(
-                                                    egui::RichText::new("Save").size(11.0).color(theme.bg_deep()).strong())
-                                                    .fill(theme.accent_dim())
-                                                    .stroke(egui::Stroke::NONE)
-                                                    .rounding(egui::Rounding::same(4.0))
-                                                    .min_size(egui::vec2(70.0, 28.0))
-                                                ).clicked() {
-                                                    should_save = true;
-                                                }
-
-                                                ui.add_space(8.0);
-
-                                                // Cancel button
-                                                if ui.add(egui::Button::new(
-                                                    egui::RichText::new("Cancel").size(11.0).color(theme.fg_secondary()))
-                                                    .fill(theme.bg_hover())
-                                                    .stroke(egui::Stroke::new(1.0, theme.border_medium()))
-                                                    .rounding(egui::Rounding::same(4.0))
-                                                    .min_size(egui::vec2(70.0, 28.0))
-                                                ).clicked() {
-                                                    should_close = true;
-                                                }
-                                            });
-                                        });
-
-                                        // Bottom padding (space between buttons and window edge)
-                                        ui.add_space(20.0);
-                                    });
-                                });
-
-                            egui::CentralPanel::default()
-                                .frame(egui::Frame::none()
-                                    .fill(theme.bg_elevated())
-                                    .inner_margin(egui::Margin { left: 16.0, right: 0.0, top: 16.0, bottom: 16.0 }))
-                                .show(ctx, |ui| {
-                                    // Header
-                                    ui.label(egui::RichText::new("WEB SETTINGS")
-                                        .size(11.0)
-                                        .color(theme.fg_muted())
-                                        .strong());
-                                    ui.add_space(16.0);
-
-                                    egui::Grid::new("web_grid")
-                                        .num_columns(2)
-                                        .spacing([16.0, 10.0])
-                                        .show(ui, |ui| {
-                                            // Protocol selection
-                                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                                ui.label(egui::RichText::new("Protocol").size(12.0).color(theme.fg_secondary()));
-                                            });
-                                            ui.horizontal(|ui| {
-                                                ui.spacing_mut().item_spacing = egui::vec2(2.0, 0.0);
-                                                if ui.add(egui::Button::new(
-                                                    egui::RichText::new("Secure").size(11.0)
-                                                        .color(if web_secure { theme.bg_deep() } else { theme.fg_muted() }))
-                                                    .fill(if web_secure { theme.accent_dim() } else { theme.bg_hover() })
-                                                    .stroke(egui::Stroke::NONE)
-                                                    .rounding(egui::Rounding::same(4.0))
-                                                    .min_size(egui::vec2(70.0, 24.0))
-                                                ).clicked() {
-                                                    web_secure = true;
-                                                }
-                                                if ui.add(egui::Button::new(
-                                                    egui::RichText::new("Non-Secure").size(11.0)
-                                                        .color(if !web_secure { theme.bg_deep() } else { theme.fg_muted() }))
-                                                    .fill(if !web_secure { theme.accent_dim() } else { theme.bg_hover() })
-                                                    .stroke(egui::Stroke::NONE)
-                                                    .rounding(egui::Rounding::same(4.0))
-                                                    .min_size(egui::vec2(80.0, 24.0))
-                                                ).clicked() {
-                                                    web_secure = false;
-                                                }
-                                            });
-                                            ui.end_row();
-
-                                            // HTTP/HTTPS enabled
-                                            let http_label = if web_secure { "HTTPS enabled" } else { "HTTP enabled" };
-                                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                                ui.label(egui::RichText::new(http_label).size(12.0).color(theme.fg_secondary()));
-                                            });
-                                            let http_text = if http_enabled { "ON" } else { "OFF" };
-                                            let http_color = if http_enabled { theme.accent() } else { theme.fg_muted() };
-                                            if ui.add(egui::Button::new(
-                                                egui::RichText::new(http_text).size(11.0).color(http_color))
-                                                .fill(if http_enabled { theme.accent_dim() } else { theme.bg_hover() })
-                                                .stroke(egui::Stroke::new(1.0, if http_enabled { theme.accent_dim() } else { theme.border_medium() }))
-                                                .rounding(egui::Rounding::same(4.0))
-                                                .min_size(egui::vec2(50.0, 24.0))
-                                            ).clicked() {
-                                                http_enabled = !http_enabled;
-                                            }
-                                            ui.end_row();
-
-                                            // HTTP/HTTPS port
-                                            let http_port_label = if web_secure { "HTTPS port" } else { "HTTP port" };
-                                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                                ui.label(egui::RichText::new(http_port_label).size(12.0).color(theme.fg_secondary()));
-                                            });
-                                            let mut http_port_str = http_port.to_string();
-                                            let field_width = ui.available_width();
-                                            if ui.add(egui::TextEdit::singleline(&mut http_port_str)
-                                                .text_color(theme.fg())
-                                                .desired_width(field_width)
-                                                .margin(egui::vec2(8.0, 6.0))).changed() {
-                                                if let Ok(port) = http_port_str.parse::<u16>() {
-                                                    http_port = port;
-                                                }
-                                            }
-                                            ui.end_row();
-
-                                            // WS/WSS enabled
-                                            let ws_label = if web_secure { "WSS enabled" } else { "WS enabled" };
-                                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                                ui.label(egui::RichText::new(ws_label).size(12.0).color(theme.fg_secondary()));
-                                            });
-                                            let ws_text = if ws_enabled { "ON" } else { "OFF" };
-                                            let ws_color = if ws_enabled { theme.accent() } else { theme.fg_muted() };
-                                            if ui.add(egui::Button::new(
-                                                egui::RichText::new(ws_text).size(11.0).color(ws_color))
-                                                .fill(if ws_enabled { theme.accent_dim() } else { theme.bg_hover() })
-                                                .stroke(egui::Stroke::new(1.0, if ws_enabled { theme.accent_dim() } else { theme.border_medium() }))
-                                                .rounding(egui::Rounding::same(4.0))
-                                                .min_size(egui::vec2(50.0, 24.0))
-                                            ).clicked() {
-                                                ws_enabled = !ws_enabled;
-                                            }
-                                            ui.end_row();
-
-                                            // WS/WSS port
-                                            let ws_port_label = if web_secure { "WSS port" } else { "WS port" };
-                                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                                ui.label(egui::RichText::new(ws_port_label).size(12.0).color(theme.fg_secondary()));
-                                            });
-                                            let mut ws_port_str = ws_port.to_string();
-                                            let field_width = ui.available_width();
-                                            if ui.add(egui::TextEdit::singleline(&mut ws_port_str)
-                                                .text_color(theme.fg())
-                                                .desired_width(field_width)
-                                                .margin(egui::vec2(8.0, 6.0))).changed() {
-                                                if let Ok(port) = ws_port_str.parse::<u16>() {
-                                                    ws_port = port;
-                                                }
-                                            }
-                                            ui.end_row();
-
-                                            // Allow list
-                                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                                ui.label(egui::RichText::new("Allow List").size(12.0).color(theme.fg_secondary()));
-                                            });
-                                            let field_width = ui.available_width();
-                                            ui.add(egui::TextEdit::singleline(&mut ws_allow_list)
-                                                .text_color(theme.fg())
-                                                .hint_text("localhost, 192.168.*")
-                                                .desired_width(field_width)
-                                                .margin(egui::vec2(8.0, 6.0)));
-                                            ui.end_row();
-                                        });
-                            });
-                        },
-                    );
-
-                    // Apply changes back to self
-                    self.web_secure = web_secure;
-                    self.http_enabled = http_enabled;
-                    self.http_port = http_port;
-                    self.ws_enabled = ws_enabled;
-                    self.ws_port = ws_port;
-                    self.ws_allow_list = ws_allow_list;
-
-                    if should_save {
-                        self.update_global_settings();
-                        close_popup = true;
-                    } else if should_close {
-                        close_popup = true;
-                    }
-                }
-
-                // Font popup - separate OS window
-                if self.popup_state == PopupState::Font {
-                    // Common monospace font families
-                    const FONT_FAMILIES: &[(&str, &str)] = &[
-                        ("", "System Default"),
-                        ("Monospace", "Monospace"),
-                        ("DejaVu Sans Mono", "DejaVu Sans Mono"),
-                        ("Liberation Mono", "Liberation Mono"),
-                        ("Ubuntu Mono", "Ubuntu Mono"),
-                        ("Fira Code", "Fira Code"),
-                        ("Source Code Pro", "Source Code Pro"),
-                        ("JetBrains Mono", "JetBrains Mono"),
-                        ("Hack", "Hack"),
-                        ("Inconsolata", "Inconsolata"),
-                        ("Courier New", "Courier New"),
-                        ("Consolas", "Consolas"),
-                    ];
-
-                    let mut should_close = false;
-                    let mut should_save = false;
-
-                    // Copy mutable state for viewport
-                    let mut edit_font_name = self.edit_font_name.clone();
-                    let mut edit_font_size = self.edit_font_size.clone();
-
-                    ctx.show_viewport_immediate(
-                        egui::ViewportId::from_hash_of("font_settings_window"),
-                        egui::ViewportBuilder::default()
-                            .with_title("Font Settings")
-                            .with_inner_size([380.0, 180.0]),
-                        |ctx, _class| {
-                            // Apply popup styling - remove all default strokes
-                            ctx.style_mut(|style| {
-                                style.visuals.window_fill = theme.bg_elevated();
-                                style.visuals.panel_fill = theme.bg_elevated();
-                                style.visuals.window_stroke = egui::Stroke::NONE;
-                                style.visuals.window_shadow = egui::epaint::Shadow::NONE;
-
-                                let widget_bg = theme.bg_deep();
-                                let widget_rounding = egui::Rounding::same(4.0);
-
-                                style.visuals.widgets.noninteractive.bg_fill = widget_bg;
-                                style.visuals.widgets.noninteractive.bg_stroke = egui::Stroke::NONE;
-                                style.visuals.widgets.noninteractive.fg_stroke = egui::Stroke::NONE;
-                                style.visuals.widgets.noninteractive.rounding = widget_rounding;
-                                style.visuals.widgets.noninteractive.weak_bg_fill = widget_bg;
-
-                                style.visuals.widgets.inactive.bg_fill = theme.bg_hover();
-                                style.visuals.widgets.inactive.bg_stroke = egui::Stroke::NONE;
-                                style.visuals.widgets.inactive.fg_stroke = egui::Stroke::NONE;
-                                style.visuals.widgets.inactive.rounding = widget_rounding;
-                                style.visuals.widgets.inactive.weak_bg_fill = widget_bg;
-
-                                style.visuals.widgets.hovered.bg_fill = theme.bg_hover();
-                                style.visuals.widgets.hovered.bg_stroke = egui::Stroke::NONE;
-                                style.visuals.widgets.hovered.fg_stroke = egui::Stroke::NONE;
-                                style.visuals.widgets.hovered.rounding = widget_rounding;
-                                style.visuals.widgets.hovered.weak_bg_fill = widget_bg;
-
-                                style.visuals.widgets.active.bg_fill = theme.accent_dim();
-                                style.visuals.widgets.active.bg_stroke = egui::Stroke::NONE;
-                                style.visuals.widgets.active.fg_stroke = egui::Stroke::NONE;
-                                style.visuals.widgets.active.rounding = widget_rounding;
-                                style.visuals.widgets.active.weak_bg_fill = widget_bg;
-
-                                style.visuals.widgets.open.bg_fill = widget_bg;
-                                style.visuals.widgets.open.bg_stroke = egui::Stroke::NONE;
-                                style.visuals.widgets.open.fg_stroke = egui::Stroke::NONE;
-                                style.visuals.widgets.open.rounding = widget_rounding;
-                                style.visuals.widgets.open.weak_bg_fill = widget_bg;
-
-                                style.visuals.selection.bg_fill = Color32::from_rgba_unmultiplied(34, 211, 238, 38);
-                                style.visuals.selection.stroke = egui::Stroke::NONE;
-                                style.visuals.extreme_bg_color = widget_bg;
-                            });
-
-                            if ctx.input(|i| i.key_pressed(egui::Key::Escape)) ||
-                               ctx.input(|i| i.viewport().close_requested()) {
-                                should_close = true;
-                            }
-
-                            // Bottom panel for buttons
-                            egui::TopBottomPanel::bottom("font_settings_buttons")
-                                .exact_height(44.0)
-                                .frame(egui::Frame::none()
-                                    .fill(theme.bg_surface())
-                                    .stroke(egui::Stroke::new(1.0, theme.border_subtle()))
-                                    .inner_margin(egui::Margin { left: 16.0, right: 1.0, top: 8.0, bottom: 8.0 }))
-                                .show(ctx, |ui| {
-                                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                        ui.spacing_mut().item_spacing = egui::vec2(8.0, 0.0);
-
-                                        // Cancel button
-                                        if ui.add(egui::Button::new(
-                                            egui::RichText::new("Cancel").size(11.0).color(theme.fg_secondary()))
-                                            .fill(theme.bg_hover())
-                                            .stroke(egui::Stroke::new(1.0, theme.border_medium()))
-                                            .rounding(egui::Rounding::same(4.0))
-                                            .min_size(egui::vec2(70.0, 28.0))
-                                        ).clicked() {
-                                            should_close = true;
-                                        }
-
-                                        // OK button (primary)
-                                        if ui.add(egui::Button::new(
-                                            egui::RichText::new("OK").size(11.0).color(theme.bg_deep()).strong())
-                                            .fill(theme.accent_dim())
-                                            .stroke(egui::Stroke::NONE)
-                                            .rounding(egui::Rounding::same(4.0))
-                                            .min_size(egui::vec2(70.0, 28.0))
-                                        ).clicked() {
-                                            should_save = true;
-                                        }
-                                    });
-                                });
-
-                            egui::CentralPanel::default()
-                                .frame(egui::Frame::none()
-                                    .fill(theme.bg_elevated())
-                                    .inner_margin(egui::Margin::same(16.0)))
-                                .show(ctx, |ui| {
-                                    // Header
-                                    ui.label(egui::RichText::new("FONT SETTINGS")
-                                        .size(11.0)
-                                        .color(theme.fg_muted())
-                                        .strong());
-                                    ui.add_space(16.0);
-
-                                    egui::Grid::new("font_grid")
-                                        .num_columns(2)
-                                        .spacing([16.0, 12.0])
-                                        .show(ui, |ui| {
-                                            ui.label(egui::RichText::new("Font family").size(12.0).color(theme.fg_secondary()));
-                                            let current_label = FONT_FAMILIES.iter()
-                                                .find(|(value, _)| *value == edit_font_name)
-                                                .map(|(_, label)| *label)
-                                                .unwrap_or_else(|| {
-                                                    if edit_font_name.is_empty() { "System Default" } else { &edit_font_name }
-                                                });
-
-                                            // Custom dropdown (matches world switching style)
-                                            let dropdown_id = ui.id().with("font_family_dropdown");
-                                            let dropdown_width = 180.0;
-                                            let row_height = 24.0;
-
-                                            let (rect, response) = ui.allocate_exact_size(egui::vec2(dropdown_width, row_height), egui::Sense::click());
-
-                                            ui.painter().rect_filled(rect, egui::Rounding::same(4.0), theme.bg_deep());
-
-                                            ui.painter().text(
-                                                egui::pos2(rect.min.x + 12.0, rect.center().y),
-                                                egui::Align2::LEFT_CENTER,
-                                                current_label,
-                                                egui::FontId::monospace(11.0),
-                                                theme.fg()
-                                            );
-
-                                            // Draw chevron
-                                            let chevron_x = rect.max.x - 16.0;
-                                            let chevron_y = rect.center().y;
-                                            let chevron_size = 4.0;
-                                            ui.painter().line_segment(
-                                                [egui::pos2(chevron_x - chevron_size, chevron_y - chevron_size / 2.0),
-                                                 egui::pos2(chevron_x, chevron_y + chevron_size / 2.0)],
-                                                egui::Stroke::new(1.5, theme.fg_muted())
-                                            );
-                                            ui.painter().line_segment(
-                                                [egui::pos2(chevron_x, chevron_y + chevron_size / 2.0),
-                                                 egui::pos2(chevron_x + chevron_size, chevron_y - chevron_size / 2.0)],
-                                                egui::Stroke::new(1.5, theme.fg_muted())
-                                            );
-
-                                            if response.clicked() {
-                                                ui.memory_mut(|mem| mem.toggle_popup(dropdown_id));
-                                            }
-
-                                            egui::popup_below_widget(ui, dropdown_id, &response, |ui| {
-                                                ui.set_min_width(dropdown_width);
-                                                ui.style_mut().visuals.widgets.inactive.fg_stroke = egui::Stroke::new(1.0, theme.fg());
-                                                ui.style_mut().visuals.widgets.hovered.fg_stroke = egui::Stroke::new(1.0, theme.fg());
-                                                ui.style_mut().visuals.widgets.active.fg_stroke = egui::Stroke::new(1.0, theme.fg());
-                                                egui::ScrollArea::vertical().max_height(200.0).show(ui, |ui| {
-                                                    for (value, label) in FONT_FAMILIES {
-                                                        let is_selected = *value == edit_font_name;
-                                                        if ui.selectable_label(is_selected,
-                                                            egui::RichText::new(*label).size(11.0).color(theme.fg()).family(egui::FontFamily::Monospace)).clicked() {
-                                                            edit_font_name = value.to_string();
-                                                            ui.memory_mut(|mem| mem.close_popup());
-                                                        }
-                                                    }
-                                                });
-                                            });
-                                            ui.end_row();
-
-                                            ui.label(egui::RichText::new("Font size").size(12.0).color(theme.fg_secondary()));
-                                            ui.horizontal(|ui| {
-                                                ui.spacing_mut().item_spacing = egui::vec2(4.0, 0.0);
-                                                if ui.add(egui::Button::new(
-                                                    egui::RichText::new("-").size(11.0).color(theme.fg_secondary()))
-                                                    .fill(theme.bg_hover())
-                                                    .stroke(egui::Stroke::new(1.0, theme.border_medium()))
-                                                    .rounding(egui::Rounding::same(4.0))
-                                                    .min_size(egui::vec2(28.0, 24.0))
-                                                ).clicked() {
-                                                    if let Ok(size) = edit_font_size.parse::<f32>() {
-                                                        let new_size = (size - 1.0).max(8.0);
-                                                        edit_font_size = format!("{:.1}", new_size);
-                                                    }
-                                                }
-                                                ui.add(egui::TextEdit::singleline(&mut edit_font_size)
-                                                    .desired_width(50.0)
-                                                    .margin(egui::vec2(8.0, 6.0)));
-                                                if ui.add(egui::Button::new(
-                                                    egui::RichText::new("+").size(11.0).color(theme.fg_secondary()))
-                                                    .fill(theme.bg_hover())
-                                                    .stroke(egui::Stroke::new(1.0, theme.border_medium()))
-                                                    .rounding(egui::Rounding::same(4.0))
-                                                    .min_size(egui::vec2(28.0, 24.0))
-                                                ).clicked() {
-                                                    if let Ok(size) = edit_font_size.parse::<f32>() {
-                                                        let new_size = (size + 1.0).min(48.0);
-                                                        edit_font_size = format!("{:.1}", new_size);
-                                                    }
-                                                }
-                                            });
-                                            ui.end_row();
-                                        });
-                            });
-                        },
-                    );
-
-                    // Apply changes back to self
-                    self.edit_font_name = edit_font_name;
-                    self.edit_font_size = edit_font_size;
-
-                    if should_save {
-                        // Parse and apply font settings
-                        self.font_name = self.edit_font_name.clone();
-                        if let Ok(size) = self.edit_font_size.parse::<f32>() {
-                            self.font_size = size.clamp(8.0, 48.0);
-                        }
-                        // Send updated settings to server
-                        self.update_global_settings();
-                        close_popup = true;
-                    } else if should_close {
-                        close_popup = true;
-                    }
-                }
-
-                // Help popup - separate OS window
-                if self.popup_state == PopupState::Help {
-                    let mut should_close = false;
-                    ctx.show_viewport_immediate(
-                        egui::ViewportId::from_hash_of("help_window"),
-                        egui::ViewportBuilder::default()
-                            .with_title("Help - Clay MUD Client")
-                            .with_inner_size([450.0, 400.0]),
-                        |ctx, _class| {
-                            // Apply popup styling
-                            ctx.style_mut(|style| {
-                                style.visuals.window_fill = theme.bg_elevated();
-                                style.visuals.panel_fill = theme.bg_elevated();
-                                style.visuals.window_stroke = egui::Stroke::NONE;
-                                style.visuals.window_shadow = egui::epaint::Shadow::NONE;
-
-                                let widget_bg = theme.bg_deep();
-                                let widget_rounding = egui::Rounding::same(4.0);
-
-                                style.visuals.widgets.noninteractive.bg_fill = widget_bg;
-                                style.visuals.widgets.noninteractive.bg_stroke = egui::Stroke::NONE;
-                                style.visuals.widgets.noninteractive.fg_stroke = egui::Stroke::NONE;
-                                style.visuals.widgets.noninteractive.rounding = widget_rounding;
-                                style.visuals.widgets.noninteractive.weak_bg_fill = widget_bg;
-
-                                style.visuals.widgets.inactive.bg_fill = theme.bg_hover();
-                                style.visuals.widgets.inactive.bg_stroke = egui::Stroke::NONE;
-                                style.visuals.widgets.inactive.fg_stroke = egui::Stroke::NONE;
-                                style.visuals.widgets.inactive.rounding = widget_rounding;
-                                style.visuals.widgets.inactive.weak_bg_fill = theme.bg_hover();
-
-                                style.visuals.widgets.hovered.bg_fill = theme.bg_hover();
-                                style.visuals.widgets.hovered.bg_stroke = egui::Stroke::NONE;
-                                style.visuals.widgets.hovered.fg_stroke = egui::Stroke::NONE;
-                                style.visuals.widgets.hovered.rounding = widget_rounding;
-                                style.visuals.widgets.hovered.weak_bg_fill = theme.bg_hover();
-
-                                style.visuals.widgets.active.bg_fill = theme.accent_dim();
-                                style.visuals.widgets.active.bg_stroke = egui::Stroke::NONE;
-                                style.visuals.widgets.active.fg_stroke = egui::Stroke::NONE;
-                                style.visuals.widgets.active.rounding = widget_rounding;
-                                style.visuals.widgets.active.weak_bg_fill = theme.accent_dim();
-
-                                style.visuals.widgets.open.bg_fill = theme.bg_hover();
-                                style.visuals.widgets.open.bg_stroke = egui::Stroke::NONE;
-                                style.visuals.widgets.open.fg_stroke = egui::Stroke::NONE;
-                                style.visuals.widgets.open.rounding = widget_rounding;
-                                style.visuals.widgets.open.weak_bg_fill = theme.bg_hover();
-
-                                style.visuals.selection.bg_fill = Color32::from_rgba_unmultiplied(34, 211, 238, 38);
-                                style.visuals.selection.stroke = egui::Stroke::NONE;
-                                style.visuals.extreme_bg_color = widget_bg;
-                            });
-
-                            // Check for Escape key or window close
-                            if ctx.input(|i| i.key_pressed(egui::Key::Escape)) ||
-                               ctx.input(|i| i.viewport().close_requested()) {
-                                should_close = true;
-                            }
-
-                            // Bottom panel for button
-                            egui::TopBottomPanel::bottom("help_buttons")
-                                .exact_height(44.0)
-                                .frame(egui::Frame::none()
-                                    .fill(theme.bg_surface())
-                                    .stroke(egui::Stroke::NONE)
-                                    .inner_margin(egui::Margin { left: 16.0, right: 1.0, top: 8.0, bottom: 8.0 }))
-                                .show(ctx, |ui| {
-                                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                        if ui.add(egui::Button::new(
-                                            egui::RichText::new("OK").size(11.0).color(theme.bg_deep()).strong())
-                                            .fill(theme.accent_dim())
-                                            .stroke(egui::Stroke::NONE)
-                                            .rounding(egui::Rounding::same(4.0))
-                                            .min_size(egui::vec2(70.0, 28.0))
-                                        ).clicked() {
-                                            should_close = true;
-                                        }
-                                    });
-                                });
-
-                            egui::CentralPanel::default()
-                                .frame(egui::Frame::none()
-                                    .fill(theme.bg_elevated())
-                                    .inner_margin(egui::Margin::same(16.0)))
-                                .show(ctx, |ui| {
-                                    // Title
-                                    ui.label(egui::RichText::new("CLAY MUD CLIENT")
-                                        .size(11.0)
-                                        .color(theme.fg_muted())
-                                        .strong());
-                                    ui.add_space(12.0);
-
-                                    egui::ScrollArea::vertical()
-                                        .auto_shrink([false; 2])
-                                        .show(ui, |ui| {
-                                            // World Switching section
-                                            ui.label(egui::RichText::new("World Switching")
-                                                .size(12.0)
-                                                .color(theme.accent())
-                                                .strong());
-                                            ui.add_space(4.0);
-                                            ui.label(egui::RichText::new("  Up/Down         Cycle through active worlds")
-                                                .size(11.0).color(theme.fg_secondary()));
-                                            ui.label(egui::RichText::new("  Shift+Up/Down   Cycle through all worlds")
-                                                .size(11.0).color(theme.fg_secondary()));
-                                            ui.add_space(12.0);
-
-                                            // Output Navigation section
-                                            ui.label(egui::RichText::new("Output Navigation")
-                                                .size(12.0)
-                                                .color(theme.accent())
-                                                .strong());
-                                            ui.add_space(4.0);
-                                            ui.label(egui::RichText::new("  PageUp/Down     Scroll through output history")
-                                                .size(11.0).color(theme.fg_secondary()));
-                                            ui.label(egui::RichText::new("  Tab             Release one screenful (when paused)")
-                                                .size(11.0).color(theme.fg_secondary()));
-                                            ui.label(egui::RichText::new("  Alt+J           Jump to end, release all pending")
-                                                .size(11.0).color(theme.fg_secondary()));
-                                            ui.add_space(12.0);
-
-                                            // Input section
-                                            ui.label(egui::RichText::new("Input")
-                                                .size(12.0)
-                                                .color(theme.accent())
-                                                .strong());
-                                            ui.add_space(4.0);
-                                            ui.label(egui::RichText::new("  Enter           Send command")
-                                                .size(11.0).color(theme.fg_secondary()));
-                                            ui.label(egui::RichText::new("  Ctrl+P/N        Previous/Next command history")
-                                                .size(11.0).color(theme.fg_secondary()));
-                                            ui.label(egui::RichText::new("  Ctrl+U          Clear input line")
-                                                .size(11.0).color(theme.fg_secondary()));
-                                            ui.label(egui::RichText::new("  Ctrl+W          Delete word before cursor")
-                                                .size(11.0).color(theme.fg_secondary()));
-                                            ui.label(egui::RichText::new("  Ctrl+Q          Spell check suggestions")
-                                                .size(11.0).color(theme.fg_secondary()));
-                                            ui.add_space(12.0);
-
-                                            // Display section
-                                            ui.label(egui::RichText::new("Display")
-                                                .size(12.0)
-                                                .color(theme.accent())
-                                                .strong());
-                                            ui.add_space(4.0);
-                                            ui.label(egui::RichText::new("  F2              Toggle MUD tag display")
-                                                .size(11.0).color(theme.fg_secondary()));
-                                            ui.label(egui::RichText::new("  F4              Open filter popup")
-                                                .size(11.0).color(theme.fg_secondary()));
-                                            ui.add_space(12.0);
-
-                                            // Options Menu section
-                                            ui.label(egui::RichText::new("Options Menu")
-                                                .size(12.0)
-                                                .color(theme.accent())
-                                                .strong());
-                                            ui.add_space(4.0);
-                                            ui.label(egui::RichText::new("  World List      View and select worlds")
-                                                .size(11.0).color(theme.fg_secondary()));
-                                            ui.label(egui::RichText::new("  World Editor    Edit world connection settings")
-                                                .size(11.0).color(theme.fg_secondary()));
-                                            ui.label(egui::RichText::new("  Settings        Global settings")
-                                                .size(11.0).color(theme.fg_secondary()));
-                                            ui.label(egui::RichText::new("  Font            Change font family and size")
-                                                .size(11.0).color(theme.fg_secondary()));
-                                            ui.label(egui::RichText::new("  Connect         Connect to current world")
-                                                .size(11.0).color(theme.fg_secondary()));
-                                            ui.label(egui::RichText::new("  Disconnect      Disconnect from current world")
-                                                .size(11.0).color(theme.fg_secondary()));
-                                        });
-                                });
-                        },
-                    );
-                    if should_close {
-                        close_popup = true;
-                    }
-                }
-
-                // Menu popup - separate OS window
-                if self.popup_state == PopupState::Menu {
-                    let mut should_close = false;
-                    let mut selected_command: Option<String> = None;
-                    let menu_items = [
-                        ("Help", "/help"),
-                        ("Settings", "/setup"),
-                        ("Web Settings", "/web"),
-                        ("Actions", "/actions"),
-                        ("World Selector", "/worlds"),
-                        ("Connected Worlds", "/connections"),
-                    ];
-
-                    ctx.show_viewport_immediate(
-                        egui::ViewportId::from_hash_of("menu_window"),
-                        egui::ViewportBuilder::default()
-                            .with_title("Menu")
-                            .with_inner_size([220.0, 250.0]),
-                        |ctx, _class| {
-                            // Apply popup styling
-                            ctx.style_mut(|style| {
-                                style.visuals.window_fill = theme.bg_elevated();
-                                style.visuals.panel_fill = theme.bg_elevated();
-                                style.visuals.window_stroke = egui::Stroke::NONE;
-                                style.visuals.window_shadow = egui::epaint::Shadow::NONE;
-
-                                let widget_bg = theme.bg_deep();
-                                let widget_rounding = egui::Rounding::same(4.0);
-
-                                style.visuals.widgets.noninteractive.bg_fill = widget_bg;
-                                style.visuals.widgets.noninteractive.bg_stroke = egui::Stroke::NONE;
-                                style.visuals.widgets.noninteractive.fg_stroke = egui::Stroke::NONE;
-                                style.visuals.widgets.noninteractive.rounding = widget_rounding;
-                                style.visuals.widgets.noninteractive.weak_bg_fill = widget_bg;
-
-                                style.visuals.widgets.inactive.bg_fill = theme.bg_hover();
-                                style.visuals.widgets.inactive.bg_stroke = egui::Stroke::NONE;
-                                style.visuals.widgets.inactive.fg_stroke = egui::Stroke::NONE;
-                                style.visuals.widgets.inactive.rounding = widget_rounding;
-                                style.visuals.widgets.inactive.weak_bg_fill = theme.bg_hover();
-
-                                style.visuals.widgets.hovered.bg_fill = theme.bg_hover();
-                                style.visuals.widgets.hovered.bg_stroke = egui::Stroke::NONE;
-                                style.visuals.widgets.hovered.fg_stroke = egui::Stroke::NONE;
-                                style.visuals.widgets.hovered.rounding = widget_rounding;
-                                style.visuals.widgets.hovered.weak_bg_fill = theme.bg_hover();
-
-                                style.visuals.widgets.active.bg_fill = theme.accent_dim();
-                                style.visuals.widgets.active.bg_stroke = egui::Stroke::NONE;
-                                style.visuals.widgets.active.fg_stroke = egui::Stroke::NONE;
-                                style.visuals.widgets.active.rounding = widget_rounding;
-                                style.visuals.widgets.active.weak_bg_fill = theme.accent_dim();
-
-                                style.visuals.selection.bg_fill = Color32::from_rgba_unmultiplied(34, 211, 238, 38);
-                                style.visuals.selection.stroke = egui::Stroke::NONE;
-                            });
-
-                            // Handle keyboard
-                            if ctx.input(|i| i.key_pressed(egui::Key::Escape)) ||
-                               ctx.input(|i| i.viewport().close_requested()) {
-                                should_close = true;
-                            }
-                            if ctx.input(|i| i.key_pressed(egui::Key::ArrowUp)) {
-                                if self.menu_selected > 0 {
-                                    self.menu_selected -= 1;
-                                } else {
-                                    self.menu_selected = menu_items.len() - 1;
-                                }
-                            }
-                            if ctx.input(|i| i.key_pressed(egui::Key::ArrowDown)) {
-                                if self.menu_selected < menu_items.len() - 1 {
-                                    self.menu_selected += 1;
-                                } else {
-                                    self.menu_selected = 0;
-                                }
-                            }
-                            if ctx.input(|i| i.key_pressed(egui::Key::Enter)) {
-                                selected_command = Some(menu_items[self.menu_selected].1.to_string());
-                                should_close = true;
-                            }
-
-                            egui::CentralPanel::default()
-                                .frame(egui::Frame::none()
-                                    .fill(theme.bg_elevated())
-                                    .inner_margin(egui::Margin::same(12.0)))
-                                .show(ctx, |ui| {
-                                    ui.vertical(|ui| {
-                                        for (i, (label, _cmd)) in menu_items.iter().enumerate() {
-                                            let is_selected = i == self.menu_selected;
-                                            let bg_color = if is_selected { theme.accent_dim() } else { Color32::TRANSPARENT };
-                                            let text_color = if is_selected { theme.bg_deep() } else { theme.fg() };
-
-                                            let response = ui.add(
-                                                egui::Button::new(
-                                                    egui::RichText::new(*label)
-                                                        .size(12.0)
-                                                        .color(text_color)
-                                                        .strong()
-                                                )
-                                                .fill(bg_color)
-                                                .stroke(egui::Stroke::NONE)
-                                                .rounding(egui::Rounding::same(4.0))
-                                                .min_size(egui::vec2(190.0, 28.0))
-                                            );
-
-                                            if response.clicked() {
-                                                selected_command = Some(menu_items[i].1.to_string());
-                                                should_close = true;
-                                            }
-                                        }
-
-                                        ui.add_space(12.0);
-                                        ui.label(egui::RichText::new("↑↓ select, Enter open")
-                                            .size(10.0)
-                                            .color(theme.fg_secondary()));
-                                    });
-                                });
-                        },
-                    );
-
-                    if let Some(cmd) = selected_command {
-                        // Execute the command
-                        let parsed = super::parse_command(&cmd);
-                        match parsed {
-                            super::Command::Help => self.popup_state = PopupState::Help,
-                            super::Command::Version => {
-                                let ts = current_timestamp_secs();
-                                if self.current_world < self.worlds.len() {
-                                    let seq = self.worlds[self.current_world].output_lines.len() as u64;
-                                    self.worlds[self.current_world].output_lines.push(
-                                        TimestampedLine { text: super::get_version_string(), ts, gagged: false, from_server: false, seq }
-                                    );
-                                }
-                            }
-                            super::Command::Setup => self.popup_state = PopupState::Setup,
-                            super::Command::Web => self.popup_state = PopupState::Web,
-                            super::Command::Actions { .. } => {
-                                self.open_actions_list_unified();
-                            }
-                            super::Command::WorldSelector => {
-                                self.popup_state = PopupState::ConnectedWorlds;
-                                self.world_list_selected = self.current_world;
-                                self.only_connected_worlds = false;
-                            }
-                            super::Command::WorldsList => {
-                                // Output connected worlds list as text (no window)
-                                let worlds_info: Vec<super::util::WorldListInfo> = self.worlds.iter().enumerate().map(|(idx, world)| {
-                                    super::util::WorldListInfo {
-                                        name: world.name.clone(),
-                                        connected: world.connected,
-                                        is_current: idx == self.current_world,
-                                        is_ssl: world.settings.use_ssl,
-                                        is_proxy: false,
-                                        unseen_lines: world.unseen_lines,
-                                        last_send_secs: world.last_send_secs,
-                                        last_recv_secs: world.last_recv_secs,
-                                        last_nop_secs: world.last_nop_secs,
-                                        next_nop_secs: None,
-                                    }
-                                }).collect();
-                                let output = super::util::format_worlds_list(&worlds_info);
-                                let ts = super::current_timestamp_secs();
-                                if self.current_world < self.worlds.len() {
-                                    for line in output.lines() {
-                                        let seq = self.worlds[self.current_world].output_lines.len() as u64;
-                                        self.worlds[self.current_world].output_lines.push(TimestampedLine {
-                                            text: line.to_string(),
-                                            ts,
-                                            gagged: false,
-                                            from_server: false,
-                                            seq,
-                                        });
-                                    }
-                                }
-                            }
-                            _ => close_popup = true,
-                        }
-                    } else if should_close {
-                        close_popup = true;
-                    }
-                }
-
-                // Debug Text popup - separate OS window
-                if self.popup_state == PopupState::DebugText {
-                    let mut should_close = false;
-                    let debug_text_clone = self.debug_text.clone();
-
-                    ctx.show_viewport_immediate(
-                        egui::ViewportId::from_hash_of("debug_text_window"),
-                        egui::ViewportBuilder::default()
-                            .with_title("Debug - Raw ANSI Codes")
-                            .with_inner_size([600.0, 250.0]),
-                        |ctx, _class| {
-                            // Apply popup styling
-                            ctx.style_mut(|style| {
-                                style.visuals.window_fill = theme.bg_elevated();
-                                style.visuals.panel_fill = theme.bg_elevated();
-                                style.visuals.window_stroke = egui::Stroke::NONE;
-                                style.visuals.window_shadow = egui::epaint::Shadow::NONE;
-
-                                let widget_bg = theme.bg_deep();
-                                let widget_rounding = egui::Rounding::same(4.0);
-
-                                style.visuals.widgets.noninteractive.bg_fill = widget_bg;
-                                style.visuals.widgets.noninteractive.bg_stroke = egui::Stroke::NONE;
-                                style.visuals.widgets.noninteractive.fg_stroke = egui::Stroke::NONE;
-                                style.visuals.widgets.noninteractive.rounding = widget_rounding;
-                                style.visuals.widgets.noninteractive.weak_bg_fill = widget_bg;
-
-                                style.visuals.widgets.inactive.bg_fill = theme.bg_hover();
-                                style.visuals.widgets.inactive.bg_stroke = egui::Stroke::NONE;
-                                style.visuals.widgets.inactive.fg_stroke = egui::Stroke::NONE;
-                                style.visuals.widgets.inactive.rounding = widget_rounding;
-                                style.visuals.widgets.inactive.weak_bg_fill = theme.bg_hover();
-
-                                style.visuals.widgets.hovered.bg_fill = theme.bg_hover();
-                                style.visuals.widgets.hovered.bg_stroke = egui::Stroke::NONE;
-                                style.visuals.widgets.hovered.fg_stroke = egui::Stroke::NONE;
-                                style.visuals.widgets.hovered.rounding = widget_rounding;
-                                style.visuals.widgets.hovered.weak_bg_fill = theme.bg_hover();
-
-                                style.visuals.widgets.active.bg_fill = theme.accent_dim();
-                                style.visuals.widgets.active.bg_stroke = egui::Stroke::NONE;
-                                style.visuals.widgets.active.fg_stroke = egui::Stroke::NONE;
-                                style.visuals.widgets.active.rounding = widget_rounding;
-                                style.visuals.widgets.active.weak_bg_fill = theme.accent_dim();
-
-                                style.visuals.widgets.open.bg_fill = theme.bg_hover();
-                                style.visuals.widgets.open.bg_stroke = egui::Stroke::NONE;
-                                style.visuals.widgets.open.fg_stroke = egui::Stroke::NONE;
-                                style.visuals.widgets.open.rounding = widget_rounding;
-                                style.visuals.widgets.open.weak_bg_fill = theme.bg_hover();
-
-                                style.visuals.selection.bg_fill = Color32::from_rgba_unmultiplied(34, 211, 238, 38);
-                                style.visuals.selection.stroke = egui::Stroke::NONE;
-                                style.visuals.extreme_bg_color = widget_bg;
-                            });
-
-                            if ctx.input(|i| i.key_pressed(egui::Key::Escape)) ||
-                               ctx.input(|i| i.viewport().close_requested()) {
-                                should_close = true;
-                            }
-
-                            // Bottom panel for buttons
-                            egui::TopBottomPanel::bottom("debug_buttons")
-                                .exact_height(44.0)
-                                .frame(egui::Frame::none()
-                                    .fill(theme.bg_surface())
-                                    .stroke(egui::Stroke::NONE)
-                                    .inner_margin(egui::Margin { left: 16.0, right: 1.0, top: 8.0, bottom: 8.0 }))
-                                .show(ctx, |ui| {
-                                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                        ui.spacing_mut().item_spacing = egui::vec2(8.0, 0.0);
-
-                                        // Close button (primary)
-                                        if ui.add(egui::Button::new(
-                                            egui::RichText::new("Close").size(11.0).color(theme.bg_deep()).strong())
-                                            .fill(theme.accent_dim())
-                                            .stroke(egui::Stroke::NONE)
-                                            .rounding(egui::Rounding::same(4.0))
-                                            .min_size(egui::vec2(70.0, 28.0))
-                                        ).clicked() {
-                                            should_close = true;
-                                        }
-
-                                        // Copy button (secondary)
-                                        if ui.add(egui::Button::new(
-                                            egui::RichText::new("Copy").size(11.0).color(theme.fg_secondary()))
-                                            .fill(theme.bg_hover())
-                                            .stroke(egui::Stroke::new(1.0, theme.border_medium()))
-                                            .rounding(egui::Rounding::same(4.0))
-                                            .min_size(egui::vec2(70.0, 28.0))
-                                        ).clicked() {
-                                            ui.ctx().copy_text(debug_text_clone.clone());
-                                        }
-                                    });
-                                });
-
-                            // Central panel for content
-                            egui::CentralPanel::default()
-                                .frame(egui::Frame::none()
-                                    .fill(theme.bg_elevated())
-                                    .inner_margin(egui::Margin::same(16.0)))
-                                .show(ctx, |ui| {
-                                    // Header
-                                    ui.label(egui::RichText::new("RAW ANSI CODES")
-                                        .size(11.0)
-                                        .color(theme.fg_muted())
-                                        .strong());
-                                    ui.add_space(4.0);
-                                    ui.label(egui::RichText::new("ESC character shown as <esc>")
-                                        .size(10.0)
-                                        .color(theme.fg_muted()));
-                                    ui.add_space(12.0);
-
-                                    // Content area with background
-                                    let display_text = if debug_text_clone.is_empty() {
-                                        "(No text captured)".to_string()
-                                    } else {
-                                        debug_text_clone.clone()
-                                    };
-
-                                    egui::Frame::none()
-                                        .fill(theme.bg_deep())
-                                        .rounding(egui::Rounding::same(4.0))
-                                        .inner_margin(egui::Margin::same(12.0))
-                                        .show(ui, |ui| {
-                                            egui::ScrollArea::both()
-                                                .auto_shrink([false; 2])
-                                                .show(ui, |ui| {
-                                                    ui.add(
-                                                        egui::Label::new(
-                                                            egui::RichText::new(&display_text)
-                                                                .monospace()
-                                                                .size(11.0)
-                                                                .color(theme.fg_secondary())
-                                                        ).wrap(true)
-                                                    );
-                                                });
-                                        });
-                                });
-                        },
-                    );
-                    if should_close {
-                        close_popup = true;
-                    }
-                }
-
-                // Actions List popup (separate OS window)
-                if self.popup_state == PopupState::ActionsList {
-                    let mut should_close = false;
-                    let mut new_popup_state: Option<PopupState> = None;
-                    let mut actions_selected = self.actions_selected;
-                    let mut actions_list_filter = self.actions_list_filter.clone();
-                    let actions_clone = self.actions.clone();
-
-                    // State for opening editor
-                    let mut open_editor_idx: Option<usize> = None;
-                    let mut add_new_action = false;
-
-                    ctx.show_viewport_immediate(
-                        egui::ViewportId::from_hash_of("actions_list_window"),
-                        egui::ViewportBuilder::default()
-                            .with_title("Actions - Clay MUD Client")
-                            .with_inner_size([580.0, 400.0]),
-                        |ctx, _class| {
-                            // Apply popup styling
-                            ctx.style_mut(|style| {
-                                style.visuals.window_fill = theme.bg_elevated();
-                                style.visuals.panel_fill = theme.bg_elevated();
-                                style.visuals.window_stroke = egui::Stroke::NONE;
-                                style.visuals.window_shadow = egui::epaint::Shadow::NONE;
-
-                                let widget_bg = theme.bg_deep();
-                                let widget_rounding = egui::Rounding::same(4.0);
-
-                                style.visuals.widgets.noninteractive.bg_fill = widget_bg;
-                                style.visuals.widgets.noninteractive.bg_stroke = egui::Stroke::NONE;
-                                style.visuals.widgets.noninteractive.fg_stroke = egui::Stroke::NONE;
-                                style.visuals.widgets.noninteractive.rounding = widget_rounding;
-                                style.visuals.widgets.noninteractive.weak_bg_fill = widget_bg;
-
-                                style.visuals.widgets.inactive.bg_fill = theme.bg_hover();
-                                style.visuals.widgets.inactive.bg_stroke = egui::Stroke::NONE;
-                                style.visuals.widgets.inactive.fg_stroke = egui::Stroke::NONE;
-                                style.visuals.widgets.inactive.rounding = widget_rounding;
-                                style.visuals.widgets.inactive.weak_bg_fill = theme.bg_hover();
-
-                                style.visuals.widgets.hovered.bg_fill = theme.bg_hover();
-                                style.visuals.widgets.hovered.bg_stroke = egui::Stroke::NONE;
-                                style.visuals.widgets.hovered.fg_stroke = egui::Stroke::NONE;
-                                style.visuals.widgets.hovered.rounding = widget_rounding;
-                                style.visuals.widgets.hovered.weak_bg_fill = theme.bg_hover();
-
-                                style.visuals.widgets.active.bg_fill = theme.accent_dim();
-                                style.visuals.widgets.active.bg_stroke = egui::Stroke::NONE;
-                                style.visuals.widgets.active.fg_stroke = egui::Stroke::NONE;
-                                style.visuals.widgets.active.rounding = widget_rounding;
-                                style.visuals.widgets.active.weak_bg_fill = theme.accent_dim();
-
-                                style.visuals.widgets.open.bg_fill = theme.bg_hover();
-                                style.visuals.widgets.open.bg_stroke = egui::Stroke::NONE;
-                                style.visuals.widgets.open.fg_stroke = egui::Stroke::NONE;
-                                style.visuals.widgets.open.rounding = widget_rounding;
-                                style.visuals.widgets.open.weak_bg_fill = theme.bg_hover();
-
-                                style.visuals.selection.bg_fill = Color32::from_rgba_unmultiplied(34, 211, 238, 38);
-                                style.visuals.selection.stroke = egui::Stroke::NONE;
-                                style.visuals.extreme_bg_color = widget_bg;
-                            });
-
-                            if ctx.input(|i| i.key_pressed(egui::Key::Escape)) ||
-                               ctx.input(|i| i.viewport().close_requested()) {
-                                should_close = true;
-                            }
-
-                            // Bottom panel for buttons
-                            egui::TopBottomPanel::bottom("actions_buttons")
-                                .exact_height(44.0)
-                                .frame(egui::Frame::none()
-                                    .fill(theme.bg_surface())
-                                    .stroke(egui::Stroke::NONE)
-                                    .inner_margin(egui::Margin { left: 16.0, right: 17.0, top: 8.0, bottom: 8.0 }))
-                                .show(ctx, |ui| {
-                                    ui.horizontal(|ui| {
-                                        ui.spacing_mut().item_spacing = egui::vec2(8.0, 0.0);
-
-                                        // Delete button (danger) - left aligned
-                                        if ui.add(egui::Button::new(
-                                            egui::RichText::new("DELETE").size(11.0).color(Color32::WHITE).family(egui::FontFamily::Monospace))
-                                            .fill(Color32::from_rgb(255, 25, 25))  // Red #ff1919
-                                            .stroke(egui::Stroke::NONE)
-                                            .rounding(egui::Rounding::same(4.0))
-                                            .min_size(egui::vec2(70.0, 28.0))
-                                        ).clicked() && !actions_clone.is_empty() {
-                                            new_popup_state = Some(PopupState::ActionConfirmDelete);
-                                        }
-
-                                        // Spacer to push remaining buttons to the right
-                                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                            ui.spacing_mut().item_spacing = egui::vec2(8.0, 0.0);
-
-                                            // OK button (primary)
-                                            if ui.add(egui::Button::new(
-                                                egui::RichText::new("OK").size(11.0).color(theme.bg_deep()).strong().family(egui::FontFamily::Monospace))
-                                                .fill(theme.accent_dim())
-                                                .stroke(egui::Stroke::NONE)
-                                                .rounding(egui::Rounding::same(4.0))
-                                                .min_size(egui::vec2(70.0, 28.0))
-                                            ).clicked() {
-                                                should_close = true;
-                                            }
-
-                                            // Edit button (secondary)
-                                            if ui.add(egui::Button::new(
-                                                egui::RichText::new("EDIT").size(11.0).color(theme.fg_secondary()).family(egui::FontFamily::Monospace))
-                                                .fill(theme.bg_hover())
-                                                .stroke(egui::Stroke::new(1.0, theme.border_medium()))
-                                                .rounding(egui::Rounding::same(4.0))
-                                                .min_size(egui::vec2(70.0, 28.0))
-                                            ).clicked() && !actions_clone.is_empty() {
-                                                open_editor_idx = Some(actions_selected);
-                                            }
-
-                                            // Add button (secondary)
-                                            if ui.add(egui::Button::new(
-                                                egui::RichText::new("ADD").size(11.0).color(theme.fg_secondary()).family(egui::FontFamily::Monospace))
-                                                .fill(theme.bg_hover())
-                                                .stroke(egui::Stroke::new(1.0, theme.border_medium()))
-                                                .rounding(egui::Rounding::same(4.0))
-                                                .min_size(egui::vec2(70.0, 28.0))
-                                            ).clicked() {
-                                                add_new_action = true;
-                                            }
-                                        });
-                                    });
-                                });
-
-                            egui::CentralPanel::default()
-                                .frame(egui::Frame::none()
-                                    .fill(theme.bg_elevated())
-                                    .inner_margin(egui::Margin::same(16.0)))
-                                .show(ctx, |ui| {
-                                    // Filter input
-                                    let filter_rect = ui.allocate_space(egui::vec2(ui.available_width(), 28.0)).1;
-                                    ui.painter().rect_filled(filter_rect, egui::Rounding::same(4.0), theme.bg_deep());
-                                    let filter_inner = filter_rect.shrink2(egui::vec2(8.0, 4.0));
-                                    let mut filter_ui = ui.child_ui(filter_inner, egui::Layout::left_to_right(egui::Align::Center));
-                                    let filter_edit = TextEdit::singleline(&mut actions_list_filter)
-                                        .frame(false)
-                                        .hint_text(egui::RichText::new("Filter actions...").color(theme.fg_dim()))
-                                        .desired_width(filter_inner.width())
-                                        .text_color(theme.fg())
-                                        .font(egui::FontId::monospace(12.0));
-                                    filter_ui.add(filter_edit);
-                                    ui.add_space(12.0);
-
-                                    // Table header row
-                                    let row_height = 24.0;
-                                    let col_widths = [140.0, 100.0, 220.0]; // Name, World, Pattern
-                                    let header_rect = ui.allocate_space(egui::vec2(ui.available_width(), row_height)).1;
-                                    let header_y = header_rect.center().y;
-                                    ui.painter().text(
-                                        egui::pos2(header_rect.left() + 4.0, header_y),
-                                        egui::Align2::LEFT_CENTER,
-                                        "Name",
-                                        egui::FontId::monospace(11.0),
-                                        theme.fg_muted());
-                                    ui.painter().text(
-                                        egui::pos2(header_rect.left() + col_widths[0], header_y),
-                                        egui::Align2::LEFT_CENTER,
-                                        "World",
-                                        egui::FontId::monospace(11.0),
-                                        theme.fg_muted());
-                                    ui.painter().text(
-                                        egui::pos2(header_rect.left() + col_widths[0] + col_widths[1], header_y),
-                                        egui::Align2::LEFT_CENTER,
-                                        "Pattern",
-                                        egui::FontId::monospace(11.0),
-                                        theme.fg_muted());
-
-                                    ui.add_space(4.0);
-                                    ui.add(egui::Separator::default().spacing(0.0));
-                                    ui.add_space(4.0);
-
-                                    // Build filtered list of actions
-                                    let filter_lower = actions_list_filter.to_lowercase();
-                                    let filtered_actions: Vec<(usize, &Action)> = actions_clone.iter()
-                                        .enumerate()
-                                        .filter(|(_, a)| {
-                                            if filter_lower.is_empty() {
-                                                true
-                                            } else {
-                                                a.name.to_lowercase().contains(&filter_lower) ||
-                                                a.world.to_lowercase().contains(&filter_lower) ||
-                                                a.pattern.to_lowercase().contains(&filter_lower)
-                                            }
-                                        })
-                                        .collect();
-
-                                    if filtered_actions.is_empty() {
-                                        ui.add_space(8.0);
-                                        let msg = if actions_clone.is_empty() { "No actions defined." } else { "No actions found." };
-                                        ui.label(egui::RichText::new(msg)
-                                            .size(12.0)
-                                            .color(theme.fg_muted())
-                                            .family(egui::FontFamily::Monospace));
-                                    } else {
-                                        ScrollArea::vertical().auto_shrink([false; 2]).show(ui, |ui| {
-                                            for (idx, action) in filtered_actions.iter() {
-                                                let is_selected = *idx == actions_selected;
-
-                                                // Full row as a clickable area
-                                                let row_rect = ui.allocate_space(egui::vec2(ui.available_width(), row_height)).1;
-                                                let response = ui.interact(row_rect, ui.id().with(idx), egui::Sense::click());
-
-                                                // Draw selection/hover background for full row
-                                                if is_selected {
-                                                    ui.painter().rect_filled(row_rect, egui::Rounding::same(2.0),
-                                                        Color32::from_rgba_unmultiplied(34, 211, 238, 38));
-                                                } else if response.hovered() {
-                                                    ui.painter().rect_filled(row_rect, egui::Rounding::same(2.0), theme.bg_hover());
-                                                }
-
-                                                if response.clicked() {
-                                                    actions_selected = *idx;
-                                                }
-
-                                                // Draw row content
-                                                let col_x = row_rect.left() + 4.0;
-                                                let text_y = row_rect.center().y;
-
-                                                // Name column
-                                                let name_color = if is_selected { theme.fg() } else { theme.fg_secondary() };
-                                                ui.painter().text(
-                                                    egui::pos2(col_x, text_y),
-                                                    egui::Align2::LEFT_CENTER,
-                                                    &action.name,
-                                                    egui::FontId::monospace(12.0),
-                                                    name_color);
-
-                                                // World column
-                                                let world_display = if action.world.is_empty() { "(all)" } else { &action.world };
-                                                ui.painter().text(
-                                                    egui::pos2(row_rect.left() + col_widths[0], text_y),
-                                                    egui::Align2::LEFT_CENTER,
-                                                    world_display,
-                                                    egui::FontId::monospace(12.0),
-                                                    theme.fg_muted());
-
-                                                // Pattern column
-                                                let pattern_display = if action.pattern.is_empty() { "(manual)" } else { &action.pattern };
-                                                ui.painter().text(
-                                                    egui::pos2(row_rect.left() + col_widths[0] + col_widths[1], text_y),
-                                                    egui::Align2::LEFT_CENTER,
-                                                    pattern_display,
-                                                    egui::FontId::monospace(12.0),
-                                                    theme.fg_muted());
-                                            }
-                                        });
-                                    }
-                                });
-                        },
-                    );
-
-                    // Apply changes back to self
-                    self.actions_selected = actions_selected;
-                    self.actions_list_filter = actions_list_filter;
-
-                    if let Some(state) = new_popup_state {
-                        self.popup_state = state;
-                    } else if let Some(idx) = open_editor_idx {
-                        // Load selected action into editor
-                        if let Some(action) = self.actions.get(idx) {
-                            self.edit_action_name = action.name.clone();
-                            self.edit_action_world = action.world.clone();
-                            self.edit_action_match_type = action.match_type;
-                            self.edit_action_pattern = action.pattern.clone();
-                            self.edit_action_command = action.command.clone();
-                            self.edit_action_enabled = action.enabled;
-                            self.action_error = None;
-                            self.popup_state = PopupState::ActionEditor(idx);
-                        }
-                    } else if add_new_action {
-                        // Create new action and open editor
-                        self.edit_action_name = String::new();
-                        self.edit_action_world = String::new();
-                        self.edit_action_match_type = MatchType::Regexp;
-                        self.edit_action_pattern = String::new();
-                        self.edit_action_command = String::new();
-                        self.edit_action_enabled = true;
-                        self.action_error = None;
-                        self.popup_state = PopupState::ActionEditor(usize::MAX); // MAX = new action
-                    } else if should_close {
-                        close_popup = true;
-                    }
-                }
-
-                // Actions Editor popup (separate OS window)
-                if let PopupState::ActionEditor(edit_idx) = self.popup_state.clone() {
-                    let title = if edit_idx == usize::MAX { "New Action - Clay MUD Client" } else { "Edit Action - Clay MUD Client" };
-                    let mut should_close = false;
-                    let mut should_save = false;
-
-                    // Copy mutable state for viewport
-                    let mut edit_action_name = self.edit_action_name.clone();
-                    let mut edit_action_world = self.edit_action_world.clone();
-                    let mut edit_action_match_type = self.edit_action_match_type;
-                    let mut edit_action_pattern = self.edit_action_pattern.clone();
-                    let mut edit_action_command = self.edit_action_command.clone();
-                    let mut action_error = self.action_error.clone();
-                    let actions_clone = self.actions.clone();
-
-                    ctx.show_viewport_immediate(
-                        egui::ViewportId::from_hash_of("actions_editor_window"),
-                        egui::ViewportBuilder::default()
-                            .with_title(title)
-                            .with_inner_size([450.0, 340.0]),
-                        |ctx, _class| {
-                            // Apply popup styling
-                            ctx.style_mut(|style| {
-                                style.visuals.window_fill = theme.bg_elevated();
-                                style.visuals.panel_fill = theme.bg_elevated();
-                                style.visuals.window_stroke = egui::Stroke::NONE;
-                                style.visuals.window_shadow = egui::epaint::Shadow::NONE;
-
-                                let widget_bg = theme.bg_deep();
-                                let widget_rounding = egui::Rounding::same(4.0);
-
-                                style.visuals.widgets.noninteractive.bg_fill = widget_bg;
-                                style.visuals.widgets.noninteractive.bg_stroke = egui::Stroke::NONE;
-                                style.visuals.widgets.noninteractive.fg_stroke = egui::Stroke::NONE;
-                                style.visuals.widgets.noninteractive.rounding = widget_rounding;
-                                style.visuals.widgets.noninteractive.weak_bg_fill = widget_bg;
-
-                                style.visuals.widgets.inactive.bg_fill = theme.bg_hover();
-                                style.visuals.widgets.inactive.bg_stroke = egui::Stroke::NONE;
-                                style.visuals.widgets.inactive.fg_stroke = egui::Stroke::NONE;
-                                style.visuals.widgets.inactive.rounding = widget_rounding;
-                                style.visuals.widgets.inactive.weak_bg_fill = theme.bg_hover();
-
-                                style.visuals.widgets.hovered.bg_fill = theme.bg_hover();
-                                style.visuals.widgets.hovered.bg_stroke = egui::Stroke::NONE;
-                                style.visuals.widgets.hovered.fg_stroke = egui::Stroke::NONE;
-                                style.visuals.widgets.hovered.rounding = widget_rounding;
-                                style.visuals.widgets.hovered.weak_bg_fill = theme.bg_hover();
-
-                                style.visuals.widgets.active.bg_fill = theme.accent_dim();
-                                style.visuals.widgets.active.bg_stroke = egui::Stroke::NONE;
-                                style.visuals.widgets.active.fg_stroke = egui::Stroke::NONE;
-                                style.visuals.widgets.active.rounding = widget_rounding;
-                                style.visuals.widgets.active.weak_bg_fill = theme.accent_dim();
-
-                                style.visuals.widgets.open.bg_fill = theme.bg_hover();
-                                style.visuals.widgets.open.bg_stroke = egui::Stroke::NONE;
-                                style.visuals.widgets.open.fg_stroke = egui::Stroke::NONE;
-                                style.visuals.widgets.open.rounding = widget_rounding;
-                                style.visuals.widgets.open.weak_bg_fill = theme.bg_hover();
-
-                                style.visuals.selection.bg_fill = Color32::from_rgba_unmultiplied(34, 211, 238, 38);
-                                style.visuals.selection.stroke = egui::Stroke::NONE;
-                                style.visuals.extreme_bg_color = widget_bg;
-                            });
-
-                            if ctx.input(|i| i.key_pressed(egui::Key::Escape)) ||
-                               ctx.input(|i| i.viewport().close_requested()) {
-                                should_close = true;
-                            }
-
-                            // Bottom panel for buttons
-                            egui::TopBottomPanel::bottom("action_editor_buttons")
-                                .exact_height(44.0)
-                                .frame(egui::Frame::none()
-                                    .fill(theme.bg_surface())
-                                    .stroke(egui::Stroke::NONE)
-                                    .inner_margin(egui::Margin { left: 16.0, right: 17.0, top: 8.0, bottom: 8.0 }))
-                                .show(ctx, |ui| {
-                                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                        ui.spacing_mut().item_spacing = egui::vec2(8.0, 0.0);
-
-                                        // Cancel button (secondary)
-                                        if ui.add(egui::Button::new(
-                                            egui::RichText::new("CANCEL").size(11.0).color(theme.fg_secondary()).family(egui::FontFamily::Monospace))
-                                            .fill(theme.bg_hover())
-                                            .stroke(egui::Stroke::new(1.0, theme.border_medium()))
-                                            .rounding(egui::Rounding::same(4.0))
-                                            .min_size(egui::vec2(70.0, 28.0))
-                                        ).clicked() {
-                                            should_close = true;
-                                        }
-
-                                        // Save button (primary)
-                                        if ui.add(egui::Button::new(
-                                            egui::RichText::new("SAVE").size(11.0).color(theme.bg_deep()).strong().family(egui::FontFamily::Monospace))
-                                            .fill(theme.accent_dim())
-                                            .stroke(egui::Stroke::NONE)
-                                            .rounding(egui::Rounding::same(4.0))
-                                            .min_size(egui::vec2(70.0, 28.0))
-                                        ).clicked() {
-                                            // Validate
-                                            let name = edit_action_name.trim();
-                                            if name.is_empty() {
-                                                action_error = Some("Name is required".to_string());
-                                            } else {
-                                                // Check for duplicates (excluding current if editing)
-                                                let mut duplicate = false;
-                                                for (i, a) in actions_clone.iter().enumerate() {
-                                                    if (edit_idx == usize::MAX || i != edit_idx) &&
-                                                       a.name.eq_ignore_ascii_case(name) {
-                                                        action_error = Some(format!("Action '{}' already exists", name));
-                                                        duplicate = true;
-                                                        break;
-                                                    }
-                                                }
-                                                if !duplicate {
-                                                    should_save = true;
-                                                }
-                                            }
-                                        }
-                                    });
-                                });
-
-                            egui::CentralPanel::default()
-                                .frame(egui::Frame::none()
-                                    .fill(theme.bg_elevated())
-                                    .inner_margin(egui::Margin { left: 20.0, right: 16.0, top: 20.0, bottom: 16.0 }))
-                                .show(ctx, |ui| {
-                                    // Layout dimensions (matching World Editor)
-                                    let label_width = 90.0;
-                                    let label_spacing = 12.0;
-                                    let row_height = 28.0;
-
-                                    // Helper to draw chevron (down arrow) like World Editor
-                                    let draw_chevron = |painter: &egui::Painter, center: egui::Pos2, color: Color32| {
-                                        let half_width = 5.0;
-                                        let half_height = 3.0;
-                                        let stroke = egui::Stroke::new(1.5, color);
-                                        painter.line_segment(
-                                            [egui::pos2(center.x - half_width, center.y - half_height),
-                                             egui::pos2(center.x, center.y + half_height)],
-                                            stroke
-                                        );
-                                        painter.line_segment(
-                                            [egui::pos2(center.x + half_width, center.y - half_height),
-                                             egui::pos2(center.x, center.y + half_height)],
-                                            stroke
-                                        );
-                                    };
-
-                                    // Helper for form rows with right-aligned uppercase labels
-                                    let form_row = |ui: &mut egui::Ui, label: &str, add_widget: &mut dyn FnMut(&mut egui::Ui)| {
-                                        ui.horizontal(|ui| {
-                                            ui.spacing_mut().item_spacing = egui::vec2(0.0, 0.0);
-                                            ui.set_height(row_height);
-                                            // Right-aligned label
-                                            ui.allocate_ui_with_layout(
-                                                egui::vec2(label_width, row_height),
-                                                egui::Layout::right_to_left(egui::Align::Center),
-                                                |ui| {
-                                                    ui.label(egui::RichText::new(label.to_uppercase())
-                                                        .size(10.0)
-                                                        .color(theme.fg_muted()));
-                                                }
-                                            );
-                                            ui.add_space(label_spacing);
-                                            add_widget(ui);
-                                        });
-                                        ui.add_space(6.0);
-                                    };
-
-                                    // Helper for styled text input (no border, just background)
-                                    let styled_text_input = |ui: &mut egui::Ui, text: &mut String, hint: Option<&str>, id_salt: &str| {
-                                        let width = ui.available_width();
-                                        let field_rect = ui.allocate_space(egui::vec2(width, row_height)).1;
-                                        ui.painter().rect_filled(field_rect, egui::Rounding::same(4.0), theme.bg_deep());
-                                        let inner_rect = field_rect.shrink2(egui::vec2(8.0, 4.0));
-                                        let mut child_ui = ui.child_ui(inner_rect, egui::Layout::left_to_right(egui::Align::Center));
-                                        let mut text_edit = TextEdit::singleline(text)
-                                            .frame(false)
-                                            .desired_width(inner_rect.width())
-                                            .text_color(theme.fg())
-                                            .font(egui::FontId::monospace(11.0));
-                                        if let Some(h) = hint {
-                                            text_edit = text_edit.hint_text(egui::RichText::new(h).color(theme.fg_dim()));
-                                        }
-                                        child_ui.add(text_edit);
-                                        let _ = id_salt; // Used for uniqueness if needed
-                                    };
-
-                                    // Name
-                                    form_row(ui, "Name", &mut |ui| {
-                                        styled_text_input(ui, &mut edit_action_name, None, "action_name");
-                                    });
-
-                                    // World
-                                    form_row(ui, "World", &mut |ui| {
-                                        styled_text_input(ui, &mut edit_action_world, Some("(empty = all worlds)"), "action_world");
-                                    });
-
-                                    // Match Type (custom styled dropdown, full width, NO border - exactly like World Editor)
-                                    form_row(ui, "Match Type", &mut |ui| {
-                                        let dropdown_id = ui.id().with("match_type_dropdown");
-                                        let _is_open = ui.memory(|mem| mem.is_popup_open(dropdown_id));
-                                        let dropdown_width = ui.available_width();
-
-                                        let button_rect = ui.allocate_space(egui::vec2(dropdown_width, row_height)).1;
-                                        let response = ui.interact(button_rect, dropdown_id.with("button"), egui::Sense::click());
-
-                                        // Background only - NO border
-                                        ui.painter().rect_filled(button_rect, egui::Rounding::same(4.0), theme.bg_deep());
-
-                                        let match_type_text = match edit_action_match_type {
-                                            MatchType::Regexp => "Regexp",
-                                            MatchType::Wildcard => "Wildcard",
-                                        };
-                                        ui.painter().text(
-                                            egui::pos2(button_rect.min.x + 12.0, button_rect.center().y),
-                                            egui::Align2::LEFT_CENTER,
-                                            match_type_text,
-                                            egui::FontId::monospace(11.0),
-                                            theme.fg()
-                                        );
-
-                                        draw_chevron(ui.painter(), egui::pos2(button_rect.max.x - 16.0, button_rect.center().y), theme.fg_muted());
-
-                                        if response.clicked() {
-                                            ui.memory_mut(|mem| mem.toggle_popup(dropdown_id));
-                                        }
-
-                                        egui::popup_below_widget(ui, dropdown_id, &response, |ui| {
-                                            ui.set_min_width(dropdown_width);
-                                            ui.style_mut().visuals.widgets.inactive.fg_stroke = egui::Stroke::new(1.0, theme.fg());
-                                            ui.style_mut().visuals.widgets.hovered.fg_stroke = egui::Stroke::new(1.0, theme.fg());
-                                            ui.style_mut().visuals.widgets.active.fg_stroke = egui::Stroke::new(1.0, theme.fg());
-                                            if ui.selectable_label(edit_action_match_type == MatchType::Regexp,
-                                                egui::RichText::new("Regexp").size(11.0).color(theme.fg()).family(egui::FontFamily::Monospace)).clicked() {
-                                                edit_action_match_type = MatchType::Regexp;
-                                                ui.memory_mut(|mem| mem.close_popup());
-                                            }
-                                            if ui.selectable_label(edit_action_match_type == MatchType::Wildcard,
-                                                egui::RichText::new("Wildcard").size(11.0).color(theme.fg()).family(egui::FontFamily::Monospace)).clicked() {
-                                                edit_action_match_type = MatchType::Wildcard;
-                                                ui.memory_mut(|mem| mem.close_popup());
-                                            }
-                                        });
-                                    });
-                                    ui.add_space(6.0);
-
-                                    // Pattern
-                                    let pattern_hint = match edit_action_match_type {
-                                        MatchType::Regexp => "(regex, empty = manual only)",
-                                        MatchType::Wildcard => "(wildcard: * ?, empty = manual only)",
-                                    };
-                                    form_row(ui, "Pattern", &mut |ui| {
-                                        styled_text_input(ui, &mut edit_action_pattern, Some(pattern_hint), "action_pattern");
-                                    });
-
-                                    ui.add_space(4.0);
-
-                                    // Command label (right-aligned like other labels)
-                                    ui.horizontal(|ui| {
-                                        ui.spacing_mut().item_spacing = egui::vec2(0.0, 0.0);
-                                        ui.allocate_ui_with_layout(
-                                            egui::vec2(label_width, row_height),
-                                            egui::Layout::right_to_left(egui::Align::Center),
-                                            |ui| {
-                                                ui.label(egui::RichText::new("COMMAND")
-                                                    .size(10.0)
-                                                    .color(theme.fg_muted()));
-                                            }
-                                        );
-                                    });
-                                    ui.add_space(4.0);
-
-                                    // Command area with background (full width)
-                                    let cmd_rect = ui.allocate_space(egui::vec2(ui.available_width(), 100.0)).1;
-                                    ui.painter().rect_filled(cmd_rect, egui::Rounding::same(4.0), theme.bg_deep());
-                                    let cmd_inner = cmd_rect.shrink2(egui::vec2(8.0, 6.0));
-                                    let mut cmd_ui = ui.child_ui(cmd_inner, egui::Layout::left_to_right(egui::Align::TOP));
-                                    cmd_ui.add(egui::TextEdit::multiline(&mut edit_action_command)
-                                        .frame(false)
-                                        .hint_text(egui::RichText::new("Commands (semicolon-separated)").color(theme.fg_dim()))
-                                        .desired_width(cmd_inner.width())
-                                        .desired_rows(3)
-                                        .text_color(theme.fg())
-                                        .font(egui::FontId::monospace(11.0)));
-
-                                    // Error message
-                                    if let Some(ref err) = action_error {
-                                        ui.add_space(8.0);
-                                        ui.label(egui::RichText::new(err)
-                                            .size(11.0)
-                                            .color(theme.error()));
-                                    }
-                                });
-                        },
-                    );
-
-                    // Apply changes back to self
-                    self.edit_action_name = edit_action_name;
-                    self.edit_action_world = edit_action_world;
-                    self.edit_action_match_type = edit_action_match_type;
-                    self.edit_action_pattern = edit_action_pattern;
-                    self.edit_action_command = edit_action_command;
-                    self.action_error = action_error;
-
-                    if should_save {
-                        let new_action = Action {
-                            name: self.edit_action_name.trim().to_string(),
-                            world: self.edit_action_world.trim().to_string(),
-                            match_type: self.edit_action_match_type,
-                            pattern: self.edit_action_pattern.clone(),
-                            command: self.edit_action_command.clone(),
-                            owner: None,
-                            enabled: self.edit_action_enabled,
-                        };
-                        if edit_idx == usize::MAX {
-                            // New action
-                            self.actions.push(new_action);
-                            self.actions_selected = self.actions.len() - 1;
-                        } else {
-                            // Update existing
-                            self.actions[edit_idx] = new_action;
-                        }
-                        // Send updated actions to server
-                        self.update_actions();
-                        self.popup_state = PopupState::ActionsList;
-                    } else if should_close {
-                        self.popup_state = PopupState::ActionsList;
-                    }
-                }
-
-                // Action delete confirmation popup (separate OS window)
-                if self.popup_state == PopupState::ActionConfirmDelete {
-                    let mut should_close = false;
-                    let mut should_delete = false;
-                    let action_name = self.actions.get(self.actions_selected)
-                        .map(|a| a.name.clone())
-                        .unwrap_or_else(|| "(unknown)".to_string());
-
-                    ctx.show_viewport_immediate(
-                        egui::ViewportId::from_hash_of("action_confirm_delete_window"),
-                        egui::ViewportBuilder::default()
-                            .with_title("Confirm Delete - Clay MUD Client")
-                            .with_inner_size([340.0, 140.0]),
-                        |ctx, _class| {
-                            // Apply popup styling
-                            ctx.style_mut(|style| {
-                                style.visuals.window_fill = theme.bg_elevated();
-                                style.visuals.panel_fill = theme.bg_elevated();
-                                style.visuals.window_stroke = egui::Stroke::NONE;
-                                style.visuals.window_shadow = egui::epaint::Shadow::NONE;
-
-                                let widget_bg = theme.bg_deep();
-                                let widget_rounding = egui::Rounding::same(4.0);
-
-                                style.visuals.widgets.noninteractive.bg_fill = widget_bg;
-                                style.visuals.widgets.noninteractive.bg_stroke = egui::Stroke::NONE;
-                                style.visuals.widgets.noninteractive.fg_stroke = egui::Stroke::NONE;
-                                style.visuals.widgets.noninteractive.rounding = widget_rounding;
-                                style.visuals.widgets.noninteractive.weak_bg_fill = widget_bg;
-
-                                style.visuals.widgets.inactive.bg_fill = theme.bg_hover();
-                                style.visuals.widgets.inactive.bg_stroke = egui::Stroke::NONE;
-                                style.visuals.widgets.inactive.fg_stroke = egui::Stroke::NONE;
-                                style.visuals.widgets.inactive.rounding = widget_rounding;
-                                style.visuals.widgets.inactive.weak_bg_fill = theme.bg_hover();
-
-                                style.visuals.widgets.hovered.bg_fill = theme.bg_hover();
-                                style.visuals.widgets.hovered.bg_stroke = egui::Stroke::NONE;
-                                style.visuals.widgets.hovered.fg_stroke = egui::Stroke::NONE;
-                                style.visuals.widgets.hovered.rounding = widget_rounding;
-                                style.visuals.widgets.hovered.weak_bg_fill = theme.bg_hover();
-
-                                style.visuals.widgets.active.bg_fill = theme.accent_dim();
-                                style.visuals.widgets.active.bg_stroke = egui::Stroke::NONE;
-                                style.visuals.widgets.active.fg_stroke = egui::Stroke::NONE;
-                                style.visuals.widgets.active.rounding = widget_rounding;
-                                style.visuals.widgets.active.weak_bg_fill = theme.accent_dim();
-
-                                style.visuals.widgets.open.bg_fill = theme.bg_hover();
-                                style.visuals.widgets.open.bg_stroke = egui::Stroke::NONE;
-                                style.visuals.widgets.open.fg_stroke = egui::Stroke::NONE;
-                                style.visuals.widgets.open.rounding = widget_rounding;
-                                style.visuals.widgets.open.weak_bg_fill = theme.bg_hover();
-
-                                style.visuals.selection.bg_fill = Color32::from_rgba_unmultiplied(34, 211, 238, 38);
-                                style.visuals.selection.stroke = egui::Stroke::NONE;
-                                style.visuals.extreme_bg_color = widget_bg;
-                            });
-
-                            if ctx.input(|i| i.key_pressed(egui::Key::Escape)) ||
-                               ctx.input(|i| i.viewport().close_requested()) {
-                                should_close = true;
-                            }
-
-                            // Bottom panel for buttons
-                            egui::TopBottomPanel::bottom("action_confirm_delete_buttons")
-                                .exact_height(44.0)
-                                .frame(egui::Frame::none()
-                                    .fill(theme.bg_surface())
-                                    .stroke(egui::Stroke::NONE)
-                                    .inner_margin(egui::Margin { left: 16.0, right: 17.0, top: 8.0, bottom: 8.0 }))
-                                .show(ctx, |ui| {
-                                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                        ui.spacing_mut().item_spacing = egui::vec2(8.0, 0.0);
-
-                                        // No button (secondary)
-                                        if ui.add(egui::Button::new(
-                                            egui::RichText::new("NO").size(11.0).color(theme.fg_secondary()).family(egui::FontFamily::Monospace))
-                                            .fill(theme.bg_hover())
-                                            .stroke(egui::Stroke::new(1.0, theme.border_medium()))
-                                            .rounding(egui::Rounding::same(4.0))
-                                            .min_size(egui::vec2(70.0, 28.0))
-                                        ).clicked() {
-                                            should_close = true;
-                                        }
-
-                                        // Yes button (danger)
-                                        if ui.add(egui::Button::new(
-                                            egui::RichText::new("YES").size(11.0).color(Color32::WHITE).strong().family(egui::FontFamily::Monospace))
-                                            .fill(theme.error_dim())
-                                            .stroke(egui::Stroke::NONE)
-                                            .rounding(egui::Rounding::same(4.0))
-                                            .min_size(egui::vec2(70.0, 28.0))
-                                        ).clicked() {
-                                            should_delete = true;
-                                        }
-                                    });
-                                });
-
-                            egui::CentralPanel::default()
-                                .frame(egui::Frame::none()
-                                    .fill(theme.bg_elevated())
-                                    .inner_margin(egui::Margin::same(16.0)))
-                                .show(ctx, |ui| {
-                                    ui.label(egui::RichText::new("CONFIRM DELETE")
-                                        .size(11.0)
-                                        .color(theme.fg_muted())
-                                        .strong());
-                                    ui.add_space(16.0);
-
-                                    ui.label(egui::RichText::new(format!("Delete action '{}'?", action_name))
-                                        .size(12.0)
-                                        .color(theme.fg()));
-                                });
-                        },
-                    );
-
-                    if should_delete {
-                        if self.actions_selected < self.actions.len() {
-                            self.actions.remove(self.actions_selected);
-                            if self.actions_selected >= self.actions.len() && !self.actions.is_empty() {
-                                self.actions_selected = self.actions.len() - 1;
-                            }
-                            // Send updated actions to server
-                            self.update_actions();
-                        }
-                        self.popup_state = PopupState::ActionsList;
-                    } else if should_close {
-                        self.popup_state = PopupState::ActionsList;
-                    }
-                }
-
-                // Unified popup rendering
-                if let Some(ref mut popup_state) = self.unified_popup {
-                    let popup_title = popup_state.definition.title.clone();
-                    let popup_id_str = popup_state.definition.id.0.to_string();
-                    let mut should_close_unified = false;
-                    let mut clicked_button: Option<crate::popup::ButtonId> = None;
-
-                    // Calculate popup size based on layout
-                    let min_width = popup_state.definition.layout.min_width as f32;
-                    let label_width = popup_state.definition.layout.label_width as f32;
-
-                    ctx.show_viewport_immediate(
-                        egui::ViewportId::from_hash_of(format!("unified_popup_{}", popup_id_str)),
-                        egui::ViewportBuilder::default()
-                            .with_title(format!("{} - Clay MUD Client", popup_title))
-                            .with_inner_size([min_width.max(400.0), 420.0])
-                            .with_resizable(true),
-                        |ctx, _class| {
-                            // Apply popup styling
-                            ctx.style_mut(|style| {
-                                style.visuals.window_fill = theme.bg_elevated();
-                                style.visuals.panel_fill = theme.bg_elevated();
-                                style.visuals.window_stroke = egui::Stroke::NONE;
-                                style.visuals.window_shadow = egui::epaint::Shadow::NONE;
-
-                                let widget_bg = theme.bg_deep();
-                                let widget_rounding = egui::Rounding::same(4.0);
-
-                                style.visuals.widgets.noninteractive.bg_fill = widget_bg;
-                                style.visuals.widgets.inactive.bg_fill = theme.bg_hover();
-                                style.visuals.widgets.hovered.bg_fill = theme.bg_hover();
-                                style.visuals.widgets.active.bg_fill = theme.accent_dim();
-                                style.visuals.widgets.open.bg_fill = theme.bg_hover();
-
-                                for w in [
-                                    &mut style.visuals.widgets.noninteractive,
-                                    &mut style.visuals.widgets.inactive,
-                                    &mut style.visuals.widgets.hovered,
-                                    &mut style.visuals.widgets.active,
-                                    &mut style.visuals.widgets.open,
-                                ] {
-                                    w.bg_stroke = egui::Stroke::NONE;
-                                    w.fg_stroke = egui::Stroke::NONE;
-                                    w.rounding = widget_rounding;
-                                }
-
-                                style.visuals.selection.bg_fill = Color32::from_rgba_unmultiplied(34, 211, 238, 38);
-                                style.visuals.selection.stroke = egui::Stroke::NONE;
-                                style.visuals.extreme_bg_color = widget_bg;
-                            });
-
-                            if ctx.input(|i| i.key_pressed(egui::Key::Escape)) ||
-                               ctx.input(|i| i.viewport().close_requested()) {
-                                should_close_unified = true;
-                            }
-
-                            egui::CentralPanel::default()
-                                .frame(egui::Frame::none()
-                                    .fill(theme.bg_elevated())
-                                    .inner_margin(egui::Margin { left: 16.0, right: 16.0, top: 16.0, bottom: 15.0 }))
-                                .show(ctx, |ui| {
-                                    // Create GUI popup theme from current theme
-                                    let gui_theme = crate::popup::gui_renderer::GuiPopupTheme::from_colors(
-                                        theme.bg_elevated(),
-                                        theme.bg_surface(),
-                                        theme.bg_deep(),
-                                        theme.bg_hover(),
-                                        theme.fg(),
-                                        theme.fg_muted(),
-                                        theme.fg_muted(),
-                                        theme.accent(),
-                                        theme.accent_dim(),
-                                        theme.fg_dim(),  // border color
-                                        theme.error(),
-                                    );
-
-                                    let actions = crate::popup::gui_renderer::render_popup_content(
-                                        ui,
-                                        popup_state,
-                                        &gui_theme,
-                                        label_width.max(80.0),
-                                    );
-
-                                    // Store clicked button for processing outside viewport
-                                    if let Some(btn_id) = actions.clicked_button {
-                                        clicked_button = Some(btn_id);
-                                    }
-
-                                    // Apply other actions to state
-                                    crate::popup::gui_renderer::apply_actions(popup_state, actions);
-                                });
-                        },
-                    );
-
-                    // Handle button clicks outside viewport closure
-                    if let Some(btn_id) = clicked_button {
-                        // Check if this is a close/cancel/ok button
-                        let popup_id = self.unified_popup.as_ref().map(|p| p.definition.id.0);
-                        match popup_id {
-                            Some("connections") => {
-                                // Connections popup just closes
-                                should_close_unified = true;
-                            }
-                            Some("actions_list") => {
-                                use crate::popup::definitions::actions::*;
-                                if btn_id == ACTIONS_BTN_CANCEL {
-                                    should_close_unified = true;
-                                } else if btn_id == ACTIONS_BTN_ADD {
-                                    // Open action editor for new action
-                                    let settings = ActionSettings::default();
-                                    let def = create_action_editor_popup(&settings, true);
-                                    self.unified_popup = Some(crate::popup::PopupState::new(def));
-                                } else if btn_id == ACTIONS_BTN_EDIT {
-                                    // Get selected action index from list
-                                    if let Some(ps) = &self.unified_popup {
-                                        if let Some(field) = ps.field(ACTIONS_FIELD_LIST) {
-                                            if let crate::popup::FieldKind::List { selected_index, items, .. } = &field.kind {
-                                                if let Some(item) = items.get(*selected_index) {
-                                                    if let Ok(idx) = item.id.parse::<usize>() {
-                                                        if let Some(action) = self.actions.get(idx) {
-                                                            let settings = ActionSettings {
-                                                                name: action.name.clone(),
-                                                                world: action.world.clone(),
-                                                                match_type: action.match_type.as_str().to_string(),
-                                                                pattern: action.pattern.clone(),
-                                                                command: action.command.clone(),
-                                                                enabled: action.enabled,
-                                                            };
-                                                            self.actions_selected = idx;
-                                                            let def = create_action_editor_popup(&settings, false);
-                                                            self.unified_popup = Some(crate::popup::PopupState::new(def));
-                                                        }
-                                                    }
-                                                }
-                                            }
-                                        }
-                                    }
-                                } else if btn_id == ACTIONS_BTN_DELETE {
-                                    // Get selected action and open confirm dialog
-                                    if let Some(ps) = &self.unified_popup {
-                                        if let Some(field) = ps.field(ACTIONS_FIELD_LIST) {
-                                            if let crate::popup::FieldKind::List { selected_index, items, .. } = &field.kind {
-                                                if let Some(item) = items.get(*selected_index) {
-                                                    if let Ok(idx) = item.id.parse::<usize>() {
-                                                        if let Some(action) = self.actions.get(idx) {
-                                                            let def = crate::popup::definitions::confirm::create_delete_action_dialog(&action.name);
-                                                            self.actions_selected = idx;
-                                                            self.unified_popup = Some(crate::popup::PopupState::new(def));
-                                                        }
-                                                    }
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                            Some("action_editor") => {
-                                use crate::popup::definitions::actions::*;
-                                if btn_id == EDITOR_BTN_CANCEL {
-                                    // Return to actions list
-                                    self.open_actions_list_unified();
-                                } else if btn_id == EDITOR_BTN_SAVE {
-                                    // Save action and return to list
-                                    if let Some(ps) = &self.unified_popup {
-                                        let editing_idx = ps.field(EDITOR_FIELD_NAME)
-                                            .and_then(|_| ps.definition.id.0.strip_prefix("action_editor"))
-                                            .and_then(|s| s.parse::<usize>().ok());
-
-                                        let name = ps.field(EDITOR_FIELD_NAME)
-                                            .and_then(|f| f.kind.get_text())
-                                            .unwrap_or("")
-                                            .to_string();
-                                        let world = ps.field(EDITOR_FIELD_WORLD)
-                                            .and_then(|f| f.kind.get_text())
-                                            .unwrap_or("")
-                                            .to_string();
-                                        let pattern = ps.field(EDITOR_FIELD_PATTERN)
-                                            .and_then(|f| f.kind.get_text())
-                                            .unwrap_or("")
-                                            .to_string();
-                                        let command = ps.field(EDITOR_FIELD_COMMAND)
-                                            .and_then(|f| f.kind.get_text())
-                                            .unwrap_or("")
-                                            .to_string();
-                                        let match_type_idx = ps.field(EDITOR_FIELD_MATCH_TYPE)
-                                            .and_then(|f| if let crate::popup::FieldKind::Select { selected_index, .. } = &f.kind {
-                                                Some(*selected_index)
-                                            } else { None })
-                                            .unwrap_or(0);
-                                        let enabled = ps.field(EDITOR_FIELD_ENABLED)
-                                            .and_then(|f| if let crate::popup::FieldKind::Toggle { value } = &f.kind {
-                                                Some(*value)
-                                            } else { None })
-                                            .unwrap_or(true);
-
-                                        let action = Action {
-                                            name,
-                                            world,
-                                            pattern,
-                                            command,
-                                            match_type: if match_type_idx == 0 { super::MatchType::Regexp } else { super::MatchType::Wildcard },
-                                            enabled,
-                                            owner: None,
-                                        };
-
-                                        if let Some(idx) = editing_idx {
-                                            if idx < self.actions.len() {
-                                                self.actions[idx] = action;
-                                            }
-                                        } else {
-                                            self.actions.push(action);
-                                        }
-
-                                        self.update_actions();
-                                    }
-                                    self.open_actions_list_unified();
-                                }
-                            }
-                            Some("delete_action") => {
-                                use crate::popup::definitions::confirm::*;
-                                if btn_id == CONFIRM_BTN_YES {
-                                    // Delete the action
-                                    if self.actions_selected < self.actions.len() {
-                                        self.actions.remove(self.actions_selected);
-                                        if self.actions_selected >= self.actions.len() && !self.actions.is_empty() {
-                                            self.actions_selected = self.actions.len() - 1;
-                                        }
-                                        self.update_actions();
-                                    }
-                                    self.open_actions_list_unified();
-                                } else if btn_id == CONFIRM_BTN_NO {
-                                    self.open_actions_list_unified();
-                                }
-                            }
-                            Some("delete_world") => {
-                                use crate::popup::definitions::confirm::*;
-                                if btn_id == CONFIRM_BTN_YES {
-                                    // Get world index from custom_data and send delete request to server
-                                    if let Some(ps) = &self.unified_popup {
-                                        if let Some(world_index_str) = ps.definition.custom_data.get("world_index") {
-                                            if let Ok(world_index) = world_index_str.parse::<usize>() {
-                                                if let Some(ref ws_tx) = self.ws_tx {
-                                                    let msg = WsMessage::DeleteWorld { world_index };
-                                                    let _ = ws_tx.send(msg);
-                                                }
-                                            }
-                                        }
-                                    }
-                                    self.open_world_selector_unified();
-                                } else if btn_id == CONFIRM_BTN_NO {
-                                    self.open_world_selector_unified();
-                                }
-                            }
-                            _ => {
-                                // Generic close on any button for unknown popups
-                                should_close_unified = true;
-                            }
-                        }
-                    }
-
-                    if should_close_unified {
-                        self.unified_popup = None;
-                    }
-                }
-
-                // Handle popup actions
-                if let Some((action, idx)) = popup_action {
-                    match action {
-                        "connect" => self.connect_world(idx),
-                        "edit" => self.open_world_editor(idx),
-                        "switch" => {
-                            self.current_world = idx;
-                            self.switch_world(idx);
-                        }
-                        "delete" => {
-                            if self.worlds.len() > 1 && idx < self.worlds.len() {
-                                self.popup_state = PopupState::WorldConfirmDelete(idx);
-                            }
-                        }
-                        _ => {}
-                    }
-                }
-
-                if close_popup {
-                    self.popup_state = PopupState::None;
-                }
-            }
-        }
-    }
-
-    /// Run the remote GUI client
-    pub fn run(addr: &str, runtime: tokio::runtime::Handle) -> io::Result<()> {
-        // Check for display server availability
-        let has_display = std::env::var("DISPLAY").map(|v| !v.is_empty()).unwrap_or(false)
-            || std::env::var("WAYLAND_DISPLAY").map(|v| !v.is_empty()).unwrap_or(false);
-        if !has_display {
-            return Err(io::Error::other(
-                "No display server found. Set DISPLAY (X11) or WAYLAND_DISPLAY environment variable."
-            ));
-        }
-
-        let options = eframe::NativeOptions {
-            viewport: egui::ViewportBuilder::default()
-                .with_inner_size([800.0, 600.0])
-                .with_title("Clay Mud Client"),
-            hardware_acceleration: eframe::HardwareAcceleration::Preferred,
-            ..Default::default()
-        };
-
-        let addr_string = addr.to_string();
-
-        eframe::run_native(
-            "Clay Mud Client",
-            options,
-            Box::new(move |cc| {
-                // Install image loaders for Discord emoji support
-                egui_extras::install_image_loaders(&cc.egui_ctx);
-                Box::new(RemoteGuiApp::new(addr_string, runtime)) as Box<dyn eframe::App>
-            }),
-        ).map_err(|e| io::Error::other(format!("eframe error: {}", e)))
-    }
-}
-
-#[cfg(all(feature = "remote-gui", not(target_os = "android")))]
-fn run_remote_gui(addr: &str) -> io::Result<()> {
-    let runtime = tokio::runtime::Handle::current();
-    remote_gui::run(addr, runtime)
 }
 
 /// Run as console client connecting to remote daemon (--console=host:port)
@@ -15623,8 +4248,23 @@ fn handle_remote_client_key(
                     }
                 }
             }
-            NewPopupAction::Confirm(_data) => {
-                // Confirm action - remote client doesn't handle locally
+            NewPopupAction::Confirm(data) => {
+                // Handle action deletion confirm
+                if let Some(action_index_str) = data.get("action_index") {
+                    if let Ok(action_index) = action_index_str.parse::<usize>() {
+                        if action_index < app.settings.actions.len() {
+                            let action_name = app.settings.actions[action_index].name.clone();
+                            app.settings.actions.remove(action_index);
+                            app.add_output(&format!("Action '{}' deleted.", action_name));
+                            // Send UpdateActions to daemon
+                            let _ = ws_tx.send(WsMessage::UpdateActions {
+                                actions: app.settings.actions.clone()
+                            });
+                            // Reopen actions list to show updated list
+                            app.open_actions_list_popup();
+                        }
+                    }
+                }
             }
             NewPopupAction::ConfirmCancelled(data) => {
                 // Reopen the parent list popup when confirm dialog is cancelled
@@ -15734,11 +4374,144 @@ fn handle_remote_client_key(
             NewPopupAction::ConnectionsClose => {
                 // Connections popup closed - no action needed
             }
-            NewPopupAction::ActionsList(_action) => {
-                // Actions list action - remote client doesn't handle locally
+            NewPopupAction::ActionsList(action) => {
+                match action {
+                    ActionsListAction::Add => {
+                        app.open_action_editor_popup(None);
+                    }
+                    ActionsListAction::Edit(idx) => {
+                        if idx < app.settings.actions.len() {
+                            app.open_action_editor_popup(Some(idx));
+                        }
+                    }
+                    ActionsListAction::Delete(idx) => {
+                        if idx < app.settings.actions.len() {
+                            let name = app.settings.actions[idx].name.clone();
+                            app.open_delete_action_confirm(&name, idx);
+                        }
+                    }
+                    ActionsListAction::Toggle(idx) => {
+                        if idx < app.settings.actions.len() {
+                            app.settings.actions[idx].enabled = !app.settings.actions[idx].enabled;
+                            // Send UpdateActions to daemon
+                            let _ = ws_tx.send(WsMessage::UpdateActions {
+                                actions: app.settings.actions.clone()
+                            });
+                            // Update the list display in the popup
+                            use popup::definitions::actions::{ActionInfo, filter_actions, ACTIONS_FIELD_FILTER, ACTIONS_FIELD_LIST};
+                            if let Some(state) = app.popup_manager.current_mut() {
+                                let filter_text = if state.editing && state.is_field_selected(ACTIONS_FIELD_FILTER) {
+                                    state.edit_buffer.clone()
+                                } else {
+                                    state.get_text(ACTIONS_FIELD_FILTER).unwrap_or("").to_string()
+                                };
+                                let all_actions: Vec<ActionInfo> = app.settings.actions
+                                    .iter()
+                                    .map(|a| ActionInfo {
+                                        name: a.name.clone(),
+                                        world: a.world.clone(),
+                                        pattern: a.pattern.clone(),
+                                        enabled: a.enabled,
+                                    })
+                                    .collect();
+                                let filtered = filter_actions(&all_actions, &filter_text);
+                                if let Some(field) = state.field_mut(ACTIONS_FIELD_LIST) {
+                                    if let popup::FieldKind::List { items, .. } = &mut field.kind {
+                                        *items = filtered.iter().filter_map(|info| {
+                                            app.settings.actions.iter().position(|a| a.name == info.name).map(|orig_idx| {
+                                                let status = if info.enabled { "[x]" } else { "[ ]" };
+                                                let world_part = if info.world.is_empty() {
+                                                    String::new()
+                                                } else {
+                                                    format!("({})", info.world)
+                                                };
+                                                let pattern_preview = if info.pattern.len() > 30 {
+                                                    format!("{}...", &info.pattern[..27])
+                                                } else {
+                                                    info.pattern.clone()
+                                                };
+                                                popup::ListItem {
+                                                    id: orig_idx.to_string(),
+                                                    columns: vec![
+                                                        format!("{} {}", status, info.name),
+                                                        world_part,
+                                                        pattern_preview,
+                                                    ],
+                                                    style: popup::ListItemStyle {
+                                                        is_disabled: !info.enabled,
+                                                        ..Default::default()
+                                                    },
+                                                }
+                                            })
+                                        }).collect();
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
             }
             NewPopupAction::ActionsListFilter => {
-                // Filter changed - remote client doesn't handle locally
+                // Filter changed - update the actions list locally
+                use popup::definitions::actions::{ActionInfo, filter_actions, ACTIONS_FIELD_FILTER, ACTIONS_FIELD_LIST};
+                if let Some(state) = app.popup_manager.current_mut() {
+                    let filter_text = if state.editing && state.is_field_selected(ACTIONS_FIELD_FILTER) {
+                        state.edit_buffer.clone()
+                    } else {
+                        state.get_text(ACTIONS_FIELD_FILTER).unwrap_or("").to_string()
+                    };
+                    let all_actions: Vec<ActionInfo> = app.settings.actions
+                        .iter()
+                        .map(|a| ActionInfo {
+                            name: a.name.clone(),
+                            world: a.world.clone(),
+                            pattern: a.pattern.clone(),
+                            enabled: a.enabled,
+                        })
+                        .collect();
+                    let filtered = filter_actions(&all_actions, &filter_text);
+                    if let Some(field) = state.field_mut(ACTIONS_FIELD_LIST) {
+                        if let popup::FieldKind::List { items, selected_index, scroll_offset, .. } = &mut field.kind {
+                            let old_len = items.len();
+                            *items = filtered.iter().filter_map(|info| {
+                                app.settings.actions.iter().position(|a| a.name == info.name).map(|orig_idx| {
+                                    let status = if info.enabled { "[x]" } else { "[ ]" };
+                                    let world_part = if info.world.is_empty() {
+                                        String::new()
+                                    } else {
+                                        format!("({})", info.world)
+                                    };
+                                    let pattern_preview = if info.pattern.len() > 30 {
+                                        format!("{}...", &info.pattern[..27])
+                                    } else {
+                                        info.pattern.clone()
+                                    };
+                                    popup::ListItem {
+                                        id: orig_idx.to_string(),
+                                        columns: vec![
+                                            format!("{} {}", status, info.name),
+                                            world_part,
+                                            pattern_preview,
+                                        ],
+                                        style: popup::ListItemStyle {
+                                            is_disabled: !info.enabled,
+                                            ..Default::default()
+                                        },
+                                    }
+                                })
+                            }).collect();
+                            if items.is_empty() {
+                                *selected_index = 0;
+                                *scroll_offset = 0;
+                            } else if *selected_index >= items.len() {
+                                *selected_index = items.len().saturating_sub(1);
+                            }
+                            if old_len != items.len() {
+                                *scroll_offset = 0;
+                            }
+                        }
+                    }
+                }
             }
             NewPopupAction::ActionEditorSave { action, editing_index } => {
                 // Update local actions list
@@ -16850,7 +5623,7 @@ fn handle_new_popup_key(app: &mut App, key: KeyEvent) -> NewPopupAction {
                                 return NewPopupAction::ActionsList(ActionsListAction::Delete(idx));
                             }
                         }
-                        'c' | 'C' => {
+                        'c' | 'C' | 'o' | 'O' => {
                             app.popup_manager.close();
                         }
                         _ => {}
@@ -17438,1565 +6211,6 @@ fn handle_remote_filter_popup_key(app: &mut App, key: KeyEvent) {
     }
 }
 
-/// Run in daemon mode (-D) - background server for remote connections only
-/// No console UI, just prints listening ports and handles remote clients
-async fn run_daemon_server() -> io::Result<()> {
-    let mut app = App::new();
-
-    // Load settings from normal settings file
-    if let Err(e) = load_settings(&mut app) {
-        eprintln!("Warning: Could not load settings: {}", e);
-    }
-
-    // Ensure at least one world exists
-    app.ensure_has_world();
-
-    // Re-create spell checker with custom dictionary path if configured
-    if !app.settings.dictionary_path.is_empty() {
-        app.spell_checker = SpellChecker::new(&app.settings.dictionary_path);
-    }
-
-    let (event_tx, mut event_rx) = mpsc::channel::<AppEvent>(100);
-
-    // Start WebSocket server if enabled
-    if app.settings.ws_enabled && !app.settings.websocket_password.is_empty() {
-        let mut server = WebSocketServer::new(
-            &app.settings.websocket_password,
-            app.settings.ws_port,
-            &app.settings.websocket_allow_list,
-            app.settings.websocket_whitelisted_host.clone(),
-            false, // Not multiuser mode
-            app.ban_list.clone(),
-        );
-
-        // Configure TLS if secure mode enabled
-        #[cfg(feature = "native-tls-backend")]
-        let tls_configured = if app.settings.web_secure
-            && !app.settings.websocket_cert_file.is_empty()
-            && !app.settings.websocket_key_file.is_empty()
-        {
-            match server.configure_tls(&app.settings.websocket_cert_file, &app.settings.websocket_key_file) {
-                Ok(()) => true,
-                Err(e) => {
-                    eprintln!("Warning: Failed to configure TLS: {}", e);
-                    false
-                }
-            }
-        } else {
-            false
-        };
-        #[cfg(feature = "rustls-backend")]
-        let tls_configured = if app.settings.web_secure
-            && !app.settings.websocket_cert_file.is_empty()
-            && !app.settings.websocket_key_file.is_empty()
-        {
-            match server.configure_tls(&app.settings.websocket_cert_file, &app.settings.websocket_key_file) {
-                Ok(()) => true,
-                Err(e) => {
-                    eprintln!("Warning: Failed to configure TLS: {}", e);
-                    false
-                }
-            }
-        } else {
-            false
-        };
-
-        if let Err(e) = start_websocket_server(&mut server, event_tx.clone()).await {
-            eprintln!("Failed to start WebSocket server: {}", e);
-            return Ok(());
-        }
-        let protocol = if tls_configured { "wss" } else { "ws" };
-        println!("WebSocket: {}://0.0.0.0:{}", protocol, app.settings.ws_port);
-        app.ws_server = Some(server);
-    }
-
-    // Start HTTP/HTTPS server if enabled
-    if app.settings.http_enabled {
-        let has_cert = !app.settings.websocket_cert_file.is_empty()
-            && !app.settings.websocket_key_file.is_empty();
-        let web_secure = app.settings.web_secure;
-
-        if web_secure && has_cert {
-            // Start HTTPS
-            #[cfg(any(feature = "native-tls-backend", feature = "rustls-backend"))]
-            {
-                let mut https_server = HttpsServer::new(app.settings.http_port);
-                match start_https_server(
-                    &mut https_server,
-                    &app.settings.websocket_cert_file,
-                    &app.settings.websocket_key_file,
-                    app.settings.ws_port,
-                    true,
-                ).await {
-                    Ok(()) => {
-                        println!("HTTPS: https://0.0.0.0:{}", app.settings.http_port);
-                        app.https_server = Some(https_server);
-                    }
-                    Err(e) => {
-                        eprintln!("Warning: Failed to start HTTPS server: {}", e);
-                    }
-                }
-            }
-        } else {
-            // Start HTTP
-            let mut http_server = HttpServer::new(app.settings.http_port);
-            match start_http_server(&mut http_server, app.settings.ws_port, false, app.ban_list.clone()).await {
-                Ok(()) => {
-                    println!("HTTP: http://0.0.0.0:{}", app.settings.http_port);
-                    app.http_server = Some(http_server);
-                }
-                Err(e) => {
-                    eprintln!("Warning: Failed to start HTTP server: {}", e);
-                }
-            }
-        }
-    }
-
-    // Check if any servers are running
-    if app.ws_server.is_none() && app.http_server.is_none() && app.https_server.is_none() {
-        eprintln!("Error: No servers started. Enable WebSocket or HTTP in settings.");
-        eprintln!("Use /web command to configure, or edit ~/.clay.dat");
-        return Ok(());
-    }
-
-    // Show allow list if configured (helps debug connection rejections)
-    if !app.settings.websocket_allow_list.is_empty() {
-        println!("Allow list: {}", app.settings.websocket_allow_list);
-    }
-
-    println!("Daemon running. Press Ctrl+C to stop.");
-
-    // Main event loop - handles MUD connections and WebSocket messages
-    loop {
-        #[cfg(all(unix, not(target_os = "android")))]
-        reap_zombie_children();
-
-        tokio::select! {
-            Some(event) = event_rx.recv() => {
-                match event {
-                    AppEvent::ServerData(ref world_name, bytes) => {
-                        if let Some(world_idx) = app.find_world_index(world_name) {
-                            // Use shared server data processing (same as console mode)
-                            let commands = app.process_server_data(
-                                world_idx,
-                                &bytes,
-                                24, // Default console height for daemon mode
-                                80, // Default console width
-                                true, // is_daemon_mode
-                            );
-
-                            // Execute any triggered commands
-                            let saved_current_world = app.current_world_index;
-                            app.current_world_index = world_idx;
-                            for cmd in commands {
-                                if cmd.starts_with('/') {
-                                    // Internal Clay command - execute it
-                                    let parsed = parse_command(&cmd);
-                                    match parsed {
-                                        Command::Send { text, target_world, .. } => {
-                                            // Handle /send command
-                                            let target_idx = if let Some(ref w) = target_world {
-                                                app.find_world_index(w)
-                                            } else {
-                                                Some(world_idx)
-                                            };
-                                            if let Some(idx) = target_idx {
-                                                if let Some(tx) = &app.worlds[idx].command_tx {
-                                                    let _ = tx.try_send(WriteCommand::Text(text));
-                                                }
-                                            }
-                                        }
-                                        _ => {
-                                            // Other commands - limited support in daemon mode
-                                        }
-                                    }
-                                } else if cmd.starts_with('#') {
-                                    // TF command
-                                    if let tf::TfCommandResult::SendToMud(text) = app.tf_engine.execute(&cmd) {
-                                        if let Some(tx) = &app.worlds[world_idx].command_tx {
-                                            let _ = tx.try_send(WriteCommand::Text(text));
-                                        }
-                                    }
-                                } else if let Some(tx) = &app.worlds[world_idx].command_tx {
-                                    // Plain text - send to MUD
-                                    let _ = tx.try_send(WriteCommand::Text(cmd));
-                                }
-                            }
-                            app.current_world_index = saved_current_world;
-                        }
-                    }
-                    AppEvent::Disconnected(ref world_name) => {
-                        if let Some(world_idx) = app.find_world_index(world_name) {
-                            app.worlds[world_idx].connected = false;
-                            app.worlds[world_idx].command_tx = None;
-
-                            // Broadcast disconnect to clients
-                            app.ws_broadcast(WsMessage::WorldDisconnected { world_index: world_idx });
-                        }
-                    }
-                    AppEvent::WsClientMessage(client_id, msg) => {
-                        // Check if this is an AuthRequest (client just authenticated)
-                        if matches!(*msg, WsMessage::AuthRequest { .. }) {
-                            // Send initial state after successful authentication
-                            let initial_state = app.build_initial_state();
-                            app.ws_send_to_client(client_id, initial_state);
-                        } else {
-                            handle_daemon_ws_message(&mut app, client_id, *msg, &event_tx).await;
-                        }
-                    }
-                    AppEvent::WsClientConnected(_client_id) => {
-                        // Client connected but not yet authenticated - nothing to do
-                    }
-                    AppEvent::WsClientDisconnected(_client_id) => {
-                        // Client disconnected, nothing special to do
-                    }
-                    AppEvent::SystemMessage(msg) => {
-                        // Print system messages (including connection rejections) to console
-                        println!("{}", msg);
-                    }
-                    _ => {}
-                }
-            }
-        }
-    }
-}
-
-/// Handle WebSocket message in daemon mode
-async fn handle_daemon_ws_message(
-    app: &mut App,
-    client_id: u64,
-    msg: WsMessage,
-    event_tx: &mpsc::Sender<AppEvent>,
-) {
-    match msg {
-        WsMessage::SendCommand { world_index, command } => {
-            if world_index < app.worlds.len() && app.worlds[world_index].connected {
-                if let Some(tx) = &app.worlds[world_index].command_tx {
-                    let _ = tx.send(WriteCommand::Text(command)).await;
-                    app.worlds[world_index].last_send_time = Some(std::time::Instant::now());
-                    app.worlds[world_index].last_user_command_time = Some(std::time::Instant::now());
-                    // Reset more-mode counter when user sends a command
-                    app.worlds[world_index].lines_since_pause = 0;
-                }
-            }
-        }
-        WsMessage::ConnectWorld { world_index } => {
-            if world_index < app.worlds.len() && !app.worlds[world_index].connected {
-                let settings = app.worlds[world_index].settings.clone();
-                let world_name = app.worlds[world_index].name.clone();
-
-                // Check if world has connection settings
-                if !settings.has_connection_settings() {
-                    app.ws_broadcast(WsMessage::ServerData {
-                        world_index,
-                        data: "Configure host/port in world settings.\n".to_string(),
-                        is_viewed: false,
-                        ts: current_timestamp_secs(),
-                        from_server: false,
-                    });
-                    return;
-                }
-
-                let ssl_msg = if settings.use_ssl { " with SSL" } else { "" };
-                app.ws_broadcast(WsMessage::ServerData {
-                    world_index,
-                    data: format!("Connecting to {}:{}{}...\n", settings.hostname, settings.port, ssl_msg),
-                    is_viewed: false,
-                    ts: current_timestamp_secs(),
-                    from_server: false,
-                });
-
-                // Attempt connection
-                if let Some(cmd_tx) = connect_daemon_world(
-                    world_index,
-                    world_name.clone(),
-                    &settings,
-                    event_tx.clone(),
-                ).await {
-                    // Connection succeeded
-                    app.worlds[world_index].connected = true;
-                    app.worlds[world_index].command_tx = Some(cmd_tx);
-                    app.worlds[world_index].was_connected = true;
-                    let now = std::time::Instant::now();
-                    app.worlds[world_index].last_send_time = Some(now);
-                    app.worlds[world_index].last_receive_time = Some(now);
-
-                    app.ws_broadcast(WsMessage::WorldConnected { world_index, name: world_name });
-                } else {
-                    // Connection failed
-                    app.ws_broadcast(WsMessage::ServerData {
-                        world_index,
-                        data: "Connection failed.\n".to_string(),
-                        is_viewed: false,
-                        ts: current_timestamp_secs(),
-                        from_server: false,
-                    });
-                }
-            }
-        }
-        WsMessage::DisconnectWorld { world_index } => {
-            if world_index < app.worlds.len() && app.worlds[world_index].connected {
-                app.worlds[world_index].connected = false;
-                app.worlds[world_index].command_tx = None;
-                app.ws_broadcast(WsMessage::WorldDisconnected { world_index });
-            }
-        }
-        WsMessage::SwitchWorld { world_index } => {
-            if world_index < app.worlds.len() {
-                app.current_world_index = world_index;
-                app.ws_broadcast(WsMessage::WorldSwitched { new_index: world_index });
-            }
-        }
-        WsMessage::UpdateGlobalSettings { more_mode_enabled, spell_check_enabled, temp_convert_enabled, world_switch_mode, show_tags, debug_enabled, ansi_music_enabled, console_theme, gui_theme, gui_transparency, color_offset_percent, input_height, font_name, font_size, web_font_size_phone, web_font_size_tablet, web_font_size_desktop, ws_allow_list, web_secure, http_enabled, http_port, ws_enabled, ws_port, ws_cert_file, ws_key_file, tls_proxy_enabled, dictionary_path } => {
-            app.settings.more_mode_enabled = more_mode_enabled;
-            app.settings.spell_check_enabled = spell_check_enabled;
-            app.settings.temp_convert_enabled = temp_convert_enabled;
-            app.settings.world_switch_mode = WorldSwitchMode::from_name(&world_switch_mode);
-            app.show_tags = show_tags;
-            app.settings.debug_enabled = debug_enabled;
-            app.settings.ansi_music_enabled = ansi_music_enabled;
-            app.input_height = input_height;
-            app.settings.theme = Theme::from_name(&console_theme);
-            app.settings.gui_theme = Theme::from_name(&gui_theme);
-            app.settings.gui_transparency = gui_transparency;
-            app.settings.color_offset_percent = color_offset_percent;
-            app.settings.font_name = font_name;
-            app.settings.font_size = font_size;
-            app.settings.web_font_size_phone = web_font_size_phone;
-            app.settings.web_font_size_tablet = web_font_size_tablet;
-            app.settings.web_font_size_desktop = web_font_size_desktop;
-            app.settings.websocket_allow_list = ws_allow_list;
-            app.settings.web_secure = web_secure;
-            app.settings.http_enabled = http_enabled;
-            app.settings.http_port = http_port;
-            app.settings.ws_enabled = ws_enabled;
-            app.settings.ws_port = ws_port;
-            app.settings.websocket_cert_file = ws_cert_file;
-            app.settings.websocket_key_file = ws_key_file;
-            app.settings.tls_proxy_enabled = tls_proxy_enabled;
-            if app.settings.dictionary_path != dictionary_path {
-                app.settings.dictionary_path = dictionary_path;
-                app.spell_checker = SpellChecker::new(&app.settings.dictionary_path);
-            }
-
-            // Save settings
-            let _ = save_settings(app);
-
-            // Broadcast updated settings
-            let settings = GlobalSettingsMsg {
-                more_mode_enabled: app.settings.more_mode_enabled,
-                spell_check_enabled: app.settings.spell_check_enabled,
-                temp_convert_enabled: app.settings.temp_convert_enabled,
-                world_switch_mode: app.settings.world_switch_mode.name().to_string(),
-                debug_enabled: app.settings.debug_enabled,
-                show_tags: app.show_tags,
-                ansi_music_enabled: app.settings.ansi_music_enabled,
-                input_height: app.input_height,
-                console_theme: app.settings.theme.name().to_string(),
-                gui_theme: app.settings.gui_theme.name().to_string(),
-                gui_transparency: app.settings.gui_transparency,
-                color_offset_percent: app.settings.color_offset_percent,
-                font_name: app.settings.font_name.clone(),
-                font_size: app.settings.font_size,
-                web_font_size_phone: app.settings.web_font_size_phone,
-                web_font_size_tablet: app.settings.web_font_size_tablet,
-                web_font_size_desktop: app.settings.web_font_size_desktop,
-                ws_allow_list: app.settings.websocket_allow_list.clone(),
-                web_secure: app.settings.web_secure,
-                http_enabled: app.settings.http_enabled,
-                http_port: app.settings.http_port,
-                ws_enabled: app.settings.ws_enabled,
-                ws_port: app.settings.ws_port,
-                ws_cert_file: app.settings.websocket_cert_file.clone(),
-                ws_key_file: app.settings.websocket_key_file.clone(),
-                tls_proxy_enabled: app.settings.tls_proxy_enabled,
-                dictionary_path: app.settings.dictionary_path.clone(),
-            };
-            app.ws_broadcast(WsMessage::GlobalSettingsUpdated { settings, input_height: app.input_height });
-        }
-        WsMessage::Ping => {
-            app.ws_send_to_client(client_id, WsMessage::Pong);
-        }
-        WsMessage::UpdateViewState { world_index, visible_lines } => {
-            // Track client's view state for more-mode threshold calculation
-            if world_index < app.worlds.len() {
-                let dimensions = app.ws_client_worlds.get(&client_id).and_then(|s| s.dimensions);
-                app.ws_client_worlds.insert(client_id, ClientViewState { world_index, visible_lines, dimensions });
-            }
-        }
-        WsMessage::MarkWorldSeen { world_index } => {
-            if world_index < app.worlds.len() {
-                app.worlds[world_index].unseen_lines = 0;
-                app.worlds[world_index].first_unseen_at = None;
-                app.ws_broadcast(WsMessage::UnseenCleared { world_index });
-                app.broadcast_activity();
-                // Trigger console redraw to update activity indicator
-                app.needs_output_redraw = true;
-            }
-        }
-        WsMessage::ReleasePending { world_index, count } => {
-            // Release pending lines for the specified world
-            if world_index < app.worlds.len() {
-                let pending_count = app.worlds[world_index].pending_lines.len();
-                if pending_count > 0 {
-                    let to_release = if count == 0 { pending_count } else { count.min(pending_count) };
-
-                    // Get the lines that will be released (for broadcasting)
-                    let lines_to_broadcast: Vec<String> = app.worlds[world_index]
-                        .pending_lines
-                        .iter()
-                        .take(to_release)
-                        .map(|line| line.text.replace('\r', ""))
-                        .collect();
-
-                    // Release the lines
-                    app.worlds[world_index].release_pending(to_release);
-
-                    // Broadcast the released lines as ServerData
-                    if !lines_to_broadcast.is_empty() {
-                        let ws_data = lines_to_broadcast.join("\n") + "\n";
-                        app.ws_broadcast(WsMessage::ServerData {
-                            world_index,
-                            data: ws_data,
-                            is_viewed: true,
-                            ts: current_timestamp_secs(),
-                            from_server: false,
-                        });
-                    }
-
-                    // Broadcast release event and updated pending count
-                    app.ws_broadcast(WsMessage::PendingReleased { world_index, count: to_release });
-                    let new_pending_count = app.worlds[world_index].pending_lines.len();
-                    app.ws_broadcast(WsMessage::PendingLinesUpdate { world_index, count: new_pending_count });
-                    app.broadcast_activity();
-                }
-            }
-        }
-        WsMessage::ReportSeqMismatch { world_index, expected_seq_gt, actual_seq, line_text, source } => {
-            let world_name = app.worlds.get(world_index).map(|w| w.name.as_str()).unwrap_or("?");
-            use std::io::Write;
-            if let Ok(mut f) = std::fs::OpenOptions::new()
-                .create(true).append(true)
-                .open("clay.output.debug")
-            {
-                let _ = writeln!(f, "SEQ MISMATCH [{}] in '{}': expected seq>{}, got seq={}, text={:?}",
-                    source, world_name, expected_seq_gt, actual_seq,
-                    line_text.chars().take(80).collect::<String>());
-            }
-        }
-        _ => {}
-    }
-}
-
-/// Run in multiuser server mode - web interface only, no console
-async fn run_multiuser_server() -> io::Result<()> {
-    let mut app = App::new();
-    app.multiuser_mode = true;
-
-    // Load multiuser settings from separate file
-    let settings_path = get_multiuser_settings_path();
-    if !settings_path.exists() {
-        println!("Multiuser settings file not found: {}", settings_path.display());
-        print!("Would you like to create a sample configuration? (y/n): ");
-        io::stdout().flush()?;
-
-        let mut input = String::new();
-        io::stdin().read_line(&mut input)?;
-
-        if input.trim().eq_ignore_ascii_case("y") || input.trim().eq_ignore_ascii_case("yes") {
-            // Create sample multiuser configuration
-            let sample_config = r#"[global]
-ws_enabled=true
-ws_port=9002
-http_enabled=true
-http_port=9000
-
-[user:star]
-password=xyzzy
-
-[world:ascii:star]
-world_type=mud
-hostname=teenymush.dynu.net
-port=4096
-use_ssl=false
-encoding=utf8
-auto_connect_type=Connect
-keep_alive_type=Generic
-"#;
-            std::fs::write(&settings_path, sample_config)?;
-            println!("Created sample configuration at: {}", settings_path.display());
-            println!("Default user: star, password: xyzzy");
-            println!("IMPORTANT: Change the user password before production use!");
-            println!();
-        } else {
-            println!("Multiuser mode requires a configuration file.");
-            println!("Create {} with [user:NAME] and [world:NAME:OWNER] sections.", settings_path.display());
-            return Ok(());
-        }
-    }
-
-    if let Err(e) = load_multiuser_settings(&mut app) {
-        eprintln!("Error loading multiuser settings: {}", e);
-        return Ok(());
-    }
-
-    // Validate: must have at least one user
-    if app.users.is_empty() {
-        eprintln!("Error: No users defined in multiuser settings.");
-        eprintln!("Add [user:NAME] sections to {}", settings_path.display());
-        return Ok(());
-    }
-
-    // Validate: all worlds must have owners
-    for world in &app.worlds {
-        if world.owner.is_none() {
-            eprintln!("Error: World '{}' has no owner.", world.name);
-            eprintln!("Use [world:{}:OWNERNAME] format in settings file.", world.name);
-            return Ok(());
-        }
-    }
-
-    // Validate: all actions must have owners
-    for action in &app.settings.actions {
-        if action.owner.is_none() {
-            eprintln!("Error: Action '{}' has no owner.", action.name);
-            eprintln!("Use [action:{}:OWNERNAME] format in settings file.", action.name);
-            return Ok(());
-        }
-    }
-
-    println!("Starting multiuser server...");
-    println!("Users: {}", app.users.iter().map(|u| u.name.as_str()).collect::<Vec<_>>().join(", "));
-    println!("Worlds: {}", app.worlds.iter().map(|w| format!("{} ({})", w.name, w.owner.as_ref().unwrap())).collect::<Vec<_>>().join(", "));
-
-    let (event_tx, mut event_rx) = mpsc::channel::<AppEvent>(100);
-
-    // Start WebSocket server (required for multiuser mode)
-    if !app.settings.ws_enabled {
-        eprintln!("Warning: WebSocket server not enabled. Enabling for multiuser mode.");
-        app.settings.ws_enabled = true;
-    }
-
-    // Start the WebSocket server
-    let mut server = WebSocketServer::new(
-        &app.settings.websocket_password,
-        app.settings.ws_port,
-        &app.settings.websocket_allow_list,
-        app.settings.websocket_whitelisted_host.clone(),
-        app.multiuser_mode,
-        app.ban_list.clone(),
-    );
-
-    // Configure TLS if secure mode and cert/key files are specified
-    #[cfg(feature = "native-tls-backend")]
-    let tls_configured = if app.settings.web_secure
-        && !app.settings.websocket_cert_file.is_empty()
-        && !app.settings.websocket_key_file.is_empty()
-    {
-        match server.configure_tls(&app.settings.websocket_cert_file, &app.settings.websocket_key_file) {
-            Ok(()) => true,
-            Err(e) => {
-                eprintln!("Warning: Failed to configure WSS TLS: {}", e);
-                false
-            }
-        }
-    } else {
-        false
-    };
-    #[cfg(feature = "rustls-backend")]
-    let tls_configured = if app.settings.web_secure
-        && !app.settings.websocket_cert_file.is_empty()
-        && !app.settings.websocket_key_file.is_empty()
-    {
-        match server.configure_tls(&app.settings.websocket_cert_file, &app.settings.websocket_key_file) {
-            Ok(()) => true,
-            Err(e) => {
-                eprintln!("Warning: Failed to configure WSS TLS: {}", e);
-                false
-            }
-        }
-    } else {
-        false
-    };
-
-    // Add user credentials to the WebSocket server for multiuser authentication
-    for user in &app.users {
-        server.add_user(&user.name, &user.password);
-    }
-
-    if let Err(e) = start_websocket_server(&mut server, event_tx.clone()).await {
-        eprintln!("Failed to start WebSocket server: {}", e);
-        return Ok(());
-    }
-    let protocol = if tls_configured { "wss" } else { "ws" };
-    println!("WebSocket server started on port {} ({})", app.settings.ws_port, protocol);
-    app.ws_server = Some(server);
-
-    // Start HTTP server if enabled
-    if app.settings.http_enabled {
-        let mut http_server = HttpServer::new(app.settings.http_port);
-        match start_http_server(&mut http_server, app.settings.ws_port, false, app.ban_list.clone()).await {
-            Ok(()) => {
-                println!("HTTP server started on port {}", app.settings.http_port);
-                app.http_server = Some(http_server);
-            }
-            Err(e) => {
-                eprintln!("Warning: Failed to start HTTP server: {}", e);
-            }
-        }
-    }
-
-    println!("Multiuser server running. Press Ctrl+C to stop.");
-
-    // Main event loop - only handles WebSocket events
-    loop {
-        // Reap any zombie child processes (TLS proxies that have exited)
-        #[cfg(all(unix, not(target_os = "android")))]
-        reap_zombie_children();
-
-        tokio::select! {
-            Some(event) = event_rx.recv() => {
-                match event {
-                    AppEvent::WsClientMessage(client_id, msg) => {
-                        handle_multiuser_ws_message(&mut app, client_id, *msg, &event_tx).await;
-                    }
-                    // Legacy events - not used in multiuser mode (we use Multiuser* variants)
-                    AppEvent::ServerData(_, _) => {}
-                    AppEvent::Disconnected(_) => {}
-                    AppEvent::ConnectWorldRequest(world_index, requesting_username) => {
-                        // Connect a world on behalf of a user (per-user isolated connection)
-                        let key = (world_index, requesting_username.clone());
-                        let already_connected = app.user_connections.get(&key).map(|c| c.connected).unwrap_or(false);
-
-                        if world_index < app.worlds.len() && !already_connected {
-                            let settings = app.worlds[world_index].settings.clone();
-                            let world_name = app.worlds[world_index].name.clone();
-
-                            // Check if world has connection settings
-                            if !settings.has_connection_settings() {
-                                if let Some(ws) = &app.ws_server {
-                                    ws.broadcast_to_owner(WsMessage::ServerData {
-                                        world_index,
-                                        data: "No connection settings configured for this world.\n".to_string(),
-                                        is_viewed: true,
-                                        ts: current_timestamp_secs(),
-                                        from_server: false,
-                                    }, Some(&requesting_username));
-                                }
-                            // Create per-user connection
-                            } else if let Some(cmd_tx) = connect_multiuser_world(
-                                world_index,
-                                requesting_username.clone(),
-                                &settings,
-                                event_tx.clone(),
-                            ).await {
-                                // Store connection in user_connections
-                                let mut conn = UserConnection::new();
-                                conn.connected = true;
-                                conn.command_tx = Some(cmd_tx);
-                                conn.last_send_time = Some(std::time::Instant::now());
-                                conn.last_receive_time = Some(std::time::Instant::now());
-                                app.user_connections.insert(key, conn);
-
-                                // Send WorldConnected only to this user
-                                if let Some(ws) = &app.ws_server {
-                                    ws.broadcast_to_owner(
-                                        WsMessage::WorldConnected { world_index, name: world_name },
-                                        Some(&requesting_username)
-                                    );
-                                }
-                            } else {
-                                // Connection failed - send error to user
-                                if let Some(ws) = &app.ws_server {
-                                    ws.broadcast_to_owner(WsMessage::ServerData {
-                                        world_index,
-                                        data: "✨ Connection failed.\n".to_string(),
-                                        is_viewed: true,
-                                        ts: current_timestamp_secs(),
-                                        from_server: false,
-                                    }, Some(&requesting_username));
-                                }
-                            }
-                        }
-                    }
-                    AppEvent::MultiuserServerData(world_index, username, data) => {
-                        // Route server data to specific user's connection
-                        let key = (world_index, username.clone());
-                        if let Some(conn) = app.user_connections.get_mut(&key) {
-                            let encoding = if world_index < app.worlds.len() {
-                                app.worlds[world_index].settings.encoding
-                            } else {
-                                Encoding::Utf8
-                            };
-                            let decoded = encoding.decode(&data);
-
-                            // Add to user's output buffer
-                            for line in decoded.lines() {
-                                let seq = conn.output_lines.len() as u64;
-                                conn.output_lines.push(OutputLine::new(line.to_string(), seq));
-                            }
-
-                            // Send to this user's WebSocket clients only
-                            if let Some(ws) = &app.ws_server {
-                                ws.broadcast_to_owner(WsMessage::ServerData {
-                                    world_index,
-                                    data: decoded,
-                                    is_viewed: true,
-                                    ts: current_timestamp_secs(),
-                                    from_server: false,
-                                }, Some(&username));
-                            }
-                        }
-                    }
-                    AppEvent::MultiuserDisconnected(world_index, username) => {
-                        // Handle disconnect for specific user's connection
-                        let key = (world_index, username.clone());
-                        if let Some(conn) = app.user_connections.get_mut(&key) {
-                            conn.connected = false;
-                            conn.command_tx = None;
-
-                            // Send disconnect to this user only
-                            if let Some(ws) = &app.ws_server {
-                                ws.broadcast_to_owner(
-                                    WsMessage::WorldDisconnected { world_index },
-                                    Some(&username)
-                                );
-                            }
-                        }
-                    }
-                    AppEvent::MultiuserTelnetDetected(world_index, username) => {
-                        let key = (world_index, username.clone());
-                        if let Some(conn) = app.user_connections.get_mut(&key) {
-                            conn.telnet_mode = true;
-                        }
-                    }
-                    AppEvent::MultiuserPrompt(world_index, username, prompt_bytes) => {
-                        let key = (world_index, username.clone());
-                        if let Some(conn) = app.user_connections.get_mut(&key) {
-                            let encoding = if world_index < app.worlds.len() {
-                                app.worlds[world_index].settings.encoding
-                            } else {
-                                Encoding::Utf8
-                            };
-                            let prompt_text = encoding.decode(&prompt_bytes);
-                            conn.prompt = prompt_text.trim_end().to_string() + " ";
-
-                            // Send prompt update to this user
-                            if let Some(ws) = &app.ws_server {
-                                ws.broadcast_to_owner(WsMessage::PromptUpdate {
-                                    world_index,
-                                    prompt: conn.prompt.clone(),
-                                }, Some(&username));
-                            }
-                        }
-                    }
-                    _ => {} // Ignore other events in multiuser mode
-                }
-            }
-            _ = tokio::signal::ctrl_c() => {
-                println!("\nShutting down multiuser server...");
-                break;
-            }
-        }
-    }
-
-    Ok(())
-}
-
-/// Connect to a world for a specific user in multiuser mode
-/// Returns the command sender if successful
-async fn connect_multiuser_world(
-    world_index: usize,
-    username: String,
-    settings: &WorldSettings,
-    event_tx: mpsc::Sender<AppEvent>,
-) -> Option<mpsc::Sender<WriteCommand>> {
-    let host = &settings.hostname;
-    let port = &settings.port;
-    let use_ssl = settings.use_ssl;
-
-    if host.is_empty() || port.is_empty() {
-        return None;
-    }
-
-    match TcpStream::connect(format!("{}:{}", host, port)).await {
-        Ok(tcp_stream) => {
-            let _ = tcp_stream.set_nodelay(true);
-
-            // Enable TCP keepalive to detect dead connections faster
-            enable_tcp_keepalive(&tcp_stream);
-
-            // Handle SSL if needed
-            let (mut read_half, mut write_half): (StreamReader, StreamWriter) = if use_ssl {
-                #[cfg(feature = "native-tls-backend")]
-                {
-                    let connector = match native_tls::TlsConnector::builder()
-                        .danger_accept_invalid_certs(true)
-                        .build()
-                    {
-                        Ok(c) => c,
-                        Err(_) => return None,
-                    };
-                    let connector = tokio_native_tls::TlsConnector::from(connector);
-
-                    match connector.connect(host, tcp_stream).await {
-                        Ok(tls_stream) => {
-                            let (r, w) = tokio::io::split(tls_stream);
-                            (StreamReader::Tls(r), StreamWriter::Tls(w))
-                        }
-                        Err(_) => return None,
-                    }
-                }
-
-                #[cfg(feature = "rustls-backend")]
-                {
-                    use rustls::RootCertStore;
-                    use tokio_rustls::TlsConnector;
-                    use rustls::pki_types::ServerName;
-
-                    let mut root_store = RootCertStore::empty();
-                    root_store.roots = webpki_roots::TLS_SERVER_ROOTS.iter().map(|ta| { rustls::pki_types::TrustAnchor { subject: ta.subject.into(), subject_public_key_info: ta.spki.into(), name_constraints: ta.name_constraints.map(|nc| nc.into()), } }).collect();
-
-                    let config = rustls::ClientConfig::builder()
-                        .dangerous()
-                        .with_custom_certificate_verifier(Arc::new(danger::NoCertificateVerification::new()))
-                        .with_no_client_auth();
-
-                    let connector = TlsConnector::from(Arc::new(config));
-                    let server_name = match ServerName::try_from(host.clone()) {
-                        Ok(sn) => sn,
-                        Err(_) => return None,
-                    };
-
-                    match connector.connect(server_name, tcp_stream).await {
-                        Ok(tls_stream) => {
-                            let (r, w) = tokio::io::split(tls_stream);
-                            (StreamReader::Tls(r), StreamWriter::Tls(w))
-                        }
-                        Err(_) => return None,
-                    }
-                }
-
-                #[cfg(not(any(feature = "native-tls-backend", feature = "rustls-backend")))]
-                {
-                    return None;
-                }
-            } else {
-                let (r, w) = tcp_stream.into_split();
-                (StreamReader::Plain(r), StreamWriter::Plain(w))
-            };
-
-            let (cmd_tx, mut cmd_rx) = mpsc::channel::<WriteCommand>(100);
-
-            // Send auto-login if configured
-            let user = settings.user.clone();
-            let password = settings.password.clone();
-            let auto_connect_type = settings.auto_connect_type;
-            if !user.is_empty() && auto_connect_type == AutoConnectType::Connect {
-                let tx = cmd_tx.clone();
-                tokio::spawn(async move {
-                    tokio::time::sleep(Duration::from_millis(500)).await;
-                    let connect_cmd = format!("connect {} {}", user, password);
-                    let _ = tx.send(WriteCommand::Text(connect_cmd)).await;
-                });
-            }
-
-            // Clone for reader task
-            let telnet_tx = cmd_tx.clone();
-            let event_tx_read = event_tx.clone();
-            let username_read = username.clone();
-
-            // Spawn reader task
-            tokio::spawn(async move {
-                let mut buffer = BytesMut::with_capacity(4096);
-                buffer.resize(4096, 0);
-                let mut line_buffer: Vec<u8> = Vec::new();
-
-                loop {
-                    match read_half.read(&mut buffer).await {
-                        Ok(0) => {
-                            // Connection closed
-                            if !line_buffer.is_empty() {
-                                let result = process_telnet(&line_buffer);
-                                if !result.responses.is_empty() {
-                                    let _ = telnet_tx.send(WriteCommand::Raw(result.responses)).await;
-                                }
-                                if result.telnet_detected {
-                                    let _ = event_tx_read.send(AppEvent::MultiuserTelnetDetected(world_index, username_read.clone())).await;
-                                }
-                                if let Some(prompt_bytes) = result.prompt {
-                                    let _ = event_tx_read.send(AppEvent::MultiuserPrompt(world_index, username_read.clone(), prompt_bytes)).await;
-                                }
-                                if !result.cleaned.is_empty() {
-                                    let _ = event_tx_read.send(AppEvent::MultiuserServerData(world_index, username_read.clone(), result.cleaned)).await;
-                                }
-                            }
-                            let _ = event_tx_read.send(AppEvent::MultiuserServerData(
-                                world_index,
-                                username_read.clone(),
-                                "Connection closed by server.\n".as_bytes().to_vec(),
-                            )).await;
-                            let _ = event_tx_read.send(AppEvent::MultiuserDisconnected(world_index, username_read.clone())).await;
-                            break;
-                        }
-                        Ok(n) => {
-                            line_buffer.extend_from_slice(&buffer[..n]);
-                            let split_at = find_safe_split_point(&line_buffer);
-                            let to_send = if split_at > 0 {
-                                line_buffer.drain(..split_at).collect()
-                            } else if !line_buffer.is_empty() {
-                                std::mem::take(&mut line_buffer)
-                            } else {
-                                Vec::new()
-                            };
-
-                            if !to_send.is_empty() {
-                                let result = process_telnet(&to_send);
-                                if !result.responses.is_empty() {
-                                    let _ = telnet_tx.send(WriteCommand::Raw(result.responses)).await;
-                                }
-                                if result.telnet_detected {
-                                    let _ = event_tx_read.send(AppEvent::MultiuserTelnetDetected(world_index, username_read.clone())).await;
-                                }
-                                if let Some(prompt_bytes) = result.prompt {
-                                    let _ = event_tx_read.send(AppEvent::MultiuserPrompt(world_index, username_read.clone(), prompt_bytes)).await;
-                                }
-                                if !result.cleaned.is_empty() {
-                                    let _ = event_tx_read.send(AppEvent::MultiuserServerData(world_index, username_read.clone(), result.cleaned)).await;
-                                }
-                            }
-                        }
-                        Err(e) => {
-                            let msg = format!("Read error: {}", e);
-                            let _ = event_tx_read.send(AppEvent::MultiuserServerData(world_index, username_read.clone(), msg.into_bytes())).await;
-                            let _ = event_tx_read.send(AppEvent::MultiuserDisconnected(world_index, username_read.clone())).await;
-                            break;
-                        }
-                    }
-                }
-            });
-
-            // Spawn writer task
-            tokio::spawn(async move {
-                while let Some(cmd) = cmd_rx.recv().await {
-                    match cmd {
-                        WriteCommand::Text(text) => {
-                            let bytes = format!("{}\r\n", text).into_bytes();
-                            if write_half.write_all(&bytes).await.is_err() {
-                                break;
-                            }
-                            let _ = write_half.flush().await;
-                        }
-                        WriteCommand::Raw(raw) => {
-                            if write_half.write_all(&raw).await.is_err() {
-                                break;
-                            }
-                            let _ = write_half.flush().await;
-                        }
-                        WriteCommand::Shutdown => {
-                            // Gracefully shutdown the connection
-                            let _ = write_half.shutdown().await;
-                            break;
-                        }
-                    }
-                }
-            });
-
-            Some(cmd_tx)
-        }
-        Err(_) => None,
-    }
-}
-
-/// Connect a world in daemon mode (non-multiuser)
-/// Returns a command sender if connection succeeds
-async fn connect_daemon_world(
-    _world_index: usize,
-    world_name: String,
-    settings: &WorldSettings,
-    event_tx: mpsc::Sender<AppEvent>,
-) -> Option<mpsc::Sender<WriteCommand>> {
-    let host = &settings.hostname;
-    let port = &settings.port;
-    let use_ssl = settings.use_ssl;
-
-    if host.is_empty() || port.is_empty() {
-        return None;
-    }
-
-    match TcpStream::connect(format!("{}:{}", host, port)).await {
-        Ok(tcp_stream) => {
-            let _ = tcp_stream.set_nodelay(true);
-
-            // Enable TCP keepalive to detect dead connections faster
-            enable_tcp_keepalive(&tcp_stream);
-
-            // Handle SSL if needed
-            let (mut read_half, mut write_half): (StreamReader, StreamWriter) = if use_ssl {
-                #[cfg(feature = "native-tls-backend")]
-                {
-                    let connector = match native_tls::TlsConnector::builder()
-                        .danger_accept_invalid_certs(true)
-                        .build()
-                    {
-                        Ok(c) => c,
-                        Err(_) => return None,
-                    };
-                    let connector = tokio_native_tls::TlsConnector::from(connector);
-
-                    match connector.connect(host, tcp_stream).await {
-                        Ok(tls_stream) => {
-                            let (r, w) = tokio::io::split(tls_stream);
-                            (StreamReader::Tls(r), StreamWriter::Tls(w))
-                        }
-                        Err(_) => return None,
-                    }
-                }
-
-                #[cfg(feature = "rustls-backend")]
-                {
-                    use rustls::RootCertStore;
-                    use tokio_rustls::TlsConnector;
-                    use rustls::pki_types::ServerName;
-
-                    let mut root_store = RootCertStore::empty();
-                    root_store.roots = webpki_roots::TLS_SERVER_ROOTS.iter().map(|ta| { rustls::pki_types::TrustAnchor { subject: ta.subject.into(), subject_public_key_info: ta.spki.into(), name_constraints: ta.name_constraints.map(|nc| nc.into()), } }).collect();
-
-                    let config = rustls::ClientConfig::builder()
-                        .dangerous()
-                        .with_custom_certificate_verifier(Arc::new(danger::NoCertificateVerification::new()))
-                        .with_no_client_auth();
-
-                    let connector = TlsConnector::from(Arc::new(config));
-                    let server_name = match ServerName::try_from(host.clone()) {
-                        Ok(sn) => sn,
-                        Err(_) => return None,
-                    };
-
-                    match connector.connect(server_name, tcp_stream).await {
-                        Ok(tls_stream) => {
-                            let (r, w) = tokio::io::split(tls_stream);
-                            (StreamReader::Tls(r), StreamWriter::Tls(w))
-                        }
-                        Err(_) => return None,
-                    }
-                }
-
-                #[cfg(not(any(feature = "native-tls-backend", feature = "rustls-backend")))]
-                {
-                    return None;
-                }
-            } else {
-                let (r, w) = tcp_stream.into_split();
-                (StreamReader::Plain(r), StreamWriter::Plain(w))
-            };
-
-            let (cmd_tx, mut cmd_rx) = mpsc::channel::<WriteCommand>(100);
-
-            // Send auto-login if configured
-            let user = settings.user.clone();
-            let password = settings.password.clone();
-            let auto_connect_type = settings.auto_connect_type;
-            if !user.is_empty() && !password.is_empty() && auto_connect_type == AutoConnectType::Connect {
-                let tx = cmd_tx.clone();
-                tokio::spawn(async move {
-                    tokio::time::sleep(Duration::from_millis(500)).await;
-                    let connect_cmd = format!("connect {} {}", user, password);
-                    let _ = tx.send(WriteCommand::Text(connect_cmd)).await;
-                });
-            }
-
-            // Clone for reader task
-            let telnet_tx = cmd_tx.clone();
-            let event_tx_read = event_tx.clone();
-            let world_name_read = world_name.clone();
-
-            // Spawn reader task
-            tokio::spawn(async move {
-                let mut buffer = BytesMut::with_capacity(4096);
-                buffer.resize(4096, 0);
-                let mut line_buffer: Vec<u8> = Vec::new();
-
-                loop {
-                    match read_half.read(&mut buffer).await {
-                        Ok(0) => {
-                            // Connection closed
-                            if !line_buffer.is_empty() {
-                                let result = process_telnet(&line_buffer);
-                                if !result.responses.is_empty() {
-                                    let _ = telnet_tx.send(WriteCommand::Raw(result.responses)).await;
-                                }
-                                if !result.cleaned.is_empty() {
-                                    let _ = event_tx_read.send(AppEvent::ServerData(world_name_read.clone(), result.cleaned)).await;
-                                }
-                            }
-                            let _ = event_tx_read.send(AppEvent::ServerData(
-                                world_name_read.clone(),
-                                "Connection closed by server.\n".as_bytes().to_vec(),
-                            )).await;
-                            let _ = event_tx_read.send(AppEvent::Disconnected(world_name_read.clone())).await;
-                            break;
-                        }
-                        Ok(n) => {
-                            line_buffer.extend_from_slice(&buffer[..n]);
-                            let split_at = find_safe_split_point(&line_buffer);
-                            let to_send = if split_at > 0 {
-                                line_buffer.drain(..split_at).collect()
-                            } else if !line_buffer.is_empty() {
-                                std::mem::take(&mut line_buffer)
-                            } else {
-                                Vec::new()
-                            };
-
-                            if !to_send.is_empty() {
-                                let result = process_telnet(&to_send);
-                                if !result.responses.is_empty() {
-                                    let _ = telnet_tx.send(WriteCommand::Raw(result.responses)).await;
-                                }
-                                if !result.cleaned.is_empty() {
-                                    let _ = event_tx_read.send(AppEvent::ServerData(world_name_read.clone(), result.cleaned)).await;
-                                }
-                            }
-                        }
-                        Err(e) => {
-                            let msg = format!("Read error: {}", e);
-                            let _ = event_tx_read.send(AppEvent::ServerData(world_name_read.clone(), msg.into_bytes())).await;
-                            let _ = event_tx_read.send(AppEvent::Disconnected(world_name_read.clone())).await;
-                            break;
-                        }
-                    }
-                }
-            });
-
-            // Spawn writer task
-            tokio::spawn(async move {
-                while let Some(cmd) = cmd_rx.recv().await {
-                    match cmd {
-                        WriteCommand::Text(text) => {
-                            let bytes = format!("{}\r\n", text).into_bytes();
-                            if write_half.write_all(&bytes).await.is_err() {
-                                break;
-                            }
-                            let _ = write_half.flush().await;
-                        }
-                        WriteCommand::Raw(raw) => {
-                            if write_half.write_all(&raw).await.is_err() {
-                                break;
-                            }
-                            let _ = write_half.flush().await;
-                        }
-                        WriteCommand::Shutdown => {
-                            let _ = write_half.shutdown().await;
-                            break;
-                        }
-                    }
-                }
-            });
-
-            Some(cmd_tx)
-        }
-        Err(_) => None,
-    }
-}
-
-/// Build initial state message for a specific user (multiuser mode)
-/// World definitions are shared, but connection state is per-user
-/// Actions are still filtered per-user
-fn build_multiuser_initial_state(app: &App, username: &str) -> WsMessage {
-    // Show all worlds with per-user connection state
-    let worlds: Vec<WorldStateMsg> = app.worlds.iter().enumerate()
-        .map(|(idx, world)| {
-            // Get user's connection state for this world (if any)
-            let key = (idx, username.to_string());
-            let user_conn = app.user_connections.get(&key);
-
-            // Use user's connection state or empty defaults
-            let empty_output: Vec<OutputLine> = vec![];
-            let empty_pending: Vec<OutputLine> = vec![];
-            let (connected, output_lines, pending_lines, prompt, scroll_offset, paused, unseen_lines, last_send, last_recv) =
-                if let Some(conn) = user_conn {
-                    (
-                        conn.connected,
-                        &conn.output_lines,
-                        &conn.pending_lines,
-                        conn.prompt.clone(),
-                        conn.scroll_offset,
-                        conn.paused,
-                        conn.unseen_lines,
-                        conn.last_send_time,
-                        conn.last_receive_time,
-                    )
-                } else {
-                    (false, &empty_output, &empty_pending, String::new(), 0, false, 0, None, None)
-                };
-
-            let clean_output: Vec<String> = output_lines.iter()
-                .map(|s| s.text.replace('\r', ""))
-                .collect();
-            let clean_pending: Vec<String> = pending_lines.iter()
-                .map(|s| s.text.replace('\r', ""))
-                .collect();
-            let output_lines_ts: Vec<TimestampedLine> = output_lines.iter()
-                .map(|s| {
-                    let text = s.text.replace('\r', "");
-                    let text = if !s.from_server {
-                        format!("✨ {}", text)
-                    } else {
-                        text
-                    };
-                    TimestampedLine {
-                        text,
-                        ts: s.timestamp.duration_since(UNIX_EPOCH).unwrap_or_default().as_secs(),
-                        gagged: s.gagged,
-                        from_server: s.from_server,
-                        seq: s.seq,
-                    }
-                })
-                .collect();
-            let pending_lines_ts: Vec<TimestampedLine> = pending_lines.iter()
-                .map(|s| {
-                    let text = s.text.replace('\r', "");
-                    let text = if !s.from_server {
-                        format!("✨ {}", text)
-                    } else {
-                        text
-                    };
-                    TimestampedLine {
-                        text,
-                        ts: s.timestamp.duration_since(UNIX_EPOCH).unwrap_or_default().as_secs(),
-                        gagged: s.gagged,
-                        from_server: s.from_server,
-                        seq: s.seq,
-                    }
-                })
-                .collect();
-
-            WorldStateMsg {
-                index: idx,
-                name: world.name.clone(),
-                connected,
-                output_lines: clean_output,
-                pending_lines: clean_pending,
-                output_lines_ts,
-                pending_lines_ts,
-                prompt: prompt.replace('\r', ""),
-                scroll_offset,
-                paused,
-                unseen_lines,
-                settings: WorldSettingsMsg {
-                    hostname: world.settings.hostname.clone(),
-                    port: world.settings.port.clone(),
-                    user: world.settings.user.clone(),
-                    password: world.settings.password.clone(),
-                    use_ssl: world.settings.use_ssl,
-                    log_enabled: world.settings.log_enabled,
-                    encoding: world.settings.encoding.name().to_string(),
-                    auto_connect_type: world.settings.auto_connect_type.name().to_string(),
-                    keep_alive_type: world.settings.keep_alive_type.name().to_string(),
-                    keep_alive_cmd: world.settings.keep_alive_cmd.clone(),
-                },
-                last_send_secs: last_send.map(|t| t.elapsed().as_secs()),
-                last_recv_secs: last_recv.map(|t| t.elapsed().as_secs()),
-                last_nop_secs: None,
-                keep_alive_type: world.settings.keep_alive_type.name().to_string(),
-                showing_splash: world.showing_splash,
-            }
-        }).collect();
-
-    // Filter actions owned by this user
-    let actions: Vec<Action> = app.settings.actions.iter()
-        .filter(|a| a.owner.as_deref() == Some(username))
-        .cloned()
-        .collect();
-
-    // Build settings (same for all users for now)
-    let settings = GlobalSettingsMsg {
-        more_mode_enabled: app.settings.more_mode_enabled,
-        spell_check_enabled: app.settings.spell_check_enabled,
-        temp_convert_enabled: app.settings.temp_convert_enabled,
-        world_switch_mode: app.settings.world_switch_mode.name().to_string(),
-        debug_enabled: app.settings.debug_enabled,
-        show_tags: app.show_tags,
-        ansi_music_enabled: app.settings.ansi_music_enabled,
-        console_theme: app.settings.theme.name().to_string(),
-        gui_theme: app.settings.gui_theme.name().to_string(),
-        gui_transparency: app.settings.gui_transparency,
-        color_offset_percent: app.settings.color_offset_percent,
-        input_height: app.input_height,
-        font_name: app.settings.font_name.clone(),
-        font_size: app.settings.font_size,
-        web_font_size_phone: app.settings.web_font_size_phone,
-        web_font_size_tablet: app.settings.web_font_size_tablet,
-        web_font_size_desktop: app.settings.web_font_size_desktop,
-        ws_allow_list: app.settings.websocket_allow_list.clone(),
-        web_secure: app.settings.web_secure,
-        http_enabled: app.settings.http_enabled,
-        http_port: app.settings.http_port,
-        ws_enabled: app.settings.ws_enabled,
-        ws_port: app.settings.ws_port,
-        ws_cert_file: app.settings.websocket_cert_file.clone(),
-        ws_key_file: app.settings.websocket_key_file.clone(),
-        tls_proxy_enabled: app.settings.tls_proxy_enabled,
-        dictionary_path: app.settings.dictionary_path.clone(),
-    };
-
-    // Find current world index for this user
-    // Use the first world they have a connection to, or 9999 if none (no world selected)
-    let current_world_index = app.user_connections.keys()
-        .filter(|(_, u)| u == username)
-        .map(|(idx, _)| *idx)
-        .min()
-        .unwrap_or(9999);
-
-    // Generate splash lines for multiuser mode
-    let splash_lines = generate_splash_strings();
-
-    WsMessage::InitialState {
-        worlds,
-        settings,
-        current_world_index,
-        actions,
-        splash_lines,
-    }
-}
-
-/// Generate splash screen content as strings (for web client)
-fn generate_splash_strings() -> Vec<String> {
-    vec![
-        "".to_string(),
-        "\x1b[38;5;180m          (\\/\\__o     \x1b[38;5;209m ██████╗██╗      █████╗ ██╗   ██╗\x1b[0m".to_string(),
-        "\x1b[38;5;180m  __      `-/ `_/     \x1b[38;5;208m██╔════╝██║     ██╔══██╗╚██╗ ██╔╝\x1b[0m".to_string(),
-        "\x1b[38;5;180m `--\\______/  |       \x1b[38;5;215m██║     ██║     ███████║ ╚████╔╝ \x1b[0m".to_string(),
-        "\x1b[38;5;180m    /        /        \x1b[38;5;216m██║     ██║     ██╔══██║  ╚██╔╝  \x1b[0m".to_string(),
-        "\x1b[38;5;180m -`/_------'\\_.       \x1b[38;5;217m╚██████╗███████╗██║  ██║   ██║   \x1b[0m".to_string(),
-        "\x1b[38;5;218m                       ╚═════╝╚══════╝╚═╝  ╚═╝   ╚═╝   \x1b[0m".to_string(),
-        "".to_string(),
-        "\x1b[38;5;213m✨ A 90dies mud client written today ✨\x1b[0m".to_string(),
-        "".to_string(),
-        "\x1b[38;5;244mSelect a world to connect\x1b[0m".to_string(),
-        "".to_string(),
-    ]
-}
-
-/// Handle WebSocket message in multiuser mode
-async fn handle_multiuser_ws_message(
-    app: &mut App,
-    client_id: u64,
-    msg: WsMessage,
-    event_tx: &mpsc::Sender<AppEvent>,
-) {
-    // Get the username for this client
-    let username = if let Some(ws) = &app.ws_server {
-        ws.get_client_username(client_id)
-    } else {
-        None
-    };
-
-    match msg {
-        WsMessage::AuthRequest { .. } => {
-            // Client just authenticated - send them their InitialState filtered by username
-            if let Some(ref uname) = username {
-                let initial_state = build_multiuser_initial_state(app, uname);
-                if let Some(ws) = &app.ws_server {
-                    ws.send_to_client(client_id, initial_state);
-                }
-            }
-        }
-        WsMessage::SendCommand { world_index, command } => {
-            // Send command to user's own connection
-            if let Some(ref uname) = username {
-                let key = (world_index, uname.clone());
-                if let Some(conn) = app.user_connections.get(&key) {
-                    if let Some(tx) = &conn.command_tx {
-                        let _ = tx.send(WriteCommand::Text(command)).await;
-                    }
-                }
-            }
-        }
-        WsMessage::ConnectWorld { world_index } => {
-            // Any user can connect to any world
-            if world_index < app.worlds.len() {
-                if let Some(ref uname) = username {
-                    let _ = event_tx.send(AppEvent::ConnectWorldRequest(world_index, uname.clone())).await;
-                }
-            }
-        }
-        WsMessage::DisconnectWorld { world_index } => {
-            // Disconnect user's own connection
-            if let Some(ref uname) = username {
-                let key = (world_index, uname.clone());
-                if let Some(conn) = app.user_connections.get_mut(&key) {
-                    conn.command_tx = None;
-                    conn.connected = false;
-                    // Notify the user
-                    if let Some(ws) = &app.ws_server {
-                        ws.broadcast_to_owner(
-                            WsMessage::WorldDisconnected { world_index },
-                            Some(uname)
-                        );
-                    }
-                }
-            }
-        }
-        WsMessage::ChangePassword { old_password_hash, new_password_hash } => {
-            if let Some(ref uname) = username {
-                // Find the user and verify old password
-                if let Some(user) = app.users.iter_mut().find(|u| &u.name == uname) {
-                    let old_hash = hash_password(&user.password);
-                    if old_hash == old_password_hash {
-                        // Update password (store the hash, will be encrypted on save)
-                        user.password = new_password_hash.clone();
-                        // Save settings
-                        if let Err(e) = save_multiuser_settings(app) {
-                            eprintln!("Failed to save settings after password change: {}", e);
-                        }
-                        // Send success response
-                        if let Some(ws) = &app.ws_server {
-                            ws.send_to_client(client_id, WsMessage::PasswordChanged {
-                                success: true,
-                                error: None,
-                            });
-                        }
-                    } else {
-                        // Wrong old password
-                        if let Some(ws) = &app.ws_server {
-                            ws.send_to_client(client_id, WsMessage::PasswordChanged {
-                                success: false,
-                                error: Some("Invalid current password".to_string()),
-                            });
-                        }
-                    }
-                }
-            }
-        }
-        WsMessage::Logout => {
-            if let Some(ref uname) = username {
-                // Close all connections for this user
-                let keys_to_remove: Vec<_> = app.user_connections.keys()
-                    .filter(|(_, u)| u == uname)
-                    .cloned()
-                    .collect();
-
-                for key in &keys_to_remove {
-                    // Send shutdown command to gracefully close the TCP connection
-                    if let Some(conn) = app.user_connections.get(key) {
-                        if let Some(tx) = &conn.command_tx {
-                            let _ = tx.try_send(WriteCommand::Shutdown);
-                        }
-                    }
-                }
-
-                for key in keys_to_remove {
-                    // Remove the connection entry
-                    app.user_connections.remove(&key);
-                }
-
-                // Clear the client's authentication state
-                if let Some(ws) = &app.ws_server {
-                    ws.clear_client_auth(client_id);
-                    // Send LoggedOut response
-                    ws.send_to_client(client_id, WsMessage::LoggedOut);
-                }
-            }
-        }
-        WsMessage::RequestState => {
-            // Client requests full state resync
-            if let Some(ref uname) = username {
-                let initial_state = build_multiuser_initial_state(app, uname);
-                if let Some(ws) = &app.ws_server {
-                    ws.send_to_client(client_id, initial_state);
-                }
-            }
-        }
-        WsMessage::SwitchWorld { world_index } => {
-            // Verify the client owns this world
-            if let Some(world) = app.worlds.get(world_index) {
-                if world.owner.as_ref() == username.as_ref() {
-                    // Send WorldSwitched message to the client
-                    if let Some(ws) = &app.ws_server {
-                        ws.send_to_client(client_id, WsMessage::WorldSwitched { new_index: world_index });
-                    }
-                }
-            }
-        }
-        WsMessage::MarkWorldSeen { world_index } => {
-            // Verify the client owns this world
-            if let Some(world) = app.worlds.get_mut(world_index) {
-                if world.owner.as_ref() == username.as_ref() {
-                    world.unseen_lines = 0;
-                    // Broadcast to all clients of this owner
-                    if let Some(ws) = &app.ws_server {
-                        ws.broadcast_to_owner(WsMessage::UnseenCleared { world_index }, world.owner.as_deref());
-                    }
-                }
-            }
-        }
-        WsMessage::ReleasePending { world_index, count } => {
-            // Verify the client owns this world
-            if let Some(world) = app.worlds.get_mut(world_index) {
-                if world.owner.as_ref() == username.as_ref() {
-                    let release_count = if count == 0 { world.pending_lines.len() } else { count.min(world.pending_lines.len()) };
-                    let released: Vec<OutputLine> = world.pending_lines.drain(..release_count).collect();
-                    world.output_lines.extend(released);
-
-                    if world.pending_lines.is_empty() {
-                        world.paused = false;
-                    }
-
-                    // Broadcast to all clients of this owner
-                    if let Some(ws) = &app.ws_server {
-                        ws.broadcast_to_owner(WsMessage::PendingReleased { world_index, count: release_count }, world.owner.as_deref());
-                    }
-                }
-            }
-        }
-        WsMessage::CalculateNextWorld { current_index } | WsMessage::CalculatePrevWorld { current_index } => {
-            // Calculate next/prev world owned by this user
-            if let Some(ref uname) = username {
-                let user_worlds: Vec<usize> = app.worlds.iter().enumerate()
-                    .filter(|(_, w)| w.owner.as_deref() == Some(uname))
-                    .map(|(idx, _)| idx)
-                    .collect();
-
-                let current_pos = user_worlds.iter().position(|&idx| idx == current_index);
-                let next_index = match msg {
-                    WsMessage::CalculateNextWorld { .. } => {
-                        current_pos.map(|p| user_worlds[(p + 1) % user_worlds.len()])
-                    }
-                    WsMessage::CalculatePrevWorld { .. } => {
-                        current_pos.map(|p| {
-                            if p == 0 { user_worlds[user_worlds.len() - 1] }
-                            else { user_worlds[p - 1] }
-                        })
-                    }
-                    _ => None,
-                };
-
-                if let Some(ws) = &app.ws_server {
-                    ws.send_to_client(client_id, WsMessage::CalculatedWorld { index: next_index });
-                }
-            }
-        }
-        // Reject world editing in multiuser mode
-        WsMessage::UpdateWorldSettings { .. } | WsMessage::DeleteWorld { .. } | WsMessage::CreateWorld { .. } => {
-            // Silently reject - users can't edit worlds in multiuser mode
-        }
-        WsMessage::ReportSeqMismatch { world_index, expected_seq_gt, actual_seq, line_text, source } => {
-            let world_name = app.worlds.get(world_index).map(|w| w.name.as_str()).unwrap_or("?");
-            use std::io::Write;
-            if let Ok(mut f) = std::fs::OpenOptions::new()
-                .create(true).append(true)
-                .open("clay.output.debug")
-            {
-                let _ = writeln!(f, "SEQ MISMATCH [{}] in '{}': expected seq>{}, got seq={}, text={:?}",
-                    source, world_name, expected_seq_gt, actual_seq,
-                    line_text.chars().take(80).collect::<String>());
-            }
-        }
-        _ => {} // Handle other messages as needed
-    }
-}
-
 #[tokio::main]
 async fn main() -> io::Result<()> {
     // Check for -v or --version to show version and exit
@@ -19033,28 +6247,6 @@ async fn main() -> io::Result<()> {
         return Ok(());
     }
 
-    // Check for --remote=host:port argument for GUI client mode
-    if let Some(remote_arg) = std::env::args().find(|a| a.starts_with("--remote=")) {
-        #[cfg(all(feature = "remote-gui", not(target_os = "android")))]
-        {
-            let addr = remote_arg.strip_prefix("--remote=").unwrap();
-            return run_remote_gui(addr);
-        }
-        #[cfg(target_os = "android")]
-        {
-            eprintln!("Error: --remote (GUI client) is not available on Android/Termux.");
-            eprintln!("Argument provided: {}", remote_arg);
-            return Ok(());
-        }
-        #[cfg(all(not(feature = "remote-gui"), not(target_os = "android")))]
-        {
-            eprintln!("Error: --remote requires the 'remote-gui' feature.");
-            eprintln!("Rebuild with: cargo build --features remote-gui");
-            eprintln!("Argument provided: {}", remote_arg);
-            return Ok(());
-        }
-    }
-
     // Check for --multiuser mode
     if std::env::args().any(|a| a == "--multiuser") {
         return run_multiuser_server().await;
@@ -19066,10 +6258,83 @@ async fn main() -> io::Result<()> {
         return run_daemon_server().await;
     }
 
-    // Check for --console=host:port argument for console client mode
-    if let Some(console_arg) = std::env::args().find(|a| a.starts_with("--console=")) {
-        let addr = console_arg.strip_prefix("--console=").unwrap();
-        return run_console_client(addr).await;
+    // Parse interface mode (--gui / --console) and connection mode (--remote=host:port)
+    let has_gui_flag = std::env::args().any(|a| a == "--gui");
+    let has_console_flag = std::env::args().any(|a| a == "--console");
+    let remote_addr = std::env::args()
+        .find(|a| a.starts_with("--remote="))
+        .and_then(|a| a.strip_prefix("--remote=").map(|s| s.to_string()));
+
+    // Support legacy --console=host:port syntax (treat as --console --remote=host:port)
+    let (has_console_flag, remote_addr) = if let Some(console_arg) = std::env::args().find(|a| a.starts_with("--console=")) {
+        let addr = console_arg.strip_prefix("--console=").unwrap().to_string();
+        (true, Some(addr))
+    } else {
+        (has_console_flag, remote_addr)
+    };
+
+    // Determine interface: GUI or Console
+    let use_gui = if has_gui_flag && has_console_flag {
+        eprintln!("Error: --gui and --console are mutually exclusive.");
+        return Ok(());
+    } else if has_gui_flag {
+        true
+    } else if has_console_flag {
+        false
+    } else {
+        // Default: GUI on Windows (if feature available), Console elsewhere
+        cfg!(windows) && cfg!(feature = "remote-gui")
+    };
+
+    // Fall back to console if GUI feature not available
+    #[allow(unused_mut)]
+    let mut use_gui = use_gui && cfg!(feature = "remote-gui") && !cfg!(target_os = "android");
+    if has_gui_flag && !use_gui {
+        #[cfg(target_os = "android")]
+        {
+            eprintln!("Warning: --gui is not available on Android/Termux. Falling back to console.");
+        }
+        #[cfg(not(target_os = "android"))]
+        {
+            #[cfg(not(feature = "remote-gui"))]
+            {
+                eprintln!("Warning: --gui requires the 'remote-gui' feature. Falling back to console.");
+                eprintln!("Rebuild with: cargo build --features remote-gui");
+            }
+        }
+    }
+
+    // Dispatch based on (interface, connection_mode)
+    match (use_gui, remote_addr) {
+        // Remote GUI: connect to a running Clay instance via WebSocket
+        (true, Some(ref addr)) => {
+            #[cfg(all(feature = "remote-gui", not(target_os = "android")))]
+            {
+                return remote_gui::run_remote_gui(addr);
+            }
+            #[cfg(not(all(feature = "remote-gui", not(target_os = "android"))))]
+            {
+                let _ = addr;
+                unreachable!("use_gui should be false when remote-gui feature is not available");
+            }
+        }
+        // Master GUI: run App in-process with egui GUI
+        (true, None) => {
+            #[cfg(all(feature = "remote-gui", not(target_os = "android")))]
+            {
+                return remote_gui::run_master_gui();
+            }
+            #[cfg(not(all(feature = "remote-gui", not(target_os = "android"))))]
+            {
+                unreachable!("use_gui should be false when remote-gui feature is not available");
+            }
+        }
+        // Remote console: connect to a running Clay instance via WebSocket
+        (false, Some(ref addr)) => {
+            return run_console_client(addr).await;
+        }
+        // Master console: default TUI mode (falls through to existing code below)
+        (false, None) => {}
     }
 
     // Set up signal handlers for crash debugging (not available on Android or Windows)
@@ -19165,6 +6430,675 @@ async fn main() -> io::Result<()> {
     Ok(())
 }
 
+/// Run the App headlessly (no terminal UI) for master GUI mode.
+/// The App communicates with the embedded GUI via channels.
+pub async fn run_app_headless(
+    gui_tx: mpsc::UnboundedSender<WsMessage>,
+    mut gui_rx: mpsc::UnboundedReceiver<WsMessage>,
+) -> io::Result<()> {
+    let mut app = App::new();
+    app.gui_tx = Some(gui_tx.clone());
+
+    // Check if we're in reload mode (via --reload command line argument)
+    let is_reload = std::env::args().any(|a| a == "--reload");
+    app.is_reload = is_reload;
+    let is_crash = std::env::args().any(|a| a == "--crash");
+
+    // Initialize crash count from environment variable
+    let crash_count = get_crash_count();
+    CRASH_COUNT.store(crash_count, Ordering::SeqCst);
+
+    let should_load_state = is_reload || is_crash;
+
+    if should_load_state {
+        debug_log(true, "HEADLESS STARTUP: Loading reload state...");
+        match persistence::load_reload_state(&mut app) {
+            Ok(true) => {
+                debug_log(true, "HEADLESS STARTUP: Reload state loaded successfully");
+            }
+            Ok(false) => {
+                debug_log(true, "HEADLESS STARTUP: No reload state found");
+                if let Err(e) = persistence::load_settings(&mut app) {
+                    eprintln!("Warning: Could not load settings: {}", e);
+                }
+            }
+            Err(e) => {
+                debug_log(true, &format!("HEADLESS STARTUP: Failed to load reload state: {}", e));
+                if let Err(e) = persistence::load_settings(&mut app) {
+                    eprintln!("Warning: Could not load settings: {}", e);
+                }
+            }
+        }
+    } else {
+        // Normal startup - load settings
+        if let Err(e) = persistence::load_settings(&mut app) {
+            eprintln!("Warning: Could not load settings: {}", e);
+        }
+        // Clear runtime state on fresh start
+        for world in &mut app.worlds {
+            world.connected = false;
+            world.command_tx = None;
+            world.socket_fd = None;
+            world.pending_lines.clear();
+            world.pending_since = None;
+            world.paused = false;
+            world.unseen_lines = 0;
+            world.first_unseen_at = None;
+            world.lines_since_pause = 0;
+        }
+    }
+
+    app.ensure_has_world();
+
+    // Re-create spell checker with custom dictionary path if configured
+    if !app.settings.dictionary_path.is_empty() {
+        app.spell_checker = SpellChecker::new(&app.settings.dictionary_path);
+    }
+
+    let (event_tx, mut event_rx) = mpsc::channel::<AppEvent>(100);
+
+    // Reconstruct connections from saved fds if in reload/crash mode
+    #[cfg(unix)]
+    if should_load_state {
+        debug_log(true, "HEADLESS STARTUP: Reconstructing connections...");
+        // First pass: disconnect TLS worlds without proxy
+        let mut tls_disconnect_worlds: Vec<usize> = Vec::new();
+        for (world_idx, world) in app.worlds.iter().enumerate() {
+            if world.connected && world.is_tls && world.proxy_pid.is_none() {
+                tls_disconnect_worlds.push(world_idx);
+            }
+        }
+        let tls_msg = if is_crash {
+            "TLS connection was closed during crash recovery. Use /worlds to reconnect."
+        } else {
+            "TLS connection was closed during reload. Use /worlds to reconnect."
+        };
+        for world_idx in tls_disconnect_worlds {
+            app.worlds[world_idx].connected = false;
+            app.worlds[world_idx].command_tx = None;
+            app.worlds[world_idx].socket_fd = None;
+            let seq = app.worlds[world_idx].next_seq;
+            app.worlds[world_idx].next_seq += 1;
+            app.worlds[world_idx].output_lines.push(OutputLine::new_client(tls_msg.to_string(), seq));
+            if world_idx != app.current_world_index {
+                if app.worlds[world_idx].unseen_lines == 0 {
+                    app.worlds[world_idx].first_unseen_at = Some(std::time::Instant::now());
+                }
+                app.worlds[world_idx].unseen_lines += 1;
+            }
+        }
+
+        // Second pass: reconstruct plain TCP connections
+        for world_idx in 0..app.worlds.len() {
+            let world = &app.worlds[world_idx];
+            if world.connected && world.socket_fd.is_some() && !world.is_tls {
+                let fd = world.socket_fd.unwrap();
+                let tcp_stream = unsafe { std::net::TcpStream::from_raw_fd(fd) };
+                tcp_stream.set_nonblocking(true)?;
+                let tcp_stream = TcpStream::from_std(tcp_stream)?;
+                let (r, w) = tcp_stream.into_split();
+                let mut read_half = StreamReader::Plain(r);
+                let mut write_half = StreamWriter::Plain(w);
+                let (cmd_tx, mut cmd_rx) = mpsc::channel::<WriteCommand>(100);
+                app.worlds[world_idx].command_tx = Some(cmd_tx.clone());
+                app.worlds[world_idx].skip_auto_login = true;
+                app.worlds[world_idx].open_log_file();
+                let _telnet_tx = cmd_tx;
+                let world_name = app.worlds[world_idx].name.clone();
+
+                // Spawn reader task
+                let reader_tx = event_tx.clone();
+                let reader_world_name = world_name.clone();
+                tokio::spawn(async move {
+                    let mut buf = vec![0u8; 4096];
+                    loop {
+                        match read_half.read(&mut buf).await {
+                            Ok(0) => {
+                                let _ = reader_tx.send(AppEvent::Disconnected(reader_world_name)).await;
+                                break;
+                            }
+                            Ok(n) => {
+                                let data = buf[..n].to_vec();
+                                let _ = reader_tx.send(AppEvent::ServerData(reader_world_name.clone(), data)).await;
+                            }
+                            Err(_) => {
+                                let _ = reader_tx.send(AppEvent::Disconnected(reader_world_name)).await;
+                                break;
+                            }
+                        }
+                    }
+                });
+
+                // Spawn writer task
+                tokio::spawn(async move {
+                    while let Some(cmd) = cmd_rx.recv().await {
+                        match cmd {
+                            WriteCommand::Text(text) => {
+                                let data = format!("{}\r\n", text);
+                                if write_half.write_all(data.as_bytes()).await.is_err() {
+                                    break;
+                                }
+                            }
+                            WriteCommand::Raw(data) => {
+                                if write_half.write_all(&data).await.is_err() {
+                                    break;
+                                }
+                            }
+                            WriteCommand::Shutdown => break,
+                        }
+                    }
+                });
+            }
+
+            // Reconstruct TLS proxy connections
+            #[cfg(all(unix, not(target_os = "android")))]
+            {
+                let world = &app.worlds[world_idx];
+                if world.connected && world.is_tls && world.proxy_pid.is_some() {
+                    if let Some(ref socket_path) = world.proxy_socket_path {
+                        match tokio::net::UnixStream::connect(socket_path).await {
+                            Ok(unix_stream) => {
+                                let (r, w) = unix_stream.into_split();
+                                let mut read_half = StreamReader::Proxy(r);
+                                let mut write_half = StreamWriter::Proxy(w);
+                                let (cmd_tx, mut cmd_rx) = mpsc::channel::<WriteCommand>(100);
+                                app.worlds[world_idx].command_tx = Some(cmd_tx.clone());
+                                app.worlds[world_idx].skip_auto_login = true;
+                                app.worlds[world_idx].open_log_file();
+                                let world_name = app.worlds[world_idx].name.clone();
+
+                                let reader_tx = event_tx.clone();
+                                let reader_world_name = world_name.clone();
+                                tokio::spawn(async move {
+                                    let mut buf = vec![0u8; 4096];
+                                    loop {
+                                        match read_half.read(&mut buf).await {
+                                            Ok(0) => {
+                                                let _ = reader_tx.send(AppEvent::Disconnected(reader_world_name)).await;
+                                                break;
+                                            }
+                                            Ok(n) => {
+                                                let data = buf[..n].to_vec();
+                                                let _ = reader_tx.send(AppEvent::ServerData(reader_world_name.clone(), data)).await;
+                                            }
+                                            Err(_) => {
+                                                let _ = reader_tx.send(AppEvent::Disconnected(reader_world_name)).await;
+                                                break;
+                                            }
+                                        }
+                                    }
+                                });
+
+                                tokio::spawn(async move {
+                                    while let Some(cmd) = cmd_rx.recv().await {
+                                        match cmd {
+                                            WriteCommand::Text(text) => {
+                                                let data = format!("{}\r\n", text);
+                                                if write_half.write_all(data.as_bytes()).await.is_err() {
+                                                    break;
+                                                }
+                                            }
+                                            WriteCommand::Raw(data) => {
+                                                if write_half.write_all(&data).await.is_err() {
+                                                    break;
+                                                }
+                                            }
+                                            WriteCommand::Shutdown => break,
+                                        }
+                                    }
+                                });
+                            }
+                            Err(e) => {
+                                debug_log(true, &format!("HEADLESS: Failed to reconnect proxy for {}: {}", app.worlds[world_idx].name, e));
+                                app.worlds[world_idx].connected = false;
+                                app.worlds[world_idx].command_tx = None;
+                                app.worlds[world_idx].proxy_pid = None;
+                                app.worlds[world_idx].proxy_socket_path = None;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Cleanup: mark disconnected worlds that claim to be connected but have no command channel
+        for world in &mut app.worlds {
+            if world.connected && world.command_tx.is_none() {
+                world.connected = false;
+                world.pending_lines.clear();
+                world.paused = false;
+            }
+        }
+    }
+
+    // Start WebSocket server if enabled
+    if app.settings.ws_enabled && !app.settings.websocket_password.is_empty() {
+        let mut server = WebSocketServer::new(
+            &app.settings.websocket_password,
+            app.settings.ws_port,
+            &app.settings.websocket_allow_list,
+            app.settings.websocket_whitelisted_host.clone(),
+            false,
+            app.ban_list.clone(),
+        );
+
+        #[cfg(feature = "native-tls-backend")]
+        let tls_configured = if app.settings.web_secure
+            && !app.settings.websocket_cert_file.is_empty()
+            && !app.settings.websocket_key_file.is_empty()
+        {
+            match server.configure_tls(&app.settings.websocket_cert_file, &app.settings.websocket_key_file) {
+                Ok(()) => true,
+                Err(e) => { eprintln!("Warning: Failed to configure WSS TLS: {}", e); false }
+            }
+        } else { false };
+        #[cfg(feature = "rustls-backend")]
+        let tls_configured = if app.settings.web_secure
+            && !app.settings.websocket_cert_file.is_empty()
+            && !app.settings.websocket_key_file.is_empty()
+        {
+            match server.configure_tls(&app.settings.websocket_cert_file, &app.settings.websocket_key_file) {
+                Ok(()) => true,
+                Err(e) => { eprintln!("Warning: Failed to configure WSS TLS: {}", e); false }
+            }
+        } else { false };
+
+        if let Err(e) = start_websocket_server(&mut server, event_tx.clone()).await {
+            let err_str = e.to_string();
+            if !err_str.contains("Address in use") && !err_str.contains("address already in use") {
+                eprintln!("Warning: Failed to start WebSocket server: {}", e);
+            }
+        } else {
+            if !app.is_reload {
+                let protocol = if tls_configured { "wss" } else { "ws" };
+                debug_log(true, &format!("WebSocket server started on port {} ({})", app.settings.ws_port, protocol));
+            }
+            app.ws_server = Some(server);
+        }
+    }
+
+    // Start HTTP/HTTPS server if enabled
+    if app.settings.http_enabled {
+        if app.settings.web_secure
+            && !app.settings.websocket_cert_file.is_empty()
+            && !app.settings.websocket_key_file.is_empty()
+        {
+            #[cfg(feature = "native-tls-backend")]
+            {
+                let mut https_server = HttpsServer::new(app.settings.http_port);
+                match start_https_server(
+                    &mut https_server,
+                    &app.settings.websocket_cert_file,
+                    &app.settings.websocket_key_file,
+                    app.settings.ws_port,
+                    true,
+                ).await {
+                    Ok(()) => { app.https_server = Some(https_server); }
+                    Err(e) => {
+                        let err_str = e.to_string();
+                        if !err_str.contains("Address in use") && !err_str.contains("address already in use") {
+                            eprintln!("Warning: Failed to start HTTPS server: {}", e);
+                        }
+                    }
+                }
+            }
+            #[cfg(feature = "rustls-backend")]
+            {
+                let mut https_server = HttpsServer::new(app.settings.http_port);
+                match start_https_server(
+                    &mut https_server,
+                    &app.settings.websocket_cert_file,
+                    &app.settings.websocket_key_file,
+                    app.settings.ws_port,
+                    true,
+                ).await {
+                    Ok(()) => { app.https_server = Some(https_server); }
+                    Err(e) => {
+                        let err_str = e.to_string();
+                        if !err_str.contains("Address in use") && !err_str.contains("address already in use") {
+                            eprintln!("Warning: Failed to start HTTPS server: {}", e);
+                        }
+                    }
+                }
+            }
+        } else {
+            let mut http_server = HttpServer::new(app.settings.http_port);
+            match start_http_server(
+                &mut http_server,
+                app.settings.ws_port,
+                false,
+                app.ban_list.clone(),
+            ).await {
+                Ok(()) => { app.http_server = Some(http_server); }
+                Err(e) => {
+                    let err_str = e.to_string();
+                    if !err_str.contains("Address in use") && !err_str.contains("address already in use") {
+                        eprintln!("Warning: Failed to start HTTP server: {}", e);
+                    }
+                }
+            }
+        }
+    }
+
+    // Re-set gui_tx after potential reload state load (reload clears it)
+    app.gui_tx = Some(gui_tx);
+
+    // Send initial state to the GUI
+    let initial_state = app.build_initial_state();
+    app.ws_broadcast(initial_state);
+
+    // Keepalive interval
+    const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(5 * 60);
+    let mut keepalive_interval = tokio::time::interval(Duration::from_secs(60));
+    keepalive_interval.tick().await;
+
+    // Prompt timeout detection
+    let mut prompt_check_interval = tokio::time::interval(Duration::from_millis(150));
+    prompt_check_interval.tick().await;
+
+    // SIGUSR1 handler for hot reload
+    #[cfg(all(unix, not(target_os = "android")))]
+    {
+        let sigusr1_tx = event_tx.clone();
+        tokio::spawn(async move {
+            let mut sigusr1 = match signal(SignalKind::user_defined1()) {
+                Ok(s) => s,
+                Err(e) => {
+                    eprintln!("Failed to set up SIGUSR1 handler: {}", e);
+                    return;
+                }
+            };
+            loop {
+                sigusr1.recv().await;
+                let _ = sigusr1_tx.send(AppEvent::Sigusr1Received).await;
+            }
+        });
+    }
+
+    debug_log(true, "HEADLESS: Entering main event loop");
+
+    // Main event loop
+    loop {
+        #[cfg(all(unix, not(target_os = "android")))]
+        reap_zombie_children();
+
+        tokio::select! {
+            // App events (server data, disconnects, WS client messages)
+            Some(event) = event_rx.recv() => {
+                match event {
+                    AppEvent::ServerData(ref world_name, ref bytes) => {
+                        if let Some(world_idx) = app.find_world_index(world_name) {
+                            let commands = app.process_server_data(
+                                world_idx, bytes, 24, 80, true,
+                            );
+                            let saved_current_world = app.current_world_index;
+                            app.current_world_index = world_idx;
+                            for cmd in commands {
+                                if cmd.starts_with('/') {
+                                    let parsed = parse_command(&cmd);
+                                    match parsed {
+                                        Command::Send { text, target_world, .. } => {
+                                            let target_idx = if let Some(ref w) = target_world {
+                                                app.find_world_index(w)
+                                            } else { Some(world_idx) };
+                                            if let Some(idx) = target_idx {
+                                                if let Some(tx) = &app.worlds[idx].command_tx {
+                                                    let _ = tx.send(WriteCommand::Text(text)).await;
+                                                }
+                                            }
+                                        }
+                                        Command::Notify { message } => {
+                                            let title = if world_idx < app.worlds.len() {
+                                                app.worlds[world_idx].name.clone()
+                                            } else {
+                                                "Clay".to_string()
+                                            };
+                                            app.ws_broadcast(WsMessage::Notification {
+                                                title,
+                                                message: message.clone(),
+                                            });
+                                        }
+                                        _ => {}
+                                    }
+                                } else if cmd.starts_with('#') {
+                                    if let tf::TfCommandResult::SendToMud(text) = app.tf_engine.execute(&cmd) {
+                                        if let Some(tx) = &app.worlds[world_idx].command_tx {
+                                            let _ = tx.try_send(WriteCommand::Text(text));
+                                        }
+                                    }
+                                } else if let Some(tx) = &app.worlds[world_idx].command_tx {
+                                    let _ = tx.try_send(WriteCommand::Text(cmd));
+                                }
+                            }
+                            app.current_world_index = saved_current_world;
+                        }
+                    }
+                    AppEvent::Disconnected(ref world_name) => {
+                        if let Some(world_idx) = app.find_world_index(world_name) {
+                            // Fire TF DISCONNECT hook
+                            let hook_result = tf::bridge::fire_event(&mut app.tf_engine, tf::TfHookEvent::Disconnect);
+                            for cmd in hook_result.clay_commands {
+                                let _ = app.tf_engine.execute(&cmd);
+                            }
+
+                            app.worlds[world_idx].connected = false;
+                            app.worlds[world_idx].command_tx = None;
+                            app.worlds[world_idx].telnet_mode = false;
+                            app.worlds[world_idx].socket_fd = None;
+                            app.worlds[world_idx].naws_enabled = false;
+                            app.worlds[world_idx].naws_sent_size = None;
+                            if !app.worlds[world_idx].prompt.is_empty() {
+                                let prompt_text = app.worlds[world_idx].prompt.trim().to_string();
+                                let seq = app.worlds[world_idx].next_seq;
+                                app.worlds[world_idx].next_seq += 1;
+                                app.worlds[world_idx].output_lines.push(OutputLine::new(prompt_text, seq));
+                            }
+                            app.worlds[world_idx].prompt.clear();
+                            let seq = app.worlds[world_idx].next_seq;
+                            app.worlds[world_idx].next_seq += 1;
+                            let disconnect_msg = OutputLine::new_client("Disconnected.".to_string(), seq);
+                            app.worlds[world_idx].output_lines.push(disconnect_msg.clone());
+
+                            if world_idx != app.current_world_index {
+                                if app.worlds[world_idx].unseen_lines == 0 {
+                                    app.worlds[world_idx].first_unseen_at = Some(std::time::Instant::now());
+                                }
+                                app.worlds[world_idx].unseen_lines += 1;
+                            }
+
+                            app.ws_broadcast(WsMessage::ServerData {
+                                world_index: world_idx,
+                                data: "Disconnected.\n".to_string(),
+                                is_viewed: world_idx == app.current_world_index,
+                                ts: disconnect_msg.timestamp.duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs(),
+                                from_server: false,
+                            });
+                            app.ws_broadcast(WsMessage::WorldDisconnected { world_index: world_idx });
+                        }
+                    }
+                    AppEvent::WsClientMessage(client_id, msg) => {
+                        if matches!(*msg, WsMessage::AuthRequest { .. }) {
+                            let initial_state = app.build_initial_state();
+                            app.ws_send_to_client(client_id, initial_state);
+                        } else {
+                            daemon::handle_daemon_ws_message(&mut app, client_id, *msg, &event_tx).await;
+                        }
+                    }
+                    AppEvent::WsClientConnected(_client_id) => {}
+                    AppEvent::WsClientDisconnected(client_id) => {
+                        app.ws_client_worlds.remove(&client_id);
+                    }
+                    AppEvent::SystemMessage(msg) => {
+                        // Add to current world's output and broadcast
+                        let seq = app.current_world().next_seq;
+                        let world_idx = app.current_world_index;
+                        app.worlds[world_idx].next_seq += 1;
+                        app.worlds[world_idx].output_lines.push(OutputLine::new_client(msg.clone(), seq));
+                        app.ws_broadcast(WsMessage::ServerData {
+                            world_index: world_idx,
+                            data: format!("{}\n", msg),
+                            is_viewed: true,
+                            ts: current_timestamp_secs(),
+                            from_server: false,
+                        });
+                    }
+                    AppEvent::Sigusr1Received => {
+                        #[cfg(all(unix, not(target_os = "android")))]
+                        {
+                            debug_log(true, "HEADLESS: Received SIGUSR1, triggering reload");
+                            exec_reload(&app)?;
+                            return Ok(());
+                        }
+                    }
+                    _ => {}
+                }
+            }
+
+            // GUI messages (same format as WsMessage - reuse daemon handler)
+            Some(msg) = gui_rx.recv() => {
+                // Use client_id 0 for the embedded GUI (not a real WS client)
+                daemon::handle_daemon_ws_message(&mut app, 0, msg, &event_tx).await;
+            }
+
+            // Keepalive timer
+            _ = keepalive_interval.tick() => {
+                for world in &mut app.worlds {
+                    if world.connected {
+                        let last_activity = match (world.last_send_time, world.last_receive_time) {
+                            (Some(s), Some(r)) => Some(s.max(r)),
+                            (Some(s), None) => Some(s),
+                            (None, Some(r)) => Some(r),
+                            (None, None) => None,
+                        };
+                        let should_send = match last_activity {
+                            Some(t) => t.elapsed() >= KEEPALIVE_INTERVAL,
+                            None => true,
+                        };
+                        if should_send {
+                            if let Some(tx) = &world.command_tx {
+                                let now = std::time::Instant::now();
+                                match world.settings.keep_alive_type {
+                                    KeepAliveType::None => {}
+                                    KeepAliveType::Nop => {
+                                        let nop = vec![TELNET_IAC, TELNET_NOP];
+                                        let _ = tx.try_send(WriteCommand::Raw(nop));
+                                        world.last_send_time = Some(now);
+                                        world.last_nop_time = Some(now);
+                                    }
+                                    KeepAliveType::Custom => {
+                                        let rand_num = (std::time::SystemTime::now()
+                                            .duration_since(std::time::UNIX_EPOCH)
+                                            .unwrap_or_default()
+                                            .as_nanos() % 1000 + 1) as u32;
+                                        let idler_tag = format!("###_idler_message_{}_###", rand_num);
+                                        let cmd = world.settings.keep_alive_cmd
+                                            .replace("##rand##", &idler_tag);
+                                        let _ = tx.try_send(WriteCommand::Text(cmd));
+                                        world.last_send_time = Some(now);
+                                        world.last_nop_time = Some(now);
+                                    }
+                                    KeepAliveType::Generic => {
+                                        let rand_num = (std::time::SystemTime::now()
+                                            .duration_since(std::time::UNIX_EPOCH)
+                                            .unwrap_or_default()
+                                            .as_nanos() % 1000 + 1) as u32;
+                                        let cmd = format!("help commands ###_idler_message_{}_###", rand_num);
+                                        let _ = tx.try_send(WriteCommand::Text(cmd));
+                                        world.last_send_time = Some(now);
+                                        world.last_nop_time = Some(now);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // Check proxy health
+                #[cfg(all(unix, not(target_os = "android")))]
+                for world in &mut app.worlds {
+                    if world.connected {
+                        if let Some(proxy_pid) = world.proxy_pid {
+                            if !is_process_alive(proxy_pid) {
+                                world.connected = false;
+                                world.command_tx = None;
+                                world.proxy_pid = None;
+                                world.proxy_socket_path = None;
+                                let seq = world.next_seq;
+                                world.next_seq += 1;
+                                world.output_lines.push(OutputLine::new("TLS proxy terminated. Connection lost.".to_string(), seq));
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Prompt timeout check
+            _ = prompt_check_interval.tick() => {
+                let now = std::time::Instant::now();
+                for world in &mut app.worlds {
+                    if let Some(wont_echo_time) = world.wont_echo_time {
+                        if now.duration_since(wont_echo_time) >= Duration::from_millis(150) {
+                            if !world.trigger_partial_line.is_empty() && world.prompt.is_empty() {
+                                let prompt_text = std::mem::take(&mut world.trigger_partial_line);
+                                let prompt_clean = prompt_text.replace('\r', "").replace('\n', " ");
+                                let normalized = format!("{} ", prompt_clean.trim());
+
+                                if !world.connected {
+                                    let seq = world.next_seq;
+                                    world.next_seq += 1;
+                                    world.output_lines.push(OutputLine::new(normalized.trim().to_string(), seq));
+                                    world.wont_echo_time = None;
+                                    continue;
+                                }
+
+                                world.prompt = normalized;
+                                world.prompt_count += 1;
+
+                                // Handle auto-login
+                                if !world.skip_auto_login {
+                                    let auto_type = world.settings.auto_connect_type;
+                                    let user = world.settings.user.clone();
+                                    let password = world.settings.password.clone();
+                                    let prompt_num = world.prompt_count;
+
+                                    if !user.is_empty() && !password.is_empty() {
+                                        let cmd_to_send = match auto_type {
+                                            AutoConnectType::Prompt => {
+                                                match prompt_num {
+                                                    1 => Some(user),
+                                                    2 => Some(password),
+                                                    _ => None,
+                                                }
+                                            }
+                                            AutoConnectType::MooPrompt => {
+                                                match prompt_num {
+                                                    1 => Some(user.clone()),
+                                                    2 => Some(password),
+                                                    3 => Some(user),
+                                                    _ => None,
+                                                }
+                                            }
+                                            AutoConnectType::Connect => None,
+                                        };
+
+                                        if let Some(cmd) = cmd_to_send {
+                                            world.prompt.clear();
+                                            if let Some(tx) = &world.command_tx {
+                                                let _ = tx.try_send(WriteCommand::Text(cmd));
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            world.wont_echo_time = None;
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
 async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result<()> {
     let mut app = App::new();
 
@@ -19187,7 +7121,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
     if should_load_state {
         // Load the reload state
         debug_log(true, "STARTUP: Loading reload state...");
-        match load_reload_state(&mut app) {
+        match persistence::load_reload_state(&mut app) {
             Ok(true) => {
                 debug_log(true, "STARTUP: Reload state loaded successfully");
                 // Silent on success - only show errors
@@ -19195,21 +7129,21 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
             Ok(false) => {
                 debug_log(true, "STARTUP: No reload state found");
                 startup_messages.push("Warning: No reload state found, starting fresh.".to_string());
-                if let Err(e) = load_settings(&mut app) {
+                if let Err(e) = persistence::load_settings(&mut app) {
                     startup_messages.push(format!("Warning: Could not load settings: {}", e));
                 }
             }
             Err(e) => {
                 debug_log(true, &format!("STARTUP: Failed to load reload state: {}", e));
                 startup_messages.push(format!("Warning: Failed to load reload state: {}", e));
-                if let Err(e) = load_settings(&mut app) {
+                if let Err(e) = persistence::load_settings(&mut app) {
                     startup_messages.push(format!("Warning: Could not load settings: {}", e));
                 }
             }
         }
     } else {
         // Normal startup - load settings from file
-        if let Err(e) = load_settings(&mut app) {
+        if let Err(e) = persistence::load_settings(&mut app) {
             startup_messages.push(format!("Warning: Could not load settings: {}", e));
         }
         // On fresh start, clear all runtime state that was persisted for reload
@@ -20792,7 +8726,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                     Command::Unban { host } => {
                                         if app.ban_list.remove_ban(&host) {
                                             // Save settings to persist the change
-                                            let _ = save_settings(&app);
+                                            let _ = persistence::save_settings(&app);
                                             app.ws_broadcast(WsMessage::ServerData {
                                                 world_index,
                                                 data: format!("Removed ban for: {}", host),
@@ -21066,7 +9000,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                     app.add_output(&format!("World '{}' deleted.\n", deleted_name));
                                     // Broadcast WorldRemoved to all clients
                                     app.ws_broadcast(WsMessage::WorldRemoved { world_index });
-                                    let _ = save_settings(&app);
+                                    let _ = persistence::save_settings(&app);
                                 }
                             }
                             WsMessage::MarkWorldSeen { world_index } => {
@@ -21184,7 +9118,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                     app.worlds[world_index].settings.keep_alive_type = KeepAliveType::from_name(&keep_alive_type);
                                     app.worlds[world_index].settings.keep_alive_cmd = keep_alive_cmd.clone();
                                     // Save settings to persist changes
-                                    let _ = save_settings(&app);
+                                    let _ = persistence::save_settings(&app);
                                     // Build settings message for broadcast (encrypt password)
                                     let settings_msg = WorldSettingsMsg {
                                         hostname,
@@ -21247,7 +9181,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                     app.spell_checker = SpellChecker::new(&app.settings.dictionary_path);
                                 }
                                 // Save settings to persist changes
-                                let _ = save_settings(&app);
+                                let _ = persistence::save_settings(&app);
                                 // Build settings message for broadcast
                                 let settings_msg = GlobalSettingsMsg {
                                     more_mode_enabled: app.settings.more_mode_enabled,
@@ -21288,7 +9222,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                 // Update actions from remote client
                                 app.settings.actions = actions.clone();
                                 // Save settings to persist changes
-                                let _ = save_settings(&app);
+                                let _ = persistence::save_settings(&app);
                                 // Broadcast update to all clients
                                 app.ws_broadcast(WsMessage::ActionsUpdated {
                                     actions,
@@ -21417,7 +9351,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                             WsMessage::UnbanRequest { host } => {
                                 if app.ban_list.remove_ban(&host) {
                                     // Save settings to persist the change
-                                    let _ = save_settings(&app);
+                                    let _ = persistence::save_settings(&app);
                                     // Broadcast updated ban list to all clients
                                     app.ws_broadcast(WsMessage::BanListResponse { bans: app.ban_list.get_ban_info() });
                                     app.ws_send_to_client(client_id, WsMessage::UnbanResult { success: true, host, error: None });
@@ -22520,7 +10454,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                 Command::Unban { host } => {
                                     if app.ban_list.remove_ban(&host) {
                                         // Save settings to persist the change
-                                        let _ = save_settings(&app);
+                                        let _ = persistence::save_settings(&app);
                                         app.ws_broadcast(WsMessage::ServerData {
                                             world_index,
                                             data: format!("Removed ban for: {}", host),
@@ -22722,7 +10656,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                 app.worlds[world_index].settings.auto_connect_type = AutoConnectType::from_name(&auto_login);
                                 app.worlds[world_index].settings.keep_alive_type = KeepAliveType::from_name(&keep_alive_type);
                                 app.worlds[world_index].settings.keep_alive_cmd = keep_alive_cmd.clone();
-                                let _ = save_settings(&app);
+                                let _ = persistence::save_settings(&app);
                                 let settings_msg = WorldSettingsMsg {
                                     hostname, port, user,
                                     password: encrypt_password(&password),
@@ -22771,7 +10705,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                 app.settings.dictionary_path = dictionary_path;
                                 app.spell_checker = SpellChecker::new(&app.settings.dictionary_path);
                             }
-                            let _ = save_settings(&app);
+                            let _ = persistence::save_settings(&app);
                             let settings_msg = GlobalSettingsMsg {
                                 more_mode_enabled: app.settings.more_mode_enabled,
                                 spell_check_enabled: app.settings.spell_check_enabled,
@@ -22805,7 +10739,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                         }
                         WsMessage::UpdateActions { actions } => {
                             app.settings.actions = actions.clone();
-                            let _ = save_settings(&app);
+                            let _ = persistence::save_settings(&app);
                             app.ws_broadcast(WsMessage::ActionsUpdated { actions });
                         }
                         WsMessage::CalculateNextWorld { current_index } => {
@@ -22925,7 +10859,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                         WsMessage::UnbanRequest { host } => {
                             if app.ban_list.remove_ban(&host) {
                                 // Save settings to persist the change
-                                let _ = save_settings(&app);
+                                let _ = persistence::save_settings(&app);
                                 // Broadcast updated ban list to all clients
                                 app.ws_broadcast(WsMessage::BanListResponse { bans: app.ban_list.get_ban_info() });
                                 app.ws_send_to_client(client_id, WsMessage::UnbanResult { success: true, host, error: None });
@@ -23052,7 +10986,7 @@ fn handle_key_event(key: KeyEvent, app: &mut App) -> KeyAction {
                             app.settings.actions.remove(action_index);
                             app.add_output(&format!("Action '{}' deleted.", action_name));
                             // Save settings to disk
-                            let _ = save_settings(app);
+                            let _ = persistence::save_settings(app);
                             // Reopen actions list to show updated list
                             app.open_actions_list_popup();
                         }
@@ -23157,7 +11091,7 @@ fn handle_key_event(key: KeyEvent, app: &mut App) -> KeyAction {
                     app.spell_checker = SpellChecker::new(&app.settings.dictionary_path);
                 }
                 // Save settings to disk
-                let _ = save_settings(app);
+                let _ = persistence::save_settings(app);
             }
             NewPopupAction::WebSaved(settings) => {
                 // Apply saved web settings
@@ -23171,7 +11105,7 @@ fn handle_key_event(key: KeyEvent, app: &mut App) -> KeyAction {
                 app.settings.websocket_cert_file = settings.ws_cert_file;
                 app.settings.websocket_key_file = settings.ws_key_file;
                 // Save settings to disk
-                let _ = save_settings(app);
+                let _ = persistence::save_settings(app);
                 // Note: Server start/stop requires reload to take effect
                 app.add_output("Web settings saved. Use /reload to apply server changes.");
             }
@@ -23201,7 +11135,7 @@ fn handle_key_event(key: KeyEvent, app: &mut App) -> KeyAction {
                         // Toggle enable/disable for the action
                         if idx < app.settings.actions.len() {
                             app.settings.actions[idx].enabled = !app.settings.actions[idx].enabled;
-                            let _ = save_settings(app);
+                            let _ = persistence::save_settings(app);
 
                             // Update the list display in the popup
                             use popup::definitions::actions::{ActionInfo, filter_actions, ACTIONS_FIELD_FILTER, ACTIONS_FIELD_LIST};
@@ -23231,7 +11165,7 @@ fn handle_key_event(key: KeyEvent, app: &mut App) -> KeyAction {
                                         *items = filtered.iter().filter_map(|info| {
                                             // Find original index
                                             app.settings.actions.iter().position(|a| a.name == info.name).map(|orig_idx| {
-                                                let status = if info.enabled { "[✓]" } else { "[ ]" };
+                                                let status = if info.enabled { "[x]" } else { "[ ]" };
                                                 let world_part = if info.world.is_empty() {
                                                     String::new()
                                                 } else {
@@ -23293,7 +11227,7 @@ fn handle_key_event(key: KeyEvent, app: &mut App) -> KeyAction {
                             *items = filtered.iter().filter_map(|info| {
                                 // Find original index
                                 app.settings.actions.iter().position(|a| a.name == info.name).map(|orig_idx| {
-                                    let status = if info.enabled { "[✓]" } else { "[ ]" };
+                                    let status = if info.enabled { "[x]" } else { "[ ]" };
                                     let world_part = if info.world.is_empty() {
                                         String::new()
                                     } else {
@@ -23356,7 +11290,7 @@ fn handle_key_event(key: KeyEvent, app: &mut App) -> KeyAction {
                             app.add_output(&format!("Action '{}' created.", action.name));
                         }
                         // Save settings to disk
-                        let _ = save_settings(app);
+                        let _ = persistence::save_settings(app);
                         // Reopen actions list to show updated list
                         app.open_actions_list_popup();
                     }
@@ -23410,7 +11344,7 @@ fn handle_key_event(key: KeyEvent, app: &mut App) -> KeyAction {
                     app.worlds[idx].settings.discord_dm_user = settings.discord_dm_user;
 
                     app.add_output(&format!("World '{}' saved.", app.worlds[idx].name));
-                    let _ = save_settings(app);
+                    let _ = persistence::save_settings(app);
                 }
             }
             NewPopupAction::WorldEditorDelete(idx) => {
@@ -24512,7 +12446,7 @@ async fn handle_command(cmd: &str, app: &mut App, event_tx: mpsc::Sender<AppEven
             let current_idx = app.current_world_index;
             let lines: Vec<String> = app.worlds.iter().enumerate().map(|(idx, world)| {
                 let current = if idx == current_idx { "*" } else { " " };
-                let connected = if world.connected { "✓" } else { " " };
+                let connected = if world.connected { "x" } else { " " };
                 let type_str = world.settings.keep_alive_type.name();
                 let cmd_str = if world.settings.keep_alive_cmd.is_empty() {
                     "(none)".to_string()
@@ -24536,7 +12470,7 @@ async fn handle_command(cmd: &str, app: &mut App, event_tx: mpsc::Sender<AppEven
                 app.add_output(&line);
             }
             app.add_output("─".repeat(70).as_str());
-            app.add_output("(*=current, ✓=connected)");
+            app.add_output("(*=current, x=connected)");
         }
         Command::Actions { world } => {
             if let Some(world_name) = world {
@@ -25318,10 +13252,10 @@ async fn handle_command(cmd: &str, app: &mut App, event_tx: mpsc::Sender<AppEven
                 app.add_output(&format!("Removed ban for: {}", host));
                 // Save settings to persist the change
                 if app.multiuser_mode {
-                    if let Err(e) = save_multiuser_settings(app) {
+                    if let Err(e) = persistence::save_multiuser_settings(app) {
                         app.add_output(&format!("Warning: Failed to save settings: {}", e));
                     }
-                } else if let Err(e) = save_settings(app) {
+                } else if let Err(e) = persistence::save_settings(app) {
                     app.add_output(&format!("Warning: Failed to save settings: {}", e));
                 }
                 // Broadcast updated ban list to remote clients
@@ -25932,7 +13866,12 @@ fn render_output_crossterm(app: &App) {
     let temp_convert_enabled = app.settings.temp_convert_enabled;
     let highlight_actions = app.highlight_actions;
     let world_name = &world.name;
-    let actions = &app.settings.actions;
+    // Pre-compile action patterns once (not per-line)
+    let compiled_patterns = if highlight_actions {
+        compile_action_patterns(world_name, &app.settings.actions)
+    } else {
+        Vec::new()
+    };
 
     // Cache "now" for timestamp formatting - compute once per frame, not per line
     let cached_now = CachedNow::new();
@@ -25983,7 +13922,7 @@ fn render_output_crossterm(app: &App) {
 
     // Helper to check if a line should be highlighted
     let should_highlight = |line: &OutputLine| -> bool {
-        highlight_actions && line_matches_action(&line.text, world_name, actions)
+        highlight_actions && line_matches_compiled_patterns(&line.text, &compiled_patterns)
     };
 
     // Check if filter popup is active with a non-empty filter
@@ -26445,7 +14384,7 @@ fn render_separator_bar(f: &mut Frame, app: &App, area: Rect) {
     let is_connected = world.connected;
     let current_pos = if is_connected {
         // Connection status ball (green when connected)
-        spans.push(Span::raw("🟢"));
+        spans.push(Span::styled("● ", Style::default().fg(Color::Green)));
 
         // World name
         spans.push(Span::styled(

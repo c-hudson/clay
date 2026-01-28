@@ -2824,11 +2824,12 @@
             elements.statusIndicator.className = '';
         }
 
-        if (world && world.name) {
-            elements.connectionStatus.textContent = world.connected ? '🟢' : '🔴';
+        // Only show connection ball and world name when connected (matches console behavior)
+        if (world && world.name && world.connected) {
+            elements.connectionStatus.textContent = '🟢';
             elements.worldName.textContent = ' ' + world.name;
         } else {
-            elements.connectionStatus.textContent = '🔴';
+            elements.connectionStatus.textContent = '';
             elements.worldName.textContent = '';
         }
 

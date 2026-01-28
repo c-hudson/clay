@@ -401,7 +401,7 @@ fn render_field(
         }
 
         FieldKind::Toggle { value } => {
-            let display_value = if *value { "[✓]" } else { "[ ]" };
+            let display_value = if *value { "[x]" } else { "[ ]" };
             render_labeled_field(f, &field.label, display_value, area, label_width, is_selected, theme);
         }
 

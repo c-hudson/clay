@@ -46,29 +46,6 @@ pub struct ActionInfo {
     pub enabled: bool,
 }
 
-/// Match type for actions
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub enum MatchType {
-    Regexp,
-    Wildcard,
-}
-
-impl MatchType {
-    pub fn parse(s: &str) -> Self {
-        match s.to_lowercase().as_str() {
-            "wildcard" => MatchType::Wildcard,
-            _ => MatchType::Regexp,
-        }
-    }
-
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            MatchType::Regexp => "regexp",
-            MatchType::Wildcard => "wildcard",
-        }
-    }
-}
-
 /// Match type options
 pub fn match_type_options() -> Vec<SelectOption> {
     vec![
@@ -82,8 +59,8 @@ pub fn create_actions_list_popup(actions: &[ActionInfo], visible_height: usize) 
     let items: Vec<ListItem> = actions
         .iter()
         .map(|a| {
-            // Format: "[✓] name   world   pattern"
-            let status = if a.enabled { "[✓]" } else { "[ ]" };
+            // Format: "[x] name   world   pattern"
+            let status = if a.enabled { "[x]" } else { "[ ]" };
             let world_part = a.world.clone();
             let pattern_preview = if a.pattern.len() > 30 {
                 format!("{}...", &a.pattern[..27])
