@@ -6689,7 +6689,7 @@ impl eframe::App for RemoteGuiApp {
                     egui::ViewportId::from_hash_of("font_settings_window"),
                     egui::ViewportBuilder::default()
                         .with_title("Font Settings")
-                        .with_inner_size([380.0, 440.0]),
+                        .with_inner_size([380.0, 400.0]),
                     |ctx, _class| {
                         // Apply popup styling
                         ctx.style_mut(|style| {
