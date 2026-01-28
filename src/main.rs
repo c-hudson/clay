@@ -3981,16 +3981,12 @@ fn exec_reload(app: &App) -> io::Result<()> {
     persistence::save_reload_state(app)?;
     debug_log(true, "RELOAD: State saved successfully");
 
-    // Collect socket fds that need to survive exec (plain TCP and TLS proxy Unix sockets)
+    // Collect socket fds that need to survive exec (plain TCP only)
+    // TLS proxy connections reconnect via Unix socket path after reload
     let mut fds_to_keep: Vec<RawFd> = Vec::new();
     for world in &app.worlds {
         // Plain TCP socket
         if let Some(fd) = world.socket_fd {
-            clear_cloexec(fd)?;
-            fds_to_keep.push(fd);
-        }
-        // TLS proxy Unix socket - preserve this to avoid reconnection
-        if let Some(fd) = world.proxy_socket_fd {
             clear_cloexec(fd)?;
             fds_to_keep.push(fd);
         }
@@ -7608,12 +7604,14 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
         }
 
         // Third pass: restore TLS proxy connections
+        // The proxy is designed to accept reconnections - when exec() happens, the old
+        // client connection closes and the proxy waits for a new connection on its listener.
+        // We reconnect via the Unix socket path rather than trying to preserve FDs.
         for world_idx in 0..app.worlds.len() {
             let world = &app.worlds[world_idx];
             if world.connected && world.is_tls && world.proxy_pid.is_some() {
                 let proxy_pid = world.proxy_pid.unwrap();
                 let socket_path = world.proxy_socket_path.clone();
-                let preserved_fd = world.proxy_socket_fd;
 
                 // Check if proxy is still alive
                 if !is_process_alive(proxy_pid) {
@@ -7630,34 +7628,20 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                     continue;
                 }
 
-                // Try to use preserved FD first (most reliable), fall back to reconnection
-                let unix_stream: Option<tokio::net::UnixStream> = if let Some(fd) = preserved_fd {
-                    // Reconstruct UnixStream from preserved file descriptor
-                    use std::os::unix::io::FromRawFd;
-                    let std_stream = unsafe { std::os::unix::net::UnixStream::from_raw_fd(fd) };
-                    match tokio::net::UnixStream::from_std(std_stream) {
-                        Ok(stream) => Some(stream),
-                        Err(_) => None,
-                    }
-                } else {
-                    None
-                };
-
-                // If FD reconstruction failed, try reconnecting via socket path
-                let unix_stream = if unix_stream.is_some() {
-                    unix_stream
-                } else if let Some(ref path) = socket_path {
+                // Reconnect to proxy via Unix socket with retry logic
+                // The proxy accepts reconnections after the old client disconnects
+                let unix_stream: Option<tokio::net::UnixStream> = if let Some(ref path) = socket_path {
                     if path.exists() {
-                        // Reconnect with retry logic
                         let mut result = None;
-                        for attempt in 0..10 {
+                        // More attempts with longer delays to give proxy time to accept
+                        for attempt in 0..20 {
                             match tokio::net::UnixStream::connect(path).await {
                                 Ok(stream) => {
                                     result = Some(stream);
                                     break;
                                 }
                                 Err(_) => {
-                                    if attempt < 9 {
+                                    if attempt < 19 {
                                         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
                                     }
                                 }
