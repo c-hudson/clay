@@ -182,14 +182,16 @@ public class MainActivity extends AppCompatActivity {
                     @Override
                     public void onMessage(String message) {
                         runOnUiThread(() -> {
-                            // Escape the message for JavaScript string
-                            String escaped = message
-                                .replace("\\", "\\\\")
-                                .replace("\"", "\\\"")
-                                .replace("\n", "\\n")
-                                .replace("\r", "\\r")
-                                .replace("\t", "\\t");
-                            webView.evaluateJavascript("if (typeof onNativeWebSocketMessage === 'function') onNativeWebSocketMessage(\"" + escaped + "\");", null);
+                            // Use Base64 encoding to safely pass message to JavaScript
+                            // This handles all special characters without escaping issues
+                            String base64 = android.util.Base64.encodeToString(
+                                message.getBytes(java.nio.charset.StandardCharsets.UTF_8),
+                                android.util.Base64.NO_WRAP
+                            );
+                            webView.evaluateJavascript(
+                                "if (typeof onNativeWebSocketMessageBase64 === 'function') onNativeWebSocketMessageBase64(\"" + base64 + "\");",
+                                null
+                            );
                         });
                     }
 

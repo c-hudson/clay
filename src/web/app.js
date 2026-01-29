@@ -963,6 +963,24 @@
                 }
             };
 
+            // Base64 encoded version for safer message passing from Java
+            window.onNativeWebSocketMessageBase64 = function(base64Data) {
+                try {
+                    // Decode Base64 to string
+                    const data = atob(base64Data);
+                    // Convert from UTF-8 bytes to string
+                    const bytes = new Uint8Array(data.length);
+                    for (let i = 0; i < data.length; i++) {
+                        bytes[i] = data.charCodeAt(i);
+                    }
+                    const decoded = new TextDecoder('utf-8').decode(bytes);
+                    const msg = JSON.parse(decoded);
+                    handleMessage(msg);
+                } catch (e) {
+                    console.error('Failed to parse Base64 message:', e);
+                }
+            };
+
             window.onNativeWebSocketClose = function(code, reason) {
                 if (connectionTimeout) {
                     clearTimeout(connectionTimeout);
