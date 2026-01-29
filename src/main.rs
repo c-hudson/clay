@@ -3893,15 +3893,45 @@ async fn run_tls_proxy_async(host: &str, port: &str, socket_path: &PathBuf) {
     // Supports reconnection: when client disconnects, wait for new client (for hot reload)
     let (mut tls_read, mut tls_write) = tokio::io::split(tls_stream);
 
+    // Helper to log proxy events to debug log
+    let proxy_log = |msg: &str| {
+        if let Ok(mut f) = std::fs::OpenOptions::new()
+            .create(true).append(true)
+            .open(get_debug_log_path())
+        {
+            use std::io::Write;
+            let lt = local_time_now();
+            let timestamp = format!(
+                "{:04}-{:02}-{:02} {:02}:{:02}:{:02}",
+                lt.year, lt.month, lt.day,
+                lt.hour, lt.minute, lt.second
+            );
+            let _ = writeln!(f, "[{}] TLS_PROXY[{}]: {}", timestamp, std::process::id(), msg);
+        }
+    };
+
+    proxy_log(&format!("Connected to MUD server, waiting for client on {:?}", socket_path));
+
     loop {
+        proxy_log("Waiting for client connection (listener.accept)...");
+
         // Wait for client connection with timeout (60 seconds for reconnection)
         let client_stream = match tokio::time::timeout(
             std::time::Duration::from_secs(60),
             listener.accept()
         ).await {
-            Ok(Ok((stream, _))) => stream,
-            Ok(Err(_)) => break,
-            Err(_) => break, // Timeout waiting for client
+            Ok(Ok((stream, _))) => {
+                proxy_log("Client connected, verifying credentials...");
+                stream
+            }
+            Ok(Err(e)) => {
+                proxy_log(&format!("listener.accept() error: {}, exiting", e));
+                break;
+            }
+            Err(_) => {
+                proxy_log("Timeout (60s) waiting for client, exiting");
+                break;
+            }
         };
 
         // Verify peer credentials - only accept connections from the same user
@@ -3948,6 +3978,8 @@ async fn run_tls_proxy_async(host: &str, port: &str, socket_path: &PathBuf) {
 
         let (mut client_read, mut client_write) = client_stream.into_split();
 
+        proxy_log("Credentials verified, entering relay loop");
+
         // Track why we exited the relay loop
         let mut tls_server_disconnected = false;
 
@@ -3960,29 +3992,39 @@ async fn run_tls_proxy_async(host: &str, port: &str, socket_path: &PathBuf) {
                 // Client -> TLS
                 result = client_read.read(&mut client_buf) => {
                     match result {
-                        Ok(0) => break, // Client disconnected, wait for new client
+                        Ok(0) => {
+                            proxy_log("Client read returned 0 (EOF), client disconnected");
+                            break; // Client disconnected, wait for new client
+                        }
                         Ok(n) => {
                             if tls_write.write_all(&client_buf[..n]).await.is_err() {
+                                proxy_log("TLS write failed, MUD server disconnected");
                                 tls_server_disconnected = true;
                                 break;
                             }
                         }
-                        Err(_) => break,
+                        Err(e) => {
+                            proxy_log(&format!("Client read error: {}, treating as disconnect", e));
+                            break;
+                        }
                     }
                 }
                 // TLS -> Client
                 result = tls_read.read(&mut tls_buf) => {
                     match result {
                         Ok(0) => {
+                            proxy_log("TLS read returned 0 (EOF), MUD server disconnected");
                             tls_server_disconnected = true;
                             break;
                         }
                         Ok(n) => {
                             if client_write.write_all(&tls_buf[..n]).await.is_err() {
+                                proxy_log("Client write failed, client disconnected");
                                 break; // Client write failed, wait for new client
                             }
                         }
-                        Err(_) => {
+                        Err(e) => {
+                            proxy_log(&format!("TLS read error: {}, MUD server disconnected", e));
                             tls_server_disconnected = true;
                             break;
                         }
@@ -3993,9 +4035,11 @@ async fn run_tls_proxy_async(host: &str, port: &str, socket_path: &PathBuf) {
 
         // If TLS server disconnected, exit the proxy
         if tls_server_disconnected {
+            proxy_log("TLS server disconnected, exiting proxy");
             break;
         }
 
+        proxy_log("Client disconnected, looping back to accept new client (for hot reload)");
         // Otherwise, loop back to accept a new client (for hot reload)
     }
 
