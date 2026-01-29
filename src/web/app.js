@@ -1060,6 +1060,13 @@
             return;
         }
 
+        // On Android with wss://, use native WebSocket directly (handles self-signed certs)
+        if (hasNativeWebSocket() && protocol === 'wss') {
+            console.log('Android + wss:// detected, using native WebSocket');
+            connectWithNativeWebSocket(wsUrl);
+            return;
+        }
+
         // Standard browser WebSocket
         usingNativeWebSocket = false;
         try {
