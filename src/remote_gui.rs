@@ -2237,10 +2237,6 @@ impl RemoteGuiApp {
 
     /// Append ANSI-colored text to an existing LayoutJob
     fn append_ansi_to_job(text: &str, default_color: egui::Color32, font_id: egui::FontId, job: &mut egui::text::LayoutJob, is_light_theme: bool, color_offset_percent: u8) {
-        // Debug: log ANSI sequences and resulting colors
-        static DEBUG_COUNT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-        let debug_this = DEBUG_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 5 && text.contains('\x1b');
-
         // Theme background for shade character blending
         let theme_bg = if is_light_theme {
             egui::Color32::from_rgb(255, 255, 255)
@@ -2280,17 +2276,6 @@ impl RemoteGuiApp {
                 // Skip other CSI sequences (cursor movement, screen clearing, etc.)
                 if terminator != 'm' {
                     continue;
-                }
-
-                // Debug: log the SGR code
-                if debug_this {
-                    use std::io::Write;
-                    if let Ok(mut f) = std::fs::OpenOptions::new()
-                        .create(true).append(true)
-                        .open("/tmp/clay_gui_debug.log")
-                    {
-                        let _ = writeln!(f, "SGR code: [{}m", code);
-                    }
                 }
 
                 // Parse SGR codes (semicolon-separated)
@@ -2420,18 +2405,6 @@ impl RemoteGuiApp {
                         _ => {}
                     }
                     i += 1;
-                }
-
-                // Debug: log resulting color after parsing all SGR codes
-                if debug_this {
-                    use std::io::Write;
-                    if let Ok(mut f) = std::fs::OpenOptions::new()
-                        .create(true).append(true)
-                        .open("/tmp/clay_gui_debug.log")
-                    {
-                        let _ = writeln!(f, "  -> color: rgb({},{},{}), bold: {}",
-                            current_color.r(), current_color.g(), current_color.b(), bold);
-                    }
                 }
             } else {
                 // Check for colored square emoji and render as colored blocks
@@ -4384,32 +4357,6 @@ impl eframe::App for RemoteGuiApp {
 
                     // Clone the job for the custom rendering
                     let layout_job = combined_job.clone();
-
-                    // Debug: log LayoutJob info
-                    static DEBUG_ONCE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-                    if !DEBUG_ONCE.swap(true, std::sync::atomic::Ordering::Relaxed) {
-                        use std::io::Write;
-                        if let Ok(mut f) = std::fs::OpenOptions::new()
-                            .create(true).append(true)
-                            .open("/tmp/clay_gui_debug.log")
-                        {
-                            let _ = writeln!(f, "=== LayoutJob Debug ===");
-                            let _ = writeln!(f, "plain_text len: {}", plain_text.len());
-                            let _ = writeln!(f, "layout_job.text len: {}", layout_job.text.len());
-                            let _ = writeln!(f, "layout_job.sections: {}", layout_job.sections.len());
-                            let _ = writeln!(f, "texts_match: {}", plain_text == layout_job.text);
-                            // Log first few sections with colors
-                            for (i, section) in layout_job.sections.iter().take(10).enumerate() {
-                                let _ = writeln!(f, "  Section {}: byte_range={:?}, color=({},{},{},{})",
-                                    i, section.byte_range,
-                                    section.format.color.r(), section.format.color.g(),
-                                    section.format.color.b(), section.format.color.a());
-                            }
-                            // Log first 200 chars of each
-                            let _ = writeln!(f, "plain_text first 200: {:?}", plain_text.chars().take(200).collect::<String>());
-                            let _ = writeln!(f, "layout_job.text first 200: {:?}", layout_job.text.chars().take(200).collect::<String>());
-                        }
-                    }
 
                     // Clone values needed in the closure
                     let has_emojis = has_any_discord_emojis;

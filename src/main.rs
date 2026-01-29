@@ -1469,18 +1469,6 @@ impl World {
                     self.partial_in_pending = true;
                 }
             } else if triggers_pause {
-                // Debug: log when more-mode triggers
-                {
-                    use std::io::Write;
-                    if let Ok(mut f) = std::fs::OpenOptions::new()
-                        .create(true).append(true)
-                        .open("/tmp/clay_more_debug.log")
-                    {
-                        let _ = writeln!(f, "MORE TRIGGERED: output_lines={}, scroll_offset={}, lines_since_pause={}, visual_lines={}, max_lines={}, line={:?}",
-                            self.output_lines.len(), self.scroll_offset, self.lines_since_pause, visual_lines, max_lines,
-                            line.chars().take(50).collect::<String>());
-                    }
-                }
                 // Add line to output_lines BEFORE pausing so it's visible when we scroll to bottom
                 self.output_lines.push(new_line);
                 self.lines_since_pause += visual_lines;
@@ -1529,19 +1517,7 @@ impl World {
     }
 
     fn scroll_to_bottom(&mut self) {
-        let old_offset = self.scroll_offset;
         self.scroll_offset = self.output_lines.len().saturating_sub(1);
-        // Debug: log scroll changes
-        if old_offset != self.scroll_offset {
-            use std::io::Write;
-            if let Ok(mut f) = std::fs::OpenOptions::new()
-                .create(true).append(true)
-                .open("/tmp/clay_more_debug.log")
-            {
-                let _ = writeln!(f, "SCROLL_TO_BOTTOM: {} -> {}, output_lines={}",
-                    old_offset, self.scroll_offset, self.output_lines.len());
-            }
-        }
     }
 
     fn mark_seen(&mut self) {
@@ -1555,17 +1531,6 @@ impl World {
     }
 
     fn release_pending(&mut self, count: usize) {
-        // Debug: log pending release
-        {
-            use std::io::Write;
-            if let Ok(mut f) = std::fs::OpenOptions::new()
-                .create(true).append(true)
-                .open("/tmp/clay_more_debug.log")
-            {
-                let _ = writeln!(f, "RELEASE_PENDING: count={}, pending_lines={}, output_lines={}, scroll_offset={}",
-                    count, self.pending_lines.len(), self.output_lines.len(), self.scroll_offset);
-            }
-        }
         let to_release: Vec<OutputLine> = self
             .pending_lines
             .drain(..count.min(self.pending_lines.len()))
@@ -2407,26 +2372,6 @@ impl App {
         settings: GlobalSettingsMsg,
         splash_lines: Vec<String>,
     ) {
-        // Debug: log what we're receiving to file
-        use std::io::Write;
-        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open("/tmp/clay-debug.log") {
-            let _ = writeln!(f, "DEBUG init_from_initial_state: {} worlds, current_world_index={}, splash_lines={}",
-                worlds.len(), current_world_index, splash_lines.len());
-            for (i, w) in worlds.iter().enumerate() {
-                let _ = writeln!(f, "  World {}: name={}, connected={}, output_lines_ts={}, scroll_offset={}",
-                    i, w.name, w.connected, w.output_lines_ts.len(), w.scroll_offset);
-                // Show first few lines of content for world 0
-                if i == 0 {
-                    let _ = writeln!(f, "    showing_splash={}", w.showing_splash);
-                    for (j, line) in w.output_lines_ts.iter().take(5).enumerate() {
-                        // Truncate safely at char boundary
-                        let preview: String = line.text.chars().take(60).collect();
-                        let _ = writeln!(f, "    Line {}: len={} text={:?}", j, line.text.len(), preview);
-                    }
-                }
-            }
-        }
-
         self.worlds = worlds.into_iter().map(|w| {
             let mut world = World::new(&w.name);
             world.connected = w.connected;
@@ -2492,9 +2437,6 @@ impl App {
         if !splash_lines.is_empty() {
             if let Some(world) = self.worlds.get_mut(current_world_index) {
                 if world.output_lines.is_empty() && !world.connected {
-                    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open("/tmp/clay-debug.log") {
-                        let _ = writeln!(f, "DEBUG: Adding splash screen to world {} (was empty and not connected)", world.name);
-                    }
                     world.output_lines = splash_lines.into_iter()
                         .enumerate()
                         .map(|(i, line)| {
@@ -2505,21 +2447,6 @@ impl App {
                     world.next_seq += world.output_lines.len() as u64;
                     world.showing_splash = true;
                     world.scroll_offset = world.output_lines.len().saturating_sub(1);
-                } else if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open("/tmp/clay-debug.log") {
-                    let _ = writeln!(f, "DEBUG: NOT adding splash - output_lines.len()={}, connected={}",
-                        world.output_lines.len(), world.connected);
-                }
-            }
-        }
-        // Final state
-        if let Some(world) = self.worlds.get(current_world_index) {
-            if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open("/tmp/clay-debug.log") {
-                let _ = writeln!(f, "DEBUG: Final state - current world has {} output_lines, scroll_offset={}, showing_splash={}",
-                    world.output_lines.len(), world.scroll_offset, world.showing_splash);
-                // Show actual text in the world's output_lines
-                for (j, line) in world.output_lines.iter().take(5).enumerate() {
-                    let preview: String = line.text.chars().take(60).collect();
-                    let _ = writeln!(f, "  App Line {}: len={} text={:?}", j, line.text.len(), preview);
                 }
             }
         }
@@ -3173,27 +3100,6 @@ impl App {
             tls_proxy_enabled: self.settings.tls_proxy_enabled,
             dictionary_path: self.settings.dictionary_path.clone(),
         };
-
-        // Debug: log what we're sending to file
-        {
-            use std::io::Write;
-            if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open("/tmp/clay-debug.log") {
-                let _ = writeln!(f, "DEBUG build_initial_state: {} worlds, current_world_index={}", worlds.len(), self.current_world_index);
-                for (i, w) in worlds.iter().enumerate() {
-                    let _ = writeln!(f, "  World {}: name={}, connected={}, output_lines_ts={}, scroll_offset={}",
-                        i, w.name, w.connected, w.output_lines_ts.len(), w.scroll_offset);
-                    // Show first few lines of content for world 0
-                    if i == 0 {
-                        let _ = writeln!(f, "    showing_splash={}", w.showing_splash);
-                        for (j, line) in w.output_lines_ts.iter().take(5).enumerate() {
-                            // Truncate safely at char boundary
-                            let preview: String = line.text.chars().take(60).collect();
-                            let _ = writeln!(f, "    Line {}: len={} text={:?}", j, line.text.len(), preview);
-                        }
-                    }
-                }
-            }
-        }
 
         WsMessage::InitialState {
             worlds,
