@@ -397,7 +397,7 @@ Variables:
 
 Expressions:
   #expr expression     - Evaluate and display result
-  #test expression     - Evaluate as boolean (0 or 1)
+  #test expression     - Evaluate expression, set %?
   #eval expression     - Evaluate and execute as command
 
 Control Flow:
@@ -508,6 +508,23 @@ Examples:
             )),
             "expr" => TfCommandResult::Success(Some(
                 "#expr expression\n\nEvaluate expression and display result.\nOperators: + - * / % == != < > <= >= & | ! =~ !~ ?:\nFunctions: strlen() substr() strcat() tolower() toupper() rand() time() abs() min() max()\nExample: #expr 2 + 2 * 3".to_string()
+            )),
+            "test" => TfCommandResult::Success(Some(
+                r#"#test expression
+
+Evaluate expression and return its value, setting %?.
+
+Evaluates the expression and returns its value (any type).
+Also sets the special variable %? to the result.
+Useful for evaluating expressions for side effects.
+
+Examples:
+  #test 2 + 2           - Returns 4, sets %? to 4
+  #test strlen("hello") - Returns 5, sets %? to 5
+  #test hp < 50         - Returns 1 or 0, sets %?
+
+Unlike #expr, #test does not display the result automatically.
+The result is stored in %? for later use."#.to_string()
             )),
             "bind" => TfCommandResult::Success(Some(
                 "#bind key = command\n\nBind a key to execute a command.\nKey names: F1-F12, ^A-^Z (Ctrl), @a-@z (Alt), PgUp, PgDn, Home, End, Insert, Delete\nExample: #bind F5 = cast heal".to_string()
@@ -665,7 +682,16 @@ fn cmd_eval(engine: &mut TfEngine, args: &str) -> TfCommandResult {
     }
 }
 
-/// #test expression - Evaluate expression as boolean, return 0 or 1
+/// #test expression - Evaluate expression and return its value, setting %?
+///
+/// Evaluates the expression and returns its value (any type).
+/// Also sets the special variable %? to the result.
+/// Useful for evaluating expressions for side effects.
+///
+/// Examples:
+///   #test 2 + 2           -> returns 4, sets %? to 4
+///   #test strlen("hello") -> returns 5, sets %? to 5
+///   #test regmatch("foo(.*)", "foobar") -> sets %P1 to "bar"
 fn cmd_test(engine: &mut TfEngine, args: &str) -> TfCommandResult {
     if args.is_empty() {
         return TfCommandResult::Error("Usage: #test expression".to_string());
@@ -673,8 +699,10 @@ fn cmd_test(engine: &mut TfEngine, args: &str) -> TfCommandResult {
 
     match super::expressions::evaluate(engine, args) {
         Ok(value) => {
-            let result = if value.to_bool() { "1" } else { "0" };
-            TfCommandResult::Success(Some(result.to_string()))
+            // Set the special %? variable to the result
+            engine.set_global("?", value.clone());
+            // Return the actual value (not just 0/1)
+            TfCommandResult::Success(Some(value.to_string_value()))
         }
         Err(e) => TfCommandResult::Error(format!("Expression error: {}", e)),
     }
