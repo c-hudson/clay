@@ -979,11 +979,34 @@
     // Initialize native WebSocket callbacks
     if (hasNativeWebSocket()) {
         setupNativeWebSocketCallbacks();
+
+        // Clean up native WebSocket on page unload/reload
+        window.addEventListener('beforeunload', function() {
+            if (window.Android && window.Android.closeWebSocket) {
+                window.Android.closeWebSocket();
+            }
+        });
+
+        // Also handle pagehide for mobile browsers
+        window.addEventListener('pagehide', function() {
+            if (window.Android && window.Android.closeWebSocket) {
+                window.Android.closeWebSocket();
+            }
+        });
     }
 
     function connectWithNativeWebSocket(wsUrl) {
         console.log('Using native Android WebSocket for: ' + wsUrl);
         usingNativeWebSocket = true;
+
+        // Close any existing native WebSocket first
+        if (window.Android && window.Android.closeWebSocket) {
+            try {
+                window.Android.closeWebSocket();
+            } catch (e) {
+                console.error('Error closing previous WebSocket:', e);
+            }
+        }
 
         // Create a fake WebSocket object that bridges to native
         ws = {
