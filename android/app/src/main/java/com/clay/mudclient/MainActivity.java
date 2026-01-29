@@ -397,17 +397,7 @@ public class MainActivity extends AppCompatActivity {
             @Override
             public void onReceivedError(WebView view, WebResourceRequest request, WebResourceError error) {
                 super.onReceivedError(view, request, error);
-                String msg = "WebView Error:\n" +
-                    "URL: " + request.getUrl() + "\n" +
-                    "Error: " + error.getErrorCode() + " - " + error.getDescription() + "\n" +
-                    "Main frame: " + request.isForMainFrame();
-                runOnUiThread(() -> {
-                    new AlertDialog.Builder(MainActivity.this)
-                        .setTitle("WebView Error")
-                        .setMessage(msg)
-                        .setPositiveButton("OK", null)
-                        .show();
-                });
+                android.util.Log.w("Clay", "WebView error " + error.getErrorCode() + " on " + request.getUrl() + " main=" + request.isForMainFrame());
                 // Only handle errors for the main frame
                 if (request.isForMainFrame()) {
                     connectionFailed = true;
@@ -419,43 +409,17 @@ public class MainActivity extends AppCompatActivity {
 
             @Override
             public void onReceivedSslError(WebView view, SslErrorHandler handler, SslError error) {
-                // SSL error codes: 0=not yet valid, 1=expired, 2=hostname mismatch, 3=untrusted
-                // Always proceed immediately - don't wait for user (handler may timeout)
+                // Accept all SSL errors (expired, hostname mismatch, untrusted, etc.)
+                // This allows the app to work even with certificate issues
+                android.util.Log.w("Clay", "SSL error " + error.getPrimaryError() + " on " + error.getUrl() + " - proceeding");
                 handler.proceed();
-
-                String errorType;
-                switch (error.getPrimaryError()) {
-                    case SslError.SSL_NOTYETVALID: errorType = "Certificate not yet valid"; break;
-                    case SslError.SSL_EXPIRED: errorType = "Certificate expired"; break;
-                    case SslError.SSL_IDMISMATCH: errorType = "Hostname mismatch"; break;
-                    case SslError.SSL_UNTRUSTED: errorType = "Certificate untrusted (self-signed)"; break;
-                    case SslError.SSL_DATE_INVALID: errorType = "Certificate date invalid"; break;
-                    case SslError.SSL_INVALID: errorType = "Certificate invalid"; break;
-                    default: errorType = "Unknown SSL error"; break;
-                }
-                String msg = "SSL Error (proceeded):\n" +
-                    "URL: " + error.getUrl() + "\n" +
-                    "Error: " + error.getPrimaryError() + " - " + errorType;
-                runOnUiThread(() -> {
-                    new AlertDialog.Builder(MainActivity.this)
-                        .setTitle("SSL Error (Proceeded)")
-                        .setMessage(msg)
-                        .setPositiveButton("OK", null)
-                        .show();
-                });
             }
 
             @Override
             public void onPageFinished(WebView view, String url) {
                 super.onPageFinished(view, url);
                 connectionFailed = false;
-                runOnUiThread(() -> {
-                    new AlertDialog.Builder(MainActivity.this)
-                        .setTitle("Page Loaded")
-                        .setMessage("URL: " + url)
-                        .setPositiveButton("OK", null)
-                        .show();
-                });
+                android.util.Log.i("Clay", "Page loaded: " + url);
             }
         });
 
