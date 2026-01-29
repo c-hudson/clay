@@ -473,7 +473,9 @@ Clay includes a TinyFugue compatibility layer using `#` prefix instead of `/`. T
 - `#listvar [pattern]` - List variables matching pattern
 
 **Output:**
-- `#echo message` - Display local message (supports `%{var}` substitution)
+- `#echo [-w world] message` - Display local message (supports `%{var}` substitution and ANSI attributes)
+  - ANSI attributes: `@{B}` bold, `@{U}` underline, `@{I}` inverse, `@{D}` dim, `@{F}` flash, `@{n}` normal/reset
+  - Colors: `@{Crgb}` foreground (r,g,b = 0-5), `@{BCrgb}` background, `@{Cname}` named colors (red, green, blue, cyan, magenta, yellow, white, black)
 - `#send [-w world] text` - Send text to MUD
 - `#beep` - Terminal bell
 - `#quote text` - Send text without variable substitution
@@ -483,7 +485,13 @@ Clay includes a TinyFugue compatibility layer using `#` prefix instead of `/`. T
 - `#test expression` - Evaluate as boolean (returns 0 or 1)
 - `#eval expression` - Evaluate and execute result as command
 - Operators: `+ - * / %` (arithmetic), `== != < > <= >=` (comparison), `& | !` (logical), `=~ !~` (regex), `?:` (ternary)
-- Functions: `strlen()`, `substr()`, `strcat()`, `tolower()`, `toupper()`, `rand()`, `time()`, `abs()`, `min()`, `max()`
+- String functions: `strlen()`, `substr()`, `strcat()`, `tolower()`, `toupper()`, `strstr()`, `replace()`, `sprintf()`
+- Math functions: `rand()`, `time()`, `abs()`, `min()`, `max()`
+- Regex: `regmatch(pattern, string)` - Match and populate %P0-%P9 capture groups
+- World functions: `fg_world()`, `world_info(field[, world])`, `nactive()`, `nworlds()`, `is_connected([world])`, `idle([world])`, `sidle([world])`
+- Macro functions: `ismacro(name)`, `getopts(optstring, varname)`
+- Keyboard buffer: `kbhead()`, `kbtail()`, `kbpoint()`, `kblen()`, `kbgoto(pos)`, `kbdel(n)`, `kbmatch()`, `kbword()`, `kbwordleft()`, `kbwordright()`, `input(text)`
+- File I/O: `tfopen(path, mode)`, `tfclose(handle)`, `tfread(handle, var)`, `tfwrite(handle, text)`, `tfflush(handle)`, `tfeof(handle)`
 
 **Control Flow:**
 - `#if (expr) command` - Single-line conditional
@@ -530,12 +538,22 @@ Clay includes a TinyFugue compatibility layer using `#` prefix instead of `/`. T
 - `#save filename` - Save macros to file
 - `#lcd path` - Change local directory
 
+**World Commands:**
+- `#fg [world]` - Switch to specified world (or show current)
+- `#addworld [-Lq] name host port` - Create a new world
+
+**Input Commands:**
+- `#input text` - Insert text into input buffer at cursor
+- `#grab [world]` - Grab last line from world's output into input buffer
+- `#trigger [pattern]` - Manually trigger macros matching pattern
+
 **Miscellaneous:**
 - `#time` - Display current time
 - `#version` - Show TF compatibility version
 - `#help [topic]` - Show help
 - `#ps` - List background processes
 - `#kill id` - Kill background process
+- `#repeat [-p priority] time count command` - Schedule repeated command (-p sets priority, higher = runs first)
 - `#sh command` - Execute shell command
 - `#recall [pattern]` - Search output history
 
@@ -546,7 +564,19 @@ Clay includes a TinyFugue compatibility layer using `#` prefix instead of `/`. T
 - `%*` - All positional parameters
 - `%L` - Text left of match
 - `%R` - Text right of match
+- `%P0` - `%P9` - Regex capture groups from `regmatch()` (%P0 = full match)
 - `%%` - Literal percent sign
+
+**Special Variables:**
+- `%{world_name}` - Current world name
+- `%{world_host}` - Current world hostname
+- `%{world_port}` - Current world port
+- `%{world_character}` - Current world username
+- `%{pid}` - Process ID
+- `%{time}` - Unix timestamp
+- `%{version}` - TF compatibility version string
+- `%{nworlds}` - Total number of worlds
+- `%{nactive}` - Number of connected worlds
 
 **Example - Auto-heal trigger:**
 ```
