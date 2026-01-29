@@ -1185,9 +1185,13 @@
                         // Get timestamp from message or use current time
                         const lineTs = msg.ts || Math.floor(Date.now() / 1000);
 
-                        // Prepend any partial line from previous read
+                        // Client-generated messages (from_server: false) are always complete
+                        // Only use partial line handling for MUD server data
+                        const isFromServer = msg.from_server !== false;
+
+                        // Prepend any partial line from previous read (only for server data)
                         let data = msg.data;
-                        if (partialLines[msg.world_index]) {
+                        if (isFromServer && partialLines[msg.world_index]) {
                             data = partialLines[msg.world_index] + data;
                             partialLines[msg.world_index] = '';
                         }
@@ -1199,7 +1203,8 @@
                         const rawLines = data.split(/\r\n|\n|\r/);
 
                         // If data doesn't end with newline, last element is a partial line
-                        if (!endsWithNewline && rawLines.length > 0) {
+                        // (only for server data - client messages are always complete)
+                        if (isFromServer && !endsWithNewline && rawLines.length > 0) {
                             partialLines[msg.world_index] = rawLines.pop();
                         }
 

@@ -1114,13 +1114,14 @@ impl RemoteGuiApp {
                                 world.output_lines.clear();
                             }
 
-                            // Combine with any partial line from previous message
-                            let combined = if world.partial_line.is_empty() {
-                                data.clone()
-                            } else {
+                            // Client-generated messages (from_server: false) are always complete
+                            // Only use partial line handling for MUD server data
+                            let combined = if from_server && !world.partial_line.is_empty() {
                                 let mut s = std::mem::take(&mut world.partial_line);
                                 s.push_str(&data);
                                 s
+                            } else {
+                                data.clone()
                             };
 
                             // Check if data ends with newline (complete line) or not (partial)
@@ -1133,7 +1134,8 @@ impl RemoteGuiApp {
                             for (i, line) in lines.into_iter().enumerate() {
                                 let is_last = i == line_count - 1;
 
-                                if is_last && !ends_with_newline {
+                                // Only save partial lines for server data (client messages are always complete)
+                                if from_server && is_last && !ends_with_newline {
                                     // Last line without trailing newline - it's a partial
                                     world.partial_line = line.to_string();
                                 } else {
@@ -3441,11 +3443,6 @@ impl eframe::App for RemoteGuiApp {
                             ui.close_menu();
                         }
                         ui.separator();
-                        // Second segment - alphabetical
-                        if ui.button("Toggle Highlight").clicked() {
-                            action = Some("toggle_highlight");
-                            ui.close_menu();
-                        }
                         if ui.button("Toggle Tags").clicked() {
                             action = Some("toggle_tags");
                             ui.close_menu();
@@ -6412,12 +6409,14 @@ impl eframe::App for RemoteGuiApp {
                 let mut ws_enabled = self.ws_enabled;
                 let mut ws_port = self.ws_port;
                 let mut ws_allow_list = self.ws_allow_list.clone();
+                let mut ws_cert_file = self.ws_cert_file.clone();
+                let mut ws_key_file = self.ws_key_file.clone();
 
                 ctx.show_viewport_immediate(
                     egui::ViewportId::from_hash_of("web_settings_window"),
                     egui::ViewportBuilder::default()
                         .with_title("Web Settings")
-                        .with_inner_size([380.0, 320.0])
+                        .with_inner_size([380.0, 400.0])
                         .with_resizable(false),
                     |ctx, _class| {
                         // Apply popup styling - remove all default strokes
@@ -6644,6 +6643,33 @@ impl eframe::App for RemoteGuiApp {
                                             .desired_width(field_width)
                                             .margin(egui::vec2(8.0, 6.0)));
                                         ui.end_row();
+
+                                        // TLS cert/key files (only show when Secure is selected)
+                                        if web_secure {
+                                            // TLS Cert File
+                                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                                ui.label(egui::RichText::new("TLS Cert File").size(12.0).color(theme.fg_secondary()));
+                                            });
+                                            let field_width = ui.available_width();
+                                            ui.add(egui::TextEdit::singleline(&mut ws_cert_file)
+                                                .text_color(theme.fg())
+                                                .hint_text("/path/to/cert.pem")
+                                                .desired_width(field_width)
+                                                .margin(egui::vec2(8.0, 6.0)));
+                                            ui.end_row();
+
+                                            // TLS Key File
+                                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                                ui.label(egui::RichText::new("TLS Key File").size(12.0).color(theme.fg_secondary()));
+                                            });
+                                            let field_width = ui.available_width();
+                                            ui.add(egui::TextEdit::singleline(&mut ws_key_file)
+                                                .text_color(theme.fg())
+                                                .hint_text("/path/to/key.pem")
+                                                .desired_width(field_width)
+                                                .margin(egui::vec2(8.0, 6.0)));
+                                            ui.end_row();
+                                        }
                                     });
                         });
                     },
@@ -6656,6 +6682,8 @@ impl eframe::App for RemoteGuiApp {
                 self.ws_enabled = ws_enabled;
                 self.ws_port = ws_port;
                 self.ws_allow_list = ws_allow_list;
+                self.ws_cert_file = ws_cert_file;
+                self.ws_key_file = ws_key_file;
 
                 if should_save {
                     self.update_global_settings();

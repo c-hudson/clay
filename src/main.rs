@@ -1040,6 +1040,26 @@ pub fn current_timestamp_secs() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs()
 }
 
+/// Format a Duration for display (short format)
+pub fn format_duration_short(d: std::time::Duration) -> String {
+    let total_secs = d.as_secs_f64();
+    if total_secs < 60.0 {
+        if total_secs == total_secs.floor() {
+            format!("{}s", total_secs as u64)
+        } else {
+            format!("{:.1}s", total_secs)
+        }
+    } else if total_secs < 3600.0 {
+        let mins = (total_secs / 60.0) as u64;
+        let secs = (total_secs % 60.0) as u64;
+        format!("{}m{}s", mins, secs)
+    } else {
+        let hours = (total_secs / 3600.0) as u64;
+        let mins = ((total_secs % 3600.0) / 60.0) as u64;
+        format!("{}h{}m", hours, mins)
+    }
+}
+
 /// Output line with timestamp for F2/show tags feature
 #[derive(Clone)]
 pub struct OutputLine {
@@ -7364,6 +7384,14 @@ pub async fn run_app_headless(
                             tf::TfCommandResult::RepeatProcess(process) => {
                                 app.tf_engine.processes.push(process);
                             }
+                            tf::TfCommandResult::NotTfCommand => {
+                                // Plain text command - send to MUD
+                                if let Some(idx) = target_idx {
+                                    if let Some(tx) = &app.worlds[idx].command_tx {
+                                        let _ = tx.try_send(WriteCommand::Text(cmd.clone()));
+                                    }
+                                }
+                            }
                             _ => {}
                         }
                         let interval = app.tf_engine.processes[i].interval;
@@ -8309,7 +8337,12 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                         }
                                     }
                                     tf::TfCommandResult::RepeatProcess(process) => {
+                                        let id = process.id;
+                                        let interval = format_duration_short(process.interval);
+                                        let count_str = process.count.map_or("infinite".to_string(), |c| c.to_string());
+                                        let cmd = process.command.clone();
                                         app.tf_engine.processes.push(process);
+                                        app.add_tf_output(&format!("% Process {} started: {} every {} ({} times)", id, cmd, interval, count_str));
                                     }
                                     tf::TfCommandResult::NotTfCommand => {
                                         // Shouldn't happen since we checked for #
@@ -8854,12 +8887,90 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                         }
                                     }
                                     Command::NotACommand { text } => {
-                                        // Regular text - send to MUD
-                                        if world_index < app.worlds.len() {
-                                            if let Some(tx) = &app.worlds[world_index].command_tx {
-                                                if tx.try_send(WriteCommand::Text(text)).is_ok() {
-                                                    app.worlds[world_index].last_send_time = Some(std::time::Instant::now());
-                                                    app.worlds[world_index].prompt.clear();
+                                        // Check if this is a TF command (starts with #)
+                                        if text.starts_with('#') {
+                                            // TinyFugue command - execute on server
+                                            app.sync_tf_world_info();
+                                            match app.tf_engine.execute(&text) {
+                                                tf::TfCommandResult::Success(Some(msg)) => {
+                                                    app.ws_broadcast(WsMessage::ServerData {
+                                                        world_index,
+                                                        data: msg,
+                                                        is_viewed: false,
+                                                        ts: current_timestamp_secs(),
+                                                        from_server: false,
+                                                    });
+                                                }
+                                                tf::TfCommandResult::Success(None) => {}
+                                                tf::TfCommandResult::Error(err) => {
+                                                    app.ws_broadcast(WsMessage::ServerData {
+                                                        world_index,
+                                                        data: format!("Error: {}", err),
+                                                        is_viewed: false,
+                                                        ts: current_timestamp_secs(),
+                                                        from_server: false,
+                                                    });
+                                                }
+                                                tf::TfCommandResult::SendToMud(mud_text) => {
+                                                    if world_index < app.worlds.len() {
+                                                        if let Some(tx) = &app.worlds[world_index].command_tx {
+                                                            if tx.try_send(WriteCommand::Text(mud_text)).is_ok() {
+                                                                app.worlds[world_index].last_send_time = Some(std::time::Instant::now());
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                                tf::TfCommandResult::ClayCommand(clay_cmd) => {
+                                                    app.ws_send_to_client(client_id, WsMessage::ExecuteLocalCommand { command: clay_cmd });
+                                                }
+                                                tf::TfCommandResult::Recall(opts) => {
+                                                    if world_index < app.worlds.len() {
+                                                        let output_lines = app.worlds[world_index].output_lines.clone();
+                                                        let (matches, header) = execute_recall(&opts, &output_lines);
+                                                        let pattern_str = opts.pattern.as_deref().unwrap_or("*");
+                                                        let ts = current_timestamp_secs();
+
+                                                        if !opts.quiet {
+                                                            if let Some(h) = header {
+                                                                app.ws_broadcast(WsMessage::ServerData { world_index, data: h, is_viewed: false, ts, from_server: false });
+                                                            }
+                                                        }
+                                                        if matches.is_empty() {
+                                                            app.ws_broadcast(WsMessage::ServerData { world_index, data: format!("✨ No matches for '{}'", pattern_str), is_viewed: false, ts, from_server: false });
+                                                        } else {
+                                                            for m in matches {
+                                                                app.ws_broadcast(WsMessage::ServerData { world_index, data: m, is_viewed: false, ts, from_server: false });
+                                                            }
+                                                        }
+                                                        if !opts.quiet {
+                                                            app.ws_broadcast(WsMessage::ServerData { world_index, data: "================= Recall end =================".to_string(), is_viewed: false, ts, from_server: false });
+                                                        }
+                                                    }
+                                                }
+                                                tf::TfCommandResult::RepeatProcess(process) => {
+                                                    let id = process.id;
+                                                    let interval = format_duration_short(process.interval);
+                                                    let count_str = process.count.map_or("infinite".to_string(), |c| c.to_string());
+                                                    let cmd = process.command.clone();
+                                                    app.tf_engine.processes.push(process);
+                                                    app.ws_broadcast(WsMessage::ServerData {
+                                                        world_index,
+                                                        data: format!("% Process {} started: {} every {} ({} times)", id, cmd, interval, count_str),
+                                                        is_viewed: false,
+                                                        ts: current_timestamp_secs(),
+                                                        from_server: false,
+                                                    });
+                                                }
+                                                _ => {}
+                                            }
+                                        } else {
+                                            // Regular text - send to MUD
+                                            if world_index < app.worlds.len() {
+                                                if let Some(tx) = &app.worlds[world_index].command_tx {
+                                                    if tx.try_send(WriteCommand::Text(text)).is_ok() {
+                                                        app.worlds[world_index].last_send_time = Some(std::time::Instant::now());
+                                                        app.worlds[world_index].prompt.clear();
+                                                    }
                                                 }
                                             }
                                         }
@@ -9317,9 +9428,11 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                             // Quit was triggered (shouldn't happen from /connect)
                                             return Ok(());
                                         }
-                                        // Broadcast world connected
-                                        let name = app.worlds[world_index].name.clone();
-                                        app.ws_broadcast(WsMessage::WorldConnected { world_index, name });
+                                        // Only broadcast WorldConnected if connection actually succeeded
+                                        if app.worlds[world_index].connected {
+                                            let name = app.worlds[world_index].name.clone();
+                                            app.ws_broadcast(WsMessage::WorldConnected { world_index, name });
+                                        }
                                         // Restore previous world if it wasn't the target
                                         if prev_index != world_index {
                                             app.current_world_index = prev_index;
@@ -9929,6 +10042,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                         } else {
                             Some(app.current_world_index)
                         };
+                        let world_idx = target_idx.unwrap_or(app.current_world_index);
                         match result {
                             tf::TfCommandResult::SendToMud(text) => {
                                 if let Some(idx) = target_idx {
@@ -9938,10 +10052,29 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                 }
                             }
                             tf::TfCommandResult::Success(Some(msg)) => {
-                                app.add_tf_output(&msg);
+                                let seq = app.worlds[world_idx].next_seq;
+                                app.worlds[world_idx].next_seq += 1;
+                                app.worlds[world_idx].output_lines.push(OutputLine::new_client(msg.clone(), seq));
+                                app.ws_broadcast(WsMessage::ServerData {
+                                    world_index: world_idx,
+                                    data: msg,
+                                    is_viewed: true,
+                                    ts: current_timestamp_secs(),
+                                    from_server: false,
+                                });
                             }
                             tf::TfCommandResult::Error(err) => {
-                                app.add_tf_output(&format!("Error: {}", err));
+                                let err_msg = format!("Error: {}", err);
+                                let seq = app.worlds[world_idx].next_seq;
+                                app.worlds[world_idx].next_seq += 1;
+                                app.worlds[world_idx].output_lines.push(OutputLine::new_client(err_msg.clone(), seq));
+                                app.ws_broadcast(WsMessage::ServerData {
+                                    world_index: world_idx,
+                                    data: err_msg,
+                                    is_viewed: true,
+                                    ts: current_timestamp_secs(),
+                                    from_server: false,
+                                });
                             }
                             tf::TfCommandResult::ClayCommand(clay_cmd) => {
                                 if handle_command(&clay_cmd, &mut app, event_tx.clone()).await {
@@ -9950,6 +10083,14 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                             }
                             tf::TfCommandResult::RepeatProcess(process) => {
                                 app.tf_engine.processes.push(process);
+                            }
+                            tf::TfCommandResult::NotTfCommand => {
+                                // Plain text command - send to MUD
+                                if let Some(idx) = target_idx {
+                                    if let Some(tx) = &app.worlds[idx].command_tx {
+                                        let _ = tx.try_send(WriteCommand::Text(cmd.clone()));
+                                    }
+                                }
                             }
                             _ => {}
                         }
@@ -10616,7 +10757,18 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                                         }
                                                     }
                                                     tf::TfCommandResult::RepeatProcess(process) => {
+                                                        let id = process.id;
+                                                        let interval = format_duration_short(process.interval);
+                                                        let count_str = process.count.map_or("infinite".to_string(), |c| c.to_string());
+                                                        let cmd_str = process.command.clone();
                                                         app.tf_engine.processes.push(process);
+                                                        app.ws_broadcast(WsMessage::ServerData {
+                                                            world_index,
+                                                            data: format!("% Process {} started: {} every {} ({} times)", id, cmd_str, interval, count_str),
+                                                            is_viewed: false,
+                                                            ts: current_timestamp_secs(),
+                                                            from_server: false,
+                                                        });
                                                     }
                                                     _ => {}
                                                 }
@@ -10643,12 +10795,90 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                     }
                                 }
                                 Command::NotACommand { text } => {
-                                    // Regular text - send to MUD
-                                    if world_index < app.worlds.len() {
-                                        if let Some(tx) = &app.worlds[world_index].command_tx {
-                                            if tx.try_send(WriteCommand::Text(text)).is_ok() {
-                                                app.worlds[world_index].last_send_time = Some(std::time::Instant::now());
-                                                app.worlds[world_index].prompt.clear();
+                                    // Check if this is a TF command (starts with #)
+                                    if text.starts_with('#') {
+                                        // TinyFugue command - execute on server
+                                        app.sync_tf_world_info();
+                                        match app.tf_engine.execute(&text) {
+                                            tf::TfCommandResult::Success(Some(msg)) => {
+                                                app.ws_broadcast(WsMessage::ServerData {
+                                                    world_index,
+                                                    data: msg,
+                                                    is_viewed: false,
+                                                    ts: current_timestamp_secs(),
+                                                    from_server: false,
+                                                });
+                                            }
+                                            tf::TfCommandResult::Success(None) => {}
+                                            tf::TfCommandResult::Error(err) => {
+                                                app.ws_broadcast(WsMessage::ServerData {
+                                                    world_index,
+                                                    data: format!("Error: {}", err),
+                                                    is_viewed: false,
+                                                    ts: current_timestamp_secs(),
+                                                    from_server: false,
+                                                });
+                                            }
+                                            tf::TfCommandResult::SendToMud(mud_text) => {
+                                                if world_index < app.worlds.len() {
+                                                    if let Some(tx) = &app.worlds[world_index].command_tx {
+                                                        if tx.try_send(WriteCommand::Text(mud_text)).is_ok() {
+                                                            app.worlds[world_index].last_send_time = Some(std::time::Instant::now());
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                            tf::TfCommandResult::ClayCommand(clay_cmd) => {
+                                                app.ws_send_to_client(client_id, WsMessage::ExecuteLocalCommand { command: clay_cmd });
+                                            }
+                                            tf::TfCommandResult::Recall(opts) => {
+                                                if world_index < app.worlds.len() {
+                                                    let output_lines = app.worlds[world_index].output_lines.clone();
+                                                    let (matches, header) = execute_recall(&opts, &output_lines);
+                                                    let pattern_str = opts.pattern.as_deref().unwrap_or("*");
+                                                    let ts = current_timestamp_secs();
+
+                                                    if !opts.quiet {
+                                                        if let Some(h) = header {
+                                                            app.ws_broadcast(WsMessage::ServerData { world_index, data: h, is_viewed: false, ts, from_server: false });
+                                                        }
+                                                    }
+                                                    if matches.is_empty() {
+                                                        app.ws_broadcast(WsMessage::ServerData { world_index, data: format!("✨ No matches for '{}'", pattern_str), is_viewed: false, ts, from_server: false });
+                                                    } else {
+                                                        for m in matches {
+                                                            app.ws_broadcast(WsMessage::ServerData { world_index, data: m, is_viewed: false, ts, from_server: false });
+                                                        }
+                                                    }
+                                                    if !opts.quiet {
+                                                        app.ws_broadcast(WsMessage::ServerData { world_index, data: "================= Recall end =================".to_string(), is_viewed: false, ts, from_server: false });
+                                                    }
+                                                }
+                                            }
+                                            tf::TfCommandResult::RepeatProcess(process) => {
+                                                let id = process.id;
+                                                let interval = format_duration_short(process.interval);
+                                                let count_str = process.count.map_or("infinite".to_string(), |c| c.to_string());
+                                                let cmd_str = process.command.clone();
+                                                app.tf_engine.processes.push(process);
+                                                app.ws_broadcast(WsMessage::ServerData {
+                                                    world_index,
+                                                    data: format!("% Process {} started: {} every {} ({} times)", id, cmd_str, interval, count_str),
+                                                    is_viewed: false,
+                                                    ts: current_timestamp_secs(),
+                                                    from_server: false,
+                                                });
+                                            }
+                                            _ => {}
+                                        }
+                                    } else {
+                                        // Regular text - send to MUD
+                                        if world_index < app.worlds.len() {
+                                            if let Some(tx) = &app.worlds[world_index].command_tx {
+                                                if tx.try_send(WriteCommand::Text(text)).is_ok() {
+                                                    app.worlds[world_index].last_send_time = Some(std::time::Instant::now());
+                                                    app.worlds[world_index].prompt.clear();
+                                                }
                                             }
                                         }
                                     }
@@ -11951,7 +12181,7 @@ fn handle_key_event(key: KeyEvent, app: &mut App) -> KeyAction {
                     "#while", "#done", "#for", "#break", "#def", "#undef", "#undefn",
                     "#undeft", "#list", "#purge", "#bind", "#unbind", "#load", "#save",
                     "#lcd", "#time", "#version", "#help", "#ps", "#kill", "#sh", "#recall",
-                    "#setenv", "#listvar",
+                    "#setenv", "#listvar", "#repeat",
                 ];
                 let partial_lower = partial.to_lowercase();
                 let mut m: Vec<String> = tf_commands.iter()
