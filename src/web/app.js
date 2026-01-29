@@ -871,6 +871,20 @@
     let triedWsFallback = false;
     let usingWsFallback = false;
 
+    // Track if we're using native Android WebSocket
+    let usingNativeWebSocket = false;
+
+    // Check if native Android WebSocket is available
+    function hasNativeWebSocket() {
+        try {
+            return window.Android &&
+                   typeof window.Android.hasNativeWebSocket === 'function' &&
+                   window.Android.hasNativeWebSocket();
+        } catch (e) {
+            return false;
+        }
+    }
+
     function connect() {
         showConnecting(true);
 
@@ -885,6 +899,115 @@
             connectionTimeout = null;
         }
 
+        // If native Android WebSocket is available, use it (handles self-signed certs)
+        if (hasNativeWebSocket()) {
+            console.log('Using native Android WebSocket for: ' + wsUrl);
+            usingNativeWebSocket = true;
+
+            // Create a fake WebSocket object that bridges to native
+            ws = {
+                readyState: WebSocket.CONNECTING,
+                send: function(data) {
+                    if (window.Android && window.Android.sendWebSocketMessage) {
+                        window.Android.sendWebSocketMessage(data);
+                    }
+                },
+                close: function() {
+                    if (window.Android && window.Android.closeWebSocket) {
+                        window.Android.closeWebSocket();
+                    }
+                    this.readyState = WebSocket.CLOSED;
+                }
+            };
+
+            // Set up callbacks for native WebSocket events
+            window.onNativeWebSocketOpen = function() {
+                if (connectionTimeout) {
+                    clearTimeout(connectionTimeout);
+                    connectionTimeout = null;
+                }
+                ws.readyState = WebSocket.OPEN;
+                connectionFailures = 0;
+                triedWsFallback = false;
+                hideCertWarning();
+                showConnecting(false);
+
+                // Check for saved password (Android auto-login)
+                let savedPassword = null;
+                try {
+                    if (window.Android && typeof window.Android.getSavedPassword === 'function') {
+                        savedPassword = window.Android.getSavedPassword();
+                        if (typeof savedPassword !== 'string' || savedPassword.trim() === '') {
+                            savedPassword = null;
+                        }
+                    }
+                } catch (e) {
+                    console.error('Error getting saved password:', e);
+                    savedPassword = null;
+                }
+
+                if (savedPassword) {
+                    authenticate(savedPassword);
+                } else {
+                    showAuthModal(true);
+                    elements.authPassword.focus();
+                }
+            };
+
+            window.onNativeWebSocketMessage = function(data) {
+                try {
+                    const msg = JSON.parse(data);
+                    handleMessage(msg);
+                } catch (e) {
+                    console.error('Failed to parse message:', e);
+                }
+            };
+
+            window.onNativeWebSocketClose = function(code, reason) {
+                if (connectionTimeout) {
+                    clearTimeout(connectionTimeout);
+                    connectionTimeout = null;
+                }
+                ws.readyState = WebSocket.CLOSED;
+                authenticated = false;
+                showConnecting(false);
+                connectionFailures++;
+
+                if (window.Android && window.Android.stopBackgroundService) {
+                    window.Android.stopBackgroundService();
+                }
+
+                if (connectionFailures >= 2) {
+                    showConnectionErrorModal();
+                } else {
+                    setTimeout(connect, 3000);
+                }
+            };
+
+            window.onNativeWebSocketError = function(error) {
+                console.error('Native WebSocket error:', error);
+                showConnecting(false);
+            };
+
+            // Set a 5-second timeout for connection
+            connectionTimeout = setTimeout(function() {
+                if (ws && ws.readyState === WebSocket.CONNECTING) {
+                    console.log('Native WebSocket connection timeout');
+                    if (window.Android && window.Android.closeWebSocket) {
+                        window.Android.closeWebSocket();
+                    }
+                    ws.readyState = WebSocket.CLOSED;
+                    window.onNativeWebSocketClose(1006, 'Connection timeout');
+                }
+            }, 5000);
+
+            // Initiate native WebSocket connection
+            window.Android.connectWebSocket(wsUrl);
+            return;
+        }
+
+        // Standard browser WebSocket
+        usingNativeWebSocket = false;
         try {
             ws = new WebSocket(wsUrl);
 
@@ -5516,6 +5639,11 @@
             // Send a ping to keep the connection alive
             send({ type: 'Ping' });
         }
+    };
+
+    // Expose native WebSocket check for debugging
+    window.isUsingNativeWebSocket = function() {
+        return usingNativeWebSocket;
     };
 
     // Start the app

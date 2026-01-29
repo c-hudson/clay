@@ -53,6 +53,7 @@ public class MainActivity extends AppCompatActivity {
     private PowerManager.WakeLock screenOffWakeLock;
     private Handler keepaliveHandler;
     private Runnable keepaliveRunnable;
+    private NativeWebSocket nativeWebSocket;
 
     // JavaScript interface for communication between web and Android
     public class AndroidInterface {
@@ -160,6 +161,77 @@ public class MainActivity extends AppCompatActivity {
             runOnUiThread(() -> {
                 Toast.makeText(MainActivity.this, message, Toast.LENGTH_SHORT).show();
             });
+        }
+
+        @JavascriptInterface
+        public void connectWebSocket(String url) {
+            runOnUiThread(() -> {
+                // Close any existing connection
+                if (nativeWebSocket != null) {
+                    nativeWebSocket.close();
+                }
+
+                nativeWebSocket = new NativeWebSocket(new NativeWebSocket.WebSocketCallback() {
+                    @Override
+                    public void onOpen() {
+                        runOnUiThread(() -> {
+                            webView.evaluateJavascript("if (typeof onNativeWebSocketOpen === 'function') onNativeWebSocketOpen();", null);
+                        });
+                    }
+
+                    @Override
+                    public void onMessage(String message) {
+                        runOnUiThread(() -> {
+                            // Escape the message for JavaScript string
+                            String escaped = message
+                                .replace("\\", "\\\\")
+                                .replace("\"", "\\\"")
+                                .replace("\n", "\\n")
+                                .replace("\r", "\\r")
+                                .replace("\t", "\\t");
+                            webView.evaluateJavascript("if (typeof onNativeWebSocketMessage === 'function') onNativeWebSocketMessage(\"" + escaped + "\");", null);
+                        });
+                    }
+
+                    @Override
+                    public void onClose(int code, String reason) {
+                        runOnUiThread(() -> {
+                            String escaped = reason != null ? reason.replace("\"", "\\\"") : "";
+                            webView.evaluateJavascript("if (typeof onNativeWebSocketClose === 'function') onNativeWebSocketClose(" + code + ", \"" + escaped + "\");", null);
+                        });
+                    }
+
+                    @Override
+                    public void onError(String error) {
+                        runOnUiThread(() -> {
+                            String escaped = error != null ? error.replace("\"", "\\\"") : "Unknown error";
+                            webView.evaluateJavascript("if (typeof onNativeWebSocketError === 'function') onNativeWebSocketError(\"" + escaped + "\");", null);
+                        });
+                    }
+                });
+
+                nativeWebSocket.connect(url);
+            });
+        }
+
+        @JavascriptInterface
+        public void sendWebSocketMessage(String message) {
+            if (nativeWebSocket != null) {
+                nativeWebSocket.send(message);
+            }
+        }
+
+        @JavascriptInterface
+        public void closeWebSocket() {
+            if (nativeWebSocket != null) {
+                nativeWebSocket.close();
+                nativeWebSocket = null;
+            }
+        }
+
+        @JavascriptInterface
+        public boolean hasNativeWebSocket() {
+            return true;
         }
     }
 
