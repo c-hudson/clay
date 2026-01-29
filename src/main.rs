@@ -18,8 +18,6 @@ pub mod remote_gui;
 // Version information
 const VERSION: &str = "1.0.0-alpha";
 const BUILD_HASH: &str = env!("BUILD_HASH");
-// Debug build ID - change this to test reload with binary changes
-const DEBUG_BUILD_ID: u32 = 3;
 
 // Custom config file path (set via --conf=<path> argument)
 use std::sync::OnceLock;
@@ -604,8 +602,6 @@ pub enum Command {
     Unban { host: String },
     /// /testmusic - play a test ANSI music sequence
     TestMusic,
-    /// /debug - show debug info about world state
-    Debug,
     /// /dump - dump all scrollback buffers to ~/.clay.dmp.log
     Dump,
     /// /notify <message> - send notification to mobile clients
@@ -683,7 +679,6 @@ pub fn parse_command(input: &str) -> Command {
             }
         }
         "/testmusic" => Command::TestMusic,
-        "/debug" => Command::Debug,
         "/dump" => Command::Dump,
         "/notify" => {
             if args.is_empty() {
@@ -3901,45 +3896,15 @@ async fn run_tls_proxy_async(host: &str, port: &str, socket_path: &PathBuf) {
     // Supports reconnection: when client disconnects, wait for new client (for hot reload)
     let (mut tls_read, mut tls_write) = tokio::io::split(tls_stream);
 
-    // Helper to log proxy events to debug log
-    let proxy_log = |msg: &str| {
-        if let Ok(mut f) = std::fs::OpenOptions::new()
-            .create(true).append(true)
-            .open(get_debug_log_path())
-        {
-            use std::io::Write;
-            let lt = local_time_now();
-            let timestamp = format!(
-                "{:04}-{:02}-{:02} {:02}:{:02}:{:02}",
-                lt.year, lt.month, lt.day,
-                lt.hour, lt.minute, lt.second
-            );
-            let _ = writeln!(f, "[{}] TLS_PROXY[{}]: {}", timestamp, std::process::id(), msg);
-        }
-    };
-
-    proxy_log(&format!("Connected to MUD server, waiting for client on {:?}", socket_path));
-
     loop {
-        proxy_log("Waiting for client connection (listener.accept)...");
-
         // Wait for client connection with timeout (60 seconds for reconnection)
         let client_stream = match tokio::time::timeout(
             std::time::Duration::from_secs(60),
             listener.accept()
         ).await {
-            Ok(Ok((stream, _))) => {
-                proxy_log("Client connected, verifying credentials...");
-                stream
-            }
-            Ok(Err(e)) => {
-                proxy_log(&format!("listener.accept() error: {}, exiting", e));
-                break;
-            }
-            Err(_) => {
-                proxy_log("Timeout (60s) waiting for client, exiting");
-                break;
-            }
+            Ok(Ok((stream, _))) => stream,
+            Ok(Err(_)) => break,
+            Err(_) => break,
         };
 
         // Verify peer credentials - only accept connections from the same user
@@ -3986,8 +3951,6 @@ async fn run_tls_proxy_async(host: &str, port: &str, socket_path: &PathBuf) {
 
         let (mut client_read, mut client_write) = client_stream.into_split();
 
-        proxy_log("Credentials verified, entering relay loop");
-
         // Track why we exited the relay loop
         let mut tls_server_disconnected = false;
 
@@ -4000,39 +3963,29 @@ async fn run_tls_proxy_async(host: &str, port: &str, socket_path: &PathBuf) {
                 // Client -> TLS
                 result = client_read.read(&mut client_buf) => {
                     match result {
-                        Ok(0) => {
-                            proxy_log("Client read returned 0 (EOF), client disconnected");
-                            break; // Client disconnected, wait for new client
-                        }
+                        Ok(0) => break, // Client disconnected, wait for new client
                         Ok(n) => {
                             if tls_write.write_all(&client_buf[..n]).await.is_err() {
-                                proxy_log("TLS write failed, MUD server disconnected");
                                 tls_server_disconnected = true;
                                 break;
                             }
                         }
-                        Err(e) => {
-                            proxy_log(&format!("Client read error: {}, treating as disconnect", e));
-                            break;
-                        }
+                        Err(_) => break,
                     }
                 }
                 // TLS -> Client
                 result = tls_read.read(&mut tls_buf) => {
                     match result {
                         Ok(0) => {
-                            proxy_log("TLS read returned 0 (EOF), MUD server disconnected");
                             tls_server_disconnected = true;
                             break;
                         }
                         Ok(n) => {
                             if client_write.write_all(&tls_buf[..n]).await.is_err() {
-                                proxy_log("Client write failed, client disconnected");
                                 break; // Client write failed, wait for new client
                             }
                         }
-                        Err(e) => {
-                            proxy_log(&format!("TLS read error: {}, MUD server disconnected", e));
+                        Err(_) => {
                             tls_server_disconnected = true;
                             break;
                         }
@@ -4043,11 +3996,8 @@ async fn run_tls_proxy_async(host: &str, port: &str, socket_path: &PathBuf) {
 
         // If TLS server disconnected, exit the proxy
         if tls_server_disconnected {
-            proxy_log("TLS server disconnected, exiting proxy");
             break;
         }
-
-        proxy_log("Client disconnected, looping back to accept new client (for hot reload)");
         // Otherwise, loop back to accept a new client (for hot reload)
     }
 
@@ -7732,26 +7682,12 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
             if world.connected && world.is_tls && world.proxy_pid.is_some() {
                 let proxy_pid = world.proxy_pid.unwrap();
                 let socket_path = world.proxy_socket_path.clone();
-                let world_name_for_log = world.name.clone();
-
-                debug_log(true, &format!(
-                    "PROXY_RECONNECT: Starting for world '{}', proxy_pid={}, socket_path={:?}",
-                    world_name_for_log, proxy_pid, socket_path
-                ));
 
                 // Check if proxy is still alive
                 let proxy_alive = is_process_alive(proxy_pid);
-                debug_log(true, &format!(
-                    "PROXY_RECONNECT: World '{}' proxy_pid={} alive={}",
-                    world_name_for_log, proxy_pid, proxy_alive
-                ));
 
                 if !proxy_alive {
                     // Proxy died, mark disconnected
-                    debug_log(true, &format!(
-                        "PROXY_RECONNECT: World '{}' proxy DEAD, marking disconnected",
-                        world_name_for_log
-                    ));
                     app.worlds[world_idx].connected = false;
                     app.worlds[world_idx].proxy_pid = None;
                     app.worlds[world_idx].proxy_socket_path = None;
@@ -7767,78 +7703,37 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                 // Reconnect to proxy via Unix socket with retry logic
                 // The proxy accepts reconnections after the old client disconnects
                 let unix_stream: Option<tokio::net::UnixStream> = if let Some(ref path) = socket_path {
-                    let path_exists = path.exists();
-                    debug_log(true, &format!(
-                        "PROXY_RECONNECT: World '{}' socket path {:?} exists={}",
-                        world_name_for_log, path, path_exists
-                    ));
-
-                    if path_exists {
+                    if path.exists() {
                         let mut result = None;
                         // More attempts with longer delays to give proxy time to accept
                         for attempt in 0..20 {
-                            debug_log(true, &format!(
-                                "PROXY_RECONNECT: World '{}' connection attempt {}/20",
-                                world_name_for_log, attempt + 1
-                            ));
                             match tokio::net::UnixStream::connect(path).await {
                                 Ok(stream) => {
-                                    debug_log(true, &format!(
-                                        "PROXY_RECONNECT: World '{}' connected on attempt {}",
-                                        world_name_for_log, attempt + 1
-                                    ));
                                     result = Some(stream);
                                     break;
                                 }
-                                Err(e) => {
-                                    debug_log(true, &format!(
-                                        "PROXY_RECONNECT: World '{}' attempt {} failed: {}",
-                                        world_name_for_log, attempt + 1, e
-                                    ));
+                                Err(_) => {
                                     if attempt < 19 {
                                         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
                                     }
                                 }
                             }
                         }
-                        if result.is_none() {
-                            debug_log(true, &format!(
-                                "PROXY_RECONNECT: World '{}' FAILED after 20 attempts",
-                                world_name_for_log
-                            ));
-                        }
                         result
                     } else {
-                        debug_log(true, &format!(
-                            "PROXY_RECONNECT: World '{}' socket path does not exist!",
-                            world_name_for_log
-                        ));
                         None
                     }
                 } else {
-                    debug_log(true, &format!(
-                        "PROXY_RECONNECT: World '{}' no socket path configured!",
-                        world_name_for_log
-                    ));
                     None
                 };
 
                 match unix_stream {
                     Some(unix_stream) => {
-                        debug_log(true, &format!(
-                            "PROXY_RECONNECT: World '{}' SUCCESS - setting up connection",
-                            world_name_for_log
-                        ));
-
                         // Store the new FD for future reloads
                         #[cfg(unix)]
                         {
                             use std::os::unix::io::AsRawFd;
                             let new_fd = unix_stream.as_raw_fd();
-                            debug_log(true, &format!(
-                                "PROXY_RECONNECT: World '{}' new socket fd={}",
-                                world_name_for_log, new_fd
-                            ));
                             app.worlds[world_idx].proxy_socket_fd = Some(new_fd);
                         }
                         let (r, w) = unix_stream.into_split();
@@ -7854,32 +7749,15 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
 
                         let world_name = app.worlds[world_idx].name.clone();
 
-                        debug_log(true, &format!(
-                            "PROXY_RECONNECT: World '{}' spawning reader/writer tasks",
-                            world_name_for_log
-                        ));
-
                         // Spawn reader task with telnet processing
                         let event_tx_read = event_tx.clone();
                         let telnet_tx = cmd_tx.clone();
-                        let reader_world_name = world_name_for_log.clone();
                         tokio::spawn(async move {
                             let mut buf = [0u8; 4096];
                             let mut line_buffer = Vec::new();
-                            let mut bytes_read_total: u64 = 0;
                             loop {
                                 match tokio::io::AsyncReadExt::read(&mut read_half, &mut buf).await {
                                     Ok(0) => {
-                                        // Log disconnect to debug file
-                                        if let Ok(mut f) = std::fs::OpenOptions::new()
-                                            .create(true).append(true)
-                                            .open(get_debug_log_path())
-                                        {
-                                            use std::io::Write;
-                                            let _ = writeln!(f, "PROXY_READER: World '{}' read returned 0 (EOF), total bytes read: {}, disconnecting",
-                                                reader_world_name, bytes_read_total);
-                                        }
-
                                         if !line_buffer.is_empty() {
                                             let result = process_telnet(&line_buffer);
                                             if !result.responses.is_empty() {
@@ -7899,7 +7777,6 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                         break;
                                     }
                                     Ok(n) => {
-                                        bytes_read_total += n as u64;
                                         line_buffer.extend_from_slice(&buf[..n]);
                                         let split_at = find_safe_split_point(&line_buffer);
                                         let to_send = if split_at > 0 {
@@ -7931,16 +7808,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                             }
                                         }
                                     }
-                                    Err(e) => {
-                                        // Log error to debug file
-                                        if let Ok(mut f) = std::fs::OpenOptions::new()
-                                            .create(true).append(true)
-                                            .open(get_debug_log_path())
-                                        {
-                                            use std::io::Write;
-                                            let _ = writeln!(f, "PROXY_READER: World '{}' read error: {}, total bytes read: {}, disconnecting",
-                                                reader_world_name, e, bytes_read_total);
-                                        }
+                                    Err(_) => {
                                         let _ = event_tx_read.send(AppEvent::Disconnected(world_name.clone())).await;
                                         break;
                                     }
@@ -7949,7 +7817,6 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                         });
 
                         // Spawn writer task
-                        let writer_world_name = world_name_for_log.clone();
                         tokio::spawn(async move {
                             while let Some(cmd) = cmd_rx.recv().await {
                                 let bytes = match &cmd {
@@ -7966,18 +7833,9 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                 }
                             }
                         });
-
-                        debug_log(true, &format!(
-                            "PROXY_RECONNECT: World '{}' tasks spawned, reconnection COMPLETE",
-                            writer_world_name
-                        ));
                     }
                     None => {
-                        // Failed to reconnect - neither FD preservation nor socket reconnect worked
-                        debug_log(true, &format!(
-                            "PROXY_RECONNECT: World '{}' FAILED - marking disconnected",
-                            world_name_for_log
-                        ));
+                        // Failed to reconnect
                         app.worlds[world_idx].connected = false;
                         app.worlds[world_idx].proxy_pid = None;
                         app.worlds[world_idx].proxy_socket_path = None;
@@ -7992,16 +7850,10 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
             }
         }
 
-        debug_log(true, "PROXY_RECONNECT: All proxy reconnections processed");
-
         // Final cleanup pass: mark any world as disconnected if it claims to be connected
         // but has no command channel (meaning the connection wasn't successfully reconstructed)
         for world in &mut app.worlds {
             if world.connected && world.command_tx.is_none() {
-                debug_log(true, &format!(
-                    "CLEANUP: World '{}' has connected=true but no command_tx, marking disconnected",
-                    world.name
-                ));
                 world.connected = false;
                 world.socket_fd = None;
                 let seq = world.next_seq;
@@ -9263,26 +9115,6 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                             ts: current_timestamp_secs(),
                                             from_server: false,
                                         });
-                                    }
-                                    Command::Debug => {
-                                        let ts = current_timestamp_secs();
-                                        app.ws_broadcast(WsMessage::ServerData { world_index, data: "=== Debug: World State ===".to_string(), is_viewed: false, ts , from_server: false });
-                                        app.ws_broadcast(WsMessage::ServerData { world_index, data: format!("current_world_index: {}", app.current_world_index), is_viewed: false, ts, from_server: false });
-                                        app.ws_broadcast(WsMessage::ServerData { world_index, data: format!("activity_count(): {}", app.activity_count()), is_viewed: false, ts, from_server: false });
-                                        for (i, w) in app.worlds.iter().enumerate() {
-                                            let current = if i == app.current_world_index { " *CURRENT*" } else { "" };
-                                            app.ws_broadcast(WsMessage::ServerData { world_index, data: format!("[{}] {}{}", i, w.name, current), is_viewed: false, ts, from_server: false });
-                                            app.ws_broadcast(WsMessage::ServerData { world_index, data: format!("  unseen_lines: {}, pending: {}, has_activity: {}", w.unseen_lines, w.pending_lines.len(), w.has_activity()), is_viewed: false, ts, from_server: false });
-                                        }
-                                        // Debug action patterns
-                                        app.ws_broadcast(WsMessage::ServerData { world_index, data: "=== Actions ===".to_string(), is_viewed: false, ts , from_server: false });
-                                        for (i, action) in app.settings.actions.iter().enumerate() {
-                                            app.ws_broadcast(WsMessage::ServerData { world_index, data: format!("[{}] {} ({})", i, action.name, action.match_type.as_str()), is_viewed: false, ts, from_server: false });
-                                            let pattern_bytes: Vec<String> = action.pattern.bytes().map(|b| format!("{:02x}", b)).collect();
-                                            app.ws_broadcast(WsMessage::ServerData { world_index, data: format!("  pattern: {:?}", action.pattern), is_viewed: false, ts, from_server: false });
-                                            app.ws_broadcast(WsMessage::ServerData { world_index, data: format!("  bytes: {}", pattern_bytes.join(" ")), is_viewed: false, ts, from_server: false });
-                                        }
-                                        app.ws_broadcast(WsMessage::ServerData { world_index, data: "=== End Debug ===".to_string(), is_viewed: false, ts , from_server: false });
                                     }
                                     Command::Dump => {
                                         // Dump all scrollback buffers to ~/.clay.dmp.log
@@ -11073,18 +10905,6 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                         from_server: false,
                                     });
                                 }
-                                Command::Debug => {
-                                    let ts = current_timestamp_secs();
-                                    app.ws_broadcast(WsMessage::ServerData { world_index, data: "=== Debug: World State ===".to_string(), is_viewed: false, ts , from_server: false });
-                                    app.ws_broadcast(WsMessage::ServerData { world_index, data: format!("current_world_index: {}", app.current_world_index), is_viewed: false, ts, from_server: false });
-                                    app.ws_broadcast(WsMessage::ServerData { world_index, data: format!("activity_count(): {}", app.activity_count()), is_viewed: false, ts, from_server: false });
-                                    for (i, w) in app.worlds.iter().enumerate() {
-                                        let current = if i == app.current_world_index { " *CURRENT*" } else { "" };
-                                        app.ws_broadcast(WsMessage::ServerData { world_index, data: format!("[{}] {}{}", i, w.name, current), is_viewed: false, ts, from_server: false });
-                                        app.ws_broadcast(WsMessage::ServerData { world_index, data: format!("  unseen_lines: {}, pending: {}, has_activity: {}", w.unseen_lines, w.pending_lines.len(), w.has_activity()), is_viewed: false, ts, from_server: false });
-                                    }
-                                    app.ws_broadcast(WsMessage::ServerData { world_index, data: "=== End Debug ===".to_string(), is_viewed: false, ts , from_server: false });
-                                }
                                 Command::Dump => {
                                     // Dump all scrollback buffers to ~/.clay.dmp.log
                                     use std::io::Write;
@@ -12145,7 +11965,7 @@ fn handle_key_event(key: KeyEvent, app: &mut App) -> KeyAction {
                 // Clay / commands: internal commands + manual actions
                 let internal_commands = vec![
                     "/help", "/disconnect", "/dc", "/send", "/worlds", "/connections",
-                    "/setup", "/web", "/actions", "/keepalive", "/reload", "/quit", "/gag", "/testmusic", "/debug", "/dump",
+                    "/setup", "/web", "/actions", "/keepalive", "/reload", "/quit", "/gag", "/testmusic", "/dump",
                 ];
 
                 // Get manual actions (empty pattern)
@@ -13861,48 +13681,6 @@ async fn handle_command(cmd: &str, app: &mut App, event_tx: mpsc::Sender<AppEven
                 message: message.clone(),
             });
             app.add_output(&format!("Notification sent: {}", message));
-        }
-        Command::Debug => {
-            // Show debug info about all worlds to diagnose activity indicator issues
-            // Collect lines first to avoid borrow checker issues with app.add_output inside loop
-            let mut debug_lines = Vec::new();
-            debug_lines.push(format!("=== Debug: World State === (build_id: {})", DEBUG_BUILD_ID));
-            debug_lines.push(format!("current_world_index: {}", app.current_world_index));
-            debug_lines.push(format!("activity_count(): {}", app.activity_count()));
-            debug_lines.push(format!("world_switch_mode: {:?}", app.settings.world_switch_mode));
-            debug_lines.push(String::new());
-            for (i, w) in app.worlds.iter().enumerate() {
-                let current = if i == app.current_world_index { " *CURRENT*" } else { "" };
-                debug_lines.push(format!("[{}] {}{}", i, w.name, current));
-                debug_lines.push(format!("  connected: {}", w.connected));
-                debug_lines.push(format!("  unseen_lines: {}", w.unseen_lines));
-                debug_lines.push(format!("  pending_lines.len(): {}", w.pending_lines.len()));
-                debug_lines.push(format!("  has_activity(): {}", w.has_activity()));
-                debug_lines.push(format!("  output_lines.len(): {}", w.output_lines.len()));
-                debug_lines.push(format!("  paused: {}", w.paused));
-                debug_lines.push(format!("  first_unseen_at: {:?}", w.first_unseen_at));
-                if let Some(pending_since) = w.pending_since {
-                    debug_lines.push(format!("  pending_since: {:?} ago", pending_since.elapsed()));
-                }
-            }
-
-            // Debug action patterns
-            debug_lines.push(String::new());
-            debug_lines.push("=== Actions ===".to_string());
-            for (i, action) in app.settings.actions.iter().enumerate() {
-                debug_lines.push(format!("[{}] {} ({})", i, action.name, action.match_type.as_str()));
-                // Show pattern with raw bytes for debugging
-                let pattern_bytes: Vec<String> = action.pattern.bytes()
-                    .map(|b| format!("{:02x}", b))
-                    .collect();
-                debug_lines.push(format!("  pattern: {:?}", action.pattern));
-                debug_lines.push(format!("  bytes: {}", pattern_bytes.join(" ")));
-            }
-            debug_lines.push("=== End Debug ===".to_string());
-
-            for line in debug_lines {
-                app.add_output(&line);
-            }
         }
         Command::Dump => {
             // Dump all scrollback buffers to ~/.clay.dmp.log

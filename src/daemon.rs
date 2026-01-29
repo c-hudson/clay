@@ -621,25 +621,6 @@ pub async fn handle_daemon_ws_message(
                         from_server: false,
                     });
                 }
-                Command::Debug => {
-                    let ts = current_timestamp_secs();
-                    app.ws_broadcast(WsMessage::ServerData { world_index, data: "=== Debug: World State ===".to_string(), is_viewed: false, ts, from_server: false });
-                    app.ws_broadcast(WsMessage::ServerData { world_index, data: format!("current_world_index: {}", app.current_world_index), is_viewed: false, ts, from_server: false });
-                    app.ws_broadcast(WsMessage::ServerData { world_index, data: format!("activity_count(): {}", app.activity_count()), is_viewed: false, ts, from_server: false });
-                    for (i, w) in app.worlds.iter().enumerate() {
-                        let current = if i == app.current_world_index { " *CURRENT*" } else { "" };
-                        app.ws_broadcast(WsMessage::ServerData { world_index, data: format!("[{}] {}{}", i, w.name, current), is_viewed: false, ts, from_server: false });
-                        app.ws_broadcast(WsMessage::ServerData { world_index, data: format!("  unseen_lines: {}, pending: {}, has_activity: {}", w.unseen_lines, w.pending_lines.len(), w.has_activity()), is_viewed: false, ts, from_server: false });
-                    }
-                    app.ws_broadcast(WsMessage::ServerData { world_index, data: "=== Actions ===".to_string(), is_viewed: false, ts, from_server: false });
-                    for (i, action) in app.settings.actions.iter().enumerate() {
-                        app.ws_broadcast(WsMessage::ServerData { world_index, data: format!("[{}] {} ({})", i, action.name, action.match_type.as_str()), is_viewed: false, ts, from_server: false });
-                        let pattern_bytes: Vec<String> = action.pattern.bytes().map(|b| format!("{:02x}", b)).collect();
-                        app.ws_broadcast(WsMessage::ServerData { world_index, data: format!("  pattern: {:?}", action.pattern), is_viewed: false, ts, from_server: false });
-                        app.ws_broadcast(WsMessage::ServerData { world_index, data: format!("  bytes: {}", pattern_bytes.join(" ")), is_viewed: false, ts, from_server: false });
-                    }
-                    app.ws_broadcast(WsMessage::ServerData { world_index, data: "=== End Debug ===".to_string(), is_viewed: false, ts, from_server: false });
-                }
                 Command::Dump => {
                     use std::io::Write;
                     let ts = current_timestamp_secs();
