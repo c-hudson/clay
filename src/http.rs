@@ -159,6 +159,9 @@ async fn handle_https_client(
             "/app.js" => {
                 build_http_response(200, "OK", "application/javascript", WEB_APP_JS)
             }
+            "/favicon.ico" => {
+                build_http_response(204, "No Content", "image/x-icon", "")
+            }
             _ => {
                 build_http_response(404, "Not Found", "text/plain", "Not Found")
             }
@@ -341,6 +344,9 @@ async fn handle_https_client(
             }
             "/app.js" => {
                 build_http_response(200, "OK", "application/javascript", WEB_APP_JS)
+            }
+            "/favicon.ico" => {
+                build_http_response(204, "No Content", "image/x-icon", "")
             }
             _ => {
                 build_http_response(404, "Not Found", "text/plain", "Not Found")
@@ -706,6 +712,10 @@ async fn handle_http_client(
             }
             "/app.js" => {
                 build_response(200, "OK", "application/javascript", HTTP_APP_JS)
+            }
+            "/favicon.ico" => {
+                // Return 204 No Content for favicon requests (browsers/WebViews request this)
+                build_response(204, "No Content", "image/x-icon", "")
             }
             _ => {
                 // Log the 404 before recording violation
