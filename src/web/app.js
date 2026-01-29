@@ -877,9 +877,14 @@
     let useNativeWebSocket = false;
 
     // Check if native Android WebSocket is available
-    // DISABLED: Native WebSocket bridge was unreliable. Use HTTP (not HTTPS) to avoid cert issues.
     function hasNativeWebSocket() {
-        return false;
+        try {
+            return window.Android &&
+                   typeof window.Android.hasNativeWebSocket === 'function' &&
+                   window.Android.hasNativeWebSocket();
+        } catch (e) {
+            return false;
+        }
     }
 
     // Set up native WebSocket callbacks (called once)
