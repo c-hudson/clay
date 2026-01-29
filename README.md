@@ -153,9 +153,20 @@ Clay includes TinyFugue compatibility using `#` prefix:
 | `#while (expr) ... #done` | While loop |
 | `#for var start end ... #done` | For loop |
 | `#bind key = cmd` | Bind key to command |
+| `#load filename` | Load a TF script file |
 | `#help [topic]` | Show TF help |
 
 See `#help` for full command list.
+
+### Importing TinyFugue Worlds
+
+If you have an existing TinyFugue configuration, you can import your worlds using `#load`:
+
+```bash
+#load ~/.tfrc
+```
+
+Clay will parse `/addworld` commands from your TF config file and create corresponding worlds. This makes migrating from TinyFugue seamless - your existing world definitions are automatically imported.
 
 ## Controls
 
