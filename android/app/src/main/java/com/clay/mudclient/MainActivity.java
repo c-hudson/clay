@@ -420,6 +420,9 @@ public class MainActivity extends AppCompatActivity {
             @Override
             public void onReceivedSslError(WebView view, SslErrorHandler handler, SslError error) {
                 // SSL error codes: 0=not yet valid, 1=expired, 2=hostname mismatch, 3=untrusted
+                // Always proceed immediately - don't wait for user (handler may timeout)
+                handler.proceed();
+
                 String errorType;
                 switch (error.getPrimaryError()) {
                     case SslError.SSL_NOTYETVALID: errorType = "Certificate not yet valid"; break;
@@ -430,14 +433,14 @@ public class MainActivity extends AppCompatActivity {
                     case SslError.SSL_INVALID: errorType = "Certificate invalid"; break;
                     default: errorType = "Unknown SSL error"; break;
                 }
-                String msg = "SSL Error (will proceed):\n" +
+                String msg = "SSL Error (proceeded):\n" +
                     "URL: " + error.getUrl() + "\n" +
                     "Error: " + error.getPrimaryError() + " - " + errorType;
                 runOnUiThread(() -> {
                     new AlertDialog.Builder(MainActivity.this)
-                        .setTitle("SSL Error")
+                        .setTitle("SSL Error (Proceeded)")
                         .setMessage(msg)
-                        .setPositiveButton("OK", (d, w) -> handler.proceed())
+                        .setPositiveButton("OK", null)
                         .show();
                 });
             }
