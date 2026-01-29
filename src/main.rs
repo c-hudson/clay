@@ -14135,17 +14135,7 @@ fn process_pending_world_ops(app: &mut App) {
         // Save settings to persist the new/updated world
         let _ = persistence::save_settings(app);
 
-        // Confirm the operation
-        let action = if existing_idx.is_some() { "Updated" } else { "Added" };
-        let host_info = if !app.worlds[world_idx].settings.hostname.is_empty() {
-            format!(" ({}:{}{})",
-                app.worlds[world_idx].settings.hostname,
-                app.worlds[world_idx].settings.port,
-                if op.use_ssl { " SSL" } else { "" })
-        } else {
-            " (connectionless)".to_string()
-        };
-        app.add_output(&format!("{} world '{}'{}.", action, op.name, host_info));
+        // addworld() function should be silent on success (only errors are reported)
     }
 }
 

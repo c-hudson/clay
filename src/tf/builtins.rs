@@ -568,7 +568,7 @@ fn load_file_internal(engine: &mut TfEngine, filename: &str, quiet: bool) -> TfC
     // Show loading message unless quiet
     let mut results = Vec::new();
     if !quiet {
-        results.push(TfCommandResult::Success(Some(format!("% Loading commands from {}", resolved))));
+        results.push(TfCommandResult::Success(Some(format!("✨ Loading commands from {}", resolved))));
     }
 
     let reader = BufReader::new(file);
@@ -656,11 +656,13 @@ fn load_file_internal(engine: &mut TfEngine, filename: &str, quiet: bool) -> TfC
 
     let error_count = results.iter().filter(|r| matches!(r, TfCommandResult::Error(_))).count();
     if error_count > 0 {
-        TfCommandResult::Error(format!("Loaded '{}' with {} error(s)", resolved, error_count))
+        TfCommandResult::Error(format!("✨ Loaded '{}' with {} error(s)", resolved, error_count))
     } else if exit_early {
-        TfCommandResult::Success(Some(format!("Loaded '{}' (exit early)", resolved)))
+        // Success with early exit - no output (silent)
+        TfCommandResult::Success(None)
     } else {
-        TfCommandResult::Success(Some(format!("Loaded '{}'", resolved)))
+        // Success - no completion output (silent like TF)
+        TfCommandResult::Success(None)
     }
 }
 
