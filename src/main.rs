@@ -7680,10 +7680,26 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
             if world.connected && world.is_tls && world.proxy_pid.is_some() {
                 let proxy_pid = world.proxy_pid.unwrap();
                 let socket_path = world.proxy_socket_path.clone();
+                let world_name_for_log = world.name.clone();
+
+                debug_log(true, &format!(
+                    "PROXY_RECONNECT: Starting for world '{}', proxy_pid={}, socket_path={:?}",
+                    world_name_for_log, proxy_pid, socket_path
+                ));
 
                 // Check if proxy is still alive
-                if !is_process_alive(proxy_pid) {
+                let proxy_alive = is_process_alive(proxy_pid);
+                debug_log(true, &format!(
+                    "PROXY_RECONNECT: World '{}' proxy_pid={} alive={}",
+                    world_name_for_log, proxy_pid, proxy_alive
+                ));
+
+                if !proxy_alive {
                     // Proxy died, mark disconnected
+                    debug_log(true, &format!(
+                        "PROXY_RECONNECT: World '{}' proxy DEAD, marking disconnected",
+                        world_name_for_log
+                    ));
                     app.worlds[world_idx].connected = false;
                     app.worlds[world_idx].proxy_pid = None;
                     app.worlds[world_idx].proxy_socket_path = None;
@@ -7699,37 +7715,79 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                 // Reconnect to proxy via Unix socket with retry logic
                 // The proxy accepts reconnections after the old client disconnects
                 let unix_stream: Option<tokio::net::UnixStream> = if let Some(ref path) = socket_path {
-                    if path.exists() {
+                    let path_exists = path.exists();
+                    debug_log(true, &format!(
+                        "PROXY_RECONNECT: World '{}' socket path {:?} exists={}",
+                        world_name_for_log, path, path_exists
+                    ));
+
+                    if path_exists {
                         let mut result = None;
                         // More attempts with longer delays to give proxy time to accept
                         for attempt in 0..20 {
+                            debug_log(true, &format!(
+                                "PROXY_RECONNECT: World '{}' connection attempt {}/20",
+                                world_name_for_log, attempt + 1
+                            ));
                             match tokio::net::UnixStream::connect(path).await {
                                 Ok(stream) => {
+                                    debug_log(true, &format!(
+                                        "PROXY_RECONNECT: World '{}' connected on attempt {}",
+                                        world_name_for_log, attempt + 1
+                                    ));
                                     result = Some(stream);
                                     break;
                                 }
-                                Err(_) => {
+                                Err(e) => {
+                                    debug_log(true, &format!(
+                                        "PROXY_RECONNECT: World '{}' attempt {} failed: {}",
+                                        world_name_for_log, attempt + 1, e
+                                    ));
                                     if attempt < 19 {
                                         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
                                     }
                                 }
                             }
                         }
+                        if result.is_none() {
+                            debug_log(true, &format!(
+                                "PROXY_RECONNECT: World '{}' FAILED after 20 attempts",
+                                world_name_for_log
+                            ));
+                        }
                         result
                     } else {
+                        debug_log(true, &format!(
+                            "PROXY_RECONNECT: World '{}' socket path does not exist!",
+                            world_name_for_log
+                        ));
                         None
                     }
                 } else {
+                    debug_log(true, &format!(
+                        "PROXY_RECONNECT: World '{}' no socket path configured!",
+                        world_name_for_log
+                    ));
                     None
                 };
 
                 match unix_stream {
                     Some(unix_stream) => {
+                        debug_log(true, &format!(
+                            "PROXY_RECONNECT: World '{}' SUCCESS - setting up connection",
+                            world_name_for_log
+                        ));
+
                         // Store the new FD for future reloads
                         #[cfg(unix)]
                         {
                             use std::os::unix::io::AsRawFd;
-                            app.worlds[world_idx].proxy_socket_fd = Some(unix_stream.as_raw_fd());
+                            let new_fd = unix_stream.as_raw_fd();
+                            debug_log(true, &format!(
+                                "PROXY_RECONNECT: World '{}' new socket fd={}",
+                                world_name_for_log, new_fd
+                            ));
+                            app.worlds[world_idx].proxy_socket_fd = Some(new_fd);
                         }
                         let (r, w) = unix_stream.into_split();
                         let mut read_half = StreamReader::Proxy(r);
@@ -7744,15 +7802,32 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
 
                         let world_name = app.worlds[world_idx].name.clone();
 
+                        debug_log(true, &format!(
+                            "PROXY_RECONNECT: World '{}' spawning reader/writer tasks",
+                            world_name_for_log
+                        ));
+
                         // Spawn reader task with telnet processing
                         let event_tx_read = event_tx.clone();
                         let telnet_tx = cmd_tx.clone();
+                        let reader_world_name = world_name_for_log.clone();
                         tokio::spawn(async move {
                             let mut buf = [0u8; 4096];
                             let mut line_buffer = Vec::new();
+                            let mut bytes_read_total: u64 = 0;
                             loop {
                                 match tokio::io::AsyncReadExt::read(&mut read_half, &mut buf).await {
                                     Ok(0) => {
+                                        // Log disconnect to debug file
+                                        if let Ok(mut f) = std::fs::OpenOptions::new()
+                                            .create(true).append(true)
+                                            .open(get_debug_log_path())
+                                        {
+                                            use std::io::Write;
+                                            let _ = writeln!(f, "PROXY_READER: World '{}' read returned 0 (EOF), total bytes read: {}, disconnecting",
+                                                reader_world_name, bytes_read_total);
+                                        }
+
                                         if !line_buffer.is_empty() {
                                             let result = process_telnet(&line_buffer);
                                             if !result.responses.is_empty() {
@@ -7772,6 +7847,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                         break;
                                     }
                                     Ok(n) => {
+                                        bytes_read_total += n as u64;
                                         line_buffer.extend_from_slice(&buf[..n]);
                                         let split_at = find_safe_split_point(&line_buffer);
                                         let to_send = if split_at > 0 {
@@ -7803,7 +7879,16 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                             }
                                         }
                                     }
-                                    Err(_) => {
+                                    Err(e) => {
+                                        // Log error to debug file
+                                        if let Ok(mut f) = std::fs::OpenOptions::new()
+                                            .create(true).append(true)
+                                            .open(get_debug_log_path())
+                                        {
+                                            use std::io::Write;
+                                            let _ = writeln!(f, "PROXY_READER: World '{}' read error: {}, total bytes read: {}, disconnecting",
+                                                reader_world_name, e, bytes_read_total);
+                                        }
                                         let _ = event_tx_read.send(AppEvent::Disconnected(world_name.clone())).await;
                                         break;
                                     }
@@ -7812,6 +7897,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                         });
 
                         // Spawn writer task
+                        let writer_world_name = world_name_for_log.clone();
                         tokio::spawn(async move {
                             while let Some(cmd) = cmd_rx.recv().await {
                                 let bytes = match &cmd {
@@ -7828,9 +7914,18 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                 }
                             }
                         });
+
+                        debug_log(true, &format!(
+                            "PROXY_RECONNECT: World '{}' tasks spawned, reconnection COMPLETE",
+                            writer_world_name
+                        ));
                     }
                     None => {
                         // Failed to reconnect - neither FD preservation nor socket reconnect worked
+                        debug_log(true, &format!(
+                            "PROXY_RECONNECT: World '{}' FAILED - marking disconnected",
+                            world_name_for_log
+                        ));
                         app.worlds[world_idx].connected = false;
                         app.worlds[world_idx].proxy_pid = None;
                         app.worlds[world_idx].proxy_socket_path = None;
@@ -7845,10 +7940,16 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
             }
         }
 
+        debug_log(true, "PROXY_RECONNECT: All proxy reconnections processed");
+
         // Final cleanup pass: mark any world as disconnected if it claims to be connected
         // but has no command channel (meaning the connection wasn't successfully reconstructed)
         for world in &mut app.worlds {
             if world.connected && world.command_tx.is_none() {
+                debug_log(true, &format!(
+                    "CLEANUP: World '{}' has connected=true but no command_tx, marking disconnected",
+                    world.name
+                ));
                 world.connected = false;
                 world.socket_fd = None;
                 let seq = world.next_seq;
