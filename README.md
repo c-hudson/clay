@@ -36,7 +36,8 @@ Download pre-built binaries from the [Releases](https://github.com/c-hudson/clay
 |----------|--------|-------|
 | Linux x86_64 | `clay-linux-x86_64` | GUI + audio, requires glibc |
 | Linux x86_64 (static) | `clay-linux-x86_64-musl` | TUI only, works on any Linux |
-| Linux ARM64 (Termux) | `clay-linux-aarch64` | TUI only, for Android/Termux |
+| Linux ARM64 (Termux) | `clay-termux-aarch64` | TUI only, for Android/Termux |
+| Android | `clay-android.apk` | WebSocket client app |
 | macOS (Universal) | `clay-macos-universal` | GUI + audio, Intel & Apple Silicon |
 | Windows x86_64 | `clay-windows-x86_64.exe` | GUI + audio |
 
@@ -176,6 +177,21 @@ See `#help` for full command list.
 | `F4` | Filter output |
 | `F8` | Toggle action highlighting |
 | `Ctrl+C` (x2) | Quit |
+
+## Android App
+
+The Android app (`clay-android.apk`) is a WebSocket client that connects to a running Clay instance:
+
+1. Run Clay on a server/computer with WebSocket enabled (`/web` settings)
+2. Install the APK on your Android device
+3. Enter the server address and WebSocket password
+4. Connect to control your MUD sessions remotely
+
+Features:
+- Full MUD client interface
+- Push notifications via `/notify` command
+- Background service keeps connection alive
+- Works alongside Termux native binary
 
 ## Web Interface
 
