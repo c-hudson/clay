@@ -867,11 +867,17 @@
     // Connect to WebSocket server
     let connectionTimeout = null;
 
+    // Track if we should try ws:// fallback (for self-signed cert issues)
+    let triedWsFallback = false;
+    let usingWsFallback = false;
+
     function connect() {
         showConnecting(true);
 
         const host = window.location.hostname;
-        const wsUrl = `${window.WS_PROTOCOL}://${host}:${window.WS_PORT}`;
+        // Use ws:// fallback if we've already failed with wss://
+        const protocol = usingWsFallback ? 'ws' : window.WS_PROTOCOL;
+        const wsUrl = `${protocol}://${host}:${window.WS_PORT}`;
 
         // Clear any existing timeout
         if (connectionTimeout) {
@@ -895,6 +901,7 @@
                     connectionTimeout = null;
                 }
                 connectionFailures = 0;
+                triedWsFallback = false; // Reset for future reconnects
                 hideCertWarning();
                 showConnecting(false);
 
@@ -934,10 +941,20 @@
                     window.Android.stopBackgroundService();
                 }
 
+                // If wss:// failed and we haven't tried ws:// fallback yet, try it
+                if (window.WS_PROTOCOL === 'wss' && !triedWsFallback && !usingWsFallback) {
+                    console.log('wss:// connection failed, trying ws:// fallback...');
+                    triedWsFallback = true;
+                    usingWsFallback = true;
+                    connectionFailures = 0; // Reset failures for fallback attempt
+                    setTimeout(connect, 500);
+                    return;
+                }
+
                 // After 2 failures, show error modal instead of auto-reconnecting
                 if (connectionFailures >= 2) {
                     // If using wss://, show certificate warning
-                    if (window.WS_PROTOCOL === 'wss') {
+                    if (window.WS_PROTOCOL === 'wss' && !usingWsFallback) {
                         showCertWarning();
                     }
                     showConnectionErrorModal();
@@ -5208,6 +5225,9 @@
         elements.connectionRetryBtn.onclick = function() {
             hideConnectionErrorModal();
             connectionFailures = 0;
+            // Keep using ws:// fallback if it worked, otherwise reset to try wss:// again
+            // (user can refresh page to fully reset)
+            triedWsFallback = false;
             connect();
         };
         elements.connectionCancelBtn.onclick = function() {
