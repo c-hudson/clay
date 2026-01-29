@@ -396,6 +396,7 @@ public class MainActivity extends AppCompatActivity {
             @Override
             public void onReceivedError(WebView view, WebResourceRequest request, WebResourceError error) {
                 super.onReceivedError(view, request, error);
+                Toast.makeText(MainActivity.this, "Error: " + error.getDescription() + " main=" + request.isForMainFrame(), Toast.LENGTH_SHORT).show();
                 // Only handle errors for the main frame
                 if (request.isForMainFrame()) {
                     connectionFailed = true;
@@ -408,7 +409,7 @@ public class MainActivity extends AppCompatActivity {
             @Override
             public void onReceivedSslError(WebView view, SslErrorHandler handler, SslError error) {
                 // For self-signed certificates, allow proceeding
-                // In production, you might want to show a dialog
+                Toast.makeText(MainActivity.this, "SSL Error (proceeding): " + error.getPrimaryError(), Toast.LENGTH_SHORT).show();
                 handler.proceed();
             }
 
@@ -416,6 +417,7 @@ public class MainActivity extends AppCompatActivity {
             public void onPageFinished(WebView view, String url) {
                 super.onPageFinished(view, url);
                 connectionFailed = false;
+                Toast.makeText(MainActivity.this, "Page loaded: " + url, Toast.LENGTH_SHORT).show();
             }
         });
 
