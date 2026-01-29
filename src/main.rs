@@ -19,7 +19,7 @@ pub mod remote_gui;
 const VERSION: &str = "1.0.0-alpha";
 const BUILD_HASH: &str = env!("BUILD_HASH");
 // Debug build ID - change this to test reload with binary changes
-const DEBUG_BUILD_ID: u32 = 2;
+const DEBUG_BUILD_ID: u32 = 3;
 
 // Custom config file path (set via --conf=<path> argument)
 use std::sync::OnceLock;
@@ -3812,6 +3812,12 @@ fn spawn_tls_proxy(
 #[cfg(all(unix, not(target_os = "android")))]
 async fn run_tls_proxy_async(host: &str, port: &str, socket_path: &PathBuf) {
     use tokio::net::UnixListener;
+
+    // Ignore SIGUSR1 - the main clay process uses this for reload, but the proxy
+    // should not be affected by reload signals (it stays running across reloads)
+    unsafe {
+        libc::signal(libc::SIGUSR1, libc::SIG_IGN);
+    }
 
     // Step 1: Connect to the MUD server with TLS
     let tcp_stream = match TcpStream::connect(format!("{}:{}", host, port)).await {
