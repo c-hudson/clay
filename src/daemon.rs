@@ -307,6 +307,8 @@ pub async fn run_daemon_server() -> io::Result<()> {
                             // Send initial state after successful authentication
                             let initial_state = app.build_initial_state();
                             app.ws_send_to_client(client_id, initial_state);
+                            // Mark client as having received initial state so it receives broadcasts
+                            app.ws_mark_initial_state_sent(client_id);
                         } else {
                             handle_daemon_ws_message(&mut app, client_id, *msg, &event_tx).await;
                         }
@@ -2311,6 +2313,8 @@ pub async fn handle_multiuser_ws_message(
                 let initial_state = build_multiuser_initial_state(app, uname);
                 if let Some(ws) = &app.ws_server {
                     ws.send_to_client(client_id, initial_state);
+                    // Mark client as having received initial state so it receives broadcasts
+                    ws.mark_initial_state_sent(client_id);
                 }
             }
         }

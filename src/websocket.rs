@@ -342,6 +342,9 @@ pub struct WsClientInfo {
     pub current_world: Option<usize>,
     /// Username of the authenticated user (multiuser mode only)
     pub username: Option<String>,
+    /// Whether the client has received its InitialState message
+    /// Clients only receive broadcasts after getting InitialState to prevent duplicates
+    pub received_initial_state: bool,
 }
 
 /// User credential for multiuser authentication
@@ -459,13 +462,26 @@ impl WebSocketServer {
     }
 
     /// Broadcast a message to all authenticated clients (regardless of owner)
+    /// Only sends to clients that have received their InitialState to prevent duplicates
     pub fn broadcast_to_all(&self, msg: WsMessage) {
         // Use try_read to avoid blocking in async context
         if let Ok(clients) = self.clients.try_read() {
             for client in clients.values() {
-                if client.authenticated {
+                // Only broadcast to clients that are authenticated AND have received InitialState
+                // This prevents duplicate messages when a client connects while data is streaming
+                if client.authenticated && client.received_initial_state {
                     let _ = client.tx.send(msg.clone());
                 }
+            }
+        }
+    }
+
+    /// Mark a client as having received its InitialState
+    /// After this, the client will receive broadcasts
+    pub fn mark_initial_state_sent(&self, client_id: u64) {
+        if let Ok(mut clients) = self.clients.try_write() {
+            if let Some(client) = clients.get_mut(&client_id) {
+                client.received_initial_state = true;
             }
         }
     }
@@ -840,6 +856,7 @@ where
             tx: tx.clone(),
             current_world: None,
             username: None,
+            received_initial_state: false,
         });
     }
 

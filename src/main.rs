@@ -2755,6 +2755,18 @@ impl App {
         }
     }
 
+    /// Mark a client as having received its InitialState
+    /// After this, the client will receive broadcasts (prevents duplicate messages)
+    fn ws_mark_initial_state_sent(&self, client_id: u64) {
+        // client_id 0 is the embedded GUI - doesn't need this tracking
+        if client_id == 0 {
+            return;
+        }
+        if let Some(ref server) = self.ws_server {
+            server.mark_initial_state_sent(client_id);
+        }
+    }
+
     /// Check if any WS client is currently viewing a specific world
     fn ws_client_viewing(&self, world_index: usize) -> bool {
         self.ws_client_worlds.values().any(|v| v.world_index == world_index)
@@ -7148,6 +7160,8 @@ pub async fn run_app_headless(
                         if matches!(*msg, WsMessage::AuthRequest { .. }) {
                             let initial_state = app.build_initial_state();
                             app.ws_send_to_client(client_id, initial_state);
+                            // Mark client as having received initial state so it receives broadcasts
+                            app.ws_mark_initial_state_sent(client_id);
                         } else {
                             daemon::handle_daemon_ws_message(&mut app, client_id, *msg, &event_tx).await;
                         }
@@ -8765,6 +8779,8 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                 // Client just authenticated - send initial state
                                 let initial_state = app.build_initial_state();
                                 app.ws_send_to_client(client_id, initial_state);
+                                // Mark client as having received initial state so it receives broadcasts
+                                app.ws_mark_initial_state_sent(client_id);
                                 // Also send current activity count
                                 app.ws_send_to_client(client_id, WsMessage::ActivityUpdate {
                                     count: app.activity_count(),
@@ -9774,6 +9790,8 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                 // Client requested full state resync - send initial state
                                 let initial_state = app.build_initial_state();
                                 app.ws_send_to_client(client_id, initial_state);
+                                // Mark client as having received initial state so it receives broadcasts
+                                app.ws_mark_initial_state_sent(client_id);
                                 // Also send current activity count
                                 app.ws_send_to_client(client_id, WsMessage::ActivityUpdate {
                                     count: app.activity_count(),
@@ -10662,6 +10680,8 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                         WsMessage::AuthRequest { .. } => {
                             let initial_state = app.build_initial_state();
                             app.ws_send_to_client(client_id, initial_state);
+                            // Mark client as having received initial state so it receives broadcasts
+                            app.ws_mark_initial_state_sent(client_id);
                             // Also send current activity count
                             app.ws_send_to_client(client_id, WsMessage::ActivityUpdate {
                                 count: app.activity_count(),
@@ -11468,6 +11488,8 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                             // Client requested full state resync - send initial state
                             let initial_state = app.build_initial_state();
                             app.ws_send_to_client(client_id, initial_state);
+                            // Mark client as having received initial state so it receives broadcasts
+                            app.ws_mark_initial_state_sent(client_id);
                             // Also send current activity count
                             app.ws_send_to_client(client_id, WsMessage::ActivityUpdate {
                                 count: app.activity_count(),
