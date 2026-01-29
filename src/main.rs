@@ -608,6 +608,15 @@ pub enum Command {
     Dump,
     /// /notify <message> - send notification to mobile clients
     Notify { message: String },
+    /// /addworld - add or update a world definition
+    AddWorld {
+        name: String,
+        host: Option<String>,
+        port: Option<String>,
+        user: Option<String>,
+        password: Option<String>,
+        use_ssl: bool,
+    },
     /// /<action_name> [args] - execute action
     ActionCommand { name: String, args: String },
     /// Not a command (regular text to send to MUD)
@@ -681,6 +690,7 @@ pub fn parse_command(input: &str) -> Command {
                 Command::Notify { message: args.join(" ") }
             }
         }
+        "/addworld" => parse_addworld_command(args),
         _ => {
             // Check if it's an action command (starts with / but not a known command)
             let action_name = cmd.trim_start_matches('/');
@@ -738,6 +748,109 @@ fn parse_connect_command(args: &[&str]) -> Command {
     let ssl = args.get(2).map(|s| s.to_lowercase() == "ssl").unwrap_or(false);
 
     Command::Connect { host, port, ssl }
+}
+
+/// Parse /addworld command (TF-compatible world creation)
+///
+/// Formats:
+///   /addworld [-xe] [-Ttype] name [char pass] host port
+///   /addworld [-Ttype] name
+///
+/// Options:
+///   -x  Use SSL/TLS
+///   -e  Echo (ignored)
+///   -Ttype  World type (ignored, defaults to MUD)
+///   -p  No proxy (ignored)
+fn parse_addworld_command(args: &[&str]) -> Command {
+    if args.is_empty() {
+        return Command::Unknown { cmd: "/addworld".to_string() };
+    }
+
+    let mut use_ssl = false;
+    let mut remaining_args: Vec<&str> = Vec::new();
+
+    // Parse options
+    for arg in args {
+        if arg.starts_with('-') {
+            // Parse option flags
+            let flags = &arg[1..];
+            for c in flags.chars() {
+                match c {
+                    'x' => use_ssl = true,
+                    'e' | 'p' => {} // Ignored: echo, proxy
+                    'T' => break,   // -Ttype: skip the rest of this arg
+                    _ => {}
+                }
+            }
+        } else {
+            remaining_args.push(arg);
+        }
+    }
+
+    // Remaining args interpretation:
+    // 1 arg:  name (connectionless world)
+    // 3 args: name host port
+    // 5 args: name char pass host port
+
+    match remaining_args.len() {
+        0 => Command::Unknown { cmd: "/addworld".to_string() },
+        1 => {
+            // Just name - connectionless world
+            Command::AddWorld {
+                name: remaining_args[0].to_string(),
+                host: None,
+                port: None,
+                user: None,
+                password: None,
+                use_ssl,
+            }
+        }
+        2 => {
+            // name host (assume default port or error)
+            Command::AddWorld {
+                name: remaining_args[0].to_string(),
+                host: Some(remaining_args[1].to_string()),
+                port: None,
+                user: None,
+                password: None,
+                use_ssl,
+            }
+        }
+        3 => {
+            // name host port
+            Command::AddWorld {
+                name: remaining_args[0].to_string(),
+                host: Some(remaining_args[1].to_string()),
+                port: Some(remaining_args[2].to_string()),
+                user: None,
+                password: None,
+                use_ssl,
+            }
+        }
+        4 => {
+            // Could be: name char host port (missing pass) or name char pass host (missing port)
+            // Assume: name char host port (user without password)
+            Command::AddWorld {
+                name: remaining_args[0].to_string(),
+                host: Some(remaining_args[2].to_string()),
+                port: Some(remaining_args[3].to_string()),
+                user: Some(remaining_args[1].to_string()),
+                password: None,
+                use_ssl,
+            }
+        }
+        _ => {
+            // 5+ args: name char pass host port [file]
+            Command::AddWorld {
+                name: remaining_args[0].to_string(),
+                host: Some(remaining_args[3].to_string()),
+                port: Some(remaining_args[4].to_string()),
+                user: Some(remaining_args[1].to_string()),
+                password: Some(remaining_args[2].to_string()),
+                use_ssl,
+            }
+        }
+    }
 }
 
 /// Parse /send command with flags
@@ -8261,6 +8374,8 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                         // This shouldn't normally happen since cmd_exit checks loading_files
                                     }
                                 }
+                                // Process any pending world operations from TF functions like addworld()
+                                process_pending_world_ops(&mut app);
                             } else if app.current_world().connected {
                                 if let Some(tx) = &app.current_world().command_tx {
                                     if tx.send(WriteCommand::Text(cmd)).await.is_err() {
@@ -9141,6 +9256,51 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                     Command::WorldsList | Command::WorldSelector | Command::WorldEdit { .. } => {
                                         // These are handled by the GUI/web interface locally
                                         // No server action needed
+                                    }
+                                    // AddWorld - add or update world definition
+                                    Command::AddWorld { name, host, port, user, password, use_ssl } => {
+                                        let existing_idx = app.worlds.iter().position(|w| w.name.eq_ignore_ascii_case(&name));
+
+                                        let world_idx = if let Some(idx) = existing_idx {
+                                            idx
+                                        } else {
+                                            let new_world = World::new(&name);
+                                            app.worlds.push(new_world);
+                                            app.worlds.len() - 1
+                                        };
+
+                                        if let Some(h) = host {
+                                            app.worlds[world_idx].settings.hostname = h;
+                                        }
+                                        if let Some(p) = port {
+                                            app.worlds[world_idx].settings.port = p;
+                                        }
+                                        if let Some(u) = user {
+                                            app.worlds[world_idx].settings.user = u;
+                                        }
+                                        if let Some(p) = password {
+                                            app.worlds[world_idx].settings.password = p;
+                                        }
+                                        app.worlds[world_idx].settings.use_ssl = use_ssl;
+
+                                        let _ = persistence::save_settings(&app);
+
+                                        let action = if existing_idx.is_some() { "Updated" } else { "Added" };
+                                        let host_info = if !app.worlds[world_idx].settings.hostname.is_empty() {
+                                            format!(" ({}:{}{})",
+                                                app.worlds[world_idx].settings.hostname,
+                                                app.worlds[world_idx].settings.port,
+                                                if use_ssl { " SSL" } else { "" })
+                                        } else {
+                                            " (connectionless)".to_string()
+                                        };
+                                        app.ws_broadcast(WsMessage::ServerData {
+                                            world_index,
+                                            data: format!("{} world '{}'{}.", action, name, host_info),
+                                            is_viewed: false,
+                                            ts: current_timestamp_secs(),
+                                            from_server: false,
+                                        });
                                     }
                                     // Connect command is handled via ConnectWorld message
                                     Command::Connect { .. } => {
@@ -10930,6 +11090,51 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                 Command::WorldsList | Command::WorldSelector | Command::WorldEdit { .. } => {
                                     // These are handled by the GUI/web interface locally
                                     // No server action needed
+                                }
+                                // AddWorld - add or update world definition
+                                Command::AddWorld { name, host, port, user, password, use_ssl } => {
+                                    let existing_idx = app.worlds.iter().position(|w| w.name.eq_ignore_ascii_case(&name));
+
+                                    let world_idx = if let Some(idx) = existing_idx {
+                                        idx
+                                    } else {
+                                        let new_world = World::new(&name);
+                                        app.worlds.push(new_world);
+                                        app.worlds.len() - 1
+                                    };
+
+                                    if let Some(h) = host {
+                                        app.worlds[world_idx].settings.hostname = h;
+                                    }
+                                    if let Some(p) = port {
+                                        app.worlds[world_idx].settings.port = p;
+                                    }
+                                    if let Some(u) = user {
+                                        app.worlds[world_idx].settings.user = u;
+                                    }
+                                    if let Some(p) = password {
+                                        app.worlds[world_idx].settings.password = p;
+                                    }
+                                    app.worlds[world_idx].settings.use_ssl = use_ssl;
+
+                                    let _ = persistence::save_settings(&app);
+
+                                    let action = if existing_idx.is_some() { "Updated" } else { "Added" };
+                                    let host_info = if !app.worlds[world_idx].settings.hostname.is_empty() {
+                                        format!(" ({}:{}{})",
+                                            app.worlds[world_idx].settings.hostname,
+                                            app.worlds[world_idx].settings.port,
+                                            if use_ssl { " SSL" } else { "" })
+                                    } else {
+                                        " (connectionless)".to_string()
+                                    };
+                                    app.ws_broadcast(WsMessage::ServerData {
+                                        world_index,
+                                        data: format!("{} world '{}'{}.", action, name, host_info),
+                                        is_viewed: false,
+                                        ts: current_timestamp_secs(),
+                                        from_server: false,
+                                    });
                                 }
                                 // Connect command - can't do async in drain loop, use ConnectWorld message
                                 Command::Connect { .. } => {
@@ -13732,6 +13937,66 @@ async fn handle_command(cmd: &str, app: &mut App, event_tx: mpsc::Sender<AppEven
                 }
             }
         }
+        Command::AddWorld { name, host, port, user, password, use_ssl } => {
+            // Check if world already exists (case-insensitive)
+            let existing_idx = app.worlds.iter().position(|w| w.name.eq_ignore_ascii_case(&name));
+
+            let world_idx = if let Some(idx) = existing_idx {
+                // Update existing world
+                idx
+            } else {
+                // Create new world - validate name
+                if name.is_empty() {
+                    app.add_output("Error: World name cannot be empty");
+                    return false;
+                }
+                if name.contains(' ') {
+                    app.add_output("Error: World name cannot contain spaces");
+                    return false;
+                }
+                if name.starts_with('(') {
+                    app.add_output("Error: World name cannot start with '('");
+                    return false;
+                }
+
+                // Create new world
+                let new_world = World::new(&name);
+                app.worlds.push(new_world);
+                app.worlds.len() - 1
+            };
+
+            // Update world settings
+            if let Some(h) = host {
+                app.worlds[world_idx].settings.hostname = h;
+            }
+            if let Some(p) = port {
+                app.worlds[world_idx].settings.port = p;
+            }
+            if let Some(u) = user {
+                app.worlds[world_idx].settings.user = u;
+            }
+            if let Some(p) = password {
+                app.worlds[world_idx].settings.password = p;
+            }
+            app.worlds[world_idx].settings.use_ssl = use_ssl;
+
+            // Save settings to persist the new/updated world
+            if let Err(e) = persistence::save_settings(app) {
+                app.add_output(&format!("Warning: Failed to save settings: {}", e));
+            }
+
+            // Confirm the operation
+            let action = if existing_idx.is_some() { "Updated" } else { "Added" };
+            let host_info = if !app.worlds[world_idx].settings.hostname.is_empty() {
+                format!(" ({}:{}{})",
+                    app.worlds[world_idx].settings.hostname,
+                    app.worlds[world_idx].settings.port,
+                    if use_ssl { " SSL" } else { "" })
+            } else {
+                " (connectionless)".to_string()
+            };
+            app.add_output(&format!("{} world '{}'{}.", action, name, host_info));
+        }
         Command::ActionCommand { name, args } => {
             // Check if this is an action command (/name)
             let action_found = app.settings.actions.iter()
@@ -13832,6 +14097,56 @@ async fn handle_command(cmd: &str, app: &mut App, event_tx: mpsc::Sender<AppEven
         }
     }
     false
+}
+
+/// Process any pending world operations queued by TF functions like addworld()
+fn process_pending_world_ops(app: &mut App) {
+    // Drain pending operations
+    let ops: Vec<tf::PendingWorldOp> = app.tf_engine.pending_world_ops.drain(..).collect();
+
+    for op in ops {
+        // Check if world already exists (case-insensitive)
+        let existing_idx = app.worlds.iter().position(|w| w.name.eq_ignore_ascii_case(&op.name));
+
+        let world_idx = if let Some(idx) = existing_idx {
+            idx
+        } else {
+            // Create new world
+            let new_world = World::new(&op.name);
+            app.worlds.push(new_world);
+            app.worlds.len() - 1
+        };
+
+        // Update world settings
+        if let Some(h) = op.host {
+            app.worlds[world_idx].settings.hostname = h;
+        }
+        if let Some(p) = op.port {
+            app.worlds[world_idx].settings.port = p;
+        }
+        if let Some(u) = op.user {
+            app.worlds[world_idx].settings.user = u;
+        }
+        if let Some(p) = op.password {
+            app.worlds[world_idx].settings.password = p;
+        }
+        app.worlds[world_idx].settings.use_ssl = op.use_ssl;
+
+        // Save settings to persist the new/updated world
+        let _ = persistence::save_settings(app);
+
+        // Confirm the operation
+        let action = if existing_idx.is_some() { "Updated" } else { "Added" };
+        let host_info = if !app.worlds[world_idx].settings.hostname.is_empty() {
+            format!(" ({}:{}{})",
+                app.worlds[world_idx].settings.hostname,
+                app.worlds[world_idx].settings.port,
+                if op.use_ssl { " SSL" } else { "" })
+        } else {
+            " (connectionless)".to_string()
+        };
+        app.add_output(&format!("{} world '{}'{}.", action, op.name, host_info));
+    }
 }
 
 fn ui(f: &mut Frame, app: &mut App) {

@@ -313,6 +313,19 @@ pub struct TfEngine {
     pub loaded_tokens: std::collections::HashSet<String>,
     /// Stack of files currently being loaded (for nested loads)
     pub loading_files: Vec<String>,
+    /// Pending world operations (addworld calls from expressions)
+    pub pending_world_ops: Vec<PendingWorldOp>,
+}
+
+/// A pending world operation to be processed by the main app
+#[derive(Debug, Clone)]
+pub struct PendingWorldOp {
+    pub name: String,
+    pub host: Option<String>,
+    pub port: Option<String>,
+    pub user: Option<String>,
+    pub password: Option<String>,
+    pub use_ssl: bool,
 }
 
 impl TfEngine {

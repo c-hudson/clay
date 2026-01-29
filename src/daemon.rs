@@ -713,6 +713,51 @@ pub async fn handle_daemon_ws_message(
                 Command::WorldsList | Command::WorldSelector | Command::WorldEdit { .. } => {
                     // These are handled by the GUI/web interface locally
                 }
+                // AddWorld - add or update world definition
+                Command::AddWorld { name, host, port, user, password, use_ssl } => {
+                    let existing_idx = app.worlds.iter().position(|w| w.name.eq_ignore_ascii_case(&name));
+
+                    let world_idx = if let Some(idx) = existing_idx {
+                        idx
+                    } else {
+                        let new_world = World::new(&name);
+                        app.worlds.push(new_world);
+                        app.worlds.len() - 1
+                    };
+
+                    if let Some(h) = host {
+                        app.worlds[world_idx].settings.hostname = h;
+                    }
+                    if let Some(p) = port {
+                        app.worlds[world_idx].settings.port = p;
+                    }
+                    if let Some(u) = user {
+                        app.worlds[world_idx].settings.user = u;
+                    }
+                    if let Some(p) = password {
+                        app.worlds[world_idx].settings.password = p;
+                    }
+                    app.worlds[world_idx].settings.use_ssl = use_ssl;
+
+                    let _ = persistence::save_settings(app);
+
+                    let action = if existing_idx.is_some() { "Updated" } else { "Added" };
+                    let host_info = if !app.worlds[world_idx].settings.hostname.is_empty() {
+                        format!(" ({}:{}{})",
+                            app.worlds[world_idx].settings.hostname,
+                            app.worlds[world_idx].settings.port,
+                            if use_ssl { " SSL" } else { "" })
+                    } else {
+                        " (connectionless)".to_string()
+                    };
+                    app.ws_broadcast(WsMessage::ServerData {
+                        world_index,
+                        data: format!("{} world '{}'{}.", action, name, host_info),
+                        is_viewed: false,
+                        ts: current_timestamp_secs(),
+                        from_server: false,
+                    });
+                }
                 // Connect command - use daemon connection logic
                 Command::Connect { .. } => {
                     if world_index < app.worlds.len() && !app.worlds[world_index].connected {

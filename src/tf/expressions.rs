@@ -1063,6 +1063,76 @@ impl<'a> Evaluator<'a> {
                 Ok(TfValue::String(c.to_string()))
             }
 
+            "addworld" => {
+                // addworld(name, type, [host, port [, char, pass [, file [, flags]]]])
+                // Minimum 1 argument (name), type is optional and ignored (defaults to MUD)
+                if args.is_empty() {
+                    return Err("addworld requires at least 1 argument (name)".to_string());
+                }
+
+                let name = self.eval(&args[0])?.to_string_value();
+                if name.is_empty() {
+                    return Err("addworld: name cannot be empty".to_string());
+                }
+                if name.contains(' ') {
+                    return Err("addworld: name cannot contain spaces".to_string());
+                }
+                if name.starts_with('(') {
+                    return Err("addworld: name cannot start with '('".to_string());
+                }
+
+                // Type is ignored (arg index 1) - we default to MUD
+                let host = if args.len() > 2 {
+                    let h = self.eval(&args[2])?.to_string_value();
+                    if h.is_empty() { None } else { Some(h) }
+                } else {
+                    None
+                };
+
+                let port = if args.len() > 3 {
+                    let p = self.eval(&args[3])?.to_string_value();
+                    if p.is_empty() { None } else { Some(p) }
+                } else {
+                    None
+                };
+
+                let user = if args.len() > 4 {
+                    let u = self.eval(&args[4])?.to_string_value();
+                    if u.is_empty() { None } else { Some(u) }
+                } else {
+                    None
+                };
+
+                let password = if args.len() > 5 {
+                    let p = self.eval(&args[5])?.to_string_value();
+                    if p.is_empty() { None } else { Some(p) }
+                } else {
+                    None
+                };
+
+                // file (arg 6) is ignored
+                // flags (arg 7) - check for 'x' (SSL)
+                let use_ssl = if args.len() > 7 {
+                    let flags = self.eval(&args[7])?.to_string_value();
+                    flags.contains('x')
+                } else {
+                    false
+                };
+
+                // Queue the world operation for the main app to process
+                self.engine.pending_world_ops.push(super::PendingWorldOp {
+                    name: name.clone(),
+                    host,
+                    port,
+                    user,
+                    password,
+                    use_ssl,
+                });
+
+                // Return 1 for success (TF convention)
+                Ok(TfValue::Integer(1))
+            }
+
             _ => Err(format!("Unknown function: {}", name)),
         }
     }

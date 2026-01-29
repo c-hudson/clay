@@ -94,6 +94,7 @@ pub fn execute_command(engine: &mut TfEngine, input: &str) -> TfCommandResult {
         "listworlds" => TfCommandResult::ClayCommand("/worlds".to_string()),
         "listsockets" | "connections" => TfCommandResult::ClayCommand("/connections".to_string()),
         "connect" => cmd_connect(args),
+        "addworld" => cmd_addworld(args),
 
         // Info commands
         "help" => cmd_help(args),
@@ -381,6 +382,29 @@ fn cmd_connect(args: &str) -> TfCommandResult {
     }
 }
 
+/// #addworld - Define a new world or redefine an existing world
+///
+/// Command usage:
+///   #addworld [-xe] [-Ttype] name [char pass] host port
+///   #addworld [-Ttype] name
+///
+/// Options:
+///   -x  Use SSL/TLS for connections
+///   -e  Echo sent text back (ignored in Clay)
+///   -Ttype  World type (ignored in Clay, defaults to MUD)
+///
+/// Examples:
+///   #addworld MyMUD mud.example.com 4000
+///   #addworld -x SecureMUD secure.example.com 4443
+///   #addworld MyMUD player password mud.example.com 4000
+fn cmd_addworld(args: &str) -> TfCommandResult {
+    // Pass through to Clay's /addworld command which handles the actual creation
+    if args.trim().is_empty() {
+        return TfCommandResult::Error("Usage: #addworld [-xe] [-Ttype] name [char pass] host port".to_string());
+    }
+    TfCommandResult::ClayCommand(format!("/addworld {}", args))
+}
+
 /// #help [topic] - Display help
 fn cmd_help(args: &str) -> TfCommandResult {
     let topic = args.trim().trim_start_matches('#').to_lowercase();
@@ -429,6 +453,7 @@ Output:
 World Management:
   #world [name]        - Switch to or list worlds
   #connect [world]     - Connect to a world
+  #addworld [opts] name [args] - Add/update world
   #listworlds          - List all worlds
   #listsockets         - List connected worlds
   #dc, #disconnect     - Disconnect current world
@@ -632,7 +657,35 @@ not undone.
 When called outside of file loading, #exit is equivalent
 to #quit (exits Clay)."#.to_string()
             )),
-            _ => TfCommandResult::Success(Some(format!("No help available for '{}'\nTry: set, echo, send, def, if, while, for, expr, bind, hooks, repeat, ps, kill, load, require, loaded, exit", topic))),
+            "addworld" => TfCommandResult::Success(Some(
+                r#"#addworld [-xe] [-Ttype] name [char pass] host port
+
+Define a new world or update an existing world.
+
+Command form:
+  #addworld MyMUD mud.example.com 4000
+  #addworld -x SecureMUD secure.example.com 4443
+  #addworld MyMUD player password mud.example.com 4000
+
+Function form:
+  addworld(name, type, host, port, char, pass, file, flags)
+
+Options:
+  -x    Use SSL/TLS for connections
+  -e    Echo sent text (ignored)
+  -Ttype World type (ignored, defaults to MUD)
+  -p    No proxy (ignored)
+
+Function flags string:
+  "x" = use SSL
+
+Examples:
+  #addworld Cave cave.tcp.com 2283
+  #addworld -x Secure secure.tcp.com 4443
+  #test addworld("Cave", "", "cave.tcp.com", "2283")
+  #test addworld("Secure", "", "ssl.tcp.com", "4443", "", "", "", "x")"#.to_string()
+            )),
+            _ => TfCommandResult::Success(Some(format!("No help available for '{}'\nTry: set, echo, send, def, if, while, for, expr, bind, hooks, repeat, ps, kill, load, require, loaded, exit, addworld", topic))),
         }
     }
 }
