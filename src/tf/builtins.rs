@@ -938,6 +938,7 @@ pub fn cmd_repeat(engine: &mut TfEngine, args: &str) -> TfCommandResult {
     let mut synchronous = false;
     let mut on_prompt = false;
     let mut interval: Option<Duration> = None;
+    let mut priority: i32 = 0;
     let mut remaining = args;
 
     // Parse flags
@@ -979,6 +980,17 @@ pub fn cmd_repeat(engine: &mut TfEngine, args: &str) -> TfCommandResult {
             on_prompt = true;
             remaining = &remaining[2..];
             continue;
+        }
+
+        // Check for -p priority
+        if remaining.starts_with("-p") {
+            let rest = &remaining[2..];
+            let end = rest.find(char::is_whitespace).unwrap_or(rest.len());
+            if let Ok(p) = rest[..end].parse::<i32>() {
+                priority = p;
+                remaining = &rest[end..];
+                continue;
+            }
         }
 
         // Check for -time (e.g. -30, -0:30, -1:0:0)
@@ -1054,6 +1066,7 @@ pub fn cmd_repeat(engine: &mut TfEngine, args: &str) -> TfCommandResult {
         world,
         synchronous: false,
         on_prompt,
+        priority,
     };
 
     TfCommandResult::RepeatProcess(process)

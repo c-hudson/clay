@@ -2,6 +2,51 @@
 
 use super::TfEngine;
 
+/// Get special built-in variable value (world_*, etc.)
+fn get_special_var(engine: &TfEngine, name: &str) -> Option<String> {
+    match name {
+        // Current world info
+        "world_name" => engine.current_world.clone(),
+        "world_host" => {
+            let current = engine.current_world.as_ref()?;
+            engine.world_info_cache.iter()
+                .find(|w| &w.name == current)
+                .map(|w| w.host.clone())
+        }
+        "world_port" => {
+            let current = engine.current_world.as_ref()?;
+            engine.world_info_cache.iter()
+                .find(|w| &w.name == current)
+                .map(|w| w.port.clone())
+        }
+        "world_character" | "world_char" => {
+            let current = engine.current_world.as_ref()?;
+            engine.world_info_cache.iter()
+                .find(|w| &w.name == current)
+                .map(|w| w.user.clone())
+        }
+        // Process info
+        "pid" => Some(std::process::id().to_string()),
+        // Time
+        "time" => {
+            use std::time::{SystemTime, UNIX_EPOCH};
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_secs().to_string())
+                .ok()
+        }
+        // TF version
+        "version" => Some("Clay TF 1.0".to_string()),
+        // Status
+        "nworlds" => Some(engine.world_info_cache.len().to_string()),
+        "nactive" => Some(engine.world_info_cache.iter()
+            .filter(|w| w.is_connected)
+            .count()
+            .to_string()),
+        _ => None,
+    }
+}
+
 /// Perform variable substitution on text.
 ///
 /// Supports:
@@ -26,7 +71,10 @@ pub fn substitute_variables(engine: &TfEngine, text: &str) -> String {
                     // %{varname} form
                     '{' => {
                         if let Some((var_name, end_idx)) = extract_braced_var(&chars, i + 2) {
-                            if let Some(value) = engine.get_var(&var_name) {
+                            // Check for special world_* variables first
+                            if let Some(value) = get_special_var(engine, &var_name) {
+                                result.push_str(&value);
+                            } else if let Some(value) = engine.get_var(&var_name) {
                                 result.push_str(&value.to_string_value());
                             }
                             // If variable not found, substitute empty string (TF behavior)
@@ -53,9 +101,23 @@ pub fn substitute_variables(engine: &TfEngine, text: &str) -> String {
                         result.push(c);
                         i += 2;
                     }
-                    // %P forms for capture groups
+                    // %P forms for capture groups from regmatch()
+                    'P' if i + 2 < len => {
+                        match chars[i + 2] {
+                            c @ '0'..='9' => {
+                                let idx = (c as usize) - ('0' as usize);
+                                if idx < engine.regex_captures.len() {
+                                    result.push_str(&engine.regex_captures[idx]);
+                                }
+                                i += 3;
+                            }
+                            _ => {
+                                result.push('%');
+                                i += 1;
+                            }
+                        }
+                    }
                     'P' => {
-                        // Keep as-is for now; handled in trigger context
                         result.push('%');
                         i += 1;
                     }

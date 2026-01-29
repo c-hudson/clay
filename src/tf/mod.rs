@@ -160,6 +160,7 @@ pub struct TfProcess {
     pub world: Option<String>,     // -w option
     pub synchronous: bool,         // -S flag
     pub on_prompt: bool,           // -P flag
+    pub priority: i32,             // -p option (higher = runs first)
 }
 
 /// Result of executing a TF command
@@ -315,6 +316,20 @@ pub struct TfEngine {
     pub loading_files: Vec<String>,
     /// Pending world operations (addworld calls from expressions)
     pub pending_world_ops: Vec<PendingWorldOp>,
+    /// Regex capture groups from last regmatch() call (%P0-%P9)
+    pub regex_captures: Vec<String>,
+    /// Open file handles for tfopen/tfclose (handle_id -> TfFileHandle)
+    pub open_files: HashMap<i32, TfFileHandle>,
+    /// Next file handle ID
+    pub next_file_handle: i32,
+    /// Current world name (set by main app for fg_world/world_info)
+    pub current_world: Option<String>,
+    /// Connected worlds list (name, host, port, user, is_connected)
+    pub world_info_cache: Vec<WorldInfoCache>,
+    /// Current keyboard buffer state (synced from InputArea)
+    pub keyboard_state: KeyboardBufferState,
+    /// Pending keyboard operations to be processed by main app
+    pub pending_keyboard_ops: Vec<PendingKeyboardOp>,
 }
 
 /// A pending world operation to be processed by the main app
@@ -326,6 +341,55 @@ pub struct PendingWorldOp {
     pub user: Option<String>,
     pub password: Option<String>,
     pub use_ssl: bool,
+}
+
+/// Cached world info for TF functions (fg_world, world_info, nactive)
+#[derive(Debug, Clone, Default)]
+pub struct WorldInfoCache {
+    pub name: String,
+    pub host: String,
+    pub port: String,
+    pub user: String,
+    pub is_connected: bool,
+    pub use_ssl: bool,
+}
+
+/// Cached keyboard buffer state for TF functions (kbhead, kbtail, etc.)
+#[derive(Debug, Clone, Default)]
+pub struct KeyboardBufferState {
+    pub buffer: String,
+    pub cursor_position: usize,
+}
+
+/// Pending keyboard operation to be processed by the main app
+#[derive(Debug, Clone)]
+pub enum PendingKeyboardOp {
+    /// Move cursor to absolute position
+    Goto(usize),
+    /// Delete count characters at cursor (negative = before cursor)
+    Delete(i32),
+    /// Move cursor left by word
+    WordLeft,
+    /// Move cursor right by word
+    WordRight,
+    /// Insert text at cursor
+    Insert(String),
+}
+
+/// File handle mode for TF file I/O
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum TfFileMode {
+    Read,
+    Write,
+    Append,
+}
+
+/// Open file handle for TF file I/O
+#[derive(Debug)]
+pub struct TfFileHandle {
+    pub path: String,
+    pub mode: TfFileMode,
+    pub read_position: u64,  // For read mode: current position in file
 }
 
 impl TfEngine {

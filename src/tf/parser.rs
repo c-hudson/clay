@@ -147,6 +147,19 @@ pub fn execute_command(engine: &mut TfEngine, input: &str) -> TfCommandResult {
         "ps" => builtins::cmd_ps(engine),
         "kill" => builtins::cmd_kill(engine, args),
 
+        // World switching
+        "fg" => cmd_fg(args),
+
+        // Variable management
+        "listvar" => cmd_listvar(engine, args),
+
+        // Trigger commands
+        "trigger" => cmd_trigger(engine, args),
+
+        // Input manipulation
+        "input" => cmd_input(engine, args),
+        "grab" => cmd_grab(args),
+
         // Check for user-defined macro with this name
         _ => {
             // Look for a macro with this name (case-insensitive)
@@ -324,10 +337,109 @@ fn cmd_setenv(engine: &mut TfEngine, args: &str) -> TfCommandResult {
 
 /// #echo message - Display message locally
 fn cmd_echo(engine: &TfEngine, args: &str) -> TfCommandResult {
-    // Variable substitution already done, just return the message
+    // Variable substitution already done, just process attribute codes
     let _ = engine;  // Engine already used for substitution
-    let message = args.to_string();
+
+    // Process TF attribute codes: @{attr} sequences
+    // @{B} = bold, @{U} = underline, @{n} = normal/reset
+    // @{Crgb} = foreground color, @{BCrgb} = background color
+    let message = process_attr_codes(args);
     TfCommandResult::Success(Some(message))
+}
+
+/// Process TF attribute codes in text
+/// @{B} = bold, @{U} = underline, @{n} = normal/reset
+/// @{Crgb} = foreground color (where r,g,b are 0-5)
+/// @{BCrgb} = background color
+fn process_attr_codes(text: &str) -> String {
+    let mut result = String::with_capacity(text.len());
+    let chars: Vec<char> = text.chars().collect();
+    let len = chars.len();
+    let mut i = 0;
+
+    while i < len {
+        if chars[i] == '@' && i + 1 < len && chars[i + 1] == '{' {
+            // Find closing brace
+            if let Some(end) = chars[i + 2..].iter().position(|&c| c == '}') {
+                let attr: String = chars[i + 2..i + 2 + end].iter().collect();
+                let ansi = attr_to_ansi(&attr);
+                result.push_str(&ansi);
+                i = i + 3 + end;
+                continue;
+            }
+        }
+        result.push(chars[i]);
+        i += 1;
+    }
+
+    result
+}
+
+/// Convert TF attribute code to ANSI escape sequence
+fn attr_to_ansi(attr: &str) -> String {
+    match attr.to_uppercase().as_str() {
+        // Basic attributes
+        "N" | "NORMAL" => "\x1b[0m".to_string(),
+        "B" | "BOLD" => "\x1b[1m".to_string(),
+        "D" | "DIM" => "\x1b[2m".to_string(),
+        "U" | "UNDERLINE" => "\x1b[4m".to_string(),
+        "BLINK" | "FLASH" => "\x1b[5m".to_string(),
+        "R" | "REVERSE" => "\x1b[7m".to_string(),
+
+        // Standard colors (foreground)
+        "BLACK" => "\x1b[30m".to_string(),
+        "RED" => "\x1b[31m".to_string(),
+        "GREEN" => "\x1b[32m".to_string(),
+        "YELLOW" => "\x1b[33m".to_string(),
+        "BLUE" => "\x1b[34m".to_string(),
+        "MAGENTA" => "\x1b[35m".to_string(),
+        "CYAN" => "\x1b[36m".to_string(),
+        "WHITE" => "\x1b[37m".to_string(),
+
+        // Standard colors (background)
+        "BGBLACK" => "\x1b[40m".to_string(),
+        "BGRED" => "\x1b[41m".to_string(),
+        "BGGREEN" => "\x1b[42m".to_string(),
+        "BGYELLOW" => "\x1b[43m".to_string(),
+        "BGBLUE" => "\x1b[44m".to_string(),
+        "BGMAGENTA" => "\x1b[45m".to_string(),
+        "BGCYAN" => "\x1b[46m".to_string(),
+        "BGWHITE" => "\x1b[47m".to_string(),
+
+        // 216-color cube: Crgb where r,g,b are 0-5
+        _ if attr.len() == 4 && attr.starts_with('C') => {
+            if let (Some(r), Some(g), Some(b)) = (
+                attr.chars().nth(1).and_then(|c| c.to_digit(10)),
+                attr.chars().nth(2).and_then(|c| c.to_digit(10)),
+                attr.chars().nth(3).and_then(|c| c.to_digit(10)),
+            ) {
+                if r <= 5 && g <= 5 && b <= 5 {
+                    // Convert to 256-color code: 16 + 36*r + 6*g + b
+                    let code = 16 + 36 * r + 6 * g + b;
+                    return format!("\x1b[38;5;{}m", code);
+                }
+            }
+            String::new()
+        }
+
+        // Background 216-color: BCrgb
+        _ if attr.len() == 5 && attr.starts_with("BC") => {
+            if let (Some(r), Some(g), Some(b)) = (
+                attr.chars().nth(2).and_then(|c| c.to_digit(10)),
+                attr.chars().nth(3).and_then(|c| c.to_digit(10)),
+                attr.chars().nth(4).and_then(|c| c.to_digit(10)),
+            ) {
+                if r <= 5 && g <= 5 && b <= 5 {
+                    let code = 16 + 36 * r + 6 * g + b;
+                    return format!("\x1b[48;5;{}m", code);
+                }
+            }
+            String::new()
+        }
+
+        // Unknown attribute - return empty
+        _ => String::new(),
+    }
 }
 
 /// #send [-w world] text - Send text to MUD
@@ -1008,6 +1120,117 @@ fn cmd_unbind(engine: &mut TfEngine, args: &str) -> TfCommandResult {
         Ok(false) => TfCommandResult::Error(format!("{} was not bound", key)),
         Err(e) => TfCommandResult::Error(e),
     }
+}
+
+/// Switch to a world (foreground)
+fn cmd_fg(args: &str) -> TfCommandResult {
+    let world = args.trim();
+    if world.is_empty() {
+        // No argument - show current world or list
+        TfCommandResult::ClayCommand("/connections".to_string())
+    } else {
+        // Switch to specified world
+        TfCommandResult::ClayCommand(format!("/worlds {}", world))
+    }
+}
+
+/// List variables matching pattern
+fn cmd_listvar(engine: &TfEngine, args: &str) -> TfCommandResult {
+    let pattern = args.trim();
+
+    let mut vars: Vec<(&String, &TfValue)> = engine.global_vars.iter().collect();
+    vars.sort_by_key(|(k, _)| k.as_str());
+
+    let mut output = Vec::new();
+    for (name, value) in vars {
+        // If pattern given, filter by glob match
+        if !pattern.is_empty() {
+            let matches = if pattern.contains('*') || pattern.contains('?') {
+                // Glob pattern matching
+                let regex_pattern = pattern
+                    .replace("*", ".*")
+                    .replace("?", ".");
+                regex::Regex::new(&format!("^{}$", regex_pattern))
+                    .map(|r| r.is_match(name))
+                    .unwrap_or(false)
+            } else {
+                // Substring match
+                name.contains(pattern)
+            };
+            if !matches {
+                continue;
+            }
+        }
+        output.push(format!("{} = {}", name, value.to_string_value()));
+    }
+
+    if output.is_empty() {
+        if pattern.is_empty() {
+            TfCommandResult::Success(Some("No variables defined".to_string()))
+        } else {
+            TfCommandResult::Success(Some(format!("No variables matching '{}'", pattern)))
+        }
+    } else {
+        TfCommandResult::Success(Some(output.join("\n")))
+    }
+}
+
+/// Fire a trigger manually
+fn cmd_trigger(engine: &mut TfEngine, args: &str) -> TfCommandResult {
+    let pattern = args.trim();
+
+    if pattern.is_empty() {
+        return TfCommandResult::Error("Usage: #trigger pattern".to_string());
+    }
+
+    // Find macros with triggers that match the pattern
+    let matching_macros: Vec<_> = engine.macros.iter()
+        .filter(|m| {
+            if let Some(ref trigger) = m.trigger {
+                trigger.pattern.contains(pattern) || pattern.contains(&trigger.pattern)
+            } else {
+                false
+            }
+        })
+        .cloned()
+        .collect();
+
+    if matching_macros.is_empty() {
+        return TfCommandResult::Error(format!("No triggers match '{}'", pattern));
+    }
+
+    // Execute each matching macro
+    let mut results = Vec::new();
+    for macro_def in matching_macros {
+        // Pass None for trigger_match since this is a manual trigger invocation
+        let result = macros::execute_macro(engine, &macro_def, &[], None);
+        results.push(result);
+    }
+
+    // Flatten results
+    let all_results: Vec<TfCommandResult> = results.into_iter().flatten().collect();
+    aggregate_results(all_results)
+}
+
+/// Insert text into input buffer
+fn cmd_input(engine: &mut TfEngine, args: &str) -> TfCommandResult {
+    if args.is_empty() {
+        return TfCommandResult::Error("Usage: #input text".to_string());
+    }
+
+    // Substitute variables in the text
+    let text = super::variables::substitute_variables(engine, args);
+
+    // Queue the text insertion
+    engine.pending_keyboard_ops.push(super::PendingKeyboardOp::Insert(text));
+    TfCommandResult::Success(None)
+}
+
+/// Grab text from output (stub - returns empty since we don't track grab state)
+fn cmd_grab(_args: &str) -> TfCommandResult {
+    // In TF, #grab grabs the current line from output. We don't have that context here.
+    // Return success but note that grab is limited.
+    TfCommandResult::Success(Some("Note: #grab is not fully supported in this implementation".to_string()))
 }
 
 #[cfg(test)]

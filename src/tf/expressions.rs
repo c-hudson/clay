@@ -6,6 +6,7 @@
 use super::{TfEngine, TfValue};
 use regex::Regex;
 use std::collections::HashMap;
+use std::io::{BufRead, BufReader, Write};
 
 /// Token types for the expression lexer
 #[derive(Debug, Clone, PartialEq)]
@@ -1133,8 +1134,742 @@ impl<'a> Evaluator<'a> {
                 Ok(TfValue::Integer(1))
             }
 
+            // regmatch(pattern, string) - regex matching with capture groups
+            "regmatch" => {
+                if args.len() != 2 {
+                    return Err("regmatch requires 2 arguments (pattern, string)".to_string());
+                }
+                let pattern = self.eval(&args[0])?.to_string_value();
+                let text = self.eval(&args[1])?.to_string_value();
+
+                // Clear previous captures
+                self.engine.regex_captures.clear();
+
+                // Compile regex
+                let regex = match Regex::new(&pattern) {
+                    Ok(r) => r,
+                    Err(e) => return Err(format!("Invalid regex: {}", e)),
+                };
+
+                // Try to match
+                if let Some(caps) = regex.captures(&text) {
+                    // Store captures in P0-P9
+                    for i in 0..10 {
+                        if let Some(m) = caps.get(i) {
+                            self.engine.regex_captures.push(m.as_str().to_string());
+                        } else {
+                            self.engine.regex_captures.push(String::new());
+                        }
+                    }
+                    Ok(TfValue::Integer(1))
+                } else {
+                    // No match - clear captures
+                    for _ in 0..10 {
+                        self.engine.regex_captures.push(String::new());
+                    }
+                    Ok(TfValue::Integer(0))
+                }
+            }
+
+            // replace(str, old, new [, count]) - string replacement
+            "replace" => {
+                if args.len() < 3 || args.len() > 4 {
+                    return Err("replace requires 3 or 4 arguments (str, old, new [, count])".to_string());
+                }
+                let text = self.eval(&args[0])?.to_string_value();
+                let old = self.eval(&args[1])?.to_string_value();
+                let new = self.eval(&args[2])?.to_string_value();
+
+                if old.is_empty() {
+                    return Ok(TfValue::String(text));
+                }
+
+                let result = if args.len() == 4 {
+                    let count = self.eval(&args[3])?.to_int().unwrap_or(0) as usize;
+                    if count == 0 {
+                        text.replace(&old, &new)
+                    } else {
+                        text.replacen(&old, &new, count)
+                    }
+                } else {
+                    text.replace(&old, &new)
+                };
+
+                Ok(TfValue::String(result))
+            }
+
+            // strstr(str, substr) - find position of substring (0-indexed, -1 if not found)
+            "strstr" => {
+                if args.len() != 2 {
+                    return Err("strstr requires 2 arguments (str, substr)".to_string());
+                }
+                let text = self.eval(&args[0])?.to_string_value();
+                let substr = self.eval(&args[1])?.to_string_value();
+
+                let pos = text.find(&substr).map(|p| p as i64).unwrap_or(-1);
+                Ok(TfValue::Integer(pos))
+            }
+
+            // sprintf(format, args...) - formatted string
+            "sprintf" => {
+                if args.is_empty() {
+                    return Err("sprintf requires at least 1 argument (format)".to_string());
+                }
+                let format = self.eval(&args[0])?.to_string_value();
+
+                // Evaluate all arguments first
+                let mut arg_values: Vec<TfValue> = Vec::new();
+                for arg in &args[1..] {
+                    arg_values.push(self.eval(arg)?);
+                }
+
+                // Simple sprintf implementation supporting %s, %d, %i, %f, %%
+                let mut result = String::new();
+                let mut arg_idx = 0;
+                let mut chars = format.chars().peekable();
+
+                while let Some(c) = chars.next() {
+                    if c == '%' {
+                        match chars.peek() {
+                            Some('%') => {
+                                chars.next();
+                                result.push('%');
+                            }
+                            Some('s') => {
+                                chars.next();
+                                if arg_idx < arg_values.len() {
+                                    result.push_str(&arg_values[arg_idx].to_string_value());
+                                    arg_idx += 1;
+                                }
+                            }
+                            Some('d') | Some('i') => {
+                                chars.next();
+                                if arg_idx < arg_values.len() {
+                                    let val = arg_values[arg_idx].to_int().unwrap_or(0);
+                                    result.push_str(&val.to_string());
+                                    arg_idx += 1;
+                                }
+                            }
+                            Some('f') => {
+                                chars.next();
+                                if arg_idx < arg_values.len() {
+                                    let val = arg_values[arg_idx].to_float().unwrap_or(0.0);
+                                    result.push_str(&val.to_string());
+                                    arg_idx += 1;
+                                }
+                            }
+                            Some('c') => {
+                                chars.next();
+                                if arg_idx < arg_values.len() {
+                                    let code = arg_values[arg_idx].to_int().unwrap_or(0) as u32;
+                                    if let Some(ch) = char::from_u32(code) {
+                                        result.push(ch);
+                                    }
+                                    arg_idx += 1;
+                                }
+                            }
+                            Some('-') | Some('0'..='9') => {
+                                // Parse width/precision specifiers
+                                let mut spec = String::new();
+                                while let Some(&ch) = chars.peek() {
+                                    if ch == '-' || ch == '.' || ch.is_ascii_digit() {
+                                        spec.push(ch);
+                                        chars.next();
+                                    } else {
+                                        break;
+                                    }
+                                }
+                                // Get the format character
+                                if let Some(fc) = chars.next() {
+                                    if arg_idx < arg_values.len() {
+                                        let formatted = match fc {
+                                            's' => {
+                                                let s = arg_values[arg_idx].to_string_value();
+                                                arg_idx += 1;
+                                                format_with_width(&s, &spec, false)
+                                            }
+                                            'd' | 'i' => {
+                                                let val = arg_values[arg_idx].to_int().unwrap_or(0);
+                                                arg_idx += 1;
+                                                format_with_width(&val.to_string(), &spec, true)
+                                            }
+                                            'f' => {
+                                                let val = arg_values[arg_idx].to_float().unwrap_or(0.0);
+                                                arg_idx += 1;
+                                                format_float_with_precision(val, &spec)
+                                            }
+                                            _ => format!("%{}{}", spec, fc),
+                                        };
+                                        result.push_str(&formatted);
+                                    }
+                                }
+                            }
+                            _ => {
+                                result.push('%');
+                            }
+                        }
+                    } else {
+                        result.push(c);
+                    }
+                }
+
+                Ok(TfValue::String(result))
+            }
+
+            // getopts(optstring, arglist) - parse command-line options
+            "getopts" => {
+                if args.len() != 2 {
+                    return Err("getopts requires 2 arguments (optstring, arglist)".to_string());
+                }
+                let optstring = self.eval(&args[0])?.to_string_value();
+                let arglist = self.eval(&args[1])?.to_string_value();
+
+                // Parse optstring to find which options take values (followed by :)
+                let mut opts_with_values = std::collections::HashSet::new();
+                let mut chars = optstring.chars().peekable();
+                while let Some(c) = chars.next() {
+                    if chars.peek() == Some(&':') {
+                        opts_with_values.insert(c);
+                        chars.next();
+                    }
+                }
+
+                // Parse arguments
+                let args_vec: Vec<&str> = arglist.split_whitespace().collect();
+                let mut i = 0;
+                while i < args_vec.len() {
+                    let arg = args_vec[i];
+                    if arg.starts_with('-') && arg.len() > 1 {
+                        let opt_char = arg.chars().nth(1).unwrap();
+                        let var_name = format!("opt_{}", opt_char);
+
+                        if opts_with_values.contains(&opt_char) {
+                            // Option takes a value
+                            let value = if arg.len() > 2 {
+                                // Value attached: -fvalue
+                                arg[2..].to_string()
+                            } else if i + 1 < args_vec.len() {
+                                // Value is next argument
+                                i += 1;
+                                args_vec[i].to_string()
+                            } else {
+                                String::new()
+                            };
+                            self.engine.set_global(&var_name, TfValue::String(value));
+                        } else {
+                            // Boolean flag
+                            self.engine.set_global(&var_name, TfValue::Integer(1));
+                        }
+                    }
+                    i += 1;
+                }
+
+                Ok(TfValue::Integer(1))
+            }
+
+            // fg_world() - get foreground (current) world name
+            "fg_world" => {
+                let world_name = self.engine.current_world.clone().unwrap_or_default();
+                Ok(TfValue::String(world_name))
+            }
+
+            // world_info(world, field) - get information about a world
+            "world_info" => {
+                if args.len() != 2 {
+                    return Err("world_info requires 2 arguments (world, field)".to_string());
+                }
+                let world_name = self.eval(&args[0])?.to_string_value();
+                let field = self.eval(&args[1])?.to_string_value();
+
+                // Find world in cache
+                let world = self.engine.world_info_cache.iter()
+                    .find(|w| w.name.eq_ignore_ascii_case(&world_name));
+
+                match world {
+                    Some(w) => {
+                        let value = match field.to_lowercase().as_str() {
+                            "name" => TfValue::String(w.name.clone()),
+                            "host" => TfValue::String(w.host.clone()),
+                            "port" => TfValue::String(w.port.clone()),
+                            "character" | "char" => TfValue::String(w.user.clone()),
+                            "login" => TfValue::Integer(if w.is_connected { 1 } else { 0 }),
+                            "ssl" | "secure" => TfValue::Integer(if w.use_ssl { 1 } else { 0 }),
+                            _ => TfValue::String(String::new()),
+                        };
+                        Ok(value)
+                    }
+                    None => Ok(TfValue::String(String::new())),
+                }
+            }
+
+            // ismacro(name) - check if a macro exists
+            "ismacro" => {
+                if args.len() != 1 {
+                    return Err("ismacro requires 1 argument (name)".to_string());
+                }
+                let name = self.eval(&args[0])?.to_string_value();
+                let exists = self.engine.macros.iter().any(|m| m.name == name);
+                Ok(TfValue::Integer(if exists { 1 } else { 0 }))
+            }
+
+            // nactive() - count active (connected) worlds
+            "nactive" => {
+                let count = self.engine.world_info_cache.iter()
+                    .filter(|w| w.is_connected)
+                    .count();
+                Ok(TfValue::Integer(count as i64))
+            }
+
+            // nworlds() - count total worlds
+            "nworlds" => {
+                let count = self.engine.world_info_cache.len();
+                Ok(TfValue::Integer(count as i64))
+            }
+
+            // nread(world) - bytes available to read (always 0 - we don't buffer socket reads)
+            "nread" => {
+                Ok(TfValue::Integer(0))
+            }
+
+            // nlog() - lines in current log buffer (always 0 - we write directly)
+            "nlog" => {
+                Ok(TfValue::Integer(0))
+            }
+
+            // is_connected(world) - check if world is connected
+            "is_connected" => {
+                if args.is_empty() {
+                    // Check current world
+                    let current = self.engine.current_world.clone().unwrap_or_default();
+                    let connected = self.engine.world_info_cache.iter()
+                        .find(|w| w.name == current)
+                        .map(|w| w.is_connected)
+                        .unwrap_or(false);
+                    Ok(TfValue::Integer(if connected { 1 } else { 0 }))
+                } else {
+                    let world_name = self.eval(&args[0])?.to_string_value();
+                    let connected = self.engine.world_info_cache.iter()
+                        .find(|w| w.name.eq_ignore_ascii_case(&world_name))
+                        .map(|w| w.is_connected)
+                        .unwrap_or(false);
+                    Ok(TfValue::Integer(if connected { 1 } else { 0 }))
+                }
+            }
+
+            // idle() - seconds since last user input (not tracked, return 0)
+            "idle" => {
+                Ok(TfValue::Integer(0))
+            }
+
+            // sidle() - seconds since last send to server (not tracked, return 0)
+            "sidle" => {
+                Ok(TfValue::Integer(0))
+            }
+
+            // kbhead() - text before cursor
+            "kbhead" => {
+                let kb = &self.engine.keyboard_state;
+                let pos = kb.cursor_position.min(kb.buffer.len());
+                Ok(TfValue::String(kb.buffer[..pos].to_string()))
+            }
+
+            // kbtail() - text after cursor
+            "kbtail" => {
+                let kb = &self.engine.keyboard_state;
+                let pos = kb.cursor_position.min(kb.buffer.len());
+                Ok(TfValue::String(kb.buffer[pos..].to_string()))
+            }
+
+            // kbpoint() - cursor position
+            "kbpoint" => {
+                Ok(TfValue::Integer(self.engine.keyboard_state.cursor_position as i64))
+            }
+
+            // kblen() - total input length
+            "kblen" => {
+                Ok(TfValue::Integer(self.engine.keyboard_state.buffer.len() as i64))
+            }
+
+            // kbgoto(pos) - move cursor to position
+            "kbgoto" => {
+                if args.len() != 1 {
+                    return Err("kbgoto requires 1 argument (position)".to_string());
+                }
+                let pos = self.eval(&args[0])?.to_int().unwrap_or(0) as usize;
+                self.engine.pending_keyboard_ops.push(super::PendingKeyboardOp::Goto(pos));
+                Ok(TfValue::Integer(1))
+            }
+
+            // kbdel(count) - delete characters (positive = forward, negative = backward)
+            "kbdel" => {
+                if args.len() != 1 {
+                    return Err("kbdel requires 1 argument (count)".to_string());
+                }
+                let count = self.eval(&args[0])?.to_int().unwrap_or(0) as i32;
+                self.engine.pending_keyboard_ops.push(super::PendingKeyboardOp::Delete(count));
+                Ok(TfValue::Integer(1))
+            }
+
+            // kbmatch() - find matching brace/paren (returns position or -1)
+            "kbmatch" => {
+                let kb = &self.engine.keyboard_state;
+                let pos = kb.cursor_position.min(kb.buffer.len());
+                if pos == 0 || pos > kb.buffer.len() {
+                    return Ok(TfValue::Integer(-1));
+                }
+
+                let chars: Vec<char> = kb.buffer.chars().collect();
+                let current_char = if pos > 0 && pos <= chars.len() {
+                    chars[pos - 1]
+                } else {
+                    return Ok(TfValue::Integer(-1));
+                };
+
+                // Define matching pairs
+                let (target, direction) = match current_char {
+                    '(' => (')', 1i32),
+                    ')' => ('(', -1),
+                    '[' => (']', 1),
+                    ']' => ('[', -1),
+                    '{' => ('}', 1),
+                    '}' => ('{', -1),
+                    '<' => ('>', 1),
+                    '>' => ('<', -1),
+                    _ => return Ok(TfValue::Integer(-1)),
+                };
+
+                let mut depth = 1;
+                let mut idx = (pos as i32 - 1) + direction;
+                while idx >= 0 && (idx as usize) < chars.len() {
+                    let c = chars[idx as usize];
+                    if c == current_char {
+                        depth += 1;
+                    } else if c == target {
+                        depth -= 1;
+                        if depth == 0 {
+                            return Ok(TfValue::Integer(idx as i64 + 1)); // 1-indexed
+                        }
+                    }
+                    idx += direction;
+                }
+
+                Ok(TfValue::Integer(-1))
+            }
+
+            // kbwordleft() - move cursor left by word
+            "kbwordleft" => {
+                self.engine.pending_keyboard_ops.push(super::PendingKeyboardOp::WordLeft);
+                Ok(TfValue::Integer(1))
+            }
+
+            // kbwordright() - move cursor right by word
+            "kbwordright" => {
+                self.engine.pending_keyboard_ops.push(super::PendingKeyboardOp::WordRight);
+                Ok(TfValue::Integer(1))
+            }
+
+            // kbword() - get word at cursor
+            "kbword" => {
+                let kb = &self.engine.keyboard_state;
+                let chars: Vec<char> = kb.buffer.chars().collect();
+                let pos = kb.cursor_position.min(chars.len());
+
+                if pos == 0 || chars.is_empty() {
+                    return Ok(TfValue::String(String::new()));
+                }
+
+                // Find word boundaries
+                let mut start = pos;
+                while start > 0 && chars[start - 1].is_alphanumeric() {
+                    start -= 1;
+                }
+
+                let mut end = pos;
+                while end < chars.len() && chars[end].is_alphanumeric() {
+                    end += 1;
+                }
+
+                let word: String = chars[start..end].iter().collect();
+                Ok(TfValue::String(word))
+            }
+
+            // input(text) - insert text at cursor
+            "input" => {
+                if args.is_empty() {
+                    return Err("input requires at least 1 argument (text)".to_string());
+                }
+                let text = self.eval(&args[0])?.to_string_value();
+                self.engine.pending_keyboard_ops.push(super::PendingKeyboardOp::Insert(text));
+                Ok(TfValue::Integer(1))
+            }
+
+            // tfopen(filename, mode) - open a file (returns handle, 0 on failure)
+            "tfopen" => {
+                if args.len() < 2 {
+                    return Err("tfopen requires 2 arguments (filename, mode)".to_string());
+                }
+                let filename = self.eval(&args[0])?.to_string_value();
+                let mode_str = self.eval(&args[1])?.to_string_value();
+
+                let mode = match mode_str.to_lowercase().as_str() {
+                    "r" | "read" => super::TfFileMode::Read,
+                    "w" | "write" => super::TfFileMode::Write,
+                    "a" | "append" => super::TfFileMode::Append,
+                    _ => return Err(format!("Invalid file mode: {} (use r, w, or a)", mode_str)),
+                };
+
+                // Verify the file can be opened in the specified mode
+                let can_open = match mode {
+                    super::TfFileMode::Read => std::path::Path::new(&filename).exists(),
+                    super::TfFileMode::Write => {
+                        // Try to create/truncate the file
+                        std::fs::File::create(&filename).is_ok()
+                    }
+                    super::TfFileMode::Append => {
+                        // Try to open for appending
+                        std::fs::OpenOptions::new()
+                            .create(true)
+                            .append(true)
+                            .open(&filename)
+                            .is_ok()
+                    }
+                };
+
+                if !can_open {
+                    return Ok(TfValue::Integer(0)); // Return 0 on failure (TF convention)
+                }
+
+                // Allocate a handle
+                let handle = self.engine.next_file_handle;
+                self.engine.next_file_handle += 1;
+
+                self.engine.open_files.insert(handle, super::TfFileHandle {
+                    path: filename,
+                    mode,
+                    read_position: 0,
+                });
+
+                Ok(TfValue::Integer(handle as i64))
+            }
+
+            // tfclose(handle) - close a file (returns 1 on success, 0 on failure)
+            "tfclose" => {
+                if args.len() != 1 {
+                    return Err("tfclose requires 1 argument (handle)".to_string());
+                }
+                let handle = self.eval(&args[0])?.to_int().unwrap_or(-1) as i32;
+
+                if self.engine.open_files.remove(&handle).is_some() {
+                    Ok(TfValue::Integer(1))
+                } else {
+                    Ok(TfValue::Integer(0))
+                }
+            }
+
+            // tfread(handle, varname) - read a line into variable (returns 1 on success, 0 on EOF/error)
+            "tfread" => {
+                if args.len() != 2 {
+                    return Err("tfread requires 2 arguments (handle, varname)".to_string());
+                }
+                let handle = self.eval(&args[0])?.to_int().unwrap_or(-1) as i32;
+                let varname = self.eval(&args[1])?.to_string_value();
+
+                let file_handle = match self.engine.open_files.get_mut(&handle) {
+                    Some(fh) if fh.mode == super::TfFileMode::Read => fh,
+                    _ => return Ok(TfValue::Integer(0)),
+                };
+
+                // Open the file and seek to current position
+                let file = match std::fs::File::open(&file_handle.path) {
+                    Ok(f) => f,
+                    Err(_) => return Ok(TfValue::Integer(0)),
+                };
+
+                use std::io::Seek;
+                let mut reader = BufReader::new(file);
+                if reader.seek(std::io::SeekFrom::Start(file_handle.read_position)).is_err() {
+                    return Ok(TfValue::Integer(0));
+                }
+
+                // Read one line
+                let mut line = String::new();
+                match reader.read_line(&mut line) {
+                    Ok(0) => {
+                        // EOF
+                        Ok(TfValue::Integer(0))
+                    }
+                    Ok(n) => {
+                        // Update position
+                        file_handle.read_position += n as u64;
+
+                        // Strip trailing newline
+                        if line.ends_with('\n') {
+                            line.pop();
+                            if line.ends_with('\r') {
+                                line.pop();
+                            }
+                        }
+
+                        // Set the variable
+                        self.engine.set_global(&varname, TfValue::String(line));
+                        Ok(TfValue::Integer(1))
+                    }
+                    Err(_) => Ok(TfValue::Integer(0)),
+                }
+            }
+
+            // tfwrite(handle, text) - write text to file (returns 1 on success, 0 on failure)
+            "tfwrite" => {
+                if args.len() != 2 {
+                    return Err("tfwrite requires 2 arguments (handle, text)".to_string());
+                }
+                let handle = self.eval(&args[0])?.to_int().unwrap_or(-1) as i32;
+                let text = self.eval(&args[1])?.to_string_value();
+
+                let file_handle = match self.engine.open_files.get(&handle) {
+                    Some(fh) if fh.mode == super::TfFileMode::Write || fh.mode == super::TfFileMode::Append => fh,
+                    _ => return Ok(TfValue::Integer(0)),
+                };
+
+                // Open file in appropriate mode
+                let mut file = match file_handle.mode {
+                    super::TfFileMode::Write => {
+                        match std::fs::OpenOptions::new()
+                            .write(true)
+                            .create(true)
+                            .append(true) // Use append to not overwrite on each write
+                            .open(&file_handle.path)
+                        {
+                            Ok(f) => f,
+                            Err(_) => return Ok(TfValue::Integer(0)),
+                        }
+                    }
+                    super::TfFileMode::Append => {
+                        match std::fs::OpenOptions::new()
+                            .append(true)
+                            .create(true)
+                            .open(&file_handle.path)
+                        {
+                            Ok(f) => f,
+                            Err(_) => return Ok(TfValue::Integer(0)),
+                        }
+                    }
+                    _ => return Ok(TfValue::Integer(0)),
+                };
+
+                // Write with newline
+                match writeln!(file, "{}", text) {
+                    Ok(_) => Ok(TfValue::Integer(1)),
+                    Err(_) => Ok(TfValue::Integer(0)),
+                }
+            }
+
+            // tfflush(handle) - flush file (returns 1 on success, 0 on failure)
+            "tfflush" => {
+                if args.len() != 1 {
+                    return Err("tfflush requires 1 argument (handle)".to_string());
+                }
+                let handle = self.eval(&args[0])?.to_int().unwrap_or(-1) as i32;
+
+                // Check if handle is valid
+                if self.engine.open_files.contains_key(&handle) {
+                    // File operations are not buffered in our implementation, so flush is a no-op
+                    Ok(TfValue::Integer(1))
+                } else {
+                    Ok(TfValue::Integer(0))
+                }
+            }
+
+            // tfeof(handle) - check if at end of file (returns 1 if at EOF, 0 otherwise)
+            "tfeof" => {
+                if args.len() != 1 {
+                    return Err("tfeof requires 1 argument (handle)".to_string());
+                }
+                let handle = self.eval(&args[0])?.to_int().unwrap_or(-1) as i32;
+
+                let file_handle = match self.engine.open_files.get(&handle) {
+                    Some(fh) if fh.mode == super::TfFileMode::Read => fh,
+                    _ => return Ok(TfValue::Integer(1)), // Invalid handle = EOF
+                };
+
+                // Check if we're at EOF by comparing position to file size
+                match std::fs::metadata(&file_handle.path) {
+                    Ok(meta) => {
+                        let at_eof = file_handle.read_position >= meta.len();
+                        Ok(TfValue::Integer(if at_eof { 1 } else { 0 }))
+                    }
+                    Err(_) => Ok(TfValue::Integer(1)),
+                }
+            }
+
             _ => Err(format!("Unknown function: {}", name)),
         }
+    }
+}
+
+/// Format a string with width specification (for sprintf)
+fn format_with_width(s: &str, spec: &str, numeric: bool) -> String {
+    let mut left_align = false;
+    let mut zero_pad = false;
+    let mut width = 0;
+    let mut spec_chars = spec.chars().peekable();
+
+    // Parse flags
+    while let Some(&c) = spec_chars.peek() {
+        match c {
+            '-' => { left_align = true; spec_chars.next(); }
+            '0' if width == 0 && numeric => { zero_pad = true; spec_chars.next(); }
+            _ => break,
+        }
+    }
+
+    // Parse width
+    let width_str: String = spec_chars.take_while(|c| c.is_ascii_digit()).collect();
+    if !width_str.is_empty() {
+        width = width_str.parse().unwrap_or(0);
+    }
+
+    if width == 0 || s.len() >= width {
+        return s.to_string();
+    }
+
+    let padding = width - s.len();
+    let pad_char = if zero_pad && !left_align { '0' } else { ' ' };
+
+    if left_align {
+        format!("{}{}", s, pad_char.to_string().repeat(padding))
+    } else {
+        format!("{}{}", pad_char.to_string().repeat(padding), s)
+    }
+}
+
+/// Format a float with precision specification (for sprintf)
+fn format_float_with_precision(val: f64, spec: &str) -> String {
+    // Parse width and precision from spec like "10.2"
+    let parts: Vec<&str> = spec.split('.').collect();
+    let precision = if parts.len() > 1 {
+        parts[1].parse().unwrap_or(6)
+    } else {
+        6
+    };
+
+    let formatted = format!("{:.prec$}", val, prec = precision);
+
+    if !parts.is_empty() && !parts[0].is_empty() {
+        let width: usize = parts[0].trim_start_matches('-').trim_start_matches('0').parse().unwrap_or(0);
+        let left_align = parts[0].starts_with('-');
+        if width > formatted.len() {
+            let padding = width - formatted.len();
+            if left_align {
+                format!("{}{}", formatted, " ".repeat(padding))
+            } else {
+                format!("{}{}", " ".repeat(padding), formatted)
+            }
+        } else {
+            formatted
+        }
+    } else {
+        formatted
     }
 }
 

@@ -1703,9 +1703,6 @@ pub struct App {
     pub user_connections: std::collections::HashMap<(usize, String), UserConnection>,
     /// TinyFugue scripting engine
     pub tf_engine: tf::TfEngine,
-    // PROXY DEBUG: Timestamp when "think proxy" was sent, triggers reload after 2 seconds
-    // TODO: Remove once proxy issues are resolved
-    pub proxy_debug_reload_at: Option<std::time::Instant>,
     /// Remote client mode: WebSocket transmitter for sending commands to server
     pub ws_client_tx: Option<mpsc::UnboundedSender<WsMessage>>,
     /// Activity count from server (used in remote client mode, i.e. --console)
@@ -1755,7 +1752,6 @@ impl App {
             ban_list: BanList::new(),
             user_connections: std::collections::HashMap::new(),
             tf_engine: tf::TfEngine::new(),
-            proxy_debug_reload_at: None, // PROXY DEBUG: TODO remove
             ws_client_tx: None, // Set when running as remote client (--console mode)
             server_activity_count: 0, // Activity count from server (remote client mode)
             gui_tx: None, // Set when running in master GUI mode (--gui)
@@ -1800,6 +1796,100 @@ impl App {
             self.current_world_index.min(self.worlds.len() - 1)
         };
         &mut self.worlds[idx]
+    }
+
+    /// Sync world info to TfEngine for TF functions (fg_world, world_info, nactive)
+    fn sync_tf_world_info(&mut self) {
+        // Set current world name
+        self.tf_engine.current_world = if !self.worlds.is_empty() {
+            Some(self.worlds[self.current_world_index].name.clone())
+        } else {
+            None
+        };
+
+        // Build world info cache
+        self.tf_engine.world_info_cache.clear();
+        for world in &self.worlds {
+            self.tf_engine.world_info_cache.push(tf::WorldInfoCache {
+                name: world.name.clone(),
+                host: world.settings.hostname.clone(),
+                port: world.settings.port.clone(),
+                user: world.settings.user.clone(),
+                is_connected: world.connected,
+                use_ssl: world.settings.use_ssl,
+            });
+        }
+
+        // Sync keyboard buffer state
+        self.tf_engine.keyboard_state = tf::KeyboardBufferState {
+            buffer: self.input.buffer.clone(),
+            cursor_position: self.input.cursor_position,
+        };
+    }
+
+    /// Process pending keyboard operations from TF functions
+    fn process_pending_keyboard_ops(&mut self) {
+        let ops: Vec<tf::PendingKeyboardOp> = self.tf_engine.pending_keyboard_ops.drain(..).collect();
+        for op in ops {
+            match op {
+                tf::PendingKeyboardOp::Goto(pos) => {
+                    let max_pos = self.input.buffer.chars().count();
+                    self.input.cursor_position = pos.min(max_pos);
+                }
+                tf::PendingKeyboardOp::Delete(count) => {
+                    if count > 0 {
+                        // Delete forward
+                        let chars: Vec<char> = self.input.buffer.chars().collect();
+                        let pos = self.input.cursor_position;
+                        let end = (pos + count as usize).min(chars.len());
+                        let new_buffer: String = chars[..pos].iter().chain(chars[end..].iter()).collect();
+                        self.input.buffer = new_buffer;
+                    } else if count < 0 {
+                        // Delete backward
+                        let chars: Vec<char> = self.input.buffer.chars().collect();
+                        let pos = self.input.cursor_position;
+                        let start = pos.saturating_sub((-count) as usize);
+                        let new_buffer: String = chars[..start].iter().chain(chars[pos..].iter()).collect();
+                        self.input.buffer = new_buffer;
+                        self.input.cursor_position = start;
+                    }
+                }
+                tf::PendingKeyboardOp::WordLeft => {
+                    let chars: Vec<char> = self.input.buffer.chars().collect();
+                    let mut pos = self.input.cursor_position;
+                    // Skip whitespace
+                    while pos > 0 && !chars[pos - 1].is_alphanumeric() {
+                        pos -= 1;
+                    }
+                    // Skip word
+                    while pos > 0 && chars[pos - 1].is_alphanumeric() {
+                        pos -= 1;
+                    }
+                    self.input.cursor_position = pos;
+                }
+                tf::PendingKeyboardOp::WordRight => {
+                    let chars: Vec<char> = self.input.buffer.chars().collect();
+                    let mut pos = self.input.cursor_position;
+                    // Skip word
+                    while pos < chars.len() && chars[pos].is_alphanumeric() {
+                        pos += 1;
+                    }
+                    // Skip whitespace
+                    while pos < chars.len() && !chars[pos].is_alphanumeric() {
+                        pos += 1;
+                    }
+                    self.input.cursor_position = pos;
+                }
+                tf::PendingKeyboardOp::Insert(text) => {
+                    let chars: Vec<char> = self.input.buffer.chars().collect();
+                    let pos = self.input.cursor_position.min(chars.len());
+                    let before: String = chars[..pos].iter().collect();
+                    let after: String = chars[pos..].iter().collect();
+                    self.input.buffer = format!("{}{}{}", before, text, after);
+                    self.input.cursor_position = pos + text.chars().count();
+                }
+            }
+        }
     }
 
     /// Check if a new-style popup is currently visible
@@ -3705,53 +3795,6 @@ pub fn reap_zombie_children() {
         }
     }
 }
-
-// ============================================================================
-// PROXY DEBUG LOGGING - Temporary code for debugging proxy connection drops
-// TODO: Remove this section once proxy issues are resolved
-// ============================================================================
-
-/// Log the status of all proxy connections to the debug log
-fn log_proxy_debug_status(app: &App, context: &str) {
-    let timestamp = get_unix_timestamp();
-    debug_log(true, &format!("PROXY_DEBUG [{}]: {}", timestamp, context));
-
-    for (idx, world) in app.worlds.iter().enumerate() {
-        if world.is_tls {
-            let connected = if world.connected { "CONNECTED" } else { "DISCONNECTED" };
-            let proxy_status = if let Some(pid) = world.proxy_pid {
-                let alive = if is_process_alive(pid) { "ALIVE" } else { "DEAD" };
-                format!("proxy_pid={} ({})", pid, alive)
-            } else {
-                "NO_PROXY".to_string()
-            };
-            let socket_status = if let Some(ref path) = world.proxy_socket_path {
-                let exists = if path.exists() { "EXISTS" } else { "MISSING" };
-                format!("socket={} ({})", path.display(), exists)
-            } else {
-                "NO_SOCKET".to_string()
-            };
-            let has_tx = if world.command_tx.is_some() { "HAS_TX" } else { "NO_TX" };
-
-            debug_log(true, &format!(
-                "PROXY_DEBUG   [{}] world[{}] '{}': {} | {} | {} | {}",
-                timestamp, idx, world.name, connected, proxy_status, socket_status, has_tx
-            ));
-        }
-    }
-}
-
-/// Get current unix timestamp as string
-fn get_unix_timestamp() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs()
-}
-
-// ============================================================================
-// END PROXY DEBUG LOGGING
-// ============================================================================
 
 /// Generate a unique socket path for the TLS proxy.
 /// Uses $XDG_RUNTIME_DIR (typically /run/user/<uid> with mode 0700) for security,
@@ -7109,6 +7152,8 @@ pub async fn run_app_headless(
                                         _ => {}
                                     }
                                 } else if cmd.starts_with('#') {
+                                    // TF command - sync world info first
+                                    app.sync_tf_world_info();
                                     match app.tf_engine.execute(&cmd) {
                                         tf::TfCommandResult::SendToMud(text) => {
                                             if let Some(tx) = &app.worlds[world_idx].command_tx {
@@ -7361,6 +7406,8 @@ pub async fn run_app_headless(
                     if app.tf_engine.processes[i].next_run <= now {
                         let cmd = app.tf_engine.processes[i].command.clone();
                         let process_world = app.tf_engine.processes[i].world.clone();
+                        // Sync world info before executing process command
+                        app.sync_tf_world_info();
                         let result = app.tf_engine.execute(&cmd);
                         let target_idx = if let Some(ref wname) = process_world {
                             if wname.is_empty() {
@@ -7927,17 +7974,6 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
 
         debug_log(true, "STARTUP: Connection cleanup done, sending keepalives...");
 
-        // ================================================================
-        // PROXY DEBUG: Log post-reload status of all proxy connections
-        // TODO: Remove this section once proxy issues are resolved
-        // ================================================================
-        if is_reload {
-            log_proxy_debug_status(&app, "POST-RELOAD STATUS (after connection cleanup)");
-        }
-        // ================================================================
-        // END PROXY DEBUG
-        // ================================================================
-
         // Send immediate keepalive for all reconnected worlds since we don't know how long they were idle
         for world in &mut app.worlds {
             if world.connected {
@@ -8266,7 +8302,8 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                     if num_part.chars().all(|c| c.is_ascii_digit()) && !num_part.is_empty() {
                                         let pattern = rest[space_pos..].trim();
                                         if !pattern.is_empty() {
-                                            // Convert to #recall /N pattern
+                                            // Convert to #recall /N pattern - sync world info first
+                                            app.sync_tf_world_info();
                                             let recall_cmd = format!("#recall /{} {}", num_part, pattern);
                                             match app.tf_engine.execute(&recall_cmd) {
                                                 tf::TfCommandResult::Recall(opts) => {
@@ -8306,7 +8343,8 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                     return Ok(());
                                 }
                             } else if cmd.starts_with('#') {
-                                // TinyFugue command
+                                // TinyFugue command - sync world info first
+                                app.sync_tf_world_info();
                                 match app.tf_engine.execute(&cmd) {
                                     tf::TfCommandResult::Success(Some(msg)) => {
                                         app.add_tf_output(&msg);
@@ -8376,6 +8414,8 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                 }
                                 // Process any pending world operations from TF functions like addworld()
                                 process_pending_world_ops(&mut app);
+                                // Process any pending keyboard operations from TF functions like kbgoto()
+                                app.process_pending_keyboard_ops();
                             } else if app.current_world().connected {
                                 if let Some(tx) = &app.current_world().command_tx {
                                     if tx.send(WriteCommand::Text(cmd)).await.is_err() {
@@ -8433,7 +8473,8 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                     // Internal Clay command - execute it
                                     handle_command(&cmd, &mut app, event_tx.clone()).await;
                                 } else if cmd.starts_with('#') {
-                                    // TF command
+                                    // TF command - sync world info first
+                                    app.sync_tf_world_info();
                                     match app.tf_engine.execute(&cmd) {
                                         tf::TfCommandResult::SendToMud(text) => {
                                             if let Some(tx) = &app.worlds[world_idx].command_tx {
@@ -8734,6 +8775,8 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                 if cmd.starts_with('/') {
                                     handle_command(&cmd, &mut app, event_tx.clone()).await;
                                 } else if cmd.starts_with('#') {
+                                    // TF command - sync world info first
+                                    app.sync_tf_world_info();
                                     match app.tf_engine.execute(&cmd) {
                                         tf::TfCommandResult::SendToMud(text) => {
                                             if let Some(tx) = &app.worlds[world_idx].command_tx {
@@ -8815,7 +8858,8 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                                 if cmd.starts_with('/') {
                                                     app.ws_send_to_client(client_id, WsMessage::ExecuteLocalCommand { command: cmd });
                                                 } else if cmd.starts_with('#') {
-                                                    // TinyFugue command - execute on server
+                                                    // TinyFugue command - execute on server, sync world info first
+                                                    app.sync_tf_world_info();
                                                     match app.tf_engine.execute(&cmd) {
                                                         tf::TfCommandResult::Success(Some(msg)) => {
                                                             app.ws_broadcast(WsMessage::ServerData {
@@ -9898,23 +9942,6 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                     }
                 }
 
-                // ================================================================
-                // PROXY DEBUG: Check if 2 seconds have passed since "think proxy"
-                // TODO: Remove this section once proxy issues are resolved
-                // ================================================================
-                if let Some(start_time) = app.proxy_debug_reload_at {
-                    if start_time.elapsed() >= std::time::Duration::from_secs(2) {
-                        debug_log(true, "PROXY_DEBUG: 2 seconds elapsed, triggering reload");
-                        // Trigger reload command
-                        if handle_command("/reload", &mut app, event_tx.clone()).await {
-                            return Ok(());
-                        }
-                    }
-                }
-                // ================================================================
-                // END PROXY DEBUG
-                // ================================================================
-
                 // Redraw to update the clock display in separator bar
             }
 
@@ -9998,6 +10025,8 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                     if app.tf_engine.processes[i].next_run <= now {
                         let cmd = app.tf_engine.processes[i].command.clone();
                         let process_world = app.tf_engine.processes[i].world.clone();
+                        // Sync world info before executing process command
+                        app.sync_tf_world_info();
                         let result = app.tf_engine.execute(&cmd);
                         // Determine target world for this process
                         let target_idx = if let Some(ref wname) = process_world {
@@ -10103,29 +10132,6 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                         // Consider "current" if console OR any web/GUI client is viewing this world
                         let is_current = world_idx == app.current_world_index || app.ws_client_viewing(world_idx);
                         let decoded_data = app.worlds[world_idx].settings.encoding.decode(&bytes);
-
-                        // ================================================================
-                        // PROXY DEBUG: Log output from proxy worlds during debug wait
-                        // TODO: Remove this section once proxy issues are resolved
-                        // ================================================================
-                        if app.proxy_debug_reload_at.is_some() {
-                            let world = &app.worlds[world_idx];
-                            if world.is_tls && world.proxy_pid.is_some() {
-                                // Log the raw data received
-                                let preview: String = decoded_data.chars().take(200).collect();
-                                let preview_escaped = preview.replace('\n', "\\n").replace('\r', "\\r");
-                                debug_log(true, &format!(
-                                    "PROXY_DEBUG: Received from '{}' ({} bytes): {}{}",
-                                    world_name,
-                                    decoded_data.len(),
-                                    preview_escaped,
-                                    if decoded_data.len() > 200 { "..." } else { "" }
-                                ));
-                            }
-                        }
-                        // ================================================================
-                        // END PROXY DEBUG
-                        // ================================================================
 
                         // Extract ANSI music sequences FIRST, before any other processing
                         let (data, music_sequences) = if app.settings.ansi_music_enabled {
@@ -10335,6 +10341,8 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                             if cmd.starts_with('/') {
                                 handle_command(&cmd, &mut app, event_tx.clone()).await;
                             } else if cmd.starts_with('#') {
+                                // TF command - sync world info first
+                                app.sync_tf_world_info();
                                 match app.tf_engine.execute(&cmd) {
                                     tf::TfCommandResult::SendToMud(text) => {
                                         if let Some(tx) = &app.worlds[world_idx].command_tx {
@@ -10578,6 +10586,8 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                             if cmd.starts_with('/') {
                                 handle_command(&cmd, &mut app, event_tx.clone()).await;
                             } else if cmd.starts_with('#') {
+                                // TF command - sync world info first
+                                app.sync_tf_world_info();
                                 match app.tf_engine.execute(&cmd) {
                                     tf::TfCommandResult::SendToMud(text) => {
                                         if let Some(tx) = &app.worlds[world_idx].command_tx {
@@ -10657,7 +10667,8 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                             if cmd.starts_with('/') {
                                                 app.ws_send_to_client(client_id, WsMessage::ExecuteLocalCommand { command: cmd });
                                             } else if cmd.starts_with('#') {
-                                                // TinyFugue command - execute on server
+                                                // TinyFugue command - execute on server, sync world info first
+                                                app.sync_tf_world_info();
                                                 match app.tf_engine.execute(&cmd) {
                                                     tf::TfCommandResult::Success(Some(msg)) => {
                                                         app.ws_broadcast(WsMessage::ServerData {
@@ -13663,52 +13674,6 @@ async fn handle_command(cmd: &str, app: &mut App, event_tx: mpsc::Sender<AppEven
 
             #[cfg(all(unix, not(target_os = "android")))]
             {
-                // ================================================================
-                // PROXY DEBUG: Send "think proxy" and wait 2 seconds before reload
-                // TODO: Remove this section once proxy issues are resolved
-                // ================================================================
-                let has_proxy_connections = app.worlds.iter()
-                    .any(|w| w.connected && w.is_tls && w.proxy_pid.is_some());
-
-                if has_proxy_connections && app.proxy_debug_reload_at.is_none() {
-                    // Log proxy status before reload
-                    log_proxy_debug_status(app, "PRE-RELOAD STATUS");
-
-                    // Send "think proxy - [timestamp]" to all proxy-connected worlds
-                    let timestamp = get_unix_timestamp();
-                    let think_cmd = format!("think proxy - {}", timestamp);
-                    debug_log(true, &format!("PROXY_DEBUG: Sending '{}' to proxy worlds", think_cmd));
-
-                    for world in &app.worlds {
-                        if world.connected && world.is_tls && world.proxy_pid.is_some() {
-                            if let Some(tx) = &world.command_tx {
-                                let _ = tx.try_send(WriteCommand::Text(think_cmd.clone()));
-                                debug_log(true, &format!("PROXY_DEBUG: Sent to world '{}'", world.name));
-                            }
-                        }
-                    }
-
-                    // Set the timer - reload will proceed after 2 seconds
-                    app.proxy_debug_reload_at = Some(std::time::Instant::now());
-                    app.add_output("Proxy debug: waiting 2 seconds to collect output before reload...");
-                    debug_log(true, "PROXY_DEBUG: Waiting 2 seconds for server response");
-                    return false; // Don't do reload yet
-                }
-
-                // If we're in debug mode, check if 2 seconds have passed
-                if let Some(start_time) = app.proxy_debug_reload_at {
-                    if start_time.elapsed() < std::time::Duration::from_secs(2) {
-                        // Still waiting - this shouldn't normally happen since we trigger from event loop
-                        return false;
-                    }
-                    // 2 seconds passed, clear the flag and log final status
-                    app.proxy_debug_reload_at = None;
-                    log_proxy_debug_status(app, "RELOAD STARTING (after 2s wait)");
-                }
-                // ================================================================
-                // END PROXY DEBUG
-                // ================================================================
-
                 // First check if we can find the executable (handling " (deleted)" suffix)
                 let exe_path = match get_executable_path() {
                     Ok((p, _)) => p,
@@ -14024,7 +13989,8 @@ async fn handle_command(cmd: &str, app: &mut App, event_tx: mpsc::Sender<AppEven
                     if cmd_str.starts_with('/') {
                         Box::pin(handle_command(&cmd_str, app, event_tx.clone())).await;
                     } else if cmd_str.starts_with('#') {
-                        // TinyFugue command
+                        // TinyFugue command - sync world info first
+                        app.sync_tf_world_info();
                         match app.tf_engine.execute(&cmd_str) {
                             tf::TfCommandResult::Success(Some(msg)) => {
                                 app.add_tf_output(&msg);
