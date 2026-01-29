@@ -18,6 +18,8 @@ pub mod remote_gui;
 // Version information
 const VERSION: &str = "1.0.0-alpha";
 const BUILD_HASH: &str = env!("BUILD_HASH");
+// Debug build ID - change this to test reload with binary changes
+const DEBUG_BUILD_ID: u32 = 1;
 
 // Custom config file path (set via --conf=<path> argument)
 use std::sync::OnceLock;
@@ -13858,7 +13860,7 @@ async fn handle_command(cmd: &str, app: &mut App, event_tx: mpsc::Sender<AppEven
             // Show debug info about all worlds to diagnose activity indicator issues
             // Collect lines first to avoid borrow checker issues with app.add_output inside loop
             let mut debug_lines = Vec::new();
-            debug_lines.push("=== Debug: World State ===".to_string());
+            debug_lines.push(format!("=== Debug: World State === (build_id: {})", DEBUG_BUILD_ID));
             debug_lines.push(format!("current_world_index: {}", app.current_world_index));
             debug_lines.push(format!("activity_count(): {}", app.activity_count()));
             debug_lines.push(format!("world_switch_mode: {:?}", app.settings.world_switch_mode));
