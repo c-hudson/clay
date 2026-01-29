@@ -4131,18 +4131,32 @@ async fn run_console_client(addr: &str) -> io::Result<()> {
     use tokio_tungstenite::{connect_async, tungstenite::Message};
     use futures::SinkExt;
 
-    // Parse address - add ws:// prefix if not present
-    let ws_url = if addr.starts_with("ws://") || addr.starts_with("wss://") {
-        addr.to_string()
+    // Parse address - add wss:// prefix if not present (try secure first)
+    let (ws_url, try_fallback) = if addr.starts_with("ws://") || addr.starts_with("wss://") {
+        (addr.to_string(), false)
     } else {
-        format!("ws://{}", addr)
+        // Default to wss:// for security, will fall back to ws:// if it fails
+        (format!("wss://{}", addr), true)
     };
 
     println!("Connecting to {}...", ws_url);
 
-    // Connect to WebSocket server
-    let (ws_stream, _) = match connect_async(&ws_url).await {
+    // Connect to WebSocket server - try wss:// first, then fall back to ws://
+    let connect_result = connect_async(&ws_url).await;
+    let (ws_stream, _) = match connect_result {
         Ok(result) => result,
+        Err(e) if try_fallback => {
+            // wss:// failed, try ws:// fallback
+            let fallback_url = format!("ws://{}", addr);
+            eprintln!("Secure connection failed ({}), trying {}...", e, fallback_url);
+            match connect_async(&fallback_url).await {
+                Ok(result) => result,
+                Err(e2) => {
+                    eprintln!("Failed to connect to {}: {}", fallback_url, e2);
+                    return Ok(());
+                }
+            }
+        }
         Err(e) => {
             eprintln!("Failed to connect to {}: {}", ws_url, e);
             return Ok(());

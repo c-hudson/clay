@@ -907,16 +907,23 @@ impl RemoteGuiApp {
                 connect_async(&url).await
             };
 
-            // Without native-tls, only ws:// is supported
+            // With rustls backend, try wss:// first then fall back to ws://
             #[cfg(not(feature = "native-tls-backend"))]
             let connect_result = {
-                // For rustls backend, fall back to ws://
-                let ws_url = if url.starts_with("wss://") {
-                    format!("ws://{}", ws_url_for_fallback)
-                } else {
-                    url.clone()
-                };
-                connect_async(&ws_url).await
+                // Try the URL as-is first (wss:// or ws://)
+                let result = connect_async(&url).await;
+
+                // If wss:// failed and we defaulted to it, try ws:// as fallback
+                match result {
+                    Ok(r) => Ok(r),
+                    Err(e) if url.starts_with("wss://") && !ws_url_for_fallback.starts_with("wss://") => {
+                        // wss:// failed, try ws:// fallback
+                        let fallback_url = format!("ws://{}", ws_url_for_fallback);
+                        eprintln!("wss:// connection failed ({}), trying ws://...", e);
+                        connect_async(&fallback_url).await
+                    }
+                    Err(e) => Err(e),
+                }
             };
 
             // If wss:// failed and we defaulted to it, try ws:// as fallback
