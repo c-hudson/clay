@@ -474,14 +474,8 @@ pub fn cmd_ungag(engine: &mut TfEngine, args: &str) -> TfCommandResult {
     }
 }
 
-/// #load filename - Load and execute a TF script file
-pub fn cmd_load(engine: &mut TfEngine, args: &str) -> TfCommandResult {
-    let filename = args.trim();
-
-    if filename.is_empty() {
-        return TfCommandResult::Error("Usage: #load filename".to_string());
-    }
-
+/// Expand ~ and search TFPATH/TFLIBDIR for a file
+fn resolve_file_path(engine: &TfEngine, filename: &str) -> Option<String> {
     // Expand ~ to home directory
     let expanded = if filename.starts_with('~') {
         if let Some(home) = std::env::var_os("HOME") {
@@ -500,16 +494,87 @@ pub fn cmd_load(engine: &mut TfEngine, args: &str) -> TfCommandResult {
         filename.to_string()
     };
 
-    // Read and execute the file
-    let path = Path::new(&expanded);
-    let file = match fs::File::open(path) {
-        Ok(f) => f,
-        Err(e) => return TfCommandResult::Error(format!("Cannot open '{}': {}", expanded, e)),
+    // If absolute path, just check if it exists
+    if expanded.starts_with('/') {
+        let path = Path::new(&expanded);
+        if path.exists() {
+            return Some(expanded);
+        }
+        return None;
+    }
+
+    // Search order for relative paths:
+    // 1. Current directory (from #lcd or actual cwd)
+    // 2. Directories in TFPATH
+    // 3. TFLIBDIR
+
+    let search_dirs: Vec<String> = {
+        let mut dirs = Vec::new();
+
+        // Current directory
+        if let Some(ref cd) = engine.current_dir {
+            dirs.push(cd.clone());
+        } else if let Ok(cwd) = std::env::current_dir() {
+            dirs.push(cwd.display().to_string());
+        }
+
+        // TFPATH (colon-separated list of directories)
+        if let Ok(tfpath) = std::env::var("TFPATH") {
+            for dir in tfpath.split(':') {
+                if !dir.is_empty() {
+                    dirs.push(dir.to_string());
+                }
+            }
+        }
+
+        // TFLIBDIR (fallback if TFPATH not set)
+        if let Ok(tflibdir) = std::env::var("TFLIBDIR") {
+            if !tflibdir.is_empty() {
+                dirs.push(tflibdir);
+            }
+        }
+
+        dirs
     };
 
-    let reader = BufReader::new(file);
+    // Search each directory
+    for dir in search_dirs {
+        let full_path = format!("{}/{}", dir, expanded);
+        if Path::new(&full_path).exists() {
+            return Some(full_path);
+        }
+    }
+
+    None
+}
+
+/// Internal load implementation used by both #load and #require
+fn load_file_internal(engine: &mut TfEngine, filename: &str, quiet: bool) -> TfCommandResult {
+    // Resolve the file path
+    let resolved = match resolve_file_path(engine, filename) {
+        Some(p) => p,
+        None => return TfCommandResult::Error(format!("Cannot find file: {}", filename)),
+    };
+
+    // Open the file
+    let file = match fs::File::open(&resolved) {
+        Ok(f) => f,
+        Err(e) => return TfCommandResult::Error(format!("Cannot open '{}': {}", resolved, e)),
+    };
+
+    // Track that we're loading this file (for nested loads)
+    engine.loading_files.push(resolved.clone());
+
+    // Show loading message unless quiet
     let mut results = Vec::new();
+    if !quiet {
+        results.push(TfCommandResult::Success(Some(format!("% Loading commands from {}", resolved))));
+    }
+
+    let reader = BufReader::new(file);
     let mut line_num = 0;
+    let mut continued_line = String::new();
+    let mut exit_early = false;
 
     for line in reader.lines() {
         line_num += 1;
@@ -521,35 +586,178 @@ pub fn cmd_load(engine: &mut TfEngine, args: &str) -> TfCommandResult {
             }
         };
 
-        let trimmed = line.trim();
+        // Strip leading whitespace
+        let trimmed = line.trim_start();
 
-        // Skip empty lines and comments
-        if trimmed.is_empty() || trimmed.starts_with(';') || trimmed.starts_with(";;") {
+        // Handle line continuation
+        if trimmed.ends_with('\\') && !trimmed.ends_with("%\\") {
+            // Line continues - append without the backslash
+            continued_line.push_str(&trimmed[..trimmed.len() - 1]);
+            continue;
+        }
+
+        // Build the complete line
+        let complete_line = if !continued_line.is_empty() {
+            let mut full = std::mem::take(&mut continued_line);
+            full.push_str(trimmed);
+            // Replace %\ with just \
+            full.replace("%\\", "\\")
+        } else {
+            trimmed.replace("%\\", "\\")
+        };
+
+        let trimmed = complete_line.trim();
+
+        // Skip empty lines
+        if trimmed.is_empty() {
+            continue;
+        }
+
+        // Skip comments: lines starting with ; or single # (but not ## commands)
+        // A single # followed by space or end of line is a comment
+        // #command is a TF command
+        if trimmed.starts_with(';') {
+            continue;
+        }
+        if trimmed == "#" {
+            continue;
+        }
+        if trimmed.starts_with("# ") {
             continue;
         }
 
         // Execute the line
-        if trimmed.starts_with('#') || trimmed.starts_with('/') {
-            let result = super::parser::execute_command(engine, trimmed);
-            match &result {
-                TfCommandResult::Error(e) => {
-                    results.push(TfCommandResult::Error(format!("Line {}: {}", line_num, e)));
-                }
-                _ => results.push(result),
+        let result = if trimmed.starts_with('#') || trimmed.starts_with('/') {
+            super::parser::execute_command(engine, trimmed)
+        } else {
+            // Non-command lines are sent to the MUD in TF, but we ignore them in Clay
+            continue;
+        };
+
+        match &result {
+            TfCommandResult::Error(e) => {
+                results.push(TfCommandResult::Error(format!("{}:{}: {}", resolved, line_num, e)));
             }
+            TfCommandResult::ExitLoad => {
+                // #exit was called - stop loading this file
+                exit_early = true;
+                break;
+            }
+            _ => results.push(result),
         }
-        // Non-command lines are ignored in script files
     }
 
-    // Fire LOAD hook
+    // Remove this file from the loading stack
+    engine.loading_files.pop();
+
+    // Fire LOAD hook (even for early exit)
     let hook_results = super::hooks::fire_hook(engine, super::TfHookEvent::Load);
     results.extend(hook_results);
 
     let error_count = results.iter().filter(|r| matches!(r, TfCommandResult::Error(_))).count();
     if error_count > 0 {
-        TfCommandResult::Error(format!("Loaded '{}' with {} error(s)", expanded, error_count))
+        TfCommandResult::Error(format!("Loaded '{}' with {} error(s)", resolved, error_count))
+    } else if exit_early {
+        TfCommandResult::Success(Some(format!("Loaded '{}' (exit early)", resolved)))
     } else {
-        TfCommandResult::Success(Some(format!("Loaded '{}'", expanded)))
+        TfCommandResult::Success(Some(format!("Loaded '{}'", resolved)))
+    }
+}
+
+/// #load [-q] filename - Load and execute a TF script file
+///
+/// Options:
+///   -q  Quiet mode - don't echo "Loading commands from..." message
+///
+/// The file may contain TF commands starting with # or /.
+/// Blank lines and lines beginning with ';' or single '#' are ignored.
+/// Lines ending in '\' continue on the next line (use %\ for literal backslash).
+/// Use #exit to abort loading early.
+pub fn cmd_load(engine: &mut TfEngine, args: &str) -> TfCommandResult {
+    let args = args.trim();
+
+    if args.is_empty() {
+        return TfCommandResult::Error("Usage: #load [-q] filename".to_string());
+    }
+
+    // Parse options
+    let mut quiet = false;
+    let mut filename = args;
+
+    if args.starts_with("-q") {
+        quiet = true;
+        filename = args[2..].trim_start();
+        if filename.is_empty() {
+            return TfCommandResult::Error("Usage: #load [-q] filename".to_string());
+        }
+    }
+
+    load_file_internal(engine, filename, quiet)
+}
+
+/// #require [-q] filename - Load file only if not already loaded via #loaded
+///
+/// Same as #load, but if the file has already registered a token via #loaded,
+/// the file will not be read again (but the LOAD hook is still called).
+pub fn cmd_require(engine: &mut TfEngine, args: &str) -> TfCommandResult {
+    let args = args.trim();
+
+    if args.is_empty() {
+        return TfCommandResult::Error("Usage: #require [-q] filename".to_string());
+    }
+
+    // Parse options
+    let mut quiet = false;
+    let mut filename = args;
+
+    if args.starts_with("-q") {
+        quiet = true;
+        filename = args[2..].trim_start();
+        if filename.is_empty() {
+            return TfCommandResult::Error("Usage: #require [-q] filename".to_string());
+        }
+    }
+
+    // Note: We don't check loaded_tokens here - that's done by #loaded inside the file.
+    // #require just calls #load; the difference is that files designed for #require
+    // will have #loaded as their first command, which will abort if already loaded.
+    load_file_internal(engine, filename, quiet)
+}
+
+/// #loaded token - Mark this file as loaded (for use with #require)
+///
+/// Should be the first command in a file designed for #require.
+/// If the token has already been registered, aborts the file load and returns success.
+/// Token should be unique (file's full path is recommended).
+pub fn cmd_loaded(engine: &mut TfEngine, args: &str) -> TfCommandResult {
+    let token = args.trim();
+
+    if token.is_empty() {
+        return TfCommandResult::Error("Usage: #loaded token".to_string());
+    }
+
+    // Check if already loaded
+    if engine.loaded_tokens.contains(token) {
+        // Already loaded - abort this file load
+        return TfCommandResult::ExitLoad;
+    }
+
+    // Register the token
+    engine.loaded_tokens.insert(token.to_string());
+    TfCommandResult::Success(None)
+}
+
+/// #exit - Abort loading the current file early
+///
+/// When called during #load or #require, stops reading the current file.
+/// When called outside of file loading, this is equivalent to /quit.
+pub fn cmd_exit(engine: &TfEngine) -> TfCommandResult {
+    if engine.loading_files.is_empty() {
+        // Not loading a file - quit the application
+        TfCommandResult::ClayCommand("/quit".to_string())
+    } else {
+        // Loading a file - abort early
+        TfCommandResult::ExitLoad
     }
 }
 

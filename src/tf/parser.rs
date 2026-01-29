@@ -87,7 +87,8 @@ pub fn execute_command(engine: &mut TfEngine, input: &str) -> TfCommandResult {
         "send" => cmd_send(engine, args),
 
         // Mapped to Clay commands
-        "quit" | "exit" => TfCommandResult::ClayCommand("/quit".to_string()),
+        "quit" => TfCommandResult::ClayCommand("/quit".to_string()),
+        "exit" => builtins::cmd_exit(engine),
         "dc" | "disconnect" => TfCommandResult::ClayCommand("/disconnect".to_string()),
         "world" => cmd_world(args),
         "listworlds" => TfCommandResult::ClayCommand("/worlds".to_string()),
@@ -137,6 +138,8 @@ pub fn execute_command(engine: &mut TfEngine, input: &str) -> TfCommandResult {
         "gag" => builtins::cmd_gag(engine, args),
         "ungag" => builtins::cmd_ungag(engine, args),
         "load" => builtins::cmd_load(engine, args),
+        "require" => builtins::cmd_require(engine, args),
+        "loaded" => builtins::cmd_loaded(engine, args),
         "save" => builtins::cmd_save(engine, args),
         "log" => builtins::cmd_log(args),
         "repeat" => builtins::cmd_repeat(engine, args),
@@ -431,9 +434,12 @@ World Management:
   #dc, #disconnect     - Disconnect current world
 
 File Operations:
-  #load filename       - Load TF script
+  #load [-q] filename  - Load TF script (-q = quiet)
+  #require [-q] file   - Load file if not already loaded
+  #loaded token        - Mark file as loaded (for #require)
   #save filename       - Save macros to file
   #lcd path            - Change local directory
+  #exit                - Abort loading file / quit
 
 Process:
   #repeat [opts] count cmd - Repeat command on timer
@@ -535,7 +541,81 @@ Examples:
             "kill" => TfCommandResult::Success(Some(
                 "#kill pid\n\nKill a background process by its PID.\nUse #ps to see running processes.".to_string()
             )),
-            _ => TfCommandResult::Success(Some(format!("No help available for '{}'\nTry: set, echo, send, def, if, while, for, expr, bind, hooks, repeat, ps, kill", topic))),
+            "load" => TfCommandResult::Success(Some(
+                r#"#load [-q] filename
+
+Load and execute commands from a TF script file.
+
+Options:
+  -q  Quiet mode - don't echo "% Loading commands from..." message
+
+The file may contain:
+  - TF commands starting with # (e.g., #def, #set)
+  - Clay commands starting with / (e.g., /connect)
+  - Comments: lines starting with ; or single # followed by space
+  - Blank lines (ignored)
+
+Line continuation: End a line with \ to continue on next line.
+Use %\ for a literal backslash at end of line.
+
+File search order (for relative paths):
+  1. Current directory (from #lcd or actual cwd)
+  2. Directories in $TFPATH (colon-separated)
+  3. $TFLIBDIR
+
+Use #exit to abort loading early.
+
+Example:
+  #load ~/.tf/init.tf
+  #load -q mylib.tf"#.to_string()
+            )),
+            "require" => TfCommandResult::Success(Some(
+                r#"#require [-q] filename
+
+Load a file only if not already loaded via #loaded.
+
+Same as #load, but if the file has already registered a token
+via #loaded, the file will not be read again.
+
+Files designed for #require should have #loaded as their first
+command with a unique token (usually the file's full path).
+
+Example file (mylib.tf):
+  #loaded mylib.tf
+  #def myfunc = #echo Hello from mylib
+
+Usage:
+  #require mylib.tf   - Loads the file
+  #require mylib.tf   - Does nothing (already loaded)"#.to_string()
+            )),
+            "loaded" => TfCommandResult::Success(Some(
+                r#"#loaded token
+
+Mark a file as loaded (for use with #require).
+
+Should be the first command in a file designed for #require.
+If the token has already been registered by a previous #loaded
+call, the current file load is aborted (returns success).
+
+Token should be unique - the file's full path is recommended.
+
+Example (in mylib.tf):
+  #loaded mylib.tf
+  ; Rest of file only executed once"#.to_string()
+            )),
+            "exit" => TfCommandResult::Success(Some(
+                r#"#exit
+
+Abort loading the current file early.
+
+When called during #load or #require, stops reading the
+current file immediately. Commands already executed are
+not undone.
+
+When called outside of file loading, #exit is equivalent
+to #quit (exits Clay)."#.to_string()
+            )),
+            _ => TfCommandResult::Success(Some(format!("No help available for '{}'\nTry: set, echo, send, def, if, while, for, expr, bind, hooks, repeat, ps, kill, load, require, loaded, exit", topic))),
         }
     }
 }

@@ -8256,6 +8256,10 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                     tf::TfCommandResult::UnknownCommand(cmd_name) => {
                                         app.add_output(&format!("Unknown command: #{}", cmd_name));
                                     }
+                                    tf::TfCommandResult::ExitLoad => {
+                                        // ExitLoad from command line means nothing (not in a file load)
+                                        // This shouldn't normally happen since cmd_exit checks loading_files
+                                    }
                                 }
                             } else if app.current_world().connected {
                                 if let Some(tx) = &app.current_world().command_tx {

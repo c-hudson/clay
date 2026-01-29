@@ -177,6 +177,8 @@ pub enum TfCommandResult {
     Recall(RecallOptions),
     /// Register a repeat process for the main loop to tick
     RepeatProcess(TfProcess),
+    /// Abort file loading early (#exit during load)
+    ExitLoad,
     /// Not a TF command (doesn't start with #)
     NotTfCommand,
     /// Unknown TF command
@@ -307,6 +309,10 @@ pub struct TfEngine {
     pub processes: Vec<TfProcess>,
     /// Next process ID counter
     pub next_process_id: u32,
+    /// Tokens for files already loaded via #loaded/#require
+    pub loaded_tokens: std::collections::HashSet<String>,
+    /// Stack of files currently being loaded (for nested loads)
+    pub loading_files: Vec<String>,
 }
 
 impl TfEngine {
