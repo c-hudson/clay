@@ -19,7 +19,7 @@ pub mod remote_gui;
 const VERSION: &str = "1.0.0-alpha";
 const BUILD_HASH: &str = env!("BUILD_HASH");
 // Debug build ID - change this to test reload with binary changes
-const DEBUG_BUILD_ID: u32 = 1;
+const DEBUG_BUILD_ID: u32 = 2;
 
 // Custom config file path (set via --conf=<path> argument)
 use std::sync::OnceLock;
