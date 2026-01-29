@@ -876,6 +876,14 @@
     // Track if we should use native WebSocket (only after browser WebSocket fails)
     let useNativeWebSocket = false;
 
+    // Debug logging for Android - shows Toast messages
+    function debugLog(msg) {
+        console.log('[Clay Debug] ' + msg);
+        if (window.Android && window.Android.showToast) {
+            window.Android.showToast(msg);
+        }
+    }
+
     // Check if native Android WebSocket is available
     function hasNativeWebSocket() {
         try {
@@ -890,6 +898,7 @@
     // Set up native WebSocket callbacks (called once)
     function setupNativeWebSocketCallbacks() {
         window.onNativeWebSocketOpen = function() {
+            debugLog('Native WS OPEN');
             if (connectionTimeout) {
                 clearTimeout(connectionTimeout);
                 connectionTimeout = null;
@@ -950,6 +959,7 @@
         };
 
         window.onNativeWebSocketClose = function(code, reason) {
+            debugLog('Native WS CLOSE: ' + code + ' ' + reason);
             if (connectionTimeout) {
                 clearTimeout(connectionTimeout);
                 connectionTimeout = null;
@@ -971,7 +981,7 @@
         };
 
         window.onNativeWebSocketError = function(error) {
-            console.error('Native WebSocket error:', error);
+            debugLog('Native WS ERROR: ' + error);
             showConnecting(false);
         };
     }
@@ -996,7 +1006,7 @@
     }
 
     function connectWithNativeWebSocket(wsUrl) {
-        console.log('Using native Android WebSocket for: ' + wsUrl);
+        debugLog('Native WS connecting: ' + wsUrl);
         usingNativeWebSocket = true;
 
         // Close any existing native WebSocket first
@@ -1004,7 +1014,7 @@
             try {
                 window.Android.closeWebSocket();
             } catch (e) {
-                console.error('Error closing previous WebSocket:', e);
+                debugLog('Error closing prev WS: ' + e);
             }
         }
 
@@ -1048,6 +1058,8 @@
         const protocol = usingWsFallback ? 'ws' : window.WS_PROTOCOL;
         const wsUrl = `${protocol}://${host}:${window.WS_PORT}`;
 
+        debugLog('connect() protocol=' + protocol + ' hasNative=' + hasNativeWebSocket());
+
         // Clear any existing timeout
         if (connectionTimeout) {
             clearTimeout(connectionTimeout);
@@ -1056,18 +1068,20 @@
 
         // If we've determined we need native WebSocket, use it directly
         if (useNativeWebSocket && hasNativeWebSocket()) {
+            debugLog('Using native WS (fallback mode)');
             connectWithNativeWebSocket(wsUrl);
             return;
         }
 
         // On Android with wss://, use native WebSocket directly (handles self-signed certs)
         if (hasNativeWebSocket() && protocol === 'wss') {
-            console.log('Android + wss:// detected, using native WebSocket');
+            debugLog('Using native WS for wss://');
             connectWithNativeWebSocket(wsUrl);
             return;
         }
 
         // Standard browser WebSocket
+        debugLog('Using browser WebSocket');
         usingNativeWebSocket = false;
         try {
             ws = new WebSocket(wsUrl);
