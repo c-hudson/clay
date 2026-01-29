@@ -910,19 +910,35 @@ impl RemoteGuiApp {
             // With rustls backend, try wss:// first then fall back to ws://
             #[cfg(not(feature = "native-tls-backend"))]
             let connect_result = {
-                // Try the URL as-is first (wss:// or ws://)
-                let result = connect_async(&url).await;
+                if url.starts_with("wss://") {
+                    // Configure rustls to accept self-signed/invalid certificates
+                    use std::sync::Arc;
+                    let tls_config = rustls::ClientConfig::builder()
+                        .dangerous()
+                        .with_custom_certificate_verifier(Arc::new(crate::danger::NoCertificateVerification::new()))
+                        .with_no_client_auth();
+                    let connector = tokio_tungstenite::Connector::Rustls(Arc::new(tls_config));
+                    let result = tokio_tungstenite::connect_async_tls_with_config(
+                        &url,
+                        None,
+                        false,
+                        Some(connector),
+                    ).await;
 
-                // If wss:// failed and we defaulted to it, try ws:// as fallback
-                match result {
-                    Ok(r) => Ok(r),
-                    Err(e) if url.starts_with("wss://") && !ws_url_for_fallback.starts_with("wss://") => {
-                        // wss:// failed, try ws:// fallback
-                        let fallback_url = format!("ws://{}", ws_url_for_fallback);
-                        eprintln!("wss:// connection failed ({}), trying ws://...", e);
-                        connect_async(&fallback_url).await
+                    // If wss:// failed and we defaulted to it, try ws:// as fallback
+                    match result {
+                        Ok(r) => Ok(r),
+                        Err(e) if !ws_url_for_fallback.starts_with("wss://") => {
+                            // wss:// failed, try ws:// fallback
+                            let fallback_url = format!("ws://{}", ws_url_for_fallback);
+                            eprintln!("wss:// connection failed ({}), trying ws://...", e);
+                            connect_async(&fallback_url).await
+                        }
+                        Err(e) => Err(e),
                     }
-                    Err(e) => Err(e),
+                } else {
+                    // Plain ws:// connection
+                    connect_async(&url).await
                 }
             };
 
