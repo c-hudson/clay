@@ -385,6 +385,8 @@ pub struct Field {
     pub enabled: bool,
     /// Keyboard shortcut to select this field (like button shortcuts)
     pub shortcut: Option<char>,
+    /// Tab order index (lower = earlier in tab cycle). None = use definition order after indexed elements.
+    pub tab_index: Option<u32>,
 }
 
 impl Field {
@@ -396,6 +398,7 @@ impl Field {
             visible: true,
             enabled: true,
             shortcut: None,
+            tab_index: None,
         }
     }
 
@@ -408,6 +411,7 @@ impl Field {
             visible: false,
             enabled: false,
             shortcut: None,
+            tab_index: None,
         }
     }
 
@@ -420,6 +424,12 @@ impl Field {
     /// Add a keyboard shortcut to select this field
     pub fn with_shortcut(mut self, shortcut: char) -> Self {
         self.shortcut = Some(shortcut);
+        self
+    }
+
+    /// Set the tab order index for this field
+    pub fn with_tab_index(mut self, index: u32) -> Self {
+        self.tab_index = Some(index);
         self
     }
 
@@ -454,6 +464,8 @@ pub struct Button {
     pub style: ButtonStyle,
     pub enabled: bool,
     pub left_align: bool,
+    /// Tab order index (lower = earlier in tab cycle). None = use definition order after indexed elements.
+    pub tab_index: Option<u32>,
 }
 
 impl Button {
@@ -465,6 +477,7 @@ impl Button {
             style: ButtonStyle::Secondary,
             enabled: true,
             left_align: false,
+            tab_index: None,
         }
     }
 
@@ -490,6 +503,11 @@ impl Button {
 
     pub fn left_align(mut self) -> Self {
         self.left_align = true;
+        self
+    }
+
+    pub fn with_tab_index(mut self, index: u32) -> Self {
+        self.tab_index = Some(index);
         self
     }
 }
@@ -1006,62 +1024,75 @@ impl PopupState {
     }
 
     /// Cycle between focusable text fields and buttons (for Tab key)
-    /// Cycles: filter field -> button1 -> button2 -> ... -> buttonN -> filter field
+    /// Uses tab_index to determine order. Elements with tab_index are sorted by index,
+    /// elements without tab_index come after, in definition order.
     /// Returns true if selection changed
     pub fn cycle_field_buttons(&mut self) -> bool {
-        let buttons = self.definition.enabled_buttons();
+        // Build a list of tabbable elements: (sort_key, is_button, id)
+        // sort_key = (has_index, index_or_def_order)
+        let mut tabbable: Vec<(bool, u32, bool, u32)> = Vec::new(); // (has_index, index, is_button, id)
 
-        // Find text fields that can be cycled to
-        let text_fields: Vec<FieldId> = self.definition.focusable_fields()
-            .iter()
-            .filter(|id| {
-                self.definition.get_field(**id)
-                    .map(|f| f.kind.is_text_editable())
-                    .unwrap_or(false)
-            })
-            .copied()
-            .collect();
+        // Add text-editable fields
+        for (def_idx, field) in self.definition.fields.iter().enumerate() {
+            if field.is_focusable() && field.kind.is_text_editable() {
+                let (has_idx, idx) = match field.tab_index {
+                    Some(i) => (true, i),
+                    None => (false, def_idx as u32),
+                };
+                tabbable.push((has_idx, idx, false, field.id.0));
+            }
+        }
 
-        if text_fields.is_empty() && buttons.is_empty() {
+        // Add enabled buttons
+        for (def_idx, button) in self.definition.buttons.iter().enumerate() {
+            if button.enabled {
+                let (has_idx, idx) = match button.tab_index {
+                    Some(i) => (true, i),
+                    None => (false, def_idx as u32),
+                };
+                tabbable.push((has_idx, idx, true, button.id.0));
+            }
+        }
+
+        if tabbable.is_empty() {
             return false;
         }
 
-        match &self.selected {
-            ElementSelection::Field(_) => {
-                // If on any field (including List), go to first button
-                if let Some(btn) = buttons.first() {
-                    self.selected = ElementSelection::Button(*btn);
-                    return true;
-                }
+        // Sort: elements with tab_index come first (sorted by index),
+        // then elements without tab_index (sorted by their tuple values)
+        tabbable.sort_by(|a, b| {
+            match (a.0, b.0) {
+                (true, true) => a.1.cmp(&b.1),   // Both have index: sort by index
+                (true, false) => std::cmp::Ordering::Less,  // a has index, b doesn't: a first
+                (false, true) => std::cmp::Ordering::Greater, // b has index, a doesn't: b first
+                (false, false) => a.1.cmp(&b.1), // Neither has index: sort by def order
             }
-            ElementSelection::Button(current_id) => {
-                // If on a button, go to next button, or wrap to first text field
-                if let Some(idx) = buttons.iter().position(|id| id == current_id) {
-                    if idx + 1 < buttons.len() {
-                        // Go to next button
-                        self.selected = ElementSelection::Button(buttons[idx + 1]);
-                        return true;
-                    } else {
-                        // On last button, wrap to first text field
-                        if let Some(field_id) = text_fields.first() {
-                            self.selected = ElementSelection::Field(*field_id);
-                            return true;
-                        }
-                    }
-                }
+        });
+
+        // Find current position in the sorted list
+        let current_pos = match &self.selected {
+            ElementSelection::Field(id) => {
+                tabbable.iter().position(|(_, _, is_btn, elem_id)| !is_btn && *elem_id == id.0)
             }
-            ElementSelection::None => {
-                // Select first available
-                if let Some(field_id) = text_fields.first() {
-                    self.selected = ElementSelection::Field(*field_id);
-                    return true;
-                } else if let Some(btn) = buttons.first() {
-                    self.selected = ElementSelection::Button(*btn);
-                    return true;
-                }
+            ElementSelection::Button(id) => {
+                tabbable.iter().position(|(_, _, is_btn, elem_id)| *is_btn && *elem_id == id.0)
             }
+            ElementSelection::None => None,
+        };
+
+        // Move to next element (or first if not found or at end)
+        let next_pos = match current_pos {
+            Some(pos) => (pos + 1) % tabbable.len(),
+            None => 0,
+        };
+
+        let (_, _, is_button, id) = tabbable[next_pos];
+        if is_button {
+            self.selected = ElementSelection::Button(ButtonId(id));
+        } else {
+            self.selected = ElementSelection::Field(FieldId(id));
         }
-        false
+        true
     }
 
     /// Find and select a field by its shortcut key

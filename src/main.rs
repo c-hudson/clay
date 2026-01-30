@@ -47,7 +47,7 @@ pub use telnet::{
 };
 pub use spell::{SpellChecker, SpellState};
 pub use input::{InputArea, display_width, display_width_chars, chars_for_display_width};
-pub use util::{get_binary_name, strip_ansi_codes, visual_line_count, get_current_time_12hr, strip_mud_tag, truncate_str, convert_temperatures, parse_discord_timestamps, local_time_from_epoch, local_time_now};
+pub use util::{get_binary_name, strip_ansi_codes, visual_line_count, get_current_time_12hr, strip_mud_tag, truncate_str, convert_temperatures, parse_discord_timestamps, local_time_from_epoch, local_time_now, color_name_to_ansi_bg};
 pub use websocket::{
     WsMessage, WorldStateMsg, WorldSettingsMsg, GlobalSettingsMsg, TimestampedLine,
     WsClientInfo, WebSocketServer,
@@ -284,6 +284,384 @@ impl FilterPopup {
     }
 }
 
+/// Which side of the screen the editor appears on
+#[derive(Clone, Copy, PartialEq, Default)]
+pub enum EditorSide {
+    #[default]
+    Left,
+    Right,
+}
+
+impl EditorSide {
+    pub fn name(&self) -> &'static str {
+        match self {
+            EditorSide::Left => "left",
+            EditorSide::Right => "right",
+        }
+    }
+
+    pub fn from_name(name: &str) -> Self {
+        match name.to_lowercase().as_str() {
+            "right" => EditorSide::Right,
+            _ => EditorSide::Left,
+        }
+    }
+}
+
+/// Which element has focus when editor is open
+#[derive(Clone, Copy, PartialEq, Default)]
+pub enum EditorFocus {
+    #[default]
+    Editor,
+    Input,
+}
+
+/// State for the split-screen text editor
+pub struct EditorState {
+    /// Whether the editor is currently visible
+    pub visible: bool,
+    /// Which element has focus (editor or input)
+    pub focus: EditorFocus,
+    /// The text buffer being edited
+    pub buffer: String,
+    /// Cursor position in the buffer (character index)
+    pub cursor_position: usize,
+    /// Current line number (0-indexed)
+    pub cursor_line: usize,
+    /// Current column number (0-indexed)
+    pub cursor_col: usize,
+    /// Scroll offset for viewing (line index)
+    pub scroll_offset: usize,
+    /// Original content (for detecting changes)
+    pub original_content: String,
+    /// Whether the buffer has been modified
+    pub dirty: bool,
+    /// File path if editing an external file
+    pub file_path: Option<PathBuf>,
+    /// World index if editing world notes
+    pub world_index: Option<usize>,
+}
+
+impl EditorState {
+    pub fn new() -> Self {
+        Self {
+            visible: false,
+            focus: EditorFocus::Editor,
+            buffer: String::new(),
+            cursor_position: 0,
+            cursor_line: 0,
+            cursor_col: 0,
+            scroll_offset: 0,
+            original_content: String::new(),
+            dirty: false,
+            file_path: None,
+            world_index: None,
+        }
+    }
+
+    /// Open editor for world notes
+    pub fn open_notes(&mut self, world_index: usize, content: &str) {
+        self.visible = true;
+        self.focus = EditorFocus::Editor;
+        self.buffer = content.to_string();
+        self.cursor_position = content.len();
+        self.original_content = content.to_string();
+        self.dirty = false;
+        self.file_path = None;
+        self.world_index = Some(world_index);
+        self.update_cursor_position();
+    }
+
+    /// Open editor for an external file
+    pub fn open_file(&mut self, path: PathBuf, content: &str) {
+        self.visible = true;
+        self.focus = EditorFocus::Editor;
+        self.buffer = content.to_string();
+        self.cursor_position = content.len();
+        self.original_content = content.to_string();
+        self.dirty = false;
+        self.file_path = Some(path);
+        self.world_index = None;
+        self.update_cursor_position();
+    }
+
+    /// Close the editor
+    pub fn close(&mut self) {
+        self.visible = false;
+        self.buffer.clear();
+        self.original_content.clear();
+        self.file_path = None;
+        self.world_index = None;
+        self.cursor_position = 0;
+        self.cursor_line = 0;
+        self.cursor_col = 0;
+        self.scroll_offset = 0;
+        self.dirty = false;
+    }
+
+    /// Toggle focus between editor and input
+    pub fn toggle_focus(&mut self) {
+        self.focus = match self.focus {
+            EditorFocus::Editor => EditorFocus::Input,
+            EditorFocus::Input => EditorFocus::Editor,
+        };
+    }
+
+    /// Get the title for the editor panel
+    pub fn title(&self, world_name: Option<&str>) -> String {
+        if let Some(ref path) = self.file_path {
+            let filename = path.file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_else(|| path.to_string_lossy().to_string());
+            if self.dirty {
+                format!("Edit: {} [modified]", filename)
+            } else {
+                format!("Edit: {}", filename)
+            }
+        } else if let Some(name) = world_name {
+            if self.dirty {
+                format!("Notes: {} [modified]", name)
+            } else {
+                format!("Notes: {}", name)
+            }
+        } else {
+            "Editor".to_string()
+        }
+    }
+
+    /// Update cursor_line and cursor_col from cursor_position
+    fn update_cursor_position(&mut self) {
+        let mut line = 0;
+        let mut col = 0;
+        for (i, c) in self.buffer.chars().enumerate() {
+            if i == self.cursor_position {
+                break;
+            }
+            if c == '\n' {
+                line += 1;
+                col = 0;
+            } else {
+                col += 1;
+            }
+        }
+        self.cursor_line = line;
+        self.cursor_col = col;
+    }
+
+    /// Get lines of the buffer
+    pub fn lines(&self) -> Vec<&str> {
+        self.buffer.split('\n').collect()
+    }
+
+    /// Get total line count (logical lines)
+    pub fn line_count(&self) -> usize {
+        self.buffer.split('\n').count()
+    }
+
+    /// Get total visual line count (with wrapping at given width)
+    pub fn visual_line_count(&self, width: usize) -> usize {
+        if width == 0 {
+            return self.line_count();
+        }
+        let mut count = 0;
+        for line in self.buffer.split('\n') {
+            let len = line.chars().count();
+            if len == 0 {
+                count += 1;
+            } else {
+                count += (len + width - 1) / width; // Ceiling division
+            }
+        }
+        count
+    }
+
+    /// Get the visual line index where the cursor is (with wrapping at given width)
+    pub fn cursor_visual_line(&self, width: usize) -> usize {
+        if width == 0 {
+            return self.cursor_line;
+        }
+        let mut visual_line = 0;
+        for (line_idx, line) in self.buffer.split('\n').enumerate() {
+            let len = line.chars().count();
+            if line_idx == self.cursor_line {
+                // Cursor is on this logical line
+                // Which visual line within this logical line?
+                let visual_offset = self.cursor_col / width;
+                return visual_line + visual_offset;
+            }
+            // Count visual lines for this logical line
+            if len == 0 {
+                visual_line += 1;
+            } else {
+                visual_line += (len + width - 1) / width;
+            }
+        }
+        visual_line
+    }
+
+    /// Move cursor up one line
+    pub fn cursor_up(&mut self) {
+        if self.cursor_line == 0 {
+            return;
+        }
+        let lines = self.lines();
+        let target_line = self.cursor_line - 1;
+        let target_col = self.cursor_col.min(lines[target_line].chars().count());
+
+        // Calculate new cursor position
+        let mut pos = 0;
+        for (i, line) in lines.iter().enumerate() {
+            if i == target_line {
+                pos += target_col;
+                break;
+            }
+            pos += line.chars().count() + 1; // +1 for newline
+        }
+        self.cursor_position = pos;
+        self.update_cursor_position();
+    }
+
+    /// Move cursor down one line
+    pub fn cursor_down(&mut self) {
+        let lines = self.lines();
+        if self.cursor_line >= lines.len() - 1 {
+            return;
+        }
+        let target_line = self.cursor_line + 1;
+        let target_col = self.cursor_col.min(lines[target_line].chars().count());
+
+        // Calculate new cursor position
+        let mut pos = 0;
+        for (i, line) in lines.iter().enumerate() {
+            if i == target_line {
+                pos += target_col;
+                break;
+            }
+            pos += line.chars().count() + 1; // +1 for newline
+        }
+        self.cursor_position = pos;
+        self.update_cursor_position();
+    }
+
+    /// Move cursor left one character
+    pub fn cursor_left(&mut self) {
+        if self.cursor_position > 0 {
+            // Move back by one character
+            let chars: Vec<char> = self.buffer.chars().collect();
+            self.cursor_position = chars[..self.cursor_position].len() - 1;
+            // Actually need character count up to new position
+            self.cursor_position = self.cursor_position.min(chars.len());
+            self.update_cursor_position();
+        }
+    }
+
+    /// Move cursor right one character
+    pub fn cursor_right(&mut self) {
+        let char_count = self.buffer.chars().count();
+        if self.cursor_position < char_count {
+            self.cursor_position += 1;
+            self.update_cursor_position();
+        }
+    }
+
+    /// Move cursor to start of current line
+    pub fn cursor_home(&mut self) {
+        let lines = self.lines();
+        let mut pos = 0;
+        for (i, line) in lines.iter().enumerate() {
+            if i == self.cursor_line {
+                break;
+            }
+            pos += line.chars().count() + 1;
+        }
+        self.cursor_position = pos;
+        self.update_cursor_position();
+    }
+
+    /// Move cursor to end of current line
+    pub fn cursor_end(&mut self) {
+        let lines = self.lines();
+        let mut pos = 0;
+        for (i, line) in lines.iter().enumerate() {
+            if i == self.cursor_line {
+                pos += line.chars().count();
+                break;
+            }
+            pos += line.chars().count() + 1;
+        }
+        self.cursor_position = pos;
+        self.update_cursor_position();
+    }
+
+    /// Insert a character at cursor position
+    pub fn insert_char(&mut self, c: char) {
+        let chars: Vec<char> = self.buffer.chars().collect();
+        let pos = self.cursor_position.min(chars.len());
+        let before: String = chars[..pos].iter().collect();
+        let after: String = chars[pos..].iter().collect();
+        self.buffer = format!("{}{}{}", before, c, after);
+        self.cursor_position = pos + 1;
+        self.dirty = self.buffer != self.original_content;
+        self.update_cursor_position();
+    }
+
+    /// Delete character before cursor (backspace)
+    pub fn delete_backward(&mut self) {
+        if self.cursor_position == 0 {
+            return;
+        }
+        let chars: Vec<char> = self.buffer.chars().collect();
+        let pos = self.cursor_position.min(chars.len());
+        let before: String = chars[..pos - 1].iter().collect();
+        let after: String = chars[pos..].iter().collect();
+        self.buffer = format!("{}{}", before, after);
+        self.cursor_position = pos - 1;
+        self.dirty = self.buffer != self.original_content;
+        self.update_cursor_position();
+    }
+
+    /// Delete character after cursor (delete)
+    pub fn delete_forward(&mut self) {
+        let chars: Vec<char> = self.buffer.chars().collect();
+        let pos = self.cursor_position.min(chars.len());
+        if pos >= chars.len() {
+            return;
+        }
+        let before: String = chars[..pos].iter().collect();
+        let after: String = chars[pos + 1..].iter().collect();
+        self.buffer = format!("{}{}", before, after);
+        self.dirty = self.buffer != self.original_content;
+        self.update_cursor_position();
+    }
+
+    /// Scroll up one page (using visual lines with wrapping)
+    pub fn page_up(&mut self, visible_lines: usize, _width: usize) {
+        self.scroll_offset = self.scroll_offset.saturating_sub(visible_lines.saturating_sub(1));
+    }
+
+    /// Scroll down one page (using visual lines with wrapping)
+    pub fn page_down(&mut self, visible_lines: usize, width: usize) {
+        let max_scroll = self.visual_line_count(width).saturating_sub(visible_lines);
+        self.scroll_offset = (self.scroll_offset + visible_lines.saturating_sub(1)).min(max_scroll);
+    }
+
+    /// Ensure cursor is visible (adjust scroll based on visual lines with wrapping)
+    pub fn ensure_cursor_visible(&mut self, visible_lines: usize, width: usize) {
+        let cursor_visual = self.cursor_visual_line(width);
+        if cursor_visual < self.scroll_offset {
+            self.scroll_offset = cursor_visual;
+        } else if cursor_visual >= self.scroll_offset + visible_lines {
+            self.scroll_offset = cursor_visual - visible_lines + 1;
+        }
+    }
+}
+
+impl Default for EditorState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// Convert a wildcard filter pattern to regex for F4 filter popup.
 /// Always uses "contains" semantics - patterns match anywhere in the line.
 /// Supports \* and \? to match literal asterisk and question mark.
@@ -395,6 +773,8 @@ pub struct Settings {
     tls_proxy_enabled: bool,
     // Custom dictionary path for spell checking (empty = use system defaults)
     dictionary_path: String,
+    // Editor side for split-screen editor (left or right)
+    editor_side: EditorSide,
 }
 
 impl Default for Settings {
@@ -429,6 +809,7 @@ impl Default for Settings {
             actions: Vec::new(),
             tls_proxy_enabled: false,
             dictionary_path: String::new(),
+            editor_side: EditorSide::Left,
         }
     }
 }
@@ -484,6 +865,8 @@ pub struct WorldSettings {
     discord_guild: String,
     discord_channel: String,
     discord_dm_user: String, // User ID for DM (creates DM channel on connect)
+    // User notes (stored per-world, edited with /edit command)
+    pub notes: String,
 }
 
 impl Default for WorldSettings {
@@ -507,6 +890,7 @@ impl Default for WorldSettings {
             discord_guild: String::new(),
             discord_channel: String::new(),
             discord_dm_user: String::new(),
+            notes: String::new(),
         }
     }
 }
@@ -615,6 +999,10 @@ pub enum Command {
         password: Option<String>,
         use_ssl: bool,
     },
+    /// /edit [filename] - open split-screen editor for world notes or file
+    Edit { filename: Option<String> },
+    /// /tag - toggle MUD tag display (same as F2)
+    Tag,
     /// /<action_name> [args] - execute action
     ActionCommand { name: String, args: String },
     /// Not a command (regular text to send to MUD)
@@ -656,7 +1044,7 @@ pub fn parse_command(input: &str) -> Command {
             Command::Actions { world }
         }
         "/connections" | "/l" => Command::WorldsList,
-        "/worlds" => parse_world_command(args),
+        "/worlds" | "/world" => parse_world_command(args),
         "/connect" => parse_connect_command(args),  // Internal use only (Connect buttons)
         "/disconnect" | "/dc" => Command::Disconnect,
         "/flush" => Command::Flush,
@@ -688,6 +1076,14 @@ pub fn parse_command(input: &str) -> Command {
             }
         }
         "/addworld" => parse_addworld_command(args),
+        "/edit" => {
+            if args.is_empty() {
+                Command::Edit { filename: None }
+            } else {
+                Command::Edit { filename: Some(args.join(" ")) }
+            }
+        }
+        "/tag" | "/tags" => Command::Tag,
         _ => {
             // Check if it's an action command (starts with / but not a known command)
             let action_name = cmd.trim_start_matches('/');
@@ -1068,6 +1464,7 @@ pub struct OutputLine {
     pub from_server: bool,  // true if from MUD server, false if client-generated
     pub gagged: bool,       // true if line was gagged by an action (only shown with F2)
     pub seq: u64,           // Unique sequential number within the world (for debugging out-of-order issues)
+    pub highlight_color: Option<String>, // Optional highlight color from /highlight action command
 }
 
 /// Maximum characters per output line (prevents performance issues with extremely long lines)
@@ -1110,6 +1507,7 @@ impl OutputLine {
             from_server: true,  // Default to server output
             gagged: false,
             seq,
+            highlight_color: None,
         }
     }
 
@@ -1120,6 +1518,7 @@ impl OutputLine {
             from_server: false,
             gagged: false,
             seq,
+            highlight_color: None,
         }
     }
 
@@ -1130,11 +1529,23 @@ impl OutputLine {
             from_server: true,
             gagged: true,
             seq,
+            highlight_color: None,
+        }
+    }
+
+    fn new_highlighted(text: String, seq: u64, color: Option<String>) -> Self {
+        Self {
+            text: Self::truncate_if_needed(text),
+            timestamp: SystemTime::now(),
+            from_server: true,
+            gagged: false,
+            seq,
+            highlight_color: color,
         }
     }
 
     fn new_with_timestamp(text: String, timestamp: SystemTime, seq: u64) -> Self {
-        Self { text: Self::truncate_if_needed(text), timestamp, from_server: true, gagged: false, seq }
+        Self { text: Self::truncate_if_needed(text), timestamp, from_server: true, gagged: false, seq, highlight_color: None }
     }
 
     /// Format timestamp for display based on whether it's from today
@@ -1646,6 +2057,8 @@ pub struct App {
     pub settings: Settings,
     pub confirm_dialog: ConfirmDialog,
     pub filter_popup: FilterPopup,
+    /// Split-screen text editor for notes and files
+    pub editor: EditorState,
     /// New unified popup manager (gradual migration from old popup types)
     pub popup_manager: popup::PopupManager,
     pub last_ctrl_c: Option<std::time::Instant>,
@@ -1712,6 +2125,7 @@ impl App {
             settings: Settings::default(),
             confirm_dialog: ConfirmDialog::new(),
             filter_popup: FilterPopup::new(),
+            editor: EditorState::new(),
             popup_manager: popup::PopupManager::new(),
             last_ctrl_c: None,
             last_escape: None,
@@ -1964,6 +2378,7 @@ impl App {
             self.settings.gui_theme.name(),
             self.settings.tls_proxy_enabled,
             &self.settings.dictionary_path,
+            self.settings.editor_side.name(),
         );
         self.popup_manager.open(def);
 
@@ -2289,6 +2704,7 @@ impl App {
                             from_server: true,
                             gagged: tl.gagged,
                             seq,
+                            highlight_color: tl.highlight_color,
                         });
                     }
                     self.needs_output_redraw = true;
@@ -2324,6 +2740,11 @@ impl App {
             WsMessage::ActivityUpdate { count } => {
                 // Server's activity count changed - update our copy
                 self.server_activity_count = count;
+                self.needs_output_redraw = true;
+            }
+            WsMessage::ShowTagsChanged { show_tags } => {
+                // Server toggled show_tags (F2 or /tag command)
+                self.show_tags = show_tags;
                 self.needs_output_redraw = true;
             }
             WsMessage::ConnectionsListResponse { lines } => {
@@ -2400,6 +2821,7 @@ impl App {
                     from_server: tl.from_server,
                     gagged: tl.gagged,
                     seq: tl.seq,
+                    highlight_color: tl.highlight_color,
                 }
             }).collect();
             // Update next_seq to continue from highest seq in output_lines
@@ -2418,6 +2840,7 @@ impl App {
                     from_server: tl.from_server,
                     gagged: tl.gagged,
                     seq: tl.seq,
+                    highlight_color: tl.highlight_color,
                 }
             }).collect();
             // Update next_seq if pending_lines have higher seq values
@@ -2699,7 +3122,7 @@ impl App {
         self.needs_output_redraw = true;
     }
 
-    /// Add TF command output (does NOT get % prefix - treated like server output)
+    /// Add TF command output (does NOT get % prefix, but is client-generated so Ctrl+L filters it)
     fn add_tf_output(&mut self, text: &str) {
         let is_current = true;
         let settings = self.settings.clone();
@@ -2711,7 +3134,7 @@ impl App {
             format!("{}\n", text)
         };
         self.current_world_mut()
-            .add_output(&text_with_newline, is_current, &settings, output_height, output_width, false, true);
+            .add_output(&text_with_newline, is_current, &settings, output_height, output_width, false, false);
         self.needs_output_redraw = true;
     }
 
@@ -2849,8 +3272,8 @@ impl App {
         };
 
         // Process action triggers on complete lines
-        // Track lines with gagged flag: (line, is_gagged)
-        let mut processed_lines: Vec<(&str, bool)> = Vec::new();
+        // Track lines with gagged flag and highlight color: (line, is_gagged, highlight_color)
+        let mut processed_lines: Vec<(&str, bool, Option<String>)> = Vec::new();
         let mut commands_to_execute: Vec<String> = Vec::new();
         let mut tf_commands_to_execute: Vec<String> = Vec::new();
         let ends_with_newline = combined_data.ends_with('\n');
@@ -2888,19 +3311,21 @@ impl App {
                 has_partial = true;
             } else {
                 let mut is_gagged = false;
+                let mut highlight_color: Option<String> = None;
                 // Check Clay action triggers
                 if let Some(result) = check_action_triggers(line, &world_name_for_triggers, &actions) {
                     // Collect commands to execute
                     commands_to_execute.extend(result.commands);
                     is_gagged = result.should_gag;
+                    highlight_color = result.highlight_color;
                 }
                 // Check TF triggers
                 let tf_result = tf::bridge::process_line(&mut self.tf_engine, line, Some(&world_name_for_triggers));
                 commands_to_execute.extend(tf_result.send_commands);
                 tf_commands_to_execute.extend(tf_result.clay_commands);
                 is_gagged = is_gagged || tf_result.should_gag;
-                // Only add complete lines with gagged flag
-                processed_lines.push((line, is_gagged));
+                // Only add complete lines with gagged flag and highlight color
+                processed_lines.push((line, is_gagged, highlight_color));
             }
         }
 
@@ -2913,14 +3338,19 @@ impl App {
             self.worlds[world_idx].wont_echo_time = Some(std::time::Instant::now());
         }
 
-        // Separate gagged and non-gagged lines
-        let non_gagged_lines: Vec<&str> = processed_lines.iter()
-            .filter(|(_, gagged)| !gagged)
-            .map(|(line, _)| *line)
+        // Separate gagged and non-gagged lines, tracking highlight colors
+        let non_gagged_lines: Vec<(&str, Option<String>)> = processed_lines.iter()
+            .filter(|(_, gagged, _)| !gagged)
+            .map(|(line, _, highlight)| (*line, highlight.clone()))
             .collect();
-        let gagged_lines: Vec<&str> = processed_lines.iter()
-            .filter(|(_, gagged)| *gagged)
-            .map(|(line, _)| *line)
+        let gagged_lines: Vec<(&str, Option<String>)> = processed_lines.iter()
+            .filter(|(_, gagged, _)| *gagged)
+            .map(|(line, _, highlight)| (*line, highlight.clone()))
+            .collect();
+        // Create a map of line content to highlight color for non-gagged lines
+        let highlight_map: std::collections::HashMap<String, Option<String>> = non_gagged_lines.iter()
+            .filter(|(_, hl)| hl.is_some())
+            .map(|(line, hl)| (line.to_string(), hl.clone()))
             .collect();
 
         // Rebuild data for non-gagged lines
@@ -2929,7 +3359,8 @@ impl App {
         let filtered_data = if non_gagged_lines.is_empty() {
             String::new()
         } else {
-            let mut result = non_gagged_lines.join("\n");
+            let lines_only: Vec<&str> = non_gagged_lines.iter().map(|(line, _)| *line).collect();
+            let mut result = lines_only.join("\n");
             if ends_with_newline || has_partial {
                 result.push('\n');
             }
@@ -2981,6 +3412,24 @@ impl App {
                 (output_after.saturating_sub(output_before), output_before)
             };
             let lines_to_pending = pending_after.saturating_sub(pending_before);
+
+            // Apply highlight colors to newly added lines
+            if !highlight_map.is_empty() {
+                // Apply to output_lines
+                for line in self.worlds[world_idx].output_lines.iter_mut().skip(output_before) {
+                    let plain_text = strip_ansi_codes(&line.text);
+                    if let Some(hl) = highlight_map.get(&plain_text) {
+                        line.highlight_color = hl.clone();
+                    }
+                }
+                // Apply to pending_lines
+                for line in self.worlds[world_idx].pending_lines.iter_mut().skip(pending_before) {
+                    let plain_text = strip_ansi_codes(&line.text);
+                    if let Some(hl) = highlight_map.get(&plain_text) {
+                        line.highlight_color = hl.clone();
+                    }
+                }
+            }
 
             // Mark output for redraw if this is the current world
             if world_idx == self.current_world_index {
@@ -3036,10 +3485,12 @@ impl App {
         }
 
         // Add gagged lines to output (they'll only show with F2)
-        for line in gagged_lines {
+        for (line, highlight) in gagged_lines {
             let seq = self.worlds[world_idx].next_seq;
             self.worlds[world_idx].next_seq += 1;
-            self.worlds[world_idx].output_lines.push(OutputLine::new_gagged(line.to_string(), seq));
+            let mut output_line = OutputLine::new_gagged(line.to_string(), seq);
+            output_line.highlight_color = highlight;
+            self.worlds[world_idx].output_lines.push(output_line);
         }
         // Keep scroll at bottom if we added gagged lines
         if !self.worlds[world_idx].paused {
@@ -3078,6 +3529,7 @@ impl App {
                         gagged: s.gagged,
                         from_server: s.from_server,
                         seq: s.seq,
+                        highlight_color: s.highlight_color.clone(),
                     }
                 })
                 .collect();
@@ -4596,6 +5048,7 @@ fn handle_remote_client_key(
                     app.settings.dictionary_path = settings.dictionary_path.clone();
                     app.spell_checker = SpellChecker::new(&app.settings.dictionary_path);
                 }
+                app.settings.editor_side = EditorSide::from_name(&settings.editor_side);
 
                 // Send UpdateGlobalSettings to daemon
                 let _ = ws_tx.send(WsMessage::UpdateGlobalSettings {
@@ -5200,6 +5653,7 @@ struct SetupSettings {
     gui_theme: String,
     tls_proxy: bool,
     dictionary_path: String,
+    editor_side: String,
 }
 
 /// Settings from the web popup
@@ -5273,7 +5727,7 @@ fn handle_new_popup_key(app: &mut App, key: KeyEvent) -> NewPopupAction {
         SETUP_FIELD_MORE_MODE, SETUP_FIELD_SPELL_CHECK, SETUP_FIELD_TEMP_CONVERT,
         SETUP_FIELD_WORLD_SWITCHING, SETUP_FIELD_DEBUG, SETUP_FIELD_SHOW_TAGS,
         SETUP_FIELD_INPUT_HEIGHT, SETUP_FIELD_GUI_THEME, SETUP_FIELD_TLS_PROXY,
-        SETUP_FIELD_DICTIONARY, SETUP_BTN_SAVE, SETUP_BTN_CANCEL,
+        SETUP_FIELD_DICTIONARY, SETUP_FIELD_EDITOR_SIDE, SETUP_BTN_SAVE, SETUP_BTN_CANCEL,
     };
     use popup::definitions::web::{
         WEB_FIELD_PROTOCOL, WEB_FIELD_HTTP_ENABLED, WEB_FIELD_HTTP_PORT,
@@ -5485,6 +5939,8 @@ fn handle_new_popup_key(app: &mut App, key: KeyEvent) -> NewPopupAction {
                     tls_proxy: state.get_bool(SETUP_FIELD_TLS_PROXY).unwrap_or(false),
                     dictionary_path: state.get_text(SETUP_FIELD_DICTIONARY)
                         .unwrap_or("").to_string(),
+                    editor_side: state.get_selected(SETUP_FIELD_EDITOR_SIDE)
+                        .unwrap_or("left").to_string(),
                 }
             };
 
@@ -8474,6 +8930,8 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                                     app.current_world_mut().last_send_time = Some(now);
                                                     app.current_world_mut().last_user_command_time = Some(now);
                                                     app.current_world_mut().prompt.clear();
+                                                    // Reset more-mode counter after successfully sending
+                                                    app.current_world_mut().lines_since_pause = 0;
                                                 }
                                             }
                                         } else {
@@ -8539,6 +8997,9 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                         app.current_world_mut().last_send_time = Some(now);
                                         app.current_world_mut().last_user_command_time = Some(now);
                                         app.current_world_mut().prompt.clear();
+                                        // Reset more-mode counter after successfully sending command
+                                        // This ensures the counter is 0 when the server response arrives
+                                        app.current_world_mut().lines_since_pause = 0;
                                     }
                                 }
                             } else {
@@ -9146,6 +9607,16 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                                 }
                                             }
                                         }
+                                    }
+                                    Command::Edit { .. } => {
+                                        // Edit command is handled locally on the client, not on server
+                                        // Send back to client for local execution
+                                        app.ws_send_to_client(client_id, WsMessage::ExecuteLocalCommand { command: command.clone() });
+                                    }
+                                    Command::Tag => {
+                                        // Toggle show_tags setting (same as F2)
+                                        app.show_tags = !app.show_tags;
+                                        app.ws_broadcast(WsMessage::ShowTagsChanged { show_tags: app.show_tags });
                                     }
                                     Command::Unknown { cmd } => {
                                         app.ws_broadcast(WsMessage::ServerData {
@@ -9968,6 +10439,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                             gagged: line.gagged,
                                             from_server: line.from_server,
                                             seq: line.seq,
+                                            highlight_color: line.highlight_color.clone(),
                                         })
                                         .collect::<Vec<_>>()
                                         .into_iter()
@@ -10356,6 +10828,16 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
         let popup_visibility_changed = any_popup_visible != app.popup_was_visible;
         app.popup_was_visible = any_popup_visible;
 
+        // Handle terminal clear request (e.g., after closing editor)
+        if app.needs_terminal_clear {
+            execute!(
+                std::io::stdout(),
+                crossterm::terminal::Clear(crossterm::terminal::ClearType::All)
+            )?;
+            terminal.clear()?;
+            app.needs_terminal_clear = false;
+        }
+
         // Use ratatui for everything, but render output area with raw crossterm
         // after the ratatui draw (ratatui's Paragraph has rendering bugs)
         terminal.draw(|f| ui(f, &mut app))?;
@@ -10427,8 +10909,8 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                         };
 
                         // Process action triggers on complete lines
-                        // Track lines with gagged flag: (line, is_gagged)
-                        let mut processed_lines: Vec<(&str, bool)> = Vec::new();
+                        // Track lines with gagged flag and highlight color: (line, is_gagged, highlight_color)
+                        let mut processed_lines: Vec<(&str, bool, Option<String>)> = Vec::new();
                         let mut commands_to_execute: Vec<String> = Vec::new();
                         let mut tf_commands_to_execute: Vec<String> = Vec::new();
                         let ends_with_newline = combined_data.ends_with('\n');
@@ -10466,18 +10948,20 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                 has_partial = true;
                             } else {
                                 let mut is_gagged = false;
+                                let mut highlight_color: Option<String> = None;
                                 // Check Clay action triggers
                                 if let Some(result) = check_action_triggers(line, &world_name_for_triggers, &actions) {
                                     commands_to_execute.extend(result.commands);
                                     is_gagged = result.should_gag;
+                                    highlight_color = result.highlight_color;
                                 }
                                 // Check TF triggers
                                 let tf_result = tf::bridge::process_line(&mut app.tf_engine, line, Some(&world_name_for_triggers));
                                 commands_to_execute.extend(tf_result.send_commands);
                                 tf_commands_to_execute.extend(tf_result.clay_commands);
                                 is_gagged = is_gagged || tf_result.should_gag;
-                                // Only add complete lines with gagged flag
-                                processed_lines.push((line, is_gagged));
+                                // Only add complete lines with gagged flag and highlight color
+                                processed_lines.push((line, is_gagged, highlight_color));
                             }
                         }
 
@@ -10490,14 +10974,19 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                             app.worlds[world_idx].wont_echo_time = Some(std::time::Instant::now());
                         }
 
-                        // Separate gagged and non-gagged lines
-                        let non_gagged_lines: Vec<&str> = processed_lines.iter()
-                            .filter(|(_, gagged)| !gagged)
-                            .map(|(line, _)| *line)
+                        // Separate gagged and non-gagged lines, tracking highlight colors
+                        let non_gagged_lines: Vec<(&str, Option<String>)> = processed_lines.iter()
+                            .filter(|(_, gagged, _)| !gagged)
+                            .map(|(line, _, highlight)| (*line, highlight.clone()))
                             .collect();
-                        let gagged_lines: Vec<&str> = processed_lines.iter()
-                            .filter(|(_, gagged)| *gagged)
-                            .map(|(line, _)| *line)
+                        let gagged_lines: Vec<(&str, Option<String>)> = processed_lines.iter()
+                            .filter(|(_, gagged, _)| *gagged)
+                            .map(|(line, _, highlight)| (*line, highlight.clone()))
+                            .collect();
+                        // Create a map of line content to highlight color for non-gagged lines
+                        let highlight_map: std::collections::HashMap<String, Option<String>> = non_gagged_lines.iter()
+                            .filter(|(_, hl)| hl.is_some())
+                            .map(|(line, hl)| (line.to_string(), hl.clone()))
                             .collect();
 
                         // Add trailing newline if original ended with newline OR if we have a partial
@@ -10505,7 +10994,8 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                         let filtered_data = if non_gagged_lines.is_empty() {
                             String::new()
                         } else {
-                            let mut result = non_gagged_lines.join("\n");
+                            let lines_only: Vec<&str> = non_gagged_lines.iter().map(|(line, _)| *line).collect();
+                            let mut result = lines_only.join("\n");
                             if ends_with_newline || has_partial {
                                 result.push('\n');
                             }
@@ -10538,6 +11028,24 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                             let output_after = app.worlds[world_idx].output_lines.len();
                             let lines_to_output = output_after.saturating_sub(output_before);
                             let lines_to_pending = pending_after.saturating_sub(pending_before);
+
+                            // Apply highlight colors to newly added lines
+                            if !highlight_map.is_empty() {
+                                // Apply to output_lines
+                                for line in app.worlds[world_idx].output_lines.iter_mut().skip(output_before) {
+                                    let plain_text = strip_ansi_codes(&line.text);
+                                    if let Some(hl) = highlight_map.get(&plain_text) {
+                                        line.highlight_color = hl.clone();
+                                    }
+                                }
+                                // Apply to pending_lines
+                                for line in app.worlds[world_idx].pending_lines.iter_mut().skip(pending_before) {
+                                    let plain_text = strip_ansi_codes(&line.text);
+                                    if let Some(hl) = highlight_map.get(&plain_text) {
+                                        line.highlight_color = hl.clone();
+                                    }
+                                }
+                            }
 
                             // Mark output for redraw if this is the current world
                             if world_idx == app.current_world_index {
@@ -10589,10 +11097,12 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                         }
 
                         // Add gagged lines to output (they'll only show with F2)
-                        for line in gagged_lines {
+                        for (line, highlight) in gagged_lines {
                             let seq = app.worlds[world_idx].next_seq;
                             app.worlds[world_idx].next_seq += 1;
-                            app.worlds[world_idx].output_lines.push(OutputLine::new_gagged(line.to_string(), seq));
+                            let mut output_line = OutputLine::new_gagged(line.to_string(), seq);
+                            output_line.highlight_color = highlight;
+                            app.worlds[world_idx].output_lines.push(output_line);
                         }
                         if !app.worlds[world_idx].paused {
                             app.worlds[world_idx].scroll_to_bottom();
@@ -11117,6 +11627,16 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                             }
                                         }
                                     }
+                                }
+                                Command::Edit { .. } => {
+                                    // Edit command is handled locally on the client, not on server
+                                    // Send back to client for local execution
+                                    app.ws_send_to_client(client_id, WsMessage::ExecuteLocalCommand { command: command.clone() });
+                                }
+                                Command::Tag => {
+                                    // Toggle show_tags setting (same as F2)
+                                    app.show_tags = !app.show_tags;
+                                    app.ws_broadcast(WsMessage::ShowTagsChanged { show_tags: app.show_tags });
                                 }
                                 Command::Unknown { cmd } => {
                                     app.ws_broadcast(WsMessage::ServerData {
@@ -11725,6 +12245,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                         gagged: line.gagged,
                                         from_server: line.from_server,
                                         seq: line.seq,
+                                        highlight_color: line.highlight_color.clone(),
                                     })
                                     .collect::<Vec<_>>()
                                     .into_iter()
@@ -11863,6 +12384,34 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
     }
 }
 
+/// Save editor content (to file or world notes) and close editor
+fn save_editor_content(app: &mut App) -> KeyAction {
+    if let Some(ref path) = app.editor.file_path {
+        // Save to file
+        match std::fs::write(path, &app.editor.buffer) {
+            Ok(()) => {
+                app.add_output(&format!("Saved: {}", path.display()));
+            }
+            Err(e) => {
+                app.add_output(&format!("Failed to save file: {}", e));
+                return KeyAction::None; // Don't close on error
+            }
+        }
+    } else if let Some(world_idx) = app.editor.world_index {
+        // Save to world notes
+        if world_idx < app.worlds.len() {
+            app.worlds[world_idx].settings.notes = app.editor.buffer.clone();
+            // Save settings to persist notes
+            let _ = persistence::save_settings(app);
+            app.add_output("Notes saved.");
+        }
+    }
+    app.editor.close();
+    app.needs_output_redraw = true;
+    app.needs_terminal_clear = true;
+    KeyAction::None
+}
+
 enum KeyAction {
     Quit,
     SendCommand(String),
@@ -11900,6 +12449,144 @@ fn handle_key_event(key: KeyEvent, app: &mut App) -> KeyAction {
             _ => {}
         }
         return KeyAction::None;
+    }
+
+    // Handle split-screen editor (before popups, after confirm dialog)
+    if app.editor.visible {
+        // Ctrl+Space toggles focus between editor and input
+        if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char(' ') {
+            app.editor.toggle_focus();
+            return KeyAction::None;
+        }
+
+        // When editor is focused, handle editor keys
+        if app.editor.focus == EditorFocus::Editor {
+            match key.code {
+                KeyCode::Esc => {
+                    // Close editor without saving
+                    app.editor.close();
+                    app.needs_output_redraw = true;
+                    app.needs_terminal_clear = true;
+                    return KeyAction::None;
+                }
+                KeyCode::Char('s') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    // Save and close
+                    return save_editor_content(app);
+                }
+                KeyCode::Char('s') | KeyCode::Char('S') if !key.modifiers.contains(KeyModifiers::CONTROL) && !key.modifiers.contains(KeyModifiers::ALT) => {
+                    // Just 'S' key - check if at start of buffer (for shortcut)
+                    // Actually, we want S anywhere to be a shortcut when not typing
+                    // Let's make S work as a shortcut only without any modifiers
+                    // But we should insert 's' when typing... let's just use Ctrl+S
+                    // Insert the character
+                    app.editor.insert_char('s');
+                    return KeyAction::None;
+                }
+                KeyCode::Char('c') | KeyCode::Char('C') if !key.modifiers.contains(KeyModifiers::CONTROL) && !key.modifiers.contains(KeyModifiers::ALT) => {
+                    // Insert the character
+                    app.editor.insert_char(if key.code == KeyCode::Char('C') { 'C' } else { 'c' });
+                    return KeyAction::None;
+                }
+                KeyCode::Up => {
+                    app.editor.cursor_up();
+                    let visible_lines = app.output_height.saturating_sub(2) as usize; // Account for border and buttons
+                    let editor_width = (app.output_width / 2).saturating_sub(2) as usize; // Half width minus borders
+                    app.editor.ensure_cursor_visible(visible_lines, editor_width);
+                    return KeyAction::None;
+                }
+                KeyCode::Down => {
+                    app.editor.cursor_down();
+                    let visible_lines = app.output_height.saturating_sub(2) as usize;
+                    let editor_width = (app.output_width / 2).saturating_sub(2) as usize;
+                    app.editor.ensure_cursor_visible(visible_lines, editor_width);
+                    return KeyAction::None;
+                }
+                KeyCode::Left => {
+                    app.editor.cursor_left();
+                    let visible_lines = app.output_height.saturating_sub(2) as usize;
+                    let editor_width = (app.output_width / 2).saturating_sub(2) as usize;
+                    app.editor.ensure_cursor_visible(visible_lines, editor_width);
+                    return KeyAction::None;
+                }
+                KeyCode::Right => {
+                    app.editor.cursor_right();
+                    let visible_lines = app.output_height.saturating_sub(2) as usize;
+                    let editor_width = (app.output_width / 2).saturating_sub(2) as usize;
+                    app.editor.ensure_cursor_visible(visible_lines, editor_width);
+                    return KeyAction::None;
+                }
+                KeyCode::Home => {
+                    app.editor.cursor_home();
+                    let visible_lines = app.output_height.saturating_sub(2) as usize;
+                    let editor_width = (app.output_width / 2).saturating_sub(2) as usize;
+                    app.editor.ensure_cursor_visible(visible_lines, editor_width);
+                    return KeyAction::None;
+                }
+                KeyCode::End => {
+                    app.editor.cursor_end();
+                    let visible_lines = app.output_height.saturating_sub(2) as usize;
+                    let editor_width = (app.output_width / 2).saturating_sub(2) as usize;
+                    app.editor.ensure_cursor_visible(visible_lines, editor_width);
+                    return KeyAction::None;
+                }
+                KeyCode::PageUp => {
+                    let visible_lines = app.output_height.saturating_sub(2) as usize;
+                    let editor_width = (app.output_width / 2).saturating_sub(2) as usize;
+                    app.editor.page_up(visible_lines, editor_width);
+                    return KeyAction::None;
+                }
+                KeyCode::PageDown => {
+                    let visible_lines = app.output_height.saturating_sub(2) as usize;
+                    let editor_width = (app.output_width / 2).saturating_sub(2) as usize;
+                    app.editor.page_down(visible_lines, editor_width);
+                    return KeyAction::None;
+                }
+                KeyCode::Enter => {
+                    app.editor.insert_char('\n');
+                    let visible_lines = app.output_height.saturating_sub(2) as usize;
+                    let editor_width = (app.output_width / 2).saturating_sub(2) as usize;
+                    app.editor.ensure_cursor_visible(visible_lines, editor_width);
+                    return KeyAction::None;
+                }
+                KeyCode::Backspace => {
+                    app.editor.delete_backward();
+                    let visible_lines = app.output_height.saturating_sub(2) as usize;
+                    let editor_width = (app.output_width / 2).saturating_sub(2) as usize;
+                    app.editor.ensure_cursor_visible(visible_lines, editor_width);
+                    return KeyAction::None;
+                }
+                KeyCode::Delete => {
+                    app.editor.delete_forward();
+                    return KeyAction::None;
+                }
+                KeyCode::Tab => {
+                    // Insert 4 spaces for tab
+                    for _ in 0..4 {
+                        app.editor.insert_char(' ');
+                    }
+                    let visible_lines = app.output_height.saturating_sub(2) as usize;
+                    let editor_width = (app.output_width / 2).saturating_sub(2) as usize;
+                    app.editor.ensure_cursor_visible(visible_lines, editor_width);
+                    return KeyAction::None;
+                }
+                KeyCode::Char(c) => {
+                    // Insert character
+                    let ch = if key.modifiers.contains(KeyModifiers::SHIFT) {
+                        c.to_ascii_uppercase()
+                    } else {
+                        c
+                    };
+                    app.editor.insert_char(ch);
+                    let visible_lines = app.output_height.saturating_sub(2) as usize;
+                    let editor_width = (app.output_width / 2).saturating_sub(2) as usize;
+                    app.editor.ensure_cursor_visible(visible_lines, editor_width);
+                    return KeyAction::None;
+                }
+                _ => {}
+            }
+            return KeyAction::None;
+        }
+        // When input is focused, fall through to normal input handling below
     }
 
     // Handle new unified popup system (help popup and others)
@@ -12038,6 +12725,7 @@ fn handle_key_event(key: KeyEvent, app: &mut App) -> KeyAction {
                     app.settings.dictionary_path = settings.dictionary_path.clone();
                     app.spell_checker = SpellChecker::new(&app.settings.dictionary_path);
                 }
+                app.settings.editor_side = EditorSide::from_name(&settings.editor_side);
                 // Save settings to disk
                 let _ = persistence::save_settings(app);
             }
@@ -12467,6 +13155,57 @@ fn handle_key_event(key: KeyEvent, app: &mut App) -> KeyAction {
             input.as_str()
         };
 
+        // Check if this is a /worlds or /world command with arguments (for world name completion)
+        let is_worlds_cmd = partial.eq_ignore_ascii_case("/worlds") || partial.eq_ignore_ascii_case("/world");
+        if is_worlds_cmd && input.contains(' ') {
+            // World name completion for /worlds and /world commands
+            let args_part = &input[input.find(' ').unwrap() + 1..];
+
+            // Parse out -e or -l flag if present
+            let (has_flag, partial_name) = if args_part.starts_with("-e ") || args_part.starts_with("-E ") {
+                (true, args_part[3..].trim_start())
+            } else if args_part.starts_with("-l ") || args_part.starts_with("-L ") {
+                (true, args_part[3..].trim_start())
+            } else if args_part == "-e" || args_part == "-E" || args_part == "-l" || args_part == "-L" {
+                // Just the flag with no world name yet
+                return KeyAction::None;
+            } else {
+                (false, args_part)
+            };
+
+            // Get matching world names
+            let partial_lower = partial_name.to_lowercase();
+            let mut world_matches: Vec<String> = app.worlds.iter()
+                .map(|w| w.name.clone())
+                .filter(|name| name.to_lowercase().starts_with(&partial_lower))
+                .collect();
+            world_matches.sort_by(|a, b| a.to_lowercase().cmp(&b.to_lowercase()));
+
+            if !world_matches.is_empty() {
+                // Find current match index
+                let current_idx = world_matches.iter().position(|m| m.eq_ignore_ascii_case(partial_name));
+                let next_idx = match current_idx {
+                    Some(idx) => (idx + 1) % world_matches.len(),
+                    None => 0,
+                };
+
+                // Build the completed input
+                let completion = &world_matches[next_idx];
+                let flag_part = if has_flag {
+                    if args_part.starts_with("-e") || args_part.starts_with("-E") {
+                        "-e "
+                    } else {
+                        "-l "
+                    }
+                } else {
+                    ""
+                };
+                app.input.buffer = format!("{} {}{}", partial, flag_part, completion);
+                app.input.cursor_position = app.input.buffer.len();
+            }
+            return KeyAction::None;
+        }
+
         // Only complete if we're still in the command part (no space yet or cursor before space)
         if !input.contains(' ') || app.input.cursor_position <= input.find(' ').unwrap_or(input.len()) {
             let matches = if input.starts_with('#') {
@@ -12490,8 +13229,8 @@ fn handle_key_event(key: KeyEvent, app: &mut App) -> KeyAction {
             } else {
                 // Clay / commands: internal commands + manual actions
                 let internal_commands = vec![
-                    "/help", "/disconnect", "/dc", "/send", "/worlds", "/connections",
-                    "/setup", "/web", "/actions", "/keepalive", "/reload", "/quit", "/gag", "/testmusic", "/dump",
+                    "/help", "/disconnect", "/dc", "/send", "/worlds", "/world", "/connections",
+                    "/setup", "/web", "/actions", "/keepalive", "/reload", "/quit", "/gag", "/testmusic", "/dump", "/edit", "/tag",
                 ];
 
                 // Get manual actions (empty pattern)
@@ -12711,17 +13450,14 @@ fn handle_key_event(key: KeyEvent, app: &mut App) -> KeyAction {
             KeyAction::None
         }
 
-        // Submit - Only reset lines_since_pause if not currently paused
-        // If paused, user must Tab/PageDown to see pending output first
+        // Submit - Reset lines_since_pause when sending a command
         (_, KeyCode::Enter) => {
             let input = app.input.take_input();
             // Allow empty input to be sent if connected (some MUDs use empty lines)
             if !input.is_empty() || app.current_world().connected {
-                // Only reset counter if not paused - if paused, leave state alone
-                // so user must explicitly release pending output
-                if !app.current_world().paused {
-                    app.current_world_mut().lines_since_pause = 0;
-                }
+                // Always reset counter when user sends a command
+                // This matches daemon.rs behavior and prevents spurious pausing
+                app.current_world_mut().lines_since_pause = 0;
                 KeyAction::SendCommand(input)
             } else {
                 KeyAction::None
@@ -14256,6 +14992,42 @@ async fn handle_command(cmd: &str, app: &mut App, event_tx: mpsc::Sender<AppEven
             };
             app.add_output(&format!("{} world '{}'{}.", action, name, host_info));
         }
+        Command::Edit { filename } => {
+            // Open split-screen editor
+            if app.editor.visible {
+                app.add_output("Editor is already open. Close it first.");
+            } else if let Some(ref path_str) = filename {
+                // Edit a file
+                let path = PathBuf::from(path_str);
+                let content = if path.exists() {
+                    match std::fs::read_to_string(&path) {
+                        Ok(c) => c,
+                        Err(e) => {
+                            app.add_output(&format!("Failed to read file: {}", e));
+                            return false;
+                        }
+                    }
+                } else {
+                    // New file - start with empty content
+                    String::new()
+                };
+                app.editor.open_file(path, &content);
+                app.needs_terminal_clear = true;
+            } else {
+                // Edit current world's notes
+                let world_idx = app.current_world_index;
+                let notes = app.worlds[world_idx].settings.notes.clone();
+                app.editor.open_notes(world_idx, &notes);
+                app.needs_terminal_clear = true;
+            }
+        }
+        Command::Tag => {
+            // Toggle MUD tag display (same as F2) - silent, no output
+            app.show_tags = !app.show_tags;
+            app.needs_output_redraw = true;
+            // Broadcast to WebSocket clients
+            app.ws_broadcast(WsMessage::ShowTagsChanged { show_tags: app.show_tags });
+        }
         Command::ActionCommand { name, args } => {
             // Check if this is an action command (/name)
             let action_found = app.settings.actions.iter()
@@ -14440,8 +15212,52 @@ fn ui(f: &mut Frame, app: &mut App) {
     app.input.set_dimensions(input_area.width, app.input_height);
     app.input.prompt_len = strip_ansi_codes(&app.current_world().prompt).chars().count();
 
-    // Render output area
-    render_output_area(f, app, output_area);
+    // Check if editor is visible - split the output area if so
+    if app.editor.visible {
+        // Split output area horizontally into editor and world output
+        let half_width = output_area.width / 2;
+        let (editor_area, world_area) = match app.settings.editor_side {
+            EditorSide::Left => {
+                let editor = Rect {
+                    x: output_area.x,
+                    y: output_area.y,
+                    width: half_width,
+                    height: output_area.height,
+                };
+                let world = Rect {
+                    x: output_area.x + half_width,
+                    y: output_area.y,
+                    width: output_area.width - half_width,
+                    height: output_area.height,
+                };
+                (editor, world)
+            }
+            EditorSide::Right => {
+                let world = Rect {
+                    x: output_area.x,
+                    y: output_area.y,
+                    width: half_width,
+                    height: output_area.height,
+                };
+                let editor = Rect {
+                    x: output_area.x + half_width,
+                    y: output_area.y,
+                    width: output_area.width - half_width,
+                    height: output_area.height,
+                };
+                (editor, world)
+            }
+        };
+
+        // Render editor panel
+        render_editor_panel(f, app, editor_area);
+
+        // Render world output on the other half
+        render_output_area(f, app, world_area);
+    } else {
+        // Normal full-width output area
+        render_output_area(f, app, output_area);
+    }
 
     // Render separator bar
     render_separator_bar(f, app, separator_area);
@@ -14462,10 +15278,11 @@ fn render_output_crossterm(app: &App) {
     use std::io::Write;
     use crossterm::{style::Print, QueueableCommand};
 
-    // Skip if showing splash screen or any popup is visible (except filter popup)
+    // Skip if showing splash screen, any popup is visible, or editor is visible
+    // When editor is visible, ratatui handles all rendering for the split-screen layout
     let any_popup_visible = app.confirm_dialog.visible
         || app.has_new_popup();
-    if app.current_world().showing_splash || any_popup_visible {
+    if app.current_world().showing_splash || any_popup_visible || app.editor.visible {
         return;
     }
 
@@ -14766,8 +15583,8 @@ fn render_output_crossterm(app: &App) {
     }
 
     // Collect wrapped lines centered around scroll_offset to fill the screen
-    // Each entry is (line_text, should_highlight)
-    let mut visual_lines: Vec<(String, bool)> = Vec::new();
+    // Each entry is (line_text, should_highlight_f8, highlight_color_from_action)
+    let mut visual_lines: Vec<(String, bool, Option<String>)> = Vec::new();
     let mut first_line_idx: usize = 0;
 
     let show_tags = app.show_tags;
@@ -14784,7 +15601,7 @@ fn render_output_crossterm(app: &App) {
     // Cache "now" for timestamp formatting - compute once per frame, not per line
     let cached_now = CachedNow::new();
 
-    let expand_and_wrap = |line: &OutputLine, term_width: usize, show_tags: bool, highlight: bool, cached_now: &CachedNow| -> Vec<(String, bool)> {
+    let expand_and_wrap = |line: &OutputLine, term_width: usize, show_tags: bool, highlight_f8: bool, cached_now: &CachedNow| -> Vec<(String, bool, Option<String>)> {
         // Skip gagged lines unless show_tags (F2) is enabled
         if line.gagged && !show_tags {
             return Vec::new();
@@ -14796,7 +15613,7 @@ fn render_output_crossterm(app: &App) {
         // For legitimate blank lines (empty or whitespace-only without background colors), render as blank line
         // Lines with background colors (like ANSI art) should preserve their ANSI codes
         if is_visually_empty(&line.text) && !has_background_color(&line.text) {
-            return vec![("".to_string(), false)];
+            return vec![("".to_string(), false, None)];
         }
         // Convert Discord custom emojis to :name: for console display
         // and colorize square emoji (🟩🟨 etc.) with ANSI codes
@@ -14822,9 +15639,10 @@ fn render_output_crossterm(app: &App) {
         let expanded = processed.replace('\t', "        ");
         // Wrap URLs with OSC 8 hyperlink sequences for terminal clickability
         let with_links = wrap_urls_with_osc8(&expanded);
+        let hl_color = line.highlight_color.clone();
         wrap_ansi_line(&with_links, term_width)
             .into_iter()
-            .map(|s| (s, highlight))
+            .map(|s| (s, highlight_f8, hl_color.clone()))
             .collect()
     };
 
@@ -14954,24 +15772,30 @@ fn render_output_crossterm(app: &App) {
         }
     }
 
-    let lines_to_show: &[(String, bool)] = if first_line_idx == 0 && visual_lines.len() <= visible_height {
+    let lines_to_show: &[(String, bool, Option<String>)] = if first_line_idx == 0 && visual_lines.len() <= visible_height {
         &visual_lines[..visual_lines.len().min(visible_height)]
     } else {
         let display_start = visual_lines.len().saturating_sub(visible_height);
         &visual_lines[display_start..]
     };
 
-    for (row_idx, (wrapped, highlight)) in lines_to_show.iter().enumerate() {
+    for (row_idx, (wrapped, highlight_f8, hl_color)) in lines_to_show.iter().enumerate() {
         let _ = stdout.queue(cursor::MoveTo(0, row_idx as u16));
 
-        // Apply highlight background if this line matches an action
-        if *highlight {
-            // Dark yellow/brown background for action-matched lines
-            // Replace any resets in the line to preserve background color
-            let bg_code = "\x1b[48;5;58m";
-            let _ = stdout.queue(Print(bg_code));
-            // Replace \x1b[0m with \x1b[0m\x1b[48;5;58m to preserve background
-            let highlighted = wrapped.replace("\x1b[0m", &format!("\x1b[0m{}", bg_code));
+        // Determine background color: /highlight color takes priority, then F8 highlight
+        let bg_code = if let Some(color) = hl_color {
+            Some(color_name_to_ansi_bg(color))
+        } else if *highlight_f8 {
+            // Dark yellow/brown background for F8 action-matched lines
+            Some("\x1b[48;5;58m".to_string())
+        } else {
+            None
+        };
+
+        if let Some(ref bg) = bg_code {
+            let _ = stdout.queue(Print(bg));
+            // Replace \x1b[0m with \x1b[0m<bg_code> to preserve background
+            let highlighted = wrapped.replace("\x1b[0m", &format!("\x1b[0m{}", bg));
             let _ = stdout.queue(Print(&highlighted));
         } else {
             let _ = stdout.queue(Print(wrapped));
@@ -15078,19 +15902,19 @@ fn render_output_area(f: &mut Frame, app: &App, area: Rect) {
         return;
     }
 
-    // Check if any popup is visible - ratatui handles output when popups are shown
+    // Check if any popup is visible or editor is visible - ratatui handles output in these cases
     let any_popup_visible = app.confirm_dialog.visible
         || app.filter_popup.visible
         || app.has_new_popup();
 
-    // If no popup is visible, raw crossterm will handle output rendering
+    // If no popup is visible and editor is not visible, raw crossterm will handle output rendering
     // (it provides better ANSI color handling)
     // Just clear the area and return - crossterm will fill it in
-    if !any_popup_visible {
+    if !any_popup_visible && !app.editor.visible {
         return;
     }
 
-    // Popup is visible - render output with ratatui (crossterm is skipped when popups are shown)
+    // Popup or editor is visible - render output with ratatui (crossterm is skipped in these cases)
     // First, fill the entire output area with background to cover any crossterm remnants
     let theme = app.settings.theme;
     let background = ratatui::widgets::Block::default().style(Style::default().bg(theme.bg()));
@@ -15140,6 +15964,168 @@ fn render_output_area(f: &mut Frame, app: &App, area: Rect) {
     let output_text = Text::from(lines);
     let output_paragraph = Paragraph::new(output_text).style(Style::default().bg(theme.bg()));
     f.render_widget(output_paragraph, area);
+}
+
+/// Render the split-screen editor panel
+fn render_editor_panel(f: &mut Frame, app: &App, area: Rect) {
+    let theme = app.settings.theme;
+
+    // Get editor title with world name if editing notes
+    let world_name = app.editor.world_index.map(|idx| app.worlds[idx].name.as_str());
+    let title = app.editor.title(world_name);
+
+    // Add focus indicator to title
+    let title_with_focus = if app.editor.focus == EditorFocus::Editor {
+        format!("[Ctrl+Space] {}", title)
+    } else {
+        format!(" {} ", title)
+    };
+
+    // Create bordered block - highlight border when focused
+    let border_style = if app.editor.focus == EditorFocus::Editor {
+        Style::default().fg(Color::Yellow)
+    } else {
+        Style::default().fg(Color::DarkGray)
+    };
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(border_style)
+        .title(title_with_focus)
+        .style(Style::default().bg(theme.bg()));
+
+    // Calculate inner area (accounting for border and button row)
+    let inner = block.inner(area);
+    let button_height = 1;
+    let content_height = inner.height.saturating_sub(button_height);
+    let content_width = inner.width as usize;
+
+    // Split inner area into content and button row
+    let content_area = Rect {
+        x: inner.x,
+        y: inner.y,
+        width: inner.width,
+        height: content_height,
+    };
+    let button_area = Rect {
+        x: inner.x,
+        y: inner.y + content_height,
+        width: inner.width,
+        height: button_height,
+    };
+
+    // Clear the entire area first to prevent any bleed-through
+    f.render_widget(ratatui::widgets::Clear, area);
+
+    // Fill the entire area with background color
+    let background = Block::default().style(Style::default().bg(theme.bg()));
+    f.render_widget(background, area);
+
+    // Render the border on top
+    f.render_widget(block, area);
+
+    // Get logical lines from buffer
+    let logical_lines: Vec<&str> = app.editor.lines();
+    let visible_lines = content_height as usize;
+    let scroll_offset = app.editor.scroll_offset;
+
+    // Wrap lines by character (letter wrapping) and track cursor position
+    // Each visual line is (text, Option<cursor_col>) where cursor_col is Some if cursor is on this visual line
+    let mut visual_lines: Vec<(String, Option<usize>)> = Vec::new();
+
+    let cursor_line = app.editor.cursor_line;
+    let cursor_col = app.editor.cursor_col;
+    let show_cursor = app.editor.focus == EditorFocus::Editor;
+
+    for (line_idx, line) in logical_lines.iter().enumerate() {
+        let is_cursor_line = line_idx == cursor_line;
+        let chars: Vec<char> = line.chars().collect();
+
+        if chars.is_empty() {
+            // Empty line - just add it, with cursor if applicable
+            if is_cursor_line && show_cursor {
+                visual_lines.push((String::new(), Some(0)));
+            } else {
+                visual_lines.push((String::new(), None));
+            }
+        } else if content_width == 0 {
+            // Edge case: no width
+            visual_lines.push((String::new(), None));
+        } else {
+            // Wrap the line by characters
+            let mut pos = 0;
+            while pos < chars.len() {
+                let end = (pos + content_width).min(chars.len());
+                let segment: String = chars[pos..end].iter().collect();
+
+                // Check if cursor is in this segment
+                let cursor_in_segment = if is_cursor_line && show_cursor {
+                    if cursor_col >= pos && cursor_col <= end {
+                        Some(cursor_col - pos)
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
+
+                visual_lines.push((segment, cursor_in_segment));
+                pos = end;
+            }
+
+            // If cursor is at end of line and line length is exact multiple of width,
+            // we need an extra visual line for the cursor
+            if is_cursor_line && show_cursor && cursor_col == chars.len() && chars.len() % content_width == 0 && chars.len() > 0 {
+                visual_lines.push((String::new(), Some(0)));
+            }
+        }
+    }
+
+    // Build display lines from scroll_offset
+    let mut display_lines: Vec<Line<'_>> = Vec::with_capacity(visible_lines);
+
+    for (text, cursor_pos) in visual_lines.iter().skip(scroll_offset).take(visible_lines) {
+        if let Some(col) = cursor_pos {
+            // This visual line has the cursor
+            let chars: Vec<char> = text.chars().collect();
+            let col = (*col).min(chars.len());
+            let before: String = chars[..col].iter().collect();
+            let after: String = chars[col..].iter().collect();
+
+            let spans = vec![
+                Span::raw(before),
+                Span::styled("│", Style::default().fg(Color::Yellow)),
+                Span::raw(after),
+            ];
+            display_lines.push(Line::from(spans));
+        } else {
+            display_lines.push(Line::raw(text.clone()));
+        }
+    }
+
+    // Fill remaining lines if content is shorter than visible area
+    while display_lines.len() < visible_lines {
+        display_lines.push(Line::raw("~"));
+    }
+
+    let content = Text::from(display_lines);
+    let content_paragraph = Paragraph::new(content)
+        .style(Style::default().bg(theme.bg()).fg(theme.fg()));
+    f.render_widget(content_paragraph, content_area);
+
+    // Render button row with proper background
+    let save_style = Style::default().fg(Color::Green);
+    let cancel_style = Style::default().fg(Color::Red);
+    let button_text = Line::from(vec![
+        Span::raw(" "),
+        Span::styled("[S]", save_style),
+        Span::raw("ave "),
+        Span::styled("[C]", cancel_style),
+        Span::raw("ancel"),
+    ]);
+    let button_paragraph = Paragraph::new(button_text)
+        .style(Style::default().bg(theme.bg()).fg(theme.fg()));
+    f.render_widget(button_paragraph, button_area);
 }
 
 fn render_splash_centered<'a>(world: &World, visible_height: usize, area_width: usize) -> Text<'a> {
