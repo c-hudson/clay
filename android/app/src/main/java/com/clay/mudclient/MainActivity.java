@@ -415,6 +415,7 @@ public class MainActivity extends AppCompatActivity {
                 NotificationManager.IMPORTANCE_LOW
             );
             channel.setDescription("Keeps Clay connected in the background");
+            channel.setShowBadge(false);  // Don't show badge for service notification
 
             NotificationManager manager = getSystemService(NotificationManager.class);
             if (manager != null) {
@@ -752,6 +753,15 @@ public class MainActivity extends AppCompatActivity {
     }
 
     @Override
+    protected void onNewIntent(Intent intent) {
+        super.onNewIntent(intent);
+        // Called when activity is brought to front via FLAG_ACTIVITY_CLEAR_TOP
+        // Force a check to load the web interface if settings are now available
+        android.util.Log.i("Clay", "onNewIntent called, checking if interface needs loading");
+        checkAndLoadInterface();
+    }
+
+    @Override
     protected void onResume() {
         super.onResume();
 
@@ -760,7 +770,11 @@ public class MainActivity extends AppCompatActivity {
             return;
         }
 
-        // Only reload if settings changed or WebView was destroyed
+        checkAndLoadInterface();
+    }
+
+    private void checkAndLoadInterface() {
+        // Check if we have saved server settings and need to load interface
         SharedPreferences prefs = getSharedPreferences(PREFS_NAME, MODE_PRIVATE);
         String host = prefs.getString(KEY_SERVER_HOST, null);
         int port = prefs.getInt(KEY_SERVER_PORT, 0);
@@ -773,12 +787,15 @@ public class MainActivity extends AppCompatActivity {
 
             // Check if WebView already has content loaded
             String webViewUrl = webView.getUrl();
-            boolean webViewHasContent = webViewUrl != null && webViewUrl.startsWith(expectedUrl);
+            boolean webViewHasContent = webViewUrl != null &&
+                !webViewUrl.equals("about:blank") &&
+                webViewUrl.startsWith(expectedUrl);
 
-            // Only reload if:
-            // 1. WebView was destroyed (no URL or wrong URL)
+            // Load if:
+            // 1. WebView has no content or wrong content
             // 2. Settings changed (expected URL differs from saved URL)
             if (!webViewHasContent || (savedUrl != null && !expectedUrl.equals(savedUrl))) {
+                android.util.Log.i("Clay", "Loading interface: webViewUrl=" + webViewUrl + ", expectedUrl=" + expectedUrl);
                 loadWebInterface();
             } else if (isConnected && messagesSentSinceAck > 0) {
                 // Returning from background with unacked messages - trigger resync

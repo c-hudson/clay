@@ -94,6 +94,7 @@ public class ClayForegroundService extends Service {
         );
 
         // Build the persistent notification with Disconnect action
+        // Use all available options to prevent badge from showing
         Notification notification = new NotificationCompat.Builder(this, CHANNEL_ID)
             .setSmallIcon(R.drawable.ic_notification)
             .setContentTitle("Clay")
@@ -102,6 +103,8 @@ public class ClayForegroundService extends Service {
             .setPriority(NotificationCompat.PRIORITY_LOW)
             .setContentIntent(pendingIntent)
             .addAction(0, "Disconnect", stopPendingIntent)
+            .setNumber(0)  // No badge number
+            .setBadgeIconType(NotificationCompat.BADGE_ICON_NONE)  // No badge icon
             .build();
 
         // Start as foreground service
