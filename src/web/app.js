@@ -183,6 +183,8 @@
     let multiuserMode = false;  // True when server is in multiuser mode
     let pendingAuthPassword = null;  // Password being authenticated (saved on success for Android auto-login)
     let pendingAuthUsername = null;  // Username being authenticated (saved on success for Android auto-login)
+    let deferredAutoLoginPassword = null;  // Saved password waiting for ServerHello
+    let deferredAutoLoginUsername = null;  // Saved username waiting for ServerHello
     let hasReceivedInitialState = false;  // True after first InitialState (to preserve world on resync)
     let worlds = [];
     let currentWorldIndex = 0;
@@ -930,14 +932,28 @@
             }
 
             if (savedPassword) {
-                // If we have a saved username, enable multiuser UI before auto-login
+                // If we have both username and password, authenticate immediately
+                // (user clearly expects multiuser mode)
                 if (savedUsername) {
                     enableMultiuserAuthUI();
                     if (elements.authUsername) {
                         elements.authUsername.value = savedUsername;
                     }
+                    authenticate(savedPassword, savedUsername);
+                } else {
+                    // Only password saved - defer until ServerHello tells us if username is needed
+                    deferredAutoLoginPassword = savedPassword;
+                    deferredAutoLoginUsername = null;
+                    // Set a timeout in case ServerHello doesn't arrive
+                    setTimeout(function() {
+                        if (deferredAutoLoginPassword) {
+                            // ServerHello didn't arrive, try auth without username
+                            const pwd = deferredAutoLoginPassword;
+                            deferredAutoLoginPassword = null;
+                            authenticate(pwd, null);
+                        }
+                    }, 1000);
                 }
-                authenticate(savedPassword, savedUsername);
             } else {
                 showAuthModal(true);
                 // Pre-fill username if saved (for multiuser mode)
@@ -963,6 +979,11 @@
         // Base64 encoded version for safer message passing from Java
         window.onNativeWebSocketMessageBase64 = function(base64Data) {
             try {
+                // Acknowledge receipt to Android
+                if (window.Android && window.Android.messageAck) {
+                    window.Android.messageAck();
+                }
+
                 // Decode Base64 to string
                 const data = atob(base64Data);
                 // Convert from UTF-8 bytes to string
@@ -1148,14 +1169,28 @@
                 }
 
                 if (savedPassword) {
-                    // If we have a saved username, enable multiuser UI before auto-login
+                    // If we have both username and password, authenticate immediately
+                    // (user clearly expects multiuser mode)
                     if (savedUsername) {
                         enableMultiuserAuthUI();
                         if (elements.authUsername) {
                             elements.authUsername.value = savedUsername;
                         }
+                        authenticate(savedPassword, savedUsername);
+                    } else {
+                        // Only password saved - defer until ServerHello tells us if username is needed
+                        deferredAutoLoginPassword = savedPassword;
+                        deferredAutoLoginUsername = null;
+                        // Set a timeout in case ServerHello doesn't arrive
+                        setTimeout(function() {
+                            if (deferredAutoLoginPassword) {
+                                // ServerHello didn't arrive, try auth without username
+                                const pwd = deferredAutoLoginPassword;
+                                deferredAutoLoginPassword = null;
+                                authenticate(pwd, null);
+                            }
+                        }, 1000);
                     }
-                    authenticate(savedPassword, savedUsername);
                 } else {
                     showAuthModal(true);
                     // Pre-fill username if saved (for multiuser mode)
@@ -1240,6 +1275,25 @@
                 // Server tells us upfront if it's in multiuser mode
                 if (msg.multiuser_mode) {
                     enableMultiuserAuthUI();
+                }
+                // Handle deferred auto-login (Android saved password without username)
+                if (deferredAutoLoginPassword) {
+                    const pwd = deferredAutoLoginPassword;
+                    deferredAutoLoginPassword = null;
+                    if (msg.multiuser_mode) {
+                        // Server requires username but we don't have one saved
+                        // Show auth modal with password pre-filled
+                        showAuthModal(true);
+                        if (elements.authPassword) {
+                            elements.authPassword.value = pwd;
+                        }
+                        if (elements.authUsername) {
+                            elements.authUsername.focus();
+                        }
+                    } else {
+                        // Not multiuser mode - authenticate with just password
+                        authenticate(pwd, null);
+                    }
                 }
                 break;
 
@@ -5874,6 +5928,15 @@
         if (ws && ws.readyState === WebSocket.OPEN) {
             // Send a ping to keep the connection alive
             send({ type: 'Ping' });
+        }
+    };
+
+    // Expose resync function for Android app to call when messages may have been lost
+    window.triggerResync = function() {
+        console.log('Resync triggered by Android - requesting full state');
+        if (ws && ws.readyState === WebSocket.OPEN && authenticated) {
+            // Request a full state resync from the server
+            ws.send(JSON.stringify({ type: 'Resync' }));
         }
     };
 

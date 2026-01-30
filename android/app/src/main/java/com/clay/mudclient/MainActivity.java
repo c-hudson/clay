@@ -61,6 +61,10 @@ public class MainActivity extends AppCompatActivity {
     private Handler keepaliveHandler;
     private Runnable keepaliveRunnable;
     private NativeWebSocket nativeWebSocket;
+    private long lastMessageSentTime = 0;
+    private long lastMessageAckTime = 0;
+    private int messagesSentSinceAck = 0;
+    private static final int MAX_UNACKED_MESSAGES = 50;  // Trigger resync after this many unacked messages
 
     // JavaScript interface for communication between web and Android
     public class AndroidInterface {
@@ -145,6 +149,18 @@ public class MainActivity extends AppCompatActivity {
         }
 
         @JavascriptInterface
+        public void messageAck() {
+            // Called by JavaScript to acknowledge receiving a WebSocket message
+            lastMessageAckTime = System.currentTimeMillis();
+            messagesSentSinceAck = 0;
+        }
+
+        @JavascriptInterface
+        public int getUnackedMessageCount() {
+            return messagesSentSinceAck;
+        }
+
+        @JavascriptInterface
         public void savePassword(String password) {
             SharedPreferences prefs = getSharedPreferences(PREFS_NAME, MODE_PRIVATE);
             prefs.edit().putString(KEY_SAVED_PASSWORD, password).apply();
@@ -206,6 +222,10 @@ public class MainActivity extends AppCompatActivity {
                     @Override
                     public void onMessage(String message) {
                         runOnUiThread(() -> {
+                            // Track message sending for acknowledgment
+                            lastMessageSentTime = System.currentTimeMillis();
+                            messagesSentSinceAck++;
+
                             // Use Base64 encoding to safely pass message to JavaScript
                             // This handles all special characters without escaping issues
                             String base64 = android.util.Base64.encodeToString(
@@ -216,6 +236,17 @@ public class MainActivity extends AppCompatActivity {
                                 "if (typeof onNativeWebSocketMessageBase64 === 'function') onNativeWebSocketMessageBase64(\"" + base64 + "\");",
                                 null
                             );
+
+                            // If too many messages without acknowledgment, JavaScript may be stuck
+                            // Trigger a resync to recover
+                            if (messagesSentSinceAck >= MAX_UNACKED_MESSAGES) {
+                                android.util.Log.w("Clay", "Too many unacked messages (" + messagesSentSinceAck + "), triggering resync");
+                                messagesSentSinceAck = 0;  // Reset to avoid repeated resyncs
+                                webView.evaluateJavascript(
+                                    "if (typeof triggerResync === 'function') triggerResync();",
+                                    null
+                                );
+                            }
                         });
                     }
 
@@ -749,6 +780,14 @@ public class MainActivity extends AppCompatActivity {
             // 2. Settings changed (expected URL differs from saved URL)
             if (!webViewHasContent || (savedUrl != null && !expectedUrl.equals(savedUrl))) {
                 loadWebInterface();
+            } else if (isConnected && messagesSentSinceAck > 0) {
+                // Returning from background with unacked messages - trigger resync
+                android.util.Log.i("Clay", "Resuming with " + messagesSentSinceAck + " unacked messages, triggering resync");
+                messagesSentSinceAck = 0;
+                webView.evaluateJavascript(
+                    "if (typeof triggerResync === 'function') triggerResync();",
+                    null
+                );
             }
             // Don't reload if just returning from background with WebView intact
         }
