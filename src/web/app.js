@@ -182,6 +182,7 @@
     let authenticated = false;
     let multiuserMode = false;  // True when server is in multiuser mode
     let pendingAuthPassword = null;  // Password being authenticated (saved on success for Android auto-login)
+    let pendingAuthUsername = null;  // Username being authenticated (saved on success for Android auto-login)
     let hasReceivedInitialState = false;  // True after first InitialState (to preserve world on resync)
     let worlds = [];
     let currentWorldIndex = 0;
@@ -906,8 +907,9 @@
             hideCertWarning();
             showConnecting(false);
 
-            // Check for saved password (Android auto-login)
+            // Check for saved credentials (Android auto-login)
             let savedPassword = null;
+            let savedUsername = null;
             try {
                 if (window.Android && typeof window.Android.getSavedPassword === 'function') {
                     savedPassword = window.Android.getSavedPassword();
@@ -915,16 +917,37 @@
                         savedPassword = null;
                     }
                 }
+                if (window.Android && typeof window.Android.getSavedUsername === 'function') {
+                    savedUsername = window.Android.getSavedUsername();
+                    if (typeof savedUsername !== 'string' || savedUsername.trim() === '') {
+                        savedUsername = null;
+                    }
+                }
             } catch (e) {
-                console.error('Error getting saved password:', e);
+                console.error('Error getting saved credentials:', e);
                 savedPassword = null;
+                savedUsername = null;
             }
 
             if (savedPassword) {
-                authenticate(savedPassword);
+                // If we have a saved username, enable multiuser UI before auto-login
+                if (savedUsername) {
+                    enableMultiuserAuthUI();
+                    if (elements.authUsername) {
+                        elements.authUsername.value = savedUsername;
+                    }
+                }
+                authenticate(savedPassword, savedUsername);
             } else {
                 showAuthModal(true);
-                elements.authPassword.focus();
+                // Pre-fill username if saved (for multiuser mode)
+                if (savedUsername && elements.authUsername) {
+                    enableMultiuserAuthUI();
+                    elements.authUsername.value = savedUsername;
+                    elements.authPassword.focus();
+                } else {
+                    elements.authPassword.focus();
+                }
             }
         };
 
@@ -1101,8 +1124,9 @@
                 hideCertWarning();
                 showConnecting(false);
 
-                // Check for saved password (Android auto-login)
+                // Check for saved credentials (Android auto-login)
                 let savedPassword = null;
+                let savedUsername = null;
                 try {
                     if (window.Android && typeof window.Android.getSavedPassword === 'function') {
                         savedPassword = window.Android.getSavedPassword();
@@ -1111,16 +1135,37 @@
                             savedPassword = null;
                         }
                     }
+                    if (window.Android && typeof window.Android.getSavedUsername === 'function') {
+                        savedUsername = window.Android.getSavedUsername();
+                        if (typeof savedUsername !== 'string' || savedUsername.trim() === '') {
+                            savedUsername = null;
+                        }
+                    }
                 } catch (e) {
-                    console.error('Error getting saved password:', e);
+                    console.error('Error getting saved credentials:', e);
                     savedPassword = null;
+                    savedUsername = null;
                 }
 
                 if (savedPassword) {
-                    authenticate(savedPassword);
+                    // If we have a saved username, enable multiuser UI before auto-login
+                    if (savedUsername) {
+                        enableMultiuserAuthUI();
+                        if (elements.authUsername) {
+                            elements.authUsername.value = savedUsername;
+                        }
+                    }
+                    authenticate(savedPassword, savedUsername);
                 } else {
                     showAuthModal(true);
-                    elements.authPassword.focus();
+                    // Pre-fill username if saved (for multiuser mode)
+                    if (savedUsername && elements.authUsername) {
+                        enableMultiuserAuthUI();
+                        elements.authUsername.value = savedUsername;
+                        elements.authPassword.focus();
+                    } else {
+                        elements.authPassword.focus();
+                    }
                 }
             };
 
@@ -1207,11 +1252,15 @@
                     elements.input.focus();
                     // Update UI based on multiuser mode
                     updateMultiuserUI();
-                    // Save password for Android auto-login on Activity recreation
+                    // Save password and username for Android auto-login on Activity recreation
                     if (window.Android && window.Android.savePassword && pendingAuthPassword) {
                         window.Android.savePassword(pendingAuthPassword);
                     }
+                    if (window.Android && window.Android.saveUsername && pendingAuthUsername) {
+                        window.Android.saveUsername(pendingAuthUsername);
+                    }
                     pendingAuthPassword = null;
+                    pendingAuthUsername = null;
                     // Start Android foreground service to keep connection alive
                     if (window.Android && window.Android.startBackgroundService) {
                         window.Android.startBackgroundService();
@@ -1220,9 +1269,13 @@
                     elements.authError.textContent = msg.error || 'Authentication failed';
                     elements.authPassword.value = '';
                     pendingAuthPassword = null;
-                    // Clear saved password on auth failure (it may be outdated)
+                    pendingAuthUsername = null;
+                    // Clear saved credentials on auth failure (they may be outdated)
                     if (window.Android && window.Android.clearSavedPassword) {
                         window.Android.clearSavedPassword();
+                    }
+                    if (window.Android && window.Android.clearSavedUsername) {
+                        window.Android.clearSavedUsername();
                     }
                     // Detect multiuser mode from error messages
                     if (msg.error === 'Username required' || msg.error === 'Unknown user' || msg.multiuser_mode) {
@@ -1658,6 +1711,12 @@
                 updateStatusBar();
                 break;
 
+            case 'ShowTagsChanged':
+                // Server toggled show_tags (F2 or /tag command)
+                showTags = msg.show_tags;
+                renderOutput();
+                break;
+
             case 'PendingLinesUpdate':
                 // Update pending count for a world (used for activity indicator)
                 if (msg.world_index !== undefined && worlds[msg.world_index]) {
@@ -1818,7 +1877,8 @@
     }
 
     // Authenticate - sends directly via ws.send since authenticated is still false
-    function authenticate(passwordOverride) {
+    // passwordOverride and usernameOverride are used for Android auto-login
+    function authenticate(passwordOverride, usernameOverride) {
         // Trim password to remove any trailing spaces from Android keyboard
         const rawPassword = passwordOverride || elements.authPassword.value;
         const password = String(rawPassword || '').trim();
@@ -1828,10 +1888,13 @@
         // Store password for saving on success (Android auto-login)
         pendingAuthPassword = password;
 
-        // Get username if in multiuser mode (visible input)
-        const username = elements.authUsername && elements.authUsernameRow.style.display !== 'none'
-            ? elements.authUsername.value.trim()
-            : null;
+        // Get username: prefer override (auto-login), then UI element if visible
+        let username = usernameOverride || null;
+        if (!username && elements.authUsername && elements.authUsernameRow.style.display !== 'none') {
+            username = elements.authUsername.value.trim() || null;
+        }
+        // Store username for saving on success (Android auto-login)
+        pendingAuthUsername = username;
 
         // Hash password with SHA-256
         hashPassword(password).then(hash => {
@@ -2310,6 +2373,7 @@
             const rawLine = typeof lineObj === 'string' ? lineObj : lineObj.text;
             const lineTs = typeof lineObj === 'object' ? lineObj.ts : null;
             const lineGagged = typeof lineObj === 'object' ? lineObj.gagged : false;
+            const lineHighlightColor = typeof lineObj === 'object' ? lineObj.highlight_color : null;
 
             // Skip gagged lines unless showTags is enabled (F2)
             if (lineGagged && !showTags) {
@@ -2335,8 +2399,13 @@
             const displayText = showTags && tempConvertEnabled ? convertTemperatures(strippedText) : strippedText;
             let html = tsPrefix + convertDiscordEmojis(linkifyUrls(parseAnsi(insertWordBreaks(displayText))));
 
-            // Apply action highlighting if enabled
-            if (highlightActions && lineMatchesAction(cleanLine, world.name || '')) {
+            // Apply /highlight color from action command (takes priority)
+            if (lineHighlightColor !== null && lineHighlightColor !== undefined) {
+                const bgColor = colorNameToCss(lineHighlightColor);
+                html = `<span style="background-color: ${bgColor}; display: block;">${html}</span>`;
+            }
+            // Apply F8 action highlighting if enabled (and no explicit highlight color)
+            else if (highlightActions && lineMatchesAction(cleanLine, world.name || '')) {
                 html = `<span class="action-highlight">${html}</span>`;
             }
 
@@ -2936,6 +3005,77 @@
 
         // Always show day/month for debugging ordering issues
         return `${day}/${month} ${hours}:${minutes}> `;
+    }
+
+    // Convert a color name to CSS color value (for /highlight command)
+    // Supports named colors, RGB values, and xterm 256-color codes
+    function colorNameToCss(color) {
+        if (!color || color.trim() === '') {
+            return '#1a3a3a'; // Default dark cyan
+        }
+        const c = color.toLowerCase().trim();
+
+        // Named colors (darker/muted for backgrounds)
+        const namedColors = {
+            'red': '#4a1515',
+            'green': '#153a15',
+            'blue': '#15153a',
+            'yellow': '#3a3a15',
+            'cyan': '#1a3a3a',
+            'magenta': '#3a153a',
+            'purple': '#3a153a',
+            'orange': '#4a2a10',
+            'pink': '#4a1530',
+            'white': '#c0c0c0',
+            'black': '#1a1a1a',
+            'gray': '#3a3a3a',
+            'grey': '#3a3a3a'
+        };
+        if (namedColors[c]) {
+            return namedColors[c];
+        }
+
+        // Try xterm 256 color number
+        const num = parseInt(c, 10);
+        if (!isNaN(num) && num >= 0 && num <= 255) {
+            return xterm256ToRgb(num);
+        }
+
+        // Try RGB format (r,g,b or r;g;b)
+        const parts = c.includes(',') ? c.split(',') : c.split(';');
+        if (parts.length === 3) {
+            const r = parseInt(parts[0].trim(), 10);
+            const g = parseInt(parts[1].trim(), 10);
+            const b = parseInt(parts[2].trim(), 10);
+            if (!isNaN(r) && !isNaN(g) && !isNaN(b)) {
+                return `rgb(${r}, ${g}, ${b})`;
+            }
+        }
+
+        return '#1a3a3a'; // Default fallback
+    }
+
+    // Convert xterm 256 color code to RGB hex
+    function xterm256ToRgb(code) {
+        // Standard colors (0-15) - return muted versions
+        const standard = [
+            '#000000', '#800000', '#008000', '#808000', '#000080', '#800080', '#008080', '#c0c0c0',
+            '#808080', '#ff0000', '#00ff00', '#ffff00', '#0000ff', '#ff00ff', '#00ffff', '#ffffff'
+        ];
+        if (code < 16) {
+            return standard[code];
+        }
+        // 216 color cube (16-231)
+        if (code < 232) {
+            const c = code - 16;
+            const r = Math.floor(c / 36) * 51;
+            const g = Math.floor((c % 36) / 6) * 51;
+            const b = (c % 6) * 51;
+            return `rgb(${r}, ${g}, ${b})`;
+        }
+        // Grayscale (232-255)
+        const gray = (code - 232) * 10 + 8;
+        return `rgb(${gray}, ${gray}, ${gray})`;
     }
 
     // Strip MUD tags like [channel:] or [channel(player)] from start of line
@@ -5452,7 +5592,11 @@
         };
         elements.connectionCancelBtn.onclick = function() {
             hideConnectionErrorModal();
-            // Just leave it disconnected - user can refresh to try again
+            // On Android, open server settings to allow changing connection details
+            if (typeof Android !== 'undefined' && Android.openServerSettings) {
+                Android.openServerSettings();
+            }
+            // In browser, just leave it disconnected - user can refresh to try again
         };
 
         // Auth username field Enter key handler (multiuser mode)

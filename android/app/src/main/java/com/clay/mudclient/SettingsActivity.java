@@ -16,10 +16,14 @@ public class SettingsActivity extends AppCompatActivity {
     private static final String KEY_SERVER_HOST = "serverHost";
     private static final String KEY_SERVER_PORT = "serverPort";
     private static final String KEY_USE_SECURE = "useSecure";
+    private static final String KEY_SAVED_USERNAME = "savedUsername";
+    private static final String KEY_SAVED_PASSWORD = "savedPassword";
 
     private EditText serverHostInput;
     private EditText serverPortInput;
     private Switch secureSwitch;
+    private EditText serverUsernameInput;
+    private EditText serverPasswordInput;
     private TextView connectionStatus;
     private Button saveButton;
 
@@ -31,6 +35,8 @@ public class SettingsActivity extends AppCompatActivity {
         serverHostInput = findViewById(R.id.serverHost);
         serverPortInput = findViewById(R.id.serverPort);
         secureSwitch = findViewById(R.id.secureSwitch);
+        serverUsernameInput = findViewById(R.id.serverUsername);
+        serverPasswordInput = findViewById(R.id.serverPassword);
         connectionStatus = findViewById(R.id.connectionStatus);
         saveButton = findViewById(R.id.saveButton);
 
@@ -39,10 +45,14 @@ public class SettingsActivity extends AppCompatActivity {
         String savedHost = prefs.getString(KEY_SERVER_HOST, "192.168.2.6");
         int savedPort = prefs.getInt(KEY_SERVER_PORT, 9000);
         boolean savedSecure = prefs.getBoolean(KEY_USE_SECURE, false);
+        String savedUsername = prefs.getString(KEY_SAVED_USERNAME, "");
+        String savedPassword = prefs.getString(KEY_SAVED_PASSWORD, "");
 
         serverHostInput.setText(savedHost);
         serverPortInput.setText(savedPort > 0 ? String.valueOf(savedPort) : "");
         secureSwitch.setChecked(savedSecure);
+        serverUsernameInput.setText(savedUsername);
+        serverPasswordInput.setText(savedPassword);
 
         // Check for error message from MainActivity
         String errorMessage = getIntent().getStringExtra("errorMessage");
@@ -72,6 +82,8 @@ public class SettingsActivity extends AppCompatActivity {
         String host = serverHostInput.getText().toString().trim();
         String portStr = serverPortInput.getText().toString().trim();
         boolean useSecure = secureSwitch.isChecked();
+        String username = serverUsernameInput.getText().toString().trim();
+        String password = serverPasswordInput.getText().toString();  // Don't trim password
 
         // Validate inputs
         if (host.isEmpty()) {
@@ -105,6 +117,8 @@ public class SettingsActivity extends AppCompatActivity {
         editor.putString(KEY_SERVER_HOST, host);
         editor.putInt(KEY_SERVER_PORT, port);
         editor.putBoolean(KEY_USE_SECURE, useSecure);
+        editor.putString(KEY_SAVED_USERNAME, username);
+        editor.putString(KEY_SAVED_PASSWORD, password);
         editor.apply();
 
         // Go back to MainActivity to attempt connection

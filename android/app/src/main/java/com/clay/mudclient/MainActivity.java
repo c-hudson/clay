@@ -41,6 +41,7 @@ public class MainActivity extends AppCompatActivity {
     private static final String KEY_USE_SECURE = "useSecure";
     private static final String KEY_LAST_LOADED_URL = "lastLoadedUrl";
     private static final String KEY_SAVED_PASSWORD = "savedPassword";
+    private static final String KEY_SAVED_USERNAME = "savedUsername";
 
     private static final String CHANNEL_ID_ALERTS = "clay_alerts";
     private static final String CHANNEL_ID_SERVICE = "clay_service";
@@ -159,6 +160,24 @@ public class MainActivity extends AppCompatActivity {
         public void clearSavedPassword() {
             SharedPreferences prefs = getSharedPreferences(PREFS_NAME, MODE_PRIVATE);
             prefs.edit().remove(KEY_SAVED_PASSWORD).apply();
+        }
+
+        @JavascriptInterface
+        public void saveUsername(String username) {
+            SharedPreferences prefs = getSharedPreferences(PREFS_NAME, MODE_PRIVATE);
+            prefs.edit().putString(KEY_SAVED_USERNAME, username).apply();
+        }
+
+        @JavascriptInterface
+        public String getSavedUsername() {
+            SharedPreferences prefs = getSharedPreferences(PREFS_NAME, MODE_PRIVATE);
+            return prefs.getString(KEY_SAVED_USERNAME, "");
+        }
+
+        @JavascriptInterface
+        public void clearSavedUsername() {
+            SharedPreferences prefs = getSharedPreferences(PREFS_NAME, MODE_PRIVATE);
+            prefs.edit().remove(KEY_SAVED_USERNAME).apply();
         }
 
         @JavascriptInterface
