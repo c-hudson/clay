@@ -308,8 +308,12 @@ pub struct RemoteGuiApp {
     is_master: bool,
     /// WebSocket URL
     ws_url: String,
+    /// Username for authentication (multiuser mode)
+    username: String,
     /// Password for authentication
     password: String,
+    /// Whether server is in multiuser mode
+    multiuser_mode: bool,
     /// Whether we're connected to the server
     connected: bool,
     /// Whether we're authenticated
@@ -566,7 +570,9 @@ impl RemoteGuiApp {
         Self {
             is_master: false,
             ws_url,
+            username: String::new(),
             password: String::new(),
+            multiuser_mode: false,
             connected: false,
             authenticated: false,
             error_message: None,
@@ -1014,7 +1020,12 @@ impl RemoteGuiApp {
     fn send_auth(&mut self) {
         if let Some(ref tx) = self.ws_tx {
             let password_hash = hash_password(&self.password);
-            let _ = tx.send(WsMessage::AuthRequest { username: None, password_hash });
+            let username = if self.multiuser_mode && !self.username.is_empty() {
+                Some(self.username.clone())
+            } else {
+                None
+            };
+            let _ = tx.send(WsMessage::AuthRequest { username, password_hash });
         }
     }
 
@@ -1030,6 +1041,9 @@ impl RemoteGuiApp {
         if let Some(ref mut rx) = self.ws_rx {
             while let Ok(msg) = rx.try_recv() {
                 match msg {
+                    WsMessage::ServerHello { multiuser_mode } => {
+                        self.multiuser_mode = multiuser_mode;
+                    }
                     WsMessage::AuthResponse { success, error, .. } => {
                         if success {
                             self.authenticated = true;
@@ -3054,6 +3068,26 @@ impl eframe::App for RemoteGuiApp {
                                 ui.add_space(10.0);
                                 // Request repaint to update when timeout expires
                                 ctx.request_repaint();
+                            }
+
+                            // Username field (only in multiuser mode)
+                            if self.multiuser_mode {
+                                ui.allocate_ui_with_layout(
+                                    egui::vec2(280.0, 14.0),
+                                    egui::Layout::left_to_right(egui::Align::Center),
+                                    |ui| {
+                                        ui.label(egui::RichText::new("USERNAME")
+                                            .color(theme.fg_muted())
+                                            .size(10.0));
+                                    }
+                                );
+                                ui.add_space(4.0);
+
+                                let username_edit = TextEdit::singleline(&mut self.username)
+                                    .desired_width(280.0)
+                                    .margin(egui::vec2(12.0, 8.0));
+                                ui.add(username_edit);
+                                ui.add_space(12.0);
                             }
 
                             // Password label - left justified with field

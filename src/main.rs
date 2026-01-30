@@ -4203,7 +4203,66 @@ async fn run_console_client(addr: &str) -> io::Result<()> {
         }
     });
 
-    // Simple password prompt (not in alternate screen)
+    // Wait for ServerHello to know if we're in multiuser mode
+    let mut multiuser_mode = false;
+    loop {
+        match ws_read.next().await {
+            Some(Ok(Message::Text(text))) => {
+                if let Ok(WsMessage::ServerHello { multiuser_mode: is_multiuser }) = serde_json::from_str::<WsMessage>(&text) {
+                    multiuser_mode = is_multiuser;
+                    break;
+                }
+            }
+            Some(Ok(Message::Close(_))) | None => {
+                eprintln!("Connection closed before authentication");
+                return Ok(());
+            }
+            _ => {}
+        }
+    }
+
+    // Prompt for username if in multiuser mode
+    let mut username: Option<String> = None;
+    if multiuser_mode {
+        print!("Username? ");
+        let _ = io::stdout().flush();
+
+        let mut user_input = String::new();
+        enable_raw_mode()?;
+        let mut event_stream = EventStream::new();
+        loop {
+            if let Some(Ok(Event::Key(key))) = event_stream.next().await {
+                if key.kind != KeyEventKind::Press { continue; }
+                match key.code {
+                    KeyCode::Enter => {
+                        disable_raw_mode()?;
+                        println!();
+                        username = Some(user_input);
+                        break;
+                    }
+                    KeyCode::Char(c) => {
+                        user_input.push(c);
+                        print!("{}", c);
+                        let _ = io::stdout().flush();
+                    }
+                    KeyCode::Backspace => {
+                        if user_input.pop().is_some() {
+                            print!("\x08 \x08"); // Backspace, space, backspace
+                            let _ = io::stdout().flush();
+                        }
+                    }
+                    KeyCode::Esc => {
+                        disable_raw_mode()?;
+                        println!();
+                        return Ok(());
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    // Prompt for password
     print!("Password? ");
     let _ = io::stdout().flush();
 
@@ -4222,7 +4281,7 @@ async fn run_console_client(addr: &str) -> io::Result<()> {
                             println!(); // Move to next line after password
                             // Send authentication
                             let password_hash = hash_password(&password);
-                            let _ = ws_tx.send(WsMessage::AuthRequest { password_hash, username: None });
+                            let _ = ws_tx.send(WsMessage::AuthRequest { password_hash, username });
                             break;
                         }
                         KeyCode::Char(c) => {
