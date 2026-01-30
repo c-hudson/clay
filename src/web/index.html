@@ -161,7 +161,7 @@
                     <button id="action-add-btn" class="action-btn">Add</button>
                     <button id="action-edit-btn" class="action-btn">Edit</button>
                     <button id="action-delete-btn" class="action-btn">Delete</button>
-                    <button id="action-cancel-btn" class="action-btn">Ok</button>
+                    <button id="action-cancel-btn" class="action-btn btn-primary">Ok</button>
                 </div>
             </div>
         </div>
@@ -183,7 +183,10 @@
                 </div>
                 <div class="action-field">
                     <label for="action-match-type">Match Type:</label>
-                    <button id="action-match-type" class="toggle-btn">Regexp</button>
+                    <select id="action-match-type" class="form-select">
+                        <option value="regexp">Regexp</option>
+                        <option value="wildcard">Wildcard</option>
+                    </select>
                 </div>
                 <div class="action-field">
                     <label for="action-pattern">Pattern:</label>
@@ -191,7 +194,10 @@
                 </div>
                 <div class="action-field">
                     <label for="action-enabled">Enabled:</label>
-                    <button id="action-enabled" class="toggle-btn">Yes</button>
+                    <select id="action-enabled" class="form-select">
+                        <option value="yes">Yes</option>
+                        <option value="no">No</option>
+                    </select>
                 </div>
                 <div class="action-field">
                     <label for="action-command">Command:</label>
@@ -199,8 +205,8 @@
                 </div>
                 <div id="action-error" class="error"></div>
                 <div class="modal-buttons">
-                    <button id="action-save-btn">Save</button>
                     <button id="action-editor-cancel-btn">Cancel</button>
+                    <button id="action-save-btn" class="btn-primary">Save</button>
                 </div>
             </div>
         </div>
@@ -277,7 +283,7 @@
                         <button id="world-add-btn">Add</button>
                         <button id="world-edit-btn">Edit</button>
                         <button id="world-selector-cancel-btn">Close</button>
-                        <button id="world-connect-btn">Connect</button>
+                        <button id="world-connect-btn" class="btn-primary">Connect</button>
                     </div>
                 </div>
             </div>
@@ -484,35 +490,44 @@
                 </div>
                 <div class="web-settings-form">
                     <div class="web-field">
-                        <label>Protocol:</label>
-                        <button id="web-protocol-btn" class="toggle-btn">Non-Secure</button>
+                        <label>Protocol</label>
+                        <select id="web-protocol-select" class="form-select">
+                            <option value="non-secure">Non-Secure</option>
+                            <option value="secure">Secure</option>
+                        </select>
                     </div>
                     <div class="web-field">
-                        <label id="http-label">HTTP enabled:</label>
-                        <button id="web-http-enabled-btn" class="toggle-btn">off</button>
+                        <label id="http-label">HTTP enabled</label>
+                        <select id="web-http-enabled-select" class="form-select">
+                            <option value="off">off</option>
+                            <option value="on">on</option>
+                        </select>
                     </div>
                     <div class="web-field">
-                        <label id="http-port-label">HTTP port:</label>
+                        <label id="http-port-label">HTTP port</label>
                         <input type="text" id="web-http-port" autocomplete="off" class="web-input">
                     </div>
                     <div class="web-field">
-                        <label id="ws-label">WS enabled:</label>
-                        <button id="web-ws-enabled-btn" class="toggle-btn">off</button>
+                        <label id="ws-label">WS enabled</label>
+                        <select id="web-ws-enabled-select" class="form-select">
+                            <option value="off">off</option>
+                            <option value="on">on</option>
+                        </select>
                     </div>
                     <div class="web-field">
-                        <label id="ws-port-label">WS port:</label>
+                        <label id="ws-port-label">WS port</label>
                         <input type="text" id="web-ws-port" autocomplete="off" class="web-input">
                     </div>
                     <div class="web-field">
-                        <label>Allow List:</label>
+                        <label>Allow List</label>
                         <input type="text" id="web-allow-list" autocomplete="off" class="web-input" placeholder="localhost, 192.168.*">
                     </div>
                     <div class="web-field tls-field" id="tls-cert-field" style="display: none;">
-                        <label>TLS cert file:</label>
+                        <label>TLS cert file</label>
                         <input type="text" id="web-cert-file" autocomplete="off" class="web-input" placeholder="/path/to/cert.pem">
                     </div>
                     <div class="web-field tls-field" id="tls-key-field" style="display: none;">
-                        <label>TLS key file:</label>
+                        <label>TLS key file</label>
                         <input type="text" id="web-key-file" autocomplete="off" class="web-input" placeholder="/path/to/key.pem">
                     </div>
                 </div>
@@ -550,6 +565,7 @@
 
     <script>
         // WebSocket configuration injected by server
+        window.WS_HOST = '{{WS_HOST}}';
         window.WS_PORT = {{WS_PORT}};
         window.WS_PROTOCOL = '{{WS_PROTOCOL}}';
     </script>

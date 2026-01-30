@@ -135,10 +135,10 @@
         worldEditConnectBtn: document.getElementById('world-edit-connect-btn'),
         // Web settings popup
         webModal: document.getElementById('web-modal'),
-        webProtocolBtn: document.getElementById('web-protocol-btn'),
-        webHttpEnabledBtn: document.getElementById('web-http-enabled-btn'),
+        webProtocolSelect: document.getElementById('web-protocol-select'),
+        webHttpEnabledSelect: document.getElementById('web-http-enabled-select'),
         webHttpPort: document.getElementById('web-http-port'),
-        webWsEnabledBtn: document.getElementById('web-ws-enabled-btn'),
+        webWsEnabledSelect: document.getElementById('web-ws-enabled-select'),
         webWsPort: document.getElementById('web-ws-port'),
         webAllowList: document.getElementById('web-allow-list'),
         webCertFile: document.getElementById('web-cert-file'),
@@ -876,12 +876,9 @@
     // Track if we should use native WebSocket (only after browser WebSocket fails)
     let useNativeWebSocket = false;
 
-    // Debug logging for Android - shows Toast messages
+    // Debug logging - console only (no Toast)
     function debugLog(msg) {
         console.log('[Clay Debug] ' + msg);
-        if (window.Android && window.Android.showToast) {
-            window.Android.showToast(msg);
-        }
     }
 
     // Check if native Android WebSocket is available
@@ -1053,7 +1050,8 @@
     function connect() {
         showConnecting(true);
 
-        const host = window.location.hostname;
+        // Use WS_HOST if available (needed for Android loadDataWithBaseURL), fallback to location
+        const host = window.WS_HOST || window.location.hostname;
         // Use ws:// fallback if we've already failed with wss://
         const protocol = usingWsFallback ? 'ws' : window.WS_PROTOCOL;
         const wsUrl = `${protocol}://${host}:${window.WS_PORT}`;
@@ -3374,25 +3372,25 @@
             const action = actions[editIndex];
             elements.actionName.value = action.name || '';
             elements.actionWorld.value = action.world || '';
-            const matchType = action.match_type === 'Wildcard' ? 'Wildcard' : 'Regexp';
-            elements.actionMatchType.textContent = matchType;
-            elements.actionPattern.placeholder = matchType === 'Wildcard'
+            const matchType = action.match_type === 'Wildcard' ? 'wildcard' : 'regexp';
+            elements.actionMatchType.value = matchType;
+            elements.actionPattern.placeholder = matchType === 'wildcard'
                 ? '(wildcard: * and ?, empty = manual only)'
                 : '(regex, empty = manual only)';
             elements.actionPattern.value = action.pattern || '';
             elements.actionCommand.value = action.command || '';
             // Default to true if enabled is not set (for existing actions)
-            elements.actionEnabled.textContent = (action.enabled !== false) ? 'Yes' : 'No';
+            elements.actionEnabled.value = (action.enabled !== false) ? 'yes' : 'no';
         } else {
             // New action
             elements.actionEditorTitle.textContent = 'New Action';
             elements.actionName.value = '';
             elements.actionWorld.value = '';
-            elements.actionMatchType.textContent = 'Regexp';  // Default to Regexp
+            elements.actionMatchType.value = 'regexp';  // Default to Regexp
             elements.actionPattern.placeholder = '(regex, empty = manual only)';
             elements.actionPattern.value = '';
             elements.actionCommand.value = '';
-            elements.actionEnabled.textContent = 'Yes';  // Default to enabled
+            elements.actionEnabled.value = 'yes';  // Default to enabled
         }
         elements.actionError.textContent = '';
         elements.actionName.focus();
@@ -3469,10 +3467,10 @@
         const actionData = {
             name: name,
             world: elements.actionWorld.value.trim(),
-            match_type: elements.actionMatchType.textContent,
+            match_type: elements.actionMatchType.value === 'wildcard' ? 'Wildcard' : 'Regexp',
             pattern: elements.actionPattern.value,
             command: elements.actionCommand.value,
-            enabled: elements.actionEnabled.textContent === 'Yes'
+            enabled: elements.actionEnabled.value === 'yes'
         };
 
         if (editingActionIndex < 0) {
@@ -3645,18 +3643,18 @@
     }
 
     function updateWebPopupUI() {
-        // Update protocol button (use edit state)
-        elements.webProtocolBtn.textContent = editWebSecure ? 'Secure' : 'Non-Secure';
+        // Update protocol select (use edit state)
+        elements.webProtocolSelect.value = editWebSecure ? 'secure' : 'non-secure';
 
         // Update labels based on protocol
-        elements.httpLabel.textContent = editWebSecure ? 'HTTPS enabled:' : 'HTTP enabled:';
-        elements.httpPortLabel.textContent = editWebSecure ? 'HTTPS port:' : 'HTTP port:';
-        elements.wsLabel.textContent = editWebSecure ? 'WSS enabled:' : 'WS enabled:';
-        elements.wsPortLabel.textContent = editWebSecure ? 'WSS port:' : 'WS port:';
+        elements.httpLabel.textContent = editWebSecure ? 'HTTPS enabled' : 'HTTP enabled';
+        elements.httpPortLabel.textContent = editWebSecure ? 'HTTPS port' : 'HTTP port';
+        elements.wsLabel.textContent = editWebSecure ? 'WSS enabled' : 'WS enabled';
+        elements.wsPortLabel.textContent = editWebSecure ? 'WSS port' : 'WS port';
 
-        // Update toggle buttons (use edit state)
-        elements.webHttpEnabledBtn.textContent = editHttpEnabled ? 'on' : 'off';
-        elements.webWsEnabledBtn.textContent = editWsEnabled ? 'on' : 'off';
+        // Update select dropdowns (use edit state)
+        elements.webHttpEnabledSelect.value = editHttpEnabled ? 'on' : 'off';
+        elements.webWsEnabledSelect.value = editWsEnabled ? 'on' : 'off';
 
         // Update input fields (from global state - text fields are read on save)
         elements.webHttpPort.value = httpPort;
@@ -4485,8 +4483,23 @@
                 focusInputWithKeyboard();
                 break;
             case 'resync':
-                // Force a full page reload to get fresh CSS/JS and resync state
-                location.reload(true);
+                // On Android with loadDataWithBaseURL, location.reload doesn't work
+                // Instead, close WebSocket and reconnect to get fresh state
+                if (typeof Android !== 'undefined' && Android.hasNativeWebSocket && Android.hasNativeWebSocket()) {
+                    if (ws) {
+                        ws.close();
+                        ws = null;
+                    }
+                    // Small delay then reconnect
+                    setTimeout(function() {
+                        authenticated = false;
+                        hasReceivedInitialState = false;
+                        connect();
+                    }, 500);
+                } else {
+                    // Regular browser - full page reload
+                    location.reload(true);
+                }
                 break;
             case 'clay-server':
                 // Disconnect from WebSocket and go to server settings (Android app)
@@ -5490,21 +5503,16 @@
         elements.actionSaveBtn.onclick = saveAction;
         elements.actionEditorCancelBtn.onclick = closeActionsEditorPopup;
         elements.actionsEditorCloseBtn.onclick = closeActionsEditorPopup;
-        elements.actionMatchType.onclick = function() {
-            // Toggle between Regexp and Wildcard
-            if (elements.actionMatchType.textContent === 'Regexp') {
-                elements.actionMatchType.textContent = 'Wildcard';
+        elements.actionMatchType.onchange = function() {
+            // Update placeholder based on match type
+            if (this.value === 'wildcard') {
                 elements.actionPattern.placeholder = '(wildcard: * and ?, empty = manual only)';
             } else {
-                elements.actionMatchType.textContent = 'Regexp';
                 elements.actionPattern.placeholder = '(regex, empty = manual only)';
             }
         };
 
-        elements.actionEnabled.onclick = function() {
-            // Toggle between Yes and No
-            elements.actionEnabled.textContent = elements.actionEnabled.textContent === 'Yes' ? 'No' : 'Yes';
-        };
+        // actionEnabled is now a select, no onclick needed
 
         // Actions Confirm Delete popup
         elements.actionConfirmYesBtn.onclick = confirmDeleteAction;
@@ -5610,16 +5618,16 @@
         elements.setupCancelBtn.onclick = closeSetupPopup;
 
         // Web settings popup (use edit state, not global state)
-        elements.webProtocolBtn.onclick = function() {
-            editWebSecure = !editWebSecure;
+        elements.webProtocolSelect.onchange = function() {
+            editWebSecure = this.value === 'secure';
             updateWebPopupUI();
         };
-        elements.webHttpEnabledBtn.onclick = function() {
-            editHttpEnabled = !editHttpEnabled;
+        elements.webHttpEnabledSelect.onchange = function() {
+            editHttpEnabled = this.value === 'on';
             updateWebPopupUI();
         };
-        elements.webWsEnabledBtn.onclick = function() {
-            editWsEnabled = !editWsEnabled;
+        elements.webWsEnabledSelect.onchange = function() {
+            editWsEnabled = this.value === 'on';
             updateWebPopupUI();
         };
         elements.webSaveBtn.onclick = saveWebSettings;

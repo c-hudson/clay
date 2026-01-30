@@ -93,6 +93,22 @@ fn parse_http_request(request: &str) -> Option<(&str, &str)> {
     Some((method, path))
 }
 
+/// Extract Host header from HTTP request (without port)
+#[cfg(feature = "native-tls-backend")]
+fn get_host_from_request(request: &str) -> String {
+    for line in request.lines() {
+        if line.to_lowercase().starts_with("host:") {
+            let host = line[5..].trim();
+            // Remove port if present
+            if let Some(colon_pos) = host.rfind(':') {
+                return host[..colon_pos].to_string();
+            }
+            return host.to_string();
+        }
+    }
+    String::new()
+}
+
 /// Build an HTTP response with the given status, content type, and body
 #[cfg(feature = "native-tls-backend")]
 fn build_http_response(status: u16, status_text: &str, content_type: &str, body: &str) -> Vec<u8> {
@@ -145,10 +161,12 @@ async fn handle_https_client(
             return;
         }
 
+        let host = get_host_from_request(&request);
         let response = match path {
             "/" | "/index.html" => {
                 // Inject WebSocket configuration into the HTML
                 let html = WEB_INDEX_HTML
+                    .replace("{{WS_HOST}}", &host)
                     .replace("{{WS_PORT}}", &ws_port.to_string())
                     .replace("{{WS_PROTOCOL}}", if ws_use_tls { "wss" } else { "ws" });
                 build_http_response(200, "OK", "text/html", &html)
@@ -279,6 +297,22 @@ fn parse_http_request(request: &str) -> Option<(&str, &str)> {
     Some((method, path))
 }
 
+/// Extract Host header from HTTP request (without port) - rustls version
+#[cfg(feature = "rustls-backend")]
+fn get_host_from_request(request: &str) -> String {
+    for line in request.lines() {
+        if line.to_lowercase().starts_with("host:") {
+            let host = line[5..].trim();
+            // Remove port if present
+            if let Some(colon_pos) = host.rfind(':') {
+                return host[..colon_pos].to_string();
+            }
+            return host.to_string();
+        }
+    }
+    String::new()
+}
+
 /// Build an HTTP response with the given status, content type, and body (rustls version)
 #[cfg(feature = "rustls-backend")]
 fn build_http_response(status: u16, status_text: &str, content_type: &str, body: &str) -> Vec<u8> {
@@ -331,10 +365,12 @@ async fn handle_https_client(
             return;
         }
 
+        let host = get_host_from_request(&request);
         let response = match path {
             "/" | "/index.html" => {
                 // Inject WebSocket configuration into the HTML
                 let html = WEB_INDEX_HTML
+                    .replace("{{WS_HOST}}", &host)
                     .replace("{{WS_PORT}}", &ws_port.to_string())
                     .replace("{{WS_PROTOCOL}}", if ws_use_tls { "wss" } else { "ws" });
                 build_http_response(200, "OK", "text/html", &html)
@@ -661,6 +697,19 @@ async fn handle_http_client(
         Some((method, path))
     }
 
+    fn get_host(request: &str) -> String {
+        for line in request.lines() {
+            if line.to_lowercase().starts_with("host:") {
+                let host = line[5..].trim();
+                if let Some(colon_pos) = host.rfind(':') {
+                    return host[..colon_pos].to_string();
+                }
+                return host.to_string();
+            }
+        }
+        String::new()
+    }
+
     fn build_response(status: u16, status_text: &str, content_type: &str, body: &str) -> Vec<u8> {
         format!(
             "HTTP/1.1 {} {}\r\n\
@@ -699,10 +748,12 @@ async fn handle_http_client(
         const HTTP_STYLE_CSS: &str = include_str!("web/style.css");
         const HTTP_APP_JS: &str = include_str!("web/app.js");
 
+        let host = get_host(&request);
         let response = match path {
             "/" | "/index.html" => {
                 // Inject WebSocket configuration into the HTML
                 let html = HTTP_INDEX_HTML
+                    .replace("{{WS_HOST}}", &host)
                     .replace("{{WS_PORT}}", &ws_port.to_string())
                     .replace("{{WS_PROTOCOL}}", if ws_use_tls { "wss" } else { "ws" });
                 build_response(200, "OK", "text/html", &html)

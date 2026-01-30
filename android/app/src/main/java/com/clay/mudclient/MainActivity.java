@@ -45,12 +45,17 @@ public class MainActivity extends AppCompatActivity {
     private static final String CHANNEL_ID_ALERTS = "clay_alerts";
     private static final String CHANNEL_ID_SERVICE = "clay_service";
     private static final int NOTIFICATION_PERMISSION_REQUEST = 1001;
+    private static final int BATTERY_OPTIMIZATION_REQUEST = 1002;
     private static final int KEEPALIVE_INTERVAL_MS = 30000; // 30 seconds
 
     private WebView webView;
     private boolean connectionFailed = false;
     private int notificationId = 1000;
     private boolean isConnected = false;
+    private boolean isInitialLoadPending = false;
+    private boolean permissionsHandled = false;
+    private boolean notificationPermissionDone = false;
+    private boolean batteryOptimizationDone = false;
     private PowerManager.WakeLock screenOffWakeLock;
     private Handler keepaliveHandler;
     private Runnable keepaliveRunnable;
@@ -104,8 +109,7 @@ public class MainActivity extends AppCompatActivity {
         @JavascriptInterface
         public void startBackgroundService() {
             runOnUiThread(() -> {
-                // Request battery optimization exemption first
-                requestBatteryOptimizationExemption();
+                // Battery optimization should already be handled during startup
 
                 Intent serviceIntent = new Intent(MainActivity.this, ClayForegroundService.class);
                 if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
@@ -243,19 +247,86 @@ public class MainActivity extends AppCompatActivity {
         super.onCreate(savedInstanceState);
         setContentView(R.layout.activity_main);
 
-        // Request notification permission for Android 13+
-        requestNotificationPermission();
-
-        // Request battery optimization exemption to prevent Doze from killing the service
-        requestBatteryOptimizationExemption();
-
-        // Create notification channels
+        // Create notification channels first
         createNotificationChannel();
         createServiceNotificationChannel();
 
         webView = findViewById(R.id.webView);
         setupWebView();
 
+        // Start permission flow - will call proceedAfterPermissions when done
+        isInitialLoadPending = true;
+        startPermissionFlow();
+    }
+
+    private void startPermissionFlow() {
+        // Step 1: Check notification permission
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            if (ContextCompat.checkSelfPermission(this, Manifest.permission.POST_NOTIFICATIONS)
+                    != PackageManager.PERMISSION_GRANTED) {
+                // Need to request - callback will continue the flow
+                ActivityCompat.requestPermissions(this,
+                    new String[]{Manifest.permission.POST_NOTIFICATIONS},
+                    NOTIFICATION_PERMISSION_REQUEST);
+                return; // Wait for callback
+            }
+        }
+        notificationPermissionDone = true;
+        checkBatteryOptimization();
+    }
+
+    private void checkBatteryOptimization() {
+        // Step 2: Check battery optimization
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+            PowerManager pm = (PowerManager) getSystemService(POWER_SERVICE);
+            String packageName = getPackageName();
+            if (pm != null && !pm.isIgnoringBatteryOptimizations(packageName)) {
+                // Need to request - will return via onActivityResult
+                Intent intent = new Intent();
+                intent.setAction(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS);
+                intent.setData(Uri.parse("package:" + packageName));
+                try {
+                    startActivityForResult(intent, BATTERY_OPTIMIZATION_REQUEST);
+                    return; // Wait for callback
+                } catch (Exception e) {
+                    // Device doesn't support this intent
+                    Toast.makeText(this,
+                        "Please disable battery optimization for Clay in Settings",
+                        Toast.LENGTH_LONG).show();
+                }
+            }
+        }
+        batteryOptimizationDone = true;
+        finishPermissionFlow();
+    }
+
+    private void finishPermissionFlow() {
+        if (!permissionsHandled) {
+            permissionsHandled = true;
+            isInitialLoadPending = false;
+            proceedAfterPermissions();
+        }
+    }
+
+    @Override
+    public void onRequestPermissionsResult(int requestCode, String[] permissions, int[] grantResults) {
+        super.onRequestPermissionsResult(requestCode, permissions, grantResults);
+        if (requestCode == NOTIFICATION_PERMISSION_REQUEST) {
+            notificationPermissionDone = true;
+            checkBatteryOptimization();
+        }
+    }
+
+    @Override
+    protected void onActivityResult(int requestCode, int resultCode, Intent data) {
+        super.onActivityResult(requestCode, resultCode, data);
+        if (requestCode == BATTERY_OPTIMIZATION_REQUEST) {
+            batteryOptimizationDone = true;
+            finishPermissionFlow();
+        }
+    }
+
+    private void proceedAfterPermissions() {
         // Check if we have saved server settings
         SharedPreferences prefs = getSharedPreferences(PREFS_NAME, MODE_PRIVATE);
         String host = prefs.getString(KEY_SERVER_HOST, null);
@@ -267,38 +338,6 @@ public class MainActivity extends AppCompatActivity {
         } else {
             // Load the web interface
             loadWebInterface();
-        }
-    }
-
-    private void requestNotificationPermission() {
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-            if (ContextCompat.checkSelfPermission(this, Manifest.permission.POST_NOTIFICATIONS)
-                    != PackageManager.PERMISSION_GRANTED) {
-                ActivityCompat.requestPermissions(this,
-                    new String[]{Manifest.permission.POST_NOTIFICATIONS},
-                    NOTIFICATION_PERMISSION_REQUEST);
-            }
-        }
-    }
-
-    private void requestBatteryOptimizationExemption() {
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
-            PowerManager pm = (PowerManager) getSystemService(POWER_SERVICE);
-            String packageName = getPackageName();
-            if (pm != null && !pm.isIgnoringBatteryOptimizations(packageName)) {
-                // Request exemption from battery optimization
-                Intent intent = new Intent();
-                intent.setAction(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS);
-                intent.setData(Uri.parse("package:" + packageName));
-                try {
-                    startActivity(intent);
-                } catch (Exception e) {
-                    // Some devices may not support this intent
-                    Toast.makeText(this,
-                        "Please disable battery optimization for Clay in Settings",
-                        Toast.LENGTH_LONG).show();
-                }
-            }
         }
     }
 
@@ -393,12 +432,85 @@ public class MainActivity extends AppCompatActivity {
         // Add JavaScript interface for Android communication
         webView.addJavascriptInterface(new AndroidInterface(), "Android");
 
+        final MainActivity activity = this;
+
         webView.setWebViewClient(new WebViewClient() {
+            @Override
+            public android.webkit.WebResourceResponse shouldInterceptRequest(WebView view, WebResourceRequest request) {
+                String url = request.getUrl().toString();
+
+                // Intercept HTTPS requests to handle certificate issues
+                if (url.startsWith("https://")) {
+                    Exception lastException = null;
+                    // Retry up to 3 times for transient connection failures
+                    for (int attempt = 1; attempt <= 3; attempt++) {
+                        // Create fresh client for each attempt to avoid connection reuse issues
+                        okhttp3.OkHttpClient freshClient = activity.createTrustAllClient();
+                        try {
+                            okhttp3.Request okRequest = new okhttp3.Request.Builder()
+                                .url(url)
+                                .build();
+                            okhttp3.Response response = freshClient.newCall(okRequest).execute();
+
+                            if (!response.isSuccessful()) {
+                                final String errMsg = "HTTP " + response.code() + ": " + url;
+                                android.util.Log.e("Clay", errMsg);
+                                response.close();
+                                // Return error response instead of falling back
+                                return new android.webkit.WebResourceResponse(
+                                    "text/plain", "UTF-8",
+                                    response.code(), response.message(),
+                                    new java.util.HashMap<>(),
+                                    new java.io.ByteArrayInputStream(errMsg.getBytes())
+                                );
+                            }
+
+                            String contentType = response.header("Content-Type", "text/html");
+                            String mimeType = contentType.split(";")[0].trim();
+                            String encoding = "UTF-8";
+
+                            if (contentType.contains("charset=")) {
+                                encoding = contentType.split("charset=")[1].trim();
+                            }
+
+                            byte[] bodyBytes = response.body().bytes();
+                            response.close();
+                            String shortUrl = url.length() > 40 ? "..." + url.substring(url.length() - 37) : url;
+                            android.util.Log.d("Clay", "OK " + shortUrl + " (" + bodyBytes.length + "b, attempt " + attempt + ")");
+
+                            return new android.webkit.WebResourceResponse(
+                                mimeType,
+                                encoding,
+                                200, "OK",
+                                new java.util.HashMap<>(),
+                                new java.io.ByteArrayInputStream(bodyBytes)
+                            );
+                        } catch (Exception e) {
+                            lastException = e;
+                            android.util.Log.w("Clay", "Attempt " + attempt + " failed for " + url + ": " + e.getMessage());
+                            if (attempt < 3) {
+                                try { Thread.sleep(500 * attempt); } catch (InterruptedException ie) { }
+                            }
+                        }
+                    }
+                    // All retries failed
+                    final String errMsg = "Failed after 3 attempts: " + (lastException != null ? lastException.getMessage() : "unknown");
+                    android.util.Log.e("Clay", errMsg);
+                    return new android.webkit.WebResourceResponse(
+                        "text/plain", "UTF-8",
+                        500, "Error",
+                        new java.util.HashMap<>(),
+                        new java.io.ByteArrayInputStream(errMsg.getBytes())
+                    );
+                }
+                return super.shouldInterceptRequest(view, request);
+            }
+
             @Override
             public void onReceivedError(WebView view, WebResourceRequest request, WebResourceError error) {
                 super.onReceivedError(view, request, error);
-                android.util.Log.w("Clay", "WebView error " + error.getErrorCode() + " on " + request.getUrl() + " main=" + request.isForMainFrame());
-                // Only handle errors for the main frame
+                String msg = "Error " + error.getErrorCode() + " on " + request.getUrl();
+                android.util.Log.w("Clay", msg + " main=" + request.isForMainFrame());
                 if (request.isForMainFrame()) {
                     connectionFailed = true;
                     runOnUiThread(() -> {
@@ -446,14 +558,139 @@ public class MainActivity extends AppCompatActivity {
         boolean useSecure = prefs.getBoolean(KEY_USE_SECURE, false);
 
         String protocol = useSecure ? "https" : "http";
-        String url = protocol + "://" + host + ":" + port;
+        final String url = protocol + "://" + host + ":" + port;
 
         connectionFailed = false;
 
         // Persist URL to survive Activity recreation
         prefs.edit().putString(KEY_LAST_LOADED_URL, url).apply();
 
-        webView.loadUrl(url);
+        // For HTTPS, fetch ALL resources ourselves and inline them
+        // This completely bypasses WebView's SSL handling - no network requests from WebView
+        if (useSecure) {
+            new Thread(() -> {
+                try {
+                    okhttp3.OkHttpClient client = createTrustAllClient();
+
+                    // Fetch HTML
+                    okhttp3.Response htmlResp = client.newCall(
+                        new okhttp3.Request.Builder().url(url).build()).execute();
+                    if (!htmlResp.isSuccessful()) {
+                        final int code = htmlResp.code();
+                        htmlResp.close();
+                        runOnUiThread(() -> openSettings("HTTP " + code + " loading page"));
+                        return;
+                    }
+                    String html = htmlResp.body().string();
+                    htmlResp.close();
+
+                    // Fetch CSS
+                    String css = "";
+                    try {
+                        okhttp3.Response cssResp = client.newCall(
+                            new okhttp3.Request.Builder().url(url + "/style.css").build()).execute();
+                        if (cssResp.isSuccessful()) {
+                            css = cssResp.body().string();
+                        }
+                        cssResp.close();
+                    } catch (Exception e) { /* ignore */ }
+
+                    // Fetch JS
+                    String js = "";
+                    try {
+                        okhttp3.Response jsResp = client.newCall(
+                            new okhttp3.Request.Builder().url(url + "/app.js").build()).execute();
+                        if (jsResp.isSuccessful()) {
+                            js = jsResp.body().string();
+                        }
+                        jsResp.close();
+                    } catch (Exception e) { /* ignore */ }
+
+                    // Inline CSS and JS into HTML
+                    // Replace <link rel="stylesheet" href="style.css"> with inline <style>
+                    if (!css.isEmpty()) {
+                        html = html.replace(
+                            "<link rel=\"stylesheet\" href=\"style.css\">",
+                            "<style>\n" + css + "\n</style>");
+                        html = html.replace(
+                            "<link rel=\"stylesheet\" href=\"/style.css\">",
+                            "<style>\n" + css + "\n</style>");
+                    }
+
+                    // Replace <script src="app.js"></script> with inline <script>
+                    if (!js.isEmpty()) {
+                        html = html.replace(
+                            "<script src=\"app.js\"></script>",
+                            "<script>\n" + js + "\n</script>");
+                        html = html.replace(
+                            "<script src=\"/app.js\"></script>",
+                            "<script>\n" + js + "\n</script>");
+                    }
+
+                    final String finalHtml = html;
+                    runOnUiThread(() -> {
+                        // Load as data URL - WebView makes no network requests
+                        webView.loadDataWithBaseURL(url, finalHtml, "text/html", "UTF-8", null);
+                    });
+                } catch (Exception e) {
+                    runOnUiThread(() -> openSettings("Failed: " + e.getMessage()));
+                }
+            }).start();
+        } else {
+            webView.loadUrl(url);
+        }
+    }
+
+    /**
+     * Creates an OkHttpClient that accepts all SSL certificates.
+     * Used for intercepting HTTPS requests to handle hostname mismatches and expired certs.
+     */
+    private okhttp3.OkHttpClient createTrustAllClient() {
+        try {
+            // Create a trust manager that accepts all certificates
+            final javax.net.ssl.TrustManager[] trustAllCerts = new javax.net.ssl.TrustManager[]{
+                new javax.net.ssl.X509TrustManager() {
+                    @Override
+                    public void checkClientTrusted(java.security.cert.X509Certificate[] chain, String authType) {
+                        // Accept all client certificates
+                    }
+
+                    @Override
+                    public void checkServerTrusted(java.security.cert.X509Certificate[] chain, String authType) {
+                        // Accept all server certificates (including self-signed, expired, hostname mismatch)
+                    }
+
+                    @Override
+                    public java.security.cert.X509Certificate[] getAcceptedIssuers() {
+                        return new java.security.cert.X509Certificate[0];
+                    }
+                }
+            };
+
+            // Install the trust manager
+            final javax.net.ssl.SSLContext sslContext = javax.net.ssl.SSLContext.getInstance("TLS");
+            sslContext.init(null, trustAllCerts, new java.security.SecureRandom());
+            final javax.net.ssl.SSLSocketFactory sslSocketFactory = sslContext.getSocketFactory();
+
+            // Build OkHttpClient with custom SSL settings
+            // Disable connection pooling to avoid stale connection issues
+            return new okhttp3.OkHttpClient.Builder()
+                .sslSocketFactory(sslSocketFactory, (javax.net.ssl.X509TrustManager) trustAllCerts[0])
+                .hostnameVerifier((hostname, session) -> true) // Accept all hostnames
+                .connectTimeout(15, java.util.concurrent.TimeUnit.SECONDS)
+                .readTimeout(30, java.util.concurrent.TimeUnit.SECONDS)
+                .writeTimeout(15, java.util.concurrent.TimeUnit.SECONDS)
+                .connectionPool(new okhttp3.ConnectionPool(0, 1, java.util.concurrent.TimeUnit.MILLISECONDS)) // No pooling
+                .retryOnConnectionFailure(true)
+                .build();
+        } catch (Exception e) {
+            android.util.Log.e("Clay", "Failed to create trust-all client: " + e.getMessage());
+            // Return a default client if trust-all setup fails
+            return new okhttp3.OkHttpClient.Builder()
+                .connectTimeout(10, java.util.concurrent.TimeUnit.SECONDS)
+                .readTimeout(30, java.util.concurrent.TimeUnit.SECONDS)
+                .build();
+        }
     }
 
     private void openSettings(String errorMessage) {
@@ -467,6 +704,12 @@ public class MainActivity extends AppCompatActivity {
     @Override
     protected void onResume() {
         super.onResume();
+
+        // Don't interfere if initial delayed load is pending
+        if (isInitialLoadPending) {
+            return;
+        }
+
         // Only reload if settings changed or WebView was destroyed
         SharedPreferences prefs = getSharedPreferences(PREFS_NAME, MODE_PRIVATE);
         String host = prefs.getString(KEY_SERVER_HOST, null);

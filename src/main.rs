@@ -2715,6 +2715,27 @@ impl App {
         self.needs_output_redraw = true;
     }
 
+    /// Add output to a specific world by index (for background connection events)
+    fn add_output_to_world(&mut self, world_idx: usize, text: &str) {
+        if world_idx >= self.worlds.len() {
+            return;
+        }
+        let is_current = world_idx == self.current_world_index;
+        let settings = self.settings.clone();
+        let output_height = self.output_height;
+        let output_width = self.output_width;
+        let text_with_newline = if text.ends_with('\n') || text.is_empty() {
+            text.to_string()
+        } else {
+            format!("{}\n", text)
+        };
+        self.worlds[world_idx]
+            .add_output(&text_with_newline, is_current, &settings, output_height, output_width, false, false);
+        if is_current {
+            self.needs_output_redraw = true;
+        }
+    }
+
     /// Broadcast a message to all authenticated WebSocket clients and the embedded GUI (if any)
     fn ws_broadcast(&self, msg: WsMessage) {
         // Send to embedded GUI channel (master GUI mode)
@@ -3567,6 +3588,9 @@ pub enum AppEvent {
     TtypeRequested(String),       // world_name - server sent SB TTYPE SEND (we should send terminal type)
     SystemMessage(String),       // message to display in current world's output
     Sigusr1Received,             // SIGUSR1 received - trigger hot reload (not available on Android)
+    // Background connection events
+    ConnectionSuccess(String, mpsc::Sender<WriteCommand>, Option<i32>, bool),  // world_name, cmd_tx, socket_fd, is_tls
+    ConnectionFailed(String, String),  // world_name, error_message
     // WebSocket events
     WsClientConnected(u64),                    // client_id
     WsClientDisconnected(u64),                 // client_id
@@ -7206,6 +7230,65 @@ pub async fn run_app_headless(
                             return Ok(());
                         }
                     }
+                    // Background connection completed successfully
+                    AppEvent::ConnectionSuccess(world_name, cmd_tx, socket_fd, is_tls) => {
+                        if let Some(world_idx) = app.find_world_index(&world_name) {
+                            app.worlds[world_idx].connected = true;
+                            app.worlds[world_idx].was_connected = true;
+                            app.worlds[world_idx].prompt_count = 0;
+                            let now = std::time::Instant::now();
+                            app.worlds[world_idx].last_send_time = Some(now);
+                            app.worlds[world_idx].last_receive_time = Some(now);
+                            app.worlds[world_idx].is_initial_world = false;
+                            app.worlds[world_idx].command_tx = Some(cmd_tx.clone());
+                            #[cfg(unix)]
+                            { app.worlds[world_idx].socket_fd = socket_fd; }
+                            app.worlds[world_idx].is_tls = is_tls;
+
+                            // Discard any unused initial world
+                            app.discard_initial_world();
+
+                            // Open log file if enabled
+                            if app.worlds[world_idx].settings.log_enabled {
+                                if app.worlds[world_idx].open_log_file() {
+                                    let log_path = app.worlds[world_idx].get_log_path();
+                                    app.add_output_to_world(world_idx, &format!("Logging to: {}", log_path.display()));
+                                } else {
+                                    app.add_output_to_world(world_idx, "Warning: Could not open log file");
+                                }
+                            }
+
+                            // Fire TF CONNECT hook
+                            let hook_result = tf::bridge::fire_event(&mut app.tf_engine, tf::TfHookEvent::Connect);
+                            for cmd in hook_result.send_commands {
+                                let _ = cmd_tx.try_send(WriteCommand::Text(cmd));
+                            }
+                            for cmd in hook_result.clay_commands {
+                                let _ = app.tf_engine.execute(&cmd);
+                            }
+
+                            // Send auto-login if configured
+                            let skip_login = app.worlds[world_idx].skip_auto_login;
+                            app.worlds[world_idx].skip_auto_login = false;
+                            let user = app.worlds[world_idx].settings.user.clone();
+                            let password = app.worlds[world_idx].settings.password.clone();
+                            let auto_connect_type = app.worlds[world_idx].settings.auto_connect_type;
+                            if !skip_login && !user.is_empty() && !password.is_empty() && auto_connect_type == AutoConnectType::Connect {
+                                let connect_cmd = format!("connect {} {}", user, password);
+                                let _ = cmd_tx.try_send(WriteCommand::Text(connect_cmd));
+                            }
+
+                            // Broadcast connection status
+                            app.ws_broadcast(WsMessage::WorldConnected { world_index: world_idx, name: app.worlds[world_idx].name.clone() });
+                            app.add_output_to_world(world_idx, "Connected!");
+                        }
+                    }
+                    // Background connection failed
+                    AppEvent::ConnectionFailed(world_name, error) => {
+                        if let Some(world_idx) = app.find_world_index(&world_name) {
+                            app.add_output_to_world(world_idx, &format!("Connection failed: {}", error));
+                        }
+                    }
                     _ => {}
                 }
             }
@@ -9896,6 +9979,65 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                             }
                         }
                     }
+                    // Background connection completed successfully
+                    AppEvent::ConnectionSuccess(world_name, cmd_tx, socket_fd, is_tls) => {
+                        if let Some(world_idx) = app.find_world_index(&world_name) {
+                            app.worlds[world_idx].connected = true;
+                            app.worlds[world_idx].was_connected = true;
+                            app.worlds[world_idx].prompt_count = 0;
+                            let now = std::time::Instant::now();
+                            app.worlds[world_idx].last_send_time = Some(now);
+                            app.worlds[world_idx].last_receive_time = Some(now);
+                            app.worlds[world_idx].is_initial_world = false;
+                            app.worlds[world_idx].command_tx = Some(cmd_tx.clone());
+                            #[cfg(unix)]
+                            { app.worlds[world_idx].socket_fd = socket_fd; }
+                            app.worlds[world_idx].is_tls = is_tls;
+
+                            // Discard any unused initial world
+                            app.discard_initial_world();
+
+                            // Open log file if enabled
+                            if app.worlds[world_idx].settings.log_enabled {
+                                if app.worlds[world_idx].open_log_file() {
+                                    let log_path = app.worlds[world_idx].get_log_path();
+                                    app.add_output_to_world(world_idx, &format!("Logging to: {}", log_path.display()));
+                                } else {
+                                    app.add_output_to_world(world_idx, "Warning: Could not open log file");
+                                }
+                            }
+
+                            // Fire TF CONNECT hook
+                            let hook_result = tf::bridge::fire_event(&mut app.tf_engine, tf::TfHookEvent::Connect);
+                            for cmd in hook_result.send_commands {
+                                let _ = cmd_tx.try_send(WriteCommand::Text(cmd));
+                            }
+                            for cmd in hook_result.clay_commands {
+                                let _ = app.tf_engine.execute(&cmd);
+                            }
+
+                            // Send auto-login if configured
+                            let skip_login = app.worlds[world_idx].skip_auto_login;
+                            app.worlds[world_idx].skip_auto_login = false;
+                            let user = app.worlds[world_idx].settings.user.clone();
+                            let password = app.worlds[world_idx].settings.password.clone();
+                            let auto_connect_type = app.worlds[world_idx].settings.auto_connect_type;
+                            if !skip_login && !user.is_empty() && !password.is_empty() && auto_connect_type == AutoConnectType::Connect {
+                                let connect_cmd = format!("connect {} {}", user, password);
+                                let _ = cmd_tx.try_send(WriteCommand::Text(connect_cmd));
+                            }
+
+                            // Broadcast connection status
+                            app.ws_broadcast(WsMessage::WorldConnected { world_index: world_idx, name: app.worlds[world_idx].name.clone() });
+                            app.add_output_to_world(world_idx, "Connected!");
+                        }
+                    }
+                    // Background connection failed
+                    AppEvent::ConnectionFailed(world_name, error) => {
+                        if let Some(world_idx) = app.find_world_index(&world_name) {
+                            app.add_output_to_world(world_idx, &format!("Connection failed: {}", error));
+                        }
+                    }
                 }
             }
 
@@ -11590,6 +11732,65 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                             }
                         }
                         _ => {}
+                    }
+                }
+                // Background connection completed successfully
+                AppEvent::ConnectionSuccess(world_name, cmd_tx, socket_fd, is_tls) => {
+                    if let Some(world_idx) = app.find_world_index(&world_name) {
+                        app.worlds[world_idx].connected = true;
+                        app.worlds[world_idx].was_connected = true;
+                        app.worlds[world_idx].prompt_count = 0;
+                        let now = std::time::Instant::now();
+                        app.worlds[world_idx].last_send_time = Some(now);
+                        app.worlds[world_idx].last_receive_time = Some(now);
+                        app.worlds[world_idx].is_initial_world = false;
+                        app.worlds[world_idx].command_tx = Some(cmd_tx.clone());
+                        #[cfg(unix)]
+                        { app.worlds[world_idx].socket_fd = socket_fd; }
+                        app.worlds[world_idx].is_tls = is_tls;
+
+                        // Discard any unused initial world
+                        app.discard_initial_world();
+
+                        // Open log file if enabled
+                        if app.worlds[world_idx].settings.log_enabled {
+                            if app.worlds[world_idx].open_log_file() {
+                                let log_path = app.worlds[world_idx].get_log_path();
+                                app.add_output_to_world(world_idx, &format!("Logging to: {}", log_path.display()));
+                            } else {
+                                app.add_output_to_world(world_idx, "Warning: Could not open log file");
+                            }
+                        }
+
+                        // Fire TF CONNECT hook
+                        let hook_result = tf::bridge::fire_event(&mut app.tf_engine, tf::TfHookEvent::Connect);
+                        for cmd in hook_result.send_commands {
+                            let _ = cmd_tx.try_send(WriteCommand::Text(cmd));
+                        }
+                        for cmd in hook_result.clay_commands {
+                            let _ = app.tf_engine.execute(&cmd);
+                        }
+
+                        // Send auto-login if configured
+                        let skip_login = app.worlds[world_idx].skip_auto_login;
+                        app.worlds[world_idx].skip_auto_login = false;
+                        let user = app.worlds[world_idx].settings.user.clone();
+                        let password = app.worlds[world_idx].settings.password.clone();
+                        let auto_connect_type = app.worlds[world_idx].settings.auto_connect_type;
+                        if !skip_login && !user.is_empty() && !password.is_empty() && auto_connect_type == AutoConnectType::Connect {
+                            let connect_cmd = format!("connect {} {}", user, password);
+                            let _ = cmd_tx.try_send(WriteCommand::Text(connect_cmd));
+                        }
+
+                        // Broadcast connection status
+                        app.ws_broadcast(WsMessage::WorldConnected { world_index: world_idx, name: app.worlds[world_idx].name.clone() });
+                        app.add_output_to_world(world_idx, "Connected!");
+                    }
+                }
+                // Background connection failed
+                AppEvent::ConnectionFailed(world_name, error) => {
+                    if let Some(world_idx) = app.find_world_index(&world_name) {
+                        app.add_output_to_world(world_idx, &format!("Connection failed: {}", error));
                     }
                 }
             }
@@ -13413,308 +13614,239 @@ async fn handle_command(cmd: &str, app: &mut App, event_tx: mpsc::Sender<AppEven
                 }
             }
 
-            match TcpStream::connect(format!("{}:{}", host, port)).await {
-                Ok(tcp_stream) => {
-                    // Store the socket fd for hot reload (before splitting, Unix only)
-                    #[cfg(unix)]
-                    let socket_fd = tcp_stream.as_raw_fd();
+            // Spawn connection in background to avoid blocking the UI
+            let world_name = app.current_world().name.clone();
+            let connect_host = host.clone();
+            let connect_port = port.clone();
+            let connect_use_ssl = use_ssl;
+            let event_tx_connect = event_tx.clone();
 
-                    // Enable TCP keepalive to detect dead connections faster
-                    enable_tcp_keepalive(&tcp_stream);
-
-                    // Handle SSL if needed
-                    let (mut read_half, mut write_half): (StreamReader, StreamWriter) = if use_ssl {
-                        #[cfg(feature = "native-tls-backend")]
-                        {
-                            // Accept invalid/expired certificates (common for MUD servers)
-                            let connector = match native_tls::TlsConnector::builder()
-                                .danger_accept_invalid_certs(true)
-                                .build()
-                            {
-                                Ok(c) => c,
-                                Err(e) => {
-                                    app.add_output(&format!("TLS error: {}", e));
-                                    return false;
-                                }
-                            };
-                            let connector = tokio_native_tls::TlsConnector::from(connector);
-
-                            match connector.connect(&host, tcp_stream).await {
-                                Ok(tls_stream) => {
-                                    app.add_output("SSL handshake successful!");
-                                    // For TLS, we can't preserve the connection across reload
-                                    app.current_world_mut().socket_fd = None;
-                                    app.current_world_mut().is_tls = true;
-                                    let (r, w) = tokio::io::split(tls_stream);
-                                    (StreamReader::Tls(r), StreamWriter::Tls(w))
-                                }
-                                Err(e) => {
-                                    app.add_output(&format!("SSL handshake failed: {}", e));
-                                    return false;
-                                }
-                            }
-                        }
-
-                        #[cfg(feature = "rustls-backend")]
-                        {
-                            use rustls::RootCertStore;
-                            use tokio_rustls::TlsConnector;
-                            use rustls::pki_types::ServerName;
-
-                            // Create a config that accepts invalid certs (common for MUD servers)
-                            let mut root_store = RootCertStore::empty();
-                            root_store.roots = webpki_roots::TLS_SERVER_ROOTS.iter().map(|ta| { rustls::pki_types::TrustAnchor { subject: ta.subject.into(), subject_public_key_info: ta.spki.into(), name_constraints: ta.name_constraints.map(|nc| nc.into()), } }).collect();
-
-                            let config = rustls::ClientConfig::builder()
-                                .dangerous()
-                                .with_custom_certificate_verifier(Arc::new(danger::NoCertificateVerification::new()))
-                                .with_no_client_auth();
-
-                            let connector = TlsConnector::from(Arc::new(config));
-                            let server_name = match ServerName::try_from(host.clone()) {
-                                Ok(sn) => sn,
-                                Err(e) => {
-                                    app.add_output(&format!("Invalid server name: {}", e));
-                                    return false;
-                                }
-                            };
-
-                            match connector.connect(server_name, tcp_stream).await {
-                                Ok(tls_stream) => {
-                                    app.add_output("SSL handshake successful!");
-                                    app.current_world_mut().socket_fd = None;
-                                    app.current_world_mut().is_tls = true;
-                                    let (r, w) = tokio::io::split(tls_stream);
-                                    (StreamReader::Tls(r), StreamWriter::Tls(w))
-                                }
-                                Err(e) => {
-                                    app.add_output(&format!("SSL handshake failed: {}", e));
-                                    return false;
-                                }
-                            }
-                        }
-
-                        #[cfg(not(any(feature = "native-tls-backend", feature = "rustls-backend")))]
-                        {
-                            app.add_output("No TLS backend available. Compile with native-tls-backend or rustls-backend feature.");
-                            return false;
-                        }
-                    } else {
-                        // Store fd for plain TCP connections (can be preserved across reload, Unix only)
+            tokio::spawn(async move {
+                match TcpStream::connect(format!("{}:{}", connect_host, connect_port)).await {
+                    Ok(tcp_stream) => {
+                        // Store the socket fd for hot reload (before splitting, Unix only)
                         #[cfg(unix)]
-                        { app.current_world_mut().socket_fd = Some(socket_fd); }
-                        app.current_world_mut().is_tls = false;
-                        let (r, w) = tcp_stream.into_split();
-                        (StreamReader::Plain(r), StreamWriter::Plain(w))
-                    };
+                        let socket_fd = {
+                            use std::os::unix::io::AsRawFd;
+                            Some(tcp_stream.as_raw_fd())
+                        };
+                        #[cfg(not(unix))]
+                        let socket_fd: Option<i32> = None;
 
-                    app.current_world_mut().connected = true;
-                    app.current_world_mut().was_connected = true;
-                    app.current_world_mut().prompt_count = 0; // Reset for auto-login
-                    // Initialize timing for NOP tracking
-                    let now = std::time::Instant::now();
-                    app.current_world_mut().last_send_time = Some(now);
-                    app.current_world_mut().last_receive_time = Some(now);
+                        // Enable TCP keepalive to detect dead connections faster
+                        enable_tcp_keepalive(&tcp_stream);
 
-                    // Mark this world as no longer initial (if it was)
-                    app.current_world_mut().is_initial_world = false;
-
-                    // Discard any unused initial world now that we have a real connection
-                    app.discard_initial_world();
-
-                    // Capture world name for the reader task (stable across world deletions)
-                    let world_name = app.current_world().name.clone();
-
-                    // Open log file if enabled
-                    if app.current_world().settings.log_enabled {
-                        if app.current_world_mut().open_log_file() {
-                            let log_path = app.current_world().get_log_path();
-                            app.add_output(&format!("Logging to: {}", log_path.display()));
-                        } else {
-                            app.add_output("Warning: Could not open log file");
-                        }
-                    }
-
-                    let (cmd_tx, mut cmd_rx) = mpsc::channel::<WriteCommand>(100);
-                    app.current_world_mut().command_tx = Some(cmd_tx.clone());
-
-                    // Fire TF CONNECT hook
-                    let hook_result = tf::bridge::fire_event(&mut app.tf_engine, tf::TfHookEvent::Connect);
-                    for cmd in hook_result.send_commands {
-                        let _ = cmd_tx.try_send(WriteCommand::Text(cmd));
-                    }
-                    for cmd in hook_result.clay_commands {
-                        let _ = app.tf_engine.execute(&cmd);
-                    }
-
-                    // Send "connect <user> <password>" if configured and auto_connect_type is Connect
-                    // Skip if skip_auto_login flag is set (from /worlds -l)
-                    // Requires BOTH username AND password to be set
-                    let skip_login = app.current_world().skip_auto_login;
-                    // Reset flag so future reconnects will try auto-login again
-                    app.current_world_mut().skip_auto_login = false;
-                    let user = app.current_world().settings.user.clone();
-                    let password = app.current_world().settings.password.clone();
-                    let auto_connect_type = app.current_world().settings.auto_connect_type;
-                    // DEBUG: trace auto-login conditions
-                    debug_log(true, &format!("Auto-login check: skip={}, user='{}', pass_len={}, type={}",
-                        skip_login, user, password.len(), auto_connect_type.name()));
-                    if !skip_login && !user.is_empty() && !password.is_empty() && auto_connect_type == AutoConnectType::Connect {
-                        debug_log(true, "Auto-login sending immediately");
-                        let connect_cmd = format!("connect {} {}", user, password);
-                        let _ = cmd_tx.send(WriteCommand::Text(connect_cmd)).await;
-                    }
-
-                    // Clone tx for use in reader (for telnet responses)
-                    let telnet_tx = cmd_tx.clone();
-                    let event_tx_read = event_tx.clone();
-                    tokio::spawn(async move {
-                        let mut buffer = BytesMut::with_capacity(4096);
-                        buffer.resize(4096, 0);
-                        let mut line_buffer: Vec<u8> = Vec::new();
-
-                        loop {
-                            match read_half.read(&mut buffer).await {
-                                Ok(0) => {
-                                    // Send any remaining buffered data
-                                    if !line_buffer.is_empty() {
-                                        let result = process_telnet(&line_buffer);
-                                        if !result.responses.is_empty() {
-                                            let _ = telnet_tx.send(WriteCommand::Raw(result.responses)).await;
-                                        }
-                                        if result.telnet_detected {
-                                            let _ = event_tx_read.send(AppEvent::TelnetDetected(world_name.clone())).await;
-                                        }
-                                        // Send prompt FIRST for immediate auto-login response
-                                        if let Some(prompt_bytes) = result.prompt {
-                                            let _ = event_tx_read.send(AppEvent::Prompt(world_name.clone(), prompt_bytes)).await;
-                                        }
-                                        // Send remaining data
-                                        if !result.cleaned.is_empty() {
-                                            let _ = event_tx_read.send(AppEvent::ServerData(world_name.clone(), result.cleaned)).await;
-                                        }
-                                    }
-                                    let _ = event_tx_read
-                                        .send(AppEvent::ServerData(
+                        // Handle SSL if needed
+                        let connection_result: Result<(StreamReader, StreamWriter, bool), String> = if connect_use_ssl {
+                            #[cfg(feature = "native-tls-backend")]
+                            {
+                                let connector = match native_tls::TlsConnector::builder()
+                                    .danger_accept_invalid_certs(true)
+                                    .build()
+                                {
+                                    Ok(c) => c,
+                                    Err(e) => {
+                                        let _ = event_tx_connect.send(AppEvent::ConnectionFailed(
                                             world_name.clone(),
-                                            "Connection closed by server.\n".as_bytes().to_vec(),
-                                        ))
-                                        .await;
-                                    let _ =
-                                        event_tx_read.send(AppEvent::Disconnected(world_name.clone())).await;
-                                    break;
-                                }
-                                Ok(n) => {
-                                    // Append new data to line buffer
-                                    line_buffer.extend_from_slice(&buffer[..n]);
-
-                                    // Find safe split point (complete lines with complete ANSI sequences)
-                                    let split_at = find_safe_split_point(&line_buffer);
-
-                                    // Send data immediately - either up to split point, or all if no incomplete sequences
-                                    let to_send = if split_at > 0 {
-                                        line_buffer.drain(..split_at).collect()
-                                    } else if !line_buffer.is_empty() {
-                                        // No safe split point but we have data - send it anyway
-                                        std::mem::take(&mut line_buffer)
-                                    } else {
-                                        Vec::new()
-                                    };
-
-                                    if !to_send.is_empty() {
-                                        // Process telnet sequences
-                                        let result = process_telnet(&to_send);
-
-                                        // Send telnet responses if any
-                                        if !result.responses.is_empty() {
-                                            let _ = telnet_tx.send(WriteCommand::Raw(result.responses)).await;
-                                        }
-
-                                        // Notify if telnet detected
-                                        if result.telnet_detected {
-                                            let _ = event_tx_read
-                                                .send(AppEvent::TelnetDetected(world_name.clone()))
-                                                .await;
-                                        }
-
-                                        // Notify if NAWS was requested (server sent DO NAWS)
-                                        if result.naws_requested {
-                                            let _ = event_tx_read
-                                                .send(AppEvent::NawsRequested(world_name.clone()))
-                                                .await;
-                                        }
-
-                                        // Notify if TTYPE was requested (server sent SB TTYPE SEND)
-                                        if result.ttype_requested {
-                                            let _ = event_tx_read
-                                                .send(AppEvent::TtypeRequested(world_name.clone()))
-                                                .await;
-                                        }
-
-                                        // Notify if WONT ECHO seen (for timeout-based prompt detection)
-                                        if result.wont_echo_seen {
-                                            let _ = event_tx_read
-                                                .send(AppEvent::WontEchoSeen(world_name.clone()))
-                                                .await;
-                                        }
-
-                                        // Send prompt FIRST if detected via telnet GA/EOR
-                                        if let Some(prompt_bytes) = result.prompt {
-                                            let _ = event_tx_read
-                                                .send(AppEvent::Prompt(world_name.clone(), prompt_bytes))
-                                                .await;
-                                        }
-
-                                        // Send cleaned data to main loop
-                                        if !result.cleaned.is_empty()
-                                            && event_tx_read
-                                                .send(AppEvent::ServerData(world_name.clone(), result.cleaned))
-                                                .await
-                                                .is_err()
-                                        {
-                                            break;
-                                        }
+                                            format!("TLS error: {}", e)
+                                        )).await;
+                                        return;
                                     }
-                                }
-                                Err(e) => {
-                                    let msg = format!("Read error: {}", e);
-                                    let _ = event_tx_read
-                                        .send(AppEvent::ServerData(world_name.clone(), msg.into_bytes()))
-                                        .await;
-                                    let _ =
-                                        event_tx_read.send(AppEvent::Disconnected(world_name.clone())).await;
-                                    break;
+                                };
+                                let connector = tokio_native_tls::TlsConnector::from(connector);
+
+                                match connector.connect(&connect_host, tcp_stream).await {
+                                    Ok(tls_stream) => {
+                                        let (r, w) = tokio::io::split(tls_stream);
+                                        Ok((StreamReader::Tls(r), StreamWriter::Tls(w), true))
+                                    }
+                                    Err(e) => {
+                                        Err(format!("SSL handshake failed: {}", e))
+                                    }
                                 }
                             }
-                        }
-                    });
 
-                    tokio::spawn(async move {
-                        while let Some(cmd) = cmd_rx.recv().await {
-                            match cmd {
-                                WriteCommand::Text(text) => {
-                                    let bytes = format!("{}\r\n", text).into_bytes();
-                                    if write_half.write_all(&bytes).await.is_err() {
-                                        break;
+                            #[cfg(feature = "rustls-backend")]
+                            {
+                                use rustls::RootCertStore;
+                                use tokio_rustls::TlsConnector;
+                                use rustls::pki_types::ServerName;
+
+                                let mut root_store = RootCertStore::empty();
+                                root_store.roots = webpki_roots::TLS_SERVER_ROOTS.iter().map(|ta| { rustls::pki_types::TrustAnchor { subject: ta.subject.into(), subject_public_key_info: ta.spki.into(), name_constraints: ta.name_constraints.map(|nc| nc.into()), } }).collect();
+
+                                let config = rustls::ClientConfig::builder()
+                                    .dangerous()
+                                    .with_custom_certificate_verifier(Arc::new(danger::NoCertificateVerification::new()))
+                                    .with_no_client_auth();
+
+                                let connector = TlsConnector::from(Arc::new(config));
+                                let server_name = match ServerName::try_from(connect_host.clone()) {
+                                    Ok(sn) => sn,
+                                    Err(e) => {
+                                        let _ = event_tx_connect.send(AppEvent::ConnectionFailed(
+                                            world_name.clone(),
+                                            format!("Invalid server name: {}", e)
+                                        )).await;
+                                        return;
                                     }
-                                }
-                                WriteCommand::Raw(raw) => {
-                                    if write_half.write_all(&raw).await.is_err() {
-                                        break;
+                                };
+
+                                match connector.connect(server_name, tcp_stream).await {
+                                    Ok(tls_stream) => {
+                                        let (r, w) = tokio::io::split(tls_stream);
+                                        Ok((StreamReader::Tls(r), StreamWriter::Tls(w), true))
                                     }
-                                }
-                                WriteCommand::Shutdown => {
-                                    let _ = write_half.shutdown().await;
-                                    break;
+                                    Err(e) => {
+                                        Err(format!("SSL handshake failed: {}", e))
+                                    }
                                 }
                             }
+
+                            #[cfg(not(any(feature = "native-tls-backend", feature = "rustls-backend")))]
+                            {
+                                Err("No TLS backend available".to_string())
+                            }
+                        } else {
+                            let (r, w) = tcp_stream.into_split();
+                            Ok((StreamReader::Plain(r), StreamWriter::Plain(w), false))
+                        };
+
+                        match connection_result {
+                            Ok((mut read_half, mut write_half, is_tls)) => {
+                                // Create command channel
+                                let (cmd_tx, mut cmd_rx) = mpsc::channel::<WriteCommand>(100);
+
+                                // Clone for reader task
+                                let telnet_tx = cmd_tx.clone();
+                                let event_tx_read = event_tx_connect.clone();
+                                let read_world_name = world_name.clone();
+
+                                // Spawn reader task
+                                tokio::spawn(async move {
+                                    let mut buffer = BytesMut::with_capacity(4096);
+                                    buffer.resize(4096, 0);
+                                    let mut line_buffer: Vec<u8> = Vec::new();
+
+                                    loop {
+                                        match read_half.read(&mut buffer).await {
+                                            Ok(0) => {
+                                                if !line_buffer.is_empty() {
+                                                    let result = process_telnet(&line_buffer);
+                                                    if !result.responses.is_empty() {
+                                                        let _ = telnet_tx.send(WriteCommand::Raw(result.responses)).await;
+                                                    }
+                                                    if result.telnet_detected {
+                                                        let _ = event_tx_read.send(AppEvent::TelnetDetected(read_world_name.clone())).await;
+                                                    }
+                                                    if let Some(prompt_bytes) = result.prompt {
+                                                        let _ = event_tx_read.send(AppEvent::Prompt(read_world_name.clone(), prompt_bytes)).await;
+                                                    }
+                                                    if !result.cleaned.is_empty() {
+                                                        let _ = event_tx_read.send(AppEvent::ServerData(read_world_name.clone(), result.cleaned)).await;
+                                                    }
+                                                }
+                                                let _ = event_tx_read
+                                                    .send(AppEvent::ServerData(
+                                                        read_world_name.clone(),
+                                                        "Connection closed by server.\n".as_bytes().to_vec(),
+                                                    ))
+                                                    .await;
+                                                let _ = event_tx_read.send(AppEvent::Disconnected(read_world_name.clone())).await;
+                                                break;
+                                            }
+                                            Ok(n) => {
+                                                line_buffer.extend_from_slice(&buffer[..n]);
+                                                let split_at = find_safe_split_point(&line_buffer);
+                                                let to_send = if split_at > 0 {
+                                                    line_buffer.drain(..split_at).collect()
+                                                } else if !line_buffer.is_empty() {
+                                                    std::mem::take(&mut line_buffer)
+                                                } else {
+                                                    Vec::new()
+                                                };
+
+                                                if !to_send.is_empty() {
+                                                    let result = process_telnet(&to_send);
+                                                    if !result.responses.is_empty() {
+                                                        let _ = telnet_tx.send(WriteCommand::Raw(result.responses)).await;
+                                                    }
+                                                    if result.telnet_detected {
+                                                        let _ = event_tx_read.send(AppEvent::TelnetDetected(read_world_name.clone())).await;
+                                                    }
+                                                    if result.naws_requested {
+                                                        let _ = event_tx_read.send(AppEvent::NawsRequested(read_world_name.clone())).await;
+                                                    }
+                                                    if result.ttype_requested {
+                                                        let _ = event_tx_read.send(AppEvent::TtypeRequested(read_world_name.clone())).await;
+                                                    }
+                                                    if result.wont_echo_seen {
+                                                        let _ = event_tx_read.send(AppEvent::WontEchoSeen(read_world_name.clone())).await;
+                                                    }
+                                                    if let Some(prompt_bytes) = result.prompt {
+                                                        let _ = event_tx_read.send(AppEvent::Prompt(read_world_name.clone(), prompt_bytes)).await;
+                                                    }
+                                                    if !result.cleaned.is_empty() {
+                                                        let _ = event_tx_read.send(AppEvent::ServerData(read_world_name.clone(), result.cleaned)).await;
+                                                    }
+                                                }
+                                            }
+                                            Err(e) => {
+                                                let msg = format!("Read error: {}", e);
+                                                let _ = event_tx_read.send(AppEvent::ServerData(read_world_name.clone(), msg.into_bytes())).await;
+                                                let _ = event_tx_read.send(AppEvent::Disconnected(read_world_name.clone())).await;
+                                                break;
+                                            }
+                                        }
+                                    }
+                                });
+
+                                // Spawn writer task
+                                tokio::spawn(async move {
+                                    while let Some(cmd) = cmd_rx.recv().await {
+                                        match cmd {
+                                            WriteCommand::Text(text) => {
+                                                let bytes = format!("{}\r\n", text).into_bytes();
+                                                if write_half.write_all(&bytes).await.is_err() {
+                                                    break;
+                                                }
+                                            }
+                                            WriteCommand::Raw(raw) => {
+                                                if write_half.write_all(&raw).await.is_err() {
+                                                    break;
+                                                }
+                                            }
+                                            WriteCommand::Shutdown => {
+                                                let _ = write_half.shutdown().await;
+                                                break;
+                                            }
+                                        }
+                                    }
+                                });
+
+                                // Notify main loop of successful connection
+                                // For TLS, socket_fd should be None (can't preserve across reload)
+                                let final_socket_fd = if is_tls { None } else { socket_fd };
+                                let _ = event_tx_connect.send(AppEvent::ConnectionSuccess(
+                                    world_name,
+                                    cmd_tx,
+                                    final_socket_fd,
+                                    is_tls
+                                )).await;
+                            }
+                            Err(e) => {
+                                let _ = event_tx_connect.send(AppEvent::ConnectionFailed(world_name, e)).await;
+                            }
                         }
-                    });
+                    }
+                    Err(e) => {
+                        let _ = event_tx_connect.send(AppEvent::ConnectionFailed(
+                            world_name,
+                            format!("Connection failed: {}", e)
+                        )).await;
+                    }
                 }
-                Err(e) => {
-                    app.add_output(&format!("Connection failed: {}", e));
-                }
-            }
+            });
         }
         Command::Disconnect => {
             if app.current_world().connected {

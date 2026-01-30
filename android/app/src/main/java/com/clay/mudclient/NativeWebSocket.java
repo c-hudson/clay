@@ -126,11 +126,24 @@ public class NativeWebSocket {
 
                 @Override
                 public void onFailure(WebSocket webSocket, Throwable t, Response response) {
-                    Log.e(TAG, "WebSocket error: " + t.getMessage(), t);
+                    // Build detailed error message
+                    String errorMsg = t.getClass().getSimpleName();
+                    if (t.getMessage() != null && !t.getMessage().isEmpty()) {
+                        errorMsg += ": " + t.getMessage();
+                    }
+                    if (t.getCause() != null) {
+                        errorMsg += " (caused by: " + t.getCause().getClass().getSimpleName();
+                        if (t.getCause().getMessage() != null) {
+                            errorMsg += ": " + t.getCause().getMessage();
+                        }
+                        errorMsg += ")";
+                    }
+                    Log.e(TAG, "WebSocket error: " + errorMsg, t);
                     isConnected = false;
+                    final String finalError = errorMsg;
                     mainHandler.post(() -> {
                         if (callback != null) {
-                            callback.onError(t.getMessage());
+                            callback.onError(finalError);
                         }
                     });
                 }
@@ -155,15 +168,27 @@ public class NativeWebSocket {
     }
 
     public void close() {
+        Log.d(TAG, "Closing WebSocket connection");
+        isConnected = false;
         if (webSocket != null) {
-            webSocket.close(1000, "Client closing");
+            try {
+                webSocket.close(1000, "Client closing");
+            } catch (Exception e) {
+                Log.w(TAG, "Error closing WebSocket: " + e.getMessage());
+            }
             webSocket = null;
         }
         if (client != null) {
-            client.dispatcher().executorService().shutdown();
+            try {
+                // Cancel all pending calls
+                client.dispatcher().cancelAll();
+                // Don't shutdown executor - just let it be garbage collected
+                // Shutting down can cause issues with rapid reconnect
+            } catch (Exception e) {
+                Log.w(TAG, "Error cleaning up client: " + e.getMessage());
+            }
             client = null;
         }
-        isConnected = false;
     }
 
     public boolean isConnected() {
