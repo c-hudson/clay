@@ -102,6 +102,7 @@ pub fn create_web_popup(
             modal: true,
             buttons_right_align: true,
             blank_line_before_list: false,
+            tab_buttons_only: false,
         });
 
     // Hide TLS fields if not secure

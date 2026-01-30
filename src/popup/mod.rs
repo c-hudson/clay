@@ -535,6 +535,8 @@ pub struct PopupLayout {
     pub buttons_right_align: bool,
     /// Whether to add a blank line before list fields
     pub blank_line_before_list: bool,
+    /// Whether Tab should only cycle through buttons (skip fields)
+    pub tab_buttons_only: bool,
 }
 
 impl Default for PopupLayout {
@@ -548,6 +550,7 @@ impl Default for PopupLayout {
             modal: true,
             buttons_right_align: false,
             blank_line_before_list: false,
+            tab_buttons_only: false,
         }
     }
 }
@@ -1026,20 +1029,23 @@ impl PopupState {
     /// Cycle between focusable text fields and buttons (for Tab key)
     /// Uses tab_index to determine order. Elements with tab_index are sorted by index,
     /// elements without tab_index come after, in definition order.
+    /// If layout.tab_buttons_only is true, only cycles through buttons.
     /// Returns true if selection changed
     pub fn cycle_field_buttons(&mut self) -> bool {
         // Build a list of tabbable elements: (sort_key, is_button, id)
         // sort_key = (has_index, index_or_def_order)
         let mut tabbable: Vec<(bool, u32, bool, u32)> = Vec::new(); // (has_index, index, is_button, id)
 
-        // Add text-editable fields
-        for (def_idx, field) in self.definition.fields.iter().enumerate() {
-            if field.is_focusable() && field.kind.is_text_editable() {
-                let (has_idx, idx) = match field.tab_index {
-                    Some(i) => (true, i),
-                    None => (false, def_idx as u32),
-                };
-                tabbable.push((has_idx, idx, false, field.id.0));
+        // Add text-editable fields (unless tab_buttons_only is set)
+        if !self.definition.layout.tab_buttons_only {
+            for (def_idx, field) in self.definition.fields.iter().enumerate() {
+                if field.is_focusable() && field.kind.is_text_editable() {
+                    let (has_idx, idx) = match field.tab_index {
+                        Some(i) => (true, i),
+                        None => (false, def_idx as u32),
+                    };
+                    tabbable.push((has_idx, idx, false, field.id.0));
+                }
             }
         }
 

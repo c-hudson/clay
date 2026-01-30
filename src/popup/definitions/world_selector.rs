@@ -93,6 +93,7 @@ pub fn create_world_selector_popup(worlds: &[WorldInfo], visible_height: usize) 
             modal: true,
             buttons_right_align: true,
             blank_line_before_list: true,
+            tab_buttons_only: false,
         })
 }
 

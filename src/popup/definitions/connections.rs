@@ -139,6 +139,7 @@ pub fn create_connections_popup(connections: &[ConnectionInfo], visible_height: 
             modal: true,
             buttons_right_align: false,
             blank_line_before_list: false,
+            tab_buttons_only: false,
         })
 }
 

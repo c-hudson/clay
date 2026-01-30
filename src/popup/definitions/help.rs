@@ -84,6 +84,7 @@ pub fn create_help_popup() -> PopupDefinition {
             modal: true,
             buttons_right_align: false,
             blank_line_before_list: false,
+            tab_buttons_only: false,
         })
 }
 

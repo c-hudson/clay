@@ -134,6 +134,7 @@ pub fn create_setup_popup(
             modal: true,
             buttons_right_align: true,
             blank_line_before_list: false,
+            tab_buttons_only: false,
         })
 }
 

@@ -2551,6 +2551,7 @@ impl App {
                 modal: true,
                 buttons_right_align: false,
                 blank_line_before_list: false,
+                tab_buttons_only: false,
             });
 
         self.popup_manager.open(def);
