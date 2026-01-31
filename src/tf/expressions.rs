@@ -957,6 +957,72 @@ impl<'a> Evaluator<'a> {
                 Ok(TfValue::Integer(a.cmp(&b) as i64))
             }
 
+            "strncmp" => {
+                if args.len() != 3 {
+                    return Err("strncmp requires 3 arguments".to_string());
+                }
+                let a = self.eval(&args[0])?.to_string_value();
+                let b = self.eval(&args[1])?.to_string_value();
+                let n = self.eval(&args[2])?.to_int().unwrap_or(0) as usize;
+                let a_prefix: String = a.chars().take(n).collect();
+                let b_prefix: String = b.chars().take(n).collect();
+                Ok(TfValue::Integer(a_prefix.cmp(&b_prefix) as i64))
+            }
+
+            "strchr" => {
+                if args.len() != 2 {
+                    return Err("strchr requires 2 arguments".to_string());
+                }
+                let s = self.eval(&args[0])?.to_string_value();
+                let chars = self.eval(&args[1])?.to_string_value();
+                let pos = s.chars().position(|c| chars.contains(c));
+                Ok(TfValue::Integer(pos.map(|p| p as i64).unwrap_or(-1)))
+            }
+
+            "strrchr" => {
+                if args.len() != 2 {
+                    return Err("strrchr requires 2 arguments".to_string());
+                }
+                let s = self.eval(&args[0])?.to_string_value();
+                let chars = self.eval(&args[1])?.to_string_value();
+                let pos = s.chars().collect::<Vec<_>>().iter().rposition(|c| chars.contains(*c));
+                Ok(TfValue::Integer(pos.map(|p| p as i64).unwrap_or(-1)))
+            }
+
+            "strrep" => {
+                if args.len() != 2 {
+                    return Err("strrep requires 2 arguments".to_string());
+                }
+                let s = self.eval(&args[0])?.to_string_value();
+                let n = self.eval(&args[1])?.to_int().unwrap_or(0);
+                if n <= 0 {
+                    Ok(TfValue::String(String::new()))
+                } else {
+                    Ok(TfValue::String(s.repeat(n as usize)))
+                }
+            }
+
+            "pad" => {
+                // pad([s, i]...) - pad strings to specified widths
+                if args.len() % 2 != 0 {
+                    return Err("pad requires pairs of (string, width) arguments".to_string());
+                }
+                let mut result = String::new();
+                for i in (0..args.len()).step_by(2) {
+                    let s = self.eval(&args[i])?.to_string_value();
+                    let width = self.eval(&args[i + 1])?.to_int().unwrap_or(0);
+                    let abs_width = width.unsigned_abs() as usize;
+                    if width >= 0 {
+                        // Right-justify (left-pad)
+                        result.push_str(&format!("{:>width$}", s, width = abs_width));
+                    } else {
+                        // Left-justify (right-pad)
+                        result.push_str(&format!("{:<width$}", s, width = abs_width));
+                    }
+                }
+                Ok(TfValue::String(result))
+            }
+
             "tolower" => {
                 if args.len() != 1 {
                     return Err("tolower requires 1 argument".to_string());
@@ -984,17 +1050,26 @@ impl<'a> Evaluator<'a> {
 
             "rand" => {
                 if args.is_empty() {
-                    // Random float between 0 and 1
-                    let r = simple_random() as f64 / u32::MAX as f64;
-                    Ok(TfValue::Float(r))
-                } else {
-                    // Random integer between 0 and max-1
+                    // rand() - random integer in system range
+                    Ok(TfValue::Integer(simple_random() as i64))
+                } else if args.len() == 1 {
+                    // rand(max) - random integer in [0, max-1]
                     let max = self.eval(&args[0])?.to_int().unwrap_or(100);
                     if max <= 0 {
                         return Ok(TfValue::Integer(0));
                     }
                     let r = (simple_random() as i64) % max;
                     Ok(TfValue::Integer(r.abs()))
+                } else {
+                    // rand(min, max) - random integer in [min, max]
+                    let min = self.eval(&args[0])?.to_int().unwrap_or(0);
+                    let max = self.eval(&args[1])?.to_int().unwrap_or(100);
+                    if max < min {
+                        return Ok(TfValue::Integer(min));
+                    }
+                    let range = (max - min + 1) as u64;
+                    let r = min + ((simple_random() as u64) % range) as i64;
+                    Ok(TfValue::Integer(r))
                 }
             }
 
@@ -1044,6 +1119,131 @@ impl<'a> Evaluator<'a> {
                     }
                 }
                 Ok(result)
+            }
+
+            // Trigonometric functions
+            "sin" => {
+                if args.len() != 1 {
+                    return Err("sin requires 1 argument".to_string());
+                }
+                let x = self.eval(&args[0])?.to_float().unwrap_or(0.0);
+                Ok(TfValue::Float(x.sin()))
+            }
+
+            "cos" => {
+                if args.len() != 1 {
+                    return Err("cos requires 1 argument".to_string());
+                }
+                let x = self.eval(&args[0])?.to_float().unwrap_or(0.0);
+                Ok(TfValue::Float(x.cos()))
+            }
+
+            "tan" => {
+                if args.len() != 1 {
+                    return Err("tan requires 1 argument".to_string());
+                }
+                let x = self.eval(&args[0])?.to_float().unwrap_or(0.0);
+                Ok(TfValue::Float(x.tan()))
+            }
+
+            "asin" => {
+                if args.len() != 1 {
+                    return Err("asin requires 1 argument".to_string());
+                }
+                let x = self.eval(&args[0])?.to_float().unwrap_or(0.0);
+                if x < -1.0 || x > 1.0 {
+                    return Err("asin: argument must be in [-1, 1]".to_string());
+                }
+                Ok(TfValue::Float(x.asin()))
+            }
+
+            "acos" => {
+                if args.len() != 1 {
+                    return Err("acos requires 1 argument".to_string());
+                }
+                let x = self.eval(&args[0])?.to_float().unwrap_or(0.0);
+                if x < -1.0 || x > 1.0 {
+                    return Err("acos: argument must be in [-1, 1]".to_string());
+                }
+                Ok(TfValue::Float(x.acos()))
+            }
+
+            "atan" => {
+                if args.len() != 1 {
+                    return Err("atan requires 1 argument".to_string());
+                }
+                let x = self.eval(&args[0])?.to_float().unwrap_or(0.0);
+                Ok(TfValue::Float(x.atan()))
+            }
+
+            "exp" => {
+                if args.len() != 1 {
+                    return Err("exp requires 1 argument".to_string());
+                }
+                let x = self.eval(&args[0])?.to_float().unwrap_or(0.0);
+                Ok(TfValue::Float(x.exp()))
+            }
+
+            "pow" => {
+                if args.len() != 2 {
+                    return Err("pow requires 2 arguments".to_string());
+                }
+                let x = self.eval(&args[0])?.to_float().unwrap_or(0.0);
+                let y = self.eval(&args[1])?.to_float().unwrap_or(0.0);
+                Ok(TfValue::Float(x.powf(y)))
+            }
+
+            "sqrt" => {
+                if args.len() != 1 {
+                    return Err("sqrt requires 1 argument".to_string());
+                }
+                let x = self.eval(&args[0])?.to_float().unwrap_or(0.0);
+                if x < 0.0 {
+                    return Err("sqrt: argument must be non-negative".to_string());
+                }
+                Ok(TfValue::Float(x.sqrt()))
+            }
+
+            "log" => {
+                if args.len() != 1 {
+                    return Err("log requires 1 argument".to_string());
+                }
+                let x = self.eval(&args[0])?.to_float().unwrap_or(0.0);
+                if x <= 0.0 {
+                    return Err("log: argument must be positive".to_string());
+                }
+                Ok(TfValue::Float(x.ln()))
+            }
+
+            "log10" => {
+                if args.len() != 1 {
+                    return Err("log10 requires 1 argument".to_string());
+                }
+                let x = self.eval(&args[0])?.to_float().unwrap_or(0.0);
+                if x <= 0.0 {
+                    return Err("log10: argument must be positive".to_string());
+                }
+                Ok(TfValue::Float(x.log10()))
+            }
+
+            "mod" => {
+                if args.len() != 2 {
+                    return Err("mod requires 2 arguments".to_string());
+                }
+                let i = self.eval(&args[0])?.to_int().unwrap_or(0);
+                let j = self.eval(&args[1])?.to_int().unwrap_or(1);
+                if j == 0 {
+                    return Err("mod: division by zero".to_string());
+                }
+                Ok(TfValue::Integer(i % j))
+            }
+
+            "trunc" => {
+                if args.len() != 1 {
+                    return Err("trunc requires 1 argument".to_string());
+                }
+                let x = self.eval(&args[0])?.to_float().unwrap_or(0.0);
+                Ok(TfValue::Integer(x.trunc() as i64))
             }
 
             "ascii" => {
@@ -1466,6 +1666,167 @@ impl<'a> Evaluator<'a> {
                 Ok(TfValue::Integer(0))
             }
 
+            // columns() - number of columns on screen
+            "columns" => {
+                // Return a reasonable default; actual terminal width not tracked in TfEngine
+                Ok(TfValue::Integer(80))
+            }
+
+            // lines() - number of lines on screen
+            "lines" => {
+                // Return a reasonable default; actual terminal height not tracked in TfEngine
+                Ok(TfValue::Integer(24))
+            }
+
+            // moresize() - lines queued at more prompt (always 0 - handled by main app)
+            "moresize" => {
+                Ok(TfValue::Integer(0))
+            }
+
+            // morescroll(n) - scroll n lines at more prompt (returns 1 if scrolled, 0 otherwise)
+            "morescroll" => {
+                // Not implemented - more mode is handled by main app
+                Ok(TfValue::Integer(0))
+            }
+
+            // getpid() - process id
+            "getpid" => {
+                Ok(TfValue::Integer(std::process::id() as i64))
+            }
+
+            // systype() - system type
+            "systype" => {
+                #[cfg(target_os = "linux")]
+                { Ok(TfValue::String("unix".to_string())) }
+                #[cfg(target_os = "macos")]
+                { Ok(TfValue::String("unix".to_string())) }
+                #[cfg(target_os = "windows")]
+                { Ok(TfValue::String("cygwin32".to_string())) }
+                #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+                { Ok(TfValue::String("unix".to_string())) }
+            }
+
+            // nmail() - mail files with unread mail (always 0 - not implemented)
+            "nmail" => {
+                Ok(TfValue::Integer(0))
+            }
+
+            // filename(s) - perform filename expansion
+            "filename" => {
+                if args.len() != 1 {
+                    return Err("filename requires 1 argument".to_string());
+                }
+                let path = self.eval(&args[0])?.to_string_value();
+                // Expand ~ to home directory
+                let expanded = if path.starts_with('~') {
+                    if let Some(home) = std::env::var_os("HOME") {
+                        let home_str = home.to_string_lossy();
+                        if path == "~" {
+                            home_str.to_string()
+                        } else if let Some(rest) = path.strip_prefix("~/") {
+                            format!("{}/{}", home_str, rest)
+                        } else {
+                            path
+                        }
+                    } else {
+                        path
+                    }
+                } else {
+                    path
+                };
+                Ok(TfValue::String(expanded))
+            }
+
+            // ftime(format, time) - format a time value
+            "ftime" => {
+                if args.len() != 2 {
+                    return Err("ftime requires 2 arguments (format, time)".to_string());
+                }
+                let format = self.eval(&args[0])?.to_string_value();
+                let timestamp = self.eval(&args[1])?.to_int().unwrap_or(0);
+
+                // Basic strftime-like formatting
+                use std::time::{Duration, UNIX_EPOCH};
+                let datetime = UNIX_EPOCH + Duration::from_secs(timestamp as u64);
+                let secs_since_epoch = datetime.duration_since(UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0);
+
+                // Calculate time components (UTC)
+                let secs = secs_since_epoch % 60;
+                let mins = (secs_since_epoch / 60) % 60;
+                let hours = (secs_since_epoch / 3600) % 24;
+                let days_since_epoch = secs_since_epoch / 86400;
+
+                // Simple date calculation (not accounting for leap years properly, but close enough)
+                let mut year = 1970i64;
+                let mut remaining_days = days_since_epoch as i64;
+                loop {
+                    let days_in_year = if year % 4 == 0 && (year % 100 != 0 || year % 400 == 0) { 366 } else { 365 };
+                    if remaining_days < days_in_year {
+                        break;
+                    }
+                    remaining_days -= days_in_year;
+                    year += 1;
+                }
+
+                let days_in_month = [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+                let leap = year % 4 == 0 && (year % 100 != 0 || year % 400 == 0);
+                let mut month = 1;
+                for (i, &days) in days_in_month.iter().enumerate() {
+                    let d = if i == 1 && leap { 29 } else { days };
+                    if remaining_days < d {
+                        break;
+                    }
+                    remaining_days -= d;
+                    month += 1;
+                }
+                let day = remaining_days + 1;
+
+                // Apply format substitutions
+                let result = format
+                    .replace("%Y", &format!("{:04}", year))
+                    .replace("%m", &format!("{:02}", month))
+                    .replace("%d", &format!("{:02}", day))
+                    .replace("%H", &format!("{:02}", hours))
+                    .replace("%M", &format!("{:02}", mins))
+                    .replace("%S", &format!("{:02}", secs))
+                    .replace("%%", "%");
+
+                Ok(TfValue::String(result))
+            }
+
+            // fwrite(filename, text) - append text to file
+            "fwrite" => {
+                if args.len() != 2 {
+                    return Err("fwrite requires 2 arguments (filename, text)".to_string());
+                }
+                let filename = self.eval(&args[0])?.to_string_value();
+                let text = self.eval(&args[1])?.to_string_value();
+
+                // Expand ~ in filename
+                let expanded = if filename.starts_with("~/") {
+                    if let Some(home) = std::env::var_os("HOME") {
+                        format!("{}/{}", home.to_string_lossy(), &filename[2..])
+                    } else {
+                        filename
+                    }
+                } else {
+                    filename
+                };
+
+                use std::io::Write;
+                match std::fs::OpenOptions::new().create(true).append(true).open(&expanded) {
+                    Ok(mut file) => {
+                        match file.write_all(text.as_bytes()) {
+                            Ok(_) => Ok(TfValue::Integer(1)),
+                            Err(_) => Ok(TfValue::Integer(0)),
+                        }
+                    }
+                    Err(_) => Ok(TfValue::Integer(0)),
+                }
+            }
+
             // kbhead() - text before cursor
             "kbhead" => {
                 let kb = &self.engine.keyboard_state;
@@ -1556,16 +1917,50 @@ impl<'a> Evaluator<'a> {
                 Ok(TfValue::Integer(-1))
             }
 
-            // kbwordleft() - move cursor left by word
+            // kbwordleft([pos]) - position of word start left of pos
             "kbwordleft" => {
-                self.engine.pending_keyboard_ops.push(super::PendingKeyboardOp::WordLeft);
-                Ok(TfValue::Integer(1))
+                let kb = &self.engine.keyboard_state;
+                let chars: Vec<char> = kb.buffer.chars().collect();
+                let pos = if args.is_empty() {
+                    kb.cursor_position
+                } else {
+                    self.eval(&args[0])?.to_int().unwrap_or(0) as usize
+                };
+                let pos = pos.min(chars.len());
+
+                // Skip whitespace going left
+                let mut i = pos;
+                while i > 0 && chars[i - 1].is_whitespace() {
+                    i -= 1;
+                }
+                // Find start of word
+                while i > 0 && !chars[i - 1].is_whitespace() {
+                    i -= 1;
+                }
+                Ok(TfValue::Integer(i as i64))
             }
 
-            // kbwordright() - move cursor right by word
+            // kbwordright([pos]) - position past word end right of pos
             "kbwordright" => {
-                self.engine.pending_keyboard_ops.push(super::PendingKeyboardOp::WordRight);
-                Ok(TfValue::Integer(1))
+                let kb = &self.engine.keyboard_state;
+                let chars: Vec<char> = kb.buffer.chars().collect();
+                let pos = if args.is_empty() {
+                    kb.cursor_position
+                } else {
+                    self.eval(&args[0])?.to_int().unwrap_or(0) as usize
+                };
+                let pos = pos.min(chars.len());
+
+                // Skip non-whitespace going right
+                let mut i = pos;
+                while i < chars.len() && !chars[i].is_whitespace() {
+                    i += 1;
+                }
+                // Skip whitespace
+                while i < chars.len() && chars[i].is_whitespace() {
+                    i += 1;
+                }
+                Ok(TfValue::Integer(i as i64))
             }
 
             // kbword() - get word at cursor

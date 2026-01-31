@@ -841,19 +841,34 @@ String Functions:
   substr(str, start [,len]) - Substring extraction
   strcat(s1, s2, ...)      - Concatenate strings
   strstr(str, substr)      - Find substring position (-1 if not found)
+  strchr(str, chars)       - Find first char from set (-1 if not found)
+  strrchr(str, chars)      - Find last char from set (-1 if not found)
+  strcmp(s, t)             - Compare strings (<0, 0, >0)
+  strncmp(s, t, n)         - Compare first n chars
+  strrep(str, n)           - Repeat string n times
   tolower(str)             - Convert to lowercase
   toupper(str)             - Convert to uppercase
   replace(str, old, new [,count]) - Replace occurrences
   ascii(str)               - ASCII code of first character
   char(code)               - Character from ASCII code
   sprintf(fmt, args...)    - Formatted string (%s, %d, %c, %%)
+  pad(s, w, ...)           - Pad strings (+ = right-justify, - = left)
 
 Math Functions:
   abs(n)                   - Absolute value
   min(a, b, ...)           - Minimum value
   max(a, b, ...)           - Maximum value
-  rand([max])              - Random number (0 to max-1, or 0-999)
-  time()                   - Current Unix timestamp
+  mod(i, j)                - Remainder of i / j
+  trunc(x)                 - Integer part of float
+  rand([max])              - Random number
+  rand(min, max)           - Random in range [min, max]
+  sin(x), cos(x), tan(x)   - Trigonometric (radians)
+  asin(x), acos(x), atan(x) - Inverse trig
+  exp(x)                   - e^x
+  pow(x, y)                - x^y
+  sqrt(x)                  - Square root
+  log(x)                   - Natural logarithm
+  log10(x)                 - Base-10 logarithm
 
 Pattern Matching:
   regmatch(pattern, str)   - Regex match, sets %P0-%P9 captures
@@ -867,6 +882,16 @@ World Functions:
   idle()                   - Seconds since last input
   sidle()                  - Seconds since last send
 
+Info Functions:
+  time()                   - Current Unix timestamp
+  ftime(fmt, time)         - Format timestamp (%Y %m %d %H %M %S)
+  columns()                - Screen width
+  lines()                  - Screen height
+  moresize()               - Lines queued at more prompt
+  getpid()                 - Process ID
+  systype()                - System type ("unix")
+  filename(path)           - Expand ~ in path
+
 Macro Functions:
   ismacro(name)            - Check if macro exists
   getopts(opts, args)      - Parse command options
@@ -878,10 +903,10 @@ Keyboard Buffer:
   kblen()                  - Input buffer length
   kbgoto(pos)              - Move cursor to position
   kbdel(count)             - Delete characters
-  kbmatch()                - Find matching brace/paren
+  kbmatch([pos])           - Find matching brace/paren
   kbword()                 - Word at cursor
-  kbwordleft()             - Move cursor left by word
-  kbwordright()            - Move cursor right by word
+  kbwordleft([pos])        - Position of word start left of pos
+  kbwordright([pos])       - Position past word end right of pos
   input(text)              - Insert text at cursor
 
 File I/O:
@@ -891,6 +916,7 @@ File I/O:
   tfwrite(handle, text)    - Write text to file
   tfflush(handle)          - Flush file buffer
   tfeof(handle)            - Check for end of file
+  fwrite(file, text)       - Append text to file (simple)
 
 Usage: $[function(args)] or in #expr/#test"#.to_string()
             )),
