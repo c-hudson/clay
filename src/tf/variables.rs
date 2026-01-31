@@ -361,6 +361,20 @@ pub fn substitute_commands(engine: &mut TfEngine, text: &str) -> String {
                         i += 1;
                     }
                 }
+                // ${varname} - variable substitution (TF syntax)
+                '{' => {
+                    if let Some((var_name, end_idx)) = extract_balanced(&chars, i + 2, '{', '}') {
+                        // Get variable value
+                        if let Some(value) = engine.get_var(&var_name) {
+                            result.push_str(&value.to_string_value());
+                        }
+                        // If variable not found, substitute empty string
+                        i = end_idx + 1;
+                    } else {
+                        result.push('$');
+                        i += 1;
+                    }
+                }
                 _ => {
                     result.push(chars[i]);
                     i += 1;

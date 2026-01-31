@@ -575,13 +575,41 @@ impl Parser {
                 }
             }
             Token::LBrace => {
-                // {varname} variable substitution
+                // {varname}, {*}, {n}, or {-n} substitution
                 self.advance();
-                if let Token::Identifier(name) = self.advance() {
+
+                // Check what's inside the braces
+                let is_star = matches!(self.peek(), Token::Star);
+                let is_minus = matches!(self.peek(), Token::Minus);
+                let integer_val = if let Token::Integer(n) = self.peek() { Some(*n) } else { None };
+                let ident_val = if let Token::Identifier(s) = self.peek() { Some(s.clone()) } else { None };
+
+                if is_star {
+                    // {*} - all arguments
+                    self.advance();
+                    self.expect(Token::RBrace)?;
+                    Ok(Expr::Variable("*".to_string()))
+                } else if is_minus {
+                    // {-n} - argument from end
+                    self.advance();
+                    if let Token::Integer(n) = self.advance() {
+                        self.expect(Token::RBrace)?;
+                        Ok(Expr::Variable(format!("-{}", n)))
+                    } else {
+                        Err("Expected number after - in {-n}".to_string())
+                    }
+                } else if let Some(n) = integer_val {
+                    // {n} - positional argument
+                    self.advance();
+                    self.expect(Token::RBrace)?;
+                    Ok(Expr::Variable(n.to_string()))
+                } else if let Some(name) = ident_val {
+                    // {varname} - variable
+                    self.advance();
                     self.expect(Token::RBrace)?;
                     Ok(Expr::Variable(name))
                 } else {
-                    Err("Expected identifier in {}".to_string())
+                    Err(format!("Expected identifier, *, or number in {{}}, got {:?}", self.peek()))
                 }
             }
             Token::LParen => {
@@ -667,9 +695,28 @@ impl<'a> Evaluator<'a> {
             Expr::Literal(val) => Ok(val.clone()),
 
             Expr::Variable(name) => {
-                self.engine.get_var(name)
+                // Handle special variable names for argument access
+                if name.starts_with('-') {
+                    // {-n} - argument from end (1-indexed from end)
+                    if let Ok(n) = name[1..].parse::<usize>() {
+                        // Get total argument count
+                        let argc = self.engine.get_var("#")
+                            .and_then(|v| v.to_int())
+                            .unwrap_or(0) as usize;
+                        if n > 0 && n <= argc {
+                            // -1 = last arg, -2 = second to last, etc.
+                            let idx = argc - n + 1;
+                            return self.engine.get_var(&idx.to_string())
+                                .cloned()
+                                .ok_or_else(|| format!("Argument {} not found", idx));
+                        }
+                    }
+                    return Ok(TfValue::String(String::new()));
+                }
+                // Return empty string for undefined variables (TF behavior)
+                Ok(self.engine.get_var(name)
                     .cloned()
-                    .ok_or_else(|| format!("Undefined variable: {}", name))
+                    .unwrap_or_else(|| TfValue::String(String::new())))
             }
 
             Expr::BinaryOp(left, op, right) => {
