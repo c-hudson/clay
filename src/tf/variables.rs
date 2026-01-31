@@ -306,6 +306,133 @@ pub fn substitute_captures(text: &str, full_match: &str, captures: &[&str], left
     result
 }
 
+/// Process command substitution $(...) and expression substitution $[...]
+/// Also handles \$ escape to produce literal $
+pub fn substitute_commands(engine: &mut TfEngine, text: &str) -> String {
+    let mut result = String::with_capacity(text.len());
+    let chars: Vec<char> = text.chars().collect();
+    let len = chars.len();
+    let mut i = 0;
+
+    while i < len {
+        if chars[i] == '\\' && i + 1 < len {
+            match chars[i + 1] {
+                // \$ -> literal $
+                '$' => {
+                    result.push('$');
+                    i += 2;
+                }
+                // \\ -> literal \
+                '\\' => {
+                    result.push('\\');
+                    i += 2;
+                }
+                // Other escapes - keep as-is for now
+                _ => {
+                    result.push(chars[i]);
+                    i += 1;
+                }
+            }
+        } else if chars[i] == '$' && i + 1 < len {
+            match chars[i + 1] {
+                // $(...) - command substitution
+                '(' => {
+                    if let Some((cmd, end_idx)) = extract_balanced(&chars, i + 2, '(', ')') {
+                        // Execute the command and capture output
+                        let output = execute_for_substitution(engine, &cmd);
+                        result.push_str(&output);
+                        i = end_idx + 1;
+                    } else {
+                        result.push('$');
+                        i += 1;
+                    }
+                }
+                // $[...] - expression substitution
+                '[' => {
+                    if let Some((expr, end_idx)) = extract_balanced(&chars, i + 2, '[', ']') {
+                        // Evaluate the expression
+                        match super::expressions::evaluate(engine, &expr) {
+                            Ok(value) => result.push_str(&value.to_string_value()),
+                            Err(_) => {} // Silent failure, substitute empty string
+                        }
+                        i = end_idx + 1;
+                    } else {
+                        result.push('$');
+                        i += 1;
+                    }
+                }
+                _ => {
+                    result.push(chars[i]);
+                    i += 1;
+                }
+            }
+        } else {
+            result.push(chars[i]);
+            i += 1;
+        }
+    }
+
+    result
+}
+
+/// Extract content between balanced delimiters (handles nesting)
+fn extract_balanced(chars: &[char], start: usize, open: char, close: char) -> Option<(String, usize)> {
+    let mut content = String::new();
+    let mut depth = 1;
+    let mut i = start;
+
+    while i < chars.len() {
+        if chars[i] == open {
+            depth += 1;
+            content.push(chars[i]);
+        } else if chars[i] == close {
+            depth -= 1;
+            if depth == 0 {
+                return Some((content, i));
+            }
+            content.push(chars[i]);
+        } else {
+            content.push(chars[i]);
+        }
+        i += 1;
+    }
+
+    None // Unbalanced
+}
+
+/// Execute a command for substitution and return its output
+fn execute_for_substitution(engine: &mut TfEngine, cmd: &str) -> String {
+    let cmd = cmd.trim();
+    if cmd.is_empty() {
+        return String::new();
+    }
+
+    // Execute the command
+    let result = if cmd.starts_with('#') || cmd.starts_with('/') {
+        super::parser::execute_command(engine, cmd)
+    } else {
+        // Non-command text - just return it as-is
+        return cmd.to_string();
+    };
+
+    // Extract output from result
+    match result {
+        super::TfCommandResult::Success(Some(msg)) => msg,
+        super::TfCommandResult::Success(None) => String::new(),
+        super::TfCommandResult::Error(e) => format!("[error: {}]", e),
+        super::TfCommandResult::SendToMud(text) => {
+            // Queue this to be sent later
+            engine.pending_commands.push(super::TfCommand {
+                command: text,
+                world: None,
+                no_eol: false,
+            });
+            String::new()
+        }
+        _ => String::new(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -361,5 +488,29 @@ mod tests {
             substitute_captures("%PL[%P0]%PR", "MATCH", &captures, "before ", " after"),
             "before [MATCH] after"
         );
+    }
+
+    #[test]
+    fn test_substitute_commands_escape() {
+        let mut engine = TfEngine::new();
+        // \$ should become literal $
+        assert_eq!(substitute_commands(&mut engine, r"say \$(test)"), "say $(test)");
+        // \\ should become literal \
+        assert_eq!(substitute_commands(&mut engine, r"say \\hello"), r"say \hello");
+    }
+
+    #[test]
+    fn test_substitute_commands_expression() {
+        let mut engine = TfEngine::new();
+        // $[expr] should evaluate expression
+        assert_eq!(substitute_commands(&mut engine, "value is $[2 + 3]"), "value is 5");
+        assert_eq!(substitute_commands(&mut engine, "$[strlen(\"hello\")]"), "5");
+    }
+
+    #[test]
+    fn test_substitute_commands_nested() {
+        let mut engine = TfEngine::new();
+        // Nested parentheses should work
+        assert_eq!(substitute_commands(&mut engine, "$[max(1, min(5, 3))]"), "3");
     }
 }

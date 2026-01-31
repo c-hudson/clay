@@ -454,9 +454,13 @@ pub fn execute_macro(
             continue;
         }
 
+        // Process command/expression substitution ($(...) and $[...])
+        let cmd = variables::substitute_commands(engine, cmd);
+        let cmd = cmd.trim();
+
         // Execute the command
         let result = if cmd.starts_with('#') {
-            super::parser::execute_command(engine, cmd)
+            super::parser::execute_command(engine, &cmd)
         } else if cmd.starts_with('/') {
             TfCommandResult::ClayCommand(cmd.to_string())
         } else {
