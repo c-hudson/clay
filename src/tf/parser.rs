@@ -192,7 +192,7 @@ pub fn execute_command(engine: &mut TfEngine, input: &str) -> TfCommandResult {
                     args.split_whitespace().collect()
                 };
                 let results = macros::execute_macro(engine, &macro_def, &macro_args, None);
-                aggregate_results(results)
+                aggregate_results_with_engine(engine, results)
             } else {
                 TfCommandResult::UnknownCommand(cmd.to_string())
             }
@@ -200,7 +200,51 @@ pub fn execute_command(engine: &mut TfEngine, input: &str) -> TfCommandResult {
     }
 }
 
-/// Aggregate multiple results into one
+/// Aggregate multiple results into one, queuing SendToMud commands in the engine
+fn aggregate_results_with_engine(engine: &mut super::TfEngine, results: Vec<TfCommandResult>) -> TfCommandResult {
+    let mut messages = vec![];
+    let mut has_error = false;
+    let mut pending_clay_commands = vec![];
+
+    for result in results {
+        match result {
+            TfCommandResult::Success(Some(msg)) => messages.push(msg),
+            TfCommandResult::Error(e) if e != "__break__" => {
+                messages.push(format!("Error: {}", e));
+                has_error = true;
+            }
+            TfCommandResult::SendToMud(cmd) => {
+                // Queue the command to be sent by the main app
+                engine.pending_commands.push(super::TfCommand {
+                    command: cmd,
+                    world: None,
+                    no_eol: false,
+                });
+            }
+            TfCommandResult::ClayCommand(cmd) => {
+                // Collect clay commands to return (first one wins)
+                pending_clay_commands.push(cmd);
+            }
+            _ => {}
+        }
+    }
+
+    // If there are pending clay commands, return the first one
+    if let Some(clay_cmd) = pending_clay_commands.into_iter().next() {
+        return TfCommandResult::ClayCommand(clay_cmd);
+    }
+
+    if has_error {
+        TfCommandResult::Error(messages.join("\n"))
+    } else if messages.is_empty() {
+        TfCommandResult::Success(None)
+    } else {
+        TfCommandResult::Success(Some(messages.join("\n")))
+    }
+}
+
+/// Aggregate multiple results into one (without engine access - for tests)
+#[allow(dead_code)]
 fn aggregate_results(results: Vec<TfCommandResult>) -> TfCommandResult {
     let mut messages = vec![];
     let mut has_error = false;

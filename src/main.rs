@@ -9024,6 +9024,8 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                 }
                                 // Process any pending world operations from TF functions like addworld()
                                 process_pending_world_ops(&mut app);
+                                // Process any pending commands from TF macro execution
+                                process_pending_tf_commands(&mut app);
                                 // Process any pending keyboard operations from TF functions like kbgoto()
                                 app.process_pending_keyboard_ops();
                             } else if app.current_world().connected {
@@ -15169,6 +15171,36 @@ fn process_pending_world_ops(app: &mut App) {
         let _ = persistence::save_settings(app);
 
         // addworld() function should be silent on success (only errors are reported)
+    }
+}
+
+/// Process any pending commands queued by TF macro execution
+fn process_pending_tf_commands(app: &mut App) {
+    // Drain pending commands
+    let cmds: Vec<tf::TfCommand> = app.tf_engine.pending_commands.drain(..).collect();
+
+    for cmd in cmds {
+        // Determine target world
+        let world_idx = if let Some(ref world_name) = cmd.world {
+            // Find world by name
+            app.worlds.iter().position(|w| w.name.eq_ignore_ascii_case(world_name))
+                .unwrap_or(app.current_world_index)
+        } else {
+            app.current_world_index
+        };
+
+        // Send command to the world
+        if world_idx < app.worlds.len() && app.worlds[world_idx].connected {
+            if let Some(tx) = &app.worlds[world_idx].command_tx {
+                let text = if cmd.no_eol {
+                    cmd.command.clone()
+                } else {
+                    cmd.command.clone()
+                };
+                let _ = tx.try_send(WriteCommand::Text(text));
+                app.worlds[world_idx].last_send_time = Some(std::time::Instant::now());
+            }
+        }
     }
 }
 
