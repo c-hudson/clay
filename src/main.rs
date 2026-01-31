@@ -3545,11 +3545,6 @@ impl App {
                 .chain(world.pending_lines.iter())
                 .map(|s| {
                     let text = s.text.replace('\r', "");
-                    let text = if !s.from_server {
-                        format!("✨ {}", text)
-                    } else {
-                        text
-                    };
                     TimestampedLine {
                         text,
                         ts: s.timestamp.duration_since(UNIX_EPOCH).unwrap_or_default().as_secs(),
@@ -15621,12 +15616,6 @@ fn render_output_crossterm(app: &App) {
         // Convert Discord custom emojis to :name: for console display
         // and colorize square emoji (🟩🟨 etc.) with ANSI codes
         let text = colorize_square_emojis(&convert_discord_emojis(&line.text));
-        // Add ✨ prefix for client-generated messages
-        let text = if !line.from_server {
-            format!("✨ {}", text)
-        } else {
-            text
-        };
         let processed = if show_tags {
             // Show timestamp + original text when tags are shown
             // Convert temperatures only if both show_tags AND temp_convert are enabled
