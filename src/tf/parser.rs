@@ -896,6 +896,12 @@ Macro Functions:
   ismacro(name)            - Check if macro exists
   getopts(opts, args)      - Parse command options
 
+Command Functions:
+  echo(text [,attrs])      - Display local message (queues output)
+  send(text [,world])      - Send text to MUD (queues command)
+  substitute(text [,attrs]) - Replace trigger line with text
+  keycode(str)             - Key sequence for string (^X for ctrl)
+
 Keyboard Buffer:
   kbhead()                 - Text before cursor
   kbtail()                 - Text after cursor

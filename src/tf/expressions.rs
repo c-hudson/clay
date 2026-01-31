@@ -2197,6 +2197,103 @@ impl<'a> Evaluator<'a> {
                 }
             }
 
+            // echo(s [,attrs [,dest [,inline]]]) - function form of #echo
+            // Returns 1 on success
+            "echo" => {
+                if args.is_empty() {
+                    return Err("echo requires at least 1 argument (text)".to_string());
+                }
+                let text = self.eval(&args[0])?.to_string_value();
+                let attrs = if args.len() > 1 {
+                    self.eval(&args[1])?.to_string_value()
+                } else {
+                    String::new()
+                };
+                // dest and inline are ignored in our implementation
+                // Queue the echo for main app to process
+                self.engine.pending_outputs.push(super::TfOutput {
+                    text,
+                    attrs,
+                    world: None,
+                });
+                Ok(TfValue::Integer(1))
+            }
+
+            // send(s [,world [,flags]]) - function form of #send
+            // Returns 1 on success
+            "send" => {
+                if args.is_empty() {
+                    return Err("send requires at least 1 argument (text)".to_string());
+                }
+                let text = self.eval(&args[0])?.to_string_value();
+                let world = if args.len() > 1 {
+                    let w = self.eval(&args[1])?.to_string_value();
+                    if w.is_empty() { None } else { Some(w) }
+                } else {
+                    None
+                };
+                // flags argument is ignored in our implementation
+                self.engine.pending_commands.push(super::TfCommand {
+                    command: text,
+                    world,
+                    no_eol: false,
+                });
+                Ok(TfValue::Integer(1))
+            }
+
+            // substitute(s [,attrs [,inline]]) - replace trigger text with substituted text
+            // Returns 1 on success (but only works during trigger execution)
+            "substitute" => {
+                if args.is_empty() {
+                    return Err("substitute requires at least 1 argument (text)".to_string());
+                }
+                let text = self.eval(&args[0])?.to_string_value();
+                let attrs = if args.len() > 1 {
+                    self.eval(&args[1])?.to_string_value()
+                } else {
+                    String::new()
+                };
+                // inline is ignored - we always substitute inline
+                // Queue the substitution for main app to process
+                self.engine.pending_substitution = Some(super::TfSubstitution {
+                    text,
+                    attrs,
+                });
+                Ok(TfValue::Integer(1))
+            }
+
+            // keycode(s) - return the key sequence that generates the given string
+            // This is the inverse of key binding - what keys produce this character
+            "keycode" => {
+                if args.len() != 1 {
+                    return Err("keycode requires 1 argument (string)".to_string());
+                }
+                let s = self.eval(&args[0])?.to_string_value();
+
+                // Return the key sequence representation
+                // For control characters, return ^X format
+                // For regular characters, return as-is
+                let mut result = String::new();
+                for c in s.chars() {
+                    let code = c as u32;
+                    if code < 32 {
+                        // Control character
+                        result.push('^');
+                        result.push(char::from_u32(code + 64).unwrap_or('?'));
+                    } else if code == 127 {
+                        // DEL
+                        result.push_str("^?");
+                    } else if code >= 128 {
+                        // Meta/Alt character - represent as @X
+                        result.push('@');
+                        result.push(char::from_u32(code - 128).unwrap_or('?'));
+                    } else {
+                        result.push(c);
+                    }
+                }
+                Ok(TfValue::String(result))
+            }
+
             _ => Err(format!("Unknown function: {}", name)),
         }
     }
@@ -2462,5 +2559,47 @@ mod tests {
         assert_eq!(glob_to_regex("hel*"), "^hel.*$");
         assert_eq!(glob_to_regex("h?llo"), "^h.llo$");
         assert_eq!(glob_to_regex("test.txt"), r"^test\.txt$");
+    }
+
+    #[test]
+    fn test_echo_function() {
+        let mut engine = TfEngine::new();
+        // echo() should queue an output and return 1
+        let result = evaluate(&mut engine, r#"echo("Hello world")"#).unwrap();
+        assert_eq!(result, TfValue::Integer(1));
+        assert_eq!(engine.pending_outputs.len(), 1);
+        assert_eq!(engine.pending_outputs[0].text, "Hello world");
+    }
+
+    #[test]
+    fn test_send_function() {
+        let mut engine = TfEngine::new();
+        // send() should queue a command and return 1
+        let result = evaluate(&mut engine, r#"send("look")"#).unwrap();
+        assert_eq!(result, TfValue::Integer(1));
+        assert_eq!(engine.pending_commands.len(), 1);
+        assert_eq!(engine.pending_commands[0].command, "look");
+    }
+
+    #[test]
+    fn test_substitute_function() {
+        let mut engine = TfEngine::new();
+        // substitute() should set pending_substitution and return 1
+        let result = evaluate(&mut engine, r#"substitute("replaced text")"#).unwrap();
+        assert_eq!(result, TfValue::Integer(1));
+        assert!(engine.pending_substitution.is_some());
+        assert_eq!(engine.pending_substitution.unwrap().text, "replaced text");
+    }
+
+    #[test]
+    fn test_keycode_function() {
+        let mut engine = TfEngine::new();
+        // Regular characters return as-is
+        assert_eq!(evaluate(&mut engine, r#"keycode("abc")"#).unwrap(), TfValue::String("abc".to_string()));
+        // Control characters return ^X format
+        assert_eq!(evaluate(&mut engine, "keycode(char(1))").unwrap(), TfValue::String("^A".to_string()));
+        assert_eq!(evaluate(&mut engine, "keycode(char(3))").unwrap(), TfValue::String("^C".to_string()));
+        // DEL returns ^?
+        assert_eq!(evaluate(&mut engine, "keycode(char(127))").unwrap(), TfValue::String("^?".to_string()));
     }
 }

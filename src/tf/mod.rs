@@ -333,6 +333,12 @@ pub struct TfEngine {
     pub keyboard_state: KeyboardBufferState,
     /// Pending keyboard operations to be processed by main app
     pub pending_keyboard_ops: Vec<PendingKeyboardOp>,
+    /// Pending commands to send (from send() function)
+    pub pending_commands: Vec<TfCommand>,
+    /// Pending echo outputs (from echo() function)
+    pub pending_outputs: Vec<TfOutput>,
+    /// Pending substitution (from substitute() function)
+    pub pending_substitution: Option<TfSubstitution>,
 }
 
 /// A pending world operation to be processed by the main app
@@ -377,6 +383,29 @@ pub enum PendingKeyboardOp {
     WordRight,
     /// Insert text at cursor
     Insert(String),
+}
+
+/// A pending command to send to a world (from send() function)
+#[derive(Debug, Clone)]
+pub struct TfCommand {
+    pub command: String,
+    pub world: Option<String>,
+    pub no_eol: bool,
+}
+
+/// A pending echo output (from echo() function)
+#[derive(Debug, Clone)]
+pub struct TfOutput {
+    pub text: String,
+    pub attrs: String,
+    pub world: Option<String>,
+}
+
+/// A pending substitution (from substitute() function)
+#[derive(Debug, Clone)]
+pub struct TfSubstitution {
+    pub text: String,
+    pub attrs: String,
 }
 
 /// File handle mode for TF file I/O
