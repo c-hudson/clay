@@ -210,10 +210,19 @@ fn parse_option(input: &str) -> Result<(DefOption, &str), String> {
 }
 
 /// Parse a quoted string or a word (non-whitespace sequence)
+/// Handles both double quotes ("...") and single quotes ('...')
 fn parse_quoted_or_word(input: &str) -> Result<(String, &str), String> {
     let input = input.trim_start();
 
-    if input.starts_with('"') {
+    let quote_char = if input.starts_with('"') {
+        Some('"')
+    } else if input.starts_with('\'') {
+        Some('\'')
+    } else {
+        None
+    };
+
+    if let Some(quote) = quote_char {
         // Quoted string
         let mut end = 1;
         let chars: Vec<char> = input.chars().collect();
@@ -224,7 +233,7 @@ fn parse_quoted_or_word(input: &str) -> Result<(String, &str), String> {
                 // Escape sequence
                 result.push(chars[end + 1]);
                 end += 2;
-            } else if chars[end] == '"' {
+            } else if chars[end] == quote {
                 // End of quoted string
                 let byte_end = input.char_indices()
                     .nth(end + 1)

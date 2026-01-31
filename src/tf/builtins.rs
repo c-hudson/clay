@@ -1221,4 +1221,49 @@ mod tests {
         assert!(matches!(result, TfCommandResult::Success(_)));
         assert!(!engine.macros.iter().any(|m| m.attributes.gag && m.trigger.as_ref().map(|t| t.pattern == "spam*").unwrap_or(false)));
     }
+
+    #[test]
+    fn test_load_crypt_tf() {
+        let mut engine = TfEngine::new();
+
+        // Load crypt.tf from the project root
+        let result = cmd_load(&mut engine, "crypt.tf");
+
+        // Check loading succeeded (or at least didn't hard error)
+        // Note: Some commands like #passwd might produce errors since they try to execute
+        match &result {
+            TfCommandResult::Success(_) => {
+                // Good - loaded successfully
+            }
+            TfCommandResult::Error(e) => {
+                // Check it's not a file-not-found error
+                assert!(!e.contains("Cannot open"), "Failed to open crypt.tf: {}", e);
+                // Other errors might be OK (e.g., from executing #passwd)
+            }
+            _ => {}
+        }
+
+        // Verify macros were defined
+        let macro_names: Vec<&str> = engine.macros.iter().map(|m| m.name.as_str()).collect();
+
+        // Check that key macros exist
+        assert!(macro_names.contains(&"random"), "random macro not defined");
+        assert!(macro_names.contains(&"passwd"), "passwd macro not defined");
+        assert!(macro_names.contains(&"encrypt"), "encrypt macro not defined");
+        assert!(macro_names.contains(&"decrypt"), "decrypt macro not defined");
+        assert!(macro_names.contains(&"makeprintable"), "makeprintable macro not defined");
+        assert!(macro_names.contains(&"e"), "e macro not defined");
+        assert!(macro_names.contains(&"p"), "p macro not defined");
+        assert!(macro_names.contains(&"listen_mush"), "listen_mush macro not defined");
+
+        // Verify that %R was preserved in the random macro body
+        let random_macro = engine.macros.iter().find(|m| m.name == "random").unwrap();
+        assert!(random_macro.body.contains("%R"),
+            "random macro body should contain %R, got: {}", random_macro.body);
+
+        // Verify listen_mush has a trigger pattern
+        let listen_macro = engine.macros.iter().find(|m| m.name == "listen_mush").unwrap();
+        assert!(listen_macro.trigger.is_some(), "listen_mush should have a trigger");
+        assert_eq!(listen_macro.priority, 5000, "listen_mush should have priority 5000");
+    }
 }
