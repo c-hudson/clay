@@ -1383,4 +1383,38 @@ mod tests {
         let result = execute_command(&mut engine, "#nonexistent");
         assert!(matches!(result, TfCommandResult::UnknownCommand(_)));
     }
+
+    #[test]
+    fn test_def_command_body_parsing() {
+        let mut engine = TfEngine::new();
+
+        // Define a macro using #def command
+        let result = execute_command(&mut engine, "#def foo = bar");
+        assert!(matches!(result, TfCommandResult::Success(_)));
+
+        // Check the macro was defined correctly
+        let macro_def = engine.macros.iter().find(|m| m.name == "foo").unwrap();
+        assert_eq!(macro_def.name, "foo");
+        assert_eq!(macro_def.body, "bar", "Body should be 'bar', not '= bar'");
+    }
+
+    #[test]
+    fn test_def_and_invoke_macro() {
+        let mut engine = TfEngine::new();
+
+        // Define a macro that echoes
+        let result = execute_command(&mut engine, "#def greet = #echo Hello World");
+        assert!(matches!(result, TfCommandResult::Success(_)));
+
+        // Verify the body doesn't include the =
+        let macro_def = engine.macros.iter().find(|m| m.name == "greet").unwrap();
+        assert_eq!(macro_def.body, "#echo Hello World");
+
+        // Invoke the macro
+        let result = execute_command(&mut engine, "#greet");
+        match result {
+            TfCommandResult::Success(Some(msg)) => assert_eq!(msg, "Hello World"),
+            _ => panic!("Expected success with 'Hello World', got {:?}", result),
+        }
+    }
 }

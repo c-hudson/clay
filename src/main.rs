@@ -1799,13 +1799,19 @@ impl World {
         from_server: bool,
     ) {
 
-        // Clear splash mode when MUD data is received (not for client messages)
-        if clear_splash && self.showing_splash {
-            self.showing_splash = false;
-            self.needs_redraw = true; // Signal terminal needs full redraw
-            // Clear splash content from output_lines so MUD data starts fresh
-            self.output_lines.clear();
-            self.scroll_offset = 0;
+        // Handle splash mode transitions
+        if self.showing_splash {
+            if clear_splash {
+                // MUD server data: clear splash mode AND clear buffer
+                self.showing_splash = false;
+                self.needs_redraw = true; // Signal terminal needs full redraw
+                self.output_lines.clear();
+                self.scroll_offset = 0;
+            } else {
+                // Client message: just disable centering, keep splash content
+                self.showing_splash = false;
+                self.needs_redraw = true;
+            }
         }
         let max_lines = (output_height as usize).saturating_sub(2);
 
