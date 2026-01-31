@@ -1350,7 +1350,7 @@
                 if (msg.success) {
                     showPasswordModal(false);
                     // Show brief success message in output
-                    addSystemMessage('Password changed successfully.');
+                    appendClientLine('Password changed successfully.', currentWorldIndex, 'system');
                 } else {
                     elements.passwordError.textContent = msg.error || 'Password change failed';
                 }
@@ -2543,10 +2543,21 @@
         return html;
     }
 
-    // Append a client-generated message (with ✨ prefix)
-    function appendLine(text, worldIndex) {
+    // Append a client-generated message to output
+    // style: 'info' (✨ prefix) or 'system' (yellow %% prefix)
+    function appendClientLine(text, worldIndex = currentWorldIndex, style = 'info') {
+        const prefixes = {
+            info: '✨ ',
+            system: '\x1b[33m%% '
+        };
+        const suffixes = {
+            info: '',
+            system: '\x1b[0m'
+        };
+        const prefix = prefixes[style] || prefixes.info;
+        const suffix = suffixes[style] || '';
+        const clientText = prefix + text + suffix;
         const ts = Math.floor(Date.now() / 1000);
-        const clientText = `✨ ${text}`;
         if (worldIndex >= 0 && worldIndex < worlds.length) {
             const lineIndex = worlds[worldIndex].output_lines.length;
             worlds[worldIndex].output_lines.push({ text: clientText, ts: ts });
@@ -3459,19 +3470,6 @@
         }
     }
 
-    // Add a system message to the current world's output
-    function addSystemMessage(text) {
-        const currentWorld = worlds[currentWorldIndex];
-        if (currentWorld) {
-            const ts = Math.floor(Date.now() / 1000);
-            currentWorld.output_lines.push({ text: '\x1b[33m%% ' + text + '\x1b[0m', ts: ts });
-            if (worldOutputCache[currentWorldIndex]) {
-                worldOutputCache[currentWorldIndex] = []; // Clear cache to force re-render
-            }
-            renderOutput();
-        }
-    }
-
     // Actions popup functions (split into List and Editor)
 
     // Open Actions List popup
@@ -3881,7 +3879,7 @@
     function openWebPopup() {
         // Block web settings in multiuser mode
         if (multiuserMode) {
-            addSystemMessage('Web settings are disabled in multiuser mode.');
+            appendClientLine('Web settings are disabled in multiuser mode.', currentWorldIndex, 'system');
             return;
         }
         webPopupOpen = true;
@@ -4425,7 +4423,7 @@
     function openWorldEditorPopup(worldIndex) {
         // Block world editing in multiuser mode
         if (multiuserMode) {
-            addSystemMessage('World editing is disabled in multiuser mode.');
+            appendClientLine('World editing is disabled in multiuser mode.', currentWorldIndex, 'system');
             return;
         }
         if (worldIndex < 0 || worldIndex >= worlds.length) return;
@@ -4620,12 +4618,12 @@
                     });
                 } else {
                     // No settings - show error
-                    appendLine('No connection settings configured for this world.', worldIndex);
+                    appendClientLine('No connection settings configured for this world.', worldIndex);
                 }
             }
         } else {
             // World not found - show error message locally
-            appendLine(`World '${worldName}' not found.`, currentWorldIndex);
+            appendClientLine(`World '${worldName}' not found.`);
         }
     }
 
@@ -4771,7 +4769,7 @@
                     Android.openServerSettings();
                 } else {
                     // Fallback for browser: show a message
-                    appendLine('Clay Server settings only available in Android app.', currentWorldIndex);
+                    appendClientLine('Clay Server settings only available in Android app.');
                 }
                 break;
             case 'change-password':
