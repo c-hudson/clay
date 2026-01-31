@@ -58,7 +58,7 @@ pub fn register_hook(engine: &mut TfEngine, event: TfHookEvent, command: String)
         ..Default::default()
     };
 
-    engine.macros.push(macro_def);
+    engine.add_macro(macro_def);
     engine.hooks.entry(event).or_default().push(name);
 }
 

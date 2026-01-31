@@ -283,6 +283,7 @@ pub struct TfMacro {
     pub condition: Option<String>,  // Expression to evaluate before firing
     pub probability: Option<f32>,   // 0.0 to 1.0
     pub world: Option<String>,      // Restrict to specific world
+    pub sequence_number: u32,       // Sequential definition number (TF-compatible)
 }
 
 /// The TinyFugue scripting engine
@@ -310,6 +311,8 @@ pub struct TfEngine {
     pub processes: Vec<TfProcess>,
     /// Next process ID counter
     pub next_process_id: u32,
+    /// Next macro sequence number (for TF-compatible numbering)
+    pub next_macro_sequence: u32,
     /// Tokens for files already loaded via #loaded/#require
     pub loaded_tokens: std::collections::HashSet<String>,
     /// Stack of files currently being loaded (for nested loads)
@@ -448,6 +451,22 @@ impl TfEngine {
     /// Handles %{varname}, %varname, and {varname} in expressions
     pub fn substitute_vars(&self, text: &str) -> String {
         variables::substitute_variables(self, text)
+    }
+
+    /// Add a macro with an assigned sequence number
+    pub fn add_macro(&mut self, mut macro_def: TfMacro) -> u32 {
+        let seq = self.next_macro_sequence;
+        self.next_macro_sequence += 1;
+        macro_def.sequence_number = seq;
+        self.macros.push(macro_def);
+        seq
+    }
+
+    /// Replace an existing macro at the given index, preserving its sequence number
+    pub fn replace_macro(&mut self, idx: usize, mut macro_def: TfMacro) {
+        // Preserve the original sequence number when redefining
+        macro_def.sequence_number = self.macros[idx].sequence_number;
+        self.macros[idx] = macro_def;
     }
 }
 

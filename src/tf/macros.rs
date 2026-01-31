@@ -547,9 +547,10 @@ pub fn list_macros(engine: &TfEngine, pattern: Option<&str>) -> String {
             }
         }
 
-        output.push_str(&format!("{}: ", macro_def.name));
+        // Format: N: #def [opts] name = body (sparkle added by output system)
+        output.push_str(&format!("{}: #def ", macro_def.sequence_number));
 
-        // Show trigger if present
+        // Show trigger if present (before name, like TF)
         if let Some(ref trigger) = macro_def.trigger {
             if !trigger.pattern.is_empty() {
                 output.push_str(&format!("-t\"{}\" ", trigger.pattern));
@@ -577,7 +578,7 @@ pub fn list_macros(engine: &TfEngine, pattern: Option<&str>) -> String {
             output.push_str(&format!("-h{:?} ", hook));
         }
 
-        output.push_str(&format!("= {}\n", macro_def.body));
+        output.push_str(&format!("{} = {}\n", macro_def.name, macro_def.body));
     }
 
     if output.is_empty() {
@@ -726,12 +727,12 @@ mod tests {
     #[test]
     fn test_list_macros() {
         let mut engine = TfEngine::new();
-        engine.macros.push(TfMacro {
+        engine.add_macro(TfMacro {
             name: "greet".to_string(),
             body: "say Hello!".to_string(),
             ..Default::default()
         });
-        engine.macros.push(TfMacro {
+        engine.add_macro(TfMacro {
             name: "attack".to_string(),
             body: "kick".to_string(),
             trigger: Some(TfTrigger {
@@ -743,8 +744,8 @@ mod tests {
         });
 
         let output = list_macros(&engine, None);
-        assert!(output.contains("greet:"));
-        assert!(output.contains("attack:"));
-        assert!(output.contains("-t\"^You hit\""));
+        // Format: N: #def [opts] name = body
+        assert!(output.contains("0: #def greet = say Hello!"));
+        assert!(output.contains("1: #def -t\"^You hit\" attack = kick"));
     }
 }

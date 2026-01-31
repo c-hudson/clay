@@ -59,9 +59,30 @@ pub fn execute_command(engine: &mut TfEngine, input: &str) -> TfCommandResult {
         return TfCommandResult::NotTfCommand;
     }
 
-    // Perform variable substitution before parsing
-    let substituted = engine.substitute_vars(input);
-    let input = substituted.trim();
+    // Check if this is a #def command - if so, don't substitute variables in the body
+    // The body should be stored literally and only substituted when executed
+    let rest_check = input[1..].trim_start();
+    let is_def_command = rest_check.to_lowercase().starts_with("def ")
+        || rest_check.to_lowercase().starts_with("def\t")
+        || rest_check.to_lowercase() == "def";
+
+    // Perform variable substitution before parsing (except for #def bodies)
+    let input = if is_def_command {
+        // For #def, only substitute variables in options, not in the body
+        // Find the = separator and only substitute before it
+        if let Some(eq_pos) = input.find('=') {
+            let before_eq = &input[..eq_pos];
+            let after_eq = &input[eq_pos..];
+            let substituted_before = engine.substitute_vars(before_eq);
+            format!("{}{}", substituted_before, after_eq)
+        } else {
+            // No body (just #def or #def with options but no =), substitute normally
+            engine.substitute_vars(input)
+        }
+    } else {
+        engine.substitute_vars(input)
+    };
+    let input = input.trim();
 
     // Skip the # and parse the command
     let rest = &input[1..];
@@ -971,10 +992,10 @@ fn cmd_def(engine: &mut TfEngine, args: &str) -> TfCommandResult {
 
             // Replace existing or add new
             if let Some(idx) = existing_idx {
-                engine.macros[idx] = macro_def;
+                engine.replace_macro(idx, macro_def);
                 TfCommandResult::Success(Some("Macro redefined.".to_string()))
             } else {
-                engine.macros.push(macro_def);
+                engine.add_macro(macro_def);
                 TfCommandResult::Success(None)
             }
         }
@@ -1430,5 +1451,52 @@ mod tests {
             TfCommandResult::Success(Some(msg)) => assert_eq!(msg, "Hello World"),
             _ => panic!("Expected success with 'Hello World', got {:?}", result),
         }
+    }
+
+    #[test]
+    fn test_macro_sequence_numbers() {
+        let mut engine = TfEngine::new();
+
+        // Define several macros
+        execute_command(&mut engine, "#def first = one");
+        execute_command(&mut engine, "#def second = two");
+        execute_command(&mut engine, "#def third = three");
+
+        // Check sequence numbers
+        let first = engine.macros.iter().find(|m| m.name == "first").unwrap();
+        let second = engine.macros.iter().find(|m| m.name == "second").unwrap();
+        let third = engine.macros.iter().find(|m| m.name == "third").unwrap();
+
+        assert_eq!(first.sequence_number, 0);
+        assert_eq!(second.sequence_number, 1);
+        assert_eq!(third.sequence_number, 2);
+
+        // Redefine a macro - should keep its original sequence number
+        execute_command(&mut engine, "#def second = two_updated");
+        let second = engine.macros.iter().find(|m| m.name == "second").unwrap();
+        assert_eq!(second.sequence_number, 1, "Redefining a macro should preserve its sequence number");
+        assert_eq!(second.body, "two_updated");
+
+        // Check #list output contains sequence numbers
+        let list_output = super::super::macros::list_macros(&engine, None);
+        assert!(list_output.contains("0: #def"), "List should contain sequence number 0");
+        assert!(list_output.contains("1: #def"), "List should contain sequence number 1");
+        assert!(list_output.contains("2: #def"), "List should contain sequence number 2");
+    }
+
+    #[test]
+    fn test_def_preserves_variables_in_body() {
+        let mut engine = TfEngine::new();
+
+        // Define a macro with %R and other variables in the body
+        // These should NOT be substituted during definition
+        execute_command(&mut engine, "#def random = #echo -- %R");
+        execute_command(&mut engine, "#def test = #echo %{foo} %1 %* %L");
+
+        let random = engine.macros.iter().find(|m| m.name == "random").unwrap();
+        assert_eq!(random.body, "#echo -- %R", "Body should preserve %R literally");
+
+        let test = engine.macros.iter().find(|m| m.name == "test").unwrap();
+        assert_eq!(test.body, "#echo %{foo} %1 %* %L", "Body should preserve all variable references");
     }
 }

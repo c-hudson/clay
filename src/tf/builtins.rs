@@ -430,8 +430,9 @@ pub fn cmd_gag(engine: &mut TfEngine, args: &str) -> TfCommandResult {
     }
 
     // Create a macro with gag attribute
+    let gag_name = format!("__gag_{}", engine.next_macro_sequence);
     let macro_def = super::TfMacro {
-        name: format!("__gag_{}", engine.macros.len()),
+        name: gag_name,
         body: String::new(),
         trigger: Some(super::TfTrigger {
             pattern: pattern.to_string(),
@@ -445,7 +446,7 @@ pub fn cmd_gag(engine: &mut TfEngine, args: &str) -> TfCommandResult {
         ..Default::default()
     };
 
-    engine.macros.push(macro_def);
+    engine.add_macro(macro_def);
     TfCommandResult::Success(Some(format!("Gagging '{}'", pattern)))
 }
 
@@ -568,7 +569,7 @@ fn load_file_internal(engine: &mut TfEngine, filename: &str, quiet: bool) -> TfC
     // Show loading message unless quiet
     let mut results = Vec::new();
     if !quiet {
-        results.push(TfCommandResult::Success(Some(format!("✨ Loading commands from {}", resolved))));
+        results.push(TfCommandResult::Success(Some(format!("Loading commands from {}", resolved))));
     }
 
     let reader = BufReader::new(file);
@@ -665,7 +666,7 @@ fn load_file_internal(engine: &mut TfEngine, filename: &str, quiet: bool) -> TfC
 
     if !errors.is_empty() {
         // Build multi-line output with summary and error details
-        let mut output = format!("✨ Loaded '{}' with {} error(s)", resolved, errors.len());
+        let mut output = format!("Loaded '{}' with {} error(s)", resolved, errors.len());
         for error in &errors {
             output.push_str(&format!("\n   {}", error));
         }
