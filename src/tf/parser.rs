@@ -226,11 +226,12 @@ fn split_command(input: &str) -> (&str, &str) {
 // Command Implementations
 // =============================================================================
 
-/// #set varname value - Set a global variable
+/// #set varname=value - Set a global variable
+/// Supports both #set var=value and #set var = value
 fn cmd_set(engine: &mut TfEngine, args: &str) -> TfCommandResult {
-    let parts: Vec<&str> = args.splitn(2, char::is_whitespace).collect();
+    let args = args.trim();
 
-    if parts.is_empty() || parts[0].is_empty() {
+    if args.is_empty() {
         // No args: list all variables
         if engine.global_vars.is_empty() {
             return TfCommandResult::Success(Some("No variables set.".to_string()));
@@ -244,7 +245,18 @@ fn cmd_set(engine: &mut TfEngine, args: &str) -> TfCommandResult {
         return TfCommandResult::Success(Some(lines.join("\n")));
     }
 
-    let name = parts[0];
+    // Parse name=value or name = value
+    let (name, value) = if let Some(eq_pos) = args.find('=') {
+        let name = args[..eq_pos].trim();
+        let value = args[eq_pos + 1..].trim();
+        (name, value)
+    } else {
+        // No = found, treat as name with empty value (or could be just a name to query)
+        let parts: Vec<&str> = args.splitn(2, char::is_whitespace).collect();
+        let name = parts[0];
+        let value = if parts.len() > 1 { parts[1] } else { "" };
+        (name, value)
+    };
 
     // Validate variable name
     if !is_valid_var_name(name) {
@@ -254,13 +266,7 @@ fn cmd_set(engine: &mut TfEngine, args: &str) -> TfCommandResult {
         ));
     }
 
-    let value = if parts.len() > 1 {
-        TfValue::from(parts[1])
-    } else {
-        TfValue::String(String::new())
-    };
-
-    engine.set_global(name, value);
+    engine.set_global(name, TfValue::from(value));
     TfCommandResult::Success(None)
 }
 
@@ -279,15 +285,27 @@ fn cmd_unset(engine: &mut TfEngine, args: &str) -> TfCommandResult {
     }
 }
 
-/// #let varname value - Set a local variable
+/// #let varname=value - Set a local variable
+/// Supports both #let var=value and #let var = value
 fn cmd_let(engine: &mut TfEngine, args: &str) -> TfCommandResult {
-    let parts: Vec<&str> = args.splitn(2, char::is_whitespace).collect();
+    let args = args.trim();
 
-    if parts.is_empty() || parts[0].is_empty() {
-        return TfCommandResult::Error("Usage: #let varname value".to_string());
+    if args.is_empty() {
+        return TfCommandResult::Error("Usage: #let varname=value".to_string());
     }
 
-    let name = parts[0];
+    // Parse name=value or name = value
+    let (name, value) = if let Some(eq_pos) = args.find('=') {
+        let name = args[..eq_pos].trim();
+        let value = args[eq_pos + 1..].trim();
+        (name, value)
+    } else {
+        // No = found, treat as name with empty value
+        let parts: Vec<&str> = args.splitn(2, char::is_whitespace).collect();
+        let name = parts[0];
+        let value = if parts.len() > 1 { parts[1] } else { "" };
+        (name, value)
+    };
 
     if !is_valid_var_name(name) {
         return TfCommandResult::Error(format!(
@@ -296,11 +314,7 @@ fn cmd_let(engine: &mut TfEngine, args: &str) -> TfCommandResult {
         ));
     }
 
-    let value = if parts.len() > 1 {
-        TfValue::from(parts[1])
-    } else {
-        TfValue::String(String::new())
-    };
+    let value = TfValue::from(value);
 
     engine.set_local(name, value);
     TfCommandResult::Success(None)
