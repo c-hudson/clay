@@ -654,9 +654,21 @@ fn load_file_internal(engine: &mut TfEngine, filename: &str, quiet: bool) -> TfC
     let hook_results = super::hooks::fire_hook(engine, super::TfHookEvent::Load);
     results.extend(hook_results);
 
-    let error_count = results.iter().filter(|r| matches!(r, TfCommandResult::Error(_))).count();
-    if error_count > 0 {
-        TfCommandResult::Error(format!("✨ Loaded '{}' with {} error(s)", resolved, error_count))
+    // Collect errors for detailed output
+    let errors: Vec<String> = results.iter()
+        .filter_map(|r| match r {
+            TfCommandResult::Error(e) => Some(e.clone()),
+            _ => None,
+        })
+        .collect();
+
+    if !errors.is_empty() {
+        // Build multi-line output with summary and error details
+        let mut output = format!("✨ Loaded '{}' with {} error(s)", resolved, errors.len());
+        for error in &errors {
+            output.push_str(&format!("\n   {}", error));
+        }
+        TfCommandResult::Error(output)
     } else if exit_early {
         // Success with early exit - no output (silent)
         TfCommandResult::Success(None)
