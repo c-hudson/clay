@@ -600,7 +600,8 @@ fn load_file_internal(engine: &mut TfEngine, filename: &str, quiet: bool) -> TfC
         let complete_line = if !continued_line.is_empty() {
             let mut full = std::mem::take(&mut continued_line);
             full.push_str(trimmed);
-            // Replace %\ with just \
+            // Replace %\ with just \ (escaped backslash for line continuation)
+            // Note: %; is NOT replaced here - it's handled during macro execution
             full.replace("%\\", "\\")
         } else {
             trimmed.replace("%\\", "\\")

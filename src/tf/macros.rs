@@ -436,8 +436,12 @@ pub fn execute_macro(
         body = variables::substitute_captures(&body, tm.full_match, &capture_refs, tm.left, tm.right);
     }
 
-    // Split body by %; for multiple commands
-    for cmd in body.split("%;") {
+    // Split body by ; for multiple commands (%; is escaped semicolon)
+    // Use placeholder to protect escaped semicolons during split
+    let body_escaped = body.replace("%;", "\x00");
+    for cmd in body_escaped.split(';') {
+        // Restore escaped semicolons
+        let cmd = cmd.replace('\x00', ";");
         let cmd = cmd.trim();
         if cmd.is_empty() {
             continue;
@@ -445,7 +449,7 @@ pub fn execute_macro(
 
         // Execute the command
         let result = if cmd.starts_with('#') {
-            super::parser::execute_command(engine, cmd)
+            super::parser::execute_command(engine, &cmd)
         } else if cmd.starts_with('/') {
             TfCommandResult::ClayCommand(cmd.to_string())
         } else {
