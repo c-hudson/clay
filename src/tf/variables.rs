@@ -212,6 +212,14 @@ pub fn substitute_positional(text: &str, args: &[&str]) -> String {
                     result.push_str(&args.len().to_string());
                     i += 2;
                 }
+                // %R random argument
+                'R' => {
+                    if !args.is_empty() {
+                        let idx = (super::expressions::simple_random() as usize) % args.len();
+                        result.push_str(args[idx]);
+                    }
+                    i += 2;
+                }
                 // %P forms for regex capture groups
                 'P' if i + 2 < len => {
                     match chars[i + 2] {
