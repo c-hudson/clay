@@ -542,11 +542,28 @@ pub fn process_triggers(engine: &mut TfEngine, line: &str, world: Option<&str>) 
     results
 }
 
-/// List macros matching an optional pattern
+/// List macros matching an optional pattern (glob-style)
 pub fn list_macros(engine: &TfEngine, pattern: Option<&str>) -> String {
     let mut output = String::new();
 
-    let pattern_regex = pattern.and_then(|p| Regex::new(p).ok());
+    // Convert glob pattern to regex (TF uses glob matching for #list)
+    let pattern_regex = pattern.and_then(|p| {
+        // Convert glob to regex: * -> .*, ? -> ., escape other regex chars
+        let mut regex = String::from("^");
+        for c in p.chars() {
+            match c {
+                '*' => regex.push_str(".*"),
+                '?' => regex.push('.'),
+                '.' | '+' | '(' | ')' | '[' | ']' | '{' | '}' | '^' | '$' | '|' | '\\' => {
+                    regex.push('\\');
+                    regex.push(c);
+                }
+                _ => regex.push(c),
+            }
+        }
+        regex.push('$');
+        Regex::new(&regex).ok()
+    });
 
     for macro_def in &engine.macros {
         // Filter by name pattern if provided
