@@ -70,6 +70,7 @@ pub struct RemoteWorldSettings {
 pub struct RemoteWorld {
     pub name: String,
     pub connected: bool,
+    pub was_connected: bool,  // Whether world has ever connected (for separator bar display)
     pub output_lines: Vec<TimestampedLine>,
     pub prompt: String,
     pub settings: RemoteWorldSettings,
@@ -1066,6 +1067,7 @@ impl RemoteGuiApp {
                             RemoteWorld {
                             name: w.name,
                             connected: w.connected,
+                            was_connected: w.was_connected,
                             // For synchronized more-mode: only use output_lines, NOT pending_lines
                             // Pending lines will be sent as ServerData when released
                             output_lines: {
@@ -1074,7 +1076,7 @@ impl RemoteGuiApp {
                                 } else {
                                     // Fallback for old protocol: use current time
                                     let now = current_timestamp_secs();
-                                    w.output_lines.into_iter().enumerate().map(|(i, text)| TimestampedLine { text, ts: now, gagged: false, from_server: true, seq: i as u64 }).collect()
+                                    w.output_lines.into_iter().enumerate().map(|(i, text)| TimestampedLine { text, ts: now, gagged: false, from_server: true, seq: i as u64, highlight_color: None }).collect()
                                 }
                             },
                             prompt: w.prompt,
@@ -1193,7 +1195,7 @@ impl RemoteGuiApp {
                                     };
                                     // All lines go to output_lines - server controls more-mode via pending_count
                                     let seq = world.output_lines.len() as u64;
-                                    world.output_lines.push(TimestampedLine { text, ts, gagged: false, from_server, seq });
+                                    world.output_lines.push(TimestampedLine { text, ts, gagged: false, from_server, seq, highlight_color: None });
                                 }
                             }
 
@@ -1204,6 +1206,7 @@ impl RemoteGuiApp {
                     WsMessage::WorldConnected { world_index, name } => {
                         if world_index < self.worlds.len() {
                             self.worlds[world_index].connected = true;
+                            self.worlds[world_index].was_connected = true;
                             self.worlds[world_index].name = name;
                         }
                     }
@@ -1333,6 +1336,10 @@ impl RemoteGuiApp {
                         // Server's activity count changed - just display it
                         self.server_activity_count = count;
                     }
+                    WsMessage::ShowTagsChanged { show_tags } => {
+                        // Server toggled show_tags (F2 or /tag command)
+                        self.show_tags = show_tags;
+                    }
                     WsMessage::CalculatedWorld { index: Some(idx) } => {
                         // Server calculated the next/prev world for us
                         if idx < self.worlds.len() && idx != self.current_world {
@@ -1383,6 +1390,7 @@ impl RemoteGuiApp {
                                             gagged: false,
                                             from_server: false,
                                             seq,
+                                            highlight_color: None,
                                         });
                                     }
                                 }
@@ -1417,7 +1425,7 @@ impl RemoteGuiApp {
                                 if self.current_world < self.worlds.len() {
                                     let seq = self.worlds[self.current_world].output_lines.len() as u64;
                                     self.worlds[self.current_world].output_lines.push(
-                                        TimestampedLine { text: super::get_version_string(), ts, gagged: false, from_server: false, seq }
+                                        TimestampedLine { text: super::get_version_string(), ts, gagged: false, from_server: false, seq, highlight_color: None }
                                     );
                                 }
                             }
@@ -1978,6 +1986,57 @@ impl RemoteGuiApp {
         }
 
         result
+    }
+
+    /// Convert a color name to ANSI background color code (for /highlight command)
+    fn color_name_to_ansi_bg(color: &str) -> String {
+        let color_lower = color.to_lowercase();
+        let color_lower = color_lower.trim();
+
+        // Empty color means use default highlight
+        if color_lower.is_empty() {
+            return "\x1b[48;5;23m".to_string(); // Dark cyan background
+        }
+
+        // Named colors (using darker/muted versions for backgrounds)
+        match &color_lower[..] {
+            "red" => "\x1b[48;5;52m".to_string(),
+            "green" => "\x1b[48;5;22m".to_string(),
+            "blue" => "\x1b[48;5;17m".to_string(),
+            "yellow" => "\x1b[48;5;58m".to_string(),
+            "cyan" => "\x1b[48;5;23m".to_string(),
+            "magenta" | "purple" => "\x1b[48;5;53m".to_string(),
+            "orange" => "\x1b[48;5;94m".to_string(),
+            "pink" => "\x1b[48;5;125m".to_string(),
+            "white" => "\x1b[48;5;250m".to_string(),
+            "black" => "\x1b[48;5;234m".to_string(),
+            "gray" | "grey" => "\x1b[48;5;240m".to_string(),
+            _ => {
+                // Try parsing as xterm 256 color number
+                if let Ok(num) = color_lower.parse::<u8>() {
+                    return format!("\x1b[48;5;{}m", num);
+                }
+                // Try parsing as RGB (format: r,g,b or r;g;b)
+                let parts: Vec<&str> = if color_lower.contains(',') {
+                    color_lower.split(',').collect()
+                } else if color_lower.contains(';') {
+                    color_lower.split(';').collect()
+                } else {
+                    vec![]
+                };
+                if parts.len() == 3 {
+                    if let (Ok(r), Ok(g), Ok(b)) = (
+                        parts[0].trim().parse::<u8>(),
+                        parts[1].trim().parse::<u8>(),
+                        parts[2].trim().parse::<u8>(),
+                    ) {
+                        return format!("\x1b[48;2;{};{};{}m", r, g, b);
+                    }
+                }
+                // Default fallback
+                "\x1b[48;5;23m".to_string() // Dark cyan
+            }
+        }
     }
 
     /// Format timestamp for GUI display
@@ -3673,6 +3732,7 @@ impl eframe::App for RemoteGuiApp {
                                 gagged: false,
                                 from_server: false,
                                 seq,
+                                highlight_color: None,
                             });
                         }
                     }
@@ -3954,6 +4014,7 @@ impl eframe::App for RemoteGuiApp {
                                                 gagged: false,
                                                 from_server: false,
                                                 seq,
+                                                highlight_color: None,
                                             });
                                         }
                                     }
@@ -3966,7 +4027,7 @@ impl eframe::App for RemoteGuiApp {
                                     if self.current_world < self.worlds.len() {
                                         let seq = self.worlds[self.current_world].output_lines.len() as u64;
                                         self.worlds[self.current_world].output_lines.push(
-                                            TimestampedLine { text: super::get_version_string(), ts, gagged: false, from_server: false, seq }
+                                            TimestampedLine { text: super::get_version_string(), ts, gagged: false, from_server: false, seq, highlight_color: None }
                                         );
                                     }
                                 }
@@ -4002,7 +4063,7 @@ impl eframe::App for RemoteGuiApp {
                                         if self.current_world < self.worlds.len() {
                                             let seq = self.worlds[self.current_world].output_lines.len() as u64;
                                             self.worlds[self.current_world].output_lines.push(
-                                                TimestampedLine { text: format!("✨ World '{}' not found.", name), ts, gagged: false, from_server: false, seq }
+                                                TimestampedLine { text: format!("✨ World '{}' not found.", name), ts, gagged: false, from_server: false, seq, highlight_color: None }
                                             );
                                         }
                                     }
@@ -4021,7 +4082,7 @@ impl eframe::App for RemoteGuiApp {
                                         if self.current_world < self.worlds.len() {
                                             let seq = self.worlds[self.current_world].output_lines.len() as u64;
                                             self.worlds[self.current_world].output_lines.push(
-                                                TimestampedLine { text: format!("✨ World '{}' not found.", name), ts, gagged: false, from_server: false, seq }
+                                                TimestampedLine { text: format!("✨ World '{}' not found.", name), ts, gagged: false, from_server: false, seq, highlight_color: None }
                                             );
                                         }
                                     }
@@ -4067,6 +4128,9 @@ impl eframe::App for RemoteGuiApp {
                             .unwrap_or("---");
                         let connected = self.worlds.get(self.current_world)
                             .map(|w| w.connected)
+                            .unwrap_or(false);
+                        let was_connected = self.worlds.get(self.current_world)
+                            .map(|w| w.was_connected)
                             .unwrap_or(false);
 
                         // Use server's activity count (console broadcasts this value)
@@ -4115,16 +4179,20 @@ impl eframe::App for RemoteGuiApp {
                             ui.label(egui::RichText::new(status_text).monospace());
                         }
 
-                        // Only show connection ball, world name, and tag indicator when connected
-                        // (matches console separator bar behavior)
-                        if connected {
-                            // Connection status ball (green circle drawn via painter, not font glyph)
+                        // Only show connection ball, world name, and tag indicator if world has ever connected
+                        if was_connected {
+                            // Connection status ball (green when connected, red when disconnected)
                             let circle_size = ui.text_style_height(&egui::TextStyle::Monospace);
                             let (rect, _) = ui.allocate_exact_size(
                                 egui::vec2(circle_size, circle_size),
                                 egui::Sense::hover(),
                             );
-                            ui.painter().circle_filled(rect.center(), circle_size * 0.3, egui::Color32::from_rgb(0x3f, 0xb9, 0x50));
+                            let ball_color = if connected {
+                                egui::Color32::from_rgb(0x3f, 0xb9, 0x50) // Green
+                            } else {
+                                egui::Color32::from_rgb(0xf8, 0x51, 0x49) // Red
+                            };
+                            ui.painter().circle_filled(rect.center(), circle_size * 0.3, ball_color);
 
                             // World name (bold)
                             ui.label(egui::RichText::new(world_name).monospace().strong().color(theme.fg()));
@@ -4339,8 +4407,15 @@ impl eframe::App for RemoteGuiApp {
                         } else {
                             Self::strip_mud_tags_ansi(&line.text)
                         };
-                        // Apply action highlighting if enabled
-                        if highlight_actions && line_matches_compiled_patterns(&line.text, &compiled_patterns) {
+                        // Apply /highlight color from action command (takes priority)
+                        if let Some(ref hl_color) = line.highlight_color {
+                            let bg_code = Self::color_name_to_ansi_bg(hl_color);
+                            // Replace any resets to preserve background
+                            let highlighted = base_line.replace("\x1b[0m", &format!("\x1b[0m{}", bg_code));
+                            format!("{}{}\x1b[0m", bg_code, highlighted)
+                        }
+                        // Apply F8 action highlighting if enabled (and no explicit highlight color)
+                        else if highlight_actions && line_matches_compiled_patterns(&line.text, &compiled_patterns) {
                             // Dark yellow/brown background (same as console: 48;5;58)
                             let bg_code = "\x1b[48;5;58m";
                             // Replace any resets to preserve background
@@ -7272,7 +7347,7 @@ impl eframe::App for RemoteGuiApp {
                             if self.current_world < self.worlds.len() {
                                 let seq = self.worlds[self.current_world].output_lines.len() as u64;
                                 self.worlds[self.current_world].output_lines.push(
-                                    TimestampedLine { text: super::get_version_string(), ts, gagged: false, from_server: false, seq }
+                                    TimestampedLine { text: super::get_version_string(), ts, gagged: false, from_server: false, seq, highlight_color: None }
                                 );
                             }
                         }
@@ -7313,6 +7388,7 @@ impl eframe::App for RemoteGuiApp {
                                         gagged: false,
                                         from_server: false,
                                         seq,
+                                        highlight_color: None,
                                     });
                                 }
                             }

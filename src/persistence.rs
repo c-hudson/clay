@@ -138,6 +138,7 @@ pub fn save_settings(app: &App) -> io::Result<()> {
     if !app.settings.dictionary_path.is_empty() {
         writeln!(file, "dictionary_path={}", app.settings.dictionary_path)?;
     }
+    writeln!(file, "editor_side={}", app.settings.editor_side.name())?;
 
     // Save each world's settings (skip unconfigured worlds that have no connection info)
     for world in &app.worlds {
@@ -187,6 +188,14 @@ pub fn save_settings(app: &App) -> io::Result<()> {
         }
         if !world.settings.discord_dm_user.is_empty() {
             writeln!(file, "discord_dm_user={}", world.settings.discord_dm_user)?;
+        }
+        // Notes (escape newlines and special chars)
+        if !world.settings.notes.is_empty() {
+            let escaped_notes = world.settings.notes
+                .replace('\\', "\\\\")
+                .replace('\n', "\\n")
+                .replace('=', "\\e");
+            writeln!(file, "notes={}", escaped_notes)?;
         }
     }
 
@@ -549,6 +558,9 @@ pub fn load_settings(app: &mut App) -> io::Result<()> {
                     "dictionary_path" => {
                         app.settings.dictionary_path = value.to_string();
                     }
+                    "editor_side" => {
+                        app.settings.editor_side = EditorSide::from_name(value);
+                    }
                     _ => {}
                 }
             } else if let Some(ref world_name) = current_world {
@@ -588,6 +600,8 @@ pub fn load_settings(app: &mut App) -> io::Result<()> {
                         "discord_guild" => world.settings.discord_guild = value.to_string(),
                         "discord_channel" => world.settings.discord_channel = value.to_string(),
                         "discord_dm_user" => world.settings.discord_dm_user = value.to_string(),
+                        // Notes
+                        "notes" => world.settings.notes = unescape_string(value),
                         _ => {}
                     }
                 }
@@ -1142,6 +1156,14 @@ pub fn save_reload_state(app: &App) -> io::Result<()> {
         if !world.settings.discord_dm_user.is_empty() {
             writeln!(file, "discord_dm_user={}", world.settings.discord_dm_user.replace('=', "\\e"))?;
         }
+        // Notes (escape special chars)
+        if !world.settings.notes.is_empty() {
+            let escaped_notes = world.settings.notes
+                .replace('\\', "\\\\")
+                .replace('\n', "\\n")
+                .replace('=', "\\e");
+            writeln!(file, "notes={}", escaped_notes)?;
+        }
 
         // Output lines count (we'll save the actual lines separately due to size)
         writeln!(file, "output_count={}", world.output_lines.len())?;
@@ -1299,6 +1321,7 @@ pub fn load_reload_state(app: &mut App) -> io::Result<bool> {
                         from_server,
                         gagged,
                         seq,
+                        highlight_color: None,
                     };
                 } else if parts.len() == 3 {
                     // Older format: timestamp|flags|text (no seq)
@@ -1312,6 +1335,7 @@ pub fn load_reload_state(app: &mut App) -> io::Result<bool> {
                         from_server,
                         gagged,
                         seq: 0,
+                        highlight_color: None,
                     };
                 } else {
                     // Old format: timestamp|text (assume from_server=true for compatibility)
@@ -1321,6 +1345,7 @@ pub fn load_reload_state(app: &mut App) -> io::Result<bool> {
                         from_server: true,
                         gagged: false,
                         seq: 0,
+                        highlight_color: None,
                     };
                 }
             }
@@ -1676,6 +1701,8 @@ pub fn load_reload_state(app: &mut App) -> io::Result<bool> {
                             "discord_guild" => tw.settings.discord_guild = unescape_string(value),
                             "discord_channel" => tw.settings.discord_channel = unescape_string(value),
                             "discord_dm_user" => tw.settings.discord_dm_user = unescape_string(value),
+                            // Notes
+                            "notes" => tw.settings.notes = unescape_string(value),
                             _ => {}
                         }
                     }

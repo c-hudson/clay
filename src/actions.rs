@@ -180,6 +180,7 @@ pub fn substitute_pattern_captures(command: &str, captures: &[&str]) -> String {
 pub struct ActionTriggerResult {
     pub should_gag: bool,           // If true, suppress the line from output
     pub commands: Vec<String>,      // Commands to execute
+    pub highlight_color: Option<String>, // If Some, highlight the line with this color
 }
 
 /// Convert a wildcard pattern (* and ?) to a regex pattern
@@ -418,15 +419,34 @@ pub fn check_action_triggers(
                     cmd.eq_ignore_ascii_case("/gag") || cmd.to_lowercase().starts_with("/gag ")
                 );
 
-                // Filter out /gag and substitute captures in commands
+                // Check for /highlight command and extract color
+                let highlight_color = commands.iter().find_map(|cmd| {
+                    let lower = cmd.to_lowercase();
+                    if lower == "/highlight" {
+                        Some(String::new()) // No color specified, use default
+                    } else if lower.starts_with("/highlight ") {
+                        Some(cmd[11..].trim().to_string()) // Extract color after "/highlight "
+                    } else {
+                        None
+                    }
+                });
+
+                // Filter out /gag and /highlight, then substitute captures in commands
                 let filtered_commands: Vec<String> = commands.into_iter()
-                    .filter(|cmd| !cmd.eq_ignore_ascii_case("/gag") && !cmd.to_lowercase().starts_with("/gag "))
+                    .filter(|cmd| {
+                        let lower = cmd.to_lowercase();
+                        !lower.eq_ignore_ascii_case("/gag")
+                            && !lower.starts_with("/gag ")
+                            && lower != "/highlight"
+                            && !lower.starts_with("/highlight ")
+                    })
                     .map(|cmd| substitute_pattern_captures(&cmd, &captures))
                     .collect();
 
                 return Some(ActionTriggerResult {
                     should_gag,
                     commands: filtered_commands,
+                    highlight_color,
                 });
             }
         }

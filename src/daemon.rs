@@ -545,6 +545,17 @@ pub async fn handle_daemon_ws_message(
                         }
                     }
                 }
+                Command::Edit { .. } => {
+                    // Edit command is handled locally on the client, not on daemon
+                    // Send back to client for local execution
+                    app.ws_send_to_client(client_id, WsMessage::ExecuteLocalCommand { command: command.clone() });
+                }
+                Command::Tag => {
+                    // Toggle MUD tag display (same as F2) - silent, no output
+                    app.show_tags = !app.show_tags;
+                    // Broadcast to all clients
+                    app.ws_broadcast(WsMessage::ShowTagsChanged { show_tags: app.show_tags });
+                }
                 Command::Unknown { cmd } => {
                     app.ws_broadcast(WsMessage::ServerData {
                         world_index,
@@ -2058,6 +2069,7 @@ pub fn build_multiuser_initial_state(app: &App, username: &str) -> WsMessage {
                         gagged: s.gagged,
                         from_server: s.from_server,
                         seq: s.seq,
+                        highlight_color: s.highlight_color.clone(),
                     }
                 })
                 .collect();
@@ -2075,6 +2087,7 @@ pub fn build_multiuser_initial_state(app: &App, username: &str) -> WsMessage {
                         gagged: s.gagged,
                         from_server: s.from_server,
                         seq: s.seq,
+                        highlight_color: s.highlight_color.clone(),
                     }
                 })
                 .collect();
@@ -2108,6 +2121,7 @@ pub fn build_multiuser_initial_state(app: &App, username: &str) -> WsMessage {
                 last_nop_secs: None,
                 keep_alive_type: world.settings.keep_alive_type.name().to_string(),
                 showing_splash: world.showing_splash,
+                was_connected: world.was_connected,
             }
         }).collect();
 

@@ -37,6 +37,59 @@ pub fn strip_ansi_codes(s: &str) -> String {
     result
 }
 
+/// Convert a color name to ANSI background color code
+/// Supports named colors, xterm 256-color codes, and RGB values
+/// Empty string returns a default highlight color (dark cyan background)
+pub fn color_name_to_ansi_bg(color: &str) -> String {
+    let color_lower = color.to_lowercase();
+    let color_lower = color_lower.trim();
+
+    // Empty color means use default highlight
+    if color_lower.is_empty() {
+        return "\x1b[48;5;23m".to_string(); // Dark cyan background
+    }
+
+    // Named colors (using darker/muted versions for backgrounds)
+    match &color_lower[..] {
+        "red" => "\x1b[48;5;52m".to_string(),      // Dark red
+        "green" => "\x1b[48;5;22m".to_string(),    // Dark green
+        "blue" => "\x1b[48;5;17m".to_string(),     // Dark blue
+        "yellow" => "\x1b[48;5;58m".to_string(),   // Dark yellow/olive
+        "cyan" => "\x1b[48;5;23m".to_string(),     // Dark cyan
+        "magenta" | "purple" => "\x1b[48;5;53m".to_string(), // Dark magenta
+        "orange" => "\x1b[48;5;94m".to_string(),   // Dark orange
+        "pink" => "\x1b[48;5;125m".to_string(),    // Dark pink
+        "white" => "\x1b[48;5;250m".to_string(),   // Light gray (for contrast)
+        "black" => "\x1b[48;5;234m".to_string(),   // Very dark gray
+        "gray" | "grey" => "\x1b[48;5;240m".to_string(), // Medium gray
+        _ => {
+            // Try parsing as xterm 256 color number
+            if let Ok(num) = color_lower.parse::<u8>() {
+                return format!("\x1b[48;5;{}m", num);
+            }
+            // Try parsing as RGB (format: r,g,b or r;g;b with values 0-255)
+            let parts: Vec<&str> = if color_lower.contains(',') {
+                color_lower.split(',').collect()
+            } else if color_lower.contains(';') {
+                color_lower.split(';').collect()
+            } else {
+                vec![]
+            };
+            if parts.len() == 3 {
+                if let (Ok(r), Ok(g), Ok(b)) = (
+                    parts[0].trim().parse::<u8>(),
+                    parts[1].trim().parse::<u8>(),
+                    parts[2].trim().parse::<u8>(),
+                ) {
+                    return format!("\x1b[48;2;{};{};{}m", r, g, b);
+                }
+            }
+            // Default fallback
+            "\x1b[48;5;23m".to_string() // Dark cyan
+        }
+    }
+}
+
 /// Calculate the number of visual lines a string takes when wrapped to width
 pub fn visual_line_count(line: &str, width: usize) -> usize {
     if width == 0 {

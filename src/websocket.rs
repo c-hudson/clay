@@ -86,6 +86,8 @@ pub enum WsMessage {
     UnseenUpdate { world_index: usize, count: usize },
     /// Broadcast server's activity count (number of worlds with activity)
     ActivityUpdate { count: usize },
+    /// Broadcast when show_tags setting changes (F2 or /tag command)
+    ShowTagsChanged { show_tags: bool },
     /// Clear all output for a world (from /flush command)
     WorldFlushed { world_index: usize },
     /// Tell client to execute a command locally (for action commands like /worlds)
@@ -231,6 +233,8 @@ pub struct TimestampedLine {
     pub from_server: bool, // true if from MUD server, false if client-generated
     #[serde(default)]
     pub seq: u64, // Unique sequential number within the world (for debugging)
+    #[serde(default)]
+    pub highlight_color: Option<String>, // Optional highlight color from /highlight action command
 }
 
 /// World state for WebSocket protocol
@@ -259,6 +263,9 @@ pub struct WorldStateMsg {
     // Whether splash screen is being shown (for centering)
     #[serde(default)]
     pub showing_splash: bool,
+    // Whether world has ever connected (for separator bar display)
+    #[serde(default)]
+    pub was_connected: bool,
 }
 
 /// World settings for WebSocket protocol

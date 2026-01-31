@@ -833,6 +833,7 @@
         }
 
         setupEventListeners();
+        updateAndroidUI();
         connect();
         updateTime();
         setInterval(updateTime, 1000);
@@ -1583,7 +1584,13 @@
             case 'WorldConnected':
                 if (msg.world_index !== undefined && worlds[msg.world_index]) {
                     worlds[msg.world_index].connected = true;
+                    worlds[msg.world_index].was_connected = true;
                     updateStatusBar();
+                    // If viewing this world, ensure output is rendered
+                    // This handles cases where data arrived before WorldConnected
+                    if (msg.world_index === currentWorldIndex) {
+                        renderOutput();
+                    }
                 }
                 break;
 
@@ -1591,6 +1598,51 @@
                 if (msg.world_index !== undefined && worlds[msg.world_index]) {
                     worlds[msg.world_index].connected = false;
                     updateStatusBar();
+                }
+                break;
+
+            case 'WorldAdded':
+                if (msg.world) {
+                    const world = msg.world;
+                    const currentTs = Math.floor(Date.now() / 1000);
+                    // Convert output_lines to timestamped format (same as InitialState)
+                    if (world.output_lines_ts && world.output_lines_ts.length > 0) {
+                        world.output_lines = world.output_lines_ts;
+                    } else if (world.output_lines) {
+                        world.output_lines = world.output_lines.map(line =>
+                            typeof line === 'string' ? { text: line, ts: currentTs } : line
+                        );
+                    } else {
+                        world.output_lines = [];
+                    }
+                    // Handle pending lines
+                    let pendingLines = [];
+                    if (world.pending_lines_ts && world.pending_lines_ts.length > 0) {
+                        pendingLines = world.pending_lines_ts;
+                    } else if (world.pending_lines && world.pending_lines.length > 0) {
+                        pendingLines = world.pending_lines.map(line =>
+                            typeof line === 'string' ? { text: line, ts: currentTs } : line
+                        );
+                    }
+                    world.output_lines = world.output_lines.concat(pendingLines);
+                    world.pending_count = pendingLines.length;
+                    // Insert at the correct index
+                    const insertIndex = world.index !== undefined ? world.index : worlds.length;
+                    worlds.splice(insertIndex, 0, world);
+                    // Adjust currentWorldIndex if the new world was inserted before it
+                    if (currentWorldIndex >= insertIndex) {
+                        currentWorldIndex++;
+                    }
+                    // Adjust selectedWorldIndex if needed
+                    if (selectedWorldIndex >= insertIndex) {
+                        selectedWorldIndex++;
+                    }
+                    // Update output cache array
+                    worldOutputCache.splice(insertIndex, 0, []);
+                    updateStatusBar();
+                    if (worldSelectorPopupOpen) {
+                        renderWorldSelectorList();
+                    }
                 }
                 break;
 
@@ -1633,10 +1685,14 @@
                     }
                     // Clear any partial line buffer
                     partialLines[msg.world_index] = '';
-                    // If it's the current world, clear the display
+                    // If it's the current world, clear the display and reset more-mode state
                     if (msg.world_index === currentWorldIndex) {
                         elements.output.innerHTML = '';
                         scrollOffset = 0;
+                        // Reset more-mode state to prevent immediate pause on new data
+                        linesSincePause = 0;
+                        paused = false;
+                        pendingLines = [];
                     }
                 }
                 break;
@@ -3245,9 +3301,9 @@
             elements.statusIndicator.className = '';
         }
 
-        // Only show connection ball and world name when connected (matches console behavior)
-        if (world && world.name && world.connected) {
-            elements.connectionStatus.textContent = '🟢';
+        // Only show connection ball and world name if world has ever connected
+        if (world && world.name && world.was_connected) {
+            elements.connectionStatus.textContent = world.connected ? '🟢' : '🔴';
             elements.worldName.textContent = ' ' + world.name;
         } else {
             elements.connectionStatus.textContent = '';
@@ -3350,6 +3406,15 @@
             elements.passwordError.textContent = '';
             elements.passwordOld.focus();
         }
+    }
+
+    // Update UI based on Android app detection
+    function updateAndroidUI() {
+        // Show Clay Server menu item only when running in Android app
+        const isAndroid = typeof Android !== 'undefined' && Android.openServerSettings;
+        document.querySelectorAll('.menu-clay-server').forEach(el => {
+            el.style.display = isAndroid ? '' : 'none';
+        });
     }
 
     // Update UI based on multiuser mode
@@ -5936,7 +6001,7 @@
         console.log('Resync triggered by Android - requesting full state');
         if (ws && ws.readyState === WebSocket.OPEN && authenticated) {
             // Request a full state resync from the server
-            ws.send(JSON.stringify({ type: 'Resync' }));
+            ws.send(JSON.stringify({ type: 'RequestState' }));
         }
     };
 

@@ -3537,6 +3537,8 @@ impl App {
             // Sort by timestamp to ensure chronological order
             all_lines.sort_by_key(|line| line.ts);
             // Send all lines as output_lines_ts, pending_lines_ts is empty (clients handle more-mode locally)
+            // Also clear the string versions since output_lines_ts contains everything
+            // This prevents clients from appending pending_lines again (they're already in output_lines_ts)
             let combined_len = all_lines.len();
             let output_lines_ts = all_lines;
             let pending_lines_ts: Vec<TimestampedLine> = Vec::new();
@@ -3545,7 +3547,7 @@ impl App {
                 name: world.name.clone(),
                 connected: world.connected,
                 output_lines: clean_output,
-                pending_lines: clean_pending,
+                pending_lines: Vec::new(),  // Empty - pending is already in output_lines_ts
                 output_lines_ts,
                 pending_lines_ts,
                 prompt: world.prompt.replace('\r', ""),
@@ -3571,6 +3573,7 @@ impl App {
                 last_nop_secs: world.last_nop_time.map(|t| t.elapsed().as_secs()),
                 keep_alive_type: world.settings.keep_alive_type.name().to_string(),
                 showing_splash: world.showing_splash,
+                was_connected: world.was_connected,
             }
         }).collect();
 
@@ -4618,8 +4621,28 @@ async fn run_console_client(addr: &str) -> io::Result<()> {
 
     println!("Connecting to {}...", ws_url);
 
-    // Connect to WebSocket server - try wss:// first, then fall back to ws://
+    // Connect to WebSocket server - for wss:// we need to configure TLS to accept self-signed certs
+    #[cfg(feature = "rustls-backend")]
+    let connect_result = if ws_url.starts_with("wss://") {
+        // Configure rustls to accept self-signed/invalid certificates
+        let tls_config = rustls::ClientConfig::builder()
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(danger::NoCertificateVerification::new()))
+            .with_no_client_auth();
+        let connector = tokio_tungstenite::Connector::Rustls(Arc::new(tls_config));
+        tokio_tungstenite::connect_async_tls_with_config(
+            &ws_url,
+            None,
+            false,
+            Some(connector),
+        ).await
+    } else {
+        connect_async(&ws_url).await
+    };
+
+    #[cfg(not(feature = "rustls-backend"))]
     let connect_result = connect_async(&ws_url).await;
+
     let (ws_stream, _) = match connect_result {
         Ok(result) => result,
         Err(e) if try_fallback => {
@@ -6745,8 +6768,9 @@ fn handle_new_popup_key(app: &mut App, key: KeyEvent) -> NewPopupAction {
                     }
                     if state.is_on_button() {
                         state.select_last_field();
-                    } else if !state.next_field() {
-                        state.select_first_button();
+                    } else {
+                        // Only move between fields, never to buttons
+                        state.next_field();
                     }
                     // Auto-start editing on text/password fields
                     if state.selected_field().map(|f| f.kind.is_text_editable()).unwrap_or(false) {
@@ -16274,12 +16298,17 @@ fn render_separator_bar(f: &mut Frame, app: &App, area: Rect) {
         },
     ));
 
-    // Only show connection ball, world name, and tag indicator when connected
-    // Use world.connected flag (works for both master and console client modes)
+    // Only show connection ball, world name, and tag indicator if world has ever connected
+    // Use world.was_connected flag (set to true on first connection)
     let is_connected = world.connected;
-    let current_pos = if is_connected {
-        // Connection status ball (green when connected)
-        spans.push(Span::styled("● ", Style::default().fg(Color::Green)));
+    let was_connected = world.was_connected;
+
+    let current_pos = if was_connected {
+        // Connection status ball (green when connected, red when disconnected)
+        spans.push(Span::styled(
+            "● ",
+            Style::default().fg(if is_connected { Color::Green } else { Color::Red }),
+        ));
 
         // World name
         spans.push(Span::styled(
@@ -16298,7 +16327,7 @@ fn render_separator_bar(f: &mut Frame, app: &App, area: Rect) {
         // Calculate position: status + ball (2 chars) + world name + tag indicator
         status_str.len() + 2 + world_display.len() + tag_indicator.len()
     } else {
-        // When disconnected, just show underscores (no ball, no world name)
+        // World never connected - don't show ball or name
         status_str.len()
     };
 
