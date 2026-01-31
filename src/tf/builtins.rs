@@ -590,6 +590,23 @@ fn load_file_internal(engine: &mut TfEngine, filename: &str, quiet: bool) -> TfC
         // Strip leading whitespace
         let trimmed = line.trim_start();
 
+        // Check if this is a comment line (starts with ; or is just # or # followed by space)
+        let is_comment = trimmed.starts_with(';')
+            || trimmed == "#"
+            || trimmed.starts_with("# ");
+
+        // If this is a comment line, skip it entirely (even during line continuation)
+        // The continuation just continues to the next non-comment line
+        if is_comment {
+            // If the comment ends with \, it's still a continuation but we skip the comment content
+            if trimmed.ends_with('\\') && !trimmed.ends_with("%\\") {
+                // Don't append the comment, but continue looking for more lines
+                continue;
+            }
+            // Regular comment - just skip
+            continue;
+        }
+
         // Handle line continuation
         if trimmed.ends_with('\\') && !trimmed.ends_with("%\\") {
             // Line continues - append without the backslash
@@ -612,19 +629,6 @@ fn load_file_internal(engine: &mut TfEngine, filename: &str, quiet: bool) -> TfC
 
         // Skip empty lines
         if trimmed.is_empty() {
-            continue;
-        }
-
-        // Skip comments: lines starting with ; or single # (but not ## commands)
-        // A single # followed by space or end of line is a comment
-        // #command is a TF command
-        if trimmed.starts_with(';') {
-            continue;
-        }
-        if trimmed == "#" {
-            continue;
-        }
-        if trimmed.starts_with("# ") {
             continue;
         }
 
@@ -1260,6 +1264,14 @@ mod tests {
         let random_macro = engine.macros.iter().find(|m| m.name == "random").unwrap();
         assert!(random_macro.body.contains("%R"),
             "random macro body should contain %R, got: {}", random_macro.body);
+
+        // Verify that the "e" macro body doesn't contain comment text
+        // The comment line ";   #echo -- say \\$(#encrypt %*3.14)%;" should be stripped
+        let e_macro = engine.macros.iter().find(|m| m.name == "e").unwrap();
+        assert!(!e_macro.body.contains("#echo"),
+            "e macro body should not contain comment text '#echo', got: {}", e_macro.body);
+        assert!(e_macro.body.contains("say"),
+            "e macro body should contain 'say', got: {}", e_macro.body);
 
         // Verify listen_mush has a trigger pattern
         let listen_macro = engine.macros.iter().find(|m| m.name == "listen_mush").unwrap();
