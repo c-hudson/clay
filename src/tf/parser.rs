@@ -631,7 +631,8 @@ Variable Substitution:
   %L, %R               - Left/right of match
   %%                   - Literal percent sign
 
-Use #help <command> for detailed help on specific commands."#;
+Use #help <command> for detailed help on specific commands.
+Use #help functions for list of expression functions."#;
         TfCommandResult::Success(Some(help_text.to_string()))
     } else {
         match topic.as_str() {
@@ -832,7 +833,68 @@ Examples:
   #test addworld("Cave", "", "cave.tcp.com", "2283")
   #test addworld("Secure", "", "ssl.tcp.com", "4443", "", "", "", "x")"#.to_string()
             )),
-            _ => TfCommandResult::Success(Some(format!("No help available for '{}'\nTry: set, echo, send, def, if, while, for, expr, bind, hooks, repeat, ps, kill, load, require, loaded, exit, addworld", topic))),
+            "functions" | "func" | "funcs" => TfCommandResult::Success(Some(
+                r#"Expression Functions
+
+String Functions:
+  strlen(str)              - Length of string
+  substr(str, start [,len]) - Substring extraction
+  strcat(s1, s2, ...)      - Concatenate strings
+  strstr(str, substr)      - Find substring position (-1 if not found)
+  tolower(str)             - Convert to lowercase
+  toupper(str)             - Convert to uppercase
+  replace(str, old, new [,count]) - Replace occurrences
+  ascii(str)               - ASCII code of first character
+  char(code)               - Character from ASCII code
+  sprintf(fmt, args...)    - Formatted string (%s, %d, %c, %%)
+
+Math Functions:
+  abs(n)                   - Absolute value
+  min(a, b, ...)           - Minimum value
+  max(a, b, ...)           - Maximum value
+  rand([max])              - Random number (0 to max-1, or 0-999)
+  time()                   - Current Unix timestamp
+
+Pattern Matching:
+  regmatch(pattern, str)   - Regex match, sets %P0-%P9 captures
+
+World Functions:
+  fg_world()               - Current world name
+  world_info(field [,world]) - Get world info (name/host/port/character)
+  nactive()                - Count of connected worlds
+  nworlds()                - Total world count
+  is_connected([world])    - Check if world is connected
+  idle()                   - Seconds since last input
+  sidle()                  - Seconds since last send
+
+Macro Functions:
+  ismacro(name)            - Check if macro exists
+  getopts(opts, args)      - Parse command options
+
+Keyboard Buffer:
+  kbhead()                 - Text before cursor
+  kbtail()                 - Text after cursor
+  kbpoint()                - Cursor position
+  kblen()                  - Input buffer length
+  kbgoto(pos)              - Move cursor to position
+  kbdel(count)             - Delete characters
+  kbmatch()                - Find matching brace/paren
+  kbword()                 - Word at cursor
+  kbwordleft()             - Move cursor left by word
+  kbwordright()            - Move cursor right by word
+  input(text)              - Insert text at cursor
+
+File I/O:
+  tfopen(path, mode)       - Open file (r/w/a), returns handle
+  tfclose(handle)          - Close file
+  tfread(handle, var)      - Read line into variable
+  tfwrite(handle, text)    - Write text to file
+  tfflush(handle)          - Flush file buffer
+  tfeof(handle)            - Check for end of file
+
+Usage: $[function(args)] or in #expr/#test"#.to_string()
+            )),
+            _ => TfCommandResult::Success(Some(format!("No help available for '{}'\nTry: set, echo, send, def, if, while, for, expr, bind, hooks, repeat, ps, kill, load, require, loaded, exit, addworld, functions", topic))),
         }
     }
 }
