@@ -1739,6 +1739,26 @@ impl World {
         self.log_date = None;
     }
 
+    /// Clear connection state when disconnecting
+    /// Optionally removes the proxy socket file and clears the prompt
+    fn clear_connection_state(&mut self, remove_socket: bool, clear_prompt: bool) {
+        if remove_socket {
+            if let Some(ref socket_path) = self.proxy_socket_path {
+                let _ = std::fs::remove_file(socket_path);
+            }
+        }
+        self.proxy_pid = None;
+        self.proxy_socket_path = None;
+        self.proxy_socket_fd = None;
+        self.command_tx = None;
+        self.connected = false;
+        self.socket_fd = None;
+        if clear_prompt {
+            self.close_log_file();
+            self.prompt.clear();
+        }
+    }
+
     /// Write a line to the log file with timestamp prefix
     /// Handles day rollover (opens new file if date changed)
     fn write_log_line(&mut self, line: &str) {
@@ -7455,10 +7475,7 @@ pub async fn run_app_headless(
                             }
                             Err(e) => {
                                 debug_log(true, &format!("HEADLESS: Failed to reconnect proxy for {}: {}", app.worlds[world_idx].name, e));
-                                app.worlds[world_idx].connected = false;
-                                app.worlds[world_idx].command_tx = None;
-                                app.worlds[world_idx].proxy_pid = None;
-                                app.worlds[world_idx].proxy_socket_path = None;
+                                app.worlds[world_idx].clear_connection_state(false, false);
                             }
                         }
                     }
@@ -7898,10 +7915,7 @@ pub async fn run_app_headless(
                     if world.connected {
                         if let Some(proxy_pid) = world.proxy_pid {
                             if !is_process_alive(proxy_pid) {
-                                world.connected = false;
-                                world.command_tx = None;
-                                world.proxy_pid = None;
-                                world.proxy_socket_path = None;
+                                world.clear_connection_state(false, false);
                                 let seq = world.next_seq;
                                 world.next_seq += 1;
                                 world.output_lines.push(OutputLine::new("TLS proxy terminated. Connection lost.".to_string(), seq));
@@ -8367,10 +8381,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
 
                 if !proxy_alive {
                     // Proxy died, mark disconnected
-                    app.worlds[world_idx].connected = false;
-                    app.worlds[world_idx].proxy_pid = None;
-                    app.worlds[world_idx].proxy_socket_path = None;
-                    app.worlds[world_idx].proxy_socket_fd = None;
+                    app.worlds[world_idx].clear_connection_state(false, false);
                     let seq = app.worlds[world_idx].next_seq;
                     app.worlds[world_idx].next_seq += 1;
                     app.worlds[world_idx].output_lines.push(OutputLine::new(
@@ -8515,10 +8526,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                     }
                     None => {
                         // Failed to reconnect
-                        app.worlds[world_idx].connected = false;
-                        app.worlds[world_idx].proxy_pid = None;
-                        app.worlds[world_idx].proxy_socket_path = None;
-                        app.worlds[world_idx].proxy_socket_fd = None;
+                        app.worlds[world_idx].clear_connection_state(false, false);
                         let seq = app.worlds[world_idx].next_seq;
                         app.worlds[world_idx].next_seq += 1;
                         app.worlds[world_idx].output_lines.push(OutputLine::new(
@@ -9183,9 +9191,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                             app.worlds[world_idx].last_receive_time = Some(std::time::Instant::now());
                             let encoding = app.worlds[world_idx].settings.encoding;
                             let prompt_text = encoding.decode(&prompt_bytes);
-                            // Normalize: strip CR/LF, strip trailing spaces, add exactly one space
-                            let prompt_clean = prompt_text.replace('\r', "").replace('\n', " ");
-                            let prompt_normalized = format!("{} ", prompt_clean.trim());
+                            let prompt_normalized = crate::util::normalize_prompt(&prompt_text);
 
                             // If world is not connected, display prompt as output instead of input area
                             if !app.worlds[world_idx].connected {
@@ -9717,16 +9723,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                             if let Some(proxy_pid) = app.worlds[world_index].proxy_pid {
                                                 unsafe { libc::kill(proxy_pid as libc::pid_t, libc::SIGTERM); }
                                             }
-                                            if let Some(ref socket_path) = app.worlds[world_index].proxy_socket_path {
-                                                let _ = std::fs::remove_file(socket_path);
-                                            }
-                                            app.worlds[world_index].proxy_pid = None;
-                                            app.worlds[world_index].proxy_socket_path = None;
-                                            app.worlds[world_index].command_tx = None;
-                                            app.worlds[world_index].connected = false;
-                                            app.worlds[world_index].socket_fd = None;
-                                            app.worlds[world_index].close_log_file();
-                                            app.worlds[world_index].prompt.clear();
+                                            app.worlds[world_index].clear_connection_state(true, true);
                                             app.ws_broadcast(WsMessage::ServerData {
                                                 world_index,
                                                 data: "Disconnected.".to_string(),
@@ -10664,10 +10661,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                         if let Some(proxy_pid) = world.proxy_pid {
                             if !is_process_alive(proxy_pid) {
                                 // Proxy died - mark world as disconnected
-                                world.connected = false;
-                                world.command_tx = None;
-                                world.proxy_pid = None;
-                                world.proxy_socket_path = None;
+                                world.clear_connection_state(false, false);
                                 let seq = world.next_seq;
                                 world.next_seq += 1;
                                 world.output_lines.push(OutputLine::new("TLS proxy terminated. Connection lost.".to_string(), seq));
@@ -10691,9 +10685,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                             if !world.trigger_partial_line.is_empty() && world.prompt.is_empty() {
                                 // Extract partial line as prompt
                                 let prompt_text = std::mem::take(&mut world.trigger_partial_line);
-                                // Normalize: strip CR/LF, strip trailing spaces, add exactly one space
-                                let prompt_clean = prompt_text.replace('\r', "").replace('\n', " ");
-                                let normalized = format!("{} ", prompt_clean.trim());
+                                let normalized = crate::util::normalize_prompt(&prompt_text);
 
                                 // If world is not connected, display prompt as output instead
                                 if !world.connected {
@@ -11254,9 +11246,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                         app.worlds[world_idx].last_receive_time = Some(std::time::Instant::now());
                         let encoding = app.worlds[world_idx].settings.encoding;
                         let prompt_text = encoding.decode(&prompt_bytes);
-                        // Normalize: strip CR/LF, strip trailing spaces, add exactly one space
-                        let prompt_clean = prompt_text.replace('\r', "").replace('\n', " ");
-                        let prompt_normalized = format!("{} ", prompt_clean.trim());
+                        let prompt_normalized = crate::util::normalize_prompt(&prompt_text);
 
                         // If world is not connected, display prompt as output instead of input area
                         if !app.worlds[world_idx].connected {
@@ -11737,16 +11727,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                         if let Some(proxy_pid) = app.worlds[world_index].proxy_pid {
                                             unsafe { libc::kill(proxy_pid as libc::pid_t, libc::SIGTERM); }
                                         }
-                                        if let Some(ref socket_path) = app.worlds[world_index].proxy_socket_path {
-                                            let _ = std::fs::remove_file(socket_path);
-                                        }
-                                        app.worlds[world_index].proxy_pid = None;
-                                        app.worlds[world_index].proxy_socket_path = None;
-                                        app.worlds[world_index].command_tx = None;
-                                        app.worlds[world_index].connected = false;
-                                        app.worlds[world_index].socket_fd = None;
-                                        app.worlds[world_index].close_log_file();
-                                        app.worlds[world_index].prompt.clear();
+                                        app.worlds[world_index].clear_connection_state(true, true);
                                         app.ws_broadcast(WsMessage::ServerData {
                                             world_index,
                                             data: "Disconnected.".to_string(),
@@ -14675,16 +14656,7 @@ async fn handle_command(cmd: &str, app: &mut App, event_tx: mpsc::Sender<AppEven
                 if let Some(proxy_pid) = app.current_world().proxy_pid {
                     unsafe { libc::kill(proxy_pid as libc::pid_t, libc::SIGTERM); }
                 }
-                if let Some(ref socket_path) = app.current_world().proxy_socket_path {
-                    let _ = std::fs::remove_file(socket_path);
-                }
-                app.current_world_mut().proxy_pid = None;
-                app.current_world_mut().proxy_socket_path = None;
-                app.current_world_mut().command_tx = None;
-                app.current_world_mut().connected = false;
-                app.current_world_mut().socket_fd = None;
-                app.current_world_mut().close_log_file();
-                app.current_world_mut().prompt.clear();
+                app.current_world_mut().clear_connection_state(true, true);
                 app.add_output("Disconnected.");
             } else {
                 app.add_output("Not connected.");

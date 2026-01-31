@@ -1962,32 +1962,6 @@ impl RemoteGuiApp {
         }
     }
 
-    /// Strip ANSI escape codes for clipboard copy
-    fn strip_ansi_for_copy(text: &str) -> String {
-        let mut result = String::new();
-        let mut chars = text.chars().peekable();
-
-        while let Some(c) = chars.next() {
-            if c == '\x1b' {
-                // Skip escape sequence
-                if chars.peek() == Some(&'[') {
-                    chars.next(); // consume '['
-                    // Skip until we hit a letter
-                    while let Some(&sc) = chars.peek() {
-                        chars.next();
-                        if sc.is_ascii_alphabetic() {
-                            break;
-                        }
-                    }
-                }
-            } else {
-                result.push(c);
-            }
-        }
-
-        result
-    }
-
     /// Convert a color name to ANSI background color code (for /highlight command)
     fn color_name_to_ansi_bg(color: &str) -> String {
         let color_lower = color.to_lowercase();
@@ -2853,7 +2827,7 @@ impl RemoteGuiApp {
                                 Self::append_ansi_to_job(&before, default_color, font_id.clone(), &mut job, is_light_theme, color_offset_percent);
                             }
 
-                            let clean_url = Self::strip_ansi_for_copy(&url);
+                            let clean_url = crate::util::strip_ansi_codes(&url);
                             let url_with_breaks = Self::insert_word_breaks(&clean_url);
                             let url_start = job.text.chars().count();
                             job.append(&url_with_breaks, 0.0, egui::TextFormat {
@@ -3744,7 +3718,7 @@ impl eframe::App for RemoteGuiApp {
             // Input area at bottom (full width)
             let input_height = self.input_height as f32 * 16.0 + 8.0;
             let prompt_text = self.worlds.get(self.current_world)
-                .map(|w| Self::strip_ansi_for_copy(&w.prompt))
+                .map(|w| crate::util::strip_ansi_codes(&w.prompt))
                 .unwrap_or_default();
 
             let input_bg = theme.bg();
@@ -4328,7 +4302,7 @@ impl eframe::App for RemoteGuiApp {
                             }
                             // Apply filter if active (filter on stripped text)
                             if self.filter_active && !self.filter_text.is_empty() {
-                                let stripped = Self::strip_ansi_for_copy(&line.text);
+                                let stripped = crate::util::strip_ansi_codes(&line.text);
                                 // Check if pattern has wildcards
                                 let has_wildcards = self.filter_text.contains('*') || self.filter_text.contains('?');
                                 if has_wildcards {
@@ -4351,7 +4325,7 @@ impl eframe::App for RemoteGuiApp {
                     // Build plain text version for selection (strip ANSI codes and empty lines)
                     let lines: Vec<String> = colored_lines.iter()
                         .map(|line| {
-                            let stripped = Self::strip_ansi_for_copy(&line.text);
+                            let stripped = crate::util::strip_ansi_codes(&line.text);
                             if self.show_tags {
                                 // Add timestamp prefix when showing tags
                                 // Convert temperatures only if enabled
