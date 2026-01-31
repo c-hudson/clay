@@ -1548,6 +1548,31 @@ mod tests {
     }
 
     #[test]
+    fn test_macro_with_arguments() {
+        let mut engine = TfEngine::new();
+
+        // Define a macro that uses %* (all arguments)
+        execute_command(&mut engine, "#def say_all = #echo You said: %*");
+
+        // Invoke the macro with arguments
+        let result = execute_command(&mut engine, "#say_all hello world");
+        match result {
+            TfCommandResult::Success(Some(msg)) => assert_eq!(msg, "You said: hello world"),
+            _ => panic!("Expected success with 'You said: hello world', got {:?}", result),
+        }
+
+        // Define a macro that uses positional parameters
+        execute_command(&mut engine, "#def greet_person = #echo Hello %1, you are %2");
+
+        // Invoke with arguments
+        let result = execute_command(&mut engine, "#greet_person Alice great");
+        match result {
+            TfCommandResult::Success(Some(msg)) => assert_eq!(msg, "Hello Alice, you are great"),
+            _ => panic!("Expected success, got {:?}", result),
+        }
+    }
+
+    #[test]
     fn test_macro_sequence_numbers() {
         let mut engine = TfEngine::new();
 
