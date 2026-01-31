@@ -485,11 +485,13 @@ Clay includes a TinyFugue compatibility layer using `#` prefix instead of `/`. T
 - `#test expression` - Evaluate as boolean (returns 0 or 1)
 - `#eval expression` - Evaluate and execute result as command
 - Operators: `+ - * / %` (arithmetic), `== != < > <= >=` (comparison), `& | !` (logical), `=~ !~` (regex), `?:` (ternary)
-- String functions: `strlen()`, `substr()`, `strcat()`, `tolower()`, `toupper()`, `strstr()`, `replace()`, `sprintf()`
-- Math functions: `rand()`, `time()`, `abs()`, `min()`, `max()`
+- String functions: `strlen()`, `substr()`, `strcat()`, `tolower()`, `toupper()`, `strstr()`, `replace()`, `sprintf()`, `strcmp()`, `strncmp()`, `strchr()`, `strrchr()`, `strrep()`, `pad()`, `ascii()`, `char()`
+- Math functions: `rand()`, `time()`, `abs()`, `min()`, `max()`, `mod()`, `trunc()`, `sin()`, `cos()`, `tan()`, `asin()`, `acos()`, `atan()`, `exp()`, `pow()`, `sqrt()`, `log()`, `log10()`
 - Regex: `regmatch(pattern, string)` - Match and populate %P0-%P9 capture groups
-- World functions: `fg_world()`, `world_info(field[, world])`, `nactive()`, `nworlds()`, `is_connected([world])`, `idle([world])`, `sidle([world])`
+- World functions: `fg_world()`, `world_info(field[, world])`, `nactive()`, `nworlds()`, `is_connected([world])`, `idle([world])`, `sidle([world])`, `addworld()`
+- Info functions: `columns()`, `lines()`, `moresize()`, `getpid()`, `systype()`, `filename()`, `ftime()`, `nmail()`
 - Macro functions: `ismacro(name)`, `getopts(optstring, varname)`
+- Command functions: `echo(text[, attrs])`, `send(text[, world])`, `substitute(text[, attrs])`, `keycode(str)`
 - Keyboard buffer: `kbhead()`, `kbtail()`, `kbpoint()`, `kblen()`, `kbgoto(pos)`, `kbdel(n)`, `kbmatch()`, `kbword()`, `kbwordleft()`, `kbwordright()`, `input(text)`
 - File I/O: `tfopen(path, mode)`, `tfclose(handle)`, `tfread(handle, var)`, `tfwrite(handle, text)`, `tfflush(handle)`, `tfeof(handle)`
 
