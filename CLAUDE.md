@@ -568,6 +568,7 @@ Clay includes a TinyFugue compatibility layer using `#` prefix instead of `/`. T
 - `%R` - Text right of match
 - `%P0` - `%P9` - Regex capture groups from `regmatch()` (%P0 = full match)
 - `%%` - Literal percent sign
+- `\%` - Literal percent sign (backslash escape)
 
 **Special Variables:**
 - `%{world_name}` - Current world name
