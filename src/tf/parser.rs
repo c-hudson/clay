@@ -136,6 +136,7 @@ fn execute_command_impl(engine: &mut TfEngine, input: &str, skip_substitution: b
         // Output commands
         "echo" => cmd_echo(engine, args),
         "send" => cmd_send(engine, args),
+        "substitute" => cmd_substitute(engine, args),
 
         // Mapped to Clay commands
         "quit" => TfCommandResult::ClayCommand("/quit".to_string()),
@@ -444,25 +445,122 @@ fn cmd_setenv(engine: &mut TfEngine, args: &str) -> TfCommandResult {
     TfCommandResult::Success(None)
 }
 
-/// #echo message - Display message locally
+/// #echo [-w world] [-a attrs] [--] message - Display message locally
+/// Options:
+///   -w<world> or -w <world> - Specify world (currently ignored)
+///   -a<attrs> - Attributes: g=gag (currently ignored), h=highlight, etc.
+///   -- - End of options marker
 fn cmd_echo(engine: &TfEngine, args: &str) -> TfCommandResult {
-    // Variable substitution already done, just process attribute codes
     let _ = engine;  // Engine already used for substitution
 
-    // Handle -- as end-of-options marker
-    let text = if args.starts_with("-- ") {
-        &args[3..]
-    } else if args == "--" {
-        ""
-    } else {
-        args
-    };
+    // Parse options: -w<world>, -a<attrs>, --
+    let mut remaining = args.trim();
+    let mut _world: Option<String> = None;
+    let mut _attrs: Option<String> = None;
+
+    while !remaining.is_empty() {
+        if remaining.starts_with("--") {
+            // End of options marker
+            remaining = remaining[2..].trim_start();
+            break;
+        } else if remaining.starts_with("-w") {
+            // -w<world> or -w <world>
+            remaining = &remaining[2..];
+            if remaining.starts_with(' ') {
+                // -w <world>
+                remaining = remaining.trim_start();
+                if let Some(space_pos) = remaining.find(' ') {
+                    _world = Some(remaining[..space_pos].to_string());
+                    remaining = &remaining[space_pos..].trim_start();
+                } else {
+                    _world = Some(remaining.to_string());
+                    remaining = "";
+                }
+            } else {
+                // -w<world> (no space)
+                if let Some(space_pos) = remaining.find(' ') {
+                    _world = Some(remaining[..space_pos].to_string());
+                    remaining = &remaining[space_pos..].trim_start();
+                } else {
+                    _world = Some(remaining.to_string());
+                    remaining = "";
+                }
+            }
+        } else if remaining.starts_with("-a") {
+            // -a<attrs>
+            remaining = &remaining[2..];
+            if let Some(space_pos) = remaining.find(' ') {
+                _attrs = Some(remaining[..space_pos].to_string());
+                remaining = &remaining[space_pos..].trim_start();
+            } else {
+                _attrs = Some(remaining.to_string());
+                remaining = "";
+            }
+        } else if remaining.starts_with('-') && remaining.len() > 1 {
+            // Unknown option, skip it
+            if let Some(space_pos) = remaining.find(' ') {
+                remaining = &remaining[space_pos..].trim_start();
+            } else {
+                remaining = "";
+            }
+        } else {
+            // Not an option, this is the message
+            break;
+        }
+    }
 
     // Process TF attribute codes: @{attr} sequences
     // @{B} = bold, @{U} = underline, @{n} = normal/reset
     // @{Crgb} = foreground color, @{BCrgb} = background color
-    let message = process_attr_codes(text);
+    let message = process_attr_codes(remaining);
     TfCommandResult::Success(Some(message))
+}
+
+/// #substitute [-a attrs] [--] text - Replace trigger line with substituted text
+/// Options:
+///   -a<attrs> - Attributes: C=color (e.g., Cred, Cgreen, Cbold)
+///   -- - End of options marker
+fn cmd_substitute(engine: &mut TfEngine, args: &str) -> TfCommandResult {
+    // Parse options: -a<attrs>, --
+    let mut remaining = args.trim();
+    let mut attrs = String::new();
+
+    while !remaining.is_empty() {
+        if remaining.starts_with("--") {
+            remaining = remaining[2..].trim_start();
+            break;
+        } else if remaining.starts_with("-a") {
+            // -a<attrs>
+            remaining = &remaining[2..];
+            if let Some(space_pos) = remaining.find(' ') {
+                attrs = remaining[..space_pos].to_string();
+                remaining = &remaining[space_pos..].trim_start();
+            } else {
+                attrs = remaining.to_string();
+                remaining = "";
+            }
+        } else if remaining.starts_with('-') && remaining.len() > 1 {
+            // Unknown option, skip it
+            if let Some(space_pos) = remaining.find(' ') {
+                remaining = &remaining[space_pos..].trim_start();
+            } else {
+                remaining = "";
+            }
+        } else {
+            break;
+        }
+    }
+
+    // Process TF attribute codes in the text
+    let text = process_attr_codes(remaining);
+
+    // Queue the substitution for main app to process
+    engine.pending_substitution = Some(super::TfSubstitution {
+        text,
+        attrs,
+    });
+
+    TfCommandResult::Success(None)
 }
 
 /// Process TF attribute codes in text

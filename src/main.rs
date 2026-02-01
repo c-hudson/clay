@@ -662,6 +662,50 @@ impl Default for EditorState {
     }
 }
 
+/// Apply TF attributes to text for #substitute command.
+/// Attribute string format: C<color> for foreground, B for bold, etc.
+/// Examples: "Cred" = red, "Cbold" = bold, "Cgreen" = green
+fn apply_tf_attrs(text: &str, attrs: &str) -> String {
+    let mut result = String::new();
+    let mut has_attr = false;
+
+    // Parse attributes - Cred, Cgreen, Cbold, etc.
+    let attrs_lower = attrs.to_lowercase();
+    if attrs_lower.contains("cred") || attrs_lower.contains("red") {
+        result.push_str("\x1b[1;31m");  // Bold red
+        has_attr = true;
+    } else if attrs_lower.contains("cgreen") || attrs_lower.contains("green") {
+        result.push_str("\x1b[1;32m");  // Bold green
+        has_attr = true;
+    } else if attrs_lower.contains("cyellow") || attrs_lower.contains("yellow") {
+        result.push_str("\x1b[1;33m");  // Bold yellow
+        has_attr = true;
+    } else if attrs_lower.contains("cblue") || attrs_lower.contains("blue") {
+        result.push_str("\x1b[1;34m");  // Bold blue
+        has_attr = true;
+    } else if attrs_lower.contains("cmagenta") || attrs_lower.contains("magenta") {
+        result.push_str("\x1b[1;35m");  // Bold magenta
+        has_attr = true;
+    } else if attrs_lower.contains("ccyan") || attrs_lower.contains("cyan") {
+        result.push_str("\x1b[1;36m");  // Bold cyan
+        has_attr = true;
+    } else if attrs_lower.contains("cwhite") || attrs_lower.contains("white") {
+        result.push_str("\x1b[1;37m");  // Bold white
+        has_attr = true;
+    } else if attrs_lower.contains("cbold") || attrs_lower.contains("bold") {
+        result.push_str("\x1b[1m");  // Bold
+        has_attr = true;
+    }
+
+    result.push_str(text);
+
+    if has_attr {
+        result.push_str("\x1b[0m");  // Reset
+    }
+
+    result
+}
+
 /// Convert a wildcard filter pattern to regex for F4 filter popup.
 /// Always uses "contains" semantics - patterns match anywhere in the line.
 /// Supports \* and \? to match literal asterisk and question mark.
@@ -3381,6 +3425,18 @@ impl App {
                 tf_commands_to_execute.extend(tf_result.clay_commands);
                 tf_messages.extend(tf_result.messages);
                 is_gagged = is_gagged || tf_result.should_gag;
+                // Handle substitution: gag original, output substitute
+                if let Some((sub_text, sub_attrs)) = tf_result.substitution {
+                    is_gagged = true;  // Gag the original line
+                    // Add the substituted text as a message with attributes
+                    let sub_with_attrs = if sub_attrs.contains('C') || sub_attrs.contains('B') {
+                        // Apply attributes - Cred means bold red, etc.
+                        apply_tf_attrs(&sub_text, &sub_attrs)
+                    } else {
+                        sub_text
+                    };
+                    tf_messages.push(sub_with_attrs);
+                }
                 // Only add complete lines with gagged flag and highlight color
                 processed_lines.push((line, is_gagged, highlight_color));
             }
@@ -9338,6 +9394,16 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                 app.add_tf_output(msg);
                             }
                             is_gagged = is_gagged || tf_result.should_gag;
+                            // Handle substitution
+                            if let Some((sub_text, sub_attrs)) = tf_result.substitution {
+                                is_gagged = true;
+                                let sub_with_attrs = if sub_attrs.contains('C') || sub_attrs.contains('B') {
+                                    apply_tf_attrs(&sub_text, &sub_attrs)
+                                } else {
+                                    sub_text
+                                };
+                                app.add_tf_output(&sub_with_attrs);
+                            }
 
                             let data = format!("{}\n", message);
 
@@ -11025,6 +11091,16 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                 for msg in &tf_result.messages {
                                     app.add_tf_output(msg);
                                 }
+                                // Handle substitution
+                                if let Some((sub_text, sub_attrs)) = tf_result.substitution {
+                                    is_gagged = true;
+                                    let sub_with_attrs = if sub_attrs.contains('C') || sub_attrs.contains('B') {
+                                        apply_tf_attrs(&sub_text, &sub_attrs)
+                                    } else {
+                                        sub_text
+                                    };
+                                    app.add_tf_output(&sub_with_attrs);
+                                }
                                 // Only add complete lines with gagged flag and highlight color
                                 processed_lines.push((line, is_gagged, highlight_color));
                             }
@@ -11391,6 +11467,16 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                         // Output TF messages (from #echo etc)
                         for msg in &tf_result.messages {
                             app.add_tf_output(msg);
+                        }
+                        // Handle substitution
+                        if let Some((sub_text, sub_attrs)) = tf_result.substitution {
+                            is_gagged = true;
+                            let sub_with_attrs = if sub_attrs.contains('C') || sub_attrs.contains('B') {
+                                apply_tf_attrs(&sub_text, &sub_attrs)
+                            } else {
+                                sub_text
+                            };
+                            app.add_tf_output(&sub_with_attrs);
                         }
 
                         let data = format!("{}\n", message);

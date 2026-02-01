@@ -23,6 +23,8 @@ pub struct TfTriggerResult {
     pub should_gag: bool,
     /// Any errors that occurred
     pub errors: Vec<String>,
+    /// Substituted text (replaces the original line)
+    pub substitution: Option<(String, String)>,  // (text, attrs)
 }
 
 /// Process a line of MUD output against all TF triggers
@@ -82,6 +84,11 @@ pub fn process_line(engine: &mut TfEngine, line: &str, world: Option<&str>) -> T
 
         result.should_gag = true;
         break;
+    }
+
+    // Check for pending substitution
+    if let Some(sub) = engine.pending_substitution.take() {
+        result.substitution = Some((sub.text, sub.attrs));
     }
 
     result
