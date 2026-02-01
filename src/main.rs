@@ -8948,9 +8948,24 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
             for single_cmd in cmd_str.split(';') {
                 let single_cmd = single_cmd.trim();
                 if single_cmd.is_empty() { continue; }
-                if single_cmd.starts_with('/') || single_cmd.starts_with('#') {
-                    // Internal command - execute it
+                if single_cmd.starts_with('/') {
+                    // Clay command - execute it
                     handle_command(single_cmd, &mut app, event_tx.clone()).await;
+                } else if single_cmd.starts_with('#') {
+                    // TF command - execute via TF engine
+                    app.sync_tf_world_info();
+                    match app.tf_engine.execute(single_cmd) {
+                        tf::TfCommandResult::Success(Some(msg)) => {
+                            app.add_output(&msg);
+                        }
+                        tf::TfCommandResult::Error(err) => {
+                            app.add_output(&format!("Error: {}", err));
+                        }
+                        tf::TfCommandResult::RepeatProcess(process) => {
+                            app.tf_engine.processes.push(process);
+                        }
+                        _ => {}
+                    }
                 } else {
                     // Text to send to server - but we're not connected yet
                     // Just add it to output as a note
