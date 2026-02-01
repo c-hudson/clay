@@ -1159,6 +1159,15 @@ Actions are automated triggers that match incoming MUD output against patterns a
 - Matched lines get a dark background color
 - Useful for debugging action patterns without running commands
 
+**Startup Actions:**
+- Actions can have "Startup" enabled to run their commands when Clay starts
+- Fires on fresh start, hot reload (`/reload`, `Ctrl+R`, `SIGUSR1`), and crash recovery
+- Commands are split by semicolons and executed individually
+- In console mode: `/` commands and `#` (TF) commands are executed; plain text shows a note
+- In headless/GUI mode: Only `#` (TF) commands are executed; other commands are skipped
+- Useful for loading TF scripts, setting variables, or running initialization commands
+- Example: Create an action with empty pattern, Startup enabled, command `#load myconfig.tf`
+
 ### Actions List Popup
 
 Opened with `/actions` command:
@@ -1196,6 +1205,7 @@ Opened from actions list (Add or Edit):
 - Pattern - Trigger pattern (empty = manual-only action)
 - Command - Commands to execute (multiline editor, 3 visible lines with scrolling)
 - Enabled - Whether the action is active
+- Startup - Run commands when Clay starts (including reload/crash recovery)
 
 **Command Field:**
 - Multiline editor with 3 visible lines and scrolling viewport
