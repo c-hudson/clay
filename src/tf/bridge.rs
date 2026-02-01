@@ -30,8 +30,12 @@ pub struct TfTriggerResult {
 pub fn process_line(engine: &mut TfEngine, line: &str, world: Option<&str>) -> TfTriggerResult {
     let mut result = TfTriggerResult::default();
 
+    // Strip ANSI codes and trailing whitespace for pattern matching (like Clay actions do)
+    let plain_line = crate::util::strip_ansi_codes(line);
+    let plain_line = plain_line.trim_end();
+
     // Get trigger results from the macro system
-    let command_results = macros::process_triggers(engine, line, world);
+    let command_results = macros::process_triggers(engine, plain_line, world);
 
     // Process each result
     for cmd_result in command_results {

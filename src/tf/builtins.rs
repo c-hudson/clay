@@ -1298,7 +1298,10 @@ mod tests {
         // Check the listen_mush trigger pattern
         let listen_macro = engine.macros.iter().find(|m| m.name == "listen_mush").unwrap();
         if let Some(ref trigger) = listen_macro.trigger {
-            println!("Trigger pattern: '{}'", trigger.pattern);
+            println!("Trigger pattern (original): '{}'", trigger.pattern);
+            println!("Trigger pattern bytes: {:?}", trigger.pattern.as_bytes());
+            println!("First char: {:?}", trigger.pattern.chars().next());
+            println!("Trigger compiled regex: {:?}", trigger.compiled.as_ref().map(|r| r.as_str()));
 
             // Test matching against a sample line
             let test_line = "Someone says, \"Hello world\"";
@@ -1308,6 +1311,24 @@ mod tests {
             let test_line2 = "Bob say, \"Testing\"";
             let match_result2 = crate::tf::macros::match_trigger(trigger, test_line2);
             println!("Match against '{}': {:?}", test_line2, match_result2.is_some());
+
+            // Test with various line endings that might be in MUD output
+            let test_line3 = "Someone says, \"Hello\"\r";  // with CR
+            let match_result3 = crate::tf::macros::match_trigger(trigger, test_line3);
+            println!("Match with CR '{}': {:?}", test_line3.escape_debug(), match_result3.is_some());
+
+            let test_line4 = "Someone says, \"Hello\" ";  // with trailing space
+            let match_result4 = crate::tf::macros::match_trigger(trigger, test_line4);
+            println!("Match with trailing space: {:?}", match_result4.is_some());
+
+            // Test with ANSI codes
+            let test_line5 = "\x1b[0mSomeone says, \"Hello\"";
+            let match_result5 = crate::tf::macros::match_trigger(trigger, test_line5);
+            println!("Match with ANSI prefix: {:?}", match_result5.is_some());
+
+            let test_line6 = "Someone says, \"Hello\"\x1b[0m";
+            let match_result6 = crate::tf::macros::match_trigger(trigger, test_line6);
+            println!("Match with ANSI suffix: {:?}", match_result6.is_some());
         }
 
         // Test process_line to see if triggers fire
