@@ -1787,6 +1787,28 @@ impl World {
         }
     }
 
+    /// Log more-mode debug info to clay.more.log
+    fn log_more_debug(&self, event: &str, line: &str) {
+        use std::io::Write;
+        if let Ok(mut file) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open("clay.more.log")
+        {
+            let lt = local_time_now();
+            let truncated: String = line.chars().take(50).collect();
+            let _ = writeln!(
+                file,
+                "[{:02}:{:02}:{:02}] world={} lines_since_pause={} event={} text={:?}",
+                lt.hour, lt.minute, lt.second,
+                self.name,
+                self.lines_since_pause,
+                event,
+                truncated
+            );
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn add_output(
         &mut self,
@@ -1917,6 +1939,7 @@ impl World {
                         self.first_unseen_at = Some(std::time::Instant::now());
                     }
                 }
+                self.log_more_debug("to_pending", line);
                 self.pending_lines.push(new_line);
                 if is_partial {
                     self.partial_line = line.to_string();
@@ -1924,6 +1947,7 @@ impl World {
                 }
             } else if triggers_pause {
                 // Add line to output_lines BEFORE pausing so it's visible when we scroll to bottom
+                self.log_more_debug("TRIGGERS_MORE", line);
                 self.output_lines.push(new_line);
                 self.lines_since_pause += visual_lines;
                 if !is_current {
@@ -1941,6 +1965,7 @@ impl World {
                     self.partial_in_pending = false; // It went to output_lines, not pending
                 }
             } else {
+                self.log_more_debug("to_output", line);
                 self.output_lines.push(new_line);
                 self.lines_since_pause += visual_lines;
                 if !is_current {
@@ -1994,6 +2019,7 @@ impl World {
         }
         if self.pending_lines.is_empty() {
             self.paused = false;
+            self.log_more_debug("RESET_release_pending_all", "");
             self.lines_since_pause = 0;
             // If partial was in pending, it's now in output
             if self.partial_in_pending {
@@ -2001,12 +2027,14 @@ impl World {
             }
         } else {
             // Reset counter for next batch
+            self.log_more_debug("RESET_release_pending_batch", "");
             self.lines_since_pause = 0;
         }
         self.scroll_to_bottom();
     }
 
     fn release_all_pending(&mut self) {
+        self.log_more_debug("RESET_release_all_pending", "");
         self.output_lines.append(&mut self.pending_lines);
         self.paused = false;
         self.lines_since_pause = 0;
@@ -3303,6 +3331,7 @@ impl App {
         let mut processed_lines: Vec<(&str, bool, Option<String>)> = Vec::new();
         let mut commands_to_execute: Vec<String> = Vec::new();
         let mut tf_commands_to_execute: Vec<String> = Vec::new();
+        let mut tf_messages: Vec<String> = Vec::new();
         let ends_with_newline = combined_data.ends_with('\n');
         let lines: Vec<&str> = combined_data.lines().collect();
         let line_count = lines.len();
@@ -3350,6 +3379,7 @@ impl App {
                 let tf_result = tf::bridge::process_line(&mut self.tf_engine, line, Some(&world_name_for_triggers));
                 commands_to_execute.extend(tf_result.send_commands);
                 tf_commands_to_execute.extend(tf_result.clay_commands);
+                tf_messages.extend(tf_result.messages);
                 is_gagged = is_gagged || tf_result.should_gag;
                 // Only add complete lines with gagged flag and highlight color
                 processed_lines.push((line, is_gagged, highlight_color));
@@ -3522,6 +3552,11 @@ impl App {
         // Keep scroll at bottom if we added gagged lines
         if !self.worlds[world_idx].paused {
             self.worlds[world_idx].scroll_to_bottom();
+        }
+
+        // Display TF trigger messages (from #echo commands)
+        for msg in tf_messages {
+            self.add_tf_output(&msg);
         }
 
         // Merge TF commands into commands_to_execute
@@ -9299,6 +9334,9 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                             let tf_result = tf::bridge::process_line(&mut app.tf_engine, &message, Some(&world_name_for_triggers));
                             commands_to_execute.extend(tf_result.send_commands);
                             tf_commands_to_execute.extend(tf_result.clay_commands);
+                            for msg in &tf_result.messages {
+                                app.add_tf_output(msg);
+                            }
                             is_gagged = is_gagged || tf_result.should_gag;
 
                             let data = format!("{}\n", message);
@@ -10983,6 +11021,10 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                 commands_to_execute.extend(tf_result.send_commands);
                                 tf_commands_to_execute.extend(tf_result.clay_commands);
                                 is_gagged = is_gagged || tf_result.should_gag;
+                                // Output TF messages (from #echo etc)
+                                for msg in &tf_result.messages {
+                                    app.add_tf_output(msg);
+                                }
                                 // Only add complete lines with gagged flag and highlight color
                                 processed_lines.push((line, is_gagged, highlight_color));
                             }
@@ -11346,6 +11388,10 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                         commands_to_execute.extend(tf_result.send_commands);
                         tf_commands_to_execute.extend(tf_result.clay_commands);
                         is_gagged = is_gagged || tf_result.should_gag;
+                        // Output TF messages (from #echo etc)
+                        for msg in &tf_result.messages {
+                            app.add_tf_output(msg);
+                        }
 
                         let data = format!("{}\n", message);
 
@@ -13469,6 +13515,7 @@ fn handle_key_event(key: KeyEvent, app: &mut App) -> KeyAction {
             if !input.is_empty() || app.current_world().connected {
                 // Always reset counter when user sends a command
                 // This matches daemon.rs behavior and prevents spurious pausing
+                app.current_world_mut().log_more_debug("RESET_user_command", &input);
                 app.current_world_mut().lines_since_pause = 0;
                 KeyAction::SendCommand(input)
             } else {
@@ -16944,13 +16991,17 @@ mod tests {
     #[test]
     fn test_cursor_line_with_emoji() {
         let mut input = InputArea::new(3);
-        input.width = 5;
-        // 5 emojis = 5 characters, should wrap to 2 lines
+        input.width = 10;
+        // 5 emojis = 10 display columns (2 per emoji), at width 10 fits on 1 line
         input.buffer = "😀😀😀😀😀".to_string();
         input.cursor_position = input.buffer.len(); // end
 
-        // 5 chars at width 5 = cursor on line 1 (0-indexed)
+        // 10 columns at width 10 = cursor at end of line 0, wraps to line 1
         assert_eq!(input.cursor_line(), 1);
+
+        // At width 5, 10 columns = 2 full lines, cursor at start of line 2
+        input.width = 5;
+        assert_eq!(input.cursor_line(), 2);
     }
 
     #[test]

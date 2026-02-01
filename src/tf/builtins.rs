@@ -1329,11 +1329,23 @@ mod tests {
             let test_line6 = "Someone says, \"Hello\"\x1b[0m";
             let match_result6 = crate::tf::macros::match_trigger(trigger, test_line6);
             println!("Match with ANSI suffix: {:?}", match_result6.is_some());
+
+            // Test with user's actual MUD output
+            let test_line7 = "You say, \"-bUGT\\~T$y\"";
+            let match_result7 = crate::tf::macros::match_trigger(trigger, test_line7);
+            println!("Match 'You say, \"-bUGT\\~T$y\"': {:?}", match_result7.is_some());
+            if let Some(m) = &match_result7 {
+                println!("  Captures: {:?}", m.captures);
+            }
         }
 
         // Test process_line to see if triggers fire
         let result = crate::tf::bridge::process_line(&mut engine, "Test says, \"Hello\"", None);
         println!("process_line result: {:?}", result);
+
+        // Test with user's actual MUD output via process_line
+        let result2 = crate::tf::bridge::process_line(&mut engine, "You say, \"-bUGT\\~T$y\"", None);
+        println!("process_line 'You say, \"-bUGT\\~T$y\"': {:?}", result2);
 
         // Test parsing the problematic condition
         let test_expr = r#"substr("test",0,1) =~ "\\""#;
