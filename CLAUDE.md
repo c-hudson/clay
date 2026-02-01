@@ -484,7 +484,7 @@ Clay includes a TinyFugue compatibility layer using `#` prefix instead of `/`. T
 - `#expr expression` - Evaluate and display result
 - `#test expression` - Evaluate as boolean (returns 0 or 1)
 - `#eval expression` - Evaluate and execute result as command
-- Operators: `+ - * / %` (arithmetic), `== != < > <= >=` (comparison), `& | !` (logical), `=~ !~` (regex), `?:` (ternary)
+- Operators: `+ - * / %` (arithmetic), `== != < > <= >=` (comparison), `& | !` (logical), `=~ !~` (regex), `=/ !/` (glob), `?:` (ternary)
 - String functions: `strlen()`, `substr()`, `strcat()`, `tolower()`, `toupper()`, `strstr()`, `replace()`, `sprintf()`, `strcmp()`, `strncmp()`, `strchr()`, `strrchr()`, `strrep()`, `pad()`, `ascii()`, `char()`
 - Math functions: `rand()`, `time()`, `abs()`, `min()`, `max()`, `mod()`, `trunc()`, `sin()`, `cos()`, `tan()`, `asin()`, `acos()`, `atan()`, `exp()`, `pow()`, `sqrt()`, `log()`, `log10()`
 - Regex: `regmatch(pattern, string)` - Match and populate %P0-%P9 capture groups

@@ -90,9 +90,9 @@ pub fn parse_def(args: &str) -> Result<TfMacro, String> {
     }
 
     macro_def.name = name.to_string();
-    // Unescape \\ to \ in the macro body (TF escape processing during definition)
-    // This converts \\$ to \$ which then allows $(command) substitution at execution
-    macro_def.body = body.replace("\\\\", "\\");
+    // Store the body as-is; escape processing happens during execution
+    // The expression parser handles \\ in strings, and substitute_commands handles \\ -> \
+    macro_def.body = body.to_string();
 
     // Compile trigger pattern if present
     if let Some(ref mut trigger) = macro_def.trigger {
@@ -303,8 +303,9 @@ fn compile_pattern(pattern: &str, mode: TfMatchMode) -> Result<Option<Regex>, St
             glob_to_regex(pattern)
         }
         TfMatchMode::Regexp => {
-            // Already a regex
-            pattern.to_string()
+            // Already a regex, but convert TF $$ to regex $ (end-of-line anchor)
+            // In TF, $$ is how you write $ in a pattern that goes through variable substitution
+            pattern.replace("$$", "$")
         }
     };
 
