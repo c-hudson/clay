@@ -7741,10 +7741,10 @@ pub async fn run_app_headless(
         });
     }
 
-    // Run startup actions on fresh start (not reload/crash)
+    // Run startup actions (including on reload/crash recovery)
     // Note: In headless mode, we only support TF commands (#...) for startup actions
     // since handle_command isn't compatible with spawned tasks
-    if !should_load_state {
+    {
         let startup_actions: Vec<String> = app.settings.actions.iter()
             .filter(|a| a.startup && a.enabled)
             .map(|a| a.command.clone())
@@ -8937,8 +8937,8 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
     // Track if we've cleared the crash count after successful user input
     let mut crash_count_cleared = false;
 
-    // Run startup actions on fresh start (not reload/crash)
-    if !should_load_state {
+    // Run startup actions (including on reload/crash recovery)
+    {
         let startup_actions: Vec<String> = app.settings.actions.iter()
             .filter(|a| a.startup && a.enabled)
             .map(|a| a.command.clone())
