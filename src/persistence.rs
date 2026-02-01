@@ -1230,6 +1230,9 @@ pub fn save_reload_state(app: &App) -> io::Result<()> {
         if !action.enabled {
             writeln!(file, "enabled=false")?;
         }
+        if action.startup {
+            writeln!(file, "startup=true")?;
+        }
     }
 
     Ok(())
