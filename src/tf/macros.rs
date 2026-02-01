@@ -997,7 +997,6 @@ mod split_tests {
         });
 
         let output = list_macros(&engine, None);
-        println!("list_macros output: {:?}", output);
         assert!(!output.is_empty(), "list_macros should return non-empty string");
         assert!(output.contains("test"), "Output should contain macro name");
     }
