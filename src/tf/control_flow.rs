@@ -455,23 +455,31 @@ fn execute_if_block(if_state: &IfState) -> ControlResult {
     let mut commands = vec![];
 
     // Encode the if structure as a special internal command
-    // Format: __tf_if_eval__ followed by JSON-like encoding
-    let mut encoded = String::from("__tf_if_eval__:");
+    // Use \x1F (unit separator) as delimiter - unlikely to appear in TF code
+    const SEP: char = '\x1F';
+    let mut encoded = String::from("__tf_if_eval__");
+    encoded.push(SEP);
     for (i, cond) in if_state.conditions.iter().enumerate() {
-        encoded.push_str(&format!("COND:{}:", cond));
+        encoded.push_str(&format!("COND{}", SEP));
+        encoded.push_str(cond);
+        encoded.push(SEP);
         for line in &if_state.bodies[i] {
-            encoded.push_str(&format!("LINE:{}:", line));
+            encoded.push_str(&format!("LINE{}", SEP));
+            encoded.push_str(line);
+            encoded.push(SEP);
         }
-        encoded.push_str("ENDCOND:");
+        encoded.push_str(&format!("ENDCOND{}", SEP));
     }
     if if_state.has_else {
-        encoded.push_str("ELSE:");
+        encoded.push_str(&format!("ELSE{}", SEP));
         if let Some(else_body) = if_state.bodies.last() {
             for line in else_body {
-                encoded.push_str(&format!("LINE:{}:", line));
+                encoded.push_str(&format!("LINE{}", SEP));
+                encoded.push_str(line);
+                encoded.push(SEP);
             }
         }
-        encoded.push_str("ENDELSE:");
+        encoded.push_str(&format!("ENDELSE{}", SEP));
     }
 
     commands.push(encoded);
@@ -480,28 +488,39 @@ fn execute_if_block(if_state: &IfState) -> ControlResult {
 
 /// Generate commands for a while loop
 fn generate_while_commands(while_state: &WhileState) -> Vec<String> {
-    // Encode the while structure
-    let mut encoded = String::from("__tf_while_eval__:");
-    encoded.push_str(&format!("COND:{}:", while_state.condition));
+    // Use \x1F (unit separator) as delimiter - unlikely to appear in TF code
+    const SEP: char = '\x1F';
+    let mut encoded = String::from("__tf_while_eval__");
+    encoded.push(SEP);
+    encoded.push_str(&format!("COND{}", SEP));
+    encoded.push_str(&while_state.condition);
+    encoded.push(SEP);
     for line in &while_state.body {
-        encoded.push_str(&format!("LINE:{}:", line));
+        encoded.push_str(&format!("LINE{}", SEP));
+        encoded.push_str(line);
+        encoded.push(SEP);
     }
-    encoded.push_str("ENDWHILE:");
+    encoded.push_str(&format!("ENDWHILE{}", SEP));
 
     vec![encoded]
 }
 
 /// Generate commands for a for loop
 fn generate_for_commands(for_state: &ForState) -> Vec<String> {
-    // Encode the for structure
-    let mut encoded = format!(
-        "__tf_for_eval__:VAR:{}:START:{}:END:{}:STEP:{}:",
-        for_state.var_name, for_state.start, for_state.end, for_state.step
-    );
+    // Use \x1F (unit separator) as delimiter - unlikely to appear in TF code
+    const SEP: char = '\x1F';
+    let mut encoded = String::from("__tf_for_eval__");
+    encoded.push(SEP);
+    encoded.push_str(&format!("VAR{}{}{}", SEP, for_state.var_name, SEP));
+    encoded.push_str(&format!("START{}{}{}", SEP, for_state.start, SEP));
+    encoded.push_str(&format!("END{}{}{}", SEP, for_state.end, SEP));
+    encoded.push_str(&format!("STEP{}{}{}", SEP, for_state.step, SEP));
     for line in &for_state.body {
-        encoded.push_str(&format!("LINE:{}:", line));
+        encoded.push_str(&format!("LINE{}", SEP));
+        encoded.push_str(line);
+        encoded.push(SEP);
     }
-    encoded.push_str("ENDFOR:");
+    encoded.push_str(&format!("ENDFOR{}", SEP));
 
     vec![encoded]
 }
@@ -560,6 +579,11 @@ pub fn execute_inline_if_block(engine: &mut TfEngine, block: &str) -> Vec<TfComm
                     let mut state = IfState::new(condition);
                     // If there's content after the condition, add it as the first body line
                     if !body_start.is_empty() {
+                        // Count nested control flow in body_start
+                        let depth_change = count_control_flow_in_line(&body_start);
+                        if depth_change > 0 {
+                            state.depth += depth_change as usize;
+                        }
                         state.bodies[0].push(body_start);
                     }
                     if_state = Some(state);
@@ -582,9 +606,9 @@ pub fn execute_inline_if_block(engine: &mut TfEngine, block: &str) -> Vec<TfComm
                                 // Don't substitute encoded control flow commands - they contain
                                 // embedded line content that should only be substituted during
                                 // decode/execution, not on the entire encoded string
-                                if cmd.starts_with("__tf_if_eval__:")
-                                    || cmd.starts_with("__tf_while_eval__:")
-                                    || cmd.starts_with("__tf_for_eval__:")
+                                if cmd.starts_with("__tf_if_eval__")
+                                    || cmd.starts_with("__tf_while_eval__")
+                                    || cmd.starts_with("__tf_for_eval__")
                                 {
                                     results.push(super::parser::execute_command(engine, &cmd));
                                 } else {
@@ -742,9 +766,22 @@ fn execute_while_loop(engine: &mut TfEngine, condition: &str, body: &[String]) -
                 should_break = true;
                 break;
             }
-            // Substitute variables first, then expressions (order matters!)
-            let line = engine.substitute_vars(line);
-            let line = super::variables::substitute_commands(engine, &line);
+
+            // Check if this is a control flow block - if so, don't substitute here
+            // The control flow executor will handle per-branch substitution
+            let lower = line.trim().to_lowercase();
+            let is_control_flow = lower.starts_with("#if ") || lower.starts_with("#if(")
+                || lower.starts_with("#while ") || lower.starts_with("#for ");
+
+            let line = if is_control_flow {
+                // Pass control flow blocks directly without substitution
+                line.clone()
+            } else {
+                // Substitute variables first, then expressions (order matters!)
+                let line = engine.substitute_vars(line);
+                super::variables::substitute_commands(engine, &line)
+            };
+
             let result = super::parser::execute_command_substituted(engine, &line);
             // Check for break in nested execution
             if let TfCommandResult::Error(ref e) = result {
@@ -901,9 +938,22 @@ fn execute_for_loop(
                 should_break = true;
                 break;
             }
-            // Substitute variables first, then expressions (order matters!)
-            let line = engine.substitute_vars(line);
-            let line = super::variables::substitute_commands(engine, &line);
+
+            // Check if this is a control flow block - if so, don't substitute here
+            // The control flow executor will handle per-branch substitution
+            let lower = line.trim().to_lowercase();
+            let is_control_flow = lower.starts_with("#if ") || lower.starts_with("#if(")
+                || lower.starts_with("#while ") || lower.starts_with("#for ");
+
+            let line = if is_control_flow {
+                // Pass control flow blocks directly without substitution
+                line.clone()
+            } else {
+                // Substitute variables first, then expressions (order matters!)
+                let line = engine.substitute_vars(line);
+                super::variables::substitute_commands(engine, &line)
+            };
+
             let result = super::parser::execute_command_substituted(engine, &line);
             if let TfCommandResult::Error(ref e) = result {
                 if e == "__break__" {
@@ -923,6 +973,74 @@ fn execute_for_loop(
     }
 
     results
+}
+
+/// Count the net change in control flow depth from a line of text.
+/// Returns positive for each #if/#while/#for found, negative for each #endif/#done.
+fn count_control_flow_in_line(text: &str) -> i32 {
+    let lower = text.to_lowercase();
+    let mut depth = 0;
+
+    // Simple word-based scanning for control flow keywords
+    let words: Vec<&str> = lower.split_whitespace().collect();
+    for word in &words {
+        if *word == "#if" || word.starts_with("#if(") {
+            depth += 1;
+        } else if *word == "#while" || word.starts_with("#while(") {
+            depth += 1;
+        } else if *word == "#for" {
+            depth += 1;
+        } else if *word == "#endif" {
+            depth -= 1;
+        } else if *word == "#done" {
+            depth -= 1;
+        }
+    }
+
+    depth
+}
+
+/// Group body lines into execution units.
+/// Lines that form control flow structures (#if...#endif, #while...#done, #for...#done)
+/// are grouped together into single strings with newlines.
+fn group_control_flow_lines(lines: &[String]) -> Vec<String> {
+    let mut result = Vec::new();
+    let mut current_group = String::new();
+    let mut depth = 0;
+
+    for line in lines {
+        let trimmed = line.trim();
+        let depth_change = count_control_flow_in_line(trimmed);
+
+        if depth == 0 && depth_change > 0 {
+            // Starting a new control flow block
+            depth = depth_change;
+            current_group = trimmed.to_string();
+        } else if depth > 0 {
+            // Inside a control flow block
+            if !current_group.is_empty() {
+                current_group.push('\n');
+            }
+            current_group.push_str(trimmed);
+            depth += depth_change;
+
+            if depth <= 0 {
+                // End of control flow block
+                result.push(std::mem::take(&mut current_group));
+                depth = 0;
+            }
+        } else {
+            // Regular line, not in control flow
+            result.push(trimmed.to_string());
+        }
+    }
+
+    // If there's remaining content (unclosed control flow), add it anyway
+    if !current_group.is_empty() {
+        result.push(current_group);
+    }
+
+    result
 }
 
 /// Parse a condition from #if/#elseif, potentially with body content after it.
@@ -965,8 +1083,13 @@ fn parse_condition_with_body(args: &str) -> Result<(String, String), String> {
 pub fn execute_if_encoded(engine: &mut TfEngine, encoded: &str) -> Vec<TfCommandResult> {
     let mut results = vec![];
 
+    // Use \x1F (unit separator) as delimiter
+    const SEP: char = '\x1F';
+    let sep_str = SEP.to_string();
+
     // Parse the encoded if structure
-    let content = encoded.strip_prefix("__tf_if_eval__:").unwrap_or(encoded);
+    let content = encoded.strip_prefix("__tf_if_eval__").unwrap_or(encoded);
+    let content = content.strip_prefix(SEP).unwrap_or(content);
 
     let mut conditions: Vec<String> = vec![];
     let mut bodies: Vec<Vec<String>> = vec![];
@@ -979,37 +1102,37 @@ pub fn execute_if_encoded(engine: &mut TfEngine, encoded: &str) -> Vec<TfCommand
     // Simple parser for the encoded format
     let mut remaining = content;
     while !remaining.is_empty() {
-        if let Some(rest) = remaining.strip_prefix("COND:") {
-            if let Some(end) = rest.find(':') {
+        if let Some(rest) = remaining.strip_prefix(&format!("COND{}", SEP)) {
+            if let Some(end) = rest.find(SEP) {
                 current_cond = Some(rest[..end].to_string());
                 remaining = &rest[end + 1..];
             } else {
                 break;
             }
-        } else if let Some(rest) = remaining.strip_prefix("LINE:") {
-            if let Some(end) = rest.find(':') {
+        } else if let Some(rest) = remaining.strip_prefix(&format!("LINE{}", SEP)) {
+            if let Some(end) = rest.find(SEP) {
                 current_body.push(rest[..end].to_string());
                 remaining = &rest[end + 1..];
             } else {
                 break;
             }
-        } else if let Some(rest) = remaining.strip_prefix("ENDCOND:") {
+        } else if let Some(rest) = remaining.strip_prefix(&format!("ENDCOND{}", SEP)) {
             if let Some(cond) = current_cond.take() {
                 conditions.push(cond);
                 bodies.push(std::mem::take(&mut current_body));
             }
             remaining = rest;
-        } else if let Some(rest) = remaining.strip_prefix("ELSE:") {
+        } else if let Some(rest) = remaining.strip_prefix(&format!("ELSE{}", SEP)) {
             in_else = true;
             remaining = rest;
-        } else if let Some(rest) = remaining.strip_prefix("ENDELSE:") {
+        } else if let Some(rest) = remaining.strip_prefix(&format!("ENDELSE{}", SEP)) {
             if in_else {
                 else_body = Some(std::mem::take(&mut current_body));
             }
             remaining = rest;
         } else {
             // Skip unknown
-            if let Some(idx) = remaining.find(':') {
+            if let Some(idx) = remaining.find(SEP) {
                 remaining = &remaining[idx + 1..];
             } else {
                 break;
@@ -1024,10 +1147,27 @@ pub fn execute_if_encoded(engine: &mut TfEngine, encoded: &str) -> Vec<TfCommand
                 if value.to_bool() {
                     // Execute this branch
                     if let Some(body) = bodies.get(i) {
-                        for line in body {
-                            // Substitute variables first, then expressions
-                            let line = engine.substitute_vars(line);
-                            let line = super::variables::substitute_commands(engine, &line);
+                        // Group body lines into execution units (control flow blocks stay together)
+                        let grouped = group_control_flow_lines(body);
+                        for group in grouped {
+                            let line = group.trim();
+                            if line.is_empty() {
+                                continue;
+                            }
+
+                            // Check if this is a nested control flow block
+                            let lower = line.to_lowercase();
+                            let is_control_flow = lower.starts_with("#if ") || lower.starts_with("#if(")
+                                || lower.starts_with("#while ") || lower.starts_with("#for ");
+
+                            let line = if is_control_flow {
+                                line.to_string()
+                            } else {
+                                // Substitute variables first, then expressions
+                                let line = engine.substitute_vars(&line);
+                                super::variables::substitute_commands(engine, &line)
+                            };
+
                             results.push(super::parser::execute_command_substituted(engine, &line));
                         }
                     }
@@ -1044,9 +1184,19 @@ pub fn execute_if_encoded(engine: &mut TfEngine, encoded: &str) -> Vec<TfCommand
     // No condition matched, execute else if present
     if let Some(body) = else_body {
         for line in &body {
-            // Substitute variables first, then expressions
-            let line = engine.substitute_vars(line);
-            let line = super::variables::substitute_commands(engine, &line);
+            // Check if this is a nested control flow block
+            let lower = line.trim().to_lowercase();
+            let is_control_flow = lower.starts_with("#if ") || lower.starts_with("#if(")
+                || lower.starts_with("#while ") || lower.starts_with("#for ");
+
+            let line = if is_control_flow {
+                line.clone()
+            } else {
+                // Substitute variables first, then expressions
+                let line = engine.substitute_vars(line);
+                super::variables::substitute_commands(engine, &line)
+            };
+
             results.push(super::parser::execute_command_substituted(engine, &line));
         }
     }
@@ -1058,7 +1208,11 @@ pub fn execute_if_encoded(engine: &mut TfEngine, encoded: &str) -> Vec<TfCommand
 pub fn execute_while_encoded(engine: &mut TfEngine, encoded: &str) -> Vec<TfCommandResult> {
     let mut results = vec![];
 
-    let content = encoded.strip_prefix("__tf_while_eval__:").unwrap_or(encoded);
+    // Use \x1F (unit separator) as delimiter
+    const SEP: char = '\x1F';
+
+    let content = encoded.strip_prefix("__tf_while_eval__").unwrap_or(encoded);
+    let content = content.strip_prefix(SEP).unwrap_or(content);
 
     // Parse condition and body
     let mut condition = String::new();
@@ -1066,23 +1220,23 @@ pub fn execute_while_encoded(engine: &mut TfEngine, encoded: &str) -> Vec<TfComm
 
     let mut remaining = content;
     while !remaining.is_empty() {
-        if let Some(rest) = remaining.strip_prefix("COND:") {
-            if let Some(end) = rest.find(':') {
+        if let Some(rest) = remaining.strip_prefix(&format!("COND{}", SEP)) {
+            if let Some(end) = rest.find(SEP) {
                 condition = rest[..end].to_string();
                 remaining = &rest[end + 1..];
             } else {
                 break;
             }
-        } else if let Some(rest) = remaining.strip_prefix("LINE:") {
-            if let Some(end) = rest.find(':') {
+        } else if let Some(rest) = remaining.strip_prefix(&format!("LINE{}", SEP)) {
+            if let Some(end) = rest.find(SEP) {
                 body.push(rest[..end].to_string());
                 remaining = &rest[end + 1..];
             } else {
                 break;
             }
-        } else if remaining.starts_with("ENDWHILE:") {
+        } else if remaining.starts_with(&format!("ENDWHILE{}", SEP)) {
             break;
-        } else if let Some(idx) = remaining.find(':') {
+        } else if let Some(idx) = remaining.find(SEP) {
             remaining = &remaining[idx + 1..];
         } else {
             break;
@@ -1147,7 +1301,11 @@ pub fn execute_while_encoded(engine: &mut TfEngine, encoded: &str) -> Vec<TfComm
 pub fn execute_for_encoded(engine: &mut TfEngine, encoded: &str) -> Vec<TfCommandResult> {
     let mut results = vec![];
 
-    let content = encoded.strip_prefix("__tf_for_eval__:").unwrap_or(encoded);
+    // Use \x1F (unit separator) as delimiter
+    const SEP: char = '\x1F';
+
+    let content = encoded.strip_prefix("__tf_for_eval__").unwrap_or(encoded);
+    let content = content.strip_prefix(SEP).unwrap_or(content);
 
     // Parse var, start, end, step, and body
     let mut var_name = String::new();
@@ -1158,44 +1316,44 @@ pub fn execute_for_encoded(engine: &mut TfEngine, encoded: &str) -> Vec<TfComman
 
     let mut remaining = content;
     while !remaining.is_empty() {
-        if let Some(rest) = remaining.strip_prefix("VAR:") {
-            if let Some(idx) = rest.find(':') {
+        if let Some(rest) = remaining.strip_prefix(&format!("VAR{}", SEP)) {
+            if let Some(idx) = rest.find(SEP) {
                 var_name = rest[..idx].to_string();
                 remaining = &rest[idx + 1..];
             } else {
                 break;
             }
-        } else if let Some(rest) = remaining.strip_prefix("START:") {
-            if let Some(idx) = rest.find(':') {
+        } else if let Some(rest) = remaining.strip_prefix(&format!("START{}", SEP)) {
+            if let Some(idx) = rest.find(SEP) {
                 start = rest[..idx].parse().unwrap_or(0);
                 remaining = &rest[idx + 1..];
             } else {
                 break;
             }
-        } else if let Some(rest) = remaining.strip_prefix("END:") {
-            if let Some(idx) = rest.find(':') {
+        } else if let Some(rest) = remaining.strip_prefix(&format!("END{}", SEP)) {
+            if let Some(idx) = rest.find(SEP) {
                 end = rest[..idx].parse().unwrap_or(0);
                 remaining = &rest[idx + 1..];
             } else {
                 break;
             }
-        } else if let Some(rest) = remaining.strip_prefix("STEP:") {
-            if let Some(idx) = rest.find(':') {
+        } else if let Some(rest) = remaining.strip_prefix(&format!("STEP{}", SEP)) {
+            if let Some(idx) = rest.find(SEP) {
                 step = rest[..idx].parse().unwrap_or(1);
                 remaining = &rest[idx + 1..];
             } else {
                 break;
             }
-        } else if let Some(rest) = remaining.strip_prefix("LINE:") {
-            if let Some(idx) = rest.find(':') {
+        } else if let Some(rest) = remaining.strip_prefix(&format!("LINE{}", SEP)) {
+            if let Some(idx) = rest.find(SEP) {
                 body.push(rest[..idx].to_string());
                 remaining = &rest[idx + 1..];
             } else {
                 break;
             }
-        } else if remaining.starts_with("ENDFOR:") {
+        } else if remaining.starts_with(&format!("ENDFOR{}", SEP)) {
             break;
-        } else if let Some(idx) = remaining.find(':') {
+        } else if let Some(idx) = remaining.find(SEP) {
             remaining = &remaining[idx + 1..];
         } else {
             break;
@@ -1364,11 +1522,11 @@ mod tests {
         let mut engine = TfEngine::new();
         engine.set_global("sum", super::super::TfValue::Integer(0));
 
-        // Create and execute a simple for loop
-        let for_state = ForState::new("i".to_string(), 1, 3, 1);
+        // Create and execute a simple for loop using the new \x1F separator format
+        const SEP: char = '\x1F';
         let encoded = format!(
-            "__tf_for_eval__:VAR:{}:START:{}:END:{}:STEP:{}:LINE:#set sum (${{sum}} + %i):ENDFOR:",
-            for_state.var_name, for_state.start, for_state.end, for_state.step
+            "__tf_for_eval__{sep}VAR{sep}i{sep}START{sep}1{sep}END{sep}3{sep}STEP{sep}1{sep}LINE{sep}#set sum (${{sum}} + %i){sep}ENDFOR{sep}",
+            sep = SEP
         );
 
         let results = execute_for_encoded(&mut engine, &encoded);

@@ -936,6 +936,52 @@ mod split_tests {
         assert!(parts[0].contains("#if (a)") && parts[0].contains("#endif"));
         assert!(parts[1].contains("#if (b)") && parts[1].contains("#endif"));
     }
+
+    #[test]
+    fn test_split_listen_mush() {
+        // Simulated listen_mush body from crypt.tf
+        let body = r#"#if (substr({P2},0,1) =~ "\") #let dcrypt=$(#decrypt 1 x%P2x)%;#else #let dcrypt=$(#decrypt 0 x%P2x)%;#endif%;#if (dcrypt =/ "*3.14") #if (dcrypt =/ "\:*") #echo -w${world_name} -ag -- %*%;#substitute -aCred -- %% * %PL $[substr(dcrypt,strstr(dcrypt,":")+1,strlen(dcrypt)-5)]%;#else #echo -w${world_name} -ag -- %*%;#substitute -aCred -- %% %PL %P1 "$[substr(dcrypt,0,strlen(dcrypt)-4)]"%;#endif%;#endif"#;
+        let parts = split_body_preserving_control_flow(body);
+
+        // Should be TWO parts - two separate #if...#endif blocks
+        assert_eq!(parts.len(), 2, "Expected 2 parts, got {}: {:?}", parts.len(), parts);
+        assert!(parts[0].contains("#if (substr") && parts[0].contains("#endif"), "First block should contain first if..endif");
+        assert!(parts[1].contains("#if (dcrypt =/ \"*3.14\")") && parts[1].contains("#endif"), "Second block should contain second if..endif");
+    }
+
+    #[test]
+    fn test_execute_nested_if_block() {
+        use super::TfEngine;
+
+        let mut engine = TfEngine::new();
+
+        // Set up dcrypt variable with a value that should match "*3.14"
+        engine.set_global("dcrypt", super::TfValue::String("foobar3.14".to_string()));
+
+        // Simulated second part of listen_mush: nested if block
+        let block = r#"#if (dcrypt =/ "*3.14") #if (dcrypt =/ "\:*") #echo COLON PATH%;#else #echo ELSE PATH: $[substr(dcrypt,0,strlen(dcrypt)-4)]%;#endif%;#endif"#;
+
+        // Create a minimal macro to execute
+        let macro_def = TfMacro {
+            name: "test".to_string(),
+            body: block.to_string(),
+            ..Default::default()
+        };
+
+        let results = execute_macro(&mut engine, &macro_def, &[], None);
+
+        // Should have some output
+        assert!(!results.is_empty(), "Should have some results");
+
+        // Check for the expected message (foobar3.14 - "3.14" = "foobar")
+        let has_foobar = results.iter().any(|r| {
+            match r {
+                super::TfCommandResult::Success(Some(msg)) => msg.contains("foobar"),
+                _ => false,
+            }
+        });
+        assert!(has_foobar, "Should output 'foobar', got: {:?}", results);
+    }
 }
 
     #[test]

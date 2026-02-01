@@ -29,15 +29,16 @@ fn execute_command_impl(engine: &mut TfEngine, input: &str, skip_substitution: b
     let input = input.trim();
 
     // Check for internal encoded commands (from control flow)
-    if input.starts_with("__tf_if_eval__:") {
+    // These use \x1F (unit separator) as delimiter to avoid conflicts with : in content
+    if input.starts_with("__tf_if_eval__\x1F") {
         let results = control_flow::execute_if_encoded(engine, input);
         return aggregate_results(results);
     }
-    if input.starts_with("__tf_while_eval__:") {
+    if input.starts_with("__tf_while_eval__\x1F") {
         let results = control_flow::execute_while_encoded(engine, input);
         return aggregate_results(results);
     }
-    if input.starts_with("__tf_for_eval__:") {
+    if input.starts_with("__tf_for_eval__\x1F") {
         let results = control_flow::execute_for_encoded(engine, input);
         return aggregate_results(results);
     }
