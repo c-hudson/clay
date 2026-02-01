@@ -45,6 +45,8 @@ pub struct Action {
     pub owner: Option<String>,  // Username who owns this action (multiuser mode)
     #[serde(default = "default_enabled")]
     pub enabled: bool,          // If false, action will not fire
+    #[serde(default)]
+    pub startup: bool,          // If true, run commands on Clay startup
 }
 
 impl Default for Action {
@@ -57,6 +59,7 @@ impl Default for Action {
             command: String::new(),
             owner: None,
             enabled: true,
+            startup: false,
         }
     }
 }

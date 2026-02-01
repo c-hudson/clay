@@ -2677,6 +2677,7 @@ impl App {
                     pattern: action.pattern.clone(),
                     command: action.command.clone(),
                     enabled: action.enabled,
+                    startup: action.startup,
                 }
             } else {
                 ActionSettings::default()
@@ -5880,7 +5881,7 @@ fn handle_new_popup_key(app: &mut App, key: KeyEvent) -> NewPopupAction {
         ACTIONS_FIELD_FILTER, ACTIONS_FIELD_LIST,
         ACTIONS_BTN_ADD, ACTIONS_BTN_EDIT, ACTIONS_BTN_DELETE, ACTIONS_BTN_CANCEL,
         EDITOR_FIELD_NAME, EDITOR_FIELD_WORLD, EDITOR_FIELD_MATCH_TYPE,
-        EDITOR_FIELD_PATTERN, EDITOR_FIELD_COMMAND, EDITOR_FIELD_ENABLED,
+        EDITOR_FIELD_PATTERN, EDITOR_FIELD_COMMAND, EDITOR_FIELD_ENABLED, EDITOR_FIELD_STARTUP,
         EDITOR_BTN_SAVE, EDITOR_BTN_CANCEL,
     };
     use popup::definitions::world_editor::{
@@ -6579,6 +6580,7 @@ fn handle_new_popup_key(app: &mut App, key: KeyEvent) -> NewPopupAction {
                             let pattern = state.get_text(EDITOR_FIELD_PATTERN).unwrap_or("").to_string();
                             let command = state.get_text(EDITOR_FIELD_COMMAND).unwrap_or("").to_string();
                             let enabled = state.get_bool(EDITOR_FIELD_ENABLED).unwrap_or(true);
+                            let startup = state.get_bool(EDITOR_FIELD_STARTUP).unwrap_or(false);
                             let editing_index = state.get_custom("editing_index").and_then(|s| s.parse::<usize>().ok());
 
                             let match_type = if match_type_str == "wildcard" {
@@ -6595,6 +6597,7 @@ fn handle_new_popup_key(app: &mut App, key: KeyEvent) -> NewPopupAction {
                                 command,
                                 owner: None,
                                 enabled,
+                                startup,
                             };
 
                             app.popup_manager.close();
@@ -7736,6 +7739,31 @@ pub async fn run_app_headless(
                 let _ = sigusr1_tx.send(AppEvent::Sigusr1Received).await;
             }
         });
+    }
+
+    // Run startup actions on fresh start (not reload/crash)
+    // Note: In headless mode, we only support TF commands (#...) for startup actions
+    // since handle_command isn't compatible with spawned tasks
+    if !should_load_state {
+        let startup_actions: Vec<String> = app.settings.actions.iter()
+            .filter(|a| a.startup && a.enabled)
+            .map(|a| a.command.clone())
+            .collect();
+        for cmd_str in startup_actions {
+            // Split by semicolons and execute each command
+            for single_cmd in cmd_str.split(';') {
+                let single_cmd = single_cmd.trim();
+                if single_cmd.is_empty() { continue; }
+                if single_cmd.starts_with('#') {
+                    // TF command - execute via TF engine
+                    app.sync_tf_world_info();
+                    let _ = app.tf_engine.execute(single_cmd);
+                } else {
+                    // Other commands can't be run at startup in headless mode
+                    debug_log(true, &format!("[Startup] Skipped command (headless): {}", single_cmd));
+                }
+            }
+        }
     }
 
     debug_log(true, "HEADLESS: Entering main event loop");
@@ -8908,6 +8936,29 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
 
     // Track if we've cleared the crash count after successful user input
     let mut crash_count_cleared = false;
+
+    // Run startup actions on fresh start (not reload/crash)
+    if !should_load_state {
+        let startup_actions: Vec<String> = app.settings.actions.iter()
+            .filter(|a| a.startup && a.enabled)
+            .map(|a| a.command.clone())
+            .collect();
+        for cmd_str in startup_actions {
+            // Split by semicolons and execute each command
+            for single_cmd in cmd_str.split(';') {
+                let single_cmd = single_cmd.trim();
+                if single_cmd.is_empty() { continue; }
+                if single_cmd.starts_with('/') || single_cmd.starts_with('#') {
+                    // Internal command - execute it
+                    handle_command(single_cmd, &mut app, event_tx.clone()).await;
+                } else {
+                    // Text to send to server - but we're not connected yet
+                    // Just add it to output as a note
+                    app.add_output(&format!("[Startup] Would send: {}", single_cmd));
+                }
+            }
+        }
+    }
 
     debug_log(true, "STARTUP: Entering main event loop");
 

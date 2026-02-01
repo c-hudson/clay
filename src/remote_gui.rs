@@ -454,6 +454,7 @@ pub struct RemoteGuiApp {
     edit_action_pattern: String,
     edit_action_command: String,
     edit_action_enabled: bool,
+    edit_action_startup: bool,
     /// Action error message
     action_error: Option<String>,
     /// Debug text for showing raw ANSI codes
@@ -652,6 +653,7 @@ impl RemoteGuiApp {
             edit_action_pattern: String::new(),
             edit_action_command: String::new(),
             edit_action_enabled: true,
+            edit_action_startup: false,
             action_error: None,
             debug_text: String::new(),
             transparency: 1.0,
@@ -7792,6 +7794,7 @@ impl eframe::App for RemoteGuiApp {
                         self.edit_action_pattern = action.pattern.clone();
                         self.edit_action_command = action.command.clone();
                         self.edit_action_enabled = action.enabled;
+                        self.edit_action_startup = action.startup;
                         self.action_error = None;
                         self.popup_state = PopupState::ActionEditor(idx);
                     }
@@ -7803,6 +7806,7 @@ impl eframe::App for RemoteGuiApp {
                     self.edit_action_pattern = String::new();
                     self.edit_action_command = String::new();
                     self.edit_action_enabled = true;
+                    self.edit_action_startup = false;
                     self.action_error = None;
                     self.popup_state = PopupState::ActionEditor(usize::MAX); // MAX = new action
                 } else if should_close {
@@ -7822,6 +7826,8 @@ impl eframe::App for RemoteGuiApp {
                 let mut edit_action_match_type = self.edit_action_match_type;
                 let mut edit_action_pattern = self.edit_action_pattern.clone();
                 let mut edit_action_command = self.edit_action_command.clone();
+                let mut edit_action_enabled = self.edit_action_enabled;
+                let mut edit_action_startup = self.edit_action_startup;
                 let mut action_error = self.action_error.clone();
                 let actions_clone = self.actions.clone();
 
@@ -8069,6 +8075,40 @@ impl eframe::App for RemoteGuiApp {
                                     styled_text_input(ui, &mut edit_action_pattern, Some(pattern_hint), "action_pattern");
                                 });
 
+                                // Enabled toggle
+                                form_row(ui, "Enabled", &mut |ui| {
+                                    let text = if edit_action_enabled { "Yes" } else { "No" };
+                                    let btn = egui::Button::new(
+                                        egui::RichText::new(text)
+                                            .size(11.0)
+                                            .color(theme.fg())
+                                            .family(egui::FontFamily::Monospace)
+                                    )
+                                    .fill(theme.bg_deep())
+                                    .stroke(egui::Stroke::NONE)
+                                    .min_size(egui::vec2(60.0, 24.0));
+                                    if ui.add(btn).clicked() {
+                                        edit_action_enabled = !edit_action_enabled;
+                                    }
+                                });
+
+                                // Startup toggle
+                                form_row(ui, "Startup", &mut |ui| {
+                                    let text = if edit_action_startup { "Yes" } else { "No" };
+                                    let btn = egui::Button::new(
+                                        egui::RichText::new(text)
+                                            .size(11.0)
+                                            .color(theme.fg())
+                                            .family(egui::FontFamily::Monospace)
+                                    )
+                                    .fill(theme.bg_deep())
+                                    .stroke(egui::Stroke::NONE)
+                                    .min_size(egui::vec2(60.0, 24.0));
+                                    if ui.add(btn).clicked() {
+                                        edit_action_startup = !edit_action_startup;
+                                    }
+                                });
+
                                 ui.add_space(4.0);
 
                                 // Command label (right-aligned like other labels)
@@ -8116,6 +8156,8 @@ impl eframe::App for RemoteGuiApp {
                 self.edit_action_match_type = edit_action_match_type;
                 self.edit_action_pattern = edit_action_pattern;
                 self.edit_action_command = edit_action_command;
+                self.edit_action_enabled = edit_action_enabled;
+                self.edit_action_startup = edit_action_startup;
                 self.action_error = action_error;
 
                 if should_save {
@@ -8127,6 +8169,7 @@ impl eframe::App for RemoteGuiApp {
                         command: self.edit_action_command.clone(),
                         owner: None,
                         enabled: self.edit_action_enabled,
+                        startup: self.edit_action_startup,
                     };
                     if edit_idx == usize::MAX {
                         // New action
@@ -8403,6 +8446,7 @@ impl eframe::App for RemoteGuiApp {
                                                             pattern: action.pattern.clone(),
                                                             command: action.command.clone(),
                                                             enabled: action.enabled,
+                                                            startup: action.startup,
                                                         };
                                                         self.actions_selected = idx;
                                                         let def = create_action_editor_popup(&settings, false);
@@ -8470,6 +8514,11 @@ impl eframe::App for RemoteGuiApp {
                                             Some(*value)
                                         } else { None })
                                         .unwrap_or(true);
+                                    let startup = ps.field(EDITOR_FIELD_STARTUP)
+                                        .and_then(|f| if let crate::popup::FieldKind::Toggle { value } = &f.kind {
+                                            Some(*value)
+                                        } else { None })
+                                        .unwrap_or(false);
 
                                     let action = Action {
                                         name,
@@ -8478,6 +8527,7 @@ impl eframe::App for RemoteGuiApp {
                                         command,
                                         match_type: if match_type_idx == 0 { super::MatchType::Regexp } else { super::MatchType::Wildcard },
                                         enabled,
+                                        startup,
                                         owner: None,
                                     };
 

@@ -228,6 +228,10 @@ pub fn save_settings(app: &App) -> io::Result<()> {
         if !action.enabled {
             writeln!(file, "enabled=false")?;
         }
+        // Only save startup if enabled (default is false)
+        if action.startup {
+            writeln!(file, "startup=true")?;
+        }
     }
 
     // Save permanent bans
@@ -388,6 +392,7 @@ pub fn load_settings(app: &mut App) -> io::Result<()> {
                         "pattern" => action.pattern = unescape_action_value(value),
                         "command" => action.command = unescape_action_value(value),
                         "enabled" => action.enabled = value != "false",
+                        "startup" => action.startup = value == "true",
                         _ => {}
                     }
                 }
@@ -803,6 +808,7 @@ pub fn load_multiuser_settings(app: &mut App) -> io::Result<()> {
                         "pattern" => action.pattern = unescape_action_value(value),
                         "command" => action.command = unescape_action_value(value),
                         "enabled" => action.enabled = value != "false",
+                        "startup" => action.startup = value == "true",
                         _ => {}
                     }
                 }
@@ -999,6 +1005,9 @@ pub fn save_multiuser_settings(app: &App) -> io::Result<()> {
             writeln!(file, "command={}", escaped_command)?;
             if !action.enabled {
                 writeln!(file, "enabled=false")?;
+            }
+            if action.startup {
+                writeln!(file, "startup=true")?;
             }
         }
     }
@@ -1722,6 +1731,7 @@ pub fn load_reload_state(app: &mut App) -> io::Result<bool> {
                             "pattern" => action.pattern = unescape_action_value(value),
                             "command" => action.command = unescape_action_value(value),
                             "enabled" => action.enabled = value != "false",
+                            "startup" => action.startup = value == "true",
                             _ => {}
                         }
                     }

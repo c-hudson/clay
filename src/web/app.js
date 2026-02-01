@@ -85,6 +85,7 @@
         actionPattern: document.getElementById('action-pattern'),
         actionCommand: document.getElementById('action-command'),
         actionEnabled: document.getElementById('action-enabled'),
+        actionStartup: document.getElementById('action-startup'),
         actionError: document.getElementById('action-error'),
         actionSaveBtn: document.getElementById('action-save-btn'),
         actionEditorCancelBtn: document.getElementById('action-editor-cancel-btn'),
@@ -3638,6 +3639,7 @@
             elements.actionCommand.value = action.command || '';
             // Default to true if enabled is not set (for existing actions)
             elements.actionEnabled.value = (action.enabled !== false) ? 'yes' : 'no';
+            elements.actionStartup.value = action.startup ? 'yes' : 'no';
         } else {
             // New action
             elements.actionEditorTitle.textContent = 'New Action';
@@ -3648,6 +3650,7 @@
             elements.actionPattern.value = '';
             elements.actionCommand.value = '';
             elements.actionEnabled.value = 'yes';  // Default to enabled
+            elements.actionStartup.value = 'no';  // Default to disabled
         }
         elements.actionError.textContent = '';
         elements.actionName.focus();
@@ -3727,7 +3730,8 @@
             match_type: elements.actionMatchType.value === 'wildcard' ? 'Wildcard' : 'Regexp',
             pattern: elements.actionPattern.value,
             command: elements.actionCommand.value,
-            enabled: elements.actionEnabled.value === 'yes'
+            enabled: elements.actionEnabled.value === 'yes',
+            startup: elements.actionStartup.value === 'yes'
         };
 
         if (editingActionIndex < 0) {

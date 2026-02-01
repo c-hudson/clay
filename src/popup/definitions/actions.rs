@@ -32,6 +32,7 @@ pub const EDITOR_FIELD_MATCH_TYPE: FieldId = FieldId(12);
 pub const EDITOR_FIELD_PATTERN: FieldId = FieldId(13);
 pub const EDITOR_FIELD_COMMAND: FieldId = FieldId(14);
 pub const EDITOR_FIELD_ENABLED: FieldId = FieldId(15);
+pub const EDITOR_FIELD_STARTUP: FieldId = FieldId(16);
 
 // Button IDs - Editor view
 pub const EDITOR_BTN_SAVE: ButtonId = ButtonId(10);
@@ -135,6 +136,7 @@ pub struct ActionSettings {
     pub pattern: String,
     pub command: String,
     pub enabled: bool,
+    pub startup: bool,
 }
 
 /// Create the action editor popup definition
@@ -173,6 +175,11 @@ pub fn create_action_editor_popup(settings: &ActionSettings, is_new: bool) -> Po
             EDITOR_FIELD_ENABLED,
             "Enabled",
             FieldKind::toggle(settings.enabled),
+        ))
+        .with_field(Field::new(
+            EDITOR_FIELD_STARTUP,
+            "Startup",
+            FieldKind::toggle(settings.startup),
         ))
         .with_button(Button::new(EDITOR_BTN_SAVE, "Save").primary().with_shortcut('S'))
         .with_button(Button::new(EDITOR_BTN_CANCEL, "Cancel").with_shortcut('C'))
