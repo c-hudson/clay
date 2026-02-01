@@ -402,8 +402,9 @@ fn split_body_preserving_control_flow(body: &str) -> Vec<String> {
     let mut current = String::new();
     let mut control_depth = 0;  // Track nesting of #if/#while/#for blocks
 
-    // Split by %; and ; but track control flow depth
-    let parts: Vec<&str> = body.split("%;").flat_map(|s| s.split(';')).collect();
+    // Split by %; only - in TF, only %; is a command separator in macro bodies
+    // Bare ; is NOT a separator (unlike some other scripting languages)
+    let parts: Vec<&str> = body.split("%;").collect();
 
     for part in parts {
         let trimmed = part.trim();

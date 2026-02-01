@@ -1787,6 +1787,79 @@ mod tests {
             println!("Contains ' ': {}", encrypted.contains(' '));
         }
 
+        // Simulate what listen_mush does
+        println!("\n=== Simulating listen_mush trigger ===");
+        // The captured text from the MUD would be: ;[OXrS_FTeYX]`FbLdgRQFfURX^T0aMw!z
+        // (with trailing space because MUD converted %b to space)
+        let captured = ";[OXrS_FTeYX]`FbLdgRQFfURX^T0aMw!z ";
+        let cmd = format!("#decrypt 0 x{}x", captured);
+        println!("Command: {}", cmd);
+        let result = crate::tf::parser::execute_command(&mut engine, &cmd);
+        println!("Result: {:?}", result);
+
+        // Test the trigger pattern matching and execution
+        println!("\n=== Testing trigger pattern matching ===");
+        let line = r#"You say, ";XYY&w|Z""#;
+        println!("Test line: {}", line);
+
+        // Find the listen_mush trigger
+        if let Some(macro_def) = engine.macros.iter().find(|m| m.name == "listen_mush").cloned() {
+            if let Some(ref trigger) = macro_def.trigger {
+                println!("Trigger pattern: {:?}", trigger.pattern);
+
+                // Get the match
+                if let Some(trigger_match) = crate::tf::macros::match_trigger(trigger, line) {
+                    println!("Match found!");
+                    println!("  Full match: {:?}", trigger_match.full_match);
+                    println!("  Captures: {:?}", trigger_match.captures);
+
+                    // Show the macro body
+                    println!("\nMacro body (raw):");
+                    println!("{}", macro_def.body);
+
+                    // Execute the trigger and show results
+                    println!("\n=== Executing trigger ===");
+                    let results = crate::tf::macros::execute_macro(&mut engine, &macro_def, &[], Some(&trigger_match));
+                    for (i, result) in results.iter().enumerate() {
+                        println!("Result {}: {:?}", i, result);
+                    }
+                }
+            }
+        } else {
+            println!("listen_mush macro not found!");
+        }
+
+        // Test variable persistence between calls
+        println!("\n=== Testing variable persistence ===");
+        // First decrypt
+        let result1 = crate::tf::parser::execute_command(&mut engine, "#decrypt 0 xABCx");
+        println!("First decrypt xABCx: {:?}", result1);
+
+        // Check if 'code' variable persists
+        let code_val = engine.get_var("code");
+        println!("'code' variable after first call: {:?}", code_val);
+
+        // Second decrypt - should NOT be affected by first
+        let result2 = crate::tf::parser::execute_command(&mut engine, "#decrypt 0 xDEx");
+        println!("Second decrypt xDEx: {:?}", result2);
+
+        // Full round-trip test - try without MUD escaping issues first
+        println!("\n=== Full round-trip test (no MUD escaping) ===");
+        let original = "test";
+        let encrypt_cmd = format!("#encrypt {}3.14", original);
+        println!("Encrypting: '{}3.14'", original);
+        let encrypt_result = crate::tf::parser::execute_command(&mut engine, &encrypt_cmd);
+        println!("Encrypt result: {:?}", encrypt_result);
+
+        if let TfCommandResult::Success(Some(ref encrypted)) = encrypt_result {
+            println!("Encrypted bytes: {:?}", encrypted.as_bytes());
+            // Direct decrypt without MUD processing
+            let decrypt_cmd = format!("#decrypt 0 x{}x", encrypted);
+            println!("Decrypt command: {}", decrypt_cmd);
+            let decrypt_result = crate::tf::parser::execute_command(&mut engine, &decrypt_cmd);
+            println!("Decrypt result: {:?}", decrypt_result);
+        }
+
         println!("\n=== Testing with ] followed by ` ===");
         let result = crate::tf::parser::execute_command(&mut engine, "#decrypt 0 xA]`Bx");
         println!("xA]`Bx: {:?}", result);
