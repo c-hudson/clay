@@ -117,6 +117,75 @@ pub enum ControlResult {
     NotControlFlow,
 }
 
+/// Count if/while/for openers and closers in a line, returning (if_opens, loop_opens, if_closes, loop_closes)
+fn count_control_keywords(text: &str) -> (i32, i32, i32, i32) {
+    let lower = text.to_lowercase();
+    let mut if_opens = 0;
+    let mut loop_opens = 0;
+    let mut if_closes = 0;
+    let mut loop_closes = 0;
+
+    let words: Vec<&str> = lower.split_whitespace().collect();
+    for word in &words {
+        if *word == "#if" || word.starts_with("#if(") {
+            if_opens += 1;
+        } else if *word == "#while" || word.starts_with("#while(") || *word == "#for" {
+            loop_opens += 1;
+        } else if *word == "#endif" {
+            if_closes += 1;
+        } else if *word == "#done" {
+            loop_closes += 1;
+        }
+    }
+
+    (if_opens, loop_opens, if_closes, loop_closes)
+}
+
+/// Group body lines into executable units.
+/// Lines that form control flow blocks (#if...#endif, #while...#done, #for...#done)
+/// are collected together as a single unit. Other lines remain separate.
+pub fn group_body_lines(body: &[String]) -> Vec<String> {
+    let mut result = Vec::new();
+    let mut i = 0;
+
+    while i < body.len() {
+        let line = &body[i];
+        let trimmed = line.trim();
+
+        // Count control flow keywords in this line
+        let (if_opens, loop_opens, if_closes, loop_closes) = count_control_keywords(trimmed);
+
+        // Check if this starts a control flow block
+        if if_opens > 0 || loop_opens > 0 {
+            // Track depths separately for if blocks and loop blocks
+            let mut if_depth = if_opens - if_closes;
+            let mut loop_depth = loop_opens - loop_closes;
+            let mut block_lines = vec![trimmed.to_string()];
+            i += 1;
+
+            while i < body.len() && (if_depth > 0 || loop_depth > 0) {
+                let inner = body[i].trim();
+                let (inner_if_opens, inner_loop_opens, inner_if_closes, inner_loop_closes) = count_control_keywords(inner);
+
+                if_depth += inner_if_opens - inner_if_closes;
+                loop_depth += inner_loop_opens - inner_loop_closes;
+
+                block_lines.push(inner.to_string());
+                i += 1;
+            }
+
+            // Join the block lines into a single unit
+            result.push(block_lines.join("\n"));
+        } else {
+            // Single line (no control flow openers)
+            result.push(trimmed.to_string());
+            i += 1;
+        }
+    }
+
+    result
+}
+
 /// Parse a single-line #if: #if (condition) command
 /// Returns Some((condition, command)) if valid, None otherwise
 pub fn parse_single_line_if(args: &str) -> Option<(String, String)> {
@@ -148,12 +217,48 @@ pub fn parse_single_line_if(args: &str) -> Option<(String, String)> {
     let condition = args[1..end_paren].trim().to_string();
     let rest = args[end_paren + 1..].trim();
 
-    // If there's content after the condition, it's a single-line if
+    // If there's content after the condition, it might be a single-line if
+    // But if the content contains #else, #elseif, or #endif, it's actually
+    // a multi-line if that was joined via line continuation
     if !rest.is_empty() {
+        let rest_lower = rest.to_lowercase();
+        // Check for control flow keywords that indicate multi-line structure
+        // Need to check for these as standalone commands (preceded by ; or %)
+        if contains_control_flow_keyword(&rest_lower) {
+            return None;  // Treat as multi-line
+        }
         Some((condition, rest.to_string()))
     } else {
         None
     }
+}
+
+/// Check if a string contains control flow keywords (#else, #elseif, #endif)
+/// that indicate it's a multi-line if block
+fn contains_control_flow_keyword(text: &str) -> bool {
+    // Check for #else, #elseif, #endif as commands (not inside strings)
+    // Look for patterns like ";#else", "%;#else", or just "#else" at start
+    let keywords = ["#else", "#elseif", "#endif"];
+    for keyword in &keywords {
+        // Check at start
+        if text.starts_with(keyword) {
+            let after = &text[keyword.len()..];
+            if after.is_empty() || after.starts_with(|c: char| c.is_whitespace() || c == ';' || c == '%') {
+                return true;
+            }
+        }
+        // Check after semicolon or %;
+        for sep in [";", "%;"] {
+            if let Some(idx) = text.find(&format!("{}{}", sep, keyword)) {
+                let after_idx = idx + sep.len() + keyword.len();
+                let after = &text[after_idx..];
+                if after.is_empty() || after.starts_with(|c: char| c.is_whitespace() || c == ';' || c == '%') {
+                    return true;
+                }
+            }
+        }
+    }
+    false
 }
 
 /// Parse the condition from a multi-line #if or #elseif
@@ -407,13 +512,452 @@ pub fn execute_single_if(engine: &mut TfEngine, condition: &str, command: &str) 
     match expressions::evaluate(engine, condition) {
         Ok(value) => {
             if value.to_bool() {
-                // Execute the command
-                super::parser::execute_command(engine, command)
+                // Substitute variables first, then expressions
+                let command = engine.substitute_vars(command);
+                let command = super::variables::substitute_commands(engine, &command);
+                // Execute the command (already substituted)
+                super::parser::execute_command_substituted(engine, &command)
             } else {
                 TfCommandResult::Success(None)
             }
         }
         Err(e) => TfCommandResult::Error(format!("Condition error: {}", e)),
+    }
+}
+
+/// Execute a complete inline control flow block (from macro execution).
+/// The input is a multi-line string containing the complete #if...#endif block.
+///
+/// Example input:
+/// ```
+/// #if (cond)    cmd1
+/// #else    cmd2
+/// #endif
+/// ```
+pub fn execute_inline_if_block(engine: &mut TfEngine, block: &str) -> Vec<TfCommandResult> {
+    let mut if_state = None;
+    let lines: Vec<&str> = block.lines().collect();
+
+    for line in &lines {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let lower = trimmed.to_lowercase();
+
+        if if_state.is_none() {
+            // First line should be #if
+            if !lower.starts_with("#if ") && lower != "#if" {
+                return vec![TfCommandResult::Error("Expected #if at start of block".to_string())];
+            }
+
+            // Parse the #if line: could be "#if (cond)    cmd" or just "#if (cond)"
+            let args = &trimmed[3..].trim_start();
+
+            // Find the condition
+            match parse_condition_with_body(args) {
+                Ok((condition, body_start)) => {
+                    let mut state = IfState::new(condition);
+                    // If there's content after the condition, add it as the first body line
+                    if !body_start.is_empty() {
+                        state.bodies[0].push(body_start);
+                    }
+                    if_state = Some(state);
+                }
+                Err(e) => return vec![TfCommandResult::Error(e)],
+            }
+        } else {
+            let state = if_state.as_mut().unwrap();
+
+            // Check for #endif
+            if lower == "#endif" {
+                state.depth -= 1;
+                if state.depth == 0 {
+                    // Block complete, execute it
+                    let result = execute_if_block(state);
+                    return match result {
+                        ControlResult::Execute(commands) => {
+                            let mut results = vec![];
+                            for cmd in commands {
+                                // Don't substitute encoded control flow commands - they contain
+                                // embedded line content that should only be substituted during
+                                // decode/execution, not on the entire encoded string
+                                if cmd.starts_with("__tf_if_eval__:")
+                                    || cmd.starts_with("__tf_while_eval__:")
+                                    || cmd.starts_with("__tf_for_eval__:")
+                                {
+                                    results.push(super::parser::execute_command(engine, &cmd));
+                                } else {
+                                    // Substitute variables first, then expressions
+                                    let cmd = engine.substitute_vars(&cmd);
+                                    let cmd = super::variables::substitute_commands(engine, &cmd);
+                                    results.push(super::parser::execute_command_substituted(engine, &cmd));
+                                }
+                            }
+                            results
+                        }
+                        ControlResult::Error(e) => vec![TfCommandResult::Error(e)],
+                        _ => vec![],
+                    };
+                } else {
+                    state.bodies[state.current_branch].push(trimmed.to_string());
+                }
+            } else if lower.starts_with("#if ") || lower == "#if" {
+                // Nested #if
+                state.depth += 1;
+                state.bodies[state.current_branch].push(trimmed.to_string());
+            } else if state.depth == 1 && (lower.starts_with("#elseif ") || lower == "#elseif") {
+                if state.has_else {
+                    return vec![TfCommandResult::Error("#elseif after #else".to_string())];
+                }
+                // Parse elseif condition and optional body
+                let args = &trimmed[7..].trim_start();
+                match parse_condition_with_body(args) {
+                    Ok((condition, body_start)) => {
+                        state.conditions.push(condition);
+                        state.bodies.push(vec![]);
+                        state.current_branch += 1;
+                        if !body_start.is_empty() {
+                            state.bodies[state.current_branch].push(body_start);
+                        }
+                    }
+                    Err(e) => return vec![TfCommandResult::Error(e)],
+                }
+            } else if state.depth == 1 && (lower == "#else" || lower.starts_with("#else ")) {
+                if state.has_else {
+                    return vec![TfCommandResult::Error("Duplicate #else".to_string())];
+                }
+                state.has_else = true;
+                state.bodies.push(vec![]);
+                state.current_branch += 1;
+                // Check for content after #else
+                let rest = if lower == "#else" { "" } else { &trimmed[5..].trim_start() };
+                if !rest.is_empty() {
+                    state.bodies[state.current_branch].push(rest.to_string());
+                }
+            } else {
+                // Regular line, add to current branch
+                state.bodies[state.current_branch].push(trimmed.to_string());
+            }
+        }
+    }
+
+    // If we get here, the block wasn't properly closed
+    vec![TfCommandResult::Error("#if block not closed with #endif".to_string())]
+}
+
+/// Execute a complete inline while block (from macro execution).
+/// The input is a multi-line string containing the complete #while...#done block.
+pub fn execute_inline_while_block(engine: &mut TfEngine, block: &str) -> Vec<TfCommandResult> {
+    let mut results: Vec<TfCommandResult> = vec![];
+    let lines: Vec<&str> = block.lines().collect();
+
+    let mut condition = String::new();
+    let mut body: Vec<String> = vec![];
+    let mut depth = 0;
+    let mut in_body = false;
+
+    for line in &lines {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let lower = trimmed.to_lowercase();
+
+        if !in_body {
+            // First line should be #while
+            if !lower.starts_with("#while ") && lower != "#while" {
+                return vec![TfCommandResult::Error("Expected #while at start of block".to_string())];
+            }
+
+            // Parse the #while line
+            let args = &trimmed[6..].trim_start();
+            match parse_condition_with_body(args) {
+                Ok((cond, body_start)) => {
+                    condition = cond;
+                    depth = 1;
+                    in_body = true;
+                    if !body_start.is_empty() {
+                        body.push(body_start);
+                    }
+                }
+                Err(e) => return vec![TfCommandResult::Error(e)],
+            }
+        } else {
+            // Track nested while/for/if blocks
+            if lower.starts_with("#while ") || lower == "#while"
+                || lower.starts_with("#for ") || lower == "#for" {
+                depth += 1;
+                body.push(trimmed.to_string());
+            } else if lower == "#done" {
+                depth -= 1;
+                if depth == 0 {
+                    // Execute the while loop
+                    return execute_while_loop(engine, &condition, &body);
+                } else {
+                    body.push(trimmed.to_string());
+                }
+            } else {
+                body.push(trimmed.to_string());
+            }
+        }
+    }
+
+    vec![TfCommandResult::Error("#while block not closed with #done".to_string())]
+}
+
+/// Execute a while loop with given condition and body
+fn execute_while_loop(engine: &mut TfEngine, condition: &str, body: &[String]) -> Vec<TfCommandResult> {
+    let mut results = vec![];
+    let mut iterations = 0;
+
+    // Group body lines so control flow blocks are kept together
+    let grouped_body = group_body_lines(body);
+
+    loop {
+        if iterations >= MAX_ITERATIONS {
+            results.push(TfCommandResult::Error(format!(
+                "While loop exceeded maximum iterations ({})", MAX_ITERATIONS
+            )));
+            break;
+        }
+
+        // Evaluate condition
+        match expressions::evaluate(engine, condition) {
+            Ok(value) => {
+                if !value.to_bool() {
+                    break;
+                }
+            }
+            Err(e) => {
+                results.push(TfCommandResult::Error(format!("Condition error: {}", e)));
+                break;
+            }
+        }
+
+        // Execute body
+        let mut should_break = false;
+        for line in &grouped_body {
+            if line.trim().to_lowercase() == "#break" {
+                should_break = true;
+                break;
+            }
+            // Substitute variables first, then expressions (order matters!)
+            let line = engine.substitute_vars(line);
+            let line = super::variables::substitute_commands(engine, &line);
+            let result = super::parser::execute_command_substituted(engine, &line);
+            // Check for break in nested execution
+            if let TfCommandResult::Error(ref e) = result {
+                if e == "__break__" {
+                    should_break = true;
+                    break;
+                }
+            }
+            results.push(result);
+        }
+
+        if should_break {
+            break;
+        }
+
+        iterations += 1;
+    }
+
+    results
+}
+
+/// Execute a complete inline for block (from macro execution).
+pub fn execute_inline_for_block(engine: &mut TfEngine, block: &str) -> Vec<TfCommandResult> {
+    let mut results: Vec<TfCommandResult> = vec![];
+    let lines: Vec<&str> = block.lines().collect();
+
+    let mut var_name = String::new();
+    let mut start: i64 = 0;
+    let mut end: i64 = 0;
+    let mut step: i64 = 1;
+    let mut body: Vec<String> = vec![];
+    let mut depth = 0;
+    let mut in_body = false;
+
+    for line in &lines {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let lower = trimmed.to_lowercase();
+
+        if !in_body {
+            // First line should be #for
+            if !lower.starts_with("#for ") && lower != "#for" {
+                return vec![TfCommandResult::Error("Expected #for at start of block".to_string())];
+            }
+
+            // Parse the #for line
+            let args = &trimmed[4..].trim_start();
+            // Parse for args: var start end [step] [body_content]
+            let parts: Vec<&str> = args.split_whitespace().collect();
+            if parts.len() < 3 {
+                return vec![TfCommandResult::Error("#for requires: var start end [step]".to_string())];
+            }
+
+            var_name = parts[0].to_string();
+            start = match parts[1].parse() {
+                Ok(v) => v,
+                Err(_) => return vec![TfCommandResult::Error(format!("Invalid start value: {}", parts[1]))],
+            };
+            end = match parts[2].parse() {
+                Ok(v) => v,
+                Err(_) => return vec![TfCommandResult::Error(format!("Invalid end value: {}", parts[2]))],
+            };
+
+            let mut body_start_idx = 3;
+            if parts.len() > 3 {
+                if let Ok(s) = parts[3].parse::<i64>() {
+                    step = s;
+                    body_start_idx = 4;
+                } else if start <= end {
+                    step = 1;
+                } else {
+                    step = -1;
+                }
+            } else if start <= end {
+                step = 1;
+            } else {
+                step = -1;
+            }
+
+            depth = 1;
+            in_body = true;
+
+            // Any remaining content on the line is body
+            if body_start_idx < parts.len() {
+                let body_content = parts[body_start_idx..].join(" ");
+                if !body_content.is_empty() {
+                    body.push(body_content);
+                }
+            }
+        } else {
+            // Track nested while/for blocks
+            if lower.starts_with("#while ") || lower == "#while"
+                || lower.starts_with("#for ") || lower == "#for" {
+                depth += 1;
+                body.push(trimmed.to_string());
+            } else if lower == "#done" {
+                depth -= 1;
+                if depth == 0 {
+                    // Execute the for loop
+                    return execute_for_loop(engine, &var_name, start, end, step, &body);
+                } else {
+                    body.push(trimmed.to_string());
+                }
+            } else {
+                body.push(trimmed.to_string());
+            }
+        }
+    }
+
+    vec![TfCommandResult::Error("#for block not closed with #done".to_string())]
+}
+
+/// Execute a for loop
+fn execute_for_loop(
+    engine: &mut TfEngine,
+    var_name: &str,
+    start: i64,
+    end: i64,
+    step: i64,
+    body: &[String],
+) -> Vec<TfCommandResult> {
+    let mut results = vec![];
+    let mut iterations = 0;
+    let mut current = start;
+
+    // Group body lines so control flow blocks are kept together
+    let grouped_body = group_body_lines(body);
+
+    let should_continue = |cur: i64, end_val: i64, step_val: i64| -> bool {
+        if step_val > 0 {
+            cur <= end_val
+        } else {
+            cur >= end_val
+        }
+    };
+
+    while should_continue(current, end, step) {
+        if iterations >= MAX_ITERATIONS {
+            results.push(TfCommandResult::Error(format!(
+                "For loop exceeded maximum iterations ({})", MAX_ITERATIONS
+            )));
+            break;
+        }
+
+        // Set loop variable
+        engine.set_local(var_name, super::TfValue::Integer(current));
+
+        // Execute body
+        let mut should_break = false;
+        for line in &grouped_body {
+            if line.trim().to_lowercase() == "#break" {
+                should_break = true;
+                break;
+            }
+            // Substitute variables first, then expressions (order matters!)
+            let line = engine.substitute_vars(line);
+            let line = super::variables::substitute_commands(engine, &line);
+            let result = super::parser::execute_command_substituted(engine, &line);
+            if let TfCommandResult::Error(ref e) = result {
+                if e == "__break__" {
+                    should_break = true;
+                    break;
+                }
+            }
+            results.push(result);
+        }
+
+        if should_break {
+            break;
+        }
+
+        current += step;
+        iterations += 1;
+    }
+
+    results
+}
+
+/// Parse a condition from #if/#elseif, potentially with body content after it.
+/// Returns (condition, body_content) where body_content may be empty.
+fn parse_condition_with_body(args: &str) -> Result<(String, String), String> {
+    let args = args.trim();
+
+    if !args.starts_with('(') {
+        return Err("Condition must be enclosed in parentheses".to_string());
+    }
+
+    // Find matching closing paren
+    let mut depth = 0;
+    let mut end_paren = None;
+    for (i, c) in args.char_indices() {
+        match c {
+            '(' => depth += 1,
+            ')' => {
+                depth -= 1;
+                if depth == 0 {
+                    end_paren = Some(i);
+                    break;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    match end_paren {
+        Some(i) => {
+            let condition = args[1..i].trim().to_string();
+            let rest = args[i + 1..].trim().to_string();
+            Ok((condition, rest))
+        }
+        None => Err("Unclosed parenthesis in condition".to_string()),
     }
 }
 
@@ -481,7 +1025,10 @@ pub fn execute_if_encoded(engine: &mut TfEngine, encoded: &str) -> Vec<TfCommand
                     // Execute this branch
                     if let Some(body) = bodies.get(i) {
                         for line in body {
-                            results.push(super::parser::execute_command(engine, line));
+                            // Substitute variables first, then expressions
+                            let line = engine.substitute_vars(line);
+                            let line = super::variables::substitute_commands(engine, &line);
+                            results.push(super::parser::execute_command_substituted(engine, &line));
                         }
                     }
                     return results;
@@ -497,7 +1044,10 @@ pub fn execute_if_encoded(engine: &mut TfEngine, encoded: &str) -> Vec<TfCommand
     // No condition matched, execute else if present
     if let Some(body) = else_body {
         for line in &body {
-            results.push(super::parser::execute_command(engine, line));
+            // Substitute variables first, then expressions
+            let line = engine.substitute_vars(line);
+            let line = super::variables::substitute_commands(engine, &line);
+            results.push(super::parser::execute_command_substituted(engine, &line));
         }
     }
 
@@ -569,7 +1119,10 @@ pub fn execute_while_encoded(engine: &mut TfEngine, encoded: &str) -> Vec<TfComm
                 should_break = true;
                 break;
             }
-            let result = super::parser::execute_command(engine, line);
+            // Substitute variables first, then expressions
+            let line = engine.substitute_vars(line);
+            let line = super::variables::substitute_commands(engine, &line);
+            let result = super::parser::execute_command_substituted(engine, &line);
             // Check for break in nested execution
             if let TfCommandResult::Error(ref e) = result {
                 if e == "__break__" {
@@ -679,7 +1232,10 @@ pub fn execute_for_encoded(engine: &mut TfEngine, encoded: &str) -> Vec<TfComman
                 should_break = true;
                 break;
             }
-            let result = super::parser::execute_command(engine, line);
+            // Substitute variables first, then expressions
+            let line = engine.substitute_vars(line);
+            let line = super::variables::substitute_commands(engine, &line);
+            let result = super::parser::execute_command_substituted(engine, &line);
             if let TfCommandResult::Error(ref e) = result {
                 if e == "__break__" {
                     should_break = true;
@@ -819,5 +1375,46 @@ mod tests {
 
         // Should have executed 3 times (i=1,2,3), sum should be 6
         assert!(!results.iter().any(|r| matches!(r, TfCommandResult::Error(_))));
+    }
+}
+
+#[cfg(test)]
+mod inline_tests {
+    use super::*;
+
+    #[test]
+    fn test_execute_inline_if_block() {
+        let mut engine = TfEngine::new();
+
+        // Test true condition
+        let block = "#if (1 == 1)    #set x yes\n#else    #set x no\n#endif";
+        let results = execute_inline_if_block(&mut engine, block);
+        assert!(!results.iter().any(|r| matches!(r, TfCommandResult::Error(_))), "Results: {:?}", results);
+        assert_eq!(
+            engine.get_var("x").map(|v| v.to_string_value()),
+            Some("yes".to_string())
+        );
+
+        // Test false condition
+        let block2 = "#if (1 == 2)    #set y wrong\n#else    #set y correct\n#endif";
+        let results2 = execute_inline_if_block(&mut engine, block2);
+        assert!(!results2.iter().any(|r| matches!(r, TfCommandResult::Error(_))), "Results2: {:?}", results2);
+        assert_eq!(
+            engine.get_var("y").map(|v| v.to_string_value()),
+            Some("correct".to_string())
+        );
+    }
+
+    #[test]
+    fn test_nested_inline_if() {
+        let mut engine = TfEngine::new();
+
+        let block = "#if (1 == 1)    #if (2 == 2)    #set z inner\n#endif\n#endif";
+        let results = execute_inline_if_block(&mut engine, block);
+        assert!(!results.iter().any(|r| matches!(r, TfCommandResult::Error(_))), "Results: {:?}", results);
+        assert_eq!(
+            engine.get_var("z").map(|v| v.to_string_value()),
+            Some("inner".to_string())
+        );
     }
 }

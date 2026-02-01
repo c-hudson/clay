@@ -60,7 +60,11 @@ pub fn substitute_variables(engine: &TfEngine, text: &str) -> String {
     let mut i = 0;
 
     while i < len {
-        if chars[i] == '%' {
+        // \% -> % (escape sequence to output literal percent sign)
+        if chars[i] == '\\' && i + 1 < len && chars[i + 1] == '%' {
+            result.push('%');
+            i += 2;
+        } else if chars[i] == '%' {
             if i + 1 < len {
                 match chars[i + 1] {
                     // %% -> literal %
@@ -75,9 +79,19 @@ pub fn substitute_variables(engine: &TfEngine, text: &str) -> String {
                             if let Some(value) = get_special_var(engine, &var_name) {
                                 result.push_str(&value);
                             } else if let Some(value) = engine.get_var(&var_name) {
-                                result.push_str(&value.to_string_value());
+                                // Escape backslashes so they survive subsequent substitute_commands
+                                // processing which converts \\ -> \
+                                let val = value.to_string_value();
+                                result.push_str(&val.replace('\\', "\\\\"));
+                            } else {
+                                // Fall back to simple macros (no trigger, no hook)
+                                if let Some(macro_def) = engine.macros.iter().find(|m|
+                                    m.name == var_name && m.trigger.is_none() && m.hook.is_none()
+                                ) {
+                                    result.push_str(&macro_def.body);
+                                }
+                                // If neither found, substitute empty string (TF behavior)
                             }
-                            // If variable not found, substitute empty string (TF behavior)
                             i = end_idx + 1;
                         } else {
                             // Malformed, keep as-is
@@ -85,11 +99,26 @@ pub fn substitute_variables(engine: &TfEngine, text: &str) -> String {
                             i += 1;
                         }
                     }
+                    // %* - all positional parameters (preserved for macro execution)
+                    '*' => {
+                        result.push('%');
+                        result.push('*');
+                        i += 2;
+                    }
+                    // %L, %R - special positional parameters (preserved for macro execution)
+                    'L' | 'R' => {
+                        result.push('%');
+                        result.push(chars[i + 1]);
+                        i += 2;
+                    }
                     // %varname form - variable name is alphanumeric + underscore
                     c if c.is_alphabetic() || c == '_' => {
                         let (var_name, end_idx) = extract_simple_var(&chars, i + 1);
                         if let Some(value) = engine.get_var(&var_name) {
-                            result.push_str(&value.to_string_value());
+                            // Escape backslashes so they survive subsequent substitute_commands
+                            // processing which converts \\ -> \
+                            let val = value.to_string_value();
+                            result.push_str(&val.replace('\\', "\\\\"));
                         }
                         // If variable not found, substitute empty string
                         i = end_idx;
@@ -325,10 +354,18 @@ pub fn substitute_commands(engine: &mut TfEngine, text: &str) -> String {
     while i < len {
         if chars[i] == '\\' && i + 1 < len {
             match chars[i + 1] {
-                // \$ -> literal $
+                // \$ handling: \$( and \$[ output literal backslash AND allow substitution
                 '$' => {
-                    result.push('$');
-                    i += 2;
+                    if i + 2 < len && (chars[i + 2] == '(' || chars[i + 2] == '[') {
+                        // \$( or \$[ -> output the backslash, then let $( or $[ be processed
+                        // This allows macros like "\\$[char(92)]" to output "\" + result of char(92)
+                        result.push('\\');
+                        i += 1; // Move past backslash, $ will be processed next iteration
+                    } else {
+                        // \$ followed by anything else -> literal $
+                        result.push('$');
+                        i += 2;
+                    }
                 }
                 // \\ -> literal \
                 '\\' => {
@@ -358,10 +395,11 @@ pub fn substitute_commands(engine: &mut TfEngine, text: &str) -> String {
                 // $[...] - expression substitution
                 '[' => {
                     if let Some((expr, end_idx)) = extract_balanced(&chars, i + 2, '[', ']') {
+                        // First substitute any ${varname} inside the expression
+                        let expr = substitute_dollar_braces(engine, &expr);
                         // Evaluate the expression
-                        match super::expressions::evaluate(engine, &expr) {
-                            Ok(value) => result.push_str(&value.to_string_value()),
-                            Err(_) => {} // Silent failure, substitute empty string
+                        if let Ok(value) = super::expressions::evaluate(engine, &expr) {
+                            result.push_str(&value.to_string_value());
                         }
                         i = end_idx + 1;
                     } else {
@@ -370,13 +408,21 @@ pub fn substitute_commands(engine: &mut TfEngine, text: &str) -> String {
                     }
                 }
                 // ${varname} - variable substitution (TF syntax)
+                // Also checks simple macros (macros with no trigger/hook act like variables)
                 '{' => {
                     if let Some((var_name, end_idx)) = extract_balanced(&chars, i + 2, '{', '}') {
-                        // Get variable value
+                        // First check variables
                         if let Some(value) = engine.get_var(&var_name) {
                             result.push_str(&value.to_string_value());
+                        } else {
+                            // Fall back to simple macros (no trigger, no hook)
+                            if let Some(macro_def) = engine.macros.iter().find(|m|
+                                m.name == var_name && m.trigger.is_none() && m.hook.is_none()
+                            ) {
+                                result.push_str(&macro_def.body);
+                            }
+                            // If neither found, substitute empty string
                         }
-                        // If variable not found, substitute empty string
                         i = end_idx + 1;
                     } else {
                         result.push('$');
@@ -422,6 +468,64 @@ fn extract_balanced(chars: &[char], start: usize, open: char, close: char) -> Op
     None // Unbalanced
 }
 
+/// Substitute ${varname} with variable/macro values inside an expression
+/// This is used to pre-process expressions before evaluation
+/// String values are quoted so they're parsed as string literals, not identifiers
+fn substitute_dollar_braces(engine: &TfEngine, text: &str) -> String {
+    let mut result = String::with_capacity(text.len());
+    let chars: Vec<char> = text.chars().collect();
+    let len = chars.len();
+    let mut i = 0;
+
+    while i < len {
+        if chars[i] == '$' && i + 1 < len && chars[i + 1] == '{' {
+            // ${varname} - extract and substitute
+            if let Some((var_name, end_idx)) = extract_balanced(&chars, i + 2, '{', '}') {
+                // First check variables
+                if let Some(value) = engine.get_var(&var_name) {
+                    // Quote string values so they're parsed as literals
+                    match value {
+                        super::TfValue::String(s) => {
+                            // Escape any quotes in the string
+                            let escaped = s.replace('"', "\\\"");
+                            result.push('"');
+                            result.push_str(&escaped);
+                            result.push('"');
+                        }
+                        super::TfValue::Integer(n) => {
+                            result.push_str(&n.to_string());
+                        }
+                        super::TfValue::Float(f) => {
+                            result.push_str(&f.to_string());
+                        }
+                    }
+                } else {
+                    // Fall back to simple macros (no trigger, no hook)
+                    if let Some(macro_def) = engine.macros.iter().find(|m|
+                        m.name == var_name && m.trigger.is_none() && m.hook.is_none()
+                    ) {
+                        // Quote macro body as a string literal
+                        let escaped = macro_def.body.replace('"', "\\\"");
+                        result.push('"');
+                        result.push_str(&escaped);
+                        result.push('"');
+                    }
+                    // If neither found, substitute empty string (as quoted empty)
+                }
+                i = end_idx + 1;
+            } else {
+                result.push('$');
+                i += 1;
+            }
+        } else {
+            result.push(chars[i]);
+            i += 1;
+        }
+    }
+
+    result
+}
+
 /// Execute a command for substitution and return its output
 fn execute_for_substitution(engine: &mut TfEngine, cmd: &str) -> String {
     let cmd = cmd.trim();
@@ -438,7 +542,7 @@ fn execute_for_substitution(engine: &mut TfEngine, cmd: &str) -> String {
     };
 
     // Extract output from result
-    match result {
+    let output = match result {
         super::TfCommandResult::Success(Some(msg)) => msg,
         super::TfCommandResult::Success(None) => String::new(),
         super::TfCommandResult::Error(e) => format!("[error: {}]", e),
@@ -452,7 +556,9 @@ fn execute_for_substitution(engine: &mut TfEngine, cmd: &str) -> String {
             String::new()
         }
         _ => String::new(),
-    }
+    };
+
+    output
 }
 
 #[cfg(test)]
@@ -488,6 +594,9 @@ mod tests {
         let engine = TfEngine::new();
         assert_eq!(substitute_variables(&engine, "100%%"), "100%");
         assert_eq!(substitute_variables(&engine, "%%%%"), "%%");
+        // \% outputs % (escape sequence to output literal percent sign)
+        assert_eq!(substitute_variables(&engine, r"\%b"), "%b");
+        assert_eq!(substitute_variables(&engine, r"say \%b here"), "say %b here");
     }
 
     #[test]
@@ -515,8 +624,14 @@ mod tests {
     #[test]
     fn test_substitute_commands_escape() {
         let mut engine = TfEngine::new();
-        // \$ should become literal $
-        assert_eq!(substitute_commands(&mut engine, r"say \$(test)"), "say $(test)");
+        // \$( outputs backslash AND allows command substitution (TF behavior)
+        // This is how crypt.tf's \\$[char(x)] outputs \ + char result
+        // $(test) with non-command text returns the text itself
+        assert_eq!(substitute_commands(&mut engine, r"say \$(test)"), r"say \test");
+        // \$[ also outputs backslash and allows expression substitution
+        assert_eq!(substitute_commands(&mut engine, r"say \$[2+2]"), r"say \4");
+        // \$ followed by non-( and non-[ becomes literal $
+        assert_eq!(substitute_commands(&mut engine, r"say \$var"), "say $var");
         // \\ should become literal \
         assert_eq!(substitute_commands(&mut engine, r"say \\hello"), r"say \hello");
     }

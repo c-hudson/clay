@@ -15,6 +15,17 @@ pub fn is_tf_command(input: &str) -> bool {
 
 /// Execute a TF command and return the result.
 pub fn execute_command(engine: &mut TfEngine, input: &str) -> TfCommandResult {
+    execute_command_impl(engine, input, false)
+}
+
+/// Execute a TF command with pre-substituted input (skip variable substitution).
+/// Used by control_flow when it has already done substitution.
+pub fn execute_command_substituted(engine: &mut TfEngine, input: &str) -> TfCommandResult {
+    execute_command_impl(engine, input, true)
+}
+
+/// Internal implementation of execute_command.
+fn execute_command_impl(engine: &mut TfEngine, input: &str, skip_substitution: bool) -> TfCommandResult {
     let input = input.trim();
 
     // Check for internal encoded commands (from control flow)
@@ -59,28 +70,47 @@ pub fn execute_command(engine: &mut TfEngine, input: &str) -> TfCommandResult {
         return TfCommandResult::NotTfCommand;
     }
 
+    // Check if this is an inline control flow block (multi-line #while/#for/#if)
+    // These should not have variables substituted here - the control flow executor handles it
+    let rest_check = input[1..].trim_start();
+    let lower_rest = rest_check.to_lowercase();
+    let is_inline_control_flow = input.contains('\n') && (
+        lower_rest.starts_with("while ") || lower_rest.starts_with("while\n")
+        || lower_rest.starts_with("for ") || lower_rest.starts_with("for\n")
+        || lower_rest.starts_with("if ") || lower_rest.starts_with("if\n") || lower_rest.starts_with("if(")
+    );
+
     // Check if this is a #def command - if so, don't substitute variables in the body
     // The body should be stored literally and only substituted when executed
-    let rest_check = input[1..].trim_start();
-    let is_def_command = rest_check.to_lowercase().starts_with("def ")
-        || rest_check.to_lowercase().starts_with("def\t")
-        || rest_check.to_lowercase() == "def";
+    let is_def_command = lower_rest.starts_with("def ")
+        || lower_rest.starts_with("def\t")
+        || lower_rest == "def";
 
-    // Perform variable substitution before parsing (except for #def bodies)
-    let input = if is_def_command {
+    // Perform variable and command substitution before parsing (except for #def bodies, inline control flow,
+    // or when called with pre-substituted input from control_flow)
+    let input = if skip_substitution {
+        // Already substituted by caller (control_flow)
+        input.to_string()
+    } else if is_inline_control_flow {
+        // Don't substitute - control flow executor will handle per-iteration substitution
+        input.to_string()
+    } else if is_def_command {
         // For #def, only substitute variables in options, not in the body
         // Find the = separator and only substitute before it
         if let Some(eq_pos) = input.find('=') {
             let before_eq = &input[..eq_pos];
             let after_eq = &input[eq_pos..];
             let substituted_before = engine.substitute_vars(before_eq);
+            let substituted_before = super::variables::substitute_commands(engine, &substituted_before);
             format!("{}{}", substituted_before, after_eq)
         } else {
             // No body (just #def or #def with options but no =), substitute normally
-            engine.substitute_vars(input)
+            let input = engine.substitute_vars(input);
+            super::variables::substitute_commands(engine, &input)
         }
     } else {
-        engine.substitute_vars(input)
+        let input = engine.substitute_vars(input);
+        super::variables::substitute_commands(engine, &input)
     };
     let input = input.trim();
 
@@ -419,10 +449,19 @@ fn cmd_echo(engine: &TfEngine, args: &str) -> TfCommandResult {
     // Variable substitution already done, just process attribute codes
     let _ = engine;  // Engine already used for substitution
 
+    // Handle -- as end-of-options marker
+    let text = if args.starts_with("-- ") {
+        &args[3..]
+    } else if args == "--" {
+        ""
+    } else {
+        args
+    };
+
     // Process TF attribute codes: @{attr} sequences
     // @{B} = bold, @{U} = underline, @{n} = normal/reset
     // @{Crgb} = foreground color, @{BCrgb} = background color
-    let message = process_attr_codes(args);
+    let message = process_attr_codes(text);
     TfCommandResult::Success(Some(message))
 }
 
@@ -1039,8 +1078,8 @@ fn cmd_test(engine: &mut TfEngine, args: &str) -> TfCommandResult {
         Ok(value) => {
             // Set the special %? variable to the result
             engine.set_global("?", value.clone());
-            // Return the actual value (not just 0/1)
-            TfCommandResult::Success(Some(value.to_string_value()))
+            // #test is silent - it only sets %?, doesn't produce output
+            TfCommandResult::Success(None)
         }
         Err(e) => TfCommandResult::Error(format!("Expression error: {}", e)),
     }
@@ -1063,6 +1102,15 @@ fn is_valid_var_name(name: &str) -> bool {
 
 /// #if (condition) [command] - Conditional execution
 fn cmd_if(engine: &mut TfEngine, args: &str) -> TfCommandResult {
+    // Check if this is a complete inline block (from macro execution)
+    // These contain newlines and the full #if...#endif structure
+    if args.contains('\n') && args.to_lowercase().contains("#endif") {
+        // Reconstruct the full block by prepending "#if "
+        let full_block = format!("#if {}", args);
+        let results = control_flow::execute_inline_if_block(engine, &full_block);
+        return aggregate_inline_results(results);
+    }
+
     // Check for single-line form: #if (condition) command
     if let Some((condition, command)) = control_flow::parse_single_line_if(args) {
         return control_flow::execute_single_if(engine, &condition, &command);
@@ -1078,8 +1126,42 @@ fn cmd_if(engine: &mut TfEngine, args: &str) -> TfCommandResult {
     }
 }
 
+/// Aggregate results from inline control flow execution
+fn aggregate_inline_results(results: Vec<TfCommandResult>) -> TfCommandResult {
+    let mut messages = vec![];
+    let mut has_error = false;
+
+    for result in results {
+        match result {
+            TfCommandResult::Success(Some(msg)) => messages.push(msg),
+            TfCommandResult::Error(e) => {
+                messages.push(format!("Error: {}", e));
+                has_error = true;
+            }
+            _ => {}
+        }
+    }
+
+    if has_error {
+        TfCommandResult::Error(messages.join("\n"))
+    } else if messages.is_empty() {
+        TfCommandResult::Success(None)
+    } else {
+        TfCommandResult::Success(Some(messages.join("\n")))
+    }
+}
+
 /// #while (condition) - Start a while loop
 fn cmd_while(engine: &mut TfEngine, args: &str) -> TfCommandResult {
+    // Check if this is a complete inline block (from macro execution)
+    // These contain newlines and the full #while...#done structure
+    if args.contains('\n') && args.to_lowercase().contains("#done") {
+        // Reconstruct the full block by prepending "#while "
+        let full_block = format!("#while {}", args);
+        let results = control_flow::execute_inline_while_block(engine, &full_block);
+        return aggregate_inline_results(results);
+    }
+
     match control_flow::parse_condition(args) {
         Ok(condition) => {
             engine.control_state = ControlState::While(WhileState::new(condition));
@@ -1091,6 +1173,13 @@ fn cmd_while(engine: &mut TfEngine, args: &str) -> TfCommandResult {
 
 /// #for var start end [step] - Start a for loop
 fn cmd_for(engine: &mut TfEngine, args: &str) -> TfCommandResult {
+    // Check if this is a complete inline block (from macro execution)
+    if args.contains('\n') && args.to_lowercase().contains("#done") {
+        let full_block = format!("#for {}", args);
+        let results = control_flow::execute_inline_for_block(engine, &full_block);
+        return aggregate_inline_results(results);
+    }
+
     match control_flow::parse_for_args(args) {
         Ok((var_name, start, end, step)) => {
             engine.control_state = ControlState::For(ForState::new(var_name, start, end, step));
@@ -1648,18 +1737,21 @@ mod tests {
     }
 
     #[test]
-    fn test_def_preserves_variables_in_body() {
+    fn test_def_preserves_body() {
         let mut engine = TfEngine::new();
 
         // Define a macro with %R and other variables in the body
-        // These should NOT be substituted during definition
+        // The body should be preserved literally for later substitution when executed
         execute_command(&mut engine, "#def random = #echo -- %R");
-        execute_command(&mut engine, "#def test = #echo %{foo} %1 %* %L");
+        execute_command(&mut engine, "#def test = #echo %1 %* %L %myvar");
 
         let random = engine.macros.iter().find(|m| m.name == "random").unwrap();
         assert_eq!(random.body, "#echo -- %R", "Body should preserve %R literally");
 
         let test = engine.macros.iter().find(|m| m.name == "test").unwrap();
-        assert_eq!(test.body, "#echo %{foo} %1 %* %L", "Body should preserve all variable references");
+        assert_eq!(test.body, "#echo %1 %* %L %myvar", "Body should preserve all variables");
+
+        // When a macro is EXECUTED (not defined), variables are substituted
+        // This is handled by execute_macro, not by #def parsing
     }
 }

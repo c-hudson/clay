@@ -90,7 +90,9 @@ pub fn parse_def(args: &str) -> Result<TfMacro, String> {
     }
 
     macro_def.name = name.to_string();
-    macro_def.body = body.to_string();
+    // Unescape \\ to \ in the macro body (TF escape processing during definition)
+    // This converts \\$ to \$ which then allows $(command) substitution at execution
+    macro_def.body = body.replace("\\\\", "\\");
 
     // Compile trigger pattern if present
     if let Some(ref mut trigger) = macro_def.trigger {
@@ -389,6 +391,93 @@ pub fn match_trigger<'a>(trigger: &TfTrigger, line: &'a str) -> Option<TriggerMa
     })
 }
 
+/// Split a macro body into execution units, preserving control flow blocks as single units.
+///
+/// This handles cases like:
+///   #if (cond) cmd1%;#else cmd2%;#endif
+/// Which should be treated as ONE control flow block, not split by %;
+fn split_body_preserving_control_flow(body: &str) -> Vec<String> {
+    let mut result = Vec::new();
+    let mut current = String::new();
+    let mut control_depth = 0;  // Track nesting of #if/#while/#for blocks
+
+    // Split by %; and ; but track control flow depth
+    let parts: Vec<&str> = body.split("%;").flat_map(|s| s.split(';')).collect();
+
+    for part in parts {
+        let trimmed = part.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+
+        // Count control flow keywords within this part (handles inline nested structures)
+        let depth_change = count_control_flow_depth_change(trimmed);
+
+        if control_depth == 0 {
+            if depth_change > 0 {
+                // Starting a new control flow block
+                control_depth = depth_change;
+                current = trimmed.to_string();
+            } else {
+                // Regular command, add directly
+                result.push(trimmed.to_string());
+            }
+        } else {
+            // Inside a control flow block
+            // Append to current block
+            if !current.is_empty() {
+                current.push('\n');
+            }
+            current.push_str(trimmed);
+
+            control_depth += depth_change;
+
+            if control_depth <= 0 {
+                control_depth = 0;
+                // End of control flow block, emit it
+                result.push(std::mem::take(&mut current));
+            }
+        }
+    }
+
+    // If there's remaining content (unclosed control flow), add it anyway
+    if !current.is_empty() {
+        result.push(current);
+    }
+
+    result
+}
+
+/// Count the net change in control flow depth from a piece of text.
+/// Returns positive for opening keywords (#if, #while, #for), negative for closing (#endif, #done).
+fn count_control_flow_depth_change(text: &str) -> i32 {
+    let lower = text.to_lowercase();
+    let mut depth = 0;
+
+    // We need to find all occurrences of control flow keywords
+    // This is tricky because "#if" could appear in a string, but for simplicity
+    // we'll scan for them as whitespace-separated tokens
+
+    // Look for control flow starts
+    let words: Vec<&str> = lower.split_whitespace().collect();
+    for word in &words {
+        // Check if this is a control flow keyword (possibly with something attached)
+        if *word == "#if" || word.starts_with("#if(") {
+            depth += 1;
+        } else if *word == "#while" || word.starts_with("#while(") {
+            depth += 1;
+        } else if *word == "#for" {
+            depth += 1;
+        } else if *word == "#endif" {
+            depth -= 1;
+        } else if *word == "#done" {
+            depth -= 1;
+        }
+    }
+
+    depth
+}
+
 /// Execute a macro with the given arguments/captures
 pub fn execute_macro(
     engine: &mut TfEngine,
@@ -445,22 +534,39 @@ pub fn execute_macro(
         body = variables::substitute_captures(&body, tm.full_match, &capture_refs, tm.left, tm.right);
     }
 
-    // Split body by %; or ; for multiple commands
-    // In TF macro definitions, %; is commonly used as command separator
-    // (especially with line continuation), while ; also works
-    for cmd in body.split("%;").flat_map(|s| s.split(';')) {
+    // Split body into execution units, preserving control flow blocks as units
+    let commands = split_body_preserving_control_flow(&body);
+
+    for cmd in commands {
         let cmd = cmd.trim();
         if cmd.is_empty() {
             continue;
         }
 
-        // Process command/expression substitution ($(...) and $[...])
-        let cmd = variables::substitute_commands(engine, cmd);
+        // Check if this is a control flow block - if so, don't substitute here
+        // The control flow executor will handle per-iteration substitution
+        let lower = cmd.to_lowercase();
+        let is_control_flow = lower.starts_with("#while ") || lower.starts_with("#while\n")
+            || lower.starts_with("#for ") || lower.starts_with("#for\n")
+            || lower.starts_with("#if ") || lower.starts_with("#if\n")
+            || lower.starts_with("#if(");
+
+        let cmd = if is_control_flow {
+            // Pass control flow blocks directly without substitution
+            cmd.to_string()
+        } else {
+            // First substitute %variables, then process $[...] expressions
+            // Order matters: %tmppwd$[char(x)] must become VALUE$[char(x)] first,
+            // otherwise $[char(x)] evaluates to "F" giving %tmppwdF which is wrong
+            let cmd = engine.substitute_vars(cmd);
+            let cmd = variables::substitute_commands(engine, &cmd);
+            cmd
+        };
         let cmd = cmd.trim();
 
-        // Execute the command
+        // Execute the command (already substituted above)
         let result = if cmd.starts_with('#') {
-            super::parser::execute_command(engine, &cmd)
+            super::parser::execute_command_substituted(engine, &cmd)
         } else if cmd.starts_with('/') {
             TfCommandResult::ClayCommand(cmd.to_string())
         } else {
@@ -779,3 +885,71 @@ mod tests {
         assert!(output.contains("1: #def -t\"^You hit\" attack = kick"));
     }
 }
+
+#[cfg(test)]
+mod split_tests {
+    use super::*;
+
+    #[test]
+    fn test_split_body_preserving_control_flow() {
+        // Simulating crypt.tf pattern: #if...%;#else...%;#endif
+        let body = "#if (cond)    cmd1%;#else    cmd2%;#endif";
+        let parts = split_body_preserving_control_flow(body);
+
+        // Should be ONE part - the entire control flow block
+        assert_eq!(parts.len(), 1, "Parts: {:?}", parts);
+        assert!(parts[0].contains("#if") && parts[0].contains("#endif"));
+    }
+
+    #[test]
+    fn test_split_mixed_commands() {
+        // Mix of regular commands and control flow
+        let body = "cmd1%;#if (x)    inside%;#endif%;cmd2";
+        let parts = split_body_preserving_control_flow(body);
+
+        // Should be 3 parts: cmd1, the if block, cmd2
+        assert_eq!(parts.len(), 3, "Parts: {:?}", parts);
+        assert_eq!(parts[0], "cmd1");
+        assert!(parts[1].contains("#if") && parts[1].contains("#endif"));
+        assert_eq!(parts[2], "cmd2");
+    }
+
+    #[test]
+    fn test_split_nested_control_flow() {
+        // Nested #if blocks (like in crypt.tf)
+        let body = "#if (a)    #if (b)    inner%;#endif%;outer%;#endif";
+        let parts = split_body_preserving_control_flow(body);
+
+        // Should be ONE part - the entire outer control flow block
+        assert_eq!(parts.len(), 1, "Parts: {:?}", parts);
+    }
+
+    #[test]
+    fn test_split_crypt_tf_pattern() {
+        // Pattern from crypt.tf: two sequential #if blocks
+        let body = "#if (a)    cmd1%;#else    cmd2%;#endif%;#if (b)    #if (c)    inner%;#else    other%;#endif%;outer%;#endif";
+        let parts = split_body_preserving_control_flow(body);
+
+        // Should be TWO parts - two separate control flow blocks
+        assert_eq!(parts.len(), 2, "Parts: {:?}", parts);
+        assert!(parts[0].contains("#if (a)") && parts[0].contains("#endif"));
+        assert!(parts[1].contains("#if (b)") && parts[1].contains("#endif"));
+    }
+}
+
+    #[test]
+    fn test_list_macros_output() {
+        let mut engine = TfEngine::new();
+
+        // Add a simple macro manually
+        engine.add_macro(TfMacro {
+            name: "test".to_string(),
+            body: "echo hello".to_string(),
+            ..Default::default()
+        });
+
+        let output = list_macros(&engine, None);
+        println!("list_macros output: {:?}", output);
+        assert!(!output.is_empty(), "list_macros should return non-empty string");
+        assert!(output.contains("test"), "Output should contain macro name");
+    }

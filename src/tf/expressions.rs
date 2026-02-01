@@ -973,16 +973,20 @@ impl<'a> Evaluator<'a> {
                     return Err("substr requires 2 or 3 arguments".to_string());
                 }
                 let s = self.eval(&args[0])?.to_string_value();
-                let start = self.eval(&args[1])?.to_int().unwrap_or(0) as usize;
-                let len = if args.len() == 3 {
-                    self.eval(&args[2])?.to_int().unwrap_or(s.len() as i64) as usize
+                let start_val = self.eval(&args[1])?.to_int().unwrap_or(0);
+                let len_val = if args.len() == 3 {
+                    self.eval(&args[2])?.to_int().unwrap_or(s.len() as i64)
                 } else {
-                    s.len()
+                    s.len() as i64
                 };
+
+                // Handle negative values - treat as 0
+                let start = if start_val < 0 { 0usize } else { start_val as usize };
+                let len = if len_val < 0 { 0usize } else { len_val as usize };
 
                 let chars: Vec<char> = s.chars().collect();
                 let start = start.min(chars.len());
-                let end = (start + len).min(chars.len());
+                let end = start.saturating_add(len).min(chars.len());
                 let result: String = chars[start..end].iter().collect();
                 Ok(TfValue::String(result))
             }

@@ -1265,13 +1265,16 @@ mod tests {
         assert!(random_macro.body.contains("%R"),
             "random macro body should contain %R, got: {}", random_macro.body);
 
-        // Verify that the "e" macro body doesn't contain comment text
-        // The comment line ";   #echo -- say \\$(#encrypt %*3.14)%;" should be stripped
+        // Verify the "e" macro body contains both #echo and say commands
+        // The macro first echoes the command (for display) then sends it to MUD
         let e_macro = engine.macros.iter().find(|m| m.name == "e").unwrap();
-        assert!(!e_macro.body.contains("#echo"),
-            "e macro body should not contain comment text '#echo', got: {}", e_macro.body);
+        assert!(e_macro.body.contains("#echo"),
+            "e macro body should contain '#echo' command, got: {}", e_macro.body);
         assert!(e_macro.body.contains("say"),
             "e macro body should contain 'say', got: {}", e_macro.body);
+        // Verify \\ is unescaped to \ during macro definition
+        assert!(e_macro.body.contains("\\$("),
+            "e macro body should have \\$( for command substitution, got: {}", e_macro.body);
 
         // Verify listen_mush has a trigger pattern
         let listen_macro = engine.macros.iter().find(|m| m.name == "listen_mush").unwrap();
@@ -1279,3 +1282,181 @@ mod tests {
         assert_eq!(listen_macro.priority, 5000, "listen_mush should have priority 5000");
     }
 }
+
+    #[test]
+    fn test_load_and_list_persistence() {
+        let mut engine = TfEngine::new();
+
+        // Load crypt.tf
+        let result = crate::tf::parser::execute_command(&mut engine, "#load crypt.tf");
+        println!("Load result: {:?}", result);
+
+        // Now list macros
+        let list_result = crate::tf::parser::execute_command(&mut engine, "#list");
+        let direct_list = crate::tf::macros::list_macros(&engine, None);
+        println!("Direct list_macros output: {:?}", direct_list);
+        println!("List result: {:?}", list_result);
+
+        // Verify macros exist
+        println!("Number of macros: {}", engine.macros.len());
+        assert!(!engine.macros.is_empty(), "Macros should be loaded after #load");
+
+        // Check that #list returns something
+        match list_result {
+            TfCommandResult::Success(Some(output)) => {
+                assert!(output.contains("random"), "List output should contain 'random' macro");
+            }
+            _ => panic!("Expected Success with output from #list"),
+        }
+    }
+
+    #[test]
+    fn test_encrypt_output() {
+        let mut engine = TfEngine::new();
+
+        // Load crypt.tf
+        let _result = crate::tf::parser::execute_command(&mut engine, "#load crypt.tf");
+
+        // Execute the encryption command - just the encryption part, not the full #e macro
+        let result = crate::tf::parser::execute_command(&mut engine, "#encrypt testing3.14");
+
+        // The encrypt macro should output to echo, capture the result
+        println!("Encrypt result: {:?}", result);
+
+        match result {
+            TfCommandResult::Success(Some(output)) => {
+                println!("Encrypt output: '{}'", output);
+                // TF produces: \;XYY\\XSY!vx (with escapes for ; and \)
+                // The semicolon at position 0 and backslash at position 4 should be escaped
+                assert!(output.contains('\\'), "Encrypt output should contain backslash escape, got: {}", output);
+            }
+            TfCommandResult::Error(e) => {
+                panic!("Encrypt failed with error: {}", e);
+            }
+            other => {
+                println!("Unexpected result type: {:?}", other);
+            }
+        }
+
+        // Now test the full #e macro which sends to MUD
+        let result = crate::tf::parser::execute_command(&mut engine, "#e testing");
+        println!("#e result: {:?}", result);
+
+        // Also test what gets sent to MUD by invoking directly
+        let e_macro = engine.macros.iter().find(|m| m.name == "e").unwrap();
+        println!("#e macro body: '{}'", e_macro.body);
+
+        // Check what got queued for sending to MUD
+        println!("Pending commands: {:?}", engine.pending_commands);
+
+        // Check the stored makeprintable macro body
+        let mp_macro = engine.macros.iter().find(|m| m.name == "makeprintable").unwrap();
+        println!("makeprintable body: '{}'", mp_macro.body);
+        println!("makeprintable body bytes: {:?}", mp_macro.body.as_bytes());
+
+        // Test makeprintable directly for char 92 (backslash)
+        // It should output \\ (two backslashes) - one escape + one char
+        let result = crate::tf::parser::execute_command(&mut engine, "#makeprintable 4 92");
+        println!("makeprintable 4 92 result: {:?}", result);
+        if let TfCommandResult::Success(Some(output)) = &result {
+            println!("makeprintable output bytes: {:?}", output.as_bytes());
+            println!("makeprintable output len: {}", output.len());
+        }
+
+        // Test makeprintable for char 32 (space) - should output %b
+        let result = crate::tf::parser::execute_command(&mut engine, "#makeprintable 0 32");
+        println!("makeprintable 0 32 result: {:?}", result);
+        if let TfCommandResult::Success(Some(output)) = &result {
+            println!("makeprintable 0 32 output: '{}' (bytes: {:?})", output, output.as_bytes());
+            assert_eq!(output, "%b", "makeprintable for space (32) should output %b");
+        } else {
+            panic!("makeprintable 0 32 failed: {:?}", result);
+        }
+
+        // The expected TF output is: say \;XYY\\XSY!vx (as displayed)
+        // Where \\ represents TWO actual backslash characters (escape + char)
+        // So the actual string should have 2 backslashes between YY and XSY
+
+        // Check if any pending send matches what we expect
+        assert!(!engine.pending_commands.is_empty(), "Should have pending commands");
+        let send = &engine.pending_commands[0];
+        println!("First pending command: '{}'", send.command);
+        println!("First pending command bytes: {:?}", send.command.as_bytes());
+        println!("First pending command len: {}", send.command.len());
+
+        // Count backslashes in the result
+        let backslash_count = send.command.chars().filter(|&c| c == '\\').count();
+        println!("Backslash count: {}", backslash_count);
+
+        // TF expects 2 backslashes: one before ; and one before X (which is escaped as \\)
+        // So total should be 3 backslash characters? Or is \\ just one escaped backslash?
+
+        // Test longer input that previously crashed due to overflow in substr
+        engine.pending_commands.clear();
+
+        // First, let's trace the encryption step by step
+        // The input "this is a test of the something3.14" has 35 chars
+        // Last char '4' (ASCII 52) with password char 'k' (ASCII 107) at index 34%7=6
+        // encrypted = ((52 + 107 - 64) mod 95) + 32 = (95 mod 95) + 32 = 0 + 32 = 32 (space)
+        // So the last char should be 32, which makeprintable converts to %b
+
+        // Test with a short input where we know the last char encrypts to space
+        // 'F' (70) with password 'F' (70): (70+70-64) mod 95 + 32 = 76 mod 95 + 32 = 76+32 = 108 = 'l'
+        // Let's find a char that with 'F' gives 32:
+        // (x + 70 - 64) mod 95 + 32 = 32 => (x + 6) mod 95 = 0 => x = 89 = 'Y'
+        // So "Y" with password starting with 'F' should give space (32)
+
+        let result = crate::tf::parser::execute_command(&mut engine, "#encrypt Y");
+        println!("#encrypt Y result: {:?}", result);
+        // Should output %b since Y encrypts to space
+        if let TfCommandResult::Success(Some(ref output)) = result {
+            assert_eq!(output, "%b", "#encrypt Y should produce %b");
+        }
+
+        // Also test "YY" - first char should be space (%b), second should be 'L'
+        let result = crate::tf::parser::execute_command(&mut engine, "#encrypt YY");
+        println!("#encrypt YY result: {:?}", result);
+        if let TfCommandResult::Success(Some(ref output)) = result {
+            assert_eq!(output, "%bL", "#encrypt YY should produce %bL");
+        }
+
+        // First check strlen of the input
+        let result = crate::tf::parser::execute_command(&mut engine, "#expr strlen(\"this is a test of the something3.14\")");
+        println!("strlen of input: {:?}", result);
+
+        // Check what {*} expands to in encrypt context
+        // The encrypt macro uses {*} which should be all args
+        let input = "this is a test of the something3.14";
+        println!("Input string: '{}' (len={})", input, input.len());
+
+        // Test encrypt directly (not #e) to see raw output
+        let result = crate::tf::parser::execute_command(&mut engine, "#encrypt this is a test of the something3.14");
+        println!("#encrypt long result: {:?}", result);
+        if let TfCommandResult::Success(Some(ref output)) = result {
+            println!("#encrypt output: '{}'", output);
+            println!("#encrypt output bytes: {:?}", output.as_bytes());
+            println!("#encrypt output len: {}", output.len());
+            // Check if it ends with %b
+            if output.ends_with("%b") {
+                println!("Output correctly ends with %b");
+            } else {
+                println!("WARNING: Output does NOT end with %b, ends with: '{}'",
+                    &output[output.len().saturating_sub(5)..]);
+            }
+        }
+
+        let result = crate::tf::parser::execute_command(&mut engine, "#e this is a test of the something");
+        println!("#e long input result: {:?}", result);
+        // Should not crash - the result should be a SendToMud or Success
+        assert!(!engine.pending_commands.is_empty(), "Long input should produce pending commands");
+
+        // Check if the pending command ends with %b
+        let cmd = &engine.pending_commands.last().unwrap().command;
+        println!("Final command: '{}'", cmd);
+        if cmd.ends_with("%b") {
+            println!("Command correctly ends with %b");
+        } else {
+            println!("WARNING: Command does NOT end with %b");
+        }
+    }
+
