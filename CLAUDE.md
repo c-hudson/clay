@@ -2,6 +2,14 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
+## Debug Output
+
+**IMPORTANT: Never write debug output to stdout or stderr (no `println!`, `eprintln!`, `dbg!`).**
+
+Debug output interferes with the TUI and corrupts the terminal display. Instead:
+- Write debug logs to a file (e.g., `clay.debug.log`, `clay.tf.debug.log`)
+- Or display messages in the output area using `add_tf_output()` or similar methods
+
 ## Build Commands
 
 **IMPORTANT: Always use the musl debug build. Never use release builds.**
