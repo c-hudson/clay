@@ -8,6 +8,54 @@ use super::macros;
 use super::hooks;
 use super::builtins;
 
+/// Parse macro arguments with delimiter-aware splitting.
+///
+/// This handles the common TF pattern where delimited text (e.g., "x...x")
+/// should be preserved as a single argument even if it contains spaces.
+/// This is needed for macros like decrypt that use {-1} to get the last
+/// argument, expecting it to be the complete delimited text.
+fn parse_macro_args(args: &str) -> Vec<&str> {
+    if args.is_empty() {
+        return vec![];
+    }
+
+    let args = args.trim();
+    if args.is_empty() {
+        return vec![];
+    }
+
+    // Split into words first
+    let words: Vec<&str> = args.split_whitespace().collect();
+    if words.len() <= 1 {
+        return words;
+    }
+
+    // Check if remaining args (after first) form a delimited pattern
+    // Pattern: starts and ends with same single char (like x...x)
+    let first_word_end = args.find(char::is_whitespace).unwrap_or(args.len());
+    let rest = args[first_word_end..].trim_start();
+
+    if !rest.is_empty() {
+        let first_char = rest.chars().next().unwrap();
+        let last_char = rest.chars().last().unwrap();
+
+        // If rest starts and ends with same char, and that char appears
+        // in the content (like x...x where ... contains x), keep as one arg
+        if first_char == last_char && rest.len() > 2 {
+            // Check if this delimiter char appears again in the middle
+            // (to distinguish x...x patterns from coincidental same start/end)
+            let middle = &rest[1..rest.len()-1];
+            if middle.contains(first_char) || middle.contains(' ') {
+                // This looks like a delimited pattern - keep as single arg
+                return vec![&args[..first_word_end], rest];
+            }
+        }
+    }
+
+    // Default: split all on whitespace
+    words
+}
+
 /// Check if input is a TF command (starts with #)
 pub fn is_tf_command(input: &str) -> bool {
     input.trim_start().starts_with('#')
@@ -217,12 +265,8 @@ fn execute_command_impl(engine: &mut TfEngine, input: &str, skip_substitution: b
         _ => {
             // Look for a macro with this name (case-insensitive)
             if let Some(macro_def) = engine.macros.iter().find(|m| m.name.eq_ignore_ascii_case(cmd)).cloned() {
-                // Parse arguments for the macro
-                let macro_args: Vec<&str> = if args.is_empty() {
-                    vec![]
-                } else {
-                    args.split_whitespace().collect()
-                };
+                // Parse arguments for the macro with delimiter-aware splitting
+                let macro_args: Vec<&str> = parse_macro_args(args);
                 let results = macros::execute_macro(engine, &macro_def, &macro_args, None);
                 aggregate_results_with_engine(engine, results)
             } else {
