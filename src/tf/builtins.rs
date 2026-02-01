@@ -1632,5 +1632,171 @@ mod tests {
         println!("1. Macro body correctly stores backslash escapes (e.g., '\\\\' stays as '\\\\')");
         println!("2. Regex patterns convert $$ to $ for end-of-line matching");
         println!("3. The =# operator works for glob matching");
+
+        // Test with the actual MUD-processed text (backslashes stripped, %b -> space)
+        // Original encrypted: ;\[OXrS_FTeYX\]`FbLdgRQFfURX^T0aMw!z%b
+        // After MUD: ;[OXrS_FTeYX]`FbLdgRQFfURX^T0aMw!z  (with trailing space)
+        println!("\n--- Testing with MUD-processed encrypted text ---");
+        let mud_processed = ";[OXrS_FTeYX]`FbLdgRQFfURX^T0aMw!z ";
+        println!("MUD-processed text: '{}' (len={})", mud_processed, mud_processed.len());
+        println!("Text bytes: {:?}", mud_processed.as_bytes());
+
+        // The text doesn't start with \, so {1} will be 0
+        let decrypt_cmd = format!("#decrypt 0 x{}x", mud_processed);
+        println!("Decrypt command: '{}'", decrypt_cmd);
+
+        let decrypt_result = crate::tf::parser::execute_command(&mut engine, &decrypt_cmd);
+        println!("Decrypt MUD-processed result: {:?}", decrypt_result);
+
+        if let TfCommandResult::Success(Some(ref decrypted)) = decrypt_result {
+            println!("Decrypted: '{}' (len={})", decrypted, decrypted.len());
+            println!("Expected: 'this is a test of the something3.14' (len=35)");
+            assert_eq!(decrypted, "this is a test of the something3.14",
+                "Decrypted text should match original");
+        } else {
+            panic!("Decrypt failed: {:?}", decrypt_result);
+        }
     }
 
+
+    #[test]
+    fn test_brackets_in_decrypt() {
+        let mut engine = TfEngine::new();
+
+        // Load crypt.tf
+        let _result = crate::tf::parser::execute_command(&mut engine, "#load crypt.tf");
+
+        println!("=== Narrowing down the problematic character ===");
+
+        // Build up the string progressively
+        let tests = [
+            "x;x",
+            "x;[x",
+            "x;[Ox",
+            "x;[OXx",
+            "x;[OXrx",
+            "x;[OXrSx",
+            "x;[OXrS_x",
+            "x;[OXrS_Fx",
+            "x;[OXrS_FTx",
+            "x;[OXrS_FTex",
+            "x;[OXrS_FTeYx",
+            "x;[OXrS_FTeYXx",
+            "x;[OXrS_FTeYX]x",
+            "x;[OXrS_FTeYX]`x",
+            "x;[OXrS_FTeYX]`Fx",
+            // Continue with more chars: FbLdgRQFfURX^T0aMw!z
+            "x;[OXrS_FTeYX]`Fbx",
+            "x;[OXrS_FTeYX]`FbLx",
+            "x;[OXrS_FTeYX]`FbLdx",
+            "x;[OXrS_FTeYX]`FbLdgx",
+            "x;[OXrS_FTeYX]`FbLdgRx",
+            "x;[OXrS_FTeYX]`FbLdgRQx",
+            "x;[OXrS_FTeYX]`FbLdgRQFx",
+            "x;[OXrS_FTeYX]`FbLdgRQFfx",
+            "x;[OXrS_FTeYX]`FbLdgRQFfUx",
+            "x;[OXrS_FTeYX]`FbLdgRQFfURx",
+            "x;[OXrS_FTeYX]`FbLdgRQFfURXx",
+            "x;[OXrS_FTeYX]`FbLdgRQFfURX^x",
+            "x;[OXrS_FTeYX]`FbLdgRQFfURX^Tx",
+            "x;[OXrS_FTeYX]`FbLdgRQFfURX^T0x",
+            "x;[OXrS_FTeYX]`FbLdgRQFfURX^T0ax",
+            "x;[OXrS_FTeYX]`FbLdgRQFfURX^T0aMx",
+            "x;[OXrS_FTeYX]`FbLdgRQFfURX^T0aMwx",
+            "x;[OXrS_FTeYX]`FbLdgRQFfURX^T0aMw!x",
+            "x;[OXrS_FTeYX]`FbLdgRQFfURX^T0aMw!zx",
+            "x;[OXrS_FTeYX]`FbLdgRQFfURX^T0aMw!z x",
+        ];
+
+        for test in &tests {
+            let cmd = format!("#decrypt 0 {}", test);
+            let result = crate::tf::parser::execute_command(&mut engine, &cmd);
+            println!("{}: {:?}", test, result);
+        }
+
+        println!("\n=== Testing space at end ===");
+        // Test with just a space
+        let result = crate::tf::parser::execute_command(&mut engine, "#decrypt 0 x x");
+        println!("x x (space only): {:?}", result);
+
+        // Test with a character followed by space
+        let result = crate::tf::parser::execute_command(&mut engine, "#decrypt 0 xA x");
+        println!("xA x: {:?}", result);
+
+        // Test with shorter string + space
+        let result = crate::tf::parser::execute_command(&mut engine, "#decrypt 0 x;[ x");
+        println!("x;[ x: {:?}", result);
+
+        // Test the last few chars without space, then with space
+        let result = crate::tf::parser::execute_command(&mut engine, "#decrypt 0 xw!zx");
+        println!("xw!zx: {:?}", result);
+        let result = crate::tf::parser::execute_command(&mut engine, "#decrypt 0 xw!z x");
+        println!("xw!z x (with space): {:?}", result);
+
+        // Test argument parsing for the issue
+        println!("\n=== Testing argument parsing ===");
+        // Define a test macro to show what {-1} becomes
+        let _result = crate::tf::parser::execute_command(&mut engine, "#def show_last = #echo -- LAST=$[{-1}]");
+        let result = crate::tf::parser::execute_command(&mut engine, "#show_last 0 xABCx");
+        println!("show_last 0 xABCx: {:?}", result);
+        let result = crate::tf::parser::execute_command(&mut engine, "#show_last 0 xABC x");
+        println!("show_last 0 xABC x: {:?}", result);
+
+        // Test {n-} syntax - args from position n to end
+        println!("\n=== Testing {{n-}} syntax ===");
+        let _result = crate::tf::parser::execute_command(&mut engine, "#def show_from2 = #echo -- FROM2=$[{2-}]");
+        let result = crate::tf::parser::execute_command(&mut engine, "#show_from2 0 xABCx");
+        println!("show_from2 0 xABCx: {:?}", result);
+        let result = crate::tf::parser::execute_command(&mut engine, "#show_from2 0 xABC x");
+        println!("show_from2 0 xABC x: {:?}", result);
+        let result = crate::tf::parser::execute_command(&mut engine, "#show_from2 0 xABC DEF x");
+        println!("show_from2 0 xABC DEF x: {:?}", result);
+
+        // Test what encryption produces
+        println!("\n=== Testing encryption output ===");
+        let result = crate::tf::parser::execute_command(&mut engine, "#encrypt this is a test");
+        println!("encrypt 'this is a test': {:?}", result);
+
+        // Check if %b appears in encryption
+        if let TfCommandResult::Success(Some(ref encrypted)) = result {
+            println!("Contains %%b: {}", encrypted.contains("%b"));
+            println!("Contains actual space: {}", encrypted.contains(' '));
+        }
+
+        // Test makeprintable directly
+        println!("\n=== Testing makeprintable ===");
+        let result = crate::tf::parser::execute_command(&mut engine, "#makeprintable 10 32");
+        println!("makeprintable 10 32: {:?}", result);
+        let result = crate::tf::parser::execute_command(&mut engine, "#makeprintable 10 65");
+        println!("makeprintable 10 65: {:?}", result);
+
+        // Test the full encryption with a string that would produce a space
+        println!("\n=== Testing encryption that produces space ===");
+        // Position 34, char '4' (52) + password char 'k' (107) - 64 = 95 -> space
+        let result = crate::tf::parser::execute_command(&mut engine, "#encrypt 1234");
+        println!("encrypt '1234': {:?}", result);
+
+        // Test with the full string the user used
+        let result = crate::tf::parser::execute_command(&mut engine, "#encrypt this is a test of the something3.14");
+        println!("encrypt full string: {:?}", result);
+        if let TfCommandResult::Success(Some(ref encrypted)) = result {
+            println!("Encrypted length: {}", encrypted.len());
+            println!("Encrypted bytes: {:?}", encrypted.as_bytes());
+            // Check for %b or space
+            println!("Contains '%b': {}", encrypted.contains("%b"));
+            println!("Contains ' ': {}", encrypted.contains(' '));
+        }
+
+        println!("\n=== Testing with ] followed by ` ===");
+        let result = crate::tf::parser::execute_command(&mut engine, "#decrypt 0 xA]`Bx");
+        println!("xA]`Bx: {:?}", result);
+
+        let result = crate::tf::parser::execute_command(&mut engine, "#decrypt 0 xAB]`CDx");
+        println!("xAB]`CDx: {:?}", result);
+
+        // Check if the issue is with how the argument is parsed
+        println!("\n=== Testing argument parsing ===");
+        let result = crate::tf::parser::execute_command(&mut engine, "#set testarg xAB]`CDx");
+        let result2 = crate::tf::parser::execute_command(&mut engine, "#echo testarg=%testarg");
+        println!("testarg: {:?}", result2);
+    }

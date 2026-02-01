@@ -599,10 +599,18 @@ impl Parser {
                         Err("Expected number after - in {-n}".to_string())
                     }
                 } else if let Some(n) = integer_val {
-                    // {n} - positional argument
+                    // {n} or {n-} - positional argument or range to end
                     self.advance();
-                    self.expect(Token::RBrace)?;
-                    Ok(Expr::Variable(n.to_string()))
+                    // Check for {n-} pattern (args from n to end)
+                    if matches!(self.peek(), Token::Minus) {
+                        self.advance();
+                        self.expect(Token::RBrace)?;
+                        // Return special variable name for "n to end" range
+                        Ok(Expr::Variable(format!("{}-", n)))
+                    } else {
+                        self.expect(Token::RBrace)?;
+                        Ok(Expr::Variable(n.to_string()))
+                    }
                 } else if let Some(name) = ident_val {
                     // {varname} - variable
                     self.advance();
@@ -696,7 +704,25 @@ impl<'a> Evaluator<'a> {
 
             Expr::Variable(name) => {
                 // Handle special variable names for argument access
-                if name.starts_with('-') {
+                if name.ends_with('-') && name.len() > 1 {
+                    // {n-} - arguments from position n to end, joined with spaces
+                    if let Ok(start) = name[..name.len()-1].parse::<usize>() {
+                        let argc = self.engine.get_var("#")
+                            .and_then(|v| v.to_int())
+                            .unwrap_or(0) as usize;
+                        if start > 0 && start <= argc {
+                            // Collect args from start to end
+                            let mut parts = Vec::new();
+                            for i in start..=argc {
+                                if let Some(val) = self.engine.get_var(&i.to_string()) {
+                                    parts.push(val.to_string_value());
+                                }
+                            }
+                            return Ok(TfValue::String(parts.join(" ")));
+                        }
+                    }
+                    return Ok(TfValue::String(String::new()));
+                } else if name.starts_with('-') {
                     // {-n} - argument from end (1-indexed from end)
                     if let Ok(n) = name[1..].parse::<usize>() {
                         // Get total argument count
