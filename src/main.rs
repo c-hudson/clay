@@ -3423,6 +3423,16 @@ impl App {
         }
     }
 
+    /// Set the current world being viewed by a WebSocket client
+    fn ws_set_client_world(&self, client_id: u64, world_index: Option<usize>) {
+        if client_id == 0 {
+            return;  // Embedded GUI tracks its own world
+        }
+        if let Some(ref server) = self.ws_server {
+            server.set_client_world(client_id, world_index);
+        }
+    }
+
     /// Broadcast a message only to clients viewing a specific world
     fn ws_broadcast_to_world(&self, world_index: usize, msg: WsMessage) {
         // Send to embedded GUI if it's viewing this world
@@ -3705,6 +3715,7 @@ impl App {
 
             // For synchronized more-mode: only broadcast lines that went to output_lines
             // Lines that went to pending_lines will be broadcast when released
+            // Only send to clients viewing this world (Phase 2 output routing)
             if lines_to_output > 0 {
                 // Get only the lines that went to output_lines
                 let output_lines_to_broadcast: Vec<String> = self.worlds[world_idx]
@@ -3716,10 +3727,11 @@ impl App {
                     .collect();
                 let ws_data = output_lines_to_broadcast.join("\n") + "\n";
 
-                self.ws_broadcast(WsMessage::ServerData {
+                // Route output only to clients viewing this world
+                self.ws_broadcast_to_world(world_idx, WsMessage::ServerData {
                     world_index: world_idx,
                     data: ws_data,
-                    is_viewed: is_current,
+                    is_viewed: true,  // Clients viewing this world consider it "viewed"
                     ts: current_timestamp_secs(),
                     from_server: true,
                 });
@@ -8018,10 +8030,10 @@ pub async fn run_app_headless(
                                 app.worlds[world_idx].unseen_lines += 1;
                             }
 
-                            app.ws_broadcast(WsMessage::ServerData {
+                            app.ws_broadcast_to_world(world_idx, WsMessage::ServerData {
                                 world_index: world_idx,
                                 data: "Disconnected.\n".to_string(),
-                                is_viewed: world_idx == app.current_world_index,
+                                is_viewed: true,
                                 ts: disconnect_msg.timestamp.duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs(),
                                 from_server: false,
                             });
@@ -9459,10 +9471,10 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                             }
 
                             // Broadcast disconnect message to WebSocket clients
-                            app.ws_broadcast(WsMessage::ServerData {
+                            app.ws_broadcast_to_world(world_idx, WsMessage::ServerData {
                                 world_index: world_idx,
                                 data: "Disconnected.\n".to_string(),
-                                is_viewed: world_idx == app.current_world_index,
+                                is_viewed: true,
                                 ts: disconnect_msg.timestamp.duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs(),
                                 from_server: false,
                             });
@@ -10467,23 +10479,15 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                 // A remote client has viewed this world - update their current_world
                                 if world_index < app.worlds.len() {
                                     // Track which world this client is viewing (sync cache)
-                                    // Preserve visible_lines if already known
                                     let visible_lines = app.ws_client_worlds
                                         .get(&client_id)
                                         .map(|v| v.visible_lines)
                                         .unwrap_or(0);
-                                    app.ws_client_worlds.insert(client_id, ClientViewState { world_index, visible_lines, dimensions: None });
-                                    // Also update async client info
-                                    if let Some(ref server) = app.ws_server {
-                                        let clients = server.clients.clone();
-                                        let cid = client_id;
-                                        tokio::spawn(async move {
-                                            let mut clients_guard = clients.write().await;
-                                            if let Some(client) = clients_guard.get_mut(&cid) {
-                                                client.current_world = Some(world_index);
-                                            }
-                                        });
-                                    }
+                                    let dimensions = app.ws_client_worlds.get(&client_id).and_then(|s| s.dimensions);
+                                    app.ws_client_worlds.insert(client_id, ClientViewState { world_index, visible_lines, dimensions });
+                                    // Update client's world in WebSocket server (async state)
+                                    app.ws_set_client_world(client_id, Some(world_index));
+
                                     app.worlds[world_index].mark_seen();
                                     // Broadcast to all clients so they update their UI
                                     app.ws_broadcast(WsMessage::UnseenCleared { world_index });
@@ -10531,14 +10535,13 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                         // Release the lines on the server
                                         app.worlds[world_index].release_pending(to_release);
 
-                                        // Broadcast the released lines as ServerData so clients can display them
+                                        // Broadcast the released lines to clients viewing this world
                                         if !lines_to_broadcast.is_empty() {
                                             let ws_data = lines_to_broadcast.join("\n") + "\n";
-                                            let is_current = world_index == app.current_world_index;
-                                            app.ws_broadcast(WsMessage::ServerData {
+                                            app.ws_broadcast_to_world(world_index, WsMessage::ServerData {
                                                 world_index,
                                                 data: ws_data,
-                                                is_viewed: is_current,
+                                                is_viewed: true,
                                                 ts: current_timestamp_secs(),
                                                 from_server: false,
                                             });
@@ -10873,7 +10876,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                 };
 
                                 if let Some(idx) = new_index {
-                                    // Update client's view state
+                                    // Update client's view state (sync state)
                                     let visible_lines = app.ws_client_worlds.get(&client_id)
                                         .map(|s| s.visible_lines)
                                         .unwrap_or(24);
@@ -10884,6 +10887,8 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                         visible_lines,
                                         dimensions,
                                     });
+                                    // Update client's world in WebSocket server (async state)
+                                    app.ws_set_client_world(client_id, Some(idx));
 
                                     // Send world switch result with state
                                     if idx < app.worlds.len() {
@@ -11623,11 +11628,11 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                             app.worlds[world_idx].unseen_lines += 1;
                         }
 
-                        // Broadcast disconnect message to WebSocket clients
-                        app.ws_broadcast(WsMessage::ServerData {
+                        // Broadcast disconnect message to WebSocket clients viewing this world
+                        app.ws_broadcast_to_world(world_idx, WsMessage::ServerData {
                             world_index: world_idx,
                             data: "Disconnected.\n".to_string(),
-                            is_viewed: world_idx == app.current_world_index,
+                            is_viewed: true,
                             ts: disconnect_msg.timestamp.duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs(),
                             from_server: false,
                         });
@@ -12774,7 +12779,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                             };
 
                             if let Some(idx) = new_index {
-                                // Update client's view state
+                                // Update client's view state (sync state)
                                 let visible_lines = app.ws_client_worlds.get(&client_id)
                                     .map(|s| s.visible_lines)
                                     .unwrap_or(24);
@@ -12785,6 +12790,8 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                     visible_lines,
                                     dimensions,
                                 });
+                                // Update client's world in WebSocket server (async state)
+                                app.ws_set_client_world(client_id, Some(idx));
 
                                 // Send world switch result with state
                                 if idx < app.worlds.len() {
@@ -13650,10 +13657,10 @@ fn handle_key_event(key: KeyEvent, app: &mut App) -> KeyAction {
             app.current_world_mut().release_pending(batch_size);
             let released = pending_before - app.worlds[world_idx].pending_lines.len();
 
-            // Broadcast the released lines as ServerData so clients can display them
+            // Broadcast the released lines to clients viewing this world
             if !lines_to_broadcast.is_empty() {
                 let ws_data = lines_to_broadcast.join("\n") + "\n";
-                app.ws_broadcast(WsMessage::ServerData {
+                app.ws_broadcast_to_world(world_idx, WsMessage::ServerData {
                     world_index: world_idx,
                     data: ws_data,
                     is_viewed: true,
@@ -13835,10 +13842,10 @@ fn handle_key_event(key: KeyEvent, app: &mut App) -> KeyAction {
 
             app.current_world_mut().release_all_pending();
 
-            // Broadcast the released lines as ServerData so clients can display them
+            // Broadcast the released lines to clients viewing this world
             if !lines_to_broadcast.is_empty() {
                 let ws_data = lines_to_broadcast.join("\n") + "\n";
-                app.ws_broadcast(WsMessage::ServerData {
+                app.ws_broadcast_to_world(world_idx, WsMessage::ServerData {
                     world_index: world_idx,
                     data: ws_data,
                     is_viewed: true,

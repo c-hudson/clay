@@ -574,6 +574,15 @@ impl WebSocketServer {
         }
     }
 
+    /// Set the current world being viewed by a connected client
+    pub fn set_client_world(&self, client_id: u64, world_index: Option<usize>) {
+        if let Ok(mut clients) = self.clients.try_write() {
+            if let Some(client) = clients.get_mut(&client_id) {
+                client.current_world = world_index;
+            }
+        }
+    }
+
     /// Get the client type for a connected client
     pub fn get_client_type(&self, client_id: u64) -> Option<RemoteClientType> {
         if let Ok(clients) = self.clients.try_read() {
