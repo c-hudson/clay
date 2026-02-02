@@ -174,10 +174,10 @@ On startup, each world displays a colorful ASCII art splash screen with the tagl
 ### Separator Bar Components
 
 - Status indicator (leftmost, 10 chars, black text on red background):
-  - `More: XXXX` - pending lines when paused (priority 1)
-  - `Hist: XXXX` - lines scrolled back in history (priority 2)
+  - `More XXXX` - pending lines when paused (priority 1)
+  - `Hist XXXX` - lines scrolled back in history (priority 2)
   - Underscores when neither active (dark gray)
-  - Large numbers formatted as: 9999 → "9999", 10000 → " 10K", 999000 → "999K", 1000000+ → "Alot"
+  - Numbers are right-justified: 9999 → "9999", 10000 → " 10K", 999000 → "999K", 1000000+ → "Alot"
 - Connection indicator and world name (only shown when connected):
   - Green ball (🟢) followed by world name (bold white)
   - When disconnected, this area is filled with underscores instead
@@ -233,6 +233,8 @@ Encoding is configurable per-world in the world settings popup.
 - Wide characters (CJK, emoji) are handled correctly - they take 2 columns
 - Helper functions in `src/input.rs`: `display_width()`, `display_width_chars()`, `chars_for_display_width()`
 - Ensures cursor position matches visual text position even with mixed-width characters
+- First line has reduced capacity due to prompt; subsequent lines use full terminal width
+- Viewport scrolling correctly accounts for prompt when calculating character positions
 
 ### Multi-World System
 
@@ -709,6 +711,14 @@ The client includes an embedded WebSocket server that allows remote GUI clients 
 - Web/GUI clients send `MarkWorldSeen` when switching to a world
 - All interfaces stay synchronized via these broadcasts
 - Activity indicator shows same count across console, web, and GUI (server broadcasts count, clients display it)
+
+**Client World Tracking:**
+
+- Server tracks which world each client is viewing via `WsClient::current_world`
+- Set immediately on authentication to the server's current world (eliminates race condition)
+- Updated when client sends `UpdateViewState` or `MarkWorldSeen` messages
+- Used by `broadcast_to_world_viewers()` to route output only to clients viewing that world
+- Client-generated messages (connection errors, etc.) are broadcast via `ws_broadcast_to_world()`
 
 **Allow List Whitelist:**
 
