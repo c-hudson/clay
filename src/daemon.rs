@@ -1320,31 +1320,55 @@ pub async fn handle_daemon_ws_message(
                 }
             }
         }
-        WsMessage::RequestScrollback { world_index, count } => {
+        WsMessage::RequestScrollback { world_index, count, before_seq } => {
             // Console client requests scrollback from master
             if world_index < app.worlds.len() {
                 let world = &app.worlds[world_index];
-                let total_lines = world.output_lines.len();
-                let lines_to_send = count.min(total_lines);
 
-                // Get the last N lines (most recent history)
-                let start = total_lines.saturating_sub(lines_to_send);
-                let lines: Vec<TimestampedLine> = world.output_lines[start..].iter()
-                    .map(|line| {
-                        let ts = line.timestamp
-                            .duration_since(UNIX_EPOCH)
-                            .map(|d| d.as_secs())
-                            .unwrap_or(0);
-                        TimestampedLine {
-                            text: line.text.clone(),
-                            ts,
-                            gagged: line.gagged,
-                            from_server: line.from_server,
-                            seq: line.seq,
-                            highlight_color: line.highlight_color.clone(),
-                        }
-                    })
-                    .collect();
+                // Find lines to send based on before_seq
+                let lines: Vec<TimestampedLine> = if let Some(seq) = before_seq {
+                    // Send lines with seq < before_seq (older than what client has)
+                    let eligible: Vec<_> = world.output_lines.iter()
+                        .filter(|l| l.seq < seq)
+                        .collect();
+                    let start = eligible.len().saturating_sub(count);
+                    eligible[start..].iter()
+                        .map(|line| {
+                            let ts = line.timestamp
+                                .duration_since(UNIX_EPOCH)
+                                .map(|d| d.as_secs())
+                                .unwrap_or(0);
+                            TimestampedLine {
+                                text: line.text.clone(),
+                                ts,
+                                gagged: line.gagged,
+                                from_server: line.from_server,
+                                seq: line.seq,
+                                highlight_color: line.highlight_color.clone(),
+                            }
+                        })
+                        .collect()
+                } else {
+                    // No before_seq - send last N lines (backwards compatible)
+                    let total_lines = world.output_lines.len();
+                    let start = total_lines.saturating_sub(count);
+                    world.output_lines[start..].iter()
+                        .map(|line| {
+                            let ts = line.timestamp
+                                .duration_since(UNIX_EPOCH)
+                                .map(|d| d.as_secs())
+                                .unwrap_or(0);
+                            TimestampedLine {
+                                text: line.text.clone(),
+                                ts,
+                                gagged: line.gagged,
+                                from_server: line.from_server,
+                                seq: line.seq,
+                                highlight_color: line.highlight_color.clone(),
+                            }
+                        })
+                        .collect()
+                };
 
                 app.ws_send_to_client(client_id, WsMessage::ScrollbackLines {
                     world_index,

@@ -2960,9 +2960,12 @@ impl App {
                             highlight_color: line.highlight_color,
                         }
                     }).collect();
+                    let prepended_count = new_lines.len();
                     let mut combined = new_lines;
                     combined.extend(world.output_lines.drain(..));
                     world.output_lines = combined;
+                    // Adjust scroll_offset to keep viewing the same content
+                    world.scroll_offset += prepended_count;
                     self.needs_output_redraw = true;
                 }
             }
@@ -5757,7 +5760,20 @@ fn handle_remote_client_key(
         (_, PageUp) => {
             // Scroll up (towards older content) = decrease scroll_offset
             let scroll_amount = app.output_height.saturating_sub(2) as usize;
-            app.current_world_mut().scroll_offset = app.current_world().scroll_offset.saturating_sub(scroll_amount.max(1));
+            let current_offset = app.current_world().scroll_offset;
+            let new_offset = current_offset.saturating_sub(scroll_amount.max(1));
+            app.current_world_mut().scroll_offset = new_offset;
+
+            // If we're at or near the top, request more scrollback from server
+            if new_offset == 0 {
+                // Get the oldest sequence number we have
+                let before_seq = app.current_world().output_lines.first().map(|l| l.seq);
+                let _ = ws_tx.send(WsMessage::RequestScrollback {
+                    world_index: app.current_world_index,
+                    count: scroll_amount.max(1),
+                    before_seq,
+                });
+            }
             app.needs_output_redraw = true;
         }
         (_, PageDown) => {
@@ -11018,31 +11034,55 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                     }
                                 }
                             }
-                            WsMessage::RequestScrollback { world_index, count } => {
+                            WsMessage::RequestScrollback { world_index, count, before_seq } => {
                                 // Console client requests scrollback from master
                                 if world_index < app.worlds.len() {
                                     let world = &app.worlds[world_index];
-                                    let total_lines = world.output_lines.len();
-                                    let lines_to_send = count.min(total_lines);
 
-                                    // Get the last N lines (most recent history)
-                                    let start = total_lines.saturating_sub(lines_to_send);
-                                    let lines: Vec<TimestampedLine> = world.output_lines[start..].iter()
-                                        .map(|line| {
-                                            let ts = line.timestamp
-                                                .duration_since(std::time::UNIX_EPOCH)
-                                                .map(|d| d.as_secs())
-                                                .unwrap_or(0);
-                                            TimestampedLine {
-                                                text: line.text.clone(),
-                                                ts,
-                                                gagged: line.gagged,
-                                                from_server: line.from_server,
-                                                seq: line.seq,
-                                                highlight_color: line.highlight_color.clone(),
-                                            }
-                                        })
-                                        .collect();
+                                    // Find lines to send based on before_seq
+                                    let lines: Vec<TimestampedLine> = if let Some(seq) = before_seq {
+                                        // Send lines with seq < before_seq (older than what client has)
+                                        let eligible: Vec<_> = world.output_lines.iter()
+                                            .filter(|l| l.seq < seq)
+                                            .collect();
+                                        let start = eligible.len().saturating_sub(count);
+                                        eligible[start..].iter()
+                                            .map(|line| {
+                                                let ts = line.timestamp
+                                                    .duration_since(std::time::UNIX_EPOCH)
+                                                    .map(|d| d.as_secs())
+                                                    .unwrap_or(0);
+                                                TimestampedLine {
+                                                    text: line.text.clone(),
+                                                    ts,
+                                                    gagged: line.gagged,
+                                                    from_server: line.from_server,
+                                                    seq: line.seq,
+                                                    highlight_color: line.highlight_color.clone(),
+                                                }
+                                            })
+                                            .collect()
+                                    } else {
+                                        // No before_seq - send last N lines (backwards compatible)
+                                        let total_lines = world.output_lines.len();
+                                        let start = total_lines.saturating_sub(count);
+                                        world.output_lines[start..].iter()
+                                            .map(|line| {
+                                                let ts = line.timestamp
+                                                    .duration_since(std::time::UNIX_EPOCH)
+                                                    .map(|d| d.as_secs())
+                                                    .unwrap_or(0);
+                                                TimestampedLine {
+                                                    text: line.text.clone(),
+                                                    ts,
+                                                    gagged: line.gagged,
+                                                    from_server: line.from_server,
+                                                    seq: line.seq,
+                                                    highlight_color: line.highlight_color.clone(),
+                                                }
+                                            })
+                                            .collect()
+                                    };
 
                                     app.ws_send_to_client(client_id, WsMessage::ScrollbackLines {
                                         world_index,
@@ -13002,31 +13042,55 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                 }
                             }
                         }
-                        WsMessage::RequestScrollback { world_index, count } => {
+                        WsMessage::RequestScrollback { world_index, count, before_seq } => {
                             // Console client requests scrollback from master
                             if world_index < app.worlds.len() {
                                 let world = &app.worlds[world_index];
-                                let total_lines = world.output_lines.len();
-                                let lines_to_send = count.min(total_lines);
 
-                                // Get the last N lines (most recent history)
-                                let start = total_lines.saturating_sub(lines_to_send);
-                                let lines: Vec<TimestampedLine> = world.output_lines[start..].iter()
-                                    .map(|line| {
-                                        let ts = line.timestamp
-                                            .duration_since(std::time::UNIX_EPOCH)
-                                            .map(|d| d.as_secs())
-                                            .unwrap_or(0);
-                                        TimestampedLine {
-                                            text: line.text.clone(),
-                                            ts,
-                                            gagged: line.gagged,
-                                            from_server: line.from_server,
-                                            seq: line.seq,
-                                            highlight_color: line.highlight_color.clone(),
-                                        }
-                                    })
-                                    .collect();
+                                // Find lines to send based on before_seq
+                                let lines: Vec<TimestampedLine> = if let Some(seq) = before_seq {
+                                    // Send lines with seq < before_seq (older than what client has)
+                                    let eligible: Vec<_> = world.output_lines.iter()
+                                        .filter(|l| l.seq < seq)
+                                        .collect();
+                                    let start = eligible.len().saturating_sub(count);
+                                    eligible[start..].iter()
+                                        .map(|line| {
+                                            let ts = line.timestamp
+                                                .duration_since(std::time::UNIX_EPOCH)
+                                                .map(|d| d.as_secs())
+                                                .unwrap_or(0);
+                                            TimestampedLine {
+                                                text: line.text.clone(),
+                                                ts,
+                                                gagged: line.gagged,
+                                                from_server: line.from_server,
+                                                seq: line.seq,
+                                                highlight_color: line.highlight_color.clone(),
+                                            }
+                                        })
+                                        .collect()
+                                } else {
+                                    // No before_seq - send last N lines (backwards compatible)
+                                    let total_lines = world.output_lines.len();
+                                    let start = total_lines.saturating_sub(count);
+                                    world.output_lines[start..].iter()
+                                        .map(|line| {
+                                            let ts = line.timestamp
+                                                .duration_since(std::time::UNIX_EPOCH)
+                                                .map(|d| d.as_secs())
+                                                .unwrap_or(0);
+                                            TimestampedLine {
+                                                text: line.text.clone(),
+                                                ts,
+                                                gagged: line.gagged,
+                                                from_server: line.from_server,
+                                                seq: line.seq,
+                                                highlight_color: line.highlight_color.clone(),
+                                            }
+                                        })
+                                        .collect()
+                                };
 
                                 app.ws_send_to_client(client_id, WsMessage::ScrollbackLines {
                                     world_index,

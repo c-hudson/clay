@@ -223,7 +223,8 @@ pub enum WsMessage {
     /// Request to cycle to next/previous world (master applies switching rules)
     CycleWorld { direction: String },  // "up" or "down"
     /// Request scrollback lines from master (console clients only)
-    RequestScrollback { world_index: usize, count: usize },
+    /// before_seq: oldest sequence number the client has (server sends lines with seq < before_seq)
+    RequestScrollback { world_index: usize, count: usize, #[serde(default)] before_seq: Option<u64> },
 
     // Remote instance handling (server -> client)
     /// Batch of output lines for a world (initial or incremental)
