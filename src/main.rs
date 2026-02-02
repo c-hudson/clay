@@ -3437,6 +3437,18 @@ impl App {
         }
     }
 
+    /// Get the client type for a connected WebSocket client
+    fn ws_get_client_type(&self, client_id: u64) -> Option<websocket::RemoteClientType> {
+        if client_id == 0 {
+            return Some(websocket::RemoteClientType::RemoteGUI);  // Embedded GUI
+        }
+        if let Some(ref server) = self.ws_server {
+            server.get_client_type(client_id)
+        } else {
+            None
+        }
+    }
+
     /// Broadcast a message only to clients viewing a specific world
     fn ws_broadcast_to_world(&self, world_index: usize, msg: WsMessage) {
         // Send to embedded GUI if it's viewing this world
@@ -10954,6 +10966,48 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                             paused,
                                         });
 
+                                        // Send initial output lines based on client type
+                                        let client_type = app.ws_get_client_type(client_id);
+                                        let world = &app.worlds[idx];
+                                        let total_lines = world.output_lines.len();
+
+                                        let lines_to_send = match client_type {
+                                            Some(websocket::RemoteClientType::RemoteConsole) => {
+                                                // Console: last screenful (viewport - 2)
+                                                visible_lines.saturating_sub(2).min(total_lines)
+                                            }
+                                            _ => {
+                                                // Web/GUI: full history
+                                                total_lines
+                                            }
+                                        };
+
+                                        if lines_to_send > 0 {
+                                            let start = total_lines.saturating_sub(lines_to_send);
+                                            let lines: Vec<TimestampedLine> = world.output_lines[start..].iter()
+                                                .map(|line| {
+                                                    let ts = line.timestamp
+                                                        .duration_since(std::time::UNIX_EPOCH)
+                                                        .map(|d| d.as_secs())
+                                                        .unwrap_or(0);
+                                                    TimestampedLine {
+                                                        text: line.text.clone(),
+                                                        ts,
+                                                        gagged: line.gagged,
+                                                        from_server: line.from_server,
+                                                        seq: line.seq,
+                                                        highlight_color: line.highlight_color.clone(),
+                                                    }
+                                                })
+                                                .collect();
+
+                                            app.ws_send_to_client(client_id, WsMessage::OutputLines {
+                                                world_index: idx,
+                                                lines,
+                                                is_initial: true,
+                                            });
+                                        }
+
                                         // Also mark world as seen if it had unseen output
                                         if app.worlds[idx].unseen_lines > 0 {
                                             app.worlds[idx].unseen_lines = 0;
@@ -12895,6 +12949,48 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                         pending_count,
                                         paused,
                                     });
+
+                                    // Send initial output lines based on client type
+                                    let client_type = app.ws_get_client_type(client_id);
+                                    let world = &app.worlds[idx];
+                                    let total_lines = world.output_lines.len();
+
+                                    let lines_to_send = match client_type {
+                                        Some(websocket::RemoteClientType::RemoteConsole) => {
+                                            // Console: last screenful (viewport - 2)
+                                            visible_lines.saturating_sub(2).min(total_lines)
+                                        }
+                                        _ => {
+                                            // Web/GUI: full history
+                                            total_lines
+                                        }
+                                    };
+
+                                    if lines_to_send > 0 {
+                                        let start = total_lines.saturating_sub(lines_to_send);
+                                        let lines: Vec<TimestampedLine> = world.output_lines[start..].iter()
+                                            .map(|line| {
+                                                let ts = line.timestamp
+                                                    .duration_since(std::time::UNIX_EPOCH)
+                                                    .map(|d| d.as_secs())
+                                                    .unwrap_or(0);
+                                                TimestampedLine {
+                                                    text: line.text.clone(),
+                                                    ts,
+                                                    gagged: line.gagged,
+                                                    from_server: line.from_server,
+                                                    seq: line.seq,
+                                                    highlight_color: line.highlight_color.clone(),
+                                                }
+                                            })
+                                            .collect();
+
+                                        app.ws_send_to_client(client_id, WsMessage::OutputLines {
+                                            world_index: idx,
+                                            lines,
+                                            is_initial: true,
+                                        });
+                                    }
 
                                     // Also mark world as seen if it had unseen output
                                     if app.worlds[idx].unseen_lines > 0 {
