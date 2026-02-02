@@ -1308,6 +1308,8 @@
                     elements.input.focus();
                     // Update UI based on multiuser mode
                     updateMultiuserUI();
+                    // Declare client type to server (Web for browser clients)
+                    sendMessage({ type: 'ClientTypeDeclaration', client_type: 'Web' });
                     // Save password and username for Android auto-login on Activity recreation
                     if (window.Android && window.Android.savePassword && pendingAuthPassword) {
                         window.Android.savePassword(pendingAuthPassword);
@@ -1892,6 +1894,58 @@
                 if (window.Android && window.Android.showNotification) {
                     window.Android.showNotification(msg.title || 'Clay', msg.message || '');
                 }
+                break;
+
+            case 'WorldSwitchResult':
+                // Response to CycleWorld - update local world index and state
+                if (msg.world_index !== undefined) {
+                    currentWorldIndex = msg.world_index;
+                    if (worlds[msg.world_index]) {
+                        worlds[msg.world_index].pending_count = msg.pending_count || 0;
+                        worlds[msg.world_index].paused = msg.paused || false;
+                    }
+                    updateStatusBar();
+                    renderOutput();
+                    // Send MarkWorldSeen since we're now viewing this world
+                    sendMessage({
+                        type: 'MarkWorldSeen',
+                        world_index: currentWorldIndex
+                    });
+                }
+                break;
+
+            case 'OutputLines':
+                // Batch of output lines from server (initial or incremental)
+                if (msg.world_index !== undefined && worlds[msg.world_index]) {
+                    const world = worlds[msg.world_index];
+                    const lines = msg.lines || [];
+                    for (const line of lines) {
+                        world.output_lines.push({
+                            text: line.text,
+                            ts: line.ts,
+                            gagged: line.gagged || false,
+                            from_server: line.from_server !== false,
+                            seq: line.seq || 0,
+                            highlight_color: line.highlight_color
+                        });
+                    }
+                    if (msg.world_index === currentWorldIndex) {
+                        renderOutput();
+                    }
+                }
+                break;
+
+            case 'PendingCountUpdate':
+                // Periodic pending count update from server
+                if (msg.world_index !== undefined && worlds[msg.world_index]) {
+                    worlds[msg.world_index].pending_count = msg.count || 0;
+                    updateStatusBar();
+                }
+                break;
+
+            case 'ScrollbackLines':
+                // Response to RequestScrollback (for console clients, web clients don't use this)
+                // Web clients have full history so this is typically not needed
                 break;
 
             default:

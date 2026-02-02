@@ -217,6 +217,33 @@ pub enum WsMessage {
         source: String,  // "web", "gui", "console"
     },
 
+    // Remote instance handling (client -> server)
+    /// Client declares its type on connection (affects output delivery)
+    ClientTypeDeclaration { client_type: RemoteClientType },
+    /// Request to cycle to next/previous world (master applies switching rules)
+    CycleWorld { direction: String },  // "up" or "down"
+    /// Request scrollback lines from master (console clients only)
+    RequestScrollback { world_index: usize, count: usize },
+
+    // Remote instance handling (server -> client)
+    /// Batch of output lines for a world (initial or incremental)
+    OutputLines {
+        world_index: usize,
+        lines: Vec<TimestampedLine>,
+        is_initial: bool,  // True for initial load or world switch
+    },
+    /// Periodic pending count update (sent every 2 seconds when pending count changes)
+    PendingCountUpdate { world_index: usize, count: usize },
+    /// Response to RequestScrollback with historical lines
+    ScrollbackLines { world_index: usize, lines: Vec<TimestampedLine> },
+    /// World switch result with appropriate initial data
+    WorldSwitchResult {
+        world_index: usize,
+        world_name: String,
+        pending_count: usize,
+        paused: bool,
+    },
+
     // Keepalive
     Ping,
     Pong,
@@ -341,6 +368,23 @@ fn default_web_font_size_desktop() -> f32 {
     18.0
 }
 
+/// Type of remote client connected via WebSocket
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum RemoteClientType {
+    /// Web browser client - receives full history, scrolls locally
+    Web,
+    /// Remote GUI client (egui) - receives full history, scrolls locally
+    RemoteGUI,
+    /// Remote console client (TUI) - receives screenful, requests scrollback from master
+    RemoteConsole,
+}
+
+impl Default for RemoteClientType {
+    fn default() -> Self {
+        RemoteClientType::Web
+    }
+}
+
 /// Information about a connected WebSocket client
 pub struct WsClientInfo {
     pub authenticated: bool,
@@ -352,6 +396,10 @@ pub struct WsClientInfo {
     /// Whether the client has received its InitialState message
     /// Clients only receive broadcasts after getting InitialState to prevent duplicates
     pub received_initial_state: bool,
+    /// Type of remote client (web, GUI, console) - affects output delivery
+    pub client_type: RemoteClientType,
+    /// Client's viewport height (for calculating screenful)
+    pub viewport_height: usize,
 }
 
 /// User credential for multiuser authentication
@@ -506,6 +554,79 @@ impl WebSocketServer {
     /// Get the current whitelisted host (for saving state)
     pub fn get_whitelisted_host(&self) -> Option<String> {
         self.whitelisted_host.read().unwrap().clone()
+    }
+
+    /// Set the client type for a connected client
+    pub fn set_client_type(&self, client_id: u64, client_type: RemoteClientType) {
+        if let Ok(mut clients) = self.clients.try_write() {
+            if let Some(client) = clients.get_mut(&client_id) {
+                client.client_type = client_type;
+            }
+        }
+    }
+
+    /// Set the viewport height for a connected client
+    pub fn set_client_viewport(&self, client_id: u64, height: usize) {
+        if let Ok(mut clients) = self.clients.try_write() {
+            if let Some(client) = clients.get_mut(&client_id) {
+                client.viewport_height = height;
+            }
+        }
+    }
+
+    /// Get the client type for a connected client
+    pub fn get_client_type(&self, client_id: u64) -> Option<RemoteClientType> {
+        if let Ok(clients) = self.clients.try_read() {
+            clients.get(&client_id).map(|c| c.client_type)
+        } else {
+            None
+        }
+    }
+
+    /// Get the minimum viewport height across all clients viewing a specific world
+    /// Returns None if no clients are viewing the world
+    pub fn min_viewport_for_world(&self, world_index: usize) -> Option<usize> {
+        if let Ok(clients) = self.clients.try_read() {
+            let heights: Vec<usize> = clients.values()
+                .filter(|c| c.authenticated && c.received_initial_state)
+                .filter(|c| c.current_world == Some(world_index))
+                .map(|c| c.viewport_height)
+                .filter(|&h| h > 0)
+                .collect();
+            if heights.is_empty() {
+                None
+            } else {
+                Some(*heights.iter().min().unwrap())
+            }
+        } else {
+            None
+        }
+    }
+
+    /// Get list of client IDs viewing a specific world
+    pub fn clients_viewing_world(&self, world_index: usize) -> Vec<u64> {
+        if let Ok(clients) = self.clients.try_read() {
+            clients.iter()
+                .filter(|(_, c)| c.authenticated && c.received_initial_state)
+                .filter(|(_, c)| c.current_world == Some(world_index))
+                .map(|(&id, _)| id)
+                .collect()
+        } else {
+            Vec::new()
+        }
+    }
+
+    /// Broadcast a message only to clients viewing a specific world
+    pub fn broadcast_to_world_viewers(&self, world_index: usize, msg: WsMessage) {
+        if let Ok(clients) = self.clients.try_read() {
+            for client in clients.values() {
+                if client.authenticated && client.received_initial_state {
+                    if client.current_world == Some(world_index) {
+                        let _ = client.tx.send(msg.clone());
+                    }
+                }
+            }
+        }
     }
 
     /// Configure TLS for WSS support
@@ -864,6 +985,8 @@ where
             current_world: None,
             username: None,
             received_initial_state: false,
+            client_type: RemoteClientType::Web,  // Default, updated by ClientTypeDeclaration
+            viewport_height: 24,  // Default, updated by UpdateViewState
         });
     }
 

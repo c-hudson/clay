@@ -19,6 +19,7 @@ use crate::{
 };
 use crate::actions::{split_action_commands, substitute_action_args, execute_recall};
 use crate::util::local_time_from_epoch;
+use crate::websocket::TimestampedLine;
 
 /// Run in daemon mode (-D) - background server for remote connections only
 /// No console UI, just prints listening ports and handles remote clients
@@ -1218,6 +1219,93 @@ pub async fn handle_daemon_ws_message(
                 let _ = writeln!(f, "SEQ MISMATCH [{}] in '{}': expected seq>{}, got seq={}, text={:?}",
                     source, world_name, expected_seq_gt, actual_seq,
                     line_text.chars().take(80).collect::<String>());
+            }
+        }
+        WsMessage::ClientTypeDeclaration { client_type } => {
+            // Update client type in WebSocket server
+            if let Some(ref server) = app.ws_server {
+                server.set_client_type(client_id, client_type);
+            }
+        }
+        WsMessage::CycleWorld { direction } => {
+            // Client requests to cycle to next/previous world
+            // Apply server's world switching rules and send result
+            let current = app.ws_client_worlds.get(&client_id)
+                .map(|s| s.world_index)
+                .unwrap_or(app.current_world_index);
+
+            let new_index = if direction == "up" {
+                app.calculate_prev_world_from(current)
+            } else {
+                app.calculate_next_world_from(current)
+            };
+
+            if let Some(idx) = new_index {
+                // Update client's view state
+                let visible_lines = app.ws_client_worlds.get(&client_id)
+                    .map(|s| s.visible_lines)
+                    .unwrap_or(24);
+                let dimensions = app.ws_client_worlds.get(&client_id)
+                    .and_then(|s| s.dimensions);
+                app.ws_client_worlds.insert(client_id, ClientViewState {
+                    world_index: idx,
+                    visible_lines,
+                    dimensions,
+                });
+
+                // Send world switch result with state
+                if idx < app.worlds.len() {
+                    let pending_count = app.worlds[idx].pending_lines.len();
+                    let paused = app.worlds[idx].paused;
+                    let world_name = app.worlds[idx].name.clone();
+
+                    app.ws_send_to_client(client_id, WsMessage::WorldSwitchResult {
+                        world_index: idx,
+                        world_name,
+                        pending_count,
+                        paused,
+                    });
+
+                    // Also mark world as seen if it had unseen output
+                    if app.worlds[idx].unseen_lines > 0 {
+                        app.worlds[idx].unseen_lines = 0;
+                        app.worlds[idx].first_unseen_at = None;
+                        app.ws_broadcast(WsMessage::UnseenCleared { world_index: idx });
+                        app.broadcast_activity();
+                    }
+                }
+            }
+        }
+        WsMessage::RequestScrollback { world_index, count } => {
+            // Console client requests scrollback from master
+            if world_index < app.worlds.len() {
+                let world = &app.worlds[world_index];
+                let total_lines = world.output_lines.len();
+                let lines_to_send = count.min(total_lines);
+
+                // Get the last N lines (most recent history)
+                let start = total_lines.saturating_sub(lines_to_send);
+                let lines: Vec<TimestampedLine> = world.output_lines[start..].iter()
+                    .map(|line| {
+                        let ts = line.timestamp
+                            .duration_since(UNIX_EPOCH)
+                            .map(|d| d.as_secs())
+                            .unwrap_or(0);
+                        TimestampedLine {
+                            text: line.text.clone(),
+                            ts,
+                            gagged: line.gagged,
+                            from_server: line.from_server,
+                            seq: line.seq,
+                            highlight_color: line.highlight_color.clone(),
+                        }
+                    })
+                    .collect();
+
+                app.ws_send_to_client(client_id, WsMessage::ScrollbackLines {
+                    world_index,
+                    lines,
+                });
             }
         }
         _ => {}

@@ -1051,6 +1051,12 @@ impl RemoteGuiApp {
                         if success {
                             self.authenticated = true;
                             self.error_message = None;
+                            // Declare client type to server (RemoteGUI for egui clients)
+                            if let Some(ref tx) = self.ws_tx {
+                                let _ = tx.send(WsMessage::ClientTypeDeclaration {
+                                    client_type: crate::websocket::RemoteClientType::RemoteGUI,
+                                });
+                            }
                         } else {
                             self.error_message = error;
                             self.authenticated = false;
@@ -1469,6 +1475,33 @@ impl RemoteGuiApp {
                     }
                     WsMessage::UnbanResult { .. } => {
                         // Unban result received - output is already displayed via ServerData
+                    }
+                    WsMessage::WorldSwitchResult { world_index, world_name: _, pending_count, paused: _ } => {
+                        // Response to CycleWorld - update local world index and state
+                        if world_index < self.worlds.len() {
+                            self.current_world = world_index;
+                            self.worlds[world_index].pending_count = pending_count;
+                            self.worlds[world_index].unseen_lines = 0;
+                            self.scroll_offset = None; // Reset scroll on world switch
+                        }
+                    }
+                    WsMessage::OutputLines { world_index, lines, is_initial: _ } => {
+                        // Batch of output lines from server
+                        if world_index < self.worlds.len() {
+                            for line in lines {
+                                self.worlds[world_index].output_lines.push(line);
+                            }
+                        }
+                    }
+                    WsMessage::PendingCountUpdate { world_index, count } => {
+                        // Periodic pending count update from server
+                        if world_index < self.worlds.len() {
+                            self.worlds[world_index].pending_count = count;
+                        }
+                    }
+                    WsMessage::ScrollbackLines { world_index: _, lines: _ } => {
+                        // Response to RequestScrollback (for console clients)
+                        // GUI clients have full history so this is typically not needed
                     }
                     _ => {}
                 }

@@ -2898,6 +2898,70 @@ impl App {
                     }
                 }
             }
+            WsMessage::WorldSwitchResult { world_index, world_name: _, pending_count, paused } => {
+                // Response to CycleWorld - update local world index and state
+                if world_index < self.worlds.len() {
+                    self.current_world_index = world_index;
+                    if let Some(world) = self.worlds.get_mut(world_index) {
+                        world.pending_count = pending_count;
+                        world.paused = paused;
+                        world.unseen_lines = 0;
+                    }
+                    self.needs_output_redraw = true;
+                }
+            }
+            WsMessage::OutputLines { world_index, lines, is_initial: _ } => {
+                // Batch of output lines from server
+                if let Some(world) = self.worlds.get_mut(world_index) {
+                    let was_at_bottom = world.is_at_bottom();
+                    for line in lines {
+                        let output_line = OutputLine {
+                            text: line.text,
+                            timestamp: std::time::UNIX_EPOCH + std::time::Duration::from_secs(line.ts),
+                            from_server: line.from_server,
+                            gagged: line.gagged,
+                            seq: line.seq,
+                            highlight_color: line.highlight_color,
+                        };
+                        world.output_lines.push(output_line);
+                        if line.seq >= world.next_seq {
+                            world.next_seq = line.seq + 1;
+                        }
+                    }
+                    if was_at_bottom {
+                        world.scroll_to_bottom();
+                    }
+                    self.needs_output_redraw = true;
+                }
+            }
+            WsMessage::PendingCountUpdate { world_index, count } => {
+                // Periodic pending count update from server
+                if let Some(world) = self.worlds.get_mut(world_index) {
+                    world.pending_count = count;
+                    world.paused = count > 0;
+                    self.needs_output_redraw = true;
+                }
+            }
+            WsMessage::ScrollbackLines { world_index, lines } => {
+                // Response to RequestScrollback - prepend lines to output
+                if let Some(world) = self.worlds.get_mut(world_index) {
+                    // Insert at the beginning of output_lines
+                    let new_lines: Vec<OutputLine> = lines.into_iter().map(|line| {
+                        OutputLine {
+                            text: line.text,
+                            timestamp: std::time::UNIX_EPOCH + std::time::Duration::from_secs(line.ts),
+                            from_server: line.from_server,
+                            gagged: line.gagged,
+                            seq: line.seq,
+                            highlight_color: line.highlight_color,
+                        }
+                    }).collect();
+                    let mut combined = new_lines;
+                    combined.extend(world.output_lines.drain(..));
+                    world.output_lines = combined;
+                    self.needs_output_redraw = true;
+                }
+            }
             _ => {}
         }
     }
@@ -3174,6 +3238,34 @@ impl App {
         }
     }
 
+    /// Calculate the next world index from a given starting point (without switching)
+    fn calculate_next_world_from(&self, from_index: usize) -> Option<usize> {
+        let world_info: Vec<crate::util::WorldSwitchInfo> = self.worlds.iter()
+            .map(|w| crate::util::WorldSwitchInfo {
+                name: w.name.clone(),
+                connected: w.connected,
+                unseen_lines: w.unseen_lines,
+                pending_lines: w.pending_lines.len(),
+                first_unseen_at: w.first_unseen_at,
+            })
+            .collect();
+        crate::util::calculate_next_world(&world_info, from_index, self.settings.world_switch_mode)
+    }
+
+    /// Calculate the previous world index from a given starting point (without switching)
+    fn calculate_prev_world_from(&self, from_index: usize) -> Option<usize> {
+        let world_info: Vec<crate::util::WorldSwitchInfo> = self.worlds.iter()
+            .map(|w| crate::util::WorldSwitchInfo {
+                name: w.name.clone(),
+                connected: w.connected,
+                unseen_lines: w.unseen_lines,
+                pending_lines: w.pending_lines.len(),
+                first_unseen_at: w.first_unseen_at,
+            })
+            .collect();
+        crate::util::calculate_prev_world(&world_info, from_index, self.settings.world_switch_mode)
+    }
+
     fn activity_count(&self) -> usize {
         self.worlds
             .iter()
@@ -3308,6 +3400,62 @@ impl App {
         }
         if let Some(ref server) = self.ws_server {
             server.mark_initial_state_sent(client_id);
+        }
+    }
+
+    /// Set the client type for a connected WebSocket client
+    fn ws_set_client_type(&self, client_id: u64, client_type: websocket::RemoteClientType) {
+        if client_id == 0 {
+            return;  // Embedded GUI doesn't need this
+        }
+        if let Some(ref server) = self.ws_server {
+            server.set_client_type(client_id, client_type);
+        }
+    }
+
+    /// Set the viewport height for a connected WebSocket client
+    fn ws_set_client_viewport(&self, client_id: u64, height: usize) {
+        if client_id == 0 {
+            return;
+        }
+        if let Some(ref server) = self.ws_server {
+            server.set_client_viewport(client_id, height);
+        }
+    }
+
+    /// Broadcast a message only to clients viewing a specific world
+    fn ws_broadcast_to_world(&self, world_index: usize, msg: WsMessage) {
+        // Send to embedded GUI if it's viewing this world
+        if let Some(ref tx) = self.gui_tx {
+            // For embedded GUI, always send (it tracks its own current world)
+            let _ = tx.send(msg.clone());
+        }
+        // Broadcast to WebSocket clients viewing this world
+        if let Some(ref server) = self.ws_server {
+            server.broadcast_to_world_viewers(world_index, msg);
+        }
+    }
+
+    /// Get the minimum viewport height across all clients viewing a specific world
+    /// Includes console height if console is viewing the world
+    fn min_viewport_for_world(&self, world_index: usize) -> usize {
+        let console_height = if self.current_world_index == world_index {
+            Some(self.output_height as usize)
+        } else {
+            None
+        };
+
+        let ws_min = if let Some(ref server) = self.ws_server {
+            server.min_viewport_for_world(world_index)
+        } else {
+            None
+        };
+
+        match (console_height, ws_min) {
+            (Some(c), Some(w)) => c.min(w),
+            (Some(c), None) => c,
+            (None, Some(w)) => w,
+            (None, None) => 24,  // Default fallback
         }
     }
 
@@ -4954,6 +5102,10 @@ async fn run_console_client(addr: &str) -> io::Result<()> {
                     WsMessage::InitialState { worlds, current_world_index, settings, splash_lines, .. } => {
                         // Initialize app state from server
                         app.init_from_initial_state(worlds, current_world_index, settings, splash_lines);
+                        // Declare client type to server (RemoteConsole for TUI clients)
+                        let _ = ws_tx.send(WsMessage::ClientTypeDeclaration {
+                            client_type: websocket::RemoteClientType::RemoteConsole,
+                        });
                         // Send initial view state for more-mode sync
                         let (_, height) = crossterm::terminal::size().unwrap_or((80, 24));
                         let visible_lines = height.saturating_sub(4) as usize; // Account for input area and separator
@@ -10704,6 +10856,90 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                         line_text.chars().take(80).collect::<String>());
                                 }
                             }
+                            WsMessage::ClientTypeDeclaration { client_type } => {
+                                // Update client type in WebSocket server
+                                app.ws_set_client_type(client_id, client_type);
+                            }
+                            WsMessage::CycleWorld { direction } => {
+                                // Client requests to cycle to next/previous world
+                                let current = app.ws_client_worlds.get(&client_id)
+                                    .map(|s| s.world_index)
+                                    .unwrap_or(app.current_world_index);
+
+                                let new_index = if direction == "up" {
+                                    app.calculate_prev_world_from(current)
+                                } else {
+                                    app.calculate_next_world_from(current)
+                                };
+
+                                if let Some(idx) = new_index {
+                                    // Update client's view state
+                                    let visible_lines = app.ws_client_worlds.get(&client_id)
+                                        .map(|s| s.visible_lines)
+                                        .unwrap_or(24);
+                                    let dimensions = app.ws_client_worlds.get(&client_id)
+                                        .and_then(|s| s.dimensions);
+                                    app.ws_client_worlds.insert(client_id, ClientViewState {
+                                        world_index: idx,
+                                        visible_lines,
+                                        dimensions,
+                                    });
+
+                                    // Send world switch result with state
+                                    if idx < app.worlds.len() {
+                                        let pending_count = app.worlds[idx].pending_lines.len();
+                                        let paused = app.worlds[idx].paused;
+                                        let world_name = app.worlds[idx].name.clone();
+
+                                        app.ws_send_to_client(client_id, WsMessage::WorldSwitchResult {
+                                            world_index: idx,
+                                            world_name,
+                                            pending_count,
+                                            paused,
+                                        });
+
+                                        // Also mark world as seen if it had unseen output
+                                        if app.worlds[idx].unseen_lines > 0 {
+                                            app.worlds[idx].unseen_lines = 0;
+                                            app.worlds[idx].first_unseen_at = None;
+                                            app.ws_broadcast(WsMessage::UnseenCleared { world_index: idx });
+                                            app.broadcast_activity();
+                                        }
+                                    }
+                                }
+                            }
+                            WsMessage::RequestScrollback { world_index, count } => {
+                                // Console client requests scrollback from master
+                                if world_index < app.worlds.len() {
+                                    let world = &app.worlds[world_index];
+                                    let total_lines = world.output_lines.len();
+                                    let lines_to_send = count.min(total_lines);
+
+                                    // Get the last N lines (most recent history)
+                                    let start = total_lines.saturating_sub(lines_to_send);
+                                    let lines: Vec<TimestampedLine> = world.output_lines[start..].iter()
+                                        .map(|line| {
+                                            let ts = line.timestamp
+                                                .duration_since(std::time::UNIX_EPOCH)
+                                                .map(|d| d.as_secs())
+                                                .unwrap_or(0);
+                                            TimestampedLine {
+                                                text: line.text.clone(),
+                                                ts,
+                                                gagged: line.gagged,
+                                                from_server: line.from_server,
+                                                seq: line.seq,
+                                                highlight_color: line.highlight_color.clone(),
+                                            }
+                                        })
+                                        .collect();
+
+                                    app.ws_send_to_client(client_id, WsMessage::ScrollbackLines {
+                                        world_index,
+                                        lines,
+                                    });
+                                }
+                            }
                             _ => {
                                 // Other message types handled elsewhere or ignored
                             }
@@ -12519,6 +12755,90 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                 let _ = writeln!(f, "SEQ MISMATCH [{}] in '{}': expected seq>{}, got seq={}, text={:?}",
                                     source, world_name, expected_seq_gt, actual_seq,
                                     line_text.chars().take(80).collect::<String>());
+                            }
+                        }
+                        WsMessage::ClientTypeDeclaration { client_type } => {
+                            // Update client type in WebSocket server
+                            app.ws_set_client_type(client_id, client_type);
+                        }
+                        WsMessage::CycleWorld { direction } => {
+                            // Client requests to cycle to next/previous world
+                            let current = app.ws_client_worlds.get(&client_id)
+                                .map(|s| s.world_index)
+                                .unwrap_or(app.current_world_index);
+
+                            let new_index = if direction == "up" {
+                                app.calculate_prev_world_from(current)
+                            } else {
+                                app.calculate_next_world_from(current)
+                            };
+
+                            if let Some(idx) = new_index {
+                                // Update client's view state
+                                let visible_lines = app.ws_client_worlds.get(&client_id)
+                                    .map(|s| s.visible_lines)
+                                    .unwrap_or(24);
+                                let dimensions = app.ws_client_worlds.get(&client_id)
+                                    .and_then(|s| s.dimensions);
+                                app.ws_client_worlds.insert(client_id, ClientViewState {
+                                    world_index: idx,
+                                    visible_lines,
+                                    dimensions,
+                                });
+
+                                // Send world switch result with state
+                                if idx < app.worlds.len() {
+                                    let pending_count = app.worlds[idx].pending_lines.len();
+                                    let paused = app.worlds[idx].paused;
+                                    let world_name = app.worlds[idx].name.clone();
+
+                                    app.ws_send_to_client(client_id, WsMessage::WorldSwitchResult {
+                                        world_index: idx,
+                                        world_name,
+                                        pending_count,
+                                        paused,
+                                    });
+
+                                    // Also mark world as seen if it had unseen output
+                                    if app.worlds[idx].unseen_lines > 0 {
+                                        app.worlds[idx].unseen_lines = 0;
+                                        app.worlds[idx].first_unseen_at = None;
+                                        app.ws_broadcast(WsMessage::UnseenCleared { world_index: idx });
+                                        app.broadcast_activity();
+                                    }
+                                }
+                            }
+                        }
+                        WsMessage::RequestScrollback { world_index, count } => {
+                            // Console client requests scrollback from master
+                            if world_index < app.worlds.len() {
+                                let world = &app.worlds[world_index];
+                                let total_lines = world.output_lines.len();
+                                let lines_to_send = count.min(total_lines);
+
+                                // Get the last N lines (most recent history)
+                                let start = total_lines.saturating_sub(lines_to_send);
+                                let lines: Vec<TimestampedLine> = world.output_lines[start..].iter()
+                                    .map(|line| {
+                                        let ts = line.timestamp
+                                            .duration_since(std::time::UNIX_EPOCH)
+                                            .map(|d| d.as_secs())
+                                            .unwrap_or(0);
+                                        TimestampedLine {
+                                            text: line.text.clone(),
+                                            ts,
+                                            gagged: line.gagged,
+                                            from_server: line.from_server,
+                                            seq: line.seq,
+                                            highlight_color: line.highlight_color.clone(),
+                                        }
+                                    })
+                                    .collect();
+
+                                app.ws_send_to_client(client_id, WsMessage::ScrollbackLines {
+                                    world_index,
+                                    lines,
+                                });
                             }
                         }
                         _ => {}
