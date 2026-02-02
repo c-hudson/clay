@@ -3335,10 +3335,10 @@
         elements.outputContainer.scrollTop = elements.outputContainer.scrollHeight;
     }
 
-    // Format count for status indicator (right-justified, 4 chars like %4s)
+    // Format count for status indicator (right-justified, 4 chars)
     function formatCount(n) {
         if (n >= 1000000) return 'Alot';
-        if (n >= 10000) return (' ' + Math.floor(n / 1000) + 'K').slice(-4);
+        if (n >= 10000) return (Math.min(Math.floor(n / 1000), 999) + 'K').padStart(4, ' ');
         return n.toString().padStart(4, ' ');
     }
 

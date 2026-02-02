@@ -3309,6 +3309,7 @@ impl App {
         let settings = self.settings.clone();
         let output_height = self.output_height;
         let output_width = self.output_width;
+        let world_idx = self.current_world_index;
         // Ensure client-generated messages are complete lines (end with newline)
         let text_with_newline = if text.ends_with('\n') || text.is_empty() {
             text.to_string()
@@ -3317,6 +3318,16 @@ impl App {
         };
         self.current_world_mut()
             .add_output(&text_with_newline, is_current, &settings, output_height, output_width, false, false);
+
+        // Broadcast to WebSocket clients viewing this world
+        self.ws_broadcast_to_world(world_idx, WsMessage::ServerData {
+            world_index: world_idx,
+            data: text_with_newline,
+            is_viewed: true,
+            ts: current_timestamp_secs(),
+            from_server: false,  // Client-generated message
+        });
+
         // Mark output for redraw since we added content
         self.needs_output_redraw = true;
     }
@@ -3338,11 +3349,12 @@ impl App {
     }
 
     /// Add output to a specific world by index (for background connection events)
+    /// Also broadcasts to WebSocket clients viewing the world
     fn add_output_to_world(&mut self, world_idx: usize, text: &str) {
         if world_idx >= self.worlds.len() {
             return;
         }
-        let is_current = world_idx == self.current_world_index;
+        let is_current = world_idx == self.current_world_index || self.ws_client_viewing(world_idx);
         let settings = self.settings.clone();
         let output_height = self.output_height;
         let output_width = self.output_width;
@@ -3353,7 +3365,17 @@ impl App {
         };
         self.worlds[world_idx]
             .add_output(&text_with_newline, is_current, &settings, output_height, output_width, false, false);
-        if is_current {
+
+        // Broadcast to WebSocket clients viewing this world
+        self.ws_broadcast_to_world(world_idx, WsMessage::ServerData {
+            world_index: world_idx,
+            data: text_with_newline,
+            is_viewed: is_current,
+            ts: current_timestamp_secs(),
+            from_server: false,  // Client-generated message
+        });
+
+        if world_idx == self.current_world_index {
             self.needs_output_redraw = true;
         }
     }
@@ -8082,6 +8104,8 @@ pub async fn run_app_headless(
                             app.ws_send_to_client(client_id, initial_state);
                             // Mark client as having received initial state so it receives broadcasts
                             app.ws_mark_initial_state_sent(client_id);
+                            // Set client's initial world so broadcast_to_world_viewers works immediately
+                            app.ws_set_client_world(client_id, Some(app.current_world_index));
                         } else {
                             daemon::handle_daemon_ws_message(&mut app, client_id, *msg, &event_tx).await;
                         }
@@ -9843,6 +9867,8 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                 app.ws_send_to_client(client_id, initial_state);
                                 // Mark client as having received initial state so it receives broadcasts
                                 app.ws_mark_initial_state_sent(client_id);
+                                // Set client's initial world so broadcast_to_world_viewers works immediately
+                                app.ws_set_client_world(client_id, Some(app.current_world_index));
                                 // Also send current activity count
                                 app.ws_send_to_client(client_id, WsMessage::ActivityUpdate {
                                     count: app.activity_count(),
@@ -10582,6 +10608,8 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                     // Preserve existing dimensions when updating view state
                                     let dimensions = app.ws_client_worlds.get(&client_id).and_then(|s| s.dimensions);
                                     app.ws_client_worlds.insert(client_id, ClientViewState { world_index, visible_lines, dimensions });
+                                    // Update client's world in WebSocket server so broadcast_to_world_viewers works
+                                    app.ws_set_client_world(client_id, Some(world_index));
                                 }
                             }
                             WsMessage::UpdateDimensions { width, height } => {
@@ -10852,6 +10880,8 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                 app.ws_send_to_client(client_id, initial_state);
                                 // Mark client as having received initial state so it receives broadcasts
                                 app.ws_mark_initial_state_sent(client_id);
+                                // Set client's initial world so broadcast_to_world_viewers works immediately
+                                app.ws_set_client_world(client_id, Some(app.current_world_index));
                                 // Also send current activity count
                                 app.ws_send_to_client(client_id, WsMessage::ActivityUpdate {
                                     count: app.activity_count(),
@@ -12045,6 +12075,8 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                             app.ws_send_to_client(client_id, initial_state);
                             // Mark client as having received initial state so it receives broadcasts
                             app.ws_mark_initial_state_sent(client_id);
+                            // Set client's initial world so broadcast_to_world_viewers works immediately
+                            app.ws_set_client_world(client_id, Some(app.current_world_index));
                             // Also send current activity count
                             app.ws_send_to_client(client_id, WsMessage::ActivityUpdate {
                                 count: app.activity_count(),
@@ -12860,6 +12892,8 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                             app.ws_send_to_client(client_id, initial_state);
                             // Mark client as having received initial state so it receives broadcasts
                             app.ws_mark_initial_state_sent(client_id);
+                            // Set client's initial world so broadcast_to_world_viewers works immediately
+                            app.ws_set_client_world(client_id, Some(app.current_world_index));
                             // Also send current activity count
                             app.ws_send_to_client(client_id, WsMessage::ActivityUpdate {
                                 count: app.activity_count(),
@@ -17000,12 +17034,12 @@ fn render_splash_centered<'a>(world: &World, visible_height: usize, area_width: 
 }
 
 fn format_more_count(count: usize) -> String {
-    // Returns exactly 4 characters to make "More XXXX" or "Hist XXXX" = 9 chars total (left-justified)
+    // Returns exactly 4 characters to make "More XXXX" or "Hist XXXX" = 9 chars total (right-justified)
     if count <= 9999 {
-        format!("{:<4}", count)
+        format!("{:>4}", count)
     } else if count < 1_000_000 {
         // 10K, 99K, 100K, 999K etc.
-        format!("{:<3}K", (count / 1000).min(999))
+        format!("{:>3}K", (count / 1000).min(999))
     } else {
         "Alot".to_string()
     }
@@ -17418,12 +17452,16 @@ fn render_input(app: &mut App, width: usize, prompt: &str) -> Text<'static> {
         // Scrolled down, don't show prompt
         // Calculate start_char by iterating through lines to find correct starting position
         // This accounts for variable chars-per-line due to display width differences
+        // IMPORTANT: First line has less capacity due to prompt
+        let first_line_width = width.saturating_sub(prompt_visible_len);
         let mut start_char = 0;
-        for _ in 0..app.input.viewport_start_line {
+        for line_idx in 0..app.input.viewport_start_line {
             if start_char >= chars.len() {
                 break;
             }
-            let (chars_on_line, _) = chars_for_display_width(&chars[start_char..], width);
+            // First line has reduced width due to prompt, subsequent lines have full width
+            let line_width = if line_idx == 0 { first_line_width } else { width };
+            let (chars_on_line, _) = chars_for_display_width(&chars[start_char..], line_width);
             start_char += chars_on_line.max(1); // Ensure progress even with weird chars
         }
         let mut char_pos = start_char;

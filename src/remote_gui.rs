@@ -4161,11 +4161,11 @@ impl eframe::App for RemoteGuiApp {
                                 .map(|offset| (offset / 20.0).max(1.0) as usize) // Rough estimate
                                 .unwrap_or(0);
                             let count_str = if lines_back >= 10000 {
-                                format!("{:>4}K", lines_back / 1000)
+                                format!("{:>3}K", (lines_back / 1000).min(999))
                             } else {
                                 format!("{:>4}", lines_back)
                             };
-                            let status_text = format!("Hist:{}", count_str);
+                            let status_text = format!("Hist {}", count_str);
                             ui.label(egui::RichText::new(status_text)
                                 .monospace()
                                 .color(egui::Color32::BLACK)
@@ -4173,11 +4173,11 @@ impl eframe::App for RemoteGuiApp {
                         } else if server_pending_count > 0 {
                             // Show More indicator when paused with pending lines
                             let count_str = if server_pending_count >= 10000 {
-                                format!("{:>4}K", server_pending_count / 1000)
+                                format!("{:>3}K", (server_pending_count / 1000).min(999))
                             } else {
                                 format!("{:>4}", server_pending_count)
                             };
-                            let status_text = format!("More:{}", count_str);
+                            let status_text = format!("More {}", count_str);
                             ui.label(egui::RichText::new(status_text)
                                 .monospace()
                                 .color(egui::Color32::BLACK)
