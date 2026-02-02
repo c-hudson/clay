@@ -116,6 +116,7 @@ fn build_http_response(status: u16, status_text: &str, content_type: &str, body:
         "HTTP/1.1 {} {}\r\n\
          Content-Type: {}; charset=utf-8\r\n\
          Content-Length: {}\r\n\
+         Cache-Control: no-cache\r\n\
          Connection: close\r\n\
          \r\n\
          {}",
@@ -130,6 +131,7 @@ fn build_http_response_binary(status: u16, status_text: &str, content_type: &str
         "HTTP/1.1 {} {}\r\n\
          Content-Type: {}\r\n\
          Content-Length: {}\r\n\
+         Cache-Control: no-cache\r\n\
          Connection: close\r\n\
          \r\n",
         status, status_text, content_type, body.len()
@@ -145,6 +147,7 @@ async fn handle_https_client(
     mut stream: tokio_native_tls::TlsStream<TcpStream>,
     ws_port: u16,
     ws_use_tls: bool,
+    _client_ip: String,
 ) {
     let mut buf = [0u8; 4096];
     let n = match stream.read(&mut buf).await {
@@ -185,7 +188,11 @@ async fn handle_https_client(
             }
         };
 
-        let _ = stream.write_all(&response).await;
+        if stream.write_all(&response).await.is_ok() {
+            // Ensure the response is fully sent before closing
+            use tokio::io::AsyncWriteExt;
+            let _ = stream.shutdown().await;
+        }
     }
 }
 
@@ -228,13 +235,19 @@ pub async fn start_https_server(
             tokio::select! {
                 result = listener.accept() => {
                     match result {
-                        Ok((stream, _addr)) => {
+                        Ok((stream, addr)) => {
                             // Disable Nagle's algorithm for lower latency
                             let _ = stream.set_nodelay(true);
                             let tls_acceptor = tls_acceptor.clone();
+                            let client_ip = addr.ip().to_string();
                             tokio::spawn(async move {
-                                if let Ok(tls_stream) = tls_acceptor.accept(stream).await {
-                                    handle_https_client(tls_stream, ws_port, ws_use_tls).await;
+                                match tls_acceptor.accept(stream).await {
+                                    Ok(tls_stream) => {
+                                        handle_https_client(tls_stream, ws_port, ws_use_tls, client_ip).await;
+                                    }
+                                    Err(e) => {
+                                        log_remote_event("TLS-ERROR", &client_ip, &format!("{}", e));
+                                    }
                                 }
                             });
                         }
@@ -320,6 +333,7 @@ fn build_http_response(status: u16, status_text: &str, content_type: &str, body:
         "HTTP/1.1 {} {}\r\n\
          Content-Type: {}; charset=utf-8\r\n\
          Content-Length: {}\r\n\
+         Cache-Control: no-cache\r\n\
          Connection: close\r\n\
          \r\n\
          {}",
@@ -334,6 +348,7 @@ fn build_http_response_binary(status: u16, status_text: &str, content_type: &str
         "HTTP/1.1 {} {}\r\n\
          Content-Type: {}\r\n\
          Content-Length: {}\r\n\
+         Cache-Control: no-cache\r\n\
          Connection: close\r\n\
          \r\n",
         status, status_text, content_type, body.len()
@@ -349,6 +364,7 @@ async fn handle_https_client(
     mut stream: tokio_rustls::server::TlsStream<TcpStream>,
     ws_port: u16,
     ws_use_tls: bool,
+    _client_ip: String,
 ) {
     let mut buf = [0u8; 4096];
     let n = match stream.read(&mut buf).await {
@@ -389,7 +405,11 @@ async fn handle_https_client(
             }
         };
 
-        let _ = stream.write_all(&response).await;
+        if stream.write_all(&response).await.is_ok() {
+            // Ensure the response is fully sent before closing
+            use tokio::io::AsyncWriteExt;
+            let _ = stream.shutdown().await;
+        }
     }
 }
 
@@ -465,13 +485,19 @@ pub async fn start_https_server(
             tokio::select! {
                 result = listener.accept() => {
                     match result {
-                        Ok((stream, _addr)) => {
+                        Ok((stream, addr)) => {
                             // Disable Nagle's algorithm for lower latency
                             let _ = stream.set_nodelay(true);
                             let tls_acceptor = tls_acceptor.clone();
+                            let client_ip = addr.ip().to_string();
                             tokio::spawn(async move {
-                                if let Ok(tls_stream) = tls_acceptor.accept(stream).await {
-                                    handle_https_client(tls_stream, ws_port, ws_use_tls).await;
+                                match tls_acceptor.accept(stream).await {
+                                    Ok(tls_stream) => {
+                                        handle_https_client(tls_stream, ws_port, ws_use_tls, client_ip).await;
+                                    }
+                                    Err(e) => {
+                                        log_remote_event("TLS-ERROR", &client_ip, &format!("{}", e));
+                                    }
                                 }
                             });
                         }
@@ -715,6 +741,7 @@ async fn handle_http_client(
             "HTTP/1.1 {} {}\r\n\
              Content-Type: {}; charset=utf-8\r\n\
              Content-Length: {}\r\n\
+             Cache-Control: no-cache\r\n\
              Connection: close\r\n\
              \r\n\
              {}",
@@ -727,6 +754,7 @@ async fn handle_http_client(
             "HTTP/1.1 {} {}\r\n\
              Content-Type: {}\r\n\
              Content-Length: {}\r\n\
+             Cache-Control: no-cache\r\n\
              Connection: close\r\n\
              \r\n",
             status, status_text, content_type, body.len()
@@ -777,7 +805,10 @@ async fn handle_http_client(
             }
         };
 
-        let _ = stream.write_all(&response).await;
+        if stream.write_all(&response).await.is_ok() {
+            // Ensure the response is fully sent before closing
+            let _ = stream.shutdown().await;
+        }
     }
 }
 
