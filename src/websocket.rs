@@ -33,6 +33,8 @@ pub enum WsMessage {
         #[serde(default)]
         username: Option<String>,  // Required in multiuser mode
         password_hash: String,
+        #[serde(default)]
+        current_world: Option<usize>,  // Client's current world (for reconnection)
     },
     AuthResponse {
         success: bool,
@@ -626,14 +628,13 @@ impl WebSocketServer {
         }
     }
 
-    /// Broadcast a message only to clients viewing a specific world
-    pub fn broadcast_to_world_viewers(&self, world_index: usize, msg: WsMessage) {
+    /// Broadcast a message to all authenticated clients (they filter by world_index client-side)
+    /// This avoids race conditions where client switches world but server hasn't processed the update yet
+    pub fn broadcast_to_world_viewers(&self, _world_index: usize, msg: WsMessage) {
         if let Ok(clients) = self.clients.try_read() {
             for client in clients.values() {
                 if client.authenticated && client.received_initial_state {
-                    if client.current_world == Some(world_index) {
-                        let _ = client.tx.send(msg.clone());
-                    }
+                    let _ = client.tx.send(msg.clone());
                 }
             }
         }
@@ -1013,7 +1014,7 @@ where
         };
         let _ = tx.send(response);
         // Create a fake AuthRequest to trigger initial state send
-        let _ = event_tx.send(AppEvent::WsClientMessage(client_id, Box::new(WsMessage::AuthRequest { username: None, password_hash: String::new() }))).await;
+        let _ = event_tx.send(AppEvent::WsClientMessage(client_id, Box::new(WsMessage::AuthRequest { username: None, password_hash: String::new(), current_world: None }))).await;
     }
 
     // Spawn task to send messages from rx to WebSocket
@@ -1035,7 +1036,7 @@ where
             Ok(WsRawMessage::Text(text)) => {
                 if let Ok(ws_msg) = serde_json::from_str::<WsMessage>(&text) {
                     match &ws_msg {
-                        WsMessage::AuthRequest { username, password_hash: client_hash } => {
+                        WsMessage::AuthRequest { username, password_hash: client_hash, .. } => {
                             // Verify credentials
                             let (auth_success, auth_error, auth_username) = if multiuser_mode {
                                 // Multiuser mode: require username and validate against users map

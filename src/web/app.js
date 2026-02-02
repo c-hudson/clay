@@ -1212,6 +1212,7 @@
                     connectionTimeout = null;
                 }
                 authenticated = false;
+                hasReceivedInitialState = false;  // Reset so we use server's world on reconnect
                 showConnecting(false);
                 connectionFailures++;
                 // Stop Android foreground service when disconnected
@@ -1309,7 +1310,7 @@
                     // Update UI based on multiuser mode
                     updateMultiuserUI();
                     // Declare client type to server (Web for browser clients)
-                    sendMessage({ type: 'ClientTypeDeclaration', client_type: 'Web' });
+                    send({ type: 'ClientTypeDeclaration', client_type: 'Web' });
                     // Save password and username for Android auto-login on Activity recreation
                     if (window.Android && window.Android.savePassword && pendingAuthPassword) {
                         window.Android.savePassword(pendingAuthPassword);
@@ -1561,7 +1562,7 @@
                                 const prevSeq = world.output_lines[lineIndex - 1].seq;
                                 if (prevSeq !== undefined && lineSeq !== undefined && lineSeq <= prevSeq) {
                                     console.warn('SEQ MISMATCH in world ' + msg.world_index + ': idx=' + lineIndex + ' expected seq>' + prevSeq + ' got seq=' + lineSeq);
-                                    sendMessage({
+                                    send({
                                         type: 'ReportSeqMismatch',
                                         world_index: msg.world_index,
                                         expected_seq_gt: prevSeq,
@@ -1907,7 +1908,7 @@
                     updateStatusBar();
                     renderOutput();
                     // Send MarkWorldSeen since we're now viewing this world
-                    sendMessage({
+                    send({
                         type: 'MarkWorldSeen',
                         world_index: currentWorldIndex
                     });
@@ -2067,6 +2068,10 @@
             if (username) {
                 msg.username = username;
             }
+            // On reconnection, tell server which world we're viewing
+            if (currentWorldIndex !== undefined) {
+                msg.current_world = currentWorldIndex;
+            }
             ws.send(JSON.stringify(msg));
         }).catch(err => {
             // Try fallback directly if hashPassword somehow failed
@@ -2074,6 +2079,10 @@
             const msg = { type: 'AuthRequest', password_hash: hash };
             if (username) {
                 msg.username = username;
+            }
+            // On reconnection, tell server which world we're viewing
+            if (currentWorldIndex !== undefined) {
+                msg.current_world = currentWorldIndex;
             }
             ws.send(JSON.stringify(msg));
         });

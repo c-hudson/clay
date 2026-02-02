@@ -3388,15 +3388,38 @@ impl App {
         }
         // Broadcast to WebSocket server
         if let Some(ref server) = self.ws_server {
-            let clients = server.clients.clone();
-            tokio::spawn(async move {
-                let clients_guard = clients.read().await;
+            // Use synchronous try_read to avoid spawning a task
+            if let Ok(clients_guard) = server.clients.try_read() {
+                let mut sent_count = 0;
                 for client in clients_guard.values() {
                     if client.authenticated {
                         let _ = client.tx.send(msg.clone());
+                        sent_count += 1;
                     }
                 }
-            });
+                // Log if we didn't send to anyone (for debugging)
+                if sent_count == 0 && !clients_guard.is_empty() {
+                    // Clients connected but none authenticated
+                    use std::io::Write;
+                    if let Ok(mut f) = std::fs::OpenOptions::new()
+                        .create(true).append(true)
+                        .open("clay.output.debug")
+                    {
+                        let _ = writeln!(f, "ws_broadcast: {} clients connected, 0 authenticated", clients_guard.len());
+                    }
+                }
+            } else {
+                // Lock contention - fall back to async broadcast
+                let clients = server.clients.clone();
+                tokio::spawn(async move {
+                    let clients_guard = clients.read().await;
+                    for client in clients_guard.values() {
+                        if client.authenticated {
+                            let _ = client.tx.send(msg.clone());
+                        }
+                    }
+                });
+            }
         }
     }
 
@@ -5076,7 +5099,7 @@ async fn run_console_client(addr: &str) -> io::Result<()> {
                             println!(); // Move to next line after password
                             // Send authentication
                             let password_hash = hash_password(&password);
-                            let _ = ws_tx.send(WsMessage::AuthRequest { password_hash, username });
+                            let _ = ws_tx.send(WsMessage::AuthRequest { password_hash, username, current_world: None });
                             break;
                         }
                         KeyCode::Char(c) => {
@@ -8099,13 +8122,23 @@ pub async fn run_app_headless(
                         }
                     }
                     AppEvent::WsClientMessage(client_id, msg) => {
-                        if matches!(*msg, WsMessage::AuthRequest { .. }) {
+                        if let WsMessage::AuthRequest { current_world, .. } = &*msg {
                             let initial_state = app.build_initial_state();
                             app.ws_send_to_client(client_id, initial_state);
                             // Mark client as having received initial state so it receives broadcasts
                             app.ws_mark_initial_state_sent(client_id);
+                            // Use client's world if provided, otherwise default to console's world
+                            let world_idx = current_world
+                                .filter(|&w| w < app.worlds.len())
+                                .unwrap_or(app.current_world_index);
                             // Set client's initial world so broadcast_to_world_viewers works immediately
-                            app.ws_set_client_world(client_id, Some(app.current_world_index));
+                            app.ws_set_client_world(client_id, Some(world_idx));
+                            // Also update ws_client_worlds cache for ws_client_viewing()
+                            app.ws_client_worlds.insert(client_id, ClientViewState {
+                                world_index: world_idx,
+                                visible_lines: 0,
+                                dimensions: None,
+                            });
                         } else {
                             daemon::handle_daemon_ws_message(&mut app, client_id, *msg, &event_tx).await;
                         }
@@ -9860,6 +9893,12 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                         }
                     }
                     AppEvent::WsClientMessage(client_id, msg) => {
+                        // Extract current_world from AuthRequest before matching (avoids borrow issues)
+                        let auth_current_world = if let WsMessage::AuthRequest { current_world, .. } = &*msg {
+                            *current_world
+                        } else {
+                            None
+                        };
                         match *msg {
                             WsMessage::AuthRequest { .. } => {
                                 // Client just authenticated - send initial state
@@ -9867,18 +9906,34 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                 app.ws_send_to_client(client_id, initial_state);
                                 // Mark client as having received initial state so it receives broadcasts
                                 app.ws_mark_initial_state_sent(client_id);
+                                // Use client's world if provided, otherwise default to console's world
+                                let world_idx = auth_current_world
+                                    .filter(|&w| w < app.worlds.len())
+                                    .unwrap_or(app.current_world_index);
                                 // Set client's initial world so broadcast_to_world_viewers works immediately
-                                app.ws_set_client_world(client_id, Some(app.current_world_index));
+                                app.ws_set_client_world(client_id, Some(world_idx));
+                                // Also update ws_client_worlds cache for ws_client_viewing()
+                                app.ws_client_worlds.insert(client_id, ClientViewState {
+                                    world_index: world_idx,
+                                    visible_lines: 0,
+                                    dimensions: None,
+                                });
                                 // Also send current activity count
                                 app.ws_send_to_client(client_id, WsMessage::ActivityUpdate {
                                     count: app.activity_count(),
                                 });
                             }
-                            WsMessage::SendCommand { world_index, command } => {
+                            WsMessage::SendCommand { world_index, ref command } => {
                                 // Reset more-mode counter when ANY client sends a command
                                 if world_index < app.worlds.len() {
                                     app.worlds[world_index].lines_since_pause = 0;
                                     app.worlds[world_index].last_user_command_time = Some(std::time::Instant::now());
+                                    // Update client's viewing world to ensure they receive output
+                                    // (fixes race condition where client sends command before UpdateViewState)
+                                    let dimensions = app.ws_client_worlds.get(&client_id).and_then(|s| s.dimensions);
+                                    let visible_lines = app.ws_client_worlds.get(&client_id).map(|v| v.visible_lines).unwrap_or(0);
+                                    app.ws_client_worlds.insert(client_id, ClientViewState { world_index, visible_lines, dimensions });
+                                    app.ws_set_client_world(client_id, Some(world_index));
                                 }
 
                                 // Use shared command parsing
@@ -11727,7 +11782,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                     data: ws_data,
                                     is_viewed: is_current,
                                     ts: current_timestamp_secs(),
-                                    from_server: false,
+                                    from_server: true,  // This is MUD server data
                                 });
                             }
 
@@ -12069,24 +12124,46 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                 }
                 AppEvent::WsClientMessage(client_id, msg) => {
                     // Handle simple messages in drain loop
+                    // Extract current_world from AuthRequest before matching (avoids borrow issues)
+                    let auth_current_world = if let WsMessage::AuthRequest { current_world, .. } = &*msg {
+                        *current_world
+                    } else {
+                        None
+                    };
                     match *msg {
                         WsMessage::AuthRequest { .. } => {
                             let initial_state = app.build_initial_state();
                             app.ws_send_to_client(client_id, initial_state);
                             // Mark client as having received initial state so it receives broadcasts
                             app.ws_mark_initial_state_sent(client_id);
+                            // Use client's world if provided, otherwise default to console's world
+                            let world_idx = auth_current_world
+                                .filter(|&w| w < app.worlds.len())
+                                .unwrap_or(app.current_world_index);
                             // Set client's initial world so broadcast_to_world_viewers works immediately
-                            app.ws_set_client_world(client_id, Some(app.current_world_index));
+                            app.ws_set_client_world(client_id, Some(world_idx));
+                            // Also update ws_client_worlds cache for ws_client_viewing()
+                            app.ws_client_worlds.insert(client_id, ClientViewState {
+                                world_index: world_idx,
+                                visible_lines: 0,
+                                dimensions: None,
+                            });
                             // Also send current activity count
                             app.ws_send_to_client(client_id, WsMessage::ActivityUpdate {
                                 count: app.activity_count(),
                             });
                         }
-                        WsMessage::SendCommand { world_index, command } => {
+                        WsMessage::SendCommand { world_index, ref command } => {
                             // Reset more-mode counter when ANY client sends a command
                             if world_index < app.worlds.len() {
                                 app.worlds[world_index].lines_since_pause = 0;
                                 app.worlds[world_index].last_user_command_time = Some(std::time::Instant::now());
+                                // Update client's viewing world to ensure they receive output
+                                // (fixes race condition where client sends command before UpdateViewState)
+                                let dimensions = app.ws_client_worlds.get(&client_id).and_then(|s| s.dimensions);
+                                let visible_lines = app.ws_client_worlds.get(&client_id).map(|v| v.visible_lines).unwrap_or(0);
+                                app.ws_client_worlds.insert(client_id, ClientViewState { world_index, visible_lines, dimensions });
+                                app.ws_set_client_world(client_id, Some(world_index));
                             }
 
                             // Use shared command parsing
@@ -13074,6 +13151,38 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                         app.broadcast_activity();
                                     }
                                 }
+                            }
+                        }
+                        WsMessage::MarkWorldSeen { world_index } => {
+                            // A remote client has viewed this world - update their current_world
+                            if world_index < app.worlds.len() {
+                                // Track which world this client is viewing (sync cache)
+                                let visible_lines = app.ws_client_worlds
+                                    .get(&client_id)
+                                    .map(|v| v.visible_lines)
+                                    .unwrap_or(0);
+                                let dimensions = app.ws_client_worlds.get(&client_id).and_then(|s| s.dimensions);
+                                app.ws_client_worlds.insert(client_id, ClientViewState { world_index, visible_lines, dimensions });
+                                // Update client's world in WebSocket server (async state)
+                                app.ws_set_client_world(client_id, Some(world_index));
+
+                                app.worlds[world_index].mark_seen();
+                                // Broadcast to all clients so they update their UI
+                                app.ws_broadcast(WsMessage::UnseenCleared { world_index });
+                                // Broadcast activity count since a world was just marked as seen
+                                app.broadcast_activity();
+                                // Trigger console redraw to update activity indicator
+                                app.needs_output_redraw = true;
+                            }
+                        }
+                        WsMessage::UpdateViewState { world_index, visible_lines } => {
+                            // A remote client is reporting its view state (for more-mode threshold calculation)
+                            if world_index < app.worlds.len() {
+                                // Preserve existing dimensions when updating view state
+                                let dimensions = app.ws_client_worlds.get(&client_id).and_then(|s| s.dimensions);
+                                app.ws_client_worlds.insert(client_id, ClientViewState { world_index, visible_lines, dimensions });
+                                // Update client's world in WebSocket server so broadcast_to_world_viewers works
+                                app.ws_set_client_world(client_id, Some(world_index));
                             }
                         }
                         WsMessage::RequestScrollback { world_index, count, before_seq } => {
@@ -17962,7 +18071,7 @@ mod tests {
         let client_password = "test";
         let client_hash = hash_password(client_password);
         println!("Client sending hash: {}", client_hash);
-        let auth_msg = WsMessage::AuthRequest { password_hash: client_hash, username: None };
+        let auth_msg = WsMessage::AuthRequest { password_hash: client_hash, username: None, current_world: None };
         let json = serde_json::to_string(&auth_msg).unwrap();
         ws_sink.send(WsRawMessage::Text(json.into())).await.unwrap();
 
