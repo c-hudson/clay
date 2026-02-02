@@ -1189,10 +1189,10 @@ pub async fn handle_daemon_ws_message(
                     // Release the lines
                     app.worlds[world_index].release_pending(to_release);
 
-                    // Broadcast the released lines as ServerData
+                    // Broadcast the released lines to clients viewing this world
                     if !lines_to_broadcast.is_empty() {
                         let ws_data = lines_to_broadcast.join("\n") + "\n";
-                        app.ws_broadcast(WsMessage::ServerData {
+                        app.ws_broadcast_to_world(world_index, WsMessage::ServerData {
                             world_index,
                             data: ws_data,
                             is_viewed: true,

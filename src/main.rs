@@ -1662,6 +1662,8 @@ pub struct World {
     needs_redraw: bool,          // True when terminal needs full redraw (after splash clear)
     pending_since: Option<std::time::Instant>, // When pending output first appeared (for Alt-w)
     first_unseen_at: Option<std::time::Instant>, // When unseen output first arrived (for Unseen First switching)
+    last_pending_broadcast: Option<std::time::Instant>, // Last time pending count was broadcast (for 2s timer)
+    last_pending_count_broadcast: usize, // Last pending count that was broadcast (to detect changes)
     owner: Option<String>,       // Username who owns this world (multiuser mode)
     proxy_pid: Option<u32>,      // PID of TLS proxy process (if using TLS proxy)
     proxy_socket_path: Option<std::path::PathBuf>, // Unix socket path for TLS proxy
@@ -1719,6 +1721,8 @@ impl World {
             needs_redraw: false,
             pending_since: None,
             first_unseen_at: None,
+            last_pending_broadcast: None,
+            last_pending_count_broadcast: 0,
             owner: None,
             proxy_pid: None,
             proxy_socket_path: None,
@@ -7886,6 +7890,10 @@ pub async fn run_app_headless(
     let mut process_tick_interval = tokio::time::interval(Duration::from_secs(1));
     process_tick_interval.tick().await;
 
+    // Pending count update interval (2 seconds) for Phase 3 output routing
+    let mut pending_update_interval = tokio::time::interval(Duration::from_secs(2));
+    pending_update_interval.tick().await;
+
     // SIGUSR1 handler for hot reload
     #[cfg(all(unix, not(target_os = "android")))]
     {
@@ -8359,6 +8367,39 @@ pub async fn run_app_headless(
                 }
                 for i in to_remove.into_iter().rev() {
                     app.tf_engine.processes.remove(i);
+                }
+            }
+
+            // Pending count update timer (every 2 seconds) - broadcast to world viewers if changed
+            _ = pending_update_interval.tick() => {
+                let now = std::time::Instant::now();
+                for (idx, world) in app.worlds.iter_mut().enumerate() {
+                    // Only send updates if world has pending lines and count has changed
+                    let current_count = world.pending_lines.len();
+                    if current_count > 0 && current_count != world.last_pending_count_broadcast {
+                        // Check if 2 seconds have passed since last broadcast for this world
+                        let should_broadcast = world.last_pending_broadcast
+                            .map(|t| now.duration_since(t) >= Duration::from_secs(2))
+                            .unwrap_or(true);
+                        if should_broadcast {
+                            world.last_pending_broadcast = Some(now);
+                            world.last_pending_count_broadcast = current_count;
+                        }
+                    } else if current_count == 0 && world.last_pending_count_broadcast > 0 {
+                        // Pending was cleared - reset tracking
+                        world.last_pending_count_broadcast = 0;
+                        world.last_pending_broadcast = None;
+                    }
+                }
+                // Broadcast pending updates for worlds that need it
+                for idx in 0..app.worlds.len() {
+                    let current_count = app.worlds[idx].pending_lines.len();
+                    if current_count > 0 {
+                        app.ws_broadcast_to_world(idx, WsMessage::PendingCountUpdate {
+                            world_index: idx,
+                            count: current_count,
+                        });
+                    }
                 }
             }
         }
@@ -9093,6 +9134,10 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
     let mut process_tick_interval = tokio::time::interval(Duration::from_secs(1));
     process_tick_interval.tick().await;
 
+    // Pending count update interval (2 seconds) for Phase 3 output routing
+    let mut pending_update_interval = tokio::time::interval(Duration::from_secs(2));
+    pending_update_interval.tick().await;
+
     // Set the app pointer for crash recovery
     // SAFETY: app lives for the duration of this function and the pointer is only used
     // in the panic hook which only runs while this function is on the stack
@@ -9776,6 +9821,12 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                 });
                             }
                             WsMessage::SendCommand { world_index, command } => {
+                                // Reset more-mode counter when ANY client sends a command
+                                if world_index < app.worlds.len() {
+                                    app.worlds[world_index].lines_since_pause = 0;
+                                    app.worlds[world_index].last_user_command_time = Some(std::time::Instant::now());
+                                }
+
                                 // Use shared command parsing
                                 let parsed = parse_command(&command);
 
@@ -11247,6 +11298,39 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                     app.tf_engine.processes.remove(i);
                 }
             }
+
+            // Pending count update timer (every 2 seconds) - broadcast to world viewers if changed
+            _ = pending_update_interval.tick() => {
+                let now = std::time::Instant::now();
+                for (idx, world) in app.worlds.iter_mut().enumerate() {
+                    // Only send updates if world has pending lines and count has changed
+                    let current_count = world.pending_lines.len();
+                    if current_count > 0 && current_count != world.last_pending_count_broadcast {
+                        // Check if 2 seconds have passed since last broadcast for this world
+                        let should_broadcast = world.last_pending_broadcast
+                            .map(|t| now.duration_since(t) >= Duration::from_secs(2))
+                            .unwrap_or(true);
+                        if should_broadcast {
+                            world.last_pending_broadcast = Some(now);
+                            world.last_pending_count_broadcast = current_count;
+                        }
+                    } else if current_count == 0 && world.last_pending_count_broadcast > 0 {
+                        // Pending was cleared - reset tracking
+                        world.last_pending_count_broadcast = 0;
+                        world.last_pending_broadcast = None;
+                    }
+                }
+                // Broadcast pending updates for worlds that need it
+                for idx in 0..app.worlds.len() {
+                    let current_count = app.worlds[idx].pending_lines.len();
+                    if current_count > 0 {
+                        app.ws_broadcast_to_world(idx, WsMessage::PendingCountUpdate {
+                            world_index: idx,
+                            count: current_count,
+                        });
+                    }
+                }
+            }
         }
 
         // Check if any popup is now visible
@@ -11873,6 +11957,12 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                             });
                         }
                         WsMessage::SendCommand { world_index, command } => {
+                            // Reset more-mode counter when ANY client sends a command
+                            if world_index < app.worlds.len() {
+                                app.worlds[world_index].lines_since_pause = 0;
+                                app.worlds[world_index].last_user_command_time = Some(std::time::Instant::now());
+                            }
+
                             // Use shared command parsing
                             let parsed = parse_command(&command);
 
