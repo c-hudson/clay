@@ -15989,8 +15989,8 @@ async fn handle_command(cmd: &str, app: &mut App, event_tx: mpsc::Sender<AppEven
             } else {
                 match lookup_definition(&word).await {
                     Ok(definition) => {
-                        // Format: prefix + definition, capped at 1024 bytes, single line
-                        let full_text = format!("{} {}", prefix, definition);
+                        // Format: prefix word: definition, capped at 1024 bytes, single line
+                        let full_text = format!("{} {}: {}", prefix, word, definition);
                         let capped = if full_text.len() > 1024 {
                             let mut end = 1024;
                             // Don't cut in the middle of a UTF-8 character
@@ -16020,8 +16020,8 @@ async fn handle_command(cmd: &str, app: &mut App, event_tx: mpsc::Sender<AppEven
             } else {
                 match lookup_urban_definition(&word).await {
                     Ok(definition) => {
-                        // Format: prefix + definition, capped at 1024 bytes, single line
-                        let full_text = format!("{} {}", prefix, definition);
+                        // Format: prefix Urban Dict: word: definition, capped at 1024 bytes, single line
+                        let full_text = format!("{} Urban Dict: {}: {}", prefix, word, definition);
                         let capped = if full_text.len() > 1024 {
                             let mut end = 1024;
                             // Don't cut in the middle of a UTF-8 character
