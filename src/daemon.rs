@@ -569,6 +569,24 @@ pub async fn handle_daemon_ws_message(
                         command: format!("/urban {} {}", prefix, word),
                     });
                 }
+                Command::DictUsage => {
+                    app.ws_broadcast(WsMessage::ServerData {
+                        world_index,
+                        data: "Usage: /dict <prefix> <word>".to_string(),
+                        is_viewed: false,
+                        ts: current_timestamp_secs(),
+                        from_server: false,
+                    });
+                }
+                Command::UrbanUsage => {
+                    app.ws_broadcast(WsMessage::ServerData {
+                        world_index,
+                        data: "Usage: /urban <prefix> <word>".to_string(),
+                        is_viewed: false,
+                        ts: current_timestamp_secs(),
+                        from_server: false,
+                    });
+                }
                 Command::Unknown { cmd } => {
                     app.ws_broadcast(WsMessage::ServerData {
                         world_index,

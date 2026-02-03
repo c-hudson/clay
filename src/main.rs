@@ -1049,8 +1049,12 @@ pub enum Command {
     Tag,
     /// /dict <prefix> <word> - look up word definition and send with prefix
     Dict { prefix: String, word: String },
+    /// /dict usage error
+    DictUsage,
     /// /urban <prefix> <word> - look up Urban Dictionary definition and send with prefix
     Urban { prefix: String, word: String },
+    /// /urban usage error
+    UrbanUsage,
     /// /<action_name> [args] - execute action
     ActionCommand { name: String, args: String },
     /// Not a command (regular text to send to MUD)
@@ -1139,7 +1143,7 @@ pub fn parse_command(input: &str) -> Command {
                     word: args[1..].join(" "),
                 }
             } else {
-                Command::Unknown { cmd: trimmed.to_string() }
+                Command::DictUsage
             }
         }
         "/urban" => {
@@ -1149,7 +1153,7 @@ pub fn parse_command(input: &str) -> Command {
                     word: args[1..].join(" "),
                 }
             } else {
-                Command::Unknown { cmd: trimmed.to_string() }
+                Command::UrbanUsage
             }
         }
         _ => {
@@ -10604,6 +10608,24 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                             command: format!("/urban {} {}", prefix, word),
                                         });
                                     }
+                                    Command::DictUsage => {
+                                        app.ws_send_to_client(client_id, WsMessage::ServerData {
+                                            world_index,
+                                            data: "Usage: /dict <prefix> <word>".to_string(),
+                                            is_viewed: false,
+                                            ts: current_timestamp_secs(),
+                                            from_server: false,
+                                        });
+                                    }
+                                    Command::UrbanUsage => {
+                                        app.ws_send_to_client(client_id, WsMessage::ServerData {
+                                            world_index,
+                                            data: "Usage: /urban <prefix> <word>".to_string(),
+                                            is_viewed: false,
+                                            ts: current_timestamp_secs(),
+                                            from_server: false,
+                                        });
+                                    }
                                 }
                             }
                             WsMessage::SwitchWorld { world_index } => {
@@ -12837,6 +12859,24 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                     // /urban requires async HTTP - send back to client for local execution
                                     app.ws_send_to_client(client_id, WsMessage::ExecuteLocalCommand {
                                         command: format!("/urban {} {}", prefix, word),
+                                    });
+                                }
+                                Command::DictUsage => {
+                                    app.ws_send_to_client(client_id, WsMessage::ServerData {
+                                        world_index,
+                                        data: "Usage: /dict <prefix> <word>".to_string(),
+                                        is_viewed: false,
+                                        ts: current_timestamp_secs(),
+                                        from_server: false,
+                                    });
+                                }
+                                Command::UrbanUsage => {
+                                    app.ws_send_to_client(client_id, WsMessage::ServerData {
+                                        world_index,
+                                        data: "Usage: /urban <prefix> <word>".to_string(),
+                                        is_viewed: false,
+                                        ts: current_timestamp_secs(),
+                                        from_server: false,
                                     });
                                 }
                             }
@@ -15097,7 +15137,7 @@ async fn lookup_urban_definition(word: &str) -> Result<String, String> {
     let encoded: String = url::form_urlencoded::Serializer::new(String::new())
         .append_pair("term", word)
         .finish();
-    let url = format!("https://api.urbandictionary.com/v0/dict?{}", encoded);
+    let url = format!("https://api.urbandictionary.com/v0/define?{}", encoded);
 
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(10))
@@ -15983,65 +16023,63 @@ async fn handle_command(cmd: &str, app: &mut App, event_tx: mpsc::Sender<AppEven
         }
         Command::Dict { prefix, word } => {
             // Look up word definition from Free Dictionary API
-            let world_idx = app.current_world_index;
-            if !app.current_world().connected {
-                app.add_output("Not connected. Use /worlds to connect.");
-            } else {
-                match lookup_definition(&word).await {
-                    Ok(definition) => {
-                        // Format: prefix word: definition, capped at 1024 bytes, single line
-                        let full_text = format!("{} {}: {}", prefix, word, definition);
-                        let capped = if full_text.len() > 1024 {
-                            let mut end = 1024;
-                            // Don't cut in the middle of a UTF-8 character
-                            while end > 0 && !full_text.is_char_boundary(end) {
-                                end -= 1;
-                            }
-                            full_text[..end].to_string()
-                        } else {
-                            full_text
-                        };
-                        if let Some(tx) = &app.worlds[world_idx].command_tx {
-                            let _ = tx.try_send(WriteCommand::Text(capped));
-                            app.worlds[world_idx].last_send_time = Some(std::time::Instant::now());
+            match lookup_definition(&word).await {
+                Ok(definition) => {
+                    // Format: prefix word: definition, capped at 1024 bytes, single line
+                    let full_text = format!("{} {}: {}", prefix, word, definition);
+                    let capped = if full_text.len() > 1024 {
+                        let mut end = 1024;
+                        // Don't cut in the middle of a UTF-8 character
+                        while end > 0 && !full_text.is_char_boundary(end) {
+                            end -= 1;
                         }
-                    }
-                    Err(e) => {
-                        app.add_output(&format!("Definition lookup failed: {}", e));
-                    }
+                        full_text[..end].to_string()
+                    } else {
+                        full_text
+                    };
+                    // Put result in input buffer for user to review/send
+                    app.input.buffer = capped;
+                    app.input.cursor_position = app.input.buffer.len();
+                }
+                Err(e) => {
+                    app.add_output(&format!("Definition lookup failed: {}", e));
                 }
             }
         }
         Command::Urban { prefix, word } => {
             // Look up word definition from Urban Dictionary API
-            let world_idx = app.current_world_index;
-            if !app.current_world().connected {
-                app.add_output("Not connected. Use /worlds to connect.");
-            } else {
-                match lookup_urban_definition(&word).await {
-                    Ok(definition) => {
-                        // Format: prefix Urban Dict: word: definition, capped at 1024 bytes, single line
-                        let full_text = format!("{} Urban Dict: {}: {}", prefix, word, definition);
-                        let capped = if full_text.len() > 1024 {
-                            let mut end = 1024;
-                            // Don't cut in the middle of a UTF-8 character
-                            while end > 0 && !full_text.is_char_boundary(end) {
-                                end -= 1;
-                            }
-                            full_text[..end].to_string()
-                        } else {
-                            full_text
-                        };
-                        if let Some(tx) = &app.worlds[world_idx].command_tx {
-                            let _ = tx.try_send(WriteCommand::Text(capped));
-                            app.worlds[world_idx].last_send_time = Some(std::time::Instant::now());
+            match lookup_urban_definition(&word).await {
+                Ok(definition) => {
+                    // Format: prefix Urban Dict: word: definition, capped at 1024 bytes, single line
+                    let full_text = format!("{} Urban Dict: {}: {}", prefix, word, definition);
+                    let capped = if full_text.len() > 1024 {
+                        let mut end = 1024;
+                        // Don't cut in the middle of a UTF-8 character
+                        while end > 0 && !full_text.is_char_boundary(end) {
+                            end -= 1;
                         }
-                    }
-                    Err(e) => {
-                        app.add_output(&format!("Urban Dictionary lookup failed: {}", e));
-                    }
+                        full_text[..end].to_string()
+                    } else {
+                        full_text
+                    };
+                    // Put result in input buffer for user to review/send
+                    app.input.buffer = capped;
+                    app.input.cursor_position = app.input.buffer.len();
+                }
+                Err(e) => {
+                    app.add_output(&format!("Urban Dictionary lookup failed: {}", e));
                 }
             }
+        }
+        Command::DictUsage => {
+            app.add_output("Usage: /dict <prefix> <word>");
+            app.add_output("  Looks up <word> in the dictionary and sends '<prefix> <word>: <definition>' to the MUD.");
+            app.add_output("  Example: /dict say hello");
+        }
+        Command::UrbanUsage => {
+            app.add_output("Usage: /urban <prefix> <word>");
+            app.add_output("  Looks up <word> in Urban Dictionary and sends '<prefix> Urban Dict: <word>: <definition>' to the MUD.");
+            app.add_output("  Example: /urban say yeet");
         }
         Command::Dump => {
             // Dump all scrollback buffers to ~/.clay.dmp.log
