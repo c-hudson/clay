@@ -563,6 +563,7 @@
             case '/l':
                 return { type: CommandType.WORLDS_LIST };
             case '/worlds':
+            case '/world':
                 return parseWorldCommand(args);
             case '/connect':
                 return parseConnectCommand(args);
@@ -2571,7 +2572,9 @@
 
             const strippedText = showTags ? cleanLine : stripMudTag(cleanLine);
             const displayText = showTags && tempConvertEnabled ? convertTemperatures(strippedText) : strippedText;
-            let html = tsPrefix + convertDiscordEmojis(linkifyUrls(parseAnsi(insertWordBreaks(displayText))));
+            // Skip Discord emoji conversion when showTags is enabled so users can see original text
+            const processed = linkifyUrls(parseAnsi(insertWordBreaks(displayText)));
+            let html = tsPrefix + (showTags ? processed : convertDiscordEmojis(processed));
 
             // Apply /highlight color from action command (takes priority)
             if (lineHighlightColor !== null && lineHighlightColor !== undefined) {
@@ -2602,7 +2605,9 @@
         }
         const strippedText = showTags ? text : stripMudTag(text);
         const displayText = showTags && tempConvertEnabled ? convertTemperatures(strippedText) : strippedText;
-        const html = convertDiscordEmojis(linkifyUrls(parseAnsi(insertWordBreaks(displayText))));
+        // Skip Discord emoji conversion when showTags is enabled so users can see original text
+        const processed = linkifyUrls(parseAnsi(insertWordBreaks(displayText)));
+        const html = showTags ? processed : convertDiscordEmojis(processed);
         worldOutputCache[worldIndex][lineIndex] = { html, showTags };
         return html;
     }
@@ -2641,7 +2646,9 @@
 
         const strippedText = showTags ? cleanText : stripMudTag(cleanText);
         const displayText = showTags && tempConvertEnabled ? convertTemperatures(strippedText) : strippedText;
-        const html = tsPrefix + convertDiscordEmojis(linkifyUrls(parseAnsi(insertWordBreaks(displayText))));
+        // Skip Discord emoji conversion when showTags is enabled so users can see original text
+        const processed = linkifyUrls(parseAnsi(insertWordBreaks(displayText)));
+        const html = tsPrefix + (showTags ? processed : convertDiscordEmojis(processed));
 
         // Append to output with a <br> prefix (if not first line)
         if (elements.output.innerHTML.length > 0) {

@@ -4390,8 +4390,8 @@ impl eframe::App for RemoteGuiApp {
                         ..Default::default()
                     };
 
-                    // Check if any line has Discord emojis
-                    let has_any_discord_emojis = colored_lines.iter()
+                    // Check if any line has Discord emojis (skip when show_tags enabled to show original text)
+                    let has_any_discord_emojis = !self.show_tags && colored_lines.iter()
                         .any(|line| Self::has_discord_emojis(&line.text));
 
                     // Build display lines for both paths
@@ -4441,7 +4441,12 @@ impl eframe::App for RemoteGuiApp {
                     let mut combined_job = combined_job;
                     if !has_any_discord_emojis {
                         for (i, display_line) in display_lines.iter().enumerate() {
-                            let line_text = convert_discord_emojis(display_line);
+                            // Skip Discord emoji conversion when show_tags enabled to show original text
+                            let line_text = if self.show_tags {
+                                display_line.clone()
+                            } else {
+                                convert_discord_emojis(display_line)
+                            };
                             // Apply word breaks for long words
                             let line_text = Self::insert_word_breaks(&line_text);
                             Self::append_ansi_to_job(&line_text, default_color, font_id.clone(), &mut combined_job, is_light_theme, self.color_offset_percent);

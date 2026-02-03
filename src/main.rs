@@ -39,7 +39,7 @@ pub fn get_version_string() -> String {
 }
 
 // Re-export commonly used types from modules
-pub use encoding::{Encoding, Theme, WorldSwitchMode, convert_discord_emojis, colorize_square_emojis, is_visually_empty, is_ansi_only_line, has_background_color, strip_non_sgr_sequences, wrap_urls_with_osc8};
+pub use encoding::{Encoding, Theme, WorldSwitchMode, convert_discord_emojis, convert_discord_emojis_with_links, colorize_square_emojis, is_visually_empty, is_ansi_only_line, has_background_color, strip_non_sgr_sequences, wrap_urls_with_osc8};
 pub use telnet::{
     WriteCommand, StreamReader, StreamWriter, AutoConnectType, KeepAliveType,
     process_telnet, find_safe_split_point, build_naws_subnegotiation, build_ttype_response, TelnetResult,
@@ -10539,9 +10539,12 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                     // WorldSwitch and WorldConnectNoLogin need proper handling
                                     Command::WorldSwitch { ref name } | Command::WorldConnectNoLogin { ref name } => {
                                         if let Some(idx) = app.worlds.iter().position(|w| w.name.eq_ignore_ascii_case(name)) {
-                                            // Switch to the world
-                                            app.switch_world(idx);
-                                            app.ws_broadcast(WsMessage::WorldSwitched { new_index: idx });
+                                            // Switch only the requesting client's world, not the console
+                                            let dimensions = app.ws_client_worlds.get(&client_id).and_then(|s| s.dimensions);
+                                            let visible_lines = app.ws_client_worlds.get(&client_id).map(|v| v.visible_lines).unwrap_or(0);
+                                            app.ws_client_worlds.insert(client_id, ClientViewState { world_index: idx, visible_lines, dimensions });
+                                            app.ws_set_client_world(client_id, Some(idx));
+                                            app.ws_send_to_client(client_id, WsMessage::WorldSwitched { new_index: idx });
                                             // Connect if not connected and has settings
                                             if !app.worlds[idx].connected
                                                 && app.worlds[idx].settings.has_connection_settings()
@@ -10556,7 +10559,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                                 app.current_world_index = prev_index;
                                             }
                                         } else {
-                                            app.ws_broadcast(WsMessage::ServerData {
+                                            app.ws_send_to_client(client_id, WsMessage::ServerData {
                                                 world_index,
                                                 data: format!("World '{}' not found.", name),
                                                 is_viewed: false,
@@ -10568,10 +10571,13 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                 }
                             }
                             WsMessage::SwitchWorld { world_index } => {
-                                // Switch current world and broadcast
+                                // Switch only the requesting client's world, not the console
                                 if world_index < app.worlds.len() {
-                                    app.switch_world(world_index);
-                                    app.ws_broadcast(WsMessage::WorldSwitched { new_index: world_index });
+                                    let dimensions = app.ws_client_worlds.get(&client_id).and_then(|s| s.dimensions);
+                                    let visible_lines = app.ws_client_worlds.get(&client_id).map(|v| v.visible_lines).unwrap_or(0);
+                                    app.ws_client_worlds.insert(client_id, ClientViewState { world_index, visible_lines, dimensions });
+                                    app.ws_set_client_world(client_id, Some(world_index));
+                                    app.ws_send_to_client(client_id, WsMessage::WorldSwitched { new_index: world_index });
                                 }
                             }
                             WsMessage::ConnectWorld { world_index } => {
@@ -12768,12 +12774,15 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                 // WorldSwitch - do the switch part, skip async connect
                                 Command::WorldSwitch { ref name } | Command::WorldConnectNoLogin { ref name } => {
                                     if let Some(idx) = app.worlds.iter().position(|w| w.name.eq_ignore_ascii_case(name)) {
-                                        // Switch to the world
-                                        app.switch_world(idx);
-                                        app.ws_broadcast(WsMessage::WorldSwitched { new_index: idx });
+                                        // Switch only the requesting client's world, not the console
+                                        let dimensions = app.ws_client_worlds.get(&client_id).and_then(|s| s.dimensions);
+                                        let visible_lines = app.ws_client_worlds.get(&client_id).map(|v| v.visible_lines).unwrap_or(0);
+                                        app.ws_client_worlds.insert(client_id, ClientViewState { world_index: idx, visible_lines, dimensions });
+                                        app.ws_set_client_world(client_id, Some(idx));
+                                        app.ws_send_to_client(client_id, WsMessage::WorldSwitched { new_index: idx });
                                         // Note: Connection requires async, use ConnectWorld message
                                     } else {
-                                        app.ws_broadcast(WsMessage::ServerData {
+                                        app.ws_send_to_client(client_id, WsMessage::ServerData {
                                             world_index,
                                             data: format!("World '{}' not found.", name),
                                             is_viewed: false,
@@ -12785,9 +12794,13 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                             }
                         }
                         WsMessage::SwitchWorld { world_index } => {
+                            // Switch only the requesting client's world, not the console
                             if world_index < app.worlds.len() {
-                                app.switch_world(world_index);
-                                app.ws_broadcast(WsMessage::WorldSwitched { new_index: world_index });
+                                let dimensions = app.ws_client_worlds.get(&client_id).and_then(|s| s.dimensions);
+                                let visible_lines = app.ws_client_worlds.get(&client_id).map(|v| v.visible_lines).unwrap_or(0);
+                                app.ws_client_worlds.insert(client_id, ClientViewState { world_index, visible_lines, dimensions });
+                                app.ws_set_client_world(client_id, Some(world_index));
+                                app.ws_send_to_client(client_id, WsMessage::WorldSwitched { new_index: world_index });
                             }
                         }
                         WsMessage::UpdateWorldSettings { world_index, name, hostname, port, user, password, use_ssl, log_enabled, encoding, auto_login, keep_alive_type, keep_alive_cmd } => {
@@ -16567,9 +16580,9 @@ fn render_output_crossterm(app: &App) {
         if is_visually_empty(&line.text) && !has_background_color(&line.text) {
             return vec![("".to_string(), false, None)];
         }
-        // Convert Discord custom emojis to :name: for console display
-        // and colorize square emoji (🟩🟨 etc.) with ANSI codes
-        let text = colorize_square_emojis(&convert_discord_emojis(&line.text));
+        // Colorize square emoji (🟩🟨 etc.) with ANSI codes
+        // Note: Discord emoji conversion happens later, after URL wrapping
+        let text = colorize_square_emojis(&line.text);
         // Add ✨ prefix for client-generated messages
         let text = if !line.from_server {
             format!("✨ {}", text)
@@ -16591,8 +16604,15 @@ fn render_output_crossterm(app: &App) {
         let expanded = processed.replace('\t', "        ");
         // Wrap URLs with OSC 8 hyperlink sequences for terminal clickability
         let with_links = wrap_urls_with_osc8(&expanded);
+        // Convert Discord custom emojis to clickable :name: links (after URL wrapping to avoid conflicts)
+        // Skip conversion when show_tags is enabled so users can see original text
+        let with_emoji_links = if show_tags {
+            with_links
+        } else {
+            convert_discord_emojis_with_links(&with_links)
+        };
         let hl_color = line.highlight_color.clone();
-        wrap_ansi_line(&with_links, term_width)
+        wrap_ansi_line(&with_emoji_links, term_width)
             .into_iter()
             .map(|s| (s, highlight_f8, hl_color.clone()))
             .collect()

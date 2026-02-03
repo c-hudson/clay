@@ -747,6 +747,29 @@ pub fn convert_discord_emojis(s: &str) -> String {
     }).to_string()
 }
 
+/// Convert Discord custom emoji tags to clickable OSC 8 hyperlinks
+/// Format: <:name:id> or <a:name:id> (animated)
+/// Output: OSC 8 link wrapping :name: text that opens the emoji image URL
+pub fn convert_discord_emojis_with_links(s: &str) -> String {
+    use regex::Regex;
+    use std::sync::OnceLock;
+
+    static RE: OnceLock<Regex> = OnceLock::new();
+    let re = RE.get_or_init(|| {
+        Regex::new(r"<(a?):([^:]+):(\d+)>").unwrap()
+    });
+
+    re.replace_all(s, |caps: &regex::Captures| {
+        let animated = &caps[1] == "a";
+        let name = &caps[2];
+        let id = &caps[3];
+        let ext = if animated { "gif" } else { "png" };
+        let url = format!("https://cdn.discordapp.com/emojis/{}.{}", id, ext);
+        // OSC 8 hyperlink format: \x1b]8;;URL\x07TEXT\x1b]8;;\x07
+        format!("\x1b]8;;{}\x07:{}:\x1b]8;;\x07", url, name)
+    }).to_string()
+}
+
 /// Map common emoji names to Unicode characters
 fn emoji_name_to_unicode(name: &str) -> Option<String> {
     let lower = name.to_lowercase();
