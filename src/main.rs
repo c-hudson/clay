@@ -1047,6 +1047,10 @@ pub enum Command {
     Edit { filename: Option<String> },
     /// /tag - toggle MUD tag display (same as F2)
     Tag,
+    /// /define <prefix> <word> - look up word definition and send with prefix
+    Define { prefix: String, word: String },
+    /// /urban <prefix> <word> - look up Urban Dictionary definition and send with prefix
+    Urban { prefix: String, word: String },
     /// /<action_name> [args] - execute action
     ActionCommand { name: String, args: String },
     /// Not a command (regular text to send to MUD)
@@ -1128,6 +1132,26 @@ pub fn parse_command(input: &str) -> Command {
             }
         }
         "/tag" | "/tags" => Command::Tag,
+        "/define" => {
+            if args.len() >= 2 {
+                Command::Define {
+                    prefix: args[0].to_string(),
+                    word: args[1..].join(" "),
+                }
+            } else {
+                Command::Unknown { cmd: trimmed.to_string() }
+            }
+        }
+        "/urban" => {
+            if args.len() >= 2 {
+                Command::Urban {
+                    prefix: args[0].to_string(),
+                    word: args[1..].join(" "),
+                }
+            } else {
+                Command::Unknown { cmd: trimmed.to_string() }
+            }
+        }
         _ => {
             // Check if it's an action command (starts with / but not a known command)
             let action_name = cmd.trim_start_matches('/');
@@ -10568,6 +10592,18 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                             });
                                         }
                                     }
+                                    Command::Define { prefix, word } => {
+                                        // /define requires async HTTP - send back to client for local execution
+                                        app.ws_send_to_client(client_id, WsMessage::ExecuteLocalCommand {
+                                            command: format!("/define {} {}", prefix, word),
+                                        });
+                                    }
+                                    Command::Urban { prefix, word } => {
+                                        // /urban requires async HTTP - send back to client for local execution
+                                        app.ws_send_to_client(client_id, WsMessage::ExecuteLocalCommand {
+                                            command: format!("/urban {} {}", prefix, word),
+                                        });
+                                    }
                                 }
                             }
                             WsMessage::SwitchWorld { world_index } => {
@@ -12791,6 +12827,18 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                         });
                                     }
                                 }
+                                Command::Define { prefix, word } => {
+                                    // /define requires async HTTP - send back to client for local execution
+                                    app.ws_send_to_client(client_id, WsMessage::ExecuteLocalCommand {
+                                        command: format!("/define {} {}", prefix, word),
+                                    });
+                                }
+                                Command::Urban { prefix, word } => {
+                                    // /urban requires async HTTP - send back to client for local execution
+                                    app.ws_send_to_client(client_id, WsMessage::ExecuteLocalCommand {
+                                        command: format!("/urban {} {}", prefix, word),
+                                    });
+                                }
                             }
                         }
                         WsMessage::SwitchWorld { world_index } => {
@@ -14975,6 +15023,129 @@ async fn connect_discord(app: &mut App, event_tx: mpsc::Sender<AppEvent>) -> boo
     false
 }
 
+/// Look up a word definition from the Free Dictionary API
+/// Returns the first definition, with multiple definitions joined by spaces
+/// Result is a single line with newlines replaced by spaces
+async fn lookup_definition(word: &str) -> Result<String, String> {
+    let url = format!("https://api.dictionaryapi.dev/api/v2/entries/en/{}", word);
+
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .build()
+        .map_err(|e| format!("Failed to create HTTP client: {}", e))?;
+
+    let response = client
+        .get(&url)
+        .send()
+        .await
+        .map_err(|e| format!("HTTP request failed: {}", e))?;
+
+    if response.status() == 404 {
+        return Err(format!("Word '{}' not found", word));
+    }
+
+    if !response.status().is_success() {
+        return Err(format!("API error: {}", response.status()));
+    }
+
+    let json: serde_json::Value = response
+        .json()
+        .await
+        .map_err(|e| format!("Failed to parse JSON: {}", e))?;
+
+    // Parse the response - it's an array of entries
+    let entries = json.as_array()
+        .ok_or_else(|| "Invalid response format".to_string())?;
+
+    if entries.is_empty() {
+        return Err(format!("No definitions found for '{}'", word));
+    }
+
+    // Collect definitions from the first entry
+    let mut definitions = Vec::new();
+
+    if let Some(meanings) = entries[0].get("meanings").and_then(|m| m.as_array()) {
+        for meaning in meanings {
+            if let Some(defs) = meaning.get("definitions").and_then(|d| d.as_array()) {
+                for def in defs {
+                    if let Some(definition) = def.get("definition").and_then(|d| d.as_str()) {
+                        definitions.push(definition.to_string());
+                    }
+                }
+            }
+        }
+    }
+
+    if definitions.is_empty() {
+        return Err(format!("No definitions found for '{}'", word));
+    }
+
+    // Join all definitions with spaces and ensure single line
+    let result = definitions.join(" ")
+        .replace('\n', " ")
+        .replace('\r', "")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+
+    Ok(result)
+}
+
+/// Look up a word definition from Urban Dictionary API
+/// Returns the first definition only, as a single line
+async fn lookup_urban_definition(word: &str) -> Result<String, String> {
+    let encoded: String = url::form_urlencoded::Serializer::new(String::new())
+        .append_pair("term", word)
+        .finish();
+    let url = format!("https://api.urbandictionary.com/v0/define?{}", encoded);
+
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .build()
+        .map_err(|e| format!("Failed to create HTTP client: {}", e))?;
+
+    let response = client
+        .get(&url)
+        .send()
+        .await
+        .map_err(|e| format!("HTTP request failed: {}", e))?;
+
+    if !response.status().is_success() {
+        return Err(format!("API error: {}", response.status()));
+    }
+
+    let json: serde_json::Value = response
+        .json()
+        .await
+        .map_err(|e| format!("Failed to parse JSON: {}", e))?;
+
+    // Parse the response - it has a "list" array
+    let list = json.get("list")
+        .and_then(|l| l.as_array())
+        .ok_or_else(|| "Invalid response format".to_string())?;
+
+    if list.is_empty() {
+        return Err(format!("No definitions found for '{}'", word));
+    }
+
+    // Get the first definition only
+    let definition = list[0].get("definition")
+        .and_then(|d| d.as_str())
+        .ok_or_else(|| "No definition text found".to_string())?;
+
+    // Clean up: remove brackets (Urban Dictionary uses [word] for links), ensure single line
+    let result = definition
+        .replace('[', "")
+        .replace(']', "")
+        .replace('\n', " ")
+        .replace('\r', "")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+
+    Ok(result)
+}
+
 #[async_recursion(?Send)]
 async fn handle_command(cmd: &str, app: &mut App, event_tx: mpsc::Sender<AppEvent>) -> bool {
     let parsed = parse_command(cmd);
@@ -15809,6 +15980,68 @@ async fn handle_command(cmd: &str, app: &mut App, event_tx: mpsc::Sender<AppEven
                 message: message.clone(),
             });
             app.add_output(&format!("Notification sent: {}", message));
+        }
+        Command::Define { prefix, word } => {
+            // Look up word definition from Free Dictionary API
+            let world_idx = app.current_world_index;
+            if !app.current_world().connected {
+                app.add_output("Not connected. Use /worlds to connect.");
+            } else {
+                match lookup_definition(&word).await {
+                    Ok(definition) => {
+                        // Format: prefix + definition, capped at 1024 bytes, single line
+                        let full_text = format!("{} {}", prefix, definition);
+                        let capped = if full_text.len() > 1024 {
+                            let mut end = 1024;
+                            // Don't cut in the middle of a UTF-8 character
+                            while end > 0 && !full_text.is_char_boundary(end) {
+                                end -= 1;
+                            }
+                            full_text[..end].to_string()
+                        } else {
+                            full_text
+                        };
+                        if let Some(tx) = &app.worlds[world_idx].command_tx {
+                            let _ = tx.try_send(WriteCommand::Text(capped));
+                            app.worlds[world_idx].last_send_time = Some(std::time::Instant::now());
+                        }
+                    }
+                    Err(e) => {
+                        app.add_output(&format!("Definition lookup failed: {}", e));
+                    }
+                }
+            }
+        }
+        Command::Urban { prefix, word } => {
+            // Look up word definition from Urban Dictionary API
+            let world_idx = app.current_world_index;
+            if !app.current_world().connected {
+                app.add_output("Not connected. Use /worlds to connect.");
+            } else {
+                match lookup_urban_definition(&word).await {
+                    Ok(definition) => {
+                        // Format: prefix + definition, capped at 1024 bytes, single line
+                        let full_text = format!("{} {}", prefix, definition);
+                        let capped = if full_text.len() > 1024 {
+                            let mut end = 1024;
+                            // Don't cut in the middle of a UTF-8 character
+                            while end > 0 && !full_text.is_char_boundary(end) {
+                                end -= 1;
+                            }
+                            full_text[..end].to_string()
+                        } else {
+                            full_text
+                        };
+                        if let Some(tx) = &app.worlds[world_idx].command_tx {
+                            let _ = tx.try_send(WriteCommand::Text(capped));
+                            app.worlds[world_idx].last_send_time = Some(std::time::Instant::now());
+                        }
+                    }
+                    Err(e) => {
+                        app.add_output(&format!("Urban Dictionary lookup failed: {}", e));
+                    }
+                }
+            }
         }
         Command::Dump => {
             // Dump all scrollback buffers to ~/.clay.dmp.log
