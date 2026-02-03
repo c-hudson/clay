@@ -39,7 +39,6 @@ public class MainActivity extends AppCompatActivity {
     private static final String KEY_SERVER_HOST = "serverHost";
     private static final String KEY_SERVER_PORT = "serverPort";
     private static final String KEY_USE_SECURE = "useSecure";
-    private static final String KEY_LAST_LOADED_URL = "lastLoadedUrl";
     private static final String KEY_SAVED_PASSWORD = "savedPassword";
     private static final String KEY_SAVED_USERNAME = "savedUsername";
 
@@ -57,6 +56,8 @@ public class MainActivity extends AppCompatActivity {
     private boolean permissionsHandled = false;
     private boolean notificationPermissionDone = false;
     private boolean batteryOptimizationDone = false;
+    private boolean interfaceLoaded = false;
+    private String loadedInterfaceUrl = null;
     private PowerManager.WakeLock screenOffWakeLock;
     private Handler keepaliveHandler;
     private Runnable keepaliveRunnable;
@@ -613,9 +614,6 @@ public class MainActivity extends AppCompatActivity {
 
         connectionFailed = false;
 
-        // Persist URL to survive Activity recreation
-        prefs.edit().putString(KEY_LAST_LOADED_URL, url).apply();
-
         // For HTTPS, fetch ALL resources ourselves and inline them
         // This completely bypasses WebView's SSL handling - no network requests from WebView
         if (useSecure) {
@@ -682,6 +680,8 @@ public class MainActivity extends AppCompatActivity {
                     runOnUiThread(() -> {
                         // Load as data URL - WebView makes no network requests
                         webView.loadDataWithBaseURL(url, finalHtml, "text/html", "UTF-8", null);
+                        interfaceLoaded = true;
+                        loadedInterfaceUrl = url;
                     });
                 } catch (Exception e) {
                     runOnUiThread(() -> openSettings("Failed: " + e.getMessage()));
@@ -689,6 +689,8 @@ public class MainActivity extends AppCompatActivity {
             }).start();
         } else {
             webView.loadUrl(url);
+            interfaceLoaded = true;
+            loadedInterfaceUrl = url;
         }
     }
 
@@ -779,23 +781,20 @@ public class MainActivity extends AppCompatActivity {
         String host = prefs.getString(KEY_SERVER_HOST, null);
         int port = prefs.getInt(KEY_SERVER_PORT, 0);
         boolean useSecure = prefs.getBoolean(KEY_USE_SECURE, false);
-        String savedUrl = prefs.getString(KEY_LAST_LOADED_URL, null);
 
         if (host != null && !host.isEmpty() && port > 0) {
             String protocol = useSecure ? "https" : "http";
             String expectedUrl = protocol + "://" + host + ":" + port;
 
-            // Check if WebView already has content loaded
-            String webViewUrl = webView.getUrl();
-            boolean webViewHasContent = webViewUrl != null &&
-                !webViewUrl.equals("about:blank") &&
-                webViewUrl.startsWith(expectedUrl);
+            // Only reload if:
+            // 1. Interface hasn't been loaded yet
+            // 2. Settings changed (URL differs from what we loaded)
+            boolean needsLoad = !interfaceLoaded ||
+                (loadedInterfaceUrl != null && !expectedUrl.equals(loadedInterfaceUrl));
 
-            // Load if:
-            // 1. WebView has no content or wrong content
-            // 2. Settings changed (expected URL differs from saved URL)
-            if (!webViewHasContent || (savedUrl != null && !expectedUrl.equals(savedUrl))) {
-                android.util.Log.i("Clay", "Loading interface: webViewUrl=" + webViewUrl + ", expectedUrl=" + expectedUrl);
+            if (needsLoad) {
+                android.util.Log.i("Clay", "Loading interface: interfaceLoaded=" + interfaceLoaded +
+                    ", loadedUrl=" + loadedInterfaceUrl + ", expectedUrl=" + expectedUrl);
                 loadWebInterface();
             } else if (isConnected && messagesSentSinceAck > 0) {
                 // Returning from background with unacked messages - trigger resync
@@ -806,7 +805,7 @@ public class MainActivity extends AppCompatActivity {
                     null
                 );
             }
-            // Don't reload if just returning from background with WebView intact
+            // Don't reload if just returning from background with interface intact
         }
     }
 
