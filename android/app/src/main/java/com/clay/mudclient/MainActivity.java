@@ -603,6 +603,33 @@ public class MainActivity extends AppCompatActivity {
                 connectionFailed = false;
                 android.util.Log.i("Clay", "Page loaded: " + url);
             }
+
+            @Override
+            public boolean shouldOverrideUrlLoading(WebView view, WebResourceRequest request) {
+                String url = request.getUrl().toString();
+
+                // Check if this is the Clay server URL
+                if (loadedInterfaceUrl != null) {
+                    try {
+                        java.net.URI serverUri = new java.net.URI(loadedInterfaceUrl);
+                        java.net.URI requestUri = new java.net.URI(url);
+
+                        // If same host and port, let WebView handle it
+                        if (serverUri.getHost().equals(requestUri.getHost()) &&
+                            serverUri.getPort() == requestUri.getPort()) {
+                            return false;
+                        }
+                    } catch (Exception e) {
+                        android.util.Log.w("Clay", "Error parsing URL: " + e.getMessage());
+                    }
+                }
+
+                // External URL - open in default browser
+                android.util.Log.i("Clay", "Opening external URL: " + url);
+                Intent intent = new Intent(Intent.ACTION_VIEW, android.net.Uri.parse(url));
+                startActivity(intent);
+                return true;
+            }
         });
 
         webView.setWebChromeClient(new WebChromeClient() {
