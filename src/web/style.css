@@ -1972,7 +1972,7 @@ body.theme-light .custom-dropdown-item.selected {
 
 /* Theme: Light */
 body.theme-light {
-    --bg-color: #fafafa;
+    --bg-color: #f1f1f1;
     --text-color: #000000;
     --input-bg: #ffffff;
     --border-color: #cccccc;
@@ -1984,7 +1984,8 @@ body.theme-light {
 }
 
 body.theme-light #toolbar,
-body.theme-light #mobile-toolbar {
+body.theme-light #mobile-toolbar,
+body.theme-light #status-bar {
     background-color: #e8e8e8;
 }
 
