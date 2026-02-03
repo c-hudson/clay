@@ -222,6 +222,7 @@ body {
     justify-content: space-between;
     padding: 4px 8px;
     background-color: #111;
+    border-top: 2px solid #ffffff;
     min-height: 36px;
     flex-shrink: 0;
     box-sizing: border-box;
@@ -1991,6 +1992,10 @@ body.theme-light #status-bar {
     background-color: #e8e8e8;
 }
 
+body.theme-light #mobile-toolbar {
+    border-top-color: #000000;
+}
+
 body.theme-light .toolbar-btn,
 body.theme-light .mobile-btn {
     background-color: #d8d8d8;
@@ -2021,9 +2026,17 @@ body.theme-light .dropdown-item:hover {
     background-color: #ddd;
 }
 
+body.theme-light #input-container {
+    background-color: #e8e8e8 !important;
+    border: none !important;
+}
+
 body.theme-light #input {
-    background-color: #e8e8e8;
-    border-color: #cccccc;
+    background-color: #e8e8e8 !important;
+    border: none !important;
+    outline: none !important;
+    box-shadow: none !important;
+    caret-color: #000000;
 }
 
 body.theme-light ::-webkit-scrollbar-thumb {

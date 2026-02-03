@@ -291,6 +291,24 @@ public class MainActivity extends AppCompatActivity {
         public boolean hasNativeWebSocket() {
             return true;
         }
+
+        @JavascriptInterface
+        public void reloadPage() {
+            runOnUiThread(() -> {
+                // Close WebSocket connection
+                if (nativeWebSocket != null) {
+                    nativeWebSocket.close();
+                    nativeWebSocket = null;
+                }
+                // Clear cache for a true hard refresh
+                webView.clearCache(true);
+                // Reset interface loaded flag
+                interfaceLoaded = false;
+                loadedInterfaceUrl = null;
+                // Reload from server
+                loadWebInterface();
+            });
+        }
     }
 
     @Override

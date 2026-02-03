@@ -4889,9 +4889,11 @@
                 focusInputWithKeyboard();
                 break;
             case 'resync':
-                // On Android with loadDataWithBaseURL, location.reload doesn't work
-                // Instead, close WebSocket and reconnect to get fresh state
-                if (typeof Android !== 'undefined' && Android.hasNativeWebSocket && Android.hasNativeWebSocket()) {
+                // On Android, call native reload method if available
+                if (typeof Android !== 'undefined' && Android.reloadPage) {
+                    Android.reloadPage();
+                } else if (typeof Android !== 'undefined' && Android.hasNativeWebSocket && Android.hasNativeWebSocket()) {
+                    // Fallback: close WebSocket and reconnect to get fresh state
                     if (ws) {
                         ws.close();
                         ws = null;
