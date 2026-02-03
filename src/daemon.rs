@@ -557,10 +557,10 @@ pub async fn handle_daemon_ws_message(
                     // Broadcast to all clients
                     app.ws_broadcast(WsMessage::ShowTagsChanged { show_tags: app.show_tags });
                 }
-                Command::Define { prefix, word } => {
-                    // /define requires async HTTP - send back to client for local execution
+                Command::Dict { prefix, word } => {
+                    // /dict requires async HTTP - send back to client for local execution
                     app.ws_send_to_client(client_id, WsMessage::ExecuteLocalCommand {
-                        command: format!("/define {} {}", prefix, word),
+                        command: format!("/dict {} {}", prefix, word),
                     });
                 }
                 Command::Urban { prefix, word } => {

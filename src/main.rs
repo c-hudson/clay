@@ -1047,8 +1047,8 @@ pub enum Command {
     Edit { filename: Option<String> },
     /// /tag - toggle MUD tag display (same as F2)
     Tag,
-    /// /define <prefix> <word> - look up word definition and send with prefix
-    Define { prefix: String, word: String },
+    /// /dict <prefix> <word> - look up word definition and send with prefix
+    Dict { prefix: String, word: String },
     /// /urban <prefix> <word> - look up Urban Dictionary definition and send with prefix
     Urban { prefix: String, word: String },
     /// /<action_name> [args] - execute action
@@ -1132,9 +1132,9 @@ pub fn parse_command(input: &str) -> Command {
             }
         }
         "/tag" | "/tags" => Command::Tag,
-        "/define" => {
+        "/dict" => {
             if args.len() >= 2 {
-                Command::Define {
+                Command::Dict {
                     prefix: args[0].to_string(),
                     word: args[1..].join(" "),
                 }
@@ -10592,10 +10592,10 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                             });
                                         }
                                     }
-                                    Command::Define { prefix, word } => {
-                                        // /define requires async HTTP - send back to client for local execution
+                                    Command::Dict { prefix, word } => {
+                                        // /dict requires async HTTP - send back to client for local execution
                                         app.ws_send_to_client(client_id, WsMessage::ExecuteLocalCommand {
-                                            command: format!("/define {} {}", prefix, word),
+                                            command: format!("/dict {} {}", prefix, word),
                                         });
                                     }
                                     Command::Urban { prefix, word } => {
@@ -12827,10 +12827,10 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                         });
                                     }
                                 }
-                                Command::Define { prefix, word } => {
-                                    // /define requires async HTTP - send back to client for local execution
+                                Command::Dict { prefix, word } => {
+                                    // /dict requires async HTTP - send back to client for local execution
                                     app.ws_send_to_client(client_id, WsMessage::ExecuteLocalCommand {
-                                        command: format!("/define {} {}", prefix, word),
+                                        command: format!("/dict {} {}", prefix, word),
                                     });
                                 }
                                 Command::Urban { prefix, word } => {
@@ -15097,7 +15097,7 @@ async fn lookup_urban_definition(word: &str) -> Result<String, String> {
     let encoded: String = url::form_urlencoded::Serializer::new(String::new())
         .append_pair("term", word)
         .finish();
-    let url = format!("https://api.urbandictionary.com/v0/define?{}", encoded);
+    let url = format!("https://api.urbandictionary.com/v0/dict?{}", encoded);
 
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(10))
@@ -15981,7 +15981,7 @@ async fn handle_command(cmd: &str, app: &mut App, event_tx: mpsc::Sender<AppEven
             });
             app.add_output(&format!("Notification sent: {}", message));
         }
-        Command::Define { prefix, word } => {
+        Command::Dict { prefix, word } => {
             // Look up word definition from Free Dictionary API
             let world_idx = app.current_world_index;
             if !app.current_world().connected {
