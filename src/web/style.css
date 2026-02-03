@@ -1693,7 +1693,10 @@ body {
 }
 
 .custom-dropdown-button {
-    background: #08080a;
+    background-color: #08080a;
+    background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 24 24' fill='none' stroke='%2371717a' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M6 9l6 6 6-6'/%3E%3C/svg%3E");
+    background-repeat: no-repeat;
+    background-position: right 8px center;
     border: 1px solid rgba(255, 255, 255, 0.1);
     border-radius: 4px;
     padding: 8px 28px 8px 12px;
@@ -1701,9 +1704,6 @@ body {
     font-family: inherit;
     font-size: 13px;
     cursor: pointer;
-    background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 24 24' fill='none' stroke='%2371717a' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M6 9l6 6 6-6'/%3E%3C/svg%3E");
-    background-repeat: no-repeat;
-    background-position: right 8px center;
 }
 
 .custom-dropdown-menu {
@@ -1744,10 +1744,12 @@ body {
 
 /* Light theme custom dropdown */
 body.theme-light .custom-dropdown-button {
-    background: #e8e8e8;
+    background-color: #e8e8e8 !important;
     border-color: #cccccc;
     color: #000000;
-    background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 24 24' fill='none' stroke='%23333333' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M6 9l6 6 6-6'/%3E%3C/svg%3E");
+    background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 24 24' fill='none' stroke='%23333333' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M6 9l6 6 6-6'/%3E%3C/svg%3E") !important;
+    background-repeat: no-repeat !important;
+    background-position: right 8px center !important;
 }
 
 body.theme-light .custom-dropdown-menu {
@@ -2020,7 +2022,7 @@ body.theme-light .dropdown-item:hover {
 }
 
 body.theme-light #input {
-    background-color: #ffffff;
+    background-color: #e8e8e8;
     border-color: #cccccc;
 }
 
@@ -2156,7 +2158,7 @@ body.theme-light .action-highlight {
 body.theme-light .form-select,
 body.theme-light .setup-modal-content .form-select,
 body.theme-light .world-editor-modal-content .form-select {
-    background: #e8e8e8;
+    background-color: #e8e8e8;
     border-color: #cccccc;
     color: #000000;
     background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 24 24' fill='none' stroke='%23333333' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M6 9l6 6 6-6'/%3E%3C/svg%3E");

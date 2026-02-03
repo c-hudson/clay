@@ -41,6 +41,9 @@
         connectionErrorText: document.getElementById('connection-error-text'),
         connectionRetryBtn: document.getElementById('connection-retry-btn'),
         connectionCancelBtn: document.getElementById('connection-cancel-btn'),
+        // Device mode selector (long-press menu)
+        deviceModeModal: document.getElementById('device-mode-modal'),
+        deviceModeList: document.getElementById('device-mode-list'),
         // Password change modal (multiuser mode)
         passwordModal: document.getElementById('password-modal'),
         passwordOld: document.getElementById('password-old'),
@@ -302,6 +305,7 @@
 
     // Per-device font size tracking (saved separately for phone/tablet/desktop)
     let deviceType = 'desktop';  // 'phone', 'tablet', or 'desktop'
+    let deviceModeOverride = null;  // null = auto, or 'phone', 'tablet', 'desktop'
     let webFontSizePhone = 10.0;
     let webFontSizeTablet = 14.0;
     let webFontSizeDesktop = 18.0;
@@ -660,6 +664,18 @@
     // Detect device type and return appropriate font size position (0-3)
     // Also sets the global deviceType variable ('phone', 'tablet', 'desktop')
     function detectDeviceType() {
+        // If override is set, use that instead of auto-detection
+        if (deviceModeOverride) {
+            deviceType = deviceModeOverride;
+            if (deviceModeOverride === 'phone') {
+                return { fontPos: fontPosFromPixels(webFontSizePhone), mode: 'mobile', device: 'phone' };
+            } else if (deviceModeOverride === 'tablet') {
+                return { fontPos: fontPosFromPixels(webFontSizeTablet), mode: 'mobile', device: 'tablet' };
+            } else {
+                return { fontPos: fontPosFromPixels(webFontSizeDesktop), mode: 'desktop', device: 'desktop' };
+            }
+        }
+
         const width = window.innerWidth;
         const hasTouch = 'ontouchstart' in window || navigator.maxTouchPoints > 0;
 
@@ -774,6 +790,65 @@
                 });
             }
         }
+    }
+
+    // Destroy custom dropdowns (restore native selects)
+    function destroyCustomDropdowns() {
+        document.querySelectorAll('.custom-dropdown').forEach(wrapper => {
+            const select = wrapper.querySelector('select.form-select');
+            if (select) {
+                select.style.display = '';
+                wrapper.parentNode.insertBefore(select, wrapper);
+                delete select._customButton;
+                delete select._customMenu;
+            }
+            wrapper.remove();
+        });
+    }
+
+    // Device mode modal
+    let deviceModeModalOpen = false;
+
+    function showDeviceModeModal() {
+        deviceModeModalOpen = true;
+        elements.deviceModeModal.classList.add('visible');
+        // Highlight current mode
+        const currentMode = deviceModeOverride || 'auto';
+        elements.deviceModeList.querySelectorAll('.menu-item').forEach(item => {
+            item.classList.toggle('selected', item.dataset.mode === currentMode);
+        });
+    }
+
+    function hideDeviceModeModal() {
+        deviceModeModalOpen = false;
+        elements.deviceModeModal.classList.remove('visible');
+    }
+
+    function applyDeviceMode(mode) {
+        hideDeviceModeModal();
+
+        // Set override (null for auto)
+        deviceModeOverride = mode === 'auto' ? null : mode;
+
+        // Remove mobile class first
+        document.body.classList.remove('is-mobile');
+
+        // Destroy existing custom dropdowns
+        destroyCustomDropdowns();
+
+        // Re-detect device type with new override
+        const device = detectDeviceType();
+        setFontPos(device.fontPos);
+        setupToolbars(device.mode);
+
+        // Re-init custom dropdowns if mobile mode
+        if (device.mode === 'mobile') {
+            document.body.classList.add('is-mobile');
+            initCustomDropdowns();
+        }
+
+        // Show confirmation
+        appendClientLine('Device mode set to: ' + (mode === 'auto' ? 'Auto (' + device.device + ')' : mode));
     }
 
     // Setup toolbars based on device mode
@@ -4999,11 +5074,57 @@
         // Send button
         elements.sendBtn.onclick = sendCommand;
 
-        // Hamburger menu
-        elements.menuBtn.onclick = function(e) {
-            e.stopPropagation();
-            toggleMenu();
-        };
+        // Hamburger menu with long-press for device mode
+        let menuLongPressTimer = null;
+        let menuLongPressed = false;
+
+        elements.menuBtn.addEventListener('mousedown', function(e) {
+            menuLongPressed = false;
+            menuLongPressTimer = setTimeout(function() {
+                menuLongPressed = true;
+                showDeviceModeModal();
+            }, 2000);
+        });
+
+        elements.menuBtn.addEventListener('click', function(e) {
+            if (menuLongPressTimer) {
+                clearTimeout(menuLongPressTimer);
+                menuLongPressTimer = null;
+            }
+            if (!menuLongPressed) {
+                e.stopPropagation();
+                toggleMenu();
+            }
+            menuLongPressed = false;
+        });
+
+        elements.menuBtn.addEventListener('mouseleave', function(e) {
+            if (menuLongPressTimer) {
+                clearTimeout(menuLongPressTimer);
+                menuLongPressTimer = null;
+            }
+        });
+
+        // Touch events (for actual touch devices)
+        elements.menuBtn.addEventListener('touchstart', function(e) {
+            menuLongPressed = false;
+            menuLongPressTimer = setTimeout(function() {
+                menuLongPressed = true;
+                showDeviceModeModal();
+            }, 2000);
+        }, { passive: true });
+
+        elements.menuBtn.addEventListener('touchend', function(e) {
+            if (menuLongPressTimer) {
+                clearTimeout(menuLongPressTimer);
+                menuLongPressTimer = null;
+            }
+            if (!menuLongPressed) {
+                e.preventDefault();
+                toggleMenu();
+            }
+            menuLongPressed = false;
+        }, { passive: false });
 
         // Menu items
         elements.menuDropdown.onclick = function(e) {
@@ -5019,14 +5140,58 @@
         // Font size slider handler (mobile)
         setupSlider(elements.mobileFontSlider, elements.mobileFontSliderHandle);
 
-        // Mobile toolbar buttons
+        // Mobile toolbar buttons with long-press for device mode
+        let mobileLongPressTimer = null;
+        let mobileLongPressed = false;
+
+        // Mouse events for desktop browsers simulating mobile mode
+        elements.mobileMenuBtn.addEventListener('mousedown', function(e) {
+            mobileLongPressed = false;
+            mobileLongPressTimer = setTimeout(function() {
+                mobileLongPressed = true;
+                showDeviceModeModal();
+            }, 2000);
+        });
+
+        elements.mobileMenuBtn.addEventListener('click', function(e) {
+            if (mobileLongPressTimer) {
+                clearTimeout(mobileLongPressTimer);
+                mobileLongPressTimer = null;
+            }
+            if (!mobileLongPressed) {
+                e.stopPropagation();
+                toggleMobileMenu();
+            }
+            mobileLongPressed = false;
+        });
+
+        elements.mobileMenuBtn.addEventListener('mouseleave', function(e) {
+            if (mobileLongPressTimer) {
+                clearTimeout(mobileLongPressTimer);
+                mobileLongPressTimer = null;
+            }
+        });
+
+        // Touch events for actual mobile devices
         elements.mobileMenuBtn.addEventListener('touchstart', function(e) {
-            // Re-focus input immediately to prevent keyboard from hiding
             elements.input.focus();
+            mobileLongPressed = false;
+            mobileLongPressTimer = setTimeout(function() {
+                mobileLongPressed = true;
+                showDeviceModeModal();
+            }, 2000);
         }, { passive: true });
+
         elements.mobileMenuBtn.addEventListener('touchend', function(e) {
-            e.preventDefault();
-            toggleMobileMenu();
+            if (mobileLongPressTimer) {
+                clearTimeout(mobileLongPressTimer);
+                mobileLongPressTimer = null;
+            }
+            if (!mobileLongPressed) {
+                e.preventDefault();
+                toggleMobileMenu();
+            }
+            mobileLongPressed = false;
         }, { passive: false });
 
         elements.mobileMenuDropdown.addEventListener('touchstart', function(e) {
@@ -5039,6 +5204,15 @@
                 handleMenuItem(item.dataset.action);
             }
         }, { passive: false });
+
+        // Mouse handler for mobile dropdown when simulating mobile on desktop
+        elements.mobileMenuDropdown.onclick = function(e) {
+            e.stopPropagation();
+            const item = e.target.closest('.dropdown-item');
+            if (item) {
+                handleMenuItem(item.dataset.action);
+            }
+        };
 
         // Track button press timing for long-press detection
         let upBtnTimer = null;
@@ -5634,6 +5808,10 @@
                 // Escape: Close filter popup if open
                 e.preventDefault();
                 closeFilterPopup();
+            } else if (e.key === 'Escape' && deviceModeModalOpen) {
+                // Escape: Close device mode modal if open
+                e.preventDefault();
+                hideDeviceModeModal();
             }
         };
 
@@ -6002,6 +6180,24 @@
         if (elements.passwordCancelBtn) {
             elements.passwordCancelBtn.onclick = function() {
                 showPasswordModal(false);
+            };
+        }
+
+        // Device mode modal event handlers
+        if (elements.deviceModeList) {
+            elements.deviceModeList.onclick = function(e) {
+                const item = e.target.closest('.menu-item');
+                if (item && item.dataset.mode) {
+                    applyDeviceMode(item.dataset.mode);
+                }
+            };
+        }
+        if (elements.deviceModeModal) {
+            elements.deviceModeModal.onclick = function(e) {
+                // Close when clicking outside the modal content
+                if (e.target === elements.deviceModeModal) {
+                    hideDeviceModeModal();
+                }
             };
         }
 
