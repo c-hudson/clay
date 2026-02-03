@@ -15063,6 +15063,76 @@ async fn connect_discord(app: &mut App, event_tx: mpsc::Sender<AppEvent>) -> boo
     false
 }
 
+/// Convert UTF-8 characters with diacritics to ASCII equivalents
+/// for better compatibility with non-UTF-8 MUD worlds
+fn transliterate_to_ascii(s: &str) -> String {
+    let mut result = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            // Accented vowels - lowercase
+            'à' | 'á' | 'â' | 'ã' | 'ä' | 'å' | 'ā' | 'ă' | 'ą' => result.push('a'),
+            'è' | 'é' | 'ê' | 'ë' | 'ē' | 'ĕ' | 'ė' | 'ę' | 'ě' => result.push('e'),
+            'ì' | 'í' | 'î' | 'ï' | 'ĩ' | 'ī' | 'ĭ' | 'į' | 'ı' => result.push('i'),
+            'ò' | 'ó' | 'ô' | 'õ' | 'ö' | 'ō' | 'ŏ' | 'ő' | 'ø' => result.push('o'),
+            'ù' | 'ú' | 'û' | 'ü' | 'ũ' | 'ū' | 'ŭ' | 'ů' | 'ű' | 'ų' => result.push('u'),
+            'ý' | 'ÿ' | 'ŷ' => result.push('y'),
+            // Accented vowels - uppercase
+            'À' | 'Á' | 'Â' | 'Ã' | 'Ä' | 'Å' | 'Ā' | 'Ă' | 'Ą' => result.push('A'),
+            'È' | 'É' | 'Ê' | 'Ë' | 'Ē' | 'Ĕ' | 'Ė' | 'Ę' | 'Ě' => result.push('E'),
+            'Ì' | 'Í' | 'Î' | 'Ï' | 'Ĩ' | 'Ī' | 'Ĭ' | 'Į' | 'İ' => result.push('I'),
+            'Ò' | 'Ó' | 'Ô' | 'Õ' | 'Ö' | 'Ō' | 'Ŏ' | 'Ő' | 'Ø' => result.push('O'),
+            'Ù' | 'Ú' | 'Û' | 'Ü' | 'Ũ' | 'Ū' | 'Ŭ' | 'Ů' | 'Ű' | 'Ų' => result.push('U'),
+            'Ý' | 'Ÿ' | 'Ŷ' => result.push('Y'),
+            // Accented consonants - lowercase
+            'ç' | 'ć' | 'ĉ' | 'ċ' | 'č' => result.push('c'),
+            'ñ' | 'ń' | 'ņ' | 'ň' | 'ŉ' => result.push('n'),
+            'ś' | 'ŝ' | 'ş' | 'š' => result.push('s'),
+            'ź' | 'ż' | 'ž' => result.push('z'),
+            'ð' | 'đ' => result.push('d'),
+            'ĝ' | 'ğ' | 'ġ' | 'ģ' => result.push('g'),
+            'ĥ' | 'ħ' => result.push('h'),
+            'ĵ' => result.push('j'),
+            'ķ' | 'ĸ' => result.push('k'),
+            'ĺ' | 'ļ' | 'ľ' | 'ŀ' | 'ł' => result.push('l'),
+            'ŕ' | 'ŗ' | 'ř' => result.push('r'),
+            'ţ' | 'ť' | 'ŧ' => result.push('t'),
+            'ŵ' => result.push('w'),
+            // Accented consonants - uppercase
+            'Ç' | 'Ć' | 'Ĉ' | 'Ċ' | 'Č' => result.push('C'),
+            'Ñ' | 'Ń' | 'Ņ' | 'Ň' => result.push('N'),
+            'Ś' | 'Ŝ' | 'Ş' | 'Š' => result.push('S'),
+            'Ź' | 'Ż' | 'Ž' => result.push('Z'),
+            'Ð' | 'Đ' => result.push('D'),
+            'Ĝ' | 'Ğ' | 'Ġ' | 'Ģ' => result.push('G'),
+            'Ĥ' | 'Ħ' => result.push('H'),
+            'Ĵ' => result.push('J'),
+            'Ķ' => result.push('K'),
+            'Ĺ' | 'Ļ' | 'Ľ' | 'Ŀ' | 'Ł' => result.push('L'),
+            'Ŕ' | 'Ŗ' | 'Ř' => result.push('R'),
+            'Ţ' | 'Ť' | 'Ŧ' => result.push('T'),
+            'Ŵ' => result.push('W'),
+            // Ligatures (multi-char replacements)
+            'æ' => result.push_str("ae"),
+            'Æ' => result.push_str("AE"),
+            'œ' => result.push_str("oe"),
+            'Œ' => result.push_str("OE"),
+            'ß' => result.push_str("ss"),
+            'þ' => result.push_str("th"),
+            'Þ' => result.push_str("Th"),
+            'ĳ' => result.push_str("ij"),
+            'Ĳ' => result.push_str("IJ"),
+            // Quotes and punctuation (using unicode escapes for curly quotes)
+            '\u{2018}' | '\u{2019}' | '\u{201A}' | '\u{201B}' => result.push('\''),
+            '\u{201C}' | '\u{201D}' | '\u{201E}' | '\u{201F}' => result.push('"'),
+            '–' | '—' => result.push('-'),
+            '…' => result.push_str("..."),
+            // Everything else passes through unchanged
+            _ => result.push(c),
+        }
+    }
+    result
+}
+
 /// Look up a word definition from the Free Dictionary API
 /// Returns the first definition, with multiple definitions joined by spaces
 /// Result is a single line with newlines replaced by spaces
@@ -16025,8 +16095,10 @@ async fn handle_command(cmd: &str, app: &mut App, event_tx: mpsc::Sender<AppEven
             // Look up word definition from Free Dictionary API
             match lookup_definition(&word).await {
                 Ok(definition) => {
+                    // Transliterate to ASCII for non-UTF-8 MUD compatibility
+                    let ascii_def = transliterate_to_ascii(&definition);
                     // Format: prefix word: definition, capped at 1024 bytes, single line
-                    let full_text = format!("{} {}: {}", prefix, word, definition);
+                    let full_text = format!("{} {}: {}", prefix, word, ascii_def);
                     let capped = if full_text.len() > 1024 {
                         let mut end = 1024;
                         // Don't cut in the middle of a UTF-8 character
@@ -16050,8 +16122,10 @@ async fn handle_command(cmd: &str, app: &mut App, event_tx: mpsc::Sender<AppEven
             // Look up word definition from Urban Dictionary API
             match lookup_urban_definition(&word).await {
                 Ok(definition) => {
+                    // Transliterate to ASCII for non-UTF-8 MUD compatibility
+                    let ascii_def = transliterate_to_ascii(&definition);
                     // Format: prefix Urban Dict: word: definition, capped at 1024 bytes, single line
-                    let full_text = format!("{} Urban Dict: {}: {}", prefix, word, definition);
+                    let full_text = format!("{} Urban Dict: {}: {}", prefix, word, ascii_def);
                     let capped = if full_text.len() > 1024 {
                         let mut end = 1024;
                         // Don't cut in the middle of a UTF-8 character
