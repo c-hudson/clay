@@ -346,6 +346,10 @@ pub async fn handle_daemon_ws_message(
             if world_index < app.worlds.len() {
                 app.worlds[world_index].lines_since_pause = 0;
                 app.worlds[world_index].last_user_command_time = Some(std::time::Instant::now());
+                // Also clear paused flag if no pending lines
+                if app.worlds[world_index].pending_lines.is_empty() {
+                    app.worlds[world_index].paused = false;
+                }
             }
 
             match parsed {

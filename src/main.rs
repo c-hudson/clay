@@ -14766,6 +14766,11 @@ fn handle_key_event(key: KeyEvent, app: &mut App) -> KeyAction {
                 // This matches daemon.rs behavior and prevents spurious pausing
                 app.current_world_mut().log_more_debug("RESET_user_command", &input);
                 app.current_world_mut().lines_since_pause = 0;
+                // Also clear paused flag if no pending lines
+                // This prevents staying paused after the triggering line when user sends a command
+                if app.current_world().pending_lines.is_empty() {
+                    app.current_world_mut().paused = false;
+                }
                 KeyAction::SendCommand(input)
             } else {
                 KeyAction::None
