@@ -9604,8 +9604,6 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                                 };
                                                 app.tf_engine.processes.push(process);
                                             }
-                                            app.add_tf_output(&format!("% Quote started: {} lines, {} sec delay",
-                                                app.tf_engine.processes.len(), delay_secs));
                                         } else {
                                             // Send immediately (no delay or single line)
                                             for line in lines {
