@@ -47,7 +47,7 @@ public class MainActivity extends AppCompatActivity {
     private static final String CHANNEL_ID_SERVICE = "clay_service";
     private static final int NOTIFICATION_PERMISSION_REQUEST = 1001;
     private static final int BATTERY_OPTIMIZATION_REQUEST = 1002;
-    private static final int KEEPALIVE_INTERVAL_MS = 30000; // 30 seconds
+    private static final int KEEPALIVE_INTERVAL_MS = 60000; // 60 seconds (reduced from 30s for power savings)
 
     private WebView webView;
     private boolean connectionFailed = false;
@@ -59,7 +59,7 @@ public class MainActivity extends AppCompatActivity {
     private boolean batteryOptimizationDone = false;
     private boolean interfaceLoaded = false;
     private String loadedInterfaceUrl = null;
-    private PowerManager.WakeLock screenOffWakeLock;
+    // Removed duplicate screenOffWakeLock - ClayForegroundService already holds one
     private Handler keepaliveHandler;
     private Runnable keepaliveRunnable;
     private NativeWebSocket nativeWebSocket;
@@ -127,7 +127,6 @@ public class MainActivity extends AppCompatActivity {
 
                 // Mark as connected and start keepalive
                 isConnected = true;
-                acquireScreenOffWakeLock();
                 startKeepalive();
             });
         }
@@ -137,7 +136,6 @@ public class MainActivity extends AppCompatActivity {
             runOnUiThread(() -> {
                 isConnected = false;
                 stopKeepalive();
-                releaseScreenOffWakeLock();
 
                 Intent serviceIntent = new Intent(MainActivity.this, ClayForegroundService.class);
                 stopService(serviceIntent);
@@ -460,26 +458,6 @@ public class MainActivity extends AppCompatActivity {
             if (manager != null) {
                 manager.createNotificationChannel(channel);
             }
-        }
-    }
-
-    private void acquireScreenOffWakeLock() {
-        if (screenOffWakeLock == null) {
-            PowerManager pm = (PowerManager) getSystemService(Context.POWER_SERVICE);
-            if (pm != null) {
-                screenOffWakeLock = pm.newWakeLock(
-                    PowerManager.PARTIAL_WAKE_LOCK,
-                    "Clay::ScreenOffWakeLock"
-                );
-                screenOffWakeLock.acquire();
-            }
-        }
-    }
-
-    private void releaseScreenOffWakeLock() {
-        if (screenOffWakeLock != null && screenOffWakeLock.isHeld()) {
-            screenOffWakeLock.release();
-            screenOffWakeLock = null;
         }
     }
 
@@ -893,7 +871,6 @@ public class MainActivity extends AppCompatActivity {
     @Override
     protected void onDestroy() {
         stopKeepalive();
-        releaseScreenOffWakeLock();
         super.onDestroy();
     }
 

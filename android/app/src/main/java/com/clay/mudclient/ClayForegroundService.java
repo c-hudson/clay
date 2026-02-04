@@ -46,10 +46,11 @@ public class ClayForegroundService extends Service {
         }
 
         // Acquire wifi lock to keep wifi connection active
+        // Use WIFI_MODE_FULL instead of WIFI_MODE_FULL_HIGH_PERF to reduce power consumption
         WifiManager wifiManager = (WifiManager) getApplicationContext().getSystemService(Context.WIFI_SERVICE);
         if (wifiManager != null) {
             wifiLock = wifiManager.createWifiLock(
-                WifiManager.WIFI_MODE_FULL_HIGH_PERF,
+                WifiManager.WIFI_MODE_FULL,
                 "Clay::WifiLock"
             );
             wifiLock.acquire();
