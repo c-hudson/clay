@@ -41,6 +41,11 @@
         connectionErrorText: document.getElementById('connection-error-text'),
         connectionRetryBtn: document.getElementById('connection-retry-btn'),
         connectionCancelBtn: document.getElementById('connection-cancel-btn'),
+        // Reconnect modal (shown when send fails)
+        reconnectModal: document.getElementById('reconnect-modal'),
+        reconnectText: document.getElementById('reconnect-text'),
+        reconnectBtn: document.getElementById('reconnect-btn'),
+        reconnectCancelBtn: document.getElementById('reconnect-cancel-btn'),
         // Device mode selector (long-press menu)
         deviceModeModal: document.getElementById('device-mode-modal'),
         deviceModeList: document.getElementById('device-mode-list'),
@@ -192,6 +197,8 @@
     let hasReceivedInitialState = false;  // True after first InitialState (to preserve world on resync)
     let worlds = [];
     let currentWorldIndex = 0;
+    let pendingReconnectCommand = null;  // Command to resend after reconnect
+    let pendingReconnectWorldIndex = null;  // World index to switch to after reconnect
     let commandHistory = [];
     let historyIndex = -1;
     let connectionFailures = 0;
@@ -1581,6 +1588,35 @@
                 updateStatusBar();
                 // Send initial view state for synchronized more-mode
                 sendViewStateIfChanged();
+                // Handle pending reconnect command (resend after reconnection)
+                if (pendingReconnectCommand !== null) {
+                    // Switch to the world that was active when the command failed
+                    if (pendingReconnectWorldIndex !== null && pendingReconnectWorldIndex !== currentWorldIndex) {
+                        if (pendingReconnectWorldIndex >= 0 && pendingReconnectWorldIndex < worlds.length) {
+                            currentWorldIndex = pendingReconnectWorldIndex;
+                            renderOutput();
+                            updateStatusBar();
+                        }
+                    }
+                    // Resend the command
+                    send({
+                        type: 'SendCommand',
+                        world_index: currentWorldIndex,
+                        command: pendingReconnectCommand
+                    });
+                    // Add to history
+                    if (pendingReconnectCommand.length > 0) {
+                        commandHistory.push(pendingReconnectCommand);
+                        if (commandHistory.length > 1000) {
+                            commandHistory.shift();
+                        }
+                    }
+                    // Clear pending state
+                    pendingReconnectCommand = null;
+                    pendingReconnectWorldIndex = null;
+                    elements.input.value = '';
+                    elements.prompt.textContent = '';
+                }
                 break;
 
             case 'ServerData':
@@ -2111,11 +2147,13 @@
         updateStatusBar();
     }
 
-    // Send message to server
+    // Send message to server - returns true if sent, false if connection lost
     function send(msg) {
         if (ws && ws.readyState === WebSocket.OPEN && authenticated) {
             ws.send(JSON.stringify(msg));
+            return true;
         }
+        return false;
     }
 
     // Authenticate - sends directly via ws.send since authenticated is still false
@@ -2350,11 +2388,19 @@
         // Reset lines since pause counter on user input
         linesSincePause = 0;
 
-        send({
+        const sent = send({
             type: 'SendCommand',
             world_index: currentWorldIndex,
             command: cmd
         });
+
+        if (!sent) {
+            // Connection lost - show reconnect popup
+            pendingReconnectCommand = cmd;
+            pendingReconnectWorldIndex = currentWorldIndex;
+            showReconnectModal();
+            return;
+        }
 
         if (cmd.length > 0) {
             commandHistory.push(cmd);
@@ -3519,6 +3565,18 @@
     function hideConnectionErrorModal() {
         elements.connectionErrorModal.className = 'modal';
         elements.connectionErrorModal.style.display = 'none';
+    }
+
+    // Show/hide reconnect modal
+    function showReconnectModal() {
+        elements.reconnectModal.className = 'modal visible';
+        elements.reconnectModal.style.display = 'flex';
+        forceRepaint(elements.reconnectModal);
+    }
+
+    function hideReconnectModal() {
+        elements.reconnectModal.className = 'modal';
+        elements.reconnectModal.style.display = 'none';
     }
 
     // Show/hide auth modal
@@ -5968,6 +6026,21 @@
                 Android.openServerSettings();
             }
             // In browser, just leave it disconnected - user can refresh to try again
+        };
+
+        // Reconnect modal buttons (shown when send fails due to disconnection)
+        elements.reconnectBtn.onclick = function() {
+            hideReconnectModal();
+            // Reconnect and resend the command after authentication
+            connectionFailures = 0;
+            triedWsFallback = false;
+            connect();
+        };
+        elements.reconnectCancelBtn.onclick = function() {
+            hideReconnectModal();
+            // Clear pending command
+            pendingReconnectCommand = null;
+            pendingReconnectWorldIndex = null;
         };
 
         // Auth username field Enter key handler (multiuser mode)

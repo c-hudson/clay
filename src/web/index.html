@@ -120,6 +120,18 @@
             </div>
         </div>
 
+        <!-- Reconnect modal (shown when send fails due to disconnection) -->
+        <div id="reconnect-modal" class="modal">
+            <div class="modal-content">
+                <h2>Connection Lost</h2>
+                <p id="reconnect-text">Unable to send command. The connection to the server was lost.</p>
+                <div class="modal-buttons">
+                    <button id="reconnect-cancel-btn">Cancel</button>
+                    <button id="reconnect-btn" class="btn-primary">Reconnect</button>
+                </div>
+            </div>
+        </div>
+
         <!-- Filter popup (F4) -->
         <div id="filter-popup" class="filter-popup" style="display: none;">
             <div class="filter-popup-header">Find [Esc to close]</div>
