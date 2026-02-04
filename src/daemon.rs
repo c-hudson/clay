@@ -263,20 +263,17 @@ pub async fn run_daemon_server() -> io::Result<()> {
                                         tf::TfCommandResult::ClayCommand(clay_cmd) => {
                                             // Handle Clay-specific commands in daemon mode
                                             let parsed = parse_command(&clay_cmd);
-                                            match parsed {
-                                                Command::Send { text, target_world, .. } => {
-                                                    let target_idx = if let Some(ref w) = target_world {
-                                                        app.find_world_index(w)
-                                                    } else {
-                                                        Some(world_idx)
-                                                    };
-                                                    if let Some(idx) = target_idx {
-                                                        if let Some(tx) = &app.worlds[idx].command_tx {
-                                                            let _ = tx.try_send(WriteCommand::Text(text));
-                                                        }
+                                            if let Command::Send { text, target_world, .. } = parsed {
+                                                let target_idx = if let Some(ref w) = target_world {
+                                                    app.find_world_index(w)
+                                                } else {
+                                                    Some(world_idx)
+                                                };
+                                                if let Some(idx) = target_idx {
+                                                    if let Some(tx) = &app.worlds[idx].command_tx {
+                                                        let _ = tx.try_send(WriteCommand::Text(text));
                                                     }
                                                 }
-                                                _ => {}
                                             }
                                         }
                                         tf::TfCommandResult::RepeatProcess(process) => {

@@ -389,8 +389,10 @@ fn default_web_font_size_desktop() -> f32 {
 
 /// Type of remote client connected via WebSocket
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Default)]
 pub enum RemoteClientType {
     /// Web browser client - receives full history, scrolls locally
+    #[default]
     Web,
     /// Remote GUI client (egui) - receives full history, scrolls locally
     RemoteGUI,
@@ -398,11 +400,6 @@ pub enum RemoteClientType {
     RemoteConsole,
 }
 
-impl Default for RemoteClientType {
-    fn default() -> Self {
-        RemoteClientType::Web
-    }
-}
 
 /// Information about a connected WebSocket client
 pub struct WsClientInfo {

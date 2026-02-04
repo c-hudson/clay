@@ -561,14 +561,14 @@ pub fn execute_macro(
             // Order matters: %tmppwd$[char(x)] must become VALUE$[char(x)] first,
             // otherwise $[char(x)] evaluates to "F" giving %tmppwdF which is wrong
             let cmd = engine.substitute_vars(cmd);
-            let cmd = variables::substitute_commands(engine, &cmd);
-            cmd
+            
+            variables::substitute_commands(engine, &cmd)
         };
         let cmd = cmd.trim();
 
         // Execute the command (already substituted above)
         let result = if cmd.starts_with('#') {
-            super::parser::execute_command_substituted(engine, &cmd)
+            super::parser::execute_command_substituted(engine, cmd)
         } else if cmd.starts_with('/') {
             TfCommandResult::ClayCommand(cmd.to_string())
         } else {

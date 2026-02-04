@@ -593,7 +593,7 @@ fn cmd_echo(engine: &TfEngine, args: &str) -> TfCommandResult {
                 remaining = remaining.trim_start();
                 if let Some(space_pos) = remaining.find(' ') {
                     _world = Some(remaining[..space_pos].to_string());
-                    remaining = &remaining[space_pos..].trim_start();
+                    remaining = remaining[space_pos..].trim_start();
                 } else {
                     _world = Some(remaining.to_string());
                     remaining = "";
@@ -602,7 +602,7 @@ fn cmd_echo(engine: &TfEngine, args: &str) -> TfCommandResult {
                 // -w<world> (no space)
                 if let Some(space_pos) = remaining.find(' ') {
                     _world = Some(remaining[..space_pos].to_string());
-                    remaining = &remaining[space_pos..].trim_start();
+                    remaining = remaining[space_pos..].trim_start();
                 } else {
                     _world = Some(remaining.to_string());
                     remaining = "";
@@ -613,7 +613,7 @@ fn cmd_echo(engine: &TfEngine, args: &str) -> TfCommandResult {
             remaining = &remaining[2..];
             if let Some(space_pos) = remaining.find(' ') {
                 _attrs = Some(remaining[..space_pos].to_string());
-                remaining = &remaining[space_pos..].trim_start();
+                remaining = remaining[space_pos..].trim_start();
             } else {
                 _attrs = Some(remaining.to_string());
                 remaining = "";
@@ -621,7 +621,7 @@ fn cmd_echo(engine: &TfEngine, args: &str) -> TfCommandResult {
         } else if remaining.starts_with('-') && remaining.len() > 1 {
             // Unknown option, skip it
             if let Some(space_pos) = remaining.find(' ') {
-                remaining = &remaining[space_pos..].trim_start();
+                remaining = remaining[space_pos..].trim_start();
             } else {
                 remaining = "";
             }
@@ -656,7 +656,7 @@ fn cmd_substitute(engine: &mut TfEngine, args: &str) -> TfCommandResult {
             remaining = &remaining[2..];
             if let Some(space_pos) = remaining.find(' ') {
                 attrs = remaining[..space_pos].to_string();
-                remaining = &remaining[space_pos..].trim_start();
+                remaining = remaining[space_pos..].trim_start();
             } else {
                 attrs = remaining.to_string();
                 remaining = "";
@@ -664,7 +664,7 @@ fn cmd_substitute(engine: &mut TfEngine, args: &str) -> TfCommandResult {
         } else if remaining.starts_with('-') && remaining.len() > 1 {
             // Unknown option, skip it
             if let Some(space_pos) = remaining.find(' ') {
-                remaining = &remaining[space_pos..].trim_start();
+                remaining = remaining[space_pos..].trim_start();
             } else {
                 remaining = "";
             }

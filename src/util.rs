@@ -56,7 +56,7 @@ pub fn color_name_to_ansi_bg(color: &str) -> String {
     }
 
     // Named colors (using darker/muted versions for backgrounds)
-    match &color_lower[..] {
+    match color_lower {
         "red" => "\x1b[48;5;52m".to_string(),      // Dark red
         "green" => "\x1b[48;5;22m".to_string(),    // Dark green
         "blue" => "\x1b[48;5;17m".to_string(),     // Dark blue
@@ -149,13 +149,13 @@ pub fn local_time_from_epoch(epoch_secs: i64) -> LocalTime {
         libc::localtime_r(&time_t, &mut tm);
     }
     LocalTime {
-        year: tm.tm_year as i32 + 1900,
-        month: tm.tm_mon as i32 + 1,
-        day: tm.tm_mday as i32,
-        hour: tm.tm_hour as i32,
-        minute: tm.tm_min as i32,
-        second: tm.tm_sec as i32,
-        weekday: tm.tm_wday as i32,
+        year: tm.tm_year + 1900,
+        month: tm.tm_mon + 1,
+        day: tm.tm_mday,
+        hour: tm.tm_hour,
+        minute: tm.tm_min,
+        second: tm.tm_sec,
+        weekday: tm.tm_wday,
     }
 }
 

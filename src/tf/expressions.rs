@@ -1228,7 +1228,7 @@ impl<'a> Evaluator<'a> {
                     return Err("asin requires 1 argument".to_string());
                 }
                 let x = self.eval(&args[0])?.to_float().unwrap_or(0.0);
-                if x < -1.0 || x > 1.0 {
+                if !(-1.0..=1.0).contains(&x) {
                     return Err("asin: argument must be in [-1, 1]".to_string());
                 }
                 Ok(TfValue::Float(x.asin()))
@@ -1239,7 +1239,7 @@ impl<'a> Evaluator<'a> {
                     return Err("acos requires 1 argument".to_string());
                 }
                 let x = self.eval(&args[0])?.to_float().unwrap_or(0.0);
-                if x < -1.0 || x > 1.0 {
+                if !(-1.0..=1.0).contains(&x) {
                     return Err("acos: argument must be in [-1, 1]".to_string());
                 }
                 Ok(TfValue::Float(x.acos()))
@@ -2207,7 +2207,7 @@ impl<'a> Evaluator<'a> {
                 let mut file = match file_handle.mode {
                     super::TfFileMode::Write => {
                         match std::fs::OpenOptions::new()
-                            .write(true)
+                            
                             .create(true)
                             .append(true) // Use append to not overwrite on each write
                             .open(&file_handle.path)

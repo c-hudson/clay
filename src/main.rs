@@ -74,12 +74,9 @@ pub use daemon::{
     generate_splash_strings,
 };
 
-use std::collections::{HashMap, HashSet};
 use std::io::{self, stdout, Write as IoWrite};
 #[cfg(unix)]
 use std::os::unix::io::{AsRawFd, FromRawFd, RawFd};
-#[cfg(all(unix, not(target_os = "android")))]
-use std::os::unix::fs::PermissionsExt;
 #[cfg(all(unix, not(target_os = "android")))]
 use std::path::Path;
 use std::path::PathBuf;
@@ -121,6 +118,12 @@ pub mod danger {
 
     #[derive(Debug)]
     pub struct NoCertificateVerification;
+
+    impl Default for NoCertificateVerification {
+        fn default() -> Self {
+            Self::new()
+        }
+    }
 
     impl NoCertificateVerification {
         pub fn new() -> Self {
@@ -469,7 +472,7 @@ impl EditorState {
             if len == 0 {
                 count += 1;
             } else {
-                count += (len + width - 1) / width; // Ceiling division
+                count += len.div_ceil(width); // Ceiling division
             }
         }
         count
@@ -493,7 +496,7 @@ impl EditorState {
             if len == 0 {
                 visual_line += 1;
             } else {
-                visual_line += (len + width - 1) / width;
+                visual_line += len.div_ceil(width);
             }
         }
         visual_line
@@ -1239,9 +1242,8 @@ fn parse_addworld_command(args: &[&str]) -> Command {
 
     // Parse options
     for arg in args {
-        if arg.starts_with('-') {
+        if let Some(flags) = arg.strip_prefix('-') {
             // Parse option flags
-            let flags = &arg[1..];
             for c in flags.chars() {
                 match c {
                     'x' => use_ssl = true,
@@ -2993,7 +2995,7 @@ impl App {
                     }).collect();
                     let prepended_count = new_lines.len();
                     let mut combined = new_lines;
-                    combined.extend(world.output_lines.drain(..));
+                    combined.append(&mut world.output_lines);
                     world.output_lines = combined;
                     // Adjust scroll_offset to keep viewing the same content
                     world.scroll_offset += prepended_count;
@@ -3890,7 +3892,7 @@ impl App {
             let clean_output: Vec<String> = world.output_lines.iter()
                 .map(|s| s.text.replace('\r', ""))
                 .collect();
-            let clean_pending: Vec<String> = world.pending_lines.iter()
+            let _clean_pending: Vec<String> = world.pending_lines.iter()
                 .map(|s| s.text.replace('\r', ""))
                 .collect();
             // Create timestamped versions (add red % prefix for client-generated messages)
@@ -8564,7 +8566,7 @@ pub async fn run_app_headless(
             // Pending count update timer (every 2 seconds) - broadcast to world viewers if changed
             _ = pending_update_interval.tick() => {
                 let now = std::time::Instant::now();
-                for (idx, world) in app.worlds.iter_mut().enumerate() {
+                for world in app.worlds.iter_mut() {
                     // Only send updates if world has pending lines and count has changed
                     let current_count = world.pending_lines.len();
                     if current_count > 0 && current_count != world.last_pending_count_broadcast {
@@ -10182,7 +10184,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                 }
 
                                 // Use shared command parsing
-                                let parsed = parse_command(&command);
+                                let parsed = parse_command(command);
 
                                 match parsed {
                                     // Commands handled locally on server
@@ -11759,7 +11761,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
             // Pending count update timer (every 2 seconds) - broadcast to world viewers if changed
             _ = pending_update_interval.tick() => {
                 let now = std::time::Instant::now();
-                for (idx, world) in app.worlds.iter_mut().enumerate() {
+                for world in app.worlds.iter_mut() {
                     // Only send updates if world has pending lines and count has changed
                     let current_count = world.pending_lines.len();
                     if current_count > 0 && current_count != world.last_pending_count_broadcast {
@@ -12498,7 +12500,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                             }
 
                             // Use shared command parsing
-                            let parsed = parse_command(&command);
+                            let parsed = parse_command(command);
 
                             match parsed {
                                 // Commands handled locally on server
@@ -14474,7 +14476,7 @@ fn handle_key_event(key: KeyEvent, app: &mut App) -> KeyAction {
                 .map(|w| w.name.clone())
                 .filter(|name| name.to_lowercase().starts_with(&partial_lower))
                 .collect();
-            world_matches.sort_by(|a, b| a.to_lowercase().cmp(&b.to_lowercase()));
+            world_matches.sort_by_key(|a| a.to_lowercase());
 
             if !world_matches.is_empty() {
                 // Find current match index
@@ -15526,8 +15528,7 @@ async fn lookup_urban_definition(word: &str) -> Result<String, String> {
 
     // Clean up: remove brackets (Urban Dictionary uses [word] for links), ensure single line
     let result = definition
-        .replace('[', "")
-        .replace(']', "")
+        .replace(['[', ']'], "")
         .replace('\n', " ")
         .replace('\r', "")
         .split_whitespace()
@@ -17670,7 +17671,7 @@ fn render_editor_panel(f: &mut Frame, app: &App, area: Rect) {
 
             // If cursor is at end of line and line length is exact multiple of width,
             // we need an extra visual line for the cursor
-            if is_cursor_line && show_cursor && cursor_col == chars.len() && chars.len() % content_width == 0 && chars.len() > 0 {
+            if is_cursor_line && show_cursor && cursor_col == chars.len() && chars.len() % content_width == 0 && !chars.is_empty() {
                 visual_lines.push((String::new(), Some(0)));
             }
         }

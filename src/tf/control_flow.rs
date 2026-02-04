@@ -241,8 +241,7 @@ fn contains_control_flow_keyword(text: &str) -> bool {
     let keywords = ["#else", "#elseif", "#endif"];
     for keyword in &keywords {
         // Check at start
-        if text.starts_with(keyword) {
-            let after = &text[keyword.len()..];
+        if let Some(after) = text.strip_prefix(keyword) {
             if after.is_empty() || after.starts_with(|c: char| c.is_whitespace() || c == ';' || c == '%') {
                 return true;
             }
@@ -655,7 +654,7 @@ pub fn execute_inline_if_block(engine: &mut TfEngine, block: &str) -> Vec<TfComm
                 state.bodies.push(vec![]);
                 state.current_branch += 1;
                 // Check for content after #else
-                let rest = if lower == "#else" { "" } else { &trimmed[5..].trim_start() };
+                let rest = if lower == "#else" { "" } else { trimmed[5..].trim_start() };
                 if !rest.is_empty() {
                     state.bodies[state.current_branch].push(rest.to_string());
                 }
@@ -673,7 +672,7 @@ pub fn execute_inline_if_block(engine: &mut TfEngine, block: &str) -> Vec<TfComm
 /// Execute a complete inline while block (from macro execution).
 /// The input is a multi-line string containing the complete #while...#done block.
 pub fn execute_inline_while_block(engine: &mut TfEngine, block: &str) -> Vec<TfCommandResult> {
-    let mut results: Vec<TfCommandResult> = vec![];
+    let _results: Vec<TfCommandResult> = vec![];
     let lines: Vec<&str> = block.lines().collect();
 
     let mut condition = String::new();
@@ -805,7 +804,7 @@ fn execute_while_loop(engine: &mut TfEngine, condition: &str, body: &[String]) -
 
 /// Execute a complete inline for block (from macro execution).
 pub fn execute_inline_for_block(engine: &mut TfEngine, block: &str) -> Vec<TfCommandResult> {
-    let mut results: Vec<TfCommandResult> = vec![];
+    let _results: Vec<TfCommandResult> = vec![];
     let lines: Vec<&str> = block.lines().collect();
 
     let mut var_name = String::new();
@@ -1085,7 +1084,7 @@ pub fn execute_if_encoded(engine: &mut TfEngine, encoded: &str) -> Vec<TfCommand
 
     // Use \x1F (unit separator) as delimiter
     const SEP: char = '\x1F';
-    let sep_str = SEP.to_string();
+    let _sep_str = SEP.to_string();
 
     // Parse the encoded if structure
     let content = encoded.strip_prefix("__tf_if_eval__").unwrap_or(encoded);
@@ -1164,7 +1163,7 @@ pub fn execute_if_encoded(engine: &mut TfEngine, encoded: &str) -> Vec<TfCommand
                                 line.to_string()
                             } else {
                                 // Substitute variables first, then expressions
-                                let line = engine.substitute_vars(&line);
+                                let line = engine.substitute_vars(line);
                                 super::variables::substitute_commands(engine, &line)
                             };
 

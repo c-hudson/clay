@@ -9,7 +9,7 @@ use std::fs;
 use std::path::Path;
 use std::io::{BufRead, BufReader};
 use std::time::{Duration, Instant};
-use super::{TfEngine, TfProcess, TfCommandResult, QuoteDisposition, RecallOptions, RecallSource, RecallRange, RecallMatchStyle};
+use super::{TfEngine, TfProcess, TfCommandResult, RecallOptions, RecallSource, RecallRange, RecallMatchStyle};
 
 /// #beep - Sound the terminal bell
 pub fn cmd_beep() -> TfCommandResult {
@@ -206,8 +206,7 @@ pub fn cmd_quote(engine: &mut super::TfEngine, args: &str) -> TfCommandResult {
             let opt = &input[..space_pos];
             input = input[space_pos..].trim_start();
 
-            if opt.starts_with("-d") {
-                let disp_str = &opt[2..];
+            if let Some(disp_str) = opt.strip_prefix("-d") {
                 disposition = match disp_str {
                     "send" => QuoteDisposition::Send,
                     "echo" => QuoteDisposition::Echo,
@@ -254,7 +253,7 @@ pub fn cmd_quote(engine: &mut super::TfEngine, args: &str) -> TfCommandResult {
     // Format: [prefix] source [suffix]
     // source is: '"file"suffix or 'file suffix or `"cmd"suffix or !cmd suffix
 
-    let (prefix, source_pos) = if let Some(pos) = input.find(|c: char| c == '\'' || c == '`' || c == '!' || c == '#') {
+    let (prefix, source_pos) = if let Some(pos) = input.find(['\'', '`', '!', '#']) {
         // Check if the # is actually a TF command source or just part of text
         let char_at_pos = input.chars().nth(pos).unwrap();
         if char_at_pos == '#' {
@@ -1319,7 +1318,7 @@ pub fn cmd_repeat(engine: &mut TfEngine, args: &str) -> TfCommandResult {
             let time_end = rest.find(char::is_whitespace).unwrap_or(rest.len());
             let time_str = &rest[..time_end];
             // Must start with a digit to be a time value (not another flag)
-            if time_str.chars().next().map_or(false, |c| c.is_ascii_digit()) {
+            if time_str.chars().next().is_some_and(|c| c.is_ascii_digit()) {
                 if let Some(dur) = parse_tf_time(time_str) {
                     interval = Some(dur);
                     remaining = &rest[time_end..];
@@ -1346,7 +1345,7 @@ pub fn cmd_repeat(engine: &mut TfEngine, args: &str) -> TfCommandResult {
     } else {
         return TfCommandResult::Error(format!("#repeat: invalid count '{}'", count_str));
     };
-    remaining = &remaining[count_end..].trim_start();
+    remaining = remaining[count_end..].trim_start();
 
     // Parse command (rest of args)
     let command = remaining.to_string();
