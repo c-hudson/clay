@@ -8040,12 +8040,12 @@ pub async fn run_app_headless(
             for single_cmd in cmd_str.split(';') {
                 let single_cmd = single_cmd.trim();
                 if single_cmd.is_empty() { continue; }
-                if single_cmd.starts_with('#') {
-                    // TF command - execute via TF engine
+                if single_cmd.starts_with('/') || single_cmd.starts_with('#') {
+                    // Unified command system - route through TF parser
                     app.sync_tf_world_info();
                     let _ = app.tf_engine.execute(single_cmd);
                 } else {
-                    // Other commands can't be run at startup in headless mode
+                    // Plain text can't be run at startup in headless mode
                     debug_log(true, &format!("[Startup] Skipped command (headless): {}", single_cmd));
                 }
             }
@@ -8071,39 +8071,41 @@ pub async fn run_app_headless(
                             let saved_current_world = app.current_world_index;
                             app.current_world_index = world_idx;
                             for cmd in commands {
-                                if cmd.starts_with('/') {
-                                    let parsed = parse_command(&cmd);
-                                    match parsed {
-                                        Command::Send { text, target_world, .. } => {
-                                            let target_idx = if let Some(ref w) = target_world {
-                                                app.find_world_index(w)
-                                            } else { Some(world_idx) };
-                                            if let Some(idx) = target_idx {
-                                                if let Some(tx) = &app.worlds[idx].command_tx {
-                                                    let _ = tx.send(WriteCommand::Text(text)).await;
-                                                }
-                                            }
-                                        }
-                                        Command::Notify { message } => {
-                                            let title = if world_idx < app.worlds.len() {
-                                                app.worlds[world_idx].name.clone()
-                                            } else {
-                                                "Clay".to_string()
-                                            };
-                                            app.ws_broadcast(WsMessage::Notification {
-                                                title,
-                                                message: message.clone(),
-                                            });
-                                        }
-                                        _ => {}
-                                    }
-                                } else if cmd.starts_with('#') {
-                                    // TF command - sync world info first
+                                if cmd.starts_with('/') || cmd.starts_with('#') {
+                                    // Unified command system - route through TF parser
                                     app.sync_tf_world_info();
                                     match app.tf_engine.execute(&cmd) {
                                         tf::TfCommandResult::SendToMud(text) => {
                                             if let Some(tx) = &app.worlds[world_idx].command_tx {
                                                 let _ = tx.try_send(WriteCommand::Text(text));
+                                            }
+                                        }
+                                        tf::TfCommandResult::ClayCommand(clay_cmd) => {
+                                            // Handle Clay-specific commands in daemon mode
+                                            let parsed = parse_command(&clay_cmd);
+                                            match parsed {
+                                                Command::Send { text, target_world, .. } => {
+                                                    let target_idx = if let Some(ref w) = target_world {
+                                                        app.find_world_index(w)
+                                                    } else { Some(world_idx) };
+                                                    if let Some(idx) = target_idx {
+                                                        if let Some(tx) = &app.worlds[idx].command_tx {
+                                                            let _ = tx.send(WriteCommand::Text(text)).await;
+                                                        }
+                                                    }
+                                                }
+                                                Command::Notify { message } => {
+                                                    let title = if world_idx < app.worlds.len() {
+                                                        app.worlds[world_idx].name.clone()
+                                                    } else {
+                                                        "Clay".to_string()
+                                                    };
+                                                    app.ws_broadcast(WsMessage::Notification {
+                                                        title,
+                                                        message: message.clone(),
+                                                    });
+                                                }
+                                                _ => {}
                                             }
                                         }
                                         tf::TfCommandResult::RepeatProcess(process) => {
@@ -9346,11 +9348,8 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
             for single_cmd in cmd_str.split(';') {
                 let single_cmd = single_cmd.trim();
                 if single_cmd.is_empty() { continue; }
-                if single_cmd.starts_with('/') {
-                    // Clay command - execute it
-                    handle_command(single_cmd, &mut app, event_tx.clone()).await;
-                } else if single_cmd.starts_with('#') {
-                    // TF command - execute via TF engine
+                if single_cmd.starts_with('/') || single_cmd.starts_with('#') {
+                    // Unified command system - route through TF parser
                     app.sync_tf_world_info();
                     match app.tf_engine.execute(single_cmd) {
                         tf::TfCommandResult::Success(Some(msg)) => {
@@ -9358,6 +9357,9 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                         }
                         tf::TfCommandResult::Error(err) => {
                             app.add_output(&format!("Error: {}", err));
+                        }
+                        tf::TfCommandResult::ClayCommand(clay_cmd) => {
+                            handle_command(&clay_cmd, &mut app, event_tx.clone()).await;
                         }
                         tf::TfCommandResult::RepeatProcess(process) => {
                             app.tf_engine.processes.push(process);
@@ -9496,12 +9498,9 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                 }
                             }
 
-                            if cmd.starts_with('/') {
-                                if handle_command(&cmd, &mut app, event_tx.clone()).await {
-                                    return Ok(());
-                                }
-                            } else if cmd.starts_with('#') {
-                                // TinyFugue command - sync world info first
+                            if cmd.starts_with('/') || cmd.starts_with('#') {
+                                // Unified command system - route through TF parser first
+                                // TF parser will return ClayCommand for Clay-specific commands
                                 app.sync_tf_world_info();
                                 match app.tf_engine.execute(&cmd) {
                                     tf::TfCommandResult::Success(Some(msg)) => {
@@ -9648,11 +9647,13 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                         }
                                     }
                                     tf::TfCommandResult::NotTfCommand => {
-                                        // Shouldn't happen since we checked for #
-                                        app.add_output("Internal error: not a TF command");
+                                        // Shouldn't happen since we checked for / or #
+                                        app.add_output("Internal error: not a command");
                                     }
                                     tf::TfCommandResult::UnknownCommand(cmd_name) => {
-                                        app.add_output(&format!("Unknown command: #{}", cmd_name));
+                                        // Show the command with its original prefix
+                                        let prefix = if cmd_name.starts_with("//") { "" } else if cmd.starts_with('/') { "/" } else { "#" };
+                                        app.add_output(&format!("Unknown command: {}{}", prefix, cmd_name));
                                     }
                                     tf::TfCommandResult::ExitLoad => {
                                         // ExitLoad from command line means nothing (not in a file load)
@@ -9721,11 +9722,8 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                             let saved_current_world = app.current_world_index;
                             app.current_world_index = world_idx;
                             for cmd in commands {
-                                if cmd.starts_with('/') {
-                                    // Internal Clay command - execute it
-                                    handle_command(&cmd, &mut app, event_tx.clone()).await;
-                                } else if cmd.starts_with('#') {
-                                    // TF command - sync world info first
+                                if cmd.starts_with('/') || cmd.starts_with('#') {
+                                    // Unified command system - route through TF parser
                                     app.sync_tf_world_info();
                                     match app.tf_engine.execute(&cmd) {
                                         tf::TfCommandResult::SendToMud(text) => {
@@ -10035,10 +10033,8 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                             let saved_current_world = app.current_world_index;
                             app.current_world_index = world_idx;
                             for cmd in commands_to_execute {
-                                if cmd.starts_with('/') {
-                                    handle_command(&cmd, &mut app, event_tx.clone()).await;
-                                } else if cmd.starts_with('#') {
-                                    // TF command - sync world info first
+                                if cmd.starts_with('/') || cmd.starts_with('#') {
+                                    // Unified command system - route through TF parser
                                     app.sync_tf_world_info();
                                     match app.tf_engine.execute(&cmd) {
                                         tf::TfCommandResult::SendToMud(text) => {
@@ -10212,11 +10208,8 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                                 if cmd.eq_ignore_ascii_case("/gag") || cmd.to_lowercase().starts_with("/gag ") {
                                                     continue;
                                                 }
-                                                // If command starts with /, send back to client for local execution
-                                                if cmd.starts_with('/') {
-                                                    app.ws_send_to_client(client_id, WsMessage::ExecuteLocalCommand { command: cmd });
-                                                } else if cmd.starts_with('#') {
-                                                    // TinyFugue command - execute on server, sync world info first
+                                                // Unified command system - route through TF parser
+                                                if cmd.starts_with('/') || cmd.starts_with('#') {
                                                     app.sync_tf_world_info();
                                                     match app.tf_engine.execute(&cmd) {
                                                         tf::TfCommandResult::Success(Some(msg)) => {
@@ -12109,10 +12102,8 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                         let saved_current_world = app.current_world_index;
                         app.current_world_index = world_idx;
                         for cmd in commands_to_execute {
-                            if cmd.starts_with('/') {
-                                handle_command(&cmd, &mut app, event_tx.clone()).await;
-                            } else if cmd.starts_with('#') {
-                                // TF command - sync world info first
+                            if cmd.starts_with('/') || cmd.starts_with('#') {
+                                // Unified command system - route through TF parser
                                 app.sync_tf_world_info();
                                 match app.tf_engine.execute(&cmd) {
                                     tf::TfCommandResult::SendToMud(text) => {
@@ -12366,10 +12357,8 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                         let saved_current_world = app.current_world_index;
                         app.current_world_index = world_idx;
                         for cmd in commands_to_execute {
-                            if cmd.starts_with('/') {
-                                handle_command(&cmd, &mut app, event_tx.clone()).await;
-                            } else if cmd.starts_with('#') {
-                                // TF command - sync world info first
+                            if cmd.starts_with('/') || cmd.starts_with('#') {
+                                // Unified command system - route through TF parser
                                 app.sync_tf_world_info();
                                 match app.tf_engine.execute(&cmd) {
                                     tf::TfCommandResult::SendToMud(text) => {
@@ -12535,11 +12524,8 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                             if cmd.eq_ignore_ascii_case("/gag") || cmd.to_lowercase().starts_with("/gag ") {
                                                 continue;
                                             }
-                                            // If command starts with /, send back to client for local execution
-                                            if cmd.starts_with('/') {
-                                                app.ws_send_to_client(client_id, WsMessage::ExecuteLocalCommand { command: cmd });
-                                            } else if cmd.starts_with('#') {
-                                                // TinyFugue command - execute on server, sync world info first
+                                            // Unified command system - route through TF parser
+                                            if cmd.starts_with('/') || cmd.starts_with('#') {
                                                 app.sync_tf_world_info();
                                                 match app.tf_engine.execute(&cmd) {
                                                     tf::TfCommandResult::Success(Some(msg)) => {
@@ -14518,7 +14504,7 @@ fn handle_key_event(key: KeyEvent, app: &mut App) -> KeyAction {
         // Only complete if we're still in the command part (no space yet or cursor before space)
         if !input.contains(' ') || app.input.cursor_position <= input.find(' ').unwrap_or(input.len()) {
             let matches = if input.starts_with('#') {
-                // TF commands
+                // TF commands (backward compatibility with # prefix)
                 let tf_commands = vec![
                     "#set", "#unset", "#let", "#echo", "#send", "#beep", "#quote",
                     "#expr", "#test", "#eval", "#if", "#elseif", "#else", "#endif",
@@ -14536,10 +14522,22 @@ fn handle_key_event(key: KeyEvent, app: &mut App) -> KeyAction {
                 m.dedup();
                 m
             } else {
-                // Clay / commands: internal commands + manual actions
+                // Unified / commands: Clay commands + TF commands + manual actions
                 let internal_commands = vec![
-                    "/help", "/disconnect", "/dc", "/send", "/worlds", "/world", "/connections",
-                    "/setup", "/web", "/actions", "/keepalive", "/reload", "/quit", "/gag", "/testmusic", "/dump", "/edit", "/tag",
+                    // Clay-specific commands
+                    "/help", "/disconnect", "/dc", "/worlds", "/world", "/connections",
+                    "/setup", "/web", "/actions", "/keepalive", "/reload", "/quit", "/gag",
+                    "/testmusic", "/dump", "/edit", "/tag", "/menu", "/notify",
+                    // TF commands (now available with / prefix)
+                    "/set", "/unset", "/let", "/echo", "/send", "/beep", "/quote",
+                    "/expr", "/test", "/eval", "/if", "/elseif", "/else", "/endif",
+                    "/while", "/done", "/for", "/break", "/def", "/undef", "/undefn",
+                    "/undeft", "/list", "/purge", "/bind", "/unbind", "/load", "/save",
+                    "/lcd", "/time", "/version", "/ps", "/kill", "/sh", "/recall",
+                    "/setenv", "/listvar", "/repeat", "/fg", "/trigger", "/input",
+                    "/grab", "/ungag", "/exit", "/connect", "/addworld",
+                    // TF-specific versions (for conflicting commands)
+                    "/tfhelp", "/tfgag",
                 ];
 
                 // Get manual actions (empty pattern)
@@ -16609,11 +16607,8 @@ async fn handle_command(cmd: &str, app: &mut App, event_tx: mpsc::Sender<AppEven
                         continue;
                     }
 
-                    // If command starts with /, process it as a client command
-                    if cmd_str.starts_with('/') {
-                        Box::pin(handle_command(&cmd_str, app, event_tx.clone())).await;
-                    } else if cmd_str.starts_with('#') {
-                        // TinyFugue command - sync world info first
+                    // Unified command system - route through TF parser
+                    if cmd_str.starts_with('/') || cmd_str.starts_with('#') {
                         app.sync_tf_world_info();
                         match app.tf_engine.execute(&cmd_str) {
                             tf::TfCommandResult::Success(Some(msg)) => {

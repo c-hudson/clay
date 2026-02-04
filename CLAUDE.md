@@ -473,32 +473,37 @@ This logic applies to all interfaces (console, web, GUI). Remote clients query t
 
 ### TF Commands (TinyFugue Compatibility)
 
-Clay includes a TinyFugue compatibility layer using `#` prefix instead of `/`. TF commands work alongside existing Clay commands.
+Clay includes a TinyFugue compatibility layer. TF commands work with both `/` and `#` prefixes (unified command system).
+
+**Unified Command System:**
+- All TF commands now work with `/` prefix: `/set`, `/echo`, `/def`, etc.
+- The `#` prefix still works for backward compatibility: `#set`, `#echo`, `#def`, etc.
+- Conflicting commands use `/tf` prefix for TF version: `/tfhelp` (TF text help) vs `/help` (Clay popup), `/tfgag` (TF gag pattern) vs `/gag` (Clay action gag)
 
 **Variables:**
-- `#set varname value` - Set global variable
-- `#unset varname` - Remove variable
-- `#let varname value` - Set local variable (within macro scope)
-- `#setenv varname` - Export variable to environment
-- `#listvar [pattern]` - List variables matching pattern
+- `/set varname value` (or `#set`) - Set global variable
+- `/unset varname` - Remove variable
+- `/let varname value` - Set local variable (within macro scope)
+- `/setenv varname` - Export variable to environment
+- `/listvar [pattern]` - List variables matching pattern
 
 **Output:**
-- `#echo [-w world] message` - Display local message (supports `%{var}` substitution and ANSI attributes)
+- `/echo [-w world] message` - Display local message (supports `%{var}` substitution and ANSI attributes)
   - ANSI attributes: `@{B}` bold, `@{U}` underline, `@{I}` inverse, `@{D}` dim, `@{F}` flash, `@{n}` normal/reset
   - Colors: `@{Crgb}` foreground (r,g,b = 0-5), `@{BCrgb}` background, `@{Cname}` named colors (red, green, blue, cyan, magenta, yellow, white, black)
-- `#send [-w world] text` - Send text to MUD
-- `#beep` - Terminal bell
-- `#quote [options] [prefix] source [suffix]` - Generate and send text from file, command, or literal
+- `/send [-w world] text` - Send text to MUD
+- `/beep` - Terminal bell
+- `/quote [options] [prefix] source [suffix]` - Generate and send text from file, command, or literal
   - Sources: `'"file"` (read from file), `` `"command" `` (read internal command output), `!"command"` (read shell output), or literal text
   - Options: `-dsend` (default), `-decho` (display locally), `-dexec` (execute as TF), `-wworld`
-  - Example: `#quote say '"/tmp/lines.txt"` sends "say <line>" for each line in file
-  - Example: `` #quote think `"/version" `` sends "think Clay v1.0..." to MUD (both `/version` and `#version` work)
-  - Example: `#quote !"ls -la"` sends output of shell ls command to MUD
+  - Example: `/quote say '"/tmp/lines.txt"` sends "say <line>" for each line in file
+  - Example: `` /quote think `"/version" `` sends "think Clay v1.0..." to MUD
+  - Example: `/quote !"ls -la"` sends output of shell ls command to MUD
 
 **Expressions:**
-- `#expr expression` - Evaluate and display result
-- `#test expression` - Evaluate as boolean (returns 0 or 1)
-- `#eval expression` - Evaluate and execute result as command
+- `/expr expression` - Evaluate and display result
+- `/test expression` - Evaluate as boolean (returns 0 or 1)
+- `/eval expression` - Evaluate and execute result as command
 - Operators: `+ - * / %` (arithmetic), `== != < > <= >=` (comparison), `& | !` (logical), `=~ !~` (regex), `=/ !/` (glob), `?:` (ternary)
 - String functions: `strlen()`, `substr()`, `strcat()`, `tolower()`, `toupper()`, `strstr()`, `replace()`, `sprintf()`, `strcmp()`, `strncmp()`, `strchr()`, `strrchr()`, `strrep()`, `pad()`, `ascii()`, `char()`
 - Math functions: `rand()`, `time()`, `abs()`, `min()`, `max()`, `mod()`, `trunc()`, `sin()`, `cos()`, `tan()`, `asin()`, `acos()`, `atan()`, `exp()`, `pow()`, `sqrt()`, `log()`, `log10()`
@@ -511,14 +516,14 @@ Clay includes a TinyFugue compatibility layer using `#` prefix instead of `/`. T
 - File I/O: `tfopen(path, mode)`, `tfclose(handle)`, `tfread(handle, var)`, `tfwrite(handle, text)`, `tfflush(handle)`, `tfeof(handle)`
 
 **Control Flow:**
-- `#if (expr) command` - Single-line conditional
-- `#if (expr) ... #elseif (expr) ... #else ... #endif` - Multi-line conditional
-- `#while (expr) ... #done` - While loop
-- `#for var start end [step] ... #done` - For loop
-- `#break` - Exit loop early
+- `/if (expr) command` - Single-line conditional
+- `/if (expr) ... /elseif (expr) ... /else ... /endif` - Multi-line conditional
+- `/while (expr) ... /done` - While loop
+- `/for var start end [step] ... /done` - For loop
+- `/break` - Exit loop early
 
 **Macros (Triggers):**
-- `#def [options] name = body` - Define macro
+- `/def [options] name = body` - Define macro
   - `-t"pattern"` - Trigger pattern (fires when MUD output matches)
   - `-mtype` - Match type: `simple`, `glob` (default), `regexp`
   - `-p priority` - Execution priority (higher = first)
@@ -534,45 +539,45 @@ Clay includes a TinyFugue compatibility layer using `#` prefix instead of `/`. T
   - `-w world` - Restrict to specific world
   - `-h event` - Hook event (CONNECT, DISCONNECT, etc.)
   - `-b"key"` - Key binding
-- `#undef name` - Remove macro
-- `#undefn pattern` - Remove macros matching name pattern
-- `#undeft pattern` - Remove macros matching trigger pattern
-- `#list [pattern]` - List macros
-- `#purge [pattern]` - Remove all macros (or matching pattern)
+- `/undef name` - Remove macro
+- `/undefn pattern` - Remove macros matching name pattern
+- `/undeft pattern` - Remove macros matching trigger pattern
+- `/list [pattern]` - List macros
+- `/purge [pattern]` - Remove all macros (or matching pattern)
 
 **Hooks:**
-- `#def -hCONNECT name = command` - Fire on connect
-- `#def -hDISCONNECT name = command` - Fire on disconnect
+- `/def -hCONNECT name = command` - Fire on connect
+- `/def -hDISCONNECT name = command` - Fire on disconnect
 - Events: `CONNECT`, `DISCONNECT`, `LOGIN`, `PROMPT`, `SEND`, `ACTIVITY`, `WORLD`, `RESIZE`, `LOAD`, `REDEF`, `BACKGROUND`
 
 **Key Bindings:**
-- `#bind key = command` - Bind key to command
-- `#unbind key` - Remove binding
+- `/bind key = command` - Bind key to command
+- `/unbind key` - Remove binding
 - Key names: `F1`-`F12`, `^A`-`^Z` (Ctrl), `@a`-`@z` (Alt), `PgUp`, `PgDn`, `Home`, `End`, `Insert`, `Delete`
 
 **File Operations:**
-- `#load filename` - Load TF script file
-- `#save filename` - Save macros to file
-- `#lcd path` - Change local directory
+- `/load filename` - Load TF script file
+- `/save filename` - Save macros to file
+- `/lcd path` - Change local directory
 
 **World Commands:**
-- `#fg [world]` - Switch to specified world (or show current)
-- `#addworld [-Lq] name host port` - Create a new world
+- `/fg [world]` - Switch to specified world (or show current)
+- `/addworld [-Lq] name host port` - Create a new world
 
 **Input Commands:**
-- `#input text` - Insert text into input buffer at cursor
-- `#grab [world]` - Grab last line from world's output into input buffer
-- `#trigger [pattern]` - Manually trigger macros matching pattern
+- `/input text` - Insert text into input buffer at cursor
+- `/grab [world]` - Grab last line from world's output into input buffer
+- `/trigger [pattern]` - Manually trigger macros matching pattern
 
 **Miscellaneous:**
-- `#time` - Display current time
-- `#version` - Show TF compatibility version
-- `#help [topic]` - Show help
-- `#ps` - List background processes
-- `#kill id` - Kill background process
-- `#repeat [-p priority] time count command` - Schedule repeated command (-p sets priority, higher = runs first)
-- `#sh command` - Execute shell command
-- `#recall [pattern]` - Search output history
+- `/time` - Display current time
+- `/version` - Show TF compatibility version
+- `/tfhelp [topic]` - Show TF text help (vs `/help` for Clay popup)
+- `/ps` - List background processes
+- `/kill id` - Kill background process
+- `/repeat [-p priority] time count command` - Schedule repeated command (-p sets priority, higher = runs first)
+- `/sh command` - Execute shell command
+- `/recall [pattern]` - Search output history
 
 **Variable Substitution:**
 - `%{varname}` - Variable value
@@ -598,12 +603,12 @@ Clay includes a TinyFugue compatibility layer using `#` prefix instead of `/`. T
 
 **Example - Auto-heal trigger:**
 ```
-#def -t"Your health: *" -mglob heal_check = #if ({1} < 50) cast heal
+/def -t"Your health: *" -mglob heal_check = /if ({1} < 50) cast heal
 ```
 
 **Example - Connect hook:**
 ```
-#def -hCONNECT auto_look = look
+/def -hCONNECT auto_look = look
 ```
 
 ### ANSI Music

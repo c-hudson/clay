@@ -3377,14 +3377,14 @@ impl eframe::App for RemoteGuiApp {
                     };
 
                     let matches = if input.starts_with('#') {
-                        // TF commands
+                        // TF commands (backward compatibility with # prefix)
                         let tf_commands = vec![
                             "#set", "#unset", "#let", "#echo", "#send", "#beep", "#quote",
                             "#expr", "#test", "#eval", "#if", "#elseif", "#else", "#endif",
                             "#while", "#done", "#for", "#break", "#def", "#undef", "#undefn",
                             "#undeft", "#list", "#purge", "#bind", "#unbind", "#load", "#save",
                             "#lcd", "#time", "#version", "#help", "#ps", "#kill", "#sh", "#recall",
-                            "#setenv", "#listvar",
+                            "#setenv", "#listvar", "#repeat",
                         ];
                         let partial_lower = partial.to_lowercase();
                         let mut m: Vec<String> = tf_commands.iter()
@@ -3395,10 +3395,22 @@ impl eframe::App for RemoteGuiApp {
                         m.dedup();
                         m
                     } else {
-                        // Clay / commands: internal commands + manual actions
+                        // Unified / commands: Clay commands + TF commands + manual actions
                         let internal_commands = vec![
-                            "/help", "/version", "/disconnect", "/dc", "/send", "/worlds", "/connections",
-                            "/setup", "/web", "/actions", "/keepalive", "/reload", "/quit", "/gag", "/testmusic", "/debug", "/dump",
+                            // Clay-specific commands
+                            "/help", "/disconnect", "/dc", "/worlds", "/connections",
+                            "/setup", "/web", "/actions", "/keepalive", "/reload", "/quit", "/gag",
+                            "/testmusic", "/debug", "/dump", "/menu", "/notify", "/edit", "/tag",
+                            // TF commands (now available with / prefix)
+                            "/set", "/unset", "/let", "/echo", "/send", "/beep", "/quote",
+                            "/expr", "/test", "/eval", "/if", "/elseif", "/else", "/endif",
+                            "/while", "/done", "/for", "/break", "/def", "/undef", "/undefn",
+                            "/undeft", "/list", "/purge", "/bind", "/unbind", "/load", "/save",
+                            "/lcd", "/time", "/version", "/ps", "/kill", "/sh", "/recall",
+                            "/setenv", "/listvar", "/repeat", "/fg", "/trigger", "/input",
+                            "/grab", "/ungag", "/exit", "/connect", "/addworld",
+                            // TF-specific versions (for conflicting commands)
+                            "/tfhelp", "/tfgag",
                         ];
 
                         // Get manual actions (empty pattern)

@@ -251,33 +251,32 @@ pub async fn run_daemon_server() -> io::Result<()> {
                             let saved_current_world = app.current_world_index;
                             app.current_world_index = world_idx;
                             for cmd in commands {
-                                if cmd.starts_with('/') {
-                                    // Internal Clay command - execute it
-                                    let parsed = parse_command(&cmd);
-                                    match parsed {
-                                        Command::Send { text, target_world, .. } => {
-                                            // Handle /send command
-                                            let target_idx = if let Some(ref w) = target_world {
-                                                app.find_world_index(w)
-                                            } else {
-                                                Some(world_idx)
-                                            };
-                                            if let Some(idx) = target_idx {
-                                                if let Some(tx) = &app.worlds[idx].command_tx {
-                                                    let _ = tx.try_send(WriteCommand::Text(text));
-                                                }
-                                            }
-                                        }
-                                        _ => {
-                                            // Other commands - limited support in daemon mode
-                                        }
-                                    }
-                                } else if cmd.starts_with('#') {
-                                    // TF command
+                                if cmd.starts_with('/') || cmd.starts_with('#') {
+                                    // Unified command system - route through TF parser
+                                    app.sync_tf_world_info();
                                     match app.tf_engine.execute(&cmd) {
                                         tf::TfCommandResult::SendToMud(text) => {
                                             if let Some(tx) = &app.worlds[world_idx].command_tx {
                                                 let _ = tx.try_send(WriteCommand::Text(text));
+                                            }
+                                        }
+                                        tf::TfCommandResult::ClayCommand(clay_cmd) => {
+                                            // Handle Clay-specific commands in daemon mode
+                                            let parsed = parse_command(&clay_cmd);
+                                            match parsed {
+                                                Command::Send { text, target_world, .. } => {
+                                                    let target_idx = if let Some(ref w) = target_world {
+                                                        app.find_world_index(w)
+                                                    } else {
+                                                        Some(world_idx)
+                                                    };
+                                                    if let Some(idx) = target_idx {
+                                                        if let Some(tx) = &app.worlds[idx].command_tx {
+                                                            let _ = tx.try_send(WriteCommand::Text(text));
+                                                        }
+                                                    }
+                                                }
+                                                _ => {}
                                             }
                                         }
                                         tf::TfCommandResult::RepeatProcess(process) => {
@@ -370,11 +369,8 @@ pub async fn handle_daemon_ws_message(
                                 if cmd.eq_ignore_ascii_case("/gag") || cmd.to_lowercase().starts_with("/gag ") {
                                     continue;
                                 }
-                                if cmd.starts_with('/') {
-                                    // Sub-command starting with / - send back to client for local execution
-                                    app.ws_send_to_client(client_id, WsMessage::ExecuteLocalCommand { command: cmd });
-                                } else if cmd.starts_with('#') {
-                                    // TinyFugue command - execute on server
+                                // Unified command system - route through TF parser
+                                if cmd.starts_with('/') || cmd.starts_with('#') {
                                     match app.tf_engine.execute(&cmd) {
                                         tf::TfCommandResult::Success(Some(msg)) => {
                                             app.ws_broadcast(WsMessage::ServerData {

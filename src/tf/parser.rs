@@ -56,9 +56,33 @@ fn parse_macro_args(args: &str) -> Vec<&str> {
     words
 }
 
-/// Check if input is a TF command (starts with #)
+/// Check if input is a TF command (starts with # or is a unified / command)
 pub fn is_tf_command(input: &str) -> bool {
-    input.trim_start().starts_with('#')
+    let trimmed = input.trim_start();
+    trimmed.starts_with('#') || trimmed.starts_with('/')
+}
+
+/// Check if a command name (without prefix) is a TF command
+/// Note: "help" and "gag" are NOT included here because they have Clay equivalents.
+/// Use /tfhelp and /tfgag for the TF versions.
+fn is_tf_command_name(cmd: &str) -> bool {
+    matches!(cmd,
+        "set" | "unset" | "let" | "setenv" | "listvar" |
+        "echo" | "beep" | "quote" | "substitute" |
+        "expr" | "test" | "eval" |
+        "if" | "elseif" | "else" | "endif" | "while" | "for" | "done" | "break" |
+        "def" | "undef" | "undefn" | "undeft" | "list" | "purge" |
+        "bind" | "unbind" | "hook" | "unhook" |
+        "load" | "save" | "require" | "loaded" | "lcd" | "log" |
+        "sh" | "time" | "recall" | "repeat" | "ps" | "kill" |
+        "fg" | "trigger" | "input" | "grab" | "ungag" | "exit" |
+        // These are also TF commands (mapped to Clay equivalents)
+        "quit" | "dc" | "disconnect" | "world" | "listworlds" |
+        "listsockets" | "connections" | "connect" | "addworld" | "version" |
+        // Note: "send" maps to Clay's /send command, but TF's #send has different options
+        // so we route it through TF to handle -w flag properly
+        "send"
+    )
 }
 
 /// Execute a TF command and return the result.
@@ -115,14 +139,43 @@ fn execute_command_impl(engine: &mut TfEngine, input: &str, skip_substitution: b
         };
     }
 
-    // Handle capturable Clay commands (those that return text output)
+    // Handle commands starting with / (unified command system)
     if input.starts_with('/') {
-        let cmd = input.split_whitespace().next().unwrap_or("");
-        match cmd {
-            "/version" => return TfCommandResult::Success(Some(crate::get_version_string())),
-            // Other / commands are not capturable - they have side effects handled by main loop
-            _ => return TfCommandResult::ClayCommand(input.to_string()),
+        // Check for /tf prefix (TF-specific commands that conflict with Clay)
+        // e.g., /tfhelp, /tfgag
+        let lower_input = input.to_lowercase();
+        if lower_input.starts_with("/tfhelp") || lower_input.starts_with("/tfgag") {
+            // Route to TF-specific handlers
+            // Extract command name after /tf prefix
+            let cmd_part = input.split_whitespace().next().unwrap_or("");
+            let cmd_name = cmd_part[3..].to_lowercase(); // Skip "/tf"
+            let args = if input.len() > cmd_part.len() {
+                input[cmd_part.len()..].trim_start()
+            } else {
+                ""
+            };
+            let tf_cmd = format!("#{} {}", cmd_name, args);
+            return execute_tf_specific_command(engine, tf_cmd.trim(), skip_substitution);
         }
+
+        // Parse command name from /command format
+        let cmd_part = input.split_whitespace().next().unwrap_or("");
+        let cmd_name = cmd_part.trim_start_matches('/').to_lowercase();
+        let args = if input.len() > cmd_part.len() {
+            input[cmd_part.len()..].trim_start()
+        } else {
+            ""
+        };
+
+        // Check if it's a TF command that should be handled here
+        if is_tf_command_name(&cmd_name) {
+            // Convert / to # for internal processing
+            let tf_cmd = format!("#{} {}", cmd_name, args);
+            return execute_command_impl(engine, tf_cmd.trim(), skip_substitution);
+        }
+
+        // Not a TF command - route to Clay
+        return TfCommandResult::ClayCommand(input.to_string());
     }
 
     if !input.starts_with('#') {
@@ -359,6 +412,20 @@ fn aggregate_results(results: Vec<TfCommandResult>) -> TfCommandResult {
         TfCommandResult::Success(None)
     } else {
         TfCommandResult::Success(Some(messages.join("\n")))
+    }
+}
+
+/// Execute TF-specific commands that conflict with Clay (/tfhelp, /tfgag)
+/// Input is expected to be in #command format (already converted from /tf prefix)
+fn execute_tf_specific_command(engine: &mut TfEngine, input: &str, _skip_substitution: bool) -> TfCommandResult {
+    let rest = input.trim_start_matches('#');
+    let (cmd, args) = split_command(rest);
+    let cmd_lower = cmd.to_lowercase();
+
+    match cmd_lower.as_str() {
+        "help" => cmd_help(args),  // TF text-based help (vs Clay /help popup)
+        "gag" => builtins::cmd_gag(engine, args),  // TF gag pattern (vs Clay /gag action command)
+        _ => TfCommandResult::UnknownCommand(format!("/tf{}", cmd)),
     }
 }
 
@@ -788,78 +855,79 @@ fn cmd_addworld(args: &str) -> TfCommandResult {
     TfCommandResult::ClayCommand(format!("/addworld {}", args))
 }
 
-/// #help [topic] - Display help
+/// /help [topic] or /tfhelp [topic] - Display TF help
 fn cmd_help(args: &str) -> TfCommandResult {
-    let topic = args.trim().trim_start_matches('#').to_lowercase();
+    let topic = args.trim().trim_start_matches('/').trim_start_matches('#').to_lowercase();
 
     if topic.is_empty() {
-        let help_text = r#"TinyFugue Commands
+        let help_text = r#"TinyFugue Commands (use / or # prefix)
 
 Variables:
-  #set [name [value]]  - Set/list global variables
-  #unset name          - Remove a variable
-  #let name value      - Set a local variable
-  #setenv name         - Export variable to environment
-  #listvar [pattern]   - List variables
+  /set [name [value]]  - Set/list global variables
+  /unset name          - Remove a variable
+  /let name value      - Set a local variable
+  /setenv name         - Export variable to environment
+  /listvar [pattern]   - List variables
 
 Expressions:
-  #expr expression     - Evaluate and display result
-  #test expression     - Evaluate expression, set %?
-  #eval expression     - Evaluate and execute as command
+  /expr expression     - Evaluate and display result
+  /test expression     - Evaluate expression, set %?
+  /eval expression     - Evaluate and execute as command
 
 Control Flow:
-  #if (expr) cmd       - Conditional execution
-  #if/#elseif/#else/#endif - Multi-line conditional
-  #while (expr)/#done  - While loop
-  #for var s e [step]/#done - For loop
-  #break               - Exit loop
+  /if (expr) cmd       - Conditional execution
+  /if /elseif /else /endif - Multi-line conditional
+  /while (expr) /done  - While loop
+  /for var s e [step] /done - For loop
+  /break               - Exit loop
 
 Macros/Triggers:
-  #def [opts] name=body - Define macro (-t -m -p -F -1 -ag -h -b)
-  #undef name          - Remove macro
-  #list [pattern]      - List macros
-  #purge [pattern]     - Remove all macros
+  /def [opts] name=body - Define macro (-t -m -p -F -1 -ag -h -b)
+  /undef name          - Remove macro
+  /list [pattern]      - List macros
+  /purge [pattern]     - Remove all macros
 
 Hooks & Keys:
-  #bind key=command    - Bind key to command
-  #unbind key          - Remove key binding
+  /bind key=command    - Bind key to command
+  /unbind key          - Remove key binding
 
 Output:
-  #echo message        - Display message locally
-  #send [-w world] text - Send text to MUD
-  #beep                - Terminal bell
-  #quote text          - Send without substitution
-  #gag pattern         - Suppress matching lines
-  #ungag pattern       - Remove gag
-  #recall [pattern]    - Search output history
+  /echo message        - Display message locally
+  /send [-w world] text - Send text to MUD
+  /beep                - Terminal bell
+  /quote text          - Send without substitution
+  /tfgag pattern       - Suppress matching lines (TF)
+  /ungag pattern       - Remove gag
+  /recall [pattern]    - Search output history
 
 World Management:
-  #world [name]        - Switch to or list worlds
-  #connect [world]     - Connect to a world
-  #addworld [opts] name [args] - Add/update world
-  #listworlds          - List all worlds
-  #listsockets         - List connected worlds
-  #dc, #disconnect     - Disconnect current world
+  /fg [name]           - Switch to or list worlds
+  /connect [world]     - Connect to a world
+  /addworld [opts] name [args] - Add/update world
+  /dc, /disconnect     - Disconnect current world
 
 File Operations:
-  #load [-q] filename  - Load TF script (-q = quiet)
-  #require [-q] file   - Load file if not already loaded
-  #loaded token        - Mark file as loaded (for #require)
-  #save filename       - Save macros to file
-  #lcd path            - Change local directory
-  #exit                - Abort loading file / quit
+  /load [-q] filename  - Load TF script (-q = quiet)
+  /require [-q] file   - Load file if not already loaded
+  /loaded token        - Mark file as loaded (for /require)
+  /save filename       - Save macros to file
+  /lcd path            - Change local directory
+  /exit                - Abort loading file / quit
 
 Process:
-  #repeat [opts] count cmd - Repeat command on timer
-  #ps                  - List background processes
-  #kill id             - Kill background process
+  /repeat [opts] count cmd - Repeat command on timer
+  /ps                  - List background processes
+  /kill id             - Kill background process
 
 Misc:
-  #time                - Display current time
-  #sh command          - Execute shell command
-  #help [topic]        - Show this help
-  #version             - Show version info
-  #quit                - Exit Clay
+  /time                - Display current time
+  /sh command          - Execute shell command
+  /tfhelp [topic]      - Show this TF help
+  /version             - Show version info
+  /quit                - Exit Clay
+
+Note: Use # prefix for backward compatibility (e.g., #set, #echo).
+      Use /tfhelp and /tfgag for TF versions of conflicting commands.
 
 Variable Substitution:
   %{varname}           - Variable value
@@ -867,22 +935,22 @@ Variable Substitution:
   %L, %R               - Left/right of match
   %%                   - Literal percent sign
 
-Use #help <command> for detailed help on specific commands.
-Use #help functions for list of expression functions."#;
+Use /tfhelp <command> for detailed help on specific commands.
+Use /tfhelp functions for list of expression functions."#;
         TfCommandResult::Success(Some(help_text.to_string()))
     } else {
         match topic.as_str() {
             "set" => TfCommandResult::Success(Some(
-                "#set [name [value]]\n\nSet a global variable. Without arguments, lists all variables.\nExamples:\n  #set foo bar    - Set foo to \"bar\"\n  #set count 42   - Set count to 42\n  #set            - List all variables".to_string()
+                "/set [name [value]]  (or #set)\n\nSet a global variable. Without arguments, lists all variables.\nExamples:\n  /set foo bar    - Set foo to \"bar\"\n  /set count 42   - Set count to 42\n  /set            - List all variables".to_string()
             )),
             "echo" => TfCommandResult::Success(Some(
-                "#echo message\n\nDisplay a message locally (not sent to MUD).\nVariable substitution is performed on the message.\nExample: #echo Hello %{name}!".to_string()
+                "/echo message  (or #echo)\n\nDisplay a message locally (not sent to MUD).\nVariable substitution is performed on the message.\nExample: /echo Hello %{name}!".to_string()
             )),
             "send" => TfCommandResult::Success(Some(
-                "#send [-w world] text\n\nSend text to the MUD server.\n-w world: Send to specific world\nExample: #send say Hello everyone!".to_string()
+                "/send [-w world] text  (or #send)\n\nSend text to the MUD server.\n-w world: Send to specific world\nExample: /send say Hello everyone!".to_string()
             )),
             "def" => TfCommandResult::Success(Some(
-                r#"#def [options] name = body
+                r#"/def [options] name = body  (or #def)
 
 Define a macro. Options:
   -t"pattern"   Trigger pattern (fires on matching MUD output)
@@ -902,21 +970,21 @@ Define a macro. Options:
   -b"key"       Key binding
 
 Examples:
-  #def -t"You are hungry" eat = get food bag%; eat food
-  #def -t"^(\w+) tells you" -mregexp reply = tell %1 Got it!
-  #def -hCONNECT greet = look"#.to_string()
+  /def -t"You are hungry" eat = get food bag%; eat food
+  /def -t"^(\w+) tells you" -mregexp reply = tell %1 Got it!
+  /def -hCONNECT greet = look"#.to_string()
             )),
             "if" => TfCommandResult::Success(Some(
-                "#if (expression) command\n#if (expr) ... #elseif (expr) ... #else ... #endif\n\nConditional execution.\nExamples:\n  #if (hp < 50) cast heal\n  #if (%1 == \"yes\") #echo Confirmed #else #echo Cancelled #endif".to_string()
+                "/if (expression) command  (or #if)\n/if (expr) ... /elseif (expr) ... /else ... /endif\n\nConditional execution.\nExamples:\n  /if (hp < 50) cast heal\n  /if (%1 == \"yes\") /echo Confirmed /else /echo Cancelled /endif".to_string()
             )),
             "while" => TfCommandResult::Success(Some(
-                "#while (expression) ... #done\n\nRepeat commands while expression is true.\nExample:\n  #while (count < 10) #echo %count%; #set count $[count+1] #done".to_string()
+                "/while (expression) ... /done  (or #while)\n\nRepeat commands while expression is true.\nExample:\n  /while (count < 10) /echo %count%; /set count $[count+1] /done".to_string()
             )),
             "for" => TfCommandResult::Success(Some(
-                "#for variable start end [step] ... #done\n\nLoop from start to end.\nExample:\n  #for i 1 5 #echo Number %i #done".to_string()
+                "/for variable start end [step] ... /done  (or #for)\n\nLoop from start to end.\nExample:\n  /for i 1 5 /echo Number %i /done".to_string()
             )),
             "expr" => TfCommandResult::Success(Some(
-                "#expr expression\n\nEvaluate expression and display result.\nOperators: + - * / % == != < > <= >= & | ! =~ !~ ?:\nFunctions: strlen() substr() strcat() tolower() toupper() rand() time() abs() min() max()\nExample: #expr 2 + 2 * 3".to_string()
+                "/expr expression  (or #expr)\n\nEvaluate expression and display result.\nOperators: + - * / % == != < > <= >= & | ! =~ !~ ?:\nFunctions: strlen() substr() strcat() tolower() toupper() rand() time() abs() min() max()\nExample: /expr 2 + 2 * 3".to_string()
             )),
             "test" => TfCommandResult::Success(Some(
                 r#"#test expression
@@ -1652,10 +1720,13 @@ mod tests {
 
     #[test]
     fn test_is_tf_command() {
+        // With unified command system, both # and / prefixes are TF commands
+        // (TF parser routes Clay-only commands back via ClayCommand result)
         assert!(is_tf_command("#set foo bar"));
         assert!(is_tf_command("  #echo hello"));
-        assert!(!is_tf_command("/quit"));
-        assert!(!is_tf_command("say hello"));
+        assert!(is_tf_command("/quit"));  // Now routes through TF parser
+        assert!(is_tf_command("/set foo"));  // TF command with / prefix
+        assert!(!is_tf_command("say hello"));  // Plain text, not a command
     }
 
     #[test]
