@@ -163,6 +163,18 @@ pub struct TfProcess {
     pub priority: i32,             // -p option (higher = runs first)
 }
 
+/// Disposition for #quote command output
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum QuoteDisposition {
+    /// Send each line to the MUD server (default when no prefix)
+    #[default]
+    Send,
+    /// Echo each line locally
+    Echo,
+    /// Execute each line as a TF command
+    Exec,
+}
+
 /// Result of executing a TF command
 #[derive(Debug)]
 pub enum TfCommandResult {
@@ -178,6 +190,12 @@ pub enum TfCommandResult {
     Recall(RecallOptions),
     /// Register a repeat process for the main loop to tick
     RepeatProcess(TfProcess),
+    /// Quote output: multiple lines with disposition
+    Quote {
+        lines: Vec<String>,
+        disposition: QuoteDisposition,
+        world: Option<String>,
+    },
     /// Abort file loading early (#exit during load)
     ExitLoad,
     /// Not a TF command (doesn't start with #)

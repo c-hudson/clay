@@ -9,7 +9,7 @@ use std::fs;
 use std::path::Path;
 use std::io::{BufRead, BufReader};
 use std::time::{Duration, Instant};
-use super::{TfEngine, TfProcess, TfCommandResult, RecallOptions, RecallSource, RecallRange, RecallMatchStyle};
+use super::{TfEngine, TfProcess, TfCommandResult, QuoteDisposition, RecallOptions, RecallSource, RecallRange, RecallMatchStyle};
 
 /// #beep - Sound the terminal bell
 pub fn cmd_beep() -> TfCommandResult {
@@ -126,13 +126,218 @@ pub fn cmd_sh(args: &str) -> TfCommandResult {
     }
 }
 
-/// #quote text - Send text literally without processing
+/// #quote [options] [prefix] source [suffix] - Generate text from file, command, or literal
+///
+/// Sources:
+///   '"file"     - Read lines from a file
+///   `"command"  - Read output from shell command
+///   #"command"  - Read output from TF command (not yet implemented)
+///   text        - Send literal text (no special prefix)
+///
+/// Options:
+///   -dsend      - Send each line to MUD (default when no prefix)
+///   -decho      - Echo each line locally
+///   -dexec      - Execute each line as TF command
+///   -wworld     - Send to specified world
+///   -S          - Synchronous mode (wait for completion)
+///
+/// Examples:
+///   #quote hello world           - Send "hello world" to MUD
+///   #quote '"/etc/motd"          - Send each line of /etc/motd to MUD
+///   #quote say '"/tmp/lines.txt" - Send "say <line>" for each line
+///   #quote `"ls -la"             - Send output of ls command
+///   #quote -decho '"config.txt"  - Display file contents locally
 pub fn cmd_quote(args: &str) -> TfCommandResult {
+    use super::QuoteDisposition;
+    use std::io::{BufRead, BufReader};
+    use std::process::{Command, Stdio};
+
     if args.is_empty() {
-        return TfCommandResult::Error("Usage: #quote text".to_string());
+        return TfCommandResult::Error("Usage: #quote [options] [prefix] source [suffix]".to_string());
     }
-    // Send directly to MUD without any processing
-    TfCommandResult::SendToMud(args.to_string())
+
+    let mut input = args.trim();
+    let mut disposition = QuoteDisposition::Send;
+    let mut world: Option<String> = None;
+    let mut _synchronous = false;
+
+    // Parse options
+    while input.starts_with('-') {
+        if let Some(space_pos) = input.find(|c: char| c.is_whitespace()) {
+            let opt = &input[..space_pos];
+            input = input[space_pos..].trim_start();
+
+            if opt.starts_with("-d") {
+                let disp_str = &opt[2..];
+                disposition = match disp_str {
+                    "send" => QuoteDisposition::Send,
+                    "echo" => QuoteDisposition::Echo,
+                    "exec" => QuoteDisposition::Exec,
+                    _ => return TfCommandResult::Error(format!("Unknown disposition: {}. Use send, echo, or exec.", disp_str)),
+                };
+            } else if opt.starts_with("-w") {
+                world = Some(opt[2..].to_string());
+            } else if opt == "-S" {
+                _synchronous = true;
+            } else {
+                return TfCommandResult::Error(format!("Unknown option: {}", opt));
+            }
+        } else {
+            // Option at end with no more args - validate it's a valid option, then error
+            if input.starts_with("-d") || input.starts_with("-w") || input == "-S" {
+                return TfCommandResult::Error("No source specified after options".to_string());
+            }
+            // Not an option - break to process as source
+            break;
+        }
+    }
+
+    // Find the source specifier: ' for file, ` for shell, # for TF command
+    // Format: [prefix] source [suffix]
+    // source is: '"file"suffix or 'file suffix or `"cmd"suffix or `cmd suffix
+
+    let (prefix, source_pos) = if let Some(pos) = input.find(|c: char| c == '\'' || c == '`' || c == '#') {
+        // Check if the # is actually a TF command source or just part of text
+        let char_at_pos = input.chars().nth(pos).unwrap();
+        if char_at_pos == '#' {
+            // Only treat as source if followed by " (for #"command" syntax)
+            let after_hash = &input[pos + 1..];
+            if after_hash.starts_with('"') {
+                // Keep trailing space in prefix (user controls spacing)
+                (&input[..pos], Some(pos))
+            } else {
+                // No special source, treat entire input as literal text
+                ("", None)
+            }
+        } else {
+            // Keep trailing space in prefix (user controls spacing)
+            (&input[..pos], Some(pos))
+        }
+    } else {
+        // No special source character, treat entire input as literal text
+        ("", None)
+    };
+
+    // If no source specifier found, send the text literally
+    let source_start = match source_pos {
+        Some(pos) => pos,
+        None => {
+            return TfCommandResult::Quote {
+                lines: vec![input.to_string()],
+                disposition,
+                world,
+            };
+        }
+    };
+
+    let source_char = input.chars().nth(source_start).unwrap();
+    let after_source_char = &input[source_start + 1..];
+
+    // Parse the source: could be quoted ("...") or unquoted (word)
+    let (source_value, suffix) = if after_source_char.starts_with('"') {
+        // Quoted source: find closing quote
+        let content_start = 1; // Skip opening quote
+        let mut end = content_start;
+        let chars: Vec<char> = after_source_char.chars().collect();
+        let mut source_content = String::new();
+
+        while end < chars.len() {
+            if chars[end] == '\\' && end + 1 < chars.len() {
+                // Escape sequence
+                source_content.push(chars[end + 1]);
+                end += 2;
+            } else if chars[end] == '"' {
+                // End of quoted string
+                break;
+            } else {
+                source_content.push(chars[end]);
+                end += 1;
+            }
+        }
+
+        // Calculate byte position for suffix
+        let byte_end = after_source_char
+            .char_indices()
+            .nth(end + 1)
+            .map(|(i, _)| i)
+            .unwrap_or(after_source_char.len());
+        let suffix = after_source_char[byte_end..].trim();
+
+        (source_content, suffix)
+    } else {
+        // Unquoted source: read until whitespace
+        if let Some(space_pos) = after_source_char.find(char::is_whitespace) {
+            let source = after_source_char[..space_pos].to_string();
+            let suffix = after_source_char[space_pos..].trim();
+            (source, suffix)
+        } else {
+            (after_source_char.to_string(), "")
+        }
+    };
+
+    // Read lines from the source
+    let lines: Vec<String> = match source_char {
+        '\'' => {
+            // File source - expand ~ to home directory
+            let path = if source_value.starts_with("~/") {
+                if let Some(home) = home::home_dir() {
+                    home.join(&source_value[2..]).to_string_lossy().into_owned()
+                } else {
+                    source_value.clone()
+                }
+            } else if source_value == "~" {
+                home::home_dir()
+                    .map(|h| h.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| source_value.clone())
+            } else {
+                source_value.clone()
+            };
+            match std::fs::File::open(&path) {
+                Ok(file) => {
+                    let reader = BufReader::new(file);
+                    reader.lines()
+                        .filter_map(|l| l.ok())
+                        .map(|line| format!("{}{}{}", prefix, line, suffix))
+                        .collect()
+                }
+                Err(e) => return TfCommandResult::Error(format!("Cannot open file '{}': {}", path, e)),
+            }
+        }
+        '`' => {
+            // Shell command source
+            match Command::new("sh")
+                .arg("-c")
+                .arg(&source_value)
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .output()
+            {
+                Ok(output) => {
+                    let stdout = String::from_utf8_lossy(&output.stdout);
+                    stdout
+                        .lines()
+                        .map(|line| format!("{}{}{}", prefix, line, suffix))
+                        .collect()
+                }
+                Err(e) => return TfCommandResult::Error(format!("Cannot execute command '{}': {}", source_value, e)),
+            }
+        }
+        '#' => {
+            // TF command source - not implemented yet
+            return TfCommandResult::Error("#\"command\" source not yet implemented".to_string());
+        }
+        _ => unreachable!(),
+    };
+
+    if lines.is_empty() {
+        return TfCommandResult::Success(Some("(no output)".to_string()));
+    }
+
+    TfCommandResult::Quote {
+        lines,
+        disposition,
+        world,
+    }
 }
 
 /// #recall [-<count>] <pattern> - Search output history
@@ -1193,11 +1398,42 @@ mod tests {
 
     #[test]
     fn test_cmd_quote() {
+        // Test literal text (no source specifier)
         let result = cmd_quote("hello world");
-        assert!(matches!(result, TfCommandResult::SendToMud(s) if s == "hello world"));
+        match result {
+            TfCommandResult::Quote { lines, disposition, world } => {
+                assert_eq!(lines, vec!["hello world"]);
+                assert_eq!(disposition, QuoteDisposition::Send);
+                assert!(world.is_none());
+            }
+            _ => panic!("Expected Quote result, got {:?}", result),
+        }
 
+        // Test empty args
         let result = cmd_quote("");
         assert!(matches!(result, TfCommandResult::Error(_)));
+
+        // Test with -decho option
+        let result = cmd_quote("-decho test message");
+        match result {
+            TfCommandResult::Quote { lines, disposition, world } => {
+                assert_eq!(lines, vec!["test message"]);
+                assert_eq!(disposition, QuoteDisposition::Echo);
+                assert!(world.is_none());
+            }
+            _ => panic!("Expected Quote result, got {:?}", result),
+        }
+
+        // Test with -wworld option
+        let result = cmd_quote("-wmyworld hello");
+        match result {
+            TfCommandResult::Quote { lines, disposition, world } => {
+                assert_eq!(lines, vec!["hello"]);
+                assert_eq!(disposition, QuoteDisposition::Send);
+                assert_eq!(world, Some("myworld".to_string()));
+            }
+            _ => panic!("Expected Quote result, got {:?}", result),
+        }
     }
 
     #[test]
@@ -1209,6 +1445,87 @@ mod tests {
 
         let result = cmd_sh("");
         assert!(matches!(result, TfCommandResult::Error(_)));
+    }
+
+    #[test]
+    fn test_cmd_quote_file() {
+        use std::io::Write;
+
+        // Create a temp file
+        let temp_dir = std::env::temp_dir();
+        let temp_file = temp_dir.join("clay_quote_test.txt");
+        {
+            let mut file = std::fs::File::create(&temp_file).unwrap();
+            writeln!(file, "line one").unwrap();
+            writeln!(file, "line two").unwrap();
+            writeln!(file, "line three").unwrap();
+        }
+
+        // Test reading from file
+        let path = temp_file.to_string_lossy();
+        let result = cmd_quote(&format!("'\"{}\"", path));
+        match result {
+            TfCommandResult::Quote { lines, disposition, world } => {
+                assert_eq!(lines.len(), 3);
+                assert_eq!(lines[0], "line one");
+                assert_eq!(lines[1], "line two");
+                assert_eq!(lines[2], "line three");
+                assert_eq!(disposition, QuoteDisposition::Send);
+                assert!(world.is_none());
+            }
+            _ => panic!("Expected Quote result, got {:?}", result),
+        }
+
+        // Test with prefix
+        let result = cmd_quote(&format!("say '\"{}\"", path));
+        match result {
+            TfCommandResult::Quote { lines, disposition, .. } => {
+                assert_eq!(lines.len(), 3);
+                assert_eq!(lines[0], "say line one");
+                assert_eq!(lines[1], "say line two");
+                assert_eq!(lines[2], "say line three");
+                assert_eq!(disposition, QuoteDisposition::Send);
+            }
+            _ => panic!("Expected Quote result, got {:?}", result),
+        }
+
+        // Test with -decho option
+        let result = cmd_quote(&format!("-decho '\"{}\"", path));
+        match result {
+            TfCommandResult::Quote { lines, disposition, .. } => {
+                assert_eq!(lines.len(), 3);
+                assert_eq!(disposition, QuoteDisposition::Echo);
+            }
+            _ => panic!("Expected Quote result, got {:?}", result),
+        }
+
+        // Clean up
+        let _ = std::fs::remove_file(&temp_file);
+    }
+
+    #[test]
+    fn test_cmd_quote_shell() {
+        // Test reading from shell command
+        let result = cmd_quote("`\"echo hello\"");
+        match result {
+            TfCommandResult::Quote { lines, disposition, world } => {
+                assert_eq!(lines.len(), 1);
+                assert_eq!(lines[0], "hello");
+                assert_eq!(disposition, QuoteDisposition::Send);
+                assert!(world.is_none());
+            }
+            _ => panic!("Expected Quote result, got {:?}", result),
+        }
+
+        // Test with prefix
+        let result = cmd_quote("say `\"echo world\"");
+        match result {
+            TfCommandResult::Quote { lines, .. } => {
+                assert_eq!(lines.len(), 1);
+                assert_eq!(lines[0], "say world");
+            }
+            _ => panic!("Expected Quote result, got {:?}", result),
+        }
     }
 
     #[test]
