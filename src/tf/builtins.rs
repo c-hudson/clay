@@ -160,8 +160,8 @@ pub fn cmd_quote(args: &str) -> TfCommandResult {
     let mut disposition = QuoteDisposition::Send;
     let mut world: Option<String> = None;
     let mut _synchronous = false;
-    let mut _on_prompt = false;  // -P flag: run on prompt
-    let mut _delay_secs: f64 = 0.0;  // Timing between lines (not yet used for async)
+    let mut _on_prompt = false;  // -P flag: run on prompt (not yet implemented)
+    let mut delay_secs: f64 = 0.0;  // Timing between lines
 
     // Helper to parse time string: "seconds", "min:sec", or "hour:min:sec"
     fn parse_time_spec(s: &str) -> Option<f64> {
@@ -225,7 +225,7 @@ pub fn cmd_quote(args: &str) -> TfCommandResult {
                 if time_str == "P" {
                     _on_prompt = true;
                 } else if let Some(secs) = parse_time_spec(time_str) {
-                    _delay_secs = secs;
+                    delay_secs = secs;
                     if time_str == "S" {
                         _synchronous = true;
                     }
@@ -283,6 +283,7 @@ pub fn cmd_quote(args: &str) -> TfCommandResult {
                 lines: vec![input.to_string()],
                 disposition,
                 world,
+                delay_secs,
             };
         }
     };
@@ -394,6 +395,7 @@ pub fn cmd_quote(args: &str) -> TfCommandResult {
         lines,
         disposition,
         world,
+        delay_secs,
     }
 }
 
@@ -1458,7 +1460,7 @@ mod tests {
         // Test literal text (no source specifier)
         let result = cmd_quote("hello world");
         match result {
-            TfCommandResult::Quote { lines, disposition, world } => {
+            TfCommandResult::Quote { lines, disposition, world, .. } => {
                 assert_eq!(lines, vec!["hello world"]);
                 assert_eq!(disposition, QuoteDisposition::Send);
                 assert!(world.is_none());
@@ -1473,7 +1475,7 @@ mod tests {
         // Test with -decho option
         let result = cmd_quote("-decho test message");
         match result {
-            TfCommandResult::Quote { lines, disposition, world } => {
+            TfCommandResult::Quote { lines, disposition, world, .. } => {
                 assert_eq!(lines, vec!["test message"]);
                 assert_eq!(disposition, QuoteDisposition::Echo);
                 assert!(world.is_none());
@@ -1484,7 +1486,7 @@ mod tests {
         // Test with -wworld option
         let result = cmd_quote("-wmyworld hello");
         match result {
-            TfCommandResult::Quote { lines, disposition, world } => {
+            TfCommandResult::Quote { lines, disposition, world, .. } => {
                 assert_eq!(lines, vec!["hello"]);
                 assert_eq!(disposition, QuoteDisposition::Send);
                 assert_eq!(world, Some("myworld".to_string()));
@@ -1522,7 +1524,7 @@ mod tests {
         let path = temp_file.to_string_lossy();
         let result = cmd_quote(&format!("'\"{}\"", path));
         match result {
-            TfCommandResult::Quote { lines, disposition, world } => {
+            TfCommandResult::Quote { lines, disposition, world, .. } => {
                 assert_eq!(lines.len(), 3);
                 assert_eq!(lines[0], "line one");
                 assert_eq!(lines[1], "line two");
@@ -1565,7 +1567,7 @@ mod tests {
         // Test reading from shell command
         let result = cmd_quote("`\"echo hello\"");
         match result {
-            TfCommandResult::Quote { lines, disposition, world } => {
+            TfCommandResult::Quote { lines, disposition, world, .. } => {
                 assert_eq!(lines.len(), 1);
                 assert_eq!(lines[0], "hello");
                 assert_eq!(disposition, QuoteDisposition::Send);

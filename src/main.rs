@@ -9565,49 +9565,85 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                         app.tf_engine.processes.push(process);
                                         app.add_tf_output(&format!("% Process {} started: {} every {} ({} times)", id, cmd, interval, count_str));
                                     }
-                                    tf::TfCommandResult::Quote { lines, disposition, world } => {
+                                    tf::TfCommandResult::Quote { lines, disposition, world, delay_secs } => {
                                         // Determine target world
-                                        let target_idx = if let Some(world_name) = world {
-                                            app.worlds.iter().position(|w| w.name == world_name)
+                                        let target_world = if let Some(ref world_name) = world {
+                                            Some(world_name.clone())
+                                        } else {
+                                            Some(app.current_world().name.clone())
+                                        };
+                                        let target_idx = if let Some(ref world_name) = world {
+                                            app.worlds.iter().position(|w| w.name == *world_name)
                                         } else {
                                             Some(app.current_world_index)
                                         };
 
-                                        for line in lines {
-                                            match disposition {
-                                                tf::QuoteDisposition::Send => {
-                                                    if let Some(idx) = target_idx {
-                                                        if app.worlds[idx].connected {
-                                                            if let Some(tx) = &app.worlds[idx].command_tx {
-                                                                let _ = tx.send(WriteCommand::Text(line)).await;
+                                        if delay_secs > 0.0 && lines.len() > 1 {
+                                            // Schedule as processes with delays
+                                            let delay = std::time::Duration::from_secs_f64(delay_secs);
+                                            let now = std::time::Instant::now();
+                                            for (i, line) in lines.into_iter().enumerate() {
+                                                let cmd = match disposition {
+                                                    tf::QuoteDisposition::Send => line,
+                                                    tf::QuoteDisposition::Echo => format!("#echo {}", line),
+                                                    tf::QuoteDisposition::Exec => line,
+                                                };
+                                                let id = app.tf_engine.next_process_id;
+                                                app.tf_engine.next_process_id += 1;
+                                                let process = tf::TfProcess {
+                                                    id,
+                                                    command: cmd,
+                                                    interval: delay,
+                                                    count: Some(1),
+                                                    remaining: Some(1),
+                                                    next_run: now + delay * i as u32,
+                                                    world: target_world.clone(),
+                                                    synchronous: false,
+                                                    on_prompt: false,
+                                                    priority: 0,
+                                                };
+                                                app.tf_engine.processes.push(process);
+                                            }
+                                            app.add_tf_output(&format!("% Quote started: {} lines, {} sec delay",
+                                                app.tf_engine.processes.len(), delay_secs));
+                                        } else {
+                                            // Send immediately (no delay or single line)
+                                            for line in lines {
+                                                match disposition {
+                                                    tf::QuoteDisposition::Send => {
+                                                        if let Some(idx) = target_idx {
+                                                            if app.worlds[idx].connected {
+                                                                if let Some(tx) = &app.worlds[idx].command_tx {
+                                                                    let _ = tx.send(WriteCommand::Text(line)).await;
+                                                                }
+                                                            } else {
+                                                                app.add_output("Not connected");
+                                                                break;
                                                             }
-                                                        } else {
-                                                            app.add_output("Not connected");
-                                                            break;
                                                         }
                                                     }
-                                                }
-                                                tf::QuoteDisposition::Echo => {
-                                                    app.add_output(&line);
-                                                }
-                                                tf::QuoteDisposition::Exec => {
-                                                    // Execute each line as a TF command
-                                                    let result = app.tf_engine.execute(&line);
-                                                    match result {
-                                                        tf::TfCommandResult::SendToMud(text) => {
-                                                            if let Some(idx) = target_idx {
-                                                                if let Some(tx) = &app.worlds[idx].command_tx {
-                                                                    let _ = tx.send(WriteCommand::Text(text)).await;
+                                                    tf::QuoteDisposition::Echo => {
+                                                        app.add_output(&line);
+                                                    }
+                                                    tf::QuoteDisposition::Exec => {
+                                                        // Execute each line as a TF command
+                                                        let result = app.tf_engine.execute(&line);
+                                                        match result {
+                                                            tf::TfCommandResult::SendToMud(text) => {
+                                                                if let Some(idx) = target_idx {
+                                                                    if let Some(tx) = &app.worlds[idx].command_tx {
+                                                                        let _ = tx.send(WriteCommand::Text(text)).await;
+                                                                    }
                                                                 }
                                                             }
+                                                            tf::TfCommandResult::Success(Some(msg)) => {
+                                                                app.add_output(&msg);
+                                                            }
+                                                            tf::TfCommandResult::Error(err) => {
+                                                                app.add_output(&format!("Error: {}", err));
+                                                            }
+                                                            _ => {}
                                                         }
-                                                        tf::TfCommandResult::Success(Some(msg)) => {
-                                                            app.add_output(&msg);
-                                                        }
-                                                        tf::TfCommandResult::Error(err) => {
-                                                            app.add_output(&format!("Error: {}", err));
-                                                        }
-                                                        _ => {}
                                                     }
                                                 }
                                             }

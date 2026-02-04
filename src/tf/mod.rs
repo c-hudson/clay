@@ -195,6 +195,7 @@ pub enum TfCommandResult {
         lines: Vec<String>,
         disposition: QuoteDisposition,
         world: Option<String>,
+        delay_secs: f64,  // Delay between lines (0 = immediate)
     },
     /// Abort file loading early (#exit during load)
     ExitLoad,
