@@ -249,11 +249,11 @@ pub fn cmd_quote(args: &str) -> TfCommandResult {
         }
     }
 
-    // Find the source specifier: ' for file, ` for shell, # for TF command
+    // Find the source specifier: ' for file, ` or ! for shell, # for TF command
     // Format: [prefix] source [suffix]
-    // source is: '"file"suffix or 'file suffix or `"cmd"suffix or `cmd suffix
+    // source is: '"file"suffix or 'file suffix or `"cmd"suffix or !cmd suffix
 
-    let (prefix, source_pos) = if let Some(pos) = input.find(|c: char| c == '\'' || c == '`' || c == '#') {
+    let (prefix, source_pos) = if let Some(pos) = input.find(|c: char| c == '\'' || c == '`' || c == '!' || c == '#') {
         // Check if the # is actually a TF command source or just part of text
         let char_at_pos = input.chars().nth(pos).unwrap();
         if char_at_pos == '#' {
@@ -360,8 +360,8 @@ pub fn cmd_quote(args: &str) -> TfCommandResult {
                 Err(e) => return TfCommandResult::Error(format!("Cannot open file '{}': {}", path, e)),
             }
         }
-        '`' => {
-            // Shell command source
+        '`' | '!' => {
+            // Shell command source (both ` and ! are supported)
             match Command::new("sh")
                 .arg("-c")
                 .arg(&source_value)
