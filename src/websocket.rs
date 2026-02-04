@@ -35,6 +35,10 @@ pub enum WsMessage {
         password_hash: String,
         #[serde(default)]
         current_world: Option<usize>,  // Client's current world (for reconnection)
+        #[serde(default)]
+        auth_key: Option<String>,  // Device auth key (alternative to password)
+        #[serde(default)]
+        request_key: bool,  // If true, request a new auth key after successful password auth
     },
     AuthResponse {
         success: bool,
@@ -43,6 +47,18 @@ pub enum WsMessage {
         username: Option<String>,  // Confirmed username on success (multiuser mode)
         #[serde(default)]
         multiuser_mode: bool,      // True if server is in multiuser mode
+    },
+    // Server sends auth key to client after successful password auth (if requested)
+    KeyGenerated {
+        auth_key: String,
+    },
+    // Client requests to revoke its auth key
+    RevokeKey {
+        auth_key: String,
+    },
+    // Server confirms key revocation
+    KeyRevoked {
+        success: bool,
     },
 
     // Password change (multiuser mode)
@@ -586,6 +602,15 @@ impl WebSocketServer {
         }
     }
 
+    /// Set the authenticated status for a connected client
+    pub fn set_client_authenticated(&self, client_id: u64, authenticated: bool) {
+        if let Ok(mut clients) = self.clients.try_write() {
+            if let Some(client) = clients.get_mut(&client_id) {
+                client.authenticated = authenticated;
+            }
+        }
+    }
+
     /// Get the client type for a connected client
     pub fn get_client_type(&self, client_id: u64) -> Option<RemoteClientType> {
         if let Ok(clients) = self.clients.try_read() {
@@ -1014,7 +1039,7 @@ where
         };
         let _ = tx.send(response);
         // Create a fake AuthRequest to trigger initial state send
-        let _ = event_tx.send(AppEvent::WsClientMessage(client_id, Box::new(WsMessage::AuthRequest { username: None, password_hash: String::new(), current_world: None }))).await;
+        let _ = event_tx.send(AppEvent::WsClientMessage(client_id, Box::new(WsMessage::AuthRequest { username: None, password_hash: String::new(), current_world: None, auth_key: None, request_key: false }))).await;
     }
 
     // Spawn task to send messages from rx to WebSocket
@@ -1036,8 +1061,18 @@ where
             Ok(WsRawMessage::Text(text)) => {
                 if let Ok(ws_msg) = serde_json::from_str::<WsMessage>(&text) {
                     match &ws_msg {
-                        WsMessage::AuthRequest { username, password_hash: client_hash, .. } => {
-                            // Verify credentials
+                        WsMessage::AuthRequest { username, password_hash: client_hash, auth_key, request_key, .. } => {
+                            // Try auth_key first (device key authentication)
+                            // auth_key validation must happen in the app since keys are stored there
+                            // So we forward to app and let it respond
+                            if auth_key.is_some() && !auth_key.as_ref().unwrap().is_empty() {
+                                // Forward to app for key validation
+                                // App will send AuthResponse directly
+                                let _ = event_tx.send(AppEvent::WsAuthKeyValidation(client_id, ws_msg.clone())).await;
+                                continue;
+                            }
+
+                            // Fall back to password-based authentication
                             let (auth_success, auth_error, auth_username) = if multiuser_mode {
                                 // Multiuser mode: require username and validate against users map
                                 match username {
@@ -1103,9 +1138,21 @@ where
                             let _ = tx.send(response);
 
                             if auth_success {
-                                // Forward to app to send initial state
+                                // Extract request_key before moving ws_msg
+                                let wants_key = *request_key;
+
+                                // Forward to app to send initial state (and generate key if requested)
                                 let _ = event_tx.send(AppEvent::WsClientMessage(client_id, Box::new(ws_msg))).await;
+
+                                // If client requested a key, forward that info to app
+                                if wants_key {
+                                    let _ = event_tx.send(AppEvent::WsKeyRequest(client_id)).await;
+                                }
                             }
+                        }
+                        WsMessage::RevokeKey { auth_key } => {
+                            // Forward key revocation to app
+                            let _ = event_tx.send(AppEvent::WsKeyRevoke(client_id, auth_key.clone())).await;
                         }
                         WsMessage::Ping => {
                             let _ = tx.send(WsMessage::Pong);

@@ -41,6 +41,7 @@ public class MainActivity extends AppCompatActivity {
     private static final String KEY_USE_SECURE = "useSecure";
     private static final String KEY_SAVED_PASSWORD = "savedPassword";
     private static final String KEY_SAVED_USERNAME = "savedUsername";
+    private static final String KEY_AUTH_KEY = "authKey";  // Device auth key for passwordless login
 
     private static final String CHANNEL_ID_ALERTS = "clay_alerts";
     private static final String CHANNEL_ID_SERVICE = "clay_service";
@@ -195,6 +196,25 @@ public class MainActivity extends AppCompatActivity {
         public void clearSavedUsername() {
             SharedPreferences prefs = getSharedPreferences(PREFS_NAME, MODE_PRIVATE);
             prefs.edit().remove(KEY_SAVED_USERNAME).apply();
+        }
+
+        // Device auth key methods for passwordless authentication
+        @JavascriptInterface
+        public void saveAuthKey(String key) {
+            SharedPreferences prefs = getSharedPreferences(PREFS_NAME, MODE_PRIVATE);
+            prefs.edit().putString(KEY_AUTH_KEY, key).apply();
+        }
+
+        @JavascriptInterface
+        public String getAuthKey() {
+            SharedPreferences prefs = getSharedPreferences(PREFS_NAME, MODE_PRIVATE);
+            return prefs.getString(KEY_AUTH_KEY, "");
+        }
+
+        @JavascriptInterface
+        public void clearAuthKey() {
+            SharedPreferences prefs = getSharedPreferences(PREFS_NAME, MODE_PRIVATE);
+            prefs.edit().remove(KEY_AUTH_KEY).apply();
         }
 
         @JavascriptInterface

@@ -970,7 +970,7 @@ impl RemoteGuiApp {
 
                     // Send auth request if password was submitted
                     if password_submitted {
-                        let auth_msg = WsMessage::AuthRequest { username: None, password_hash, current_world: None };
+                        let auth_msg = WsMessage::AuthRequest { username: None, password_hash, current_world: None, auth_key: None, request_key: false };
                         if let Ok(json) = serde_json::to_string(&auth_msg) {
                             let _ = ws_sink.send(WsRawMessage::Text(json)).await;
                         }
@@ -1028,7 +1028,7 @@ impl RemoteGuiApp {
             } else {
                 None
             };
-            let _ = tx.send(WsMessage::AuthRequest { username, password_hash, current_world: None });
+            let _ = tx.send(WsMessage::AuthRequest { username, password_hash, current_world: None, auth_key: None, request_key: false });
         }
     }
 

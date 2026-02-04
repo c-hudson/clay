@@ -134,6 +134,10 @@ pub fn save_settings(app: &App) -> io::Result<()> {
     if !app.settings.websocket_key_file.is_empty() {
         writeln!(file, "websocket_key_file={}", app.settings.websocket_key_file)?;
     }
+    // Save device auth keys (encrypted)
+    for key in &app.settings.websocket_auth_keys {
+        writeln!(file, "websocket_auth_key={}", encrypt_password(key))?;
+    }
     writeln!(file, "tls_proxy_enabled={}", app.settings.tls_proxy_enabled)?;
     if !app.settings.dictionary_path.is_empty() {
         writeln!(file, "dictionary_path={}", app.settings.dictionary_path)?;
@@ -515,6 +519,13 @@ pub fn load_settings(app: &mut App) -> io::Result<()> {
                     }
                     "websocket_key_file" => {
                         app.settings.websocket_key_file = value.to_string();
+                    }
+                    "websocket_auth_key" => {
+                        // Load device auth key (decrypt it)
+                        let key = decrypt_password(value);
+                        if !key.is_empty() {
+                            app.settings.websocket_auth_keys.push(key);
+                        }
                     }
                     "http_enabled" => {
                         app.settings.http_enabled = value == "true";

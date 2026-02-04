@@ -811,6 +811,8 @@ pub struct Settings {
     websocket_whitelisted_host: Option<String>,  // Currently whitelisted host (authenticated from allow list)
     websocket_cert_file: String,   // Path to TLS certificate file (PEM) - only used when web_secure=true
     websocket_key_file: String,    // Path to TLS private key file (PEM) - only used when web_secure=true
+    // Persistent auth keys for passwordless device authentication (generated after successful password auth)
+    websocket_auth_keys: Vec<String>,
     // User-defined actions/triggers
     actions: Vec<Action>,
     // TLS proxy for connection preservation over hot reload
@@ -850,6 +852,7 @@ impl Default for Settings {
             websocket_whitelisted_host: None,
             websocket_cert_file: String::new(),
             websocket_key_file: String::new(),
+            websocket_auth_keys: Vec::new(),
             actions: Vec::new(),
             tls_proxy_enabled: false,
             dictionary_path: String::new(),
@@ -3513,6 +3516,13 @@ impl App {
         }
     }
 
+    /// Set the authenticated status for a WebSocket client
+    fn ws_set_client_authenticated(&self, client_id: u64, authenticated: bool) {
+        if let Some(ref server) = self.ws_server {
+            server.set_client_authenticated(client_id, authenticated);
+        }
+    }
+
     /// Get the client type for a connected WebSocket client
     fn ws_get_client_type(&self, client_id: u64) -> Option<websocket::RemoteClientType> {
         if client_id == 0 {
@@ -4421,6 +4431,9 @@ pub enum AppEvent {
     WsClientConnected(u64),                    // client_id
     WsClientDisconnected(u64),                 // client_id
     WsClientMessage(u64, Box<WsMessage>),      // client_id, message
+    WsAuthKeyValidation(u64, WsMessage),       // client_id, AuthRequest with auth_key
+    WsKeyRequest(u64),                         // client_id - generate and send new auth key
+    WsKeyRevoke(u64, String),                  // client_id, auth_key to revoke
     // Multiuser mode events (include username for per-user connection isolation)
     ConnectWorldRequest(usize, String),  // world_index, requesting username
     MultiuserServerData(usize, String, Vec<u8>),  // world_index, username, raw bytes
@@ -5127,7 +5140,7 @@ async fn run_console_client(addr: &str) -> io::Result<()> {
                             println!(); // Move to next line after password
                             // Send authentication
                             let password_hash = hash_password(&password);
-                            let _ = ws_tx.send(WsMessage::AuthRequest { password_hash, username, current_world: None });
+                            let _ = ws_tx.send(WsMessage::AuthRequest { password_hash, username, current_world: None, auth_key: None, request_key: false });
                             break;
                         }
                         KeyCode::Char(c) => {
@@ -8175,6 +8188,69 @@ pub async fn run_app_headless(
                     AppEvent::WsClientDisconnected(client_id) => {
                         app.ws_client_worlds.remove(&client_id);
                     }
+                    AppEvent::WsAuthKeyValidation(client_id, msg) => {
+                        // Validate auth key from AuthRequest
+                        if let WsMessage::AuthRequest { auth_key: Some(key), current_world, .. } = msg {
+                            let is_valid = app.settings.websocket_auth_keys.contains(&key);
+                            if is_valid {
+                                // Key is valid - authenticate the client
+                                app.ws_set_client_authenticated(client_id, true);
+                                app.ws_send_to_client(client_id, WsMessage::AuthResponse {
+                                    success: true,
+                                    error: None,
+                                    username: None,
+                                    multiuser_mode: false,
+                                });
+                                // Send initial state
+                                let initial_state = app.build_initial_state();
+                                app.ws_send_to_client(client_id, initial_state);
+                                app.ws_mark_initial_state_sent(client_id);
+                                // Set client's world
+                                let world_idx = current_world
+                                    .filter(|&w| w < app.worlds.len())
+                                    .unwrap_or(app.current_world_index);
+                                app.ws_set_client_world(client_id, Some(world_idx));
+                                app.ws_client_worlds.insert(client_id, ClientViewState {
+                                    world_index: world_idx,
+                                    visible_lines: 0,
+                                    dimensions: None,
+                                });
+                            } else {
+                                // Invalid key
+                                app.ws_send_to_client(client_id, WsMessage::AuthResponse {
+                                    success: false,
+                                    error: Some("Invalid auth key".to_string()),
+                                    username: None,
+                                    multiuser_mode: false,
+                                });
+                            }
+                        }
+                    }
+                    AppEvent::WsKeyRequest(client_id) => {
+                        // Generate a new auth key for the client using SHA256 hash
+                        use sha2::{Sha256, Digest};
+                        let mut hasher = Sha256::new();
+                        hasher.update(std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_nanos()
+                            .to_le_bytes());
+                        hasher.update(std::process::id().to_le_bytes());
+                        hasher.update(client_id.to_le_bytes());
+                        // Add number of existing keys for additional uniqueness
+                        hasher.update(app.settings.websocket_auth_keys.len().to_le_bytes());
+                        let key = hex::encode(hasher.finalize());
+                        // Store the key
+                        app.settings.websocket_auth_keys.push(key.clone());
+                        let _ = persistence::save_settings(&app);
+                        // Send to client
+                        app.ws_send_to_client(client_id, WsMessage::KeyGenerated { auth_key: key });
+                    }
+                    AppEvent::WsKeyRevoke(_client_id, key) => {
+                        // Remove the key from stored keys
+                        app.settings.websocket_auth_keys.retain(|k| k != &key);
+                        let _ = persistence::save_settings(&app);
+                    }
                     AppEvent::SystemMessage(msg) => {
                         // Add to current world's output and broadcast
                         let seq = app.current_world().next_seq;
@@ -9919,6 +9995,69 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                         if had_dimensions {
                             app.send_naws_to_all_worlds();
                         }
+                    }
+                    AppEvent::WsAuthKeyValidation(client_id, msg) => {
+                        // Validate auth key from AuthRequest
+                        if let WsMessage::AuthRequest { auth_key: Some(key), current_world, .. } = msg {
+                            let is_valid = app.settings.websocket_auth_keys.contains(&key);
+                            if is_valid {
+                                // Key is valid - authenticate the client
+                                app.ws_set_client_authenticated(client_id, true);
+                                app.ws_send_to_client(client_id, WsMessage::AuthResponse {
+                                    success: true,
+                                    error: None,
+                                    username: None,
+                                    multiuser_mode: false,
+                                });
+                                // Send initial state
+                                let initial_state = app.build_initial_state();
+                                app.ws_send_to_client(client_id, initial_state);
+                                app.ws_mark_initial_state_sent(client_id);
+                                // Set client's world
+                                let world_idx = current_world
+                                    .filter(|&w| w < app.worlds.len())
+                                    .unwrap_or(app.current_world_index);
+                                app.ws_set_client_world(client_id, Some(world_idx));
+                                app.ws_client_worlds.insert(client_id, ClientViewState {
+                                    world_index: world_idx,
+                                    visible_lines: 0,
+                                    dimensions: None,
+                                });
+                                // Send activity count
+                                app.ws_send_to_client(client_id, WsMessage::ActivityUpdate {
+                                    count: app.activity_count(),
+                                });
+                            } else {
+                                // Invalid key
+                                app.ws_send_to_client(client_id, WsMessage::AuthResponse {
+                                    success: false,
+                                    error: Some("Invalid auth key".to_string()),
+                                    username: None,
+                                    multiuser_mode: false,
+                                });
+                            }
+                        }
+                    }
+                    AppEvent::WsKeyRequest(client_id) => {
+                        // Generate a new auth key for the client using SHA256 hash
+                        use sha2::{Sha256, Digest};
+                        let mut hasher = Sha256::new();
+                        hasher.update(std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_nanos()
+                            .to_le_bytes());
+                        hasher.update(std::process::id().to_le_bytes());
+                        hasher.update(client_id.to_le_bytes());
+                        hasher.update(app.settings.websocket_auth_keys.len().to_le_bytes());
+                        let key = hex::encode(hasher.finalize());
+                        app.settings.websocket_auth_keys.push(key.clone());
+                        let _ = persistence::save_settings(&app);
+                        app.ws_send_to_client(client_id, WsMessage::KeyGenerated { auth_key: key });
+                    }
+                    AppEvent::WsKeyRevoke(_client_id, key) => {
+                        app.settings.websocket_auth_keys.retain(|k| k != &key);
+                        let _ = persistence::save_settings(&app);
                     }
                     AppEvent::WsClientMessage(client_id, msg) => {
                         // Extract current_world from AuthRequest before matching (avoids borrow issues)
@@ -12185,6 +12324,63 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                     if had_dimensions {
                         app.send_naws_to_all_worlds();
                     }
+                }
+                AppEvent::WsAuthKeyValidation(client_id, msg) => {
+                    // Validate auth key from AuthRequest
+                    if let WsMessage::AuthRequest { auth_key: Some(key), current_world, .. } = msg {
+                        let is_valid = app.settings.websocket_auth_keys.contains(&key);
+                        if is_valid {
+                            app.ws_set_client_authenticated(client_id, true);
+                            app.ws_send_to_client(client_id, WsMessage::AuthResponse {
+                                success: true,
+                                error: None,
+                                username: None,
+                                multiuser_mode: false,
+                            });
+                            let initial_state = app.build_initial_state();
+                            app.ws_send_to_client(client_id, initial_state);
+                            app.ws_mark_initial_state_sent(client_id);
+                            let world_idx = current_world
+                                .filter(|&w| w < app.worlds.len())
+                                .unwrap_or(app.current_world_index);
+                            app.ws_set_client_world(client_id, Some(world_idx));
+                            app.ws_client_worlds.insert(client_id, ClientViewState {
+                                world_index: world_idx,
+                                visible_lines: 0,
+                                dimensions: None,
+                            });
+                            app.ws_send_to_client(client_id, WsMessage::ActivityUpdate {
+                                count: app.activity_count(),
+                            });
+                        } else {
+                            app.ws_send_to_client(client_id, WsMessage::AuthResponse {
+                                success: false,
+                                error: Some("Invalid auth key".to_string()),
+                                username: None,
+                                multiuser_mode: false,
+                            });
+                        }
+                    }
+                }
+                AppEvent::WsKeyRequest(client_id) => {
+                    use sha2::{Sha256, Digest};
+                    let mut hasher = Sha256::new();
+                    hasher.update(std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_nanos()
+                        .to_le_bytes());
+                    hasher.update(std::process::id().to_le_bytes());
+                    hasher.update(client_id.to_le_bytes());
+                    hasher.update(app.settings.websocket_auth_keys.len().to_le_bytes());
+                    let key = hex::encode(hasher.finalize());
+                    app.settings.websocket_auth_keys.push(key.clone());
+                    let _ = persistence::save_settings(&app);
+                    app.ws_send_to_client(client_id, WsMessage::KeyGenerated { auth_key: key });
+                }
+                AppEvent::WsKeyRevoke(_client_id, key) => {
+                    app.settings.websocket_auth_keys.retain(|k| k != &key);
+                    let _ = persistence::save_settings(&app);
                 }
                 AppEvent::WsClientMessage(client_id, msg) => {
                     // Handle simple messages in drain loop
@@ -18436,7 +18632,7 @@ mod tests {
         let client_password = "test";
         let client_hash = hash_password(client_password);
         println!("Client sending hash: {}", client_hash);
-        let auth_msg = WsMessage::AuthRequest { password_hash: client_hash, username: None, current_world: None };
+        let auth_msg = WsMessage::AuthRequest { password_hash: client_hash, username: None, current_world: None, auth_key: None, request_key: false };
         let json = serde_json::to_string(&auth_msg).unwrap();
         ws_sink.send(WsRawMessage::Text(json.into())).await.unwrap();
 

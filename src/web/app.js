@@ -194,6 +194,8 @@
     let pendingAuthUsername = null;  // Username being authenticated (saved on success for Android auto-login)
     let deferredAutoLoginPassword = null;  // Saved password waiting for ServerHello
     let deferredAutoLoginUsername = null;  // Saved username waiting for ServerHello
+    let authKey = null;  // Device auth key for passwordless authentication
+    let authKeyPending = false;  // True when trying key-based auth (to fall back to password on failure)
     let hasReceivedInitialState = false;  // True after first InitialState (to preserve world on resync)
     let worlds = [];
     let currentWorldIndex = 0;
@@ -918,9 +920,42 @@
 
         setupEventListeners();
         updateAndroidUI();
+        loadAuthKey();  // Load saved auth key for passwordless login
         connect();
         updateTime();
         setInterval(updateTime, 1000);
+    }
+
+    // Load auth key from storage (Android or localStorage)
+    function loadAuthKey() {
+        if (window.Android && window.Android.getAuthKey) {
+            authKey = window.Android.getAuthKey();
+        } else if (typeof localStorage !== 'undefined') {
+            authKey = localStorage.getItem('clay_auth_key');
+        }
+        debugLog('loadAuthKey: ' + (authKey ? 'found key' : 'no key'));
+    }
+
+    // Save auth key to storage
+    function saveAuthKey(key) {
+        authKey = key;
+        if (window.Android && window.Android.saveAuthKey) {
+            window.Android.saveAuthKey(key);
+        } else if (typeof localStorage !== 'undefined') {
+            localStorage.setItem('clay_auth_key', key);
+        }
+        debugLog('saveAuthKey: saved key');
+    }
+
+    // Clear auth key from storage
+    function clearAuthKey() {
+        authKey = null;
+        if (window.Android && window.Android.clearAuthKey) {
+            window.Android.clearAuthKey();
+        } else if (typeof localStorage !== 'undefined') {
+            localStorage.removeItem('clay_auth_key');
+        }
+        debugLog('clearAuthKey: cleared');
     }
 
     // Get visible line count in output area
@@ -1362,6 +1397,11 @@
                 if (msg.multiuser_mode) {
                     enableMultiuserAuthUI();
                 }
+                // Try auth key first (if not multiuser mode - keys are single-user only)
+                if (!msg.multiuser_mode && authKey && tryAuthWithKey()) {
+                    // Key auth attempt sent, wait for response
+                    break;
+                }
                 // Handle deferred auto-login (Android saved password without username)
                 if (deferredAutoLoginPassword) {
                     const pwd = deferredAutoLoginPassword;
@@ -1386,6 +1426,7 @@
             case 'AuthResponse':
                 if (msg.success) {
                     authenticated = true;
+                    authKeyPending = false;  // Clear key-based auth flag
                     multiuserMode = msg.multiuser_mode || false;
                     showAuthModal(false);
                     elements.authError.textContent = '';
@@ -1408,6 +1449,16 @@
                         window.Android.startBackgroundService();
                     }
                 } else {
+                    // If this was a key-based auth failure, clear key and show password prompt
+                    if (authKeyPending) {
+                        debugLog('Key-based auth failed, clearing key and showing password prompt');
+                        authKeyPending = false;
+                        clearAuthKey();
+                        // Show password modal - don't show error for key failure
+                        showAuthModal(true);
+                        elements.authPassword.focus();
+                        break;
+                    }
                     elements.authError.textContent = msg.error || 'Authentication failed';
                     elements.authPassword.value = '';
                     pendingAuthPassword = null;
@@ -1430,6 +1481,14 @@
                     } else {
                         elements.authPassword.focus();
                     }
+                }
+                break;
+
+            case 'KeyGenerated':
+                // Server sent us a new auth key after successful password auth
+                if (msg.auth_key) {
+                    debugLog('Received auth key from server');
+                    saveAuthKey(msg.auth_key);
                 }
                 break;
 
@@ -2156,6 +2215,24 @@
         return false;
     }
 
+    // Try to authenticate with saved auth key (passwordless)
+    function tryAuthWithKey() {
+        if (!authKey || !ws || ws.readyState !== WebSocket.OPEN) return false;
+
+        debugLog('tryAuthWithKey: attempting key-based auth');
+        authKeyPending = true;
+        const msg = {
+            type: 'AuthRequest',
+            password_hash: '',  // Empty - using key instead
+            auth_key: authKey
+        };
+        if (currentWorldIndex !== undefined) {
+            msg.current_world = currentWorldIndex;
+        }
+        ws.send(JSON.stringify(msg));
+        return true;
+    }
+
     // Authenticate - sends directly via ws.send since authenticated is still false
     // passwordOverride and usernameOverride are used for Android auto-login
     function authenticate(passwordOverride, usernameOverride) {
@@ -2178,7 +2255,7 @@
 
         // Hash password with SHA-256
         hashPassword(password).then(hash => {
-            const msg = { type: 'AuthRequest', password_hash: hash };
+            const msg = { type: 'AuthRequest', password_hash: hash, request_key: true };
             if (username) {
                 msg.username = username;
             }
@@ -2190,7 +2267,7 @@
         }).catch(err => {
             // Try fallback directly if hashPassword somehow failed
             const hash = sha256Fallback(password);
-            const msg = { type: 'AuthRequest', password_hash: hash };
+            const msg = { type: 'AuthRequest', password_hash: hash, request_key: true };
             if (username) {
                 msg.username = username;
             }
