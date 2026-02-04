@@ -130,8 +130,8 @@ pub fn cmd_sh(args: &str) -> TfCommandResult {
 ///
 /// Sources:
 ///   '"file"     - Read lines from a file
-///   `"command"  - Read output from shell command
-///   #"command"  - Read output from TF command (not yet implemented)
+///   `"command"  - Read output from internal Clay/TF command
+///   !"command"  - Read output from shell command
 ///   text        - Send literal text (no special prefix)
 ///
 /// Options:
@@ -145,9 +145,10 @@ pub fn cmd_sh(args: &str) -> TfCommandResult {
 ///   #quote hello world           - Send "hello world" to MUD
 ///   #quote '"/etc/motd"          - Send each line of /etc/motd to MUD
 ///   #quote say '"/tmp/lines.txt" - Send "say <line>" for each line
-///   #quote `"ls -la"             - Send output of ls command
+///   #quote think `"/version"     - Send "think <version>" to MUD
+///   #quote !"ls -la"             - Send output of shell ls command
 ///   #quote -decho '"config.txt"  - Display file contents locally
-pub fn cmd_quote(args: &str) -> TfCommandResult {
+pub fn cmd_quote(engine: &mut super::TfEngine, args: &str) -> TfCommandResult {
     use super::QuoteDisposition;
     use std::io::{BufRead, BufReader};
     use std::process::{Command, Stdio};
@@ -361,8 +362,29 @@ pub fn cmd_quote(args: &str) -> TfCommandResult {
                 Err(e) => return TfCommandResult::Error(format!("Cannot open file '{}': {}", path, e)),
             }
         }
-        '`' | '!' => {
-            // Shell command source (both ` and ! are supported)
+        '`' => {
+            // Internal command source (Clay/TF command)
+            let result = super::parser::execute_command(engine, &source_value);
+            match result {
+                TfCommandResult::Success(Some(msg)) => {
+                    msg.lines()
+                        .map(|line| format!("{}{}{}", prefix, line, suffix))
+                        .collect()
+                }
+                TfCommandResult::Success(None) => {
+                    vec![]
+                }
+                TfCommandResult::Error(e) => {
+                    return TfCommandResult::Error(format!("Command '{}' failed: {}", source_value, e));
+                }
+                _ => {
+                    // Other result types (SendToMud, ClayCommand, etc.) don't produce capturable output
+                    vec![]
+                }
+            }
+        }
+        '!' => {
+            // Shell command source
             match Command::new("sh")
                 .arg("-c")
                 .arg(&source_value)
@@ -377,12 +399,28 @@ pub fn cmd_quote(args: &str) -> TfCommandResult {
                         .map(|line| format!("{}{}{}", prefix, line, suffix))
                         .collect()
                 }
-                Err(e) => return TfCommandResult::Error(format!("Cannot execute command '{}': {}", source_value, e)),
+                Err(e) => return TfCommandResult::Error(format!("Cannot execute shell command '{}': {}", source_value, e)),
             }
         }
         '#' => {
-            // TF command source - not implemented yet
-            return TfCommandResult::Error("#\"command\" source not yet implemented".to_string());
+            // Alternative syntax for internal commands (same as backtick)
+            let result = super::parser::execute_command(engine, &source_value);
+            match result {
+                TfCommandResult::Success(Some(msg)) => {
+                    msg.lines()
+                        .map(|line| format!("{}{}{}", prefix, line, suffix))
+                        .collect()
+                }
+                TfCommandResult::Success(None) => {
+                    vec![]
+                }
+                TfCommandResult::Error(e) => {
+                    return TfCommandResult::Error(format!("Command '{}' failed: {}", source_value, e));
+                }
+                _ => {
+                    vec![]
+                }
+            }
         }
         _ => unreachable!(),
     };
@@ -1457,8 +1495,10 @@ mod tests {
 
     #[test]
     fn test_cmd_quote() {
+        let mut engine = TfEngine::new();
+
         // Test literal text (no source specifier)
-        let result = cmd_quote("hello world");
+        let result = cmd_quote(&mut engine, "hello world");
         match result {
             TfCommandResult::Quote { lines, disposition, world, .. } => {
                 assert_eq!(lines, vec!["hello world"]);
@@ -1469,11 +1509,11 @@ mod tests {
         }
 
         // Test empty args
-        let result = cmd_quote("");
+        let result = cmd_quote(&mut engine, "");
         assert!(matches!(result, TfCommandResult::Error(_)));
 
         // Test with -decho option
-        let result = cmd_quote("-decho test message");
+        let result = cmd_quote(&mut engine, "-decho test message");
         match result {
             TfCommandResult::Quote { lines, disposition, world, .. } => {
                 assert_eq!(lines, vec!["test message"]);
@@ -1484,7 +1524,7 @@ mod tests {
         }
 
         // Test with -wworld option
-        let result = cmd_quote("-wmyworld hello");
+        let result = cmd_quote(&mut engine, "-wmyworld hello");
         match result {
             TfCommandResult::Quote { lines, disposition, world, .. } => {
                 assert_eq!(lines, vec!["hello"]);
@@ -1509,6 +1549,7 @@ mod tests {
     #[test]
     fn test_cmd_quote_file() {
         use std::io::Write;
+        let mut engine = TfEngine::new();
 
         // Create a temp file
         let temp_dir = std::env::temp_dir();
@@ -1522,7 +1563,7 @@ mod tests {
 
         // Test reading from file
         let path = temp_file.to_string_lossy();
-        let result = cmd_quote(&format!("'\"{}\"", path));
+        let result = cmd_quote(&mut engine, &format!("'\"{}\"", path));
         match result {
             TfCommandResult::Quote { lines, disposition, world, .. } => {
                 assert_eq!(lines.len(), 3);
@@ -1536,7 +1577,7 @@ mod tests {
         }
 
         // Test with prefix
-        let result = cmd_quote(&format!("say '\"{}\"", path));
+        let result = cmd_quote(&mut engine, &format!("say '\"{}\"", path));
         match result {
             TfCommandResult::Quote { lines, disposition, .. } => {
                 assert_eq!(lines.len(), 3);
@@ -1549,7 +1590,7 @@ mod tests {
         }
 
         // Test with -decho option
-        let result = cmd_quote(&format!("-decho '\"{}\"", path));
+        let result = cmd_quote(&mut engine, &format!("-decho '\"{}\"", path));
         match result {
             TfCommandResult::Quote { lines, disposition, .. } => {
                 assert_eq!(lines.len(), 3);
@@ -1564,8 +1605,10 @@ mod tests {
 
     #[test]
     fn test_cmd_quote_shell() {
-        // Test reading from shell command
-        let result = cmd_quote("`\"echo hello\"");
+        let mut engine = TfEngine::new();
+
+        // Test reading from shell command (using ! prefix)
+        let result = cmd_quote(&mut engine, "!\"echo hello\"");
         match result {
             TfCommandResult::Quote { lines, disposition, world, .. } => {
                 assert_eq!(lines.len(), 1);
@@ -1577,11 +1620,48 @@ mod tests {
         }
 
         // Test with prefix
-        let result = cmd_quote("say `\"echo world\"");
+        let result = cmd_quote(&mut engine, "say !\"echo world\"");
         match result {
             TfCommandResult::Quote { lines, .. } => {
                 assert_eq!(lines.len(), 1);
                 assert_eq!(lines[0], "say world");
+            }
+            _ => panic!("Expected Quote result, got {:?}", result),
+        }
+    }
+
+    #[test]
+    fn test_cmd_quote_internal() {
+        let mut engine = TfEngine::new();
+
+        // Test reading from internal command (using ` prefix)
+        // #version returns a success message
+        let result = cmd_quote(&mut engine, "`\"#version\"");
+        match result {
+            TfCommandResult::Quote { lines, disposition, .. } => {
+                assert!(!lines.is_empty());
+                assert!(lines[0].contains("Clay") || lines[0].contains("TF"));
+                assert_eq!(disposition, QuoteDisposition::Send);
+            }
+            _ => panic!("Expected Quote result, got {:?}", result),
+        }
+
+        // Test with prefix
+        let result = cmd_quote(&mut engine, "think `\"#version\"");
+        match result {
+            TfCommandResult::Quote { lines, .. } => {
+                assert!(!lines.is_empty());
+                assert!(lines[0].starts_with("think "));
+            }
+            _ => panic!("Expected Quote result, got {:?}", result),
+        }
+
+        // Test /version (Clay command) is also capturable
+        let result = cmd_quote(&mut engine, "think `\"/version\"");
+        match result {
+            TfCommandResult::Quote { lines, .. } => {
+                assert!(!lines.is_empty());
+                assert!(lines[0].starts_with("think Clay v"));
             }
             _ => panic!("Expected Quote result, got {:?}", result),
         }

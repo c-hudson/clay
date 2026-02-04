@@ -115,6 +115,16 @@ fn execute_command_impl(engine: &mut TfEngine, input: &str, skip_substitution: b
         };
     }
 
+    // Handle capturable Clay commands (those that return text output)
+    if input.starts_with('/') {
+        let cmd = input.split_whitespace().next().unwrap_or("");
+        match cmd {
+            "/version" => return TfCommandResult::Success(Some(crate::get_version_string())),
+            // Other / commands are not capturable - they have side effects handled by main loop
+            _ => return TfCommandResult::ClayCommand(input.to_string()),
+        }
+    }
+
     if !input.starts_with('#') {
         return TfCommandResult::NotTfCommand;
     }
@@ -235,7 +245,7 @@ fn execute_command_impl(engine: &mut TfEngine, input: &str, skip_substitution: b
         "time" => builtins::cmd_time(args),
         "lcd" => builtins::cmd_lcd(engine, args),
         "sh" => builtins::cmd_sh(args),
-        "quote" => builtins::cmd_quote(args),
+        "quote" => builtins::cmd_quote(engine, args),
         "recall" => builtins::cmd_recall(args),
         "gag" => builtins::cmd_gag(engine, args),
         "ungag" => builtins::cmd_ungag(engine, args),
@@ -1159,9 +1169,7 @@ Usage: $[function(args)] or in #expr/#test"#.to_string()
 
 /// #version - Show version info
 fn cmd_version() -> TfCommandResult {
-    TfCommandResult::Success(Some(
-        "Clay MUD Client with TinyFugue compatibility\nTF compatibility layer: Complete".to_string()
-    ))
+    TfCommandResult::Success(Some(crate::get_version_string()))
 }
 
 /// #expr expression - Evaluate expression and display result

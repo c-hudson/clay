@@ -488,11 +488,12 @@ Clay includes a TinyFugue compatibility layer using `#` prefix instead of `/`. T
   - Colors: `@{Crgb}` foreground (r,g,b = 0-5), `@{BCrgb}` background, `@{Cname}` named colors (red, green, blue, cyan, magenta, yellow, white, black)
 - `#send [-w world] text` - Send text to MUD
 - `#beep` - Terminal bell
-- `#quote [options] [prefix] source [suffix]` - Generate and send text from file, shell, or literal
-  - Sources: `'"file"` (read from file), `` `"command" `` (read shell output), or literal text
+- `#quote [options] [prefix] source [suffix]` - Generate and send text from file, command, or literal
+  - Sources: `'"file"` (read from file), `` `"command" `` (read internal command output), `!"command"` (read shell output), or literal text
   - Options: `-dsend` (default), `-decho` (display locally), `-dexec` (execute as TF), `-wworld`
   - Example: `#quote say '"/tmp/lines.txt"` sends "say <line>" for each line in file
-  - Example: `` #quote `"ls -la" `` sends output of ls command to MUD
+  - Example: `` #quote think `"/version" `` sends "think Clay v1.0..." to MUD (both `/version` and `#version` work)
+  - Example: `#quote !"ls -la"` sends output of shell ls command to MUD
 
 **Expressions:**
 - `#expr expression` - Evaluate and display result
