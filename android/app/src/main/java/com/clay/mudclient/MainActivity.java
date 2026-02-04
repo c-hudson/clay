@@ -48,6 +48,7 @@ public class MainActivity extends AppCompatActivity {
     private static final int NOTIFICATION_PERMISSION_REQUEST = 1001;
     private static final int BATTERY_OPTIMIZATION_REQUEST = 1002;
     private static final int KEEPALIVE_INTERVAL_MS = 60000; // 60 seconds (reduced from 30s for power savings)
+    private static final long BACKGROUND_SHUTDOWN_MS = 60 * 60 * 1000; // 1 hour - auto-disconnect when in background
 
     private WebView webView;
     private boolean connectionFailed = false;
@@ -62,6 +63,8 @@ public class MainActivity extends AppCompatActivity {
     // Removed duplicate screenOffWakeLock - ClayForegroundService already holds one
     private Handler keepaliveHandler;
     private Runnable keepaliveRunnable;
+    private Handler backgroundShutdownHandler;
+    private Runnable backgroundShutdownRunnable;
     private NativeWebSocket nativeWebSocket;
     private long lastMessageSentTime = 0;
     private long lastMessageAckTime = 0;
@@ -491,6 +494,60 @@ public class MainActivity extends AppCompatActivity {
         }
     }
 
+    private void startBackgroundShutdownTimer() {
+        // Only start timer if connected - no point otherwise
+        if (!isConnected) {
+            return;
+        }
+
+        if (backgroundShutdownHandler == null) {
+            backgroundShutdownHandler = new Handler(Looper.getMainLooper());
+        }
+
+        // Cancel any existing timer
+        cancelBackgroundShutdownTimer();
+
+        backgroundShutdownRunnable = new Runnable() {
+            @Override
+            public void run() {
+                if (isConnected) {
+                    android.util.Log.i("Clay", "Background timeout reached (1 hour), disconnecting to save power");
+                    // Stop the foreground service and disconnect
+                    isConnected = false;
+                    stopKeepalive();
+
+                    Intent serviceIntent = new Intent(MainActivity.this, ClayForegroundService.class);
+                    stopService(serviceIntent);
+
+                    // Close WebSocket
+                    if (nativeWebSocket != null) {
+                        nativeWebSocket.close();
+                        nativeWebSocket = null;
+                    }
+
+                    // Notify JavaScript that we disconnected due to timeout
+                    if (webView != null) {
+                        webView.evaluateJavascript(
+                            "if (typeof onBackgroundTimeout === 'function') onBackgroundTimeout();",
+                            null
+                        );
+                    }
+                }
+            }
+        };
+
+        backgroundShutdownHandler.postDelayed(backgroundShutdownRunnable, BACKGROUND_SHUTDOWN_MS);
+        android.util.Log.i("Clay", "Background shutdown timer started (1 hour)");
+    }
+
+    private void cancelBackgroundShutdownTimer() {
+        if (backgroundShutdownHandler != null && backgroundShutdownRunnable != null) {
+            backgroundShutdownHandler.removeCallbacks(backgroundShutdownRunnable);
+            backgroundShutdownRunnable = null;
+            android.util.Log.i("Clay", "Background shutdown timer cancelled");
+        }
+    }
+
     private void setupWebView() {
         WebSettings webSettings = webView.getSettings();
         webSettings.setJavaScriptEnabled(true);
@@ -810,6 +867,9 @@ public class MainActivity extends AppCompatActivity {
     protected void onResume() {
         super.onResume();
 
+        // Cancel background shutdown timer since user is back
+        cancelBackgroundShutdownTimer();
+
         // Don't interfere if initial delayed load is pending
         if (isInitialLoadPending) {
             return;
@@ -866,11 +926,14 @@ public class MainActivity extends AppCompatActivity {
     protected void onStop() {
         super.onStop();
         // WebView continues running if connected (foreground service keeps process alive)
+        // Start background shutdown timer to save power after 1 hour
+        startBackgroundShutdownTimer();
     }
 
     @Override
     protected void onDestroy() {
         stopKeepalive();
+        cancelBackgroundShutdownTimer();
         super.onDestroy();
     }
 
