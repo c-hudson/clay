@@ -160,6 +160,44 @@ pub fn cmd_quote(args: &str) -> TfCommandResult {
     let mut disposition = QuoteDisposition::Send;
     let mut world: Option<String> = None;
     let mut _synchronous = false;
+    let mut _on_prompt = false;  // -P flag: run on prompt
+    let mut _delay_secs: f64 = 0.0;  // Timing between lines (not yet used for async)
+
+    // Helper to parse time string: "seconds", "min:sec", or "hour:min:sec"
+    fn parse_time_spec(s: &str) -> Option<f64> {
+        if s == "S" {
+            return Some(0.0);  // Synchronous = no delay
+        }
+        if s == "P" {
+            return None;  // Prompt-based, handled separately
+        }
+        let parts: Vec<&str> = s.split(':').collect();
+        match parts.len() {
+            1 => parts[0].parse::<f64>().ok(),
+            2 => {
+                // Could be hours:minutes or minutes:seconds
+                // TF treats it as hours:minutes, but we'll be flexible
+                let a: f64 = parts[0].parse().ok()?;
+                let b: f64 = parts[1].parse().ok()?;
+                Some(a * 60.0 + b)  // Treat as minutes:seconds for practical use
+            }
+            3 => {
+                let hours: f64 = parts[0].parse().ok()?;
+                let mins: f64 = parts[1].parse().ok()?;
+                let secs: f64 = parts[2].parse().ok()?;
+                Some(hours * 3600.0 + mins * 60.0 + secs)
+            }
+            _ => None,
+        }
+    }
+
+    // Check if string looks like a time spec (digits, colons, dots, or S/P)
+    fn is_time_spec(s: &str) -> bool {
+        if s == "S" || s == "P" {
+            return true;
+        }
+        !s.is_empty() && s.chars().all(|c| c.is_ascii_digit() || c == ':' || c == '.')
+    }
 
     // Parse options
     while input.starts_with('-') {
@@ -179,12 +217,31 @@ pub fn cmd_quote(args: &str) -> TfCommandResult {
                 world = Some(opt[2..].to_string());
             } else if opt == "-S" {
                 _synchronous = true;
+            } else if opt == "-P" {
+                _on_prompt = true;
+            } else if opt.len() >= 2 && is_time_spec(&opt[1..]) {
+                // Timing option: -0, -1, -0.5, -1:30, -1:30:00, etc.
+                let time_str = &opt[1..];
+                if time_str == "P" {
+                    _on_prompt = true;
+                } else if let Some(secs) = parse_time_spec(time_str) {
+                    _delay_secs = secs;
+                    if time_str == "S" {
+                        _synchronous = true;
+                    }
+                } else {
+                    return TfCommandResult::Error(format!("Invalid timing option: {}", opt));
+                }
             } else {
                 return TfCommandResult::Error(format!("Unknown option: {}", opt));
             }
         } else {
-            // Option at end with no more args - validate it's a valid option, then error
-            if input.starts_with("-d") || input.starts_with("-w") || input == "-S" {
+            // Option at end with no more args - check if it's a valid option
+            if input.starts_with("-d") || input.starts_with("-w") || input == "-S" || input == "-P" {
+                return TfCommandResult::Error("No source specified after options".to_string());
+            }
+            // Check for timing option at end
+            if input.len() >= 2 && is_time_spec(&input[1..]) {
                 return TfCommandResult::Error("No source specified after options".to_string());
             }
             // Not an option - break to process as source
