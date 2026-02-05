@@ -165,7 +165,7 @@
         setupModal: document.getElementById('setup-modal'),
         setupCloseBtn: document.getElementById('setup-close-btn'),
         setupMoreModeToggle: document.getElementById('setup-more-mode-toggle'),
-        setupShowTagsToggle: document.getElementById('setup-show-tags-toggle'),
+        // Note: show tags removed from setup - controlled by F2 or /tag command
         setupAnsiMusicToggle: document.getElementById('setup-ansi-music-toggle'),
         setupTlsProxyToggle: document.getElementById('setup-tls-proxy-toggle'),
         setupWorldSwitchSelect: document.getElementById('setup-world-switch-select'),
@@ -277,7 +277,7 @@
     let setupPopupOpen = false;
     let setupMoreMode = true;
     let setupWorldSwitchMode = 'Unseen First';
-    let setupShowTags = false;
+    // Note: show tags removed from setup - controlled by F2 or /tag command
     let setupColorOffset = 0;
     let setupAnsiMusic = true;
     let setupTlsProxy = false;
@@ -4061,7 +4061,7 @@
         // Load current values
         setupMoreMode = moreModeEnabled;
         setupWorldSwitchMode = worldSwitchMode;
-        setupShowTags = showTags;
+        // Note: show tags removed from setup - controlled by F2 or /tag command
         setupAnsiMusic = ansiMusicEnabled;
         setupTlsProxy = tlsProxyEnabled;
         setupInputHeightValue = inputHeight;
@@ -4086,11 +4086,7 @@
         } else {
             elements.setupMoreModeToggle.classList.remove('active');
         }
-        if (setupShowTags) {
-            elements.setupShowTagsToggle.classList.add('active');
-        } else {
-            elements.setupShowTagsToggle.classList.remove('active');
-        }
+        // Note: show tags removed from setup - controlled by F2 or /tag command
         if (setupAnsiMusic) {
             elements.setupAnsiMusicToggle.classList.add('active');
         } else {
@@ -4123,7 +4119,7 @@
         // Apply locally
         moreModeEnabled = setupMoreMode;
         worldSwitchMode = setupWorldSwitchMode;
-        showTags = setupShowTags;
+        // Note: show tags removed from setup - controlled by F2 or /tag command
         ansiMusicEnabled = setupAnsiMusic;
         tlsProxyEnabled = setupTlsProxy;
         guiTheme = setupGuiTheme;
@@ -6245,10 +6241,7 @@
             setupMoreMode = !setupMoreMode;
             updateSetupPopupUI();
         };
-        elements.setupShowTagsToggle.onclick = function() {
-            setupShowTags = !setupShowTags;
-            updateSetupPopupUI();
-        };
+        // Note: show tags removed from setup - controlled by F2 or /tag command
         elements.setupAnsiMusicToggle.onclick = function() {
             setupAnsiMusic = !setupAnsiMusic;
             updateSetupPopupUI();

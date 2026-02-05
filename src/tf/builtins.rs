@@ -1456,6 +1456,7 @@ pub use super::macros::glob_to_regex;
 #[cfg(test)]
 mod tests {
     use super::*;
+    use super::super::QuoteDisposition;
 
     #[test]
     fn test_cmd_beep() {

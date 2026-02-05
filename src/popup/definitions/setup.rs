@@ -13,7 +13,7 @@ pub const SETUP_FIELD_SPELL_CHECK: FieldId = FieldId(2);
 pub const SETUP_FIELD_TEMP_CONVERT: FieldId = FieldId(3);
 pub const SETUP_FIELD_WORLD_SWITCHING: FieldId = FieldId(4);
 pub const SETUP_FIELD_DEBUG: FieldId = FieldId(5);
-pub const SETUP_FIELD_SHOW_TAGS: FieldId = FieldId(6);
+// Note: show_tags is now a temporary in-memory setting controlled by F2 or /tag command
 pub const SETUP_FIELD_INPUT_HEIGHT: FieldId = FieldId(7);
 pub const SETUP_FIELD_GUI_THEME: FieldId = FieldId(8);
 pub const SETUP_FIELD_TLS_PROXY: FieldId = FieldId(9);
@@ -56,7 +56,6 @@ pub fn create_setup_popup(
     temp_convert: bool,
     world_switching: &str,
     debug: bool,
-    show_tags: bool,
     input_height: i64,
     gui_theme: &str,
     tls_proxy: bool,
@@ -92,11 +91,6 @@ pub fn create_setup_popup(
             SETUP_FIELD_DEBUG,
             "Debug",
             FieldKind::toggle(debug),
-        ))
-        .with_field(Field::new(
-            SETUP_FIELD_SHOW_TAGS,
-            "Show Tags",
-            FieldKind::toggle(show_tags),
         ))
         .with_field(Field::new(
             SETUP_FIELD_INPUT_HEIGHT,
@@ -147,13 +141,13 @@ mod tests {
     fn test_setup_popup_creation() {
         let def = create_setup_popup(
             true, true, false, "unseen_first",
-            false, false, 3, "dark", false, "", "left",
+            false, 3, "dark", false, "", "left",
         );
         let state = PopupState::new(def);
 
         assert_eq!(state.definition.id, PopupId("setup"));
         assert_eq!(state.definition.title, "Setup");
-        assert_eq!(state.definition.fields.len(), 11);
+        assert_eq!(state.definition.fields.len(), 10);
         assert_eq!(state.definition.buttons.len(), 2);
     }
 
@@ -161,7 +155,7 @@ mod tests {
     fn test_setup_popup_values() {
         let def = create_setup_popup(
             true, false, true, "alphabetical",
-            true, true, 5, "light", true, "/custom/dict", "left",
+            true, 5, "light", true, "/custom/dict", "left",
         );
         let state = PopupState::new(def);
 
@@ -170,7 +164,6 @@ mod tests {
         assert_eq!(state.get_bool(SETUP_FIELD_TEMP_CONVERT), Some(true));
         assert_eq!(state.get_selected(SETUP_FIELD_WORLD_SWITCHING), Some("alphabetical"));
         assert_eq!(state.get_bool(SETUP_FIELD_DEBUG), Some(true));
-        assert_eq!(state.get_bool(SETUP_FIELD_SHOW_TAGS), Some(true));
         assert_eq!(state.get_number(SETUP_FIELD_INPUT_HEIGHT), Some(5));
         assert_eq!(state.get_selected(SETUP_FIELD_GUI_THEME), Some("light"));
         assert_eq!(state.get_bool(SETUP_FIELD_TLS_PROXY), Some(true));

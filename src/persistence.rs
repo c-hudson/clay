@@ -104,7 +104,7 @@ pub fn save_settings(app: &App) -> io::Result<()> {
     writeln!(file, "spell_check={}", app.settings.spell_check_enabled)?;
     writeln!(file, "temp_convert={}", app.settings.temp_convert_enabled)?;
     writeln!(file, "world_switch_mode={}", app.settings.world_switch_mode.name())?;
-    writeln!(file, "show_tags={}", app.show_tags)?;
+    // Note: show_tags is now a temporary in-memory setting (F2 or /tag), not persisted
     writeln!(file, "debug_enabled={}", app.settings.debug_enabled)?;
     writeln!(file, "ansi_music_enabled={}", app.settings.ansi_music_enabled)?;
     writeln!(file, "input_height={}", app.input_height)?;

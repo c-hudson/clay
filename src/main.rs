@@ -2508,7 +2508,6 @@ impl App {
             self.settings.temp_convert_enabled,
             world_switching,
             self.settings.debug_enabled,
-            self.show_tags,
             self.input_height as i64,
             self.settings.gui_theme.name(),
             self.settings.tls_proxy_enabled,
@@ -5452,7 +5451,7 @@ fn handle_remote_client_key(
                 app.settings.spell_check_enabled = settings.spell_check;
                 app.settings.temp_convert_enabled = settings.temp_convert;
                 app.settings.world_switch_mode = WorldSwitchMode::from_name(&settings.world_switching);
-                app.show_tags = settings.show_tags;
+                // Note: show_tags is not in setup anymore - controlled by F2 or /tag
                 app.input_height = settings.input_height as u16;
                 app.input.visible_height = app.input_height;
                 app.settings.gui_theme = Theme::from_name(&settings.gui_theme);
@@ -6081,7 +6080,6 @@ struct SetupSettings {
     temp_convert: bool,
     world_switching: String,
     debug: bool,
-    show_tags: bool,
     input_height: i64,
     gui_theme: String,
     tls_proxy: bool,
@@ -6158,7 +6156,7 @@ fn handle_new_popup_key(app: &mut App, key: KeyEvent) -> NewPopupAction {
     };
     use popup::definitions::setup::{
         SETUP_FIELD_MORE_MODE, SETUP_FIELD_SPELL_CHECK, SETUP_FIELD_TEMP_CONVERT,
-        SETUP_FIELD_WORLD_SWITCHING, SETUP_FIELD_DEBUG, SETUP_FIELD_SHOW_TAGS,
+        SETUP_FIELD_WORLD_SWITCHING, SETUP_FIELD_DEBUG,
         SETUP_FIELD_INPUT_HEIGHT, SETUP_FIELD_GUI_THEME, SETUP_FIELD_TLS_PROXY,
         SETUP_FIELD_DICTIONARY, SETUP_FIELD_EDITOR_SIDE, SETUP_BTN_SAVE, SETUP_BTN_CANCEL,
     };
@@ -6365,7 +6363,6 @@ fn handle_new_popup_key(app: &mut App, key: KeyEvent) -> NewPopupAction {
                     world_switching: state.get_selected(SETUP_FIELD_WORLD_SWITCHING)
                         .unwrap_or("unseen_first").to_string(),
                     debug: state.get_bool(SETUP_FIELD_DEBUG).unwrap_or(false),
-                    show_tags: state.get_bool(SETUP_FIELD_SHOW_TAGS).unwrap_or(false),
                     input_height: state.get_number(SETUP_FIELD_INPUT_HEIGHT).unwrap_or(3),
                     gui_theme: state.get_selected(SETUP_FIELD_GUI_THEME)
                         .unwrap_or("dark").to_string(),
@@ -6377,12 +6374,41 @@ fn handle_new_popup_key(app: &mut App, key: KeyEvent) -> NewPopupAction {
                 }
             };
 
+            // Check if current field is a text field
+            let is_text_field = state.selected_field().map(|f| f.kind.is_text()).unwrap_or(false);
+
             match key.code {
                 Esc => {
-                    app.popup_manager.close();
+                    if state.editing {
+                        state.cancel_edit();
+                    } else {
+                        app.popup_manager.close();
+                    }
                 }
-                Enter | Char(' ') => {
-                    if state.is_on_button() {
+                Enter => {
+                    if state.editing {
+                        state.commit_edit();
+                    } else if state.is_on_button() {
+                        if state.is_button_focused(SETUP_BTN_SAVE) {
+                            let settings = extract_settings();
+                            app.popup_manager.close();
+                            return NewPopupAction::SetupSaved(settings);
+                        } else if state.is_button_focused(SETUP_BTN_CANCEL) {
+                            app.popup_manager.close();
+                        }
+                    } else {
+                        // Toggle current field or start editing text field
+                        if is_text_field {
+                            state.start_edit();
+                        } else {
+                            state.toggle_current();
+                        }
+                    }
+                }
+                Char(' ') => {
+                    if state.editing {
+                        state.insert_char(' ');
+                    } else if state.is_on_button() {
                         if state.is_button_focused(SETUP_BTN_SAVE) {
                             let settings = extract_settings();
                             app.popup_manager.close();
@@ -6396,14 +6422,26 @@ fn handle_new_popup_key(app: &mut App, key: KeyEvent) -> NewPopupAction {
                     }
                 }
                 Up => {
+                    // Commit any current edit before moving
+                    if state.editing {
+                        state.commit_edit();
+                    }
                     if state.is_on_button() {
                         // Go back to last field from button row
                         state.select_last_field();
                     } else {
                         state.prev_field();
                     }
+                    // Auto-start editing if new field is text
+                    if state.selected_field().map(|f| f.kind.is_text()).unwrap_or(false) {
+                        state.start_edit();
+                    }
                 }
                 Down => {
+                    // Commit any current edit before moving
+                    if state.editing {
+                        state.commit_edit();
+                    }
                     if state.is_on_button() {
                         // Go back to last field from button row
                         state.select_last_field();
@@ -6411,16 +6449,39 @@ fn handle_new_popup_key(app: &mut App, key: KeyEvent) -> NewPopupAction {
                         // Move to next field (don't go to buttons)
                         state.next_field();
                     }
+                    // Auto-start editing if new field is text
+                    if state.selected_field().map(|f| f.kind.is_text()).unwrap_or(false) {
+                        state.start_edit();
+                    }
                 }
                 Left => {
-                    // Decrease number or cycle select
-                    state.decrease_current();
+                    if is_text_field {
+                        // Text field: move cursor (start editing if needed)
+                        if !state.editing {
+                            state.start_edit();
+                        }
+                        state.cursor_left();
+                    } else {
+                        // Decrease number or cycle select
+                        state.decrease_current();
+                    }
                 }
                 Right => {
-                    // Increase number or cycle select
-                    state.increase_current();
+                    if is_text_field {
+                        // Text field: move cursor (start editing if needed)
+                        if !state.editing {
+                            state.start_edit();
+                        }
+                        state.cursor_right();
+                    } else {
+                        // Increase number or cycle select
+                        state.increase_current();
+                    }
                 }
                 Tab => {
+                    if state.editing {
+                        state.commit_edit();
+                    }
                     if state.is_on_button() {
                         state.next_button();
                     } else {
@@ -6428,19 +6489,67 @@ fn handle_new_popup_key(app: &mut App, key: KeyEvent) -> NewPopupAction {
                     }
                 }
                 BackTab => {
+                    if state.editing {
+                        state.commit_edit();
+                    }
                     if state.is_on_button() {
                         state.prev_button();
                     } else {
                         state.select_last_field();
+                        // Auto-start editing if new field is text
+                        if state.selected_field().map(|f| f.kind.is_text()).unwrap_or(false) {
+                            state.start_edit();
+                        }
                     }
                 }
-                Char('s') | Char('S') => {
+                Backspace => {
+                    if is_text_field {
+                        if !state.editing {
+                            state.start_edit();
+                        }
+                        state.backspace();
+                    }
+                }
+                Delete => {
+                    if is_text_field {
+                        if !state.editing {
+                            state.start_edit();
+                        }
+                        state.delete_char();
+                    }
+                }
+                Home => {
+                    if is_text_field {
+                        if !state.editing {
+                            state.start_edit();
+                        }
+                        state.cursor_home();
+                    }
+                }
+                End => {
+                    if is_text_field {
+                        if !state.editing {
+                            state.start_edit();
+                        }
+                        state.cursor_end();
+                    }
+                }
+                Char('s') | Char('S') if !state.editing => {
                     let settings = extract_settings();
                     app.popup_manager.close();
                     return NewPopupAction::SetupSaved(settings);
                 }
-                Char('c') | Char('C') => {
+                Char('c') | Char('C') if !state.editing => {
                     app.popup_manager.close();
+                }
+                Char(c) => {
+                    if state.editing {
+                        state.insert_char(c);
+                    } else if is_text_field {
+                        // Start editing and insert character
+                        state.start_edit();
+                        state.insert_char(c);
+                    }
                 }
                 _ => {}
             }
@@ -14021,7 +14130,7 @@ fn handle_key_event(key: KeyEvent, app: &mut App) -> KeyAction {
                     WorldSwitchMode::Alphabetical
                 };
                 app.settings.debug_enabled = settings.debug;
-                app.show_tags = settings.show_tags;
+                // Note: show_tags is not in setup anymore - controlled by F2 or /tag
                 app.input_height = settings.input_height as u16;
                 app.settings.gui_theme = Theme::from_name(&settings.gui_theme);
                 app.settings.tls_proxy_enabled = settings.tls_proxy;

@@ -6073,7 +6073,7 @@ impl eframe::App for RemoteGuiApp {
                 let mut temp_convert = self.temp_convert_enabled;
                 let mut world_switch = self.world_switch_mode;
                 let debug_enabled = self.debug_enabled;
-                let mut show_tags = self.show_tags;
+                // Note: show_tags is not in setup anymore - controlled by F2 or /tag
                 let mut ansi_music = self.ansi_music_enabled;
                 let mut tls_proxy = self.tls_proxy_enabled;
                 let mut input_height = self.input_height;
@@ -6496,26 +6496,23 @@ impl eframe::App for RemoteGuiApp {
                                 });
                                 ui.add_space(6.0);
 
-                                // Row 2: Show Tags | ANSI Music
+                                // Row 2: ANSI Music | Temp Convert
                                 ui.horizontal(|ui| {
                                     ui.set_height(row_height);
                                     ui.allocate_ui(egui::vec2(col_total_width, row_height), |ui| {
-                                        toggle_col(ui, "SHOW TAGS", "show_tags_toggle", &mut show_tags);
+                                        toggle_col(ui, "ANSI MUSIC", "ansi_music_toggle", &mut ansi_music);
                                     });
                                     ui.allocate_ui(egui::vec2(col_total_width, row_height), |ui| {
-                                        toggle_col(ui, "ANSI MUSIC", "ansi_music_toggle", &mut ansi_music);
+                                        toggle_col(ui, "TEMP CONVERT", "temp_convert_toggle", &mut temp_convert);
                                     });
                                 });
                                 ui.add_space(6.0);
 
-                                // Row 3: TLS Proxy | Temp Convert
+                                // Row 3: TLS Proxy
                                 ui.horizontal(|ui| {
                                     ui.set_height(row_height);
                                     ui.allocate_ui(egui::vec2(col_total_width, row_height), |ui| {
                                         toggle_col(ui, "TLS PROXY", "tls_proxy_toggle", &mut tls_proxy);
-                                    });
-                                    ui.allocate_ui(egui::vec2(col_total_width, row_height), |ui| {
-                                        toggle_col(ui, "TEMP CONVERT", "temp_convert_toggle", &mut temp_convert);
                                     });
                                 });
                         });
@@ -6536,7 +6533,7 @@ impl eframe::App for RemoteGuiApp {
                 self.temp_convert_enabled = temp_convert;
                 self.world_switch_mode = world_switch;
                 self.debug_enabled = debug_enabled;
-                self.show_tags = show_tags;
+                // Note: show_tags is not in setup anymore - controlled by F2 or /tag
                 self.ansi_music_enabled = ansi_music;
                 self.tls_proxy_enabled = tls_proxy;
                 self.input_height = input_height;
