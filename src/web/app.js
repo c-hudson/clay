@@ -2167,6 +2167,11 @@
 
         // Also request server to release pending lines
         if (serverPending > 0) {
+            // Optimistic UI update: immediately reduce pending_count so rapid PageDown
+            // presses don't send redundant requests. Server will correct with PendingLinesUpdate.
+            const toRelease = Math.min(count, serverPending);
+            world.pending_count = Math.max(0, serverPending - toRelease);
+            updateStatusBar();
             send({ type: 'ReleasePending', world_index: currentWorldIndex, count: count });
         }
     }
@@ -2183,6 +2188,9 @@
 
         // Also request server to release all pending lines
         if (serverPending > 0) {
+            // Optimistic UI update: immediately set pending_count to 0
+            world.pending_count = 0;
+            updateStatusBar();
             send({ type: 'ReleasePending', world_index: currentWorldIndex, count: 0 });
         }
     }

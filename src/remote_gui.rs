@@ -3309,6 +3309,11 @@ impl eframe::App for RemoteGuiApp {
                                 // Send ReleasePending to server with this client's visible line count
                                 // Server will release lines and broadcast to all clients
                                 let release_count = self.output_visible_lines.saturating_sub(2).max(1);
+                                // Optimistic UI update: immediately reduce pending_count so rapid Tab
+                                // presses don't send redundant requests. Server will correct with PendingLinesUpdate.
+                                let to_release = release_count.min(self.worlds[self.current_world].pending_count);
+                                self.worlds[self.current_world].pending_count =
+                                    self.worlds[self.current_world].pending_count.saturating_sub(to_release);
                                 if let Some(ref tx) = self.ws_tx {
                                     let _ = tx.send(WsMessage::ReleasePending {
                                         world_index: self.current_world,

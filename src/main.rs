@@ -5767,6 +5767,8 @@ fn handle_remote_client_key(
         app.last_escape = None;
         let has_pending = !app.current_world().pending_lines.is_empty() || app.current_world().pending_count > 0;
         if app.current_world().paused && has_pending {
+            // Optimistic UI update: immediately clear pending_count
+            app.current_world_mut().pending_count = 0;
             // Send release all (count=0 means release all)
             let _ = ws_tx.send(WsMessage::ReleasePending {
                 world_index: app.current_world_index,
@@ -5876,9 +5878,14 @@ fn handle_remote_client_key(
             // Use pending_count for console mode (synced from daemon), pending_lines for daemon mode
             let has_pending = !app.current_world().pending_lines.is_empty() || app.current_world().pending_count > 0;
             if app.current_world().paused && has_pending {
+                // Optimistic UI update: immediately reduce pending_count so rapid Tab
+                // presses don't send redundant requests. Server will correct with PendingLinesUpdate.
+                let release_count = app.output_height.saturating_sub(2) as usize;
+                let to_release = release_count.min(app.current_world().pending_count);
+                app.current_world_mut().pending_count = app.current_world().pending_count.saturating_sub(to_release);
                 let _ = ws_tx.send(WsMessage::ReleasePending {
                     world_index: app.current_world_index,
-                    count: app.output_height.saturating_sub(2) as usize,
+                    count: release_count,
                 });
             } else if !app.current_world().is_at_bottom() {
                 // Scroll down (towards newer content) = increase scroll_offset
