@@ -1870,7 +1870,7 @@ impl World {
     }
 
     /// Log more-mode debug info to clay.more.log
-    fn log_more_debug(&self, event: &str, line: &str) {
+    fn log_more_debug(&self, event: &str, line: &str, visual_lines: usize) {
         use std::io::Write;
         if let Ok(mut file) = std::fs::OpenOptions::new()
             .create(true)
@@ -1878,15 +1878,16 @@ impl World {
             .open("clay.more.log")
         {
             let lt = local_time_now();
-            let truncated: String = line.chars().take(50).collect();
+            let truncated: String = strip_ansi_codes(line).chars().take(50).collect();
             let _ = writeln!(
                 file,
-                "[{:02}:{:02}:{:02}] world={} lines_since_pause={} event={} text={:?}",
+                "[{:02}:{:02}:{:02}] world={} lines_since_pause={} event={} text={:?} [lines:{}]",
                 lt.hour, lt.minute, lt.second,
                 self.name,
                 self.lines_since_pause,
                 event,
-                truncated
+                truncated,
+                visual_lines
             );
         }
     }
@@ -2021,7 +2022,7 @@ impl World {
                         self.first_unseen_at = Some(std::time::Instant::now());
                     }
                 }
-                self.log_more_debug("to_pending", line);
+                self.log_more_debug("to_pending", line, visual_lines);
                 self.pending_lines.push(new_line);
                 if is_partial {
                     self.partial_line = line.to_string();
@@ -2029,7 +2030,7 @@ impl World {
                 }
             } else if triggers_pause {
                 // Add line to output_lines BEFORE pausing so it's visible when we scroll to bottom
-                self.log_more_debug("TRIGGERS_MORE", line);
+                self.log_more_debug("TRIGGERS_MORE", line, visual_lines);
                 self.output_lines.push(new_line);
                 self.lines_since_pause += visual_lines;
                 if !is_current {
@@ -2047,7 +2048,7 @@ impl World {
                     self.partial_in_pending = false; // It went to output_lines, not pending
                 }
             } else {
-                self.log_more_debug("to_output", line);
+                self.log_more_debug("to_output", line, visual_lines);
                 self.output_lines.push(new_line);
                 self.lines_since_pause += visual_lines;
                 if !is_current {
@@ -2101,7 +2102,7 @@ impl World {
         }
         if self.pending_lines.is_empty() {
             self.paused = false;
-            self.log_more_debug("RESET_release_pending_all", "");
+            self.log_more_debug("RESET_release_pending_all", "", 0);
             self.lines_since_pause = 0;
             // If partial was in pending, it's now in output
             if self.partial_in_pending {
@@ -2109,14 +2110,14 @@ impl World {
             }
         } else {
             // Reset counter for next batch
-            self.log_more_debug("RESET_release_pending_batch", "");
+            self.log_more_debug("RESET_release_pending_batch", "", 0);
             self.lines_since_pause = 0;
         }
         self.scroll_to_bottom();
     }
 
     fn release_all_pending(&mut self) {
-        self.log_more_debug("RESET_release_all_pending", "");
+        self.log_more_debug("RESET_release_all_pending", "", 0);
         self.output_lines.append(&mut self.pending_lines);
         self.paused = false;
         self.lines_since_pause = 0;
@@ -3103,6 +3104,11 @@ impl App {
 
     fn switch_world(&mut self, index: usize) {
         if index < self.worlds.len() && index != self.current_world_index {
+            // Reset lines_since_pause for the old world if more-mode hasn't triggered
+            let old_index = self.current_world_index;
+            if self.worlds[old_index].pending_lines.is_empty() {
+                self.worlds[old_index].lines_since_pause = 0;
+            }
             // Track previous world for Alt+w fallback
             self.previous_world_index = Some(self.current_world_index);
             self.current_world_index = index;
@@ -11098,6 +11104,15 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                             WsMessage::MarkWorldSeen { world_index } => {
                                 // A remote client has viewed this world - update their current_world
                                 if world_index < app.worlds.len() {
+                                    // Reset lines_since_pause for the old world if switching away and more-mode hasn't triggered
+                                    if let Some(old_state) = app.ws_client_worlds.get(&client_id) {
+                                        let old_idx = old_state.world_index;
+                                        if old_idx != world_index && old_idx < app.worlds.len() {
+                                            if app.worlds[old_idx].pending_lines.is_empty() {
+                                                app.worlds[old_idx].lines_since_pause = 0;
+                                            }
+                                        }
+                                    }
                                     // Track which world this client is viewing (sync cache)
                                     let visible_lines = app.ws_client_worlds
                                         .get(&client_id)
@@ -13725,6 +13740,15 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                         WsMessage::MarkWorldSeen { world_index } => {
                             // A remote client has viewed this world - update their current_world
                             if world_index < app.worlds.len() {
+                                // Reset lines_since_pause for the old world if switching away and more-mode hasn't triggered
+                                if let Some(old_state) = app.ws_client_worlds.get(&client_id) {
+                                    let old_idx = old_state.world_index;
+                                    if old_idx != world_index && old_idx < app.worlds.len() {
+                                        if app.worlds[old_idx].pending_lines.is_empty() {
+                                            app.worlds[old_idx].lines_since_pause = 0;
+                                        }
+                                    }
+                                }
                                 // Track which world this client is viewing (sync cache)
                                 let visible_lines = app.ws_client_worlds
                                     .get(&client_id)
@@ -14968,7 +14992,7 @@ fn handle_key_event(key: KeyEvent, app: &mut App) -> KeyAction {
             if !input.is_empty() || app.current_world().connected {
                 // Always reset counter when user sends a command
                 // This matches daemon.rs behavior and prevents spurious pausing
-                app.current_world_mut().log_more_debug("RESET_user_command", &input);
+                app.current_world_mut().log_more_debug("RESET_user_command", &input, 0);
                 app.current_world_mut().lines_since_pause = 0;
                 // Also clear paused flag if no pending lines
                 // This prevents staying paused after the triggering line when user sends a command
