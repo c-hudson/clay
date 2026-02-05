@@ -589,6 +589,21 @@ pub async fn handle_daemon_ws_message(
                         from_server: false,
                     });
                 }
+                Command::Translate { lang, prefix, text } => {
+                    // /translate requires async HTTP - send back to client for local execution
+                    app.ws_send_to_client(client_id, WsMessage::ExecuteLocalCommand {
+                        command: format!("/translate {} {} {}", lang, prefix, text),
+                    });
+                }
+                Command::TranslateUsage => {
+                    app.ws_broadcast(WsMessage::ServerData {
+                        world_index,
+                        data: "Usage: /translate <lang> <prefix> <text>".to_string(),
+                        is_viewed: false,
+                        ts: current_timestamp_secs(),
+                        from_server: false,
+                    });
+                }
                 Command::Unknown { cmd } => {
                     app.ws_broadcast(WsMessage::ServerData {
                         world_index,

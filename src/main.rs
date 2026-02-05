@@ -1062,6 +1062,10 @@ pub enum Command {
     Urban { prefix: String, word: String },
     /// /urban usage error
     UrbanUsage,
+    /// /translate <lang> <prefix> <text> - translate text and send with prefix
+    Translate { lang: String, prefix: String, text: String },
+    /// /translate usage error
+    TranslateUsage,
     /// /<action_name> [args] - execute action
     ActionCommand { name: String, args: String },
     /// Not a command (regular text to send to MUD)
@@ -1161,6 +1165,17 @@ pub fn parse_command(input: &str) -> Command {
                 }
             } else {
                 Command::UrbanUsage
+            }
+        }
+        "/translate" | "/tr" => {
+            if args.len() >= 3 {
+                Command::Translate {
+                    lang: args[0].to_string(),
+                    prefix: args[1].to_string(),
+                    text: args[2..].join(" "),
+                }
+            } else {
+                Command::TranslateUsage
             }
         }
         _ => {
@@ -11030,6 +11045,21 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                             from_server: false,
                                         });
                                     }
+                                    Command::Translate { lang, prefix, text } => {
+                                        // /translate requires async HTTP - send back to client for local execution
+                                        app.ws_send_to_client(client_id, WsMessage::ExecuteLocalCommand {
+                                            command: format!("/translate {} {} {}", lang, prefix, text),
+                                        });
+                                    }
+                                    Command::TranslateUsage => {
+                                        app.ws_send_to_client(client_id, WsMessage::ServerData {
+                                            world_index,
+                                            data: "Usage: /translate <lang> <prefix> <text>".to_string(),
+                                            is_viewed: false,
+                                            ts: current_timestamp_secs(),
+                                            from_server: false,
+                                        });
+                                    }
                                 }
                             }
                             WsMessage::SwitchWorld { world_index } => {
@@ -13357,6 +13387,21 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                     app.ws_send_to_client(client_id, WsMessage::ServerData {
                                         world_index,
                                         data: "Usage: /urban <prefix> <word>".to_string(),
+                                        is_viewed: false,
+                                        ts: current_timestamp_secs(),
+                                        from_server: false,
+                                    });
+                                }
+                                Command::Translate { lang, prefix, text } => {
+                                    // /translate requires async HTTP - send back to client for local execution
+                                    app.ws_send_to_client(client_id, WsMessage::ExecuteLocalCommand {
+                                        command: format!("/translate {} {} {}", lang, prefix, text),
+                                    });
+                                }
+                                Command::TranslateUsage => {
+                                    app.ws_send_to_client(client_id, WsMessage::ServerData {
+                                        world_index,
+                                        data: "Usage: /translate <lang> <prefix> <text>".to_string(),
                                         is_viewed: false,
                                         ts: current_timestamp_secs(),
                                         from_server: false,
@@ -15766,6 +15811,121 @@ async fn lookup_urban_definition(word: &str) -> Result<String, String> {
     Ok(result)
 }
 
+/// Convert language name or code to ISO 639-1 code (case-insensitive)
+fn normalize_language_code(lang: &str) -> String {
+    let lower = lang.to_lowercase();
+    match lower.as_str() {
+        // Already a 2-letter code - return as-is
+        "en" | "es" | "fr" | "de" | "it" | "pt" | "ru" | "zh" | "ja" | "ko" |
+        "ar" | "nl" | "pl" | "sv" | "da" | "no" | "fi" | "cs" | "el" | "he" |
+        "hi" | "hu" | "id" | "ms" | "ro" | "sk" | "th" | "tr" | "uk" | "vi" |
+        "bg" | "ca" | "hr" | "et" | "lv" | "lt" | "sl" | "sr" | "tl" | "fa" => lower,
+        // Full language names
+        "english" => "en".to_string(),
+        "spanish" | "espanol" | "español" => "es".to_string(),
+        "french" | "francais" | "français" => "fr".to_string(),
+        "german" | "deutsch" => "de".to_string(),
+        "italian" | "italiano" => "it".to_string(),
+        "portuguese" | "portugues" | "português" => "pt".to_string(),
+        "russian" | "russkiy" | "русский" => "ru".to_string(),
+        "chinese" | "mandarin" | "zhongwen" => "zh".to_string(),
+        "japanese" | "nihongo" => "ja".to_string(),
+        "korean" | "hangugeo" => "ko".to_string(),
+        "arabic" => "ar".to_string(),
+        "dutch" | "nederlands" => "nl".to_string(),
+        "polish" | "polski" => "pl".to_string(),
+        "swedish" | "svenska" => "sv".to_string(),
+        "danish" | "dansk" => "da".to_string(),
+        "norwegian" | "norsk" => "no".to_string(),
+        "finnish" | "suomi" => "fi".to_string(),
+        "czech" | "cesky" | "čeština" => "cs".to_string(),
+        "greek" | "ellinika" => "el".to_string(),
+        "hebrew" | "ivrit" => "he".to_string(),
+        "hindi" => "hi".to_string(),
+        "hungarian" | "magyar" => "hu".to_string(),
+        "indonesian" | "bahasa" => "id".to_string(),
+        "malay" | "melayu" => "ms".to_string(),
+        "romanian" | "romana" | "română" => "ro".to_string(),
+        "slovak" | "slovencina" => "sk".to_string(),
+        "thai" => "th".to_string(),
+        "turkish" | "turkce" | "türkçe" => "tr".to_string(),
+        "ukrainian" | "ukrainska" => "uk".to_string(),
+        "vietnamese" | "tiengviet" => "vi".to_string(),
+        "bulgarian" | "balgarski" => "bg".to_string(),
+        "catalan" | "catala" | "català" => "ca".to_string(),
+        "croatian" | "hrvatski" => "hr".to_string(),
+        "estonian" | "eesti" => "et".to_string(),
+        "latvian" | "latviesu" => "lv".to_string(),
+        "lithuanian" | "lietuviu" => "lt".to_string(),
+        "slovenian" | "slovenscina" => "sl".to_string(),
+        "serbian" | "srpski" => "sr".to_string(),
+        "tagalog" | "filipino" => "tl".to_string(),
+        "persian" | "farsi" => "fa".to_string(),
+        // Default: assume it's a code and pass through
+        _ => lower,
+    }
+}
+
+/// Translate text using MyMemory API (free, no API key required for up to 1000 words/day)
+async fn lookup_translation(text: &str, target_lang: &str) -> Result<String, String> {
+    // Normalize language input (accepts both codes and names)
+    let lang_code = normalize_language_code(target_lang);
+
+    // MyMemory API uses langpair format: source|target
+    // Using "autodetect" as source to auto-detect the input language
+    let encoded_text: String = url::form_urlencoded::Serializer::new(String::new())
+        .append_pair("q", text)
+        .append_pair("langpair", &format!("autodetect|{}", lang_code))
+        .finish();
+    let url = format!("https://api.mymemory.translated.net/get?{}", encoded_text);
+
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .build()
+        .map_err(|e| format!("Failed to create HTTP client: {}", e))?;
+
+    let response = client
+        .get(&url)
+        .send()
+        .await
+        .map_err(|e| format!("HTTP request failed: {}", e))?;
+
+    if !response.status().is_success() {
+        return Err(format!("API error: {}", response.status()));
+    }
+
+    let json: serde_json::Value = response
+        .json()
+        .await
+        .map_err(|e| format!("Failed to parse JSON: {}", e))?;
+
+    // Check for error response
+    if let Some(response_status) = json.get("responseStatus").and_then(|s| s.as_i64()) {
+        if response_status != 200 {
+            let error_msg = json.get("responseDetails")
+                .and_then(|d| d.as_str())
+                .unwrap_or("Unknown error");
+            return Err(format!("Translation failed: {}", error_msg));
+        }
+    }
+
+    // Get the translated text
+    let translated = json.get("responseData")
+        .and_then(|d| d.get("translatedText"))
+        .and_then(|t| t.as_str())
+        .ok_or_else(|| "No translation found in response".to_string())?;
+
+    // Clean up: ensure single line
+    let result = translated
+        .replace('\n', " ")
+        .replace('\r', "")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+
+    Ok(result)
+}
+
 #[async_recursion(?Send)]
 async fn handle_command(cmd: &str, app: &mut App, event_tx: mpsc::Sender<AppEvent>) -> bool {
     let parsed = parse_command(cmd);
@@ -16664,6 +16824,40 @@ async fn handle_command(cmd: &str, app: &mut App, event_tx: mpsc::Sender<AppEven
             app.add_output("Usage: /urban <prefix> <word>");
             app.add_output("  Looks up <word> in Urban Dictionary and sends '<prefix> Urban Dict: <word>: <definition>' to the MUD.");
             app.add_output("  Example: /urban say yeet");
+        }
+        Command::Translate { lang, prefix, text } => {
+            // Translate text using MyMemory API
+            match lookup_translation(&text, &lang).await {
+                Ok(translation) => {
+                    // Transliterate to ASCII for non-UTF-8 MUD compatibility
+                    let ascii_trans = transliterate_to_ascii(&translation);
+                    // Format: prefix translated_text, capped at 1024 bytes, single line
+                    let full_text = format!("{} {}", prefix, ascii_trans);
+                    let capped = if full_text.len() > 1024 {
+                        let mut end = 1024;
+                        // Don't cut in the middle of a UTF-8 character
+                        while end > 0 && !full_text.is_char_boundary(end) {
+                            end -= 1;
+                        }
+                        full_text[..end].to_string()
+                    } else {
+                        full_text
+                    };
+                    // Put result in input buffer for user to review/send
+                    app.input.buffer = capped;
+                    app.input.cursor_position = app.input.buffer.len();
+                }
+                Err(e) => {
+                    app.add_output(&format!("Translation failed: {}", e));
+                }
+            }
+        }
+        Command::TranslateUsage => {
+            app.add_output("Usage: /translate <lang> <prefix> <text>");
+            app.add_output("  Translates <text> to <lang> and puts '<prefix> <translated text>' in input.");
+            app.add_output("  <lang> can be a code (es, fr, de) or name (spanish, french, german).");
+            app.add_output("  Example: /translate spanish say Hello, how are you?");
+            app.add_output("  Example: /tr es say Hello");
         }
         Command::Dump => {
             // Dump all scrollback buffers to ~/.clay.dmp.log
