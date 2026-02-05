@@ -942,6 +942,19 @@ body {
     color: #08080a;
 }
 
+.modal-buttons button.btn-danger {
+    background: #dc2626;
+    border-color: #dc2626;
+    color: #ffffff;
+    margin-right: auto;
+}
+
+.modal-buttons button.btn-danger:hover {
+    background: #ef4444;
+    border-color: #ef4444;
+    color: #ffffff;
+}
+
 #action-error {
     color: var(--error-color);
     font-size: 12px;
@@ -2408,6 +2421,18 @@ body.theme-light .modal-buttons button.btn-primary {
 body.theme-light .modal-buttons button.btn-primary:hover {
     background: #0e7490 !important;
     border-color: #0e7490;
+}
+
+body.theme-light .modal-buttons button.btn-danger {
+    background: #dc2626 !important;
+    border-color: #dc2626;
+    color: #ffffff;
+}
+
+body.theme-light .modal-buttons button.btn-danger:hover {
+    background: #b91c1c !important;
+    border-color: #b91c1c;
+    color: #ffffff;
 }
 
 /* Light theme: Worlds list modal */
