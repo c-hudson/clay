@@ -1835,6 +1835,8 @@ impl World {
         self.command_tx = None;
         self.connected = false;
         self.socket_fd = None;
+        // Reset skip_auto_login so next fresh connection triggers auto-login
+        self.skip_auto_login = false;
         if clear_prompt {
             self.close_log_file();
             self.prompt.clear();
