@@ -74,6 +74,7 @@ pub use daemon::{
     generate_splash_strings,
 };
 
+use std::collections::HashMap;
 use std::io::{self, stdout, Write as IoWrite};
 #[cfg(unix)]
 use std::os::unix::io::{AsRawFd, FromRawFd, RawFd};
@@ -3487,6 +3488,28 @@ impl App {
         }
     }
 
+    /// Set the pending merged seqs for a client (tracks which pending lines were in InitialState)
+    fn ws_set_pending_merged_seqs(&self, client_id: u64, seqs: &HashMap<usize, u64>) {
+        if client_id == 0 {
+            return;  // Embedded GUI doesn't need this
+        }
+        if let Some(ref server) = self.ws_server {
+            for (&world_index, &max_seq) in seqs {
+                server.set_pending_merged_seq(client_id, world_index, max_seq);
+            }
+        }
+    }
+
+    /// Clear pending merged tracking for a client (they've synced via command)
+    fn ws_clear_pending_merged(&self, client_id: u64) {
+        if client_id == 0 {
+            return;
+        }
+        if let Some(ref server) = self.ws_server {
+            server.clear_pending_merged(client_id);
+        }
+    }
+
     /// Set the client type for a connected WebSocket client
     fn ws_set_client_type(&self, client_id: u64, client_type: websocket::RemoteClientType) {
         if client_id == 0 {
@@ -3546,6 +3569,32 @@ impl App {
         // Broadcast to WebSocket clients viewing this world
         if let Some(ref server) = self.ws_server {
             server.broadcast_to_world_viewers(world_index, msg);
+        }
+    }
+
+    /// Broadcast released pending lines to clients viewing a world, skipping clients
+    /// that already received those lines in their InitialState.
+    fn ws_broadcast_released_to_world(&self, world_index: usize, max_seq: u64, msg: WsMessage) {
+        // Send to embedded GUI if it's viewing this world (GUI doesn't track pending_merged)
+        if let Some(ref tx) = self.gui_tx {
+            let _ = tx.send(msg.clone());
+        }
+        // Broadcast to WebSocket clients, filtering by pending_merged
+        if let Some(ref server) = self.ws_server {
+            server.broadcast_released_to_viewers(world_index, max_seq, msg);
+        }
+    }
+
+    /// Broadcast PendingLinesUpdate, but skip clients that have pending_merged tracking
+    /// for this world (they received those lines in InitialState).
+    fn ws_broadcast_pending_update(&self, world_index: usize, count: usize) {
+        // Send to embedded GUI (doesn't track pending_merged)
+        if let Some(ref tx) = self.gui_tx {
+            let _ = tx.send(WsMessage::PendingLinesUpdate { world_index, count });
+        }
+        // Broadcast to WebSocket clients with filtering
+        if let Some(ref server) = self.ws_server {
+            server.broadcast_pending_update(world_index, count);
         }
     }
 
@@ -3841,11 +3890,9 @@ impl App {
             }
 
             // Broadcast pending count update if it changed (for synchronized more-mode indicator)
+            // Use filtered broadcast to skip clients that received pending in InitialState
             if lines_to_pending > 0 || pending_after != pending_before {
-                self.ws_broadcast(WsMessage::PendingLinesUpdate {
-                    world_index: world_idx,
-                    count: pending_after,
-                });
+                self.ws_broadcast_pending_update(world_idx, pending_after);
             }
 
             // Broadcast updated unseen count so all clients stay in sync
@@ -3884,8 +3931,11 @@ impl App {
         commands_to_execute
     }
 
-    /// Build initial state message for a newly authenticated client
-    fn build_initial_state(&self) -> WsMessage {
+    /// Build initial state message for a newly authenticated client.
+    /// Returns (WsMessage, pending_merged_seqs) where pending_merged_seqs maps world_index
+    /// to the max seq of pending lines that were merged into output (for avoiding duplicates).
+    fn build_initial_state(&self) -> (WsMessage, HashMap<usize, u64>) {
+        let mut pending_merged_seqs: HashMap<usize, u64> = HashMap::new();
         let worlds: Vec<WorldStateMsg> = self.worlds.iter().enumerate().map(|(idx, world)| {
             // Strip carriage returns from output/pending lines for web clients
             let clean_output: Vec<String> = world.output_lines.iter()
@@ -3894,6 +3944,11 @@ impl App {
             let _clean_pending: Vec<String> = world.pending_lines.iter()
                 .map(|s| s.text.replace('\r', ""))
                 .collect();
+            // Track max seq of pending lines being merged (for duplicate detection)
+            if !world.pending_lines.is_empty() {
+                let max_pending_seq = world.pending_lines.iter().map(|l| l.seq).max().unwrap_or(0);
+                pending_merged_seqs.insert(idx, max_pending_seq);
+            }
             // Create timestamped versions (add red % prefix for client-generated messages)
             // Combine output_lines and pending_lines, then sort by timestamp to ensure chronological order
             let mut all_lines: Vec<TimestampedLine> = world.output_lines.iter()
@@ -3988,13 +4043,13 @@ impl App {
             dictionary_path: self.settings.dictionary_path.clone(),
         };
 
-        WsMessage::InitialState {
+        (WsMessage::InitialState {
             worlds,
             settings,
             current_world_index: self.current_world_index,
             actions: self.settings.actions.clone(),
             splash_lines: generate_splash_strings(),
-        }
+        }, pending_merged_seqs)
     }
 
     fn increase_input_height(&mut self) {
@@ -8106,7 +8161,7 @@ pub async fn run_app_headless(
     app.gui_tx = Some(gui_tx);
 
     // Send initial state to the GUI
-    let initial_state = app.build_initial_state();
+    let (initial_state, _) = app.build_initial_state();
     app.ws_broadcast(initial_state);
 
     // Keepalive interval
@@ -8284,10 +8339,12 @@ pub async fn run_app_headless(
                     }
                     AppEvent::WsClientMessage(client_id, msg) => {
                         if let WsMessage::AuthRequest { current_world, .. } = &*msg {
-                            let initial_state = app.build_initial_state();
+                            let (initial_state, pending_merged_seqs) = app.build_initial_state();
                             app.ws_send_to_client(client_id, initial_state);
                             // Mark client as having received initial state so it receives broadcasts
                             app.ws_mark_initial_state_sent(client_id);
+                            // Track pending lines merged into InitialState to avoid duplicates
+                            app.ws_set_pending_merged_seqs(client_id, &pending_merged_seqs);
                             // Use client's world if provided, otherwise default to console's world
                             let world_idx = current_world
                                 .filter(|&w| w < app.worlds.len())
@@ -8322,9 +8379,11 @@ pub async fn run_app_headless(
                                     multiuser_mode: false,
                                 });
                                 // Send initial state
-                                let initial_state = app.build_initial_state();
+                                let (initial_state, pending_merged_seqs) = app.build_initial_state();
                                 app.ws_send_to_client(client_id, initial_state);
                                 app.ws_mark_initial_state_sent(client_id);
+                                // Track pending lines merged into InitialState to avoid duplicates
+                                app.ws_set_pending_merged_seqs(client_id, &pending_merged_seqs);
                                 // Set client's world
                                 let world_idx = current_world
                                     .filter(|&w| w < app.worlds.len())
@@ -10125,11 +10184,9 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                 }
 
                                 // Broadcast pending count update if it changed
+                                // Use filtered broadcast to skip clients that received pending in InitialState
                                 if lines_to_pending > 0 || pending_after != pending_before {
-                                    app.ws_broadcast(WsMessage::PendingLinesUpdate {
-                                        world_index: world_idx,
-                                        count: pending_after,
-                                    });
+                                    app.ws_broadcast_pending_update(world_idx, pending_after);
                                 }
 
                                 // Broadcast updated unseen count so all clients stay in sync
@@ -10206,9 +10263,11 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                     multiuser_mode: false,
                                 });
                                 // Send initial state
-                                let initial_state = app.build_initial_state();
+                                let (initial_state, pending_merged_seqs) = app.build_initial_state();
                                 app.ws_send_to_client(client_id, initial_state);
                                 app.ws_mark_initial_state_sent(client_id);
+                                // Track pending lines merged into InitialState to avoid duplicates
+                                app.ws_set_pending_merged_seqs(client_id, &pending_merged_seqs);
                                 // Set client's world
                                 let world_idx = current_world
                                     .filter(|&w| w < app.worlds.len())
@@ -10265,10 +10324,12 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                         match *msg {
                             WsMessage::AuthRequest { .. } => {
                                 // Client just authenticated - send initial state
-                                let initial_state = app.build_initial_state();
+                                let (initial_state, pending_merged_seqs) = app.build_initial_state();
                                 app.ws_send_to_client(client_id, initial_state);
                                 // Mark client as having received initial state so it receives broadcasts
                                 app.ws_mark_initial_state_sent(client_id);
+                                // Track pending lines merged into InitialState to avoid duplicates
+                                app.ws_set_pending_merged_seqs(client_id, &pending_merged_seqs);
                                 // Use client's world if provided, otherwise default to console's world
                                 let world_idx = auth_current_world
                                     .filter(|&w| w < app.worlds.len())
@@ -10287,6 +10348,9 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                 });
                             }
                             WsMessage::SendCommand { world_index, ref command } => {
+                                // Clear pending_merged tracking since client is actively interacting
+                                app.ws_clear_pending_merged(client_id);
+
                                 // Reset more-mode counter when ANY client sends a command
                                 if world_index < app.worlds.len() {
                                     app.worlds[world_index].lines_since_pause = 0;
@@ -11076,11 +11140,23 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                             }
                             WsMessage::ReleasePending { world_index, count } => {
                                 // A remote client is releasing pending lines - sync across all interfaces
+                                // Clear pending_merged tracking for this client since they're actively interacting
+                                app.ws_clear_pending_merged(client_id);
+
                                 if world_index < app.worlds.len() {
                                     let pending_count = app.worlds[world_index].pending_lines.len();
                                     if pending_count > 0 {
                                         // Determine how many lines to release
                                         let to_release = if count == 0 { pending_count } else { count.min(pending_count) };
+
+                                        // Get the max seq of lines being released (for filtering clients)
+                                        let max_seq = app.worlds[world_index]
+                                            .pending_lines
+                                            .iter()
+                                            .take(to_release)
+                                            .map(|line| line.seq)
+                                            .max()
+                                            .unwrap_or(0);
 
                                         // Get the lines that will be released (for broadcasting as ServerData)
                                         let lines_to_broadcast: Vec<String> = app.worlds[world_index]
@@ -11093,10 +11169,11 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                         // Release the lines on the server
                                         app.worlds[world_index].release_pending(to_release);
 
-                                        // Broadcast the released lines to clients viewing this world
+                                        // Broadcast the released lines to clients viewing this world,
+                                        // but skip clients that already have these lines from InitialState
                                         if !lines_to_broadcast.is_empty() {
                                             let ws_data = lines_to_broadcast.join("\n") + "\n";
-                                            app.ws_broadcast_to_world(world_index, WsMessage::ServerData {
+                                            app.ws_broadcast_released_to_world(world_index, max_seq, WsMessage::ServerData {
                                                 world_index,
                                                 data: ws_data,
                                                 is_viewed: true,
@@ -11107,9 +11184,9 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
 
                                         // Broadcast to all clients so they know how many were released
                                         app.ws_broadcast(WsMessage::PendingReleased { world_index, count: to_release });
-                                        // Also update pending count
+                                        // Also update pending count (filtered broadcast to skip clients with pending_merged)
                                         let new_count = app.worlds[world_index].pending_lines.len();
-                                        app.ws_broadcast(WsMessage::PendingLinesUpdate { world_index, count: new_count });
+                                        app.ws_broadcast_pending_update(world_index, new_count);
                                         // Broadcast activity count since pending lines changed
                                         app.broadcast_activity();
 
@@ -11327,10 +11404,12 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                             }
                             WsMessage::RequestState => {
                                 // Client requested full state resync - send initial state
-                                let initial_state = app.build_initial_state();
+                                let (initial_state, pending_merged_seqs) = app.build_initial_state();
                                 app.ws_send_to_client(client_id, initial_state);
                                 // Mark client as having received initial state so it receives broadcasts
                                 app.ws_mark_initial_state_sent(client_id);
+                                // Track pending lines merged into InitialState to avoid duplicates
+                                app.ws_set_pending_merged_seqs(client_id, &pending_merged_seqs);
                                 // Set client's initial world so broadcast_to_world_viewers works immediately
                                 app.ws_set_client_world(client_id, Some(app.current_world_index));
                                 // Also send current activity count
@@ -12183,11 +12262,9 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                             }
 
                             // Broadcast pending count update if it changed
+                            // Use filtered broadcast to skip clients that received pending in InitialState
                             if lines_to_pending > 0 || pending_after != pending_before {
-                                app.ws_broadcast(WsMessage::PendingLinesUpdate {
-                                    world_index: world_idx,
-                                    count: pending_after,
-                                });
+                                app.ws_broadcast_pending_update(world_idx, pending_after);
                             }
 
                             // Broadcast updated unseen count so all clients stay in sync
@@ -12526,9 +12603,11 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                 username: None,
                                 multiuser_mode: false,
                             });
-                            let initial_state = app.build_initial_state();
+                            let (initial_state, pending_merged_seqs) = app.build_initial_state();
                             app.ws_send_to_client(client_id, initial_state);
                             app.ws_mark_initial_state_sent(client_id);
+                            // Track pending lines merged into InitialState to avoid duplicates
+                            app.ws_set_pending_merged_seqs(client_id, &pending_merged_seqs);
                             let world_idx = current_world
                                 .filter(|&w| w < app.worlds.len())
                                 .unwrap_or(app.current_world_index);
@@ -12581,10 +12660,12 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                     };
                     match *msg {
                         WsMessage::AuthRequest { .. } => {
-                            let initial_state = app.build_initial_state();
+                            let (initial_state, pending_merged_seqs) = app.build_initial_state();
                             app.ws_send_to_client(client_id, initial_state);
                             // Mark client as having received initial state so it receives broadcasts
                             app.ws_mark_initial_state_sent(client_id);
+                            // Track pending lines merged into InitialState to avoid duplicates
+                            app.ws_set_pending_merged_seqs(client_id, &pending_merged_seqs);
                             // Use client's world if provided, otherwise default to console's world
                             let world_idx = auth_current_world
                                 .filter(|&w| w < app.worlds.len())
@@ -12603,6 +12684,9 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                             });
                         }
                         WsMessage::SendCommand { world_index, ref command } => {
+                            // Clear pending_merged tracking since client is actively interacting
+                            app.ws_clear_pending_merged(client_id);
+
                             // Reset more-mode counter when ANY client sends a command
                             if world_index < app.worlds.len() {
                                 app.worlds[world_index].lines_since_pause = 0;
@@ -13448,10 +13532,12 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                         }
                         WsMessage::RequestState => {
                             // Client requested full state resync - send initial state
-                            let initial_state = app.build_initial_state();
+                            let (initial_state, pending_merged_seqs) = app.build_initial_state();
                             app.ws_send_to_client(client_id, initial_state);
                             // Mark client as having received initial state so it receives broadcasts
                             app.ws_mark_initial_state_sent(client_id);
+                            // Track pending lines merged into InitialState to avoid duplicates
+                            app.ws_set_pending_merged_seqs(client_id, &pending_merged_seqs);
                             // Set client's initial world so broadcast_to_world_viewers works immediately
                             app.ws_set_client_world(client_id, Some(app.current_world_index));
                             // Also send current activity count
@@ -14547,9 +14633,9 @@ fn handle_key_event(key: KeyEvent, app: &mut App) -> KeyAction {
 
             // Broadcast release event so other clients sync
             app.ws_broadcast(WsMessage::PendingReleased { world_index: world_idx, count: released });
-            // Also broadcast updated pending count
+            // Also broadcast updated pending count (filtered to skip clients with pending_merged)
             let pending = app.worlds[world_idx].pending_lines.len();
-            app.ws_broadcast(WsMessage::PendingLinesUpdate { world_index: world_idx, count: pending });
+            app.ws_broadcast_pending_update(world_idx, pending);
             // Broadcast activity count since pending lines changed
             app.broadcast_activity();
             app.needs_output_redraw = true;
@@ -14744,8 +14830,8 @@ fn handle_key_event(key: KeyEvent, app: &mut App) -> KeyAction {
 
             // Broadcast release event so other clients sync
             app.ws_broadcast(WsMessage::PendingReleased { world_index: world_idx, count: released });
-            // Also broadcast updated pending count
-            app.ws_broadcast(WsMessage::PendingLinesUpdate { world_index: world_idx, count: 0 });
+            // Also broadcast updated pending count (filtered to skip clients with pending_merged)
+            app.ws_broadcast_pending_update(world_idx, 0);
             // Broadcast activity count since pending lines changed
             app.broadcast_activity();
             app.needs_output_redraw = true;

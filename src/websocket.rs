@@ -416,6 +416,10 @@ pub struct WsClientInfo {
     pub client_type: RemoteClientType,
     /// Client's viewport height (for calculating screenful)
     pub viewport_height: usize,
+    /// Max seq of pending lines merged into InitialState per world.
+    /// Used to avoid sending duplicate lines when ReleasePending broadcasts ServerData.
+    /// Cleared when client sends a command (indicating they've synced).
+    pub pending_merged_max_seq: std::collections::HashMap<usize, u64>,
 }
 
 /// User credential for multiuser authentication
@@ -617,6 +621,40 @@ impl WebSocketServer {
         }
     }
 
+    /// Set the max pending seq that was merged into InitialState for a world.
+    /// Used to avoid sending duplicate lines when ReleasePending broadcasts.
+    pub fn set_pending_merged_seq(&self, client_id: u64, world_index: usize, max_seq: u64) {
+        if let Ok(mut clients) = self.clients.try_write() {
+            if let Some(client) = clients.get_mut(&client_id) {
+                client.pending_merged_max_seq.insert(world_index, max_seq);
+            }
+        }
+    }
+
+    /// Clear pending merged tracking for a client (when they've synced via command).
+    pub fn clear_pending_merged(&self, client_id: u64) {
+        if let Ok(mut clients) = self.clients.try_write() {
+            if let Some(client) = clients.get_mut(&client_id) {
+                client.pending_merged_max_seq.clear();
+            }
+        }
+    }
+
+    /// Check if a client should receive released pending lines for a world.
+    /// Returns false if the lines (by max_seq) were already sent in InitialState.
+    pub fn should_receive_released_lines(&self, client_id: u64, world_index: usize, max_seq: u64) -> bool {
+        if let Ok(clients) = self.clients.try_read() {
+            if let Some(client) = clients.get(&client_id) {
+                if let Some(&merged_seq) = client.pending_merged_max_seq.get(&world_index) {
+                    // Client already has lines up to merged_seq from InitialState
+                    // Skip if the lines being released are within that range
+                    return max_seq > merged_seq;
+                }
+            }
+        }
+        true  // No tracking info, should receive
+    }
+
     /// Get the minimum viewport height across all clients viewing a specific world
     /// Returns None if no clients are viewing the world
     pub fn min_viewport_for_world(&self, world_index: usize) -> Option<usize> {
@@ -656,6 +694,43 @@ impl WebSocketServer {
         if let Ok(clients) = self.clients.try_read() {
             for client in clients.values() {
                 if client.authenticated && client.received_initial_state {
+                    let _ = client.tx.send(msg.clone());
+                }
+            }
+        }
+    }
+
+    /// Broadcast released pending lines to clients viewing a world, but skip clients
+    /// that already received those lines in their InitialState.
+    pub fn broadcast_released_to_viewers(&self, world_index: usize, max_seq: u64, msg: WsMessage) {
+        if let Ok(clients) = self.clients.try_read() {
+            for client in clients.values() {
+                if client.authenticated && client.received_initial_state {
+                    // Check if client already has these lines from InitialState
+                    if let Some(&merged_seq) = client.pending_merged_max_seq.get(&world_index) {
+                        // Client has lines up to merged_seq, skip if max_seq <= merged_seq
+                        if max_seq <= merged_seq {
+                            continue;  // Skip - client already has these lines
+                        }
+                    }
+                    let _ = client.tx.send(msg.clone());
+                }
+            }
+        }
+    }
+
+    /// Broadcast PendingLinesUpdate, but skip clients that have pending_merged tracking
+    /// for this world (they received those lines in InitialState and have correct count already).
+    pub fn broadcast_pending_update(&self, world_index: usize, count: usize) {
+        let msg = WsMessage::PendingLinesUpdate { world_index, count };
+        if let Ok(clients) = self.clients.try_read() {
+            for client in clients.values() {
+                if client.authenticated && client.received_initial_state {
+                    // Skip clients that have pending_merged for this world
+                    // They received correct state in InitialState
+                    if client.pending_merged_max_seq.contains_key(&world_index) {
+                        continue;
+                    }
                     let _ = client.tx.send(msg.clone());
                 }
             }
@@ -1020,6 +1095,7 @@ where
             received_initial_state: false,
             client_type: RemoteClientType::Web,  // Default, updated by ClientTypeDeclaration
             viewport_height: 24,  // Default, updated by UpdateViewState
+            pending_merged_max_seq: std::collections::HashMap::new(),
         });
     }
 

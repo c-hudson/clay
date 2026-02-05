@@ -302,10 +302,12 @@ pub async fn run_daemon_server() -> io::Result<()> {
                         // Check if this is an AuthRequest (client just authenticated)
                         if matches!(*msg, WsMessage::AuthRequest { .. }) {
                             // Send initial state after successful authentication
-                            let initial_state = app.build_initial_state();
+                            let (initial_state, pending_merged_seqs) = app.build_initial_state();
                             app.ws_send_to_client(client_id, initial_state);
                             // Mark client as having received initial state so it receives broadcasts
                             app.ws_mark_initial_state_sent(client_id);
+                            // Track pending lines merged into InitialState to avoid duplicates
+                            app.ws_set_pending_merged_seqs(client_id, &pending_merged_seqs);
                         } else {
                             handle_daemon_ws_message(&mut app, client_id, *msg, &event_tx).await;
                         }
@@ -336,6 +338,9 @@ pub async fn handle_daemon_ws_message(
 ) {
     match msg {
         WsMessage::SendCommand { world_index, command } => {
+            // Clear pending_merged tracking since client is actively interacting
+            app.ws_clear_pending_merged(client_id);
+
             // Use shared command parsing (same as console mode)
             let parsed = parse_command(&command);
 
@@ -1200,10 +1205,22 @@ pub async fn handle_daemon_ws_message(
         }
         WsMessage::ReleasePending { world_index, count } => {
             // Release pending lines for the specified world
+            // Clear pending_merged tracking for the requesting client since they're actively interacting
+            app.ws_clear_pending_merged(client_id);
+
             if world_index < app.worlds.len() {
                 let pending_count = app.worlds[world_index].pending_lines.len();
                 if pending_count > 0 {
                     let to_release = if count == 0 { pending_count } else { count.min(pending_count) };
+
+                    // Get max seq of lines being released (for filtering clients)
+                    let max_seq = app.worlds[world_index]
+                        .pending_lines
+                        .iter()
+                        .take(to_release)
+                        .map(|line| line.seq)
+                        .max()
+                        .unwrap_or(0);
 
                     // Get the lines that will be released (for broadcasting)
                     let lines_to_broadcast: Vec<String> = app.worlds[world_index]
@@ -1216,10 +1233,11 @@ pub async fn handle_daemon_ws_message(
                     // Release the lines
                     app.worlds[world_index].release_pending(to_release);
 
-                    // Broadcast the released lines to clients viewing this world
+                    // Broadcast the released lines to clients viewing this world,
+                    // but skip clients that already have these lines from InitialState
                     if !lines_to_broadcast.is_empty() {
                         let ws_data = lines_to_broadcast.join("\n") + "\n";
-                        app.ws_broadcast_to_world(world_index, WsMessage::ServerData {
+                        app.ws_broadcast_released_to_world(world_index, max_seq, WsMessage::ServerData {
                             world_index,
                             data: ws_data,
                             is_viewed: true,
@@ -1229,9 +1247,10 @@ pub async fn handle_daemon_ws_message(
                     }
 
                     // Broadcast release event and updated pending count
+                    // PendingLinesUpdate is filtered to skip clients with pending_merged
                     app.ws_broadcast(WsMessage::PendingReleased { world_index, count: to_release });
                     let new_pending_count = app.worlds[world_index].pending_lines.len();
-                    app.ws_broadcast(WsMessage::PendingLinesUpdate { world_index, count: new_pending_count });
+                    app.ws_broadcast_pending_update(world_index, new_pending_count);
                     app.broadcast_activity();
                 }
             }
