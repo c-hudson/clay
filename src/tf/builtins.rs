@@ -211,8 +211,8 @@ pub fn cmd_quote(engine: &mut super::TfEngine, args: &str) -> TfCommandResult {
                     "exec" => QuoteDisposition::Exec,
                     _ => return TfCommandResult::Error(format!("Unknown disposition: {}. Use send, echo, or exec.", disp_str)),
                 };
-            } else if opt.starts_with("-w") {
-                world = Some(opt[2..].to_string());
+            } else if let Some(w) = opt.strip_prefix("-w") {
+                world = Some(w.to_string());
             } else if opt == "-S" {
                 _synchronous = true;
             } else if opt == "-P" {
@@ -335,9 +335,9 @@ pub fn cmd_quote(engine: &mut super::TfEngine, args: &str) -> TfCommandResult {
     let lines: Vec<String> = match source_char {
         '\'' => {
             // File source - expand ~ to home directory
-            let path = if source_value.starts_with("~/") {
+            let path = if let Some(rest) = source_value.strip_prefix("~/") {
                 if let Some(home) = home::home_dir() {
-                    home.join(&source_value[2..]).to_string_lossy().into_owned()
+                    home.join(rest).to_string_lossy().into_owned()
                 } else {
                     source_value.clone()
                 }
@@ -352,7 +352,7 @@ pub fn cmd_quote(engine: &mut super::TfEngine, args: &str) -> TfCommandResult {
                 Ok(file) => {
                     let reader = BufReader::new(file);
                     reader.lines()
-                        .filter_map(|l| l.ok())
+                        .map_while(Result::ok)
                         .map(|line| format!("{}{}{}", prefix, line, suffix))
                         .collect()
                 }
@@ -1003,9 +1003,9 @@ pub fn cmd_load(engine: &mut TfEngine, args: &str) -> TfCommandResult {
     let mut quiet = false;
     let mut filename = args;
 
-    if args.starts_with("-q") {
+    if let Some(rest) = args.strip_prefix("-q") {
         quiet = true;
-        filename = args[2..].trim_start();
+        filename = rest.trim_start();
         if filename.is_empty() {
             return TfCommandResult::Error("Usage: #load [-q] filename".to_string());
         }
@@ -1029,9 +1029,9 @@ pub fn cmd_require(engine: &mut TfEngine, args: &str) -> TfCommandResult {
     let mut quiet = false;
     let mut filename = args;
 
-    if args.starts_with("-q") {
+    if let Some(rest) = args.strip_prefix("-q") {
         quiet = true;
-        filename = args[2..].trim_start();
+        filename = rest.trim_start();
         if filename.is_empty() {
             return TfCommandResult::Error("Usage: #require [-q] filename".to_string());
         }

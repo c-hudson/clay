@@ -3122,7 +3122,7 @@ impl App {
     fn find_world_index(&self, name: &str) -> Option<usize> {
         self.worlds.iter().position(|w| {
             w.name.eq_ignore_ascii_case(name) ||
-            w.reader_name.as_ref().map_or(false, |rn| rn.eq_ignore_ascii_case(name))
+            w.reader_name.as_ref().is_some_and(|rn| rn.eq_ignore_ascii_case(name))
         })
     }
 
@@ -4493,7 +4493,7 @@ pub enum AppEvent {
     WsClientConnected(u64),                    // client_id
     WsClientDisconnected(u64),                 // client_id
     WsClientMessage(u64, Box<WsMessage>),      // client_id, message
-    WsAuthKeyValidation(u64, WsMessage),       // client_id, AuthRequest with auth_key
+    WsAuthKeyValidation(u64, Box<WsMessage>),   // client_id, AuthRequest with auth_key
     WsKeyRequest(u64),                         // client_id - generate and send new auth key
     WsKeyRevoke(u64, String),                  // client_id, auth_key to revoke
     // Multiuser mode events (include username for per-user connection isolation)
@@ -8367,7 +8367,7 @@ pub async fn run_app_headless(
                     }
                     AppEvent::WsAuthKeyValidation(client_id, msg) => {
                         // Validate auth key from AuthRequest
-                        if let WsMessage::AuthRequest { auth_key: Some(key), current_world, .. } = msg {
+                        if let WsMessage::AuthRequest { auth_key: Some(key), current_world, .. } = *msg {
                             let is_valid = app.settings.websocket_auth_keys.contains(&key);
                             if is_valid {
                                 // Key is valid - authenticate the client
@@ -10248,7 +10248,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                     }
                     AppEvent::WsAuthKeyValidation(client_id, msg) => {
                         // Validate auth key from AuthRequest
-                        if let WsMessage::AuthRequest { auth_key: Some(key), current_world, .. } = msg {
+                        if let WsMessage::AuthRequest { auth_key: Some(key), current_world, .. } = *msg {
                             let is_valid = app.settings.websocket_auth_keys.contains(&key);
                             if is_valid {
                                 // Key is valid - authenticate the client
@@ -11146,10 +11146,10 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                     // Reset lines_since_pause for the old world if switching away and more-mode hasn't triggered
                                     if let Some(old_state) = app.ws_client_worlds.get(&client_id) {
                                         let old_idx = old_state.world_index;
-                                        if old_idx != world_index && old_idx < app.worlds.len() {
-                                            if app.worlds[old_idx].pending_lines.is_empty() {
-                                                app.worlds[old_idx].lines_since_pause = 0;
-                                            }
+                                        if old_idx != world_index && old_idx < app.worlds.len()
+                                            && app.worlds[old_idx].pending_lines.is_empty()
+                                        {
+                                            app.worlds[old_idx].lines_since_pause = 0;
                                         }
                                     }
                                     // Track which world this client is viewing (sync cache)
@@ -12640,7 +12640,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                 }
                 AppEvent::WsAuthKeyValidation(client_id, msg) => {
                     // Validate auth key from AuthRequest
-                    if let WsMessage::AuthRequest { auth_key: Some(key), current_world, .. } = msg {
+                    if let WsMessage::AuthRequest { auth_key: Some(key), current_world, .. } = *msg {
                         let is_valid = app.settings.websocket_auth_keys.contains(&key);
                         if is_valid {
                             app.ws_set_client_authenticated(client_id, true);
@@ -13817,10 +13817,10 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                 // Reset lines_since_pause for the old world if switching away and more-mode hasn't triggered
                                 if let Some(old_state) = app.ws_client_worlds.get(&client_id) {
                                     let old_idx = old_state.world_index;
-                                    if old_idx != world_index && old_idx < app.worlds.len() {
-                                        if app.worlds[old_idx].pending_lines.is_empty() {
-                                            app.worlds[old_idx].lines_since_pause = 0;
-                                        }
+                                    if old_idx != world_index && old_idx < app.worlds.len()
+                                        && app.worlds[old_idx].pending_lines.is_empty()
+                                    {
+                                        app.worlds[old_idx].lines_since_pause = 0;
                                     }
                                 }
                                 // Track which world this client is viewing (sync cache)
@@ -14769,9 +14769,9 @@ fn handle_key_event(key: KeyEvent, app: &mut App) -> KeyAction {
             let args_part = &input[input.find(' ').unwrap() + 1..];
 
             // Parse out -e or -l flag if present
-            let (has_flag, partial_name) = if args_part.starts_with("-e ") || args_part.starts_with("-E ") {
-                (true, args_part[3..].trim_start())
-            } else if args_part.starts_with("-l ") || args_part.starts_with("-L ") {
+            let (has_flag, partial_name) = if args_part.starts_with("-e ") || args_part.starts_with("-E ")
+                || args_part.starts_with("-l ") || args_part.starts_with("-L ")
+            {
                 (true, args_part[3..].trim_start())
             } else if args_part == "-e" || args_part == "-E" || args_part == "-l" || args_part == "-L" {
                 // Just the flag with no world name yet
@@ -17334,12 +17334,7 @@ fn process_pending_tf_commands(app: &mut App) {
         // Send command to the world
         if world_idx < app.worlds.len() && app.worlds[world_idx].connected {
             if let Some(tx) = &app.worlds[world_idx].command_tx {
-                let text = if cmd.no_eol {
-                    cmd.command.clone()
-                } else {
-                    cmd.command.clone()
-                };
-                let _ = tx.try_send(WriteCommand::Text(text));
+                let _ = tx.try_send(WriteCommand::Text(cmd.command.clone()));
                 app.worlds[world_idx].last_send_time = Some(std::time::Instant::now());
             }
         }

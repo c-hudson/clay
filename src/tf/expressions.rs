@@ -722,9 +722,9 @@ impl<'a> Evaluator<'a> {
                         }
                     }
                     return Ok(TfValue::String(String::new()));
-                } else if name.starts_with('-') {
+                } else if let Some(rest) = name.strip_prefix('-') {
                     // {-n} - argument from end (1-indexed from end)
-                    if let Ok(n) = name[1..].parse::<usize>() {
+                    if let Ok(n) = rest.parse::<usize>() {
                         // Get total argument count
                         let argc = self.engine.get_var("#")
                             .and_then(|v| v.to_int())
@@ -1892,9 +1892,9 @@ impl<'a> Evaluator<'a> {
                 let text = self.eval(&args[1])?.to_string_value();
 
                 // Expand ~ in filename
-                let expanded = if filename.starts_with("~/") {
+                let expanded = if let Some(rest) = filename.strip_prefix("~/") {
                     if let Some(home) = std::env::var_os("HOME") {
-                        format!("{}/{}", home.to_string_lossy(), &filename[2..])
+                        format!("{}/{}", home.to_string_lossy(), rest)
                     } else {
                         filename
                     }

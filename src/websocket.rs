@@ -1141,7 +1141,7 @@ where
                             if auth_key.is_some() && !auth_key.as_ref().unwrap().is_empty() {
                                 // Forward to app for key validation
                                 // App will send AuthResponse directly
-                                let _ = event_tx.send(AppEvent::WsAuthKeyValidation(client_id, ws_msg.clone())).await;
+                                let _ = event_tx.send(AppEvent::WsAuthKeyValidation(client_id, Box::new(ws_msg.clone()))).await;
                                 continue;
                             }
 

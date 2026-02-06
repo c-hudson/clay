@@ -376,6 +376,7 @@ pub struct RemoteGuiApp {
     /// GUI theme (local)
     theme: GuiTheme,
     /// Last theme applied to title bar (to detect changes)
+    #[cfg(target_os = "windows")]
     titlebar_theme: Option<GuiTheme>,
     /// Font name (empty for system default)
     font_name: String,
@@ -610,6 +611,7 @@ impl RemoteGuiApp {
             input_height: 3,
             console_theme: GuiTheme::Dark,
             theme: GuiTheme::Dark,
+            #[cfg(target_os = "windows")]
             titlebar_theme: None,
             font_name: String::new(),
             font_size: 14.0,
@@ -2008,6 +2010,7 @@ impl RemoteGuiApp {
         }
 
         // Named colors (using darker/muted versions for backgrounds)
+        #[allow(clippy::redundant_slicing)]
         match &color_lower[..] {
             "red" => "\x1b[48;5;52m".to_string(),
             "green" => "\x1b[48;5;22m".to_string(),
@@ -2353,7 +2356,7 @@ impl RemoteGuiApp {
 
         let mut current_color = default_color;
         let mut current_bg = egui::Color32::TRANSPARENT;
-        let mut bold = false;
+        let mut _bold = false;
         let mut chars = text.chars().peekable();
         let mut segment = String::new();
 
@@ -2390,9 +2393,9 @@ impl RemoteGuiApp {
                 let mut i = 0;
                 while i < parts.len() {
                     match parts[i].parse::<u8>().unwrap_or(0) {
-                        0 => { current_color = default_color; current_bg = egui::Color32::TRANSPARENT; bold = false; }
-                        1 => bold = true,
-                        22 => bold = false,
+                        0 => { current_color = default_color; current_bg = egui::Color32::TRANSPARENT; _bold = false; }
+                        1 => _bold = true,
+                        22 => _bold = false,
                         // Standard foreground colors (30-37) - Xubuntu Dark palette
                         30 => current_color = egui::Color32::from_rgb(0, 0, 0),       // Black #000000
                         31 => current_color = egui::Color32::from_rgb(170, 0, 0),     // Red #aa0000

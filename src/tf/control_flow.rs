@@ -553,7 +553,7 @@ pub fn execute_single_if(engine: &mut TfEngine, condition: &str, command: &str) 
 /// #endif
 /// ```
 pub fn execute_inline_if_block(engine: &mut TfEngine, block: &str) -> Vec<TfCommandResult> {
-    let mut if_state = None;
+    let mut if_state: Option<IfState> = None;
     let lines: Vec<&str> = block.lines().collect();
 
     for line in &lines {
@@ -563,35 +563,7 @@ pub fn execute_inline_if_block(engine: &mut TfEngine, block: &str) -> Vec<TfComm
         }
         let lower = trimmed.to_lowercase();
 
-        if if_state.is_none() {
-            // First line should be #if
-            if !lower.starts_with("#if ") && lower != "#if" {
-                return vec![TfCommandResult::Error("Expected #if at start of block".to_string())];
-            }
-
-            // Parse the #if line: could be "#if (cond)    cmd" or just "#if (cond)"
-            let args = &trimmed[3..].trim_start();
-
-            // Find the condition
-            match parse_condition_with_body(args) {
-                Ok((condition, body_start)) => {
-                    let mut state = IfState::new(condition);
-                    // If there's content after the condition, add it as the first body line
-                    if !body_start.is_empty() {
-                        // Count nested control flow in body_start
-                        let depth_change = count_control_flow_in_line(&body_start);
-                        if depth_change > 0 {
-                            state.depth += depth_change as usize;
-                        }
-                        state.bodies[0].push(body_start);
-                    }
-                    if_state = Some(state);
-                }
-                Err(e) => return vec![TfCommandResult::Error(e)],
-            }
-        } else {
-            let state = if_state.as_mut().unwrap();
-
+        if let Some(state) = if_state.as_mut() {
             // Check for #endif
             if lower == "#endif" {
                 state.depth -= 1;
@@ -661,6 +633,32 @@ pub fn execute_inline_if_block(engine: &mut TfEngine, block: &str) -> Vec<TfComm
             } else {
                 // Regular line, add to current branch
                 state.bodies[state.current_branch].push(trimmed.to_string());
+            }
+        } else {
+            // First line should be #if
+            if !lower.starts_with("#if ") && lower != "#if" {
+                return vec![TfCommandResult::Error("Expected #if at start of block".to_string())];
+            }
+
+            // Parse the #if line: could be "#if (cond)    cmd" or just "#if (cond)"
+            let args = &trimmed[3..].trim_start();
+
+            // Find the condition
+            match parse_condition_with_body(args) {
+                Ok((condition, body_start)) => {
+                    let mut state = IfState::new(condition);
+                    // If there's content after the condition, add it as the first body line
+                    if !body_start.is_empty() {
+                        // Count nested control flow in body_start
+                        let depth_change = count_control_flow_in_line(&body_start);
+                        if depth_change > 0 {
+                            state.depth += depth_change as usize;
+                        }
+                        state.bodies[0].push(body_start);
+                    }
+                    if_state = Some(state);
+                }
+                Err(e) => return vec![TfCommandResult::Error(e)],
             }
         }
     }
@@ -985,15 +983,12 @@ fn count_control_flow_in_line(text: &str) -> i32 {
     // Simple word-based scanning for control flow keywords
     let words: Vec<&str> = lower.split_whitespace().collect();
     for word in &words {
-        if *word == "#if" || word.starts_with("#if(") {
+        if *word == "#if" || word.starts_with("#if(")
+            || *word == "#while" || word.starts_with("#while(")
+            || *word == "#for"
+        {
             depth += 1;
-        } else if *word == "#while" || word.starts_with("#while(") {
-            depth += 1;
-        } else if *word == "#for" {
-            depth += 1;
-        } else if *word == "#endif" {
-            depth -= 1;
-        } else if *word == "#done" {
+        } else if *word == "#endif" || *word == "#done" {
             depth -= 1;
         }
     }

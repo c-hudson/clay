@@ -464,15 +464,12 @@ fn count_control_flow_depth_change(text: &str) -> i32 {
     let words: Vec<&str> = lower.split_whitespace().collect();
     for word in &words {
         // Check if this is a control flow keyword (possibly with something attached)
-        if *word == "#if" || word.starts_with("#if(") {
+        if *word == "#if" || word.starts_with("#if(")
+            || *word == "#while" || word.starts_with("#while(")
+            || *word == "#for"
+        {
             depth += 1;
-        } else if *word == "#while" || word.starts_with("#while(") {
-            depth += 1;
-        } else if *word == "#for" {
-            depth += 1;
-        } else if *word == "#endif" {
-            depth -= 1;
-        } else if *word == "#done" {
+        } else if *word == "#endif" || *word == "#done" {
             depth -= 1;
         }
     }
