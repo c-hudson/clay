@@ -604,6 +604,31 @@ pub async fn handle_daemon_ws_message(
                         from_server: false,
                     });
                 }
+                Command::HelpTf => {
+                    // Execute TF help command and send the result
+                    match app.tf_engine.execute("#help") {
+                        crate::tf::TfCommandResult::Success(Some(msg)) => {
+                            for line in msg.lines() {
+                                app.ws_broadcast(WsMessage::ServerData {
+                                    world_index,
+                                    data: line.to_string(),
+                                    is_viewed: false,
+                                    ts: current_timestamp_secs(),
+                                    from_server: false,
+                                });
+                            }
+                        }
+                        _ => {
+                            app.ws_broadcast(WsMessage::ServerData {
+                                world_index,
+                                data: "TF help not available.".to_string(),
+                                is_viewed: false,
+                                ts: current_timestamp_secs(),
+                                from_server: false,
+                            });
+                        }
+                    }
+                }
                 Command::Unknown { cmd } => {
                     app.ws_broadcast(WsMessage::ServerData {
                         world_index,

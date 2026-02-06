@@ -995,6 +995,8 @@ pub struct ClientViewState {
 pub enum Command {
     /// /help - show help popup
     Help,
+    /// /help tf - show TF commands help
+    HelpTf,
     /// /version - show version info
     Version,
     /// /quit - exit application
@@ -1092,7 +1094,13 @@ pub fn parse_command(input: &str) -> Command {
     let args = &parts[1..];
 
     match cmd.as_str() {
-        "/help" => Command::Help,
+        "/help" => {
+            if !args.is_empty() && args[0].eq_ignore_ascii_case("tf") {
+                Command::HelpTf
+            } else {
+                Command::Help
+            }
+        }
         "/version" => Command::Version,
         "/quit" => Command::Quit,
         "/reload" => Command::Reload,
@@ -11060,6 +11068,31 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                             from_server: false,
                                         });
                                     }
+                                    Command::HelpTf => {
+                                        // Execute TF help command and send the result
+                                        match app.tf_engine.execute("#help") {
+                                            tf::TfCommandResult::Success(Some(msg)) => {
+                                                for line in msg.lines() {
+                                                    app.ws_send_to_client(client_id, WsMessage::ServerData {
+                                                        world_index,
+                                                        data: line.to_string(),
+                                                        is_viewed: false,
+                                                        ts: current_timestamp_secs(),
+                                                        from_server: false,
+                                                    });
+                                                }
+                                            }
+                                            _ => {
+                                                app.ws_send_to_client(client_id, WsMessage::ServerData {
+                                                    world_index,
+                                                    data: "TF help not available.".to_string(),
+                                                    is_viewed: false,
+                                                    ts: current_timestamp_secs(),
+                                                    from_server: false,
+                                                });
+                                            }
+                                        }
+                                    }
                                 }
                             }
                             WsMessage::SwitchWorld { world_index } => {
@@ -13406,6 +13439,33 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                         ts: current_timestamp_secs(),
                                         from_server: false,
                                     });
+                                }
+                                Command::HelpTf => {
+                                    // Execute TF help command and send the result
+                                    match app.tf_engine.execute("#help") {
+                                        tf::TfCommandResult::Success(Some(msg)) => {
+                                            for line in msg.lines() {
+                                                app.ws_send_to_client(client_id, WsMessage::ServerData {
+                                                    world_index,
+                                                    data: line.to_string(),
+                                                    is_viewed: false,
+                                                    ts: current_timestamp_secs(),
+                                                    from_server: false,
+                                                });
+                                            }
+                                        }
+                                        tf::TfCommandResult::Success(None) => {}
+                                        tf::TfCommandResult::Error(err) => {
+                                            app.ws_send_to_client(client_id, WsMessage::ServerData {
+                                                world_index,
+                                                data: format!("Error: {}", err),
+                                                is_viewed: false,
+                                                ts: current_timestamp_secs(),
+                                                from_server: false,
+                                            });
+                                        }
+                                        _ => {}
+                                    }
                                 }
                             }
                         }
@@ -16047,6 +16107,19 @@ async fn handle_command(cmd: &str, app: &mut App, event_tx: mpsc::Sender<AppEven
     match parsed {
         Command::Help => {
             app.open_help_popup_new();
+        }
+        Command::HelpTf => {
+            // Execute TF help command and display the result
+            match app.tf_engine.execute("#help") {
+                tf::TfCommandResult::Success(Some(msg)) => {
+                    for line in msg.lines() {
+                        app.add_output(line);
+                    }
+                }
+                _ => {
+                    app.add_output("TF help not available.");
+                }
+            }
         }
         Command::Version => {
             app.add_output(&get_version_string());
