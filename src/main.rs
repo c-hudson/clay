@@ -2803,6 +2803,7 @@ impl App {
             WsMessage::WorldConnected { world_index, .. } => {
                 if let Some(world) = self.worlds.get_mut(world_index) {
                     world.connected = true;
+                    world.was_connected = true;
                     self.needs_output_redraw = true;
                 }
             }
@@ -3039,6 +3040,7 @@ impl App {
         self.worlds = worlds.into_iter().map(|w| {
             let mut world = World::new(&w.name);
             world.connected = w.connected;
+            world.was_connected = w.was_connected;
             let output_lines_count = w.output_lines_ts.len();
             world.output_lines = w.output_lines_ts.into_iter().map(|tl| {
                 OutputLine {
