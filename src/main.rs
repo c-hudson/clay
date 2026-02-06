@@ -77,7 +77,7 @@ pub use daemon::{
 use std::collections::HashMap;
 use std::io::{self, stdout, Write as IoWrite};
 #[cfg(unix)]
-use std::os::unix::io::{AsRawFd, FromRawFd, RawFd};
+use std::os::unix::io::{FromRawFd, RawFd};
 #[cfg(all(unix, not(target_os = "android")))]
 use std::path::Path;
 use std::path::PathBuf;
@@ -1631,17 +1631,6 @@ impl OutputLine {
             gagged: true,
             seq,
             highlight_color: None,
-        }
-    }
-
-    fn new_highlighted(text: String, seq: u64, color: Option<String>) -> Self {
-        Self {
-            text: Self::truncate_if_needed(text),
-            timestamp: SystemTime::now(),
-            from_server: true,
-            gagged: false,
-            seq,
-            highlight_color: color,
         }
     }
 
@@ -3569,16 +3558,6 @@ impl App {
         }
     }
 
-    /// Set the viewport height for a connected WebSocket client
-    fn ws_set_client_viewport(&self, client_id: u64, height: usize) {
-        if client_id == 0 {
-            return;
-        }
-        if let Some(ref server) = self.ws_server {
-            server.set_client_viewport(client_id, height);
-        }
-    }
-
     /// Set the current world being viewed by a WebSocket client
     fn ws_set_client_world(&self, client_id: u64, world_index: Option<usize>) {
         if client_id == 0 {
@@ -3644,29 +3623,6 @@ impl App {
         // Broadcast to WebSocket clients with filtering
         if let Some(ref server) = self.ws_server {
             server.broadcast_pending_update(world_index, count);
-        }
-    }
-
-    /// Get the minimum viewport height across all clients viewing a specific world
-    /// Includes console height if console is viewing the world
-    fn min_viewport_for_world(&self, world_index: usize) -> usize {
-        let console_height = if self.current_world_index == world_index {
-            Some(self.output_height as usize)
-        } else {
-            None
-        };
-
-        let ws_min = if let Some(ref server) = self.ws_server {
-            server.min_viewport_for_world(world_index)
-        } else {
-            None
-        };
-
-        match (console_height, ws_min) {
-            (Some(c), Some(w)) => c.min(w),
-            (Some(c), None) => c,
-            (None, Some(w)) => w,
-            (None, None) => 24,  // Default fallback
         }
     }
 
@@ -5169,13 +5125,11 @@ async fn run_console_client(addr: &str) -> io::Result<()> {
     });
 
     // Wait for ServerHello to know if we're in multiuser mode
-    let mut multiuser_mode = false;
-    loop {
+    let multiuser_mode = loop {
         match ws_read.next().await {
             Some(Ok(Message::Text(text))) => {
                 if let Ok(WsMessage::ServerHello { multiuser_mode: is_multiuser }) = serde_json::from_str::<WsMessage>(&text) {
-                    multiuser_mode = is_multiuser;
-                    break;
+                    break is_multiuser;
                 }
             }
             Some(Ok(Message::Close(_))) | None => {
@@ -5184,7 +5138,7 @@ async fn run_console_client(addr: &str) -> io::Result<()> {
             }
             _ => {}
         }
-    }
+    };
 
     // Prompt for username if in multiuser mode
     let mut username: Option<String> = None;

@@ -124,23 +124,6 @@ fn build_http_response(status: u16, status_text: &str, content_type: &str, body:
     ).into_bytes()
 }
 
-/// Build an HTTP response with binary body (for images)
-#[cfg(feature = "native-tls-backend")]
-fn build_http_response_binary(status: u16, status_text: &str, content_type: &str, body: &[u8]) -> Vec<u8> {
-    let header = format!(
-        "HTTP/1.1 {} {}\r\n\
-         Content-Type: {}\r\n\
-         Content-Length: {}\r\n\
-         Cache-Control: no-cache\r\n\
-         Connection: close\r\n\
-         \r\n",
-        status, status_text, content_type, body.len()
-    );
-    let mut response = header.into_bytes();
-    response.extend_from_slice(body);
-    response
-}
-
 /// Handle an HTTPS connection
 #[cfg(feature = "native-tls-backend")]
 async fn handle_https_client(
@@ -339,23 +322,6 @@ fn build_http_response(status: u16, status_text: &str, content_type: &str, body:
          {}",
         status, status_text, content_type, body.len(), body
     ).into_bytes()
-}
-
-/// Build an HTTP response with binary body (for images) (rustls version)
-#[cfg(feature = "rustls-backend")]
-fn build_http_response_binary(status: u16, status_text: &str, content_type: &str, body: &[u8]) -> Vec<u8> {
-    let header = format!(
-        "HTTP/1.1 {} {}\r\n\
-         Content-Type: {}\r\n\
-         Content-Length: {}\r\n\
-         Cache-Control: no-cache\r\n\
-         Connection: close\r\n\
-         \r\n",
-        status, status_text, content_type, body.len()
-    );
-    let mut response = header.into_bytes();
-    response.extend_from_slice(body);
-    response
 }
 
 /// Handle an HTTPS connection (rustls version)
@@ -747,21 +713,6 @@ async fn handle_http_client(
              {}",
             status, status_text, content_type, body.len(), body
         ).into_bytes()
-    }
-
-    fn build_response_binary(status: u16, status_text: &str, content_type: &str, body: &[u8]) -> Vec<u8> {
-        let header = format!(
-            "HTTP/1.1 {} {}\r\n\
-             Content-Type: {}\r\n\
-             Content-Length: {}\r\n\
-             Cache-Control: no-cache\r\n\
-             Connection: close\r\n\
-             \r\n",
-            status, status_text, content_type, body.len()
-        );
-        let mut response = header.into_bytes();
-        response.extend_from_slice(body);
-        response
     }
 
     if let Some((method, path)) = parse_request(&request) {
