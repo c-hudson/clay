@@ -634,7 +634,7 @@ pub fn process_triggers(engine: &mut TfEngine, line: &str, world: Option<&str>) 
             if idx < engine.macros.len() && engine.macros[idx].name == macro_clone.name {
                 if let Some(ref mut remaining) = engine.macros[idx].shots_remaining {
                     *remaining -= 1;
-                    if *remaining <= 0 {
+                    if *remaining == 0 {
                         macros_to_remove.push(idx);
                     }
                 }
