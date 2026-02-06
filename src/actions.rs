@@ -466,6 +466,9 @@ pub fn compile_action_patterns(
 ) -> Vec<Regex> {
     let mut compiled = Vec::new();
     for action in actions {
+        if !action.enabled {
+            continue;
+        }
         if action.pattern.is_empty() {
             continue;
         }

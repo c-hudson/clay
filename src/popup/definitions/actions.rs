@@ -72,7 +72,11 @@ pub fn create_actions_list_popup(actions: &[ActionInfo], visible_height: usize) 
             let status = if a.enabled { "[x]" } else { "[ ]" };
             let world_part = a.world.clone();
             let pattern_preview = if a.pattern.len() > 30 {
-                format!("{}...", &a.pattern[..27])
+                let mut end = 27;
+                while end > 0 && !a.pattern.is_char_boundary(end) {
+                    end -= 1;
+                }
+                format!("{}...", &a.pattern[..end])
             } else {
                 a.pattern.clone()
             };

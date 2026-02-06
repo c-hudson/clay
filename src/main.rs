@@ -1727,6 +1727,7 @@ pub struct World {
     naws_enabled: bool,          // True if NAWS telnet option was negotiated
     naws_sent_size: Option<(u16, u16)>, // Last sent window size (width, height) to avoid duplicates
     next_seq: u64,               // Next sequence number for output lines (for debugging)
+    reader_name: Option<String>, // Name used by active reader task (for lookup after rename)
 }
 
 impl World {
@@ -1786,6 +1787,7 @@ impl World {
             naws_enabled: false,
             naws_sent_size: None,
             next_seq: 0,
+            reader_name: None,
         }
     }
 
@@ -1858,6 +1860,10 @@ impl World {
         self.command_tx = None;
         self.connected = false;
         self.socket_fd = None;
+        self.telnet_mode = false;
+        self.naws_enabled = false;
+        self.naws_sent_size = None;
+        self.reader_name = None;
         // Reset skip_auto_login so next fresh connection triggers auto-login
         self.skip_auto_login = false;
         if clear_prompt {
@@ -2127,6 +2133,7 @@ impl World {
         }
         if self.pending_lines.is_empty() {
             self.paused = false;
+            self.pending_since = None;
             self.log_more_debug("RESET_release_pending_all", "", 0);
             self.lines_since_pause = 0;
             // If partial was in pending, it's now in output
@@ -3122,9 +3129,12 @@ impl App {
         }
     }
 
-    /// Find world index by name (case-insensitive)
+    /// Find world index by name (case-insensitive), also checks reader_name for renamed worlds
     fn find_world_index(&self, name: &str) -> Option<usize> {
-        self.worlds.iter().position(|w| w.name.eq_ignore_ascii_case(name))
+        self.worlds.iter().position(|w| {
+            w.name.eq_ignore_ascii_case(name) ||
+            w.reader_name.as_ref().map_or(false, |rn| rn.eq_ignore_ascii_case(name))
+        })
     }
 
     fn switch_world(&mut self, index: usize) {
@@ -3363,6 +3373,14 @@ impl App {
                 // Adjust current_world_index if needed
                 if self.current_world_index > idx {
                     self.current_world_index -= 1;
+                }
+                // Adjust previous_world_index if needed
+                if let Some(prev) = self.previous_world_index {
+                    if prev >= self.worlds.len() {
+                        self.previous_world_index = Some(self.worlds.len().saturating_sub(1));
+                    } else if prev > idx {
+                        self.previous_world_index = Some(prev - 1);
+                    }
                 }
             }
         }
@@ -4495,6 +4513,7 @@ impl App {
                 world.scroll_offset = world.output_lines.len().saturating_sub(1);
             }
             world.paused = false;
+            world.lines_since_pause = 0;
         }
         // Mark output for redraw
         self.needs_output_redraw = true;
@@ -7956,6 +7975,7 @@ pub async fn run_app_headless(
                 app.worlds[world_idx].open_log_file();
                 let _telnet_tx = cmd_tx;
                 let world_name = app.worlds[world_idx].name.clone();
+                app.worlds[world_idx].reader_name = Some(world_name.clone());
 
                 // Spawn reader task
                 let reader_tx = event_tx.clone();
@@ -8017,6 +8037,7 @@ pub async fn run_app_headless(
                                 app.worlds[world_idx].skip_auto_login = true;
                                 app.worlds[world_idx].open_log_file();
                                 let world_name = app.worlds[world_idx].name.clone();
+                                app.worlds[world_idx].reader_name = Some(world_name.clone());
 
                                 let reader_tx = event_tx.clone();
                                 let reader_world_name = world_name.clone();
@@ -8332,20 +8353,14 @@ pub async fn run_app_headless(
                                 let _ = app.tf_engine.execute(&cmd);
                             }
 
-                            app.worlds[world_idx].connected = false;
-                            app.worlds[world_idx].command_tx = None;
-                            app.worlds[world_idx].telnet_mode = false;
-                            app.worlds[world_idx].socket_fd = None;
-                            app.worlds[world_idx].proxy_socket_fd = None;
-                            app.worlds[world_idx].naws_enabled = false;
-                            app.worlds[world_idx].naws_sent_size = None;
+                            // Push prompt to output before clearing
                             if !app.worlds[world_idx].prompt.is_empty() {
                                 let prompt_text = app.worlds[world_idx].prompt.trim().to_string();
                                 let seq = app.worlds[world_idx].next_seq;
                                 app.worlds[world_idx].next_seq += 1;
                                 app.worlds[world_idx].output_lines.push(OutputLine::new(prompt_text, seq));
                             }
-                            app.worlds[world_idx].prompt.clear();
+                            app.worlds[world_idx].clear_connection_state(true, true);
                             let seq = app.worlds[world_idx].next_seq;
                             app.worlds[world_idx].next_seq += 1;
                             let disconnect_msg = OutputLine::new_client("Disconnected.".to_string(), seq);
@@ -8954,6 +8969,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
 
                 // Capture world name for the reader task (stable across world deletions)
                 let world_name = app.worlds[world_idx].name.clone();
+                app.worlds[world_idx].reader_name = Some(world_name.clone());
 
                 // Spawn reader task
                 let event_tx_read = event_tx.clone();
@@ -9166,6 +9182,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                         app.worlds[world_idx].open_log_file();
 
                         let world_name = app.worlds[world_idx].name.clone();
+                        app.worlds[world_idx].reader_name = Some(world_name.clone());
 
                         // Spawn reader task with telnet processing
                         let event_tx_read = event_tx.clone();
@@ -9308,7 +9325,9 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
 
                     match world.settings.keep_alive_type {
                         KeepAliveType::None => {
-                            // Keepalive disabled - do nothing, don't update times
+                            // Keepalive disabled - still initialize timing fields for /connections display
+                            world.last_send_time = Some(now);
+                            world.last_receive_time = Some(now);
                         }
                         KeepAliveType::Nop => {
                             let nop = vec![TELNET_IAC, TELNET_NOP];
@@ -9963,21 +9982,14 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                 let _ = app.tf_engine.execute(&cmd);
                             }
 
-                            app.worlds[world_idx].connected = false;
-                            app.worlds[world_idx].command_tx = None;
-                            app.worlds[world_idx].telnet_mode = false;
-                            app.worlds[world_idx].socket_fd = None;
-                            // Reset NAWS state for next connection
-                            app.worlds[world_idx].naws_enabled = false;
-                            app.worlds[world_idx].naws_sent_size = None;
-                            // If there's a prompt, display it as output before clearing
+                            // Push prompt to output before clearing
                             if !app.worlds[world_idx].prompt.is_empty() {
                                 let prompt_text = app.worlds[world_idx].prompt.trim().to_string();
                                 let seq = app.worlds[world_idx].next_seq;
                                 app.worlds[world_idx].next_seq += 1;
                                 app.worlds[world_idx].output_lines.push(OutputLine::new(prompt_text, seq));
                             }
-                            app.worlds[world_idx].prompt.clear();
+                            app.worlds[world_idx].clear_connection_state(true, true);
                             // Show disconnection message
                             let seq = app.worlds[world_idx].next_seq;
                             app.worlds[world_idx].next_seq += 1;
@@ -11159,6 +11171,14 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                         app.current_world_index = app.worlds.len().saturating_sub(1);
                                     } else if app.current_world_index > world_index {
                                         app.current_world_index -= 1;
+                                    }
+                                    // Adjust previous_world_index if needed
+                                    if let Some(prev) = app.previous_world_index {
+                                        if prev >= app.worlds.len() {
+                                            app.previous_world_index = Some(app.worlds.len().saturating_sub(1));
+                                        } else if prev > world_index {
+                                            app.previous_world_index = Some(prev - 1);
+                                        }
                                     }
                                     app.add_output(&format!("World '{}' deleted.\n", deleted_name));
                                     // Broadcast WorldRemoved to all clients
@@ -12413,21 +12433,14 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                             let _ = app.tf_engine.execute(&cmd);
                         }
 
-                        app.worlds[world_idx].connected = false;
-                        app.worlds[world_idx].command_tx = None;
-                        app.worlds[world_idx].telnet_mode = false;
-                        app.worlds[world_idx].socket_fd = None;
-                        // Reset NAWS state for next connection
-                        app.worlds[world_idx].naws_enabled = false;
-                        app.worlds[world_idx].naws_sent_size = None;
-                        // If there's a prompt, display it as output before clearing
+                        // Push prompt to output before clearing
                         if !app.worlds[world_idx].prompt.is_empty() {
                             let prompt_text = app.worlds[world_idx].prompt.trim().to_string();
                             let seq = app.worlds[world_idx].next_seq;
                             app.worlds[world_idx].next_seq += 1;
                             app.worlds[world_idx].output_lines.push(OutputLine::new(prompt_text, seq));
                         }
-                        app.worlds[world_idx].prompt.clear();
+                        app.worlds[world_idx].clear_connection_state(true, true);
                         // Show disconnection message
                         let seq = app.worlds[world_idx].next_seq;
                         app.worlds[world_idx].next_seq += 1;
@@ -14237,6 +14250,16 @@ fn handle_key_event(key: KeyEvent, app: &mut App) -> KeyAction {
                             // Adjust current_world_index if needed
                             if app.current_world_index >= app.worlds.len() {
                                 app.current_world_index = app.worlds.len().saturating_sub(1);
+                            } else if app.current_world_index > world_index {
+                                app.current_world_index -= 1;
+                            }
+                            // Adjust previous_world_index if needed
+                            if let Some(prev) = app.previous_world_index {
+                                if prev >= app.worlds.len() {
+                                    app.previous_world_index = Some(app.worlds.len().saturating_sub(1));
+                                } else if prev > world_index {
+                                    app.previous_world_index = Some(prev - 1);
+                                }
                             }
                             app.add_output(&format!("World '{}' deleted.", world_name));
                             // Reopen world selector to show updated list

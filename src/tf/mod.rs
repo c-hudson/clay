@@ -441,6 +441,7 @@ pub struct TfFileHandle {
     pub path: String,
     pub mode: TfFileMode,
     pub read_position: u64,  // For read mode: current position in file
+    pub file: Option<std::fs::File>,  // Keep file handle open
 }
 
 impl TfEngine {

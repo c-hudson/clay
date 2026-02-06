@@ -186,15 +186,21 @@ pub fn process_telnet(data: &[u8]) -> TelnetResult {
                     i += 2;
                     // Find IAC SE that ends subnegotiation
                     while i < data.len() {
-                        if data[i] == TELNET_IAC && i + 1 < data.len() && data[i + 1] == TELNET_SE {
-                            // Found end of subnegotiation
-                            let sb_data = &data[sb_start..i];
-                            // Check for TTYPE SEND request
-                            if sb_data.len() >= 2 && sb_data[0] == TELNET_OPT_TTYPE && sb_data[1] == TTYPE_SEND {
-                                ttype_requested = true;
+                        if data[i] == TELNET_IAC && i + 1 < data.len() {
+                            if data[i + 1] == TELNET_SE {
+                                // Found end of subnegotiation
+                                let sb_data = &data[sb_start..i];
+                                // Check for TTYPE SEND request
+                                if sb_data.len() >= 2 && sb_data[0] == TELNET_OPT_TTYPE && sb_data[1] == TTYPE_SEND {
+                                    ttype_requested = true;
+                                }
+                                i += 2;
+                                break;
+                            } else if data[i + 1] == TELNET_IAC {
+                                // Escaped 0xFF - skip the doubled byte
+                                i += 2;
+                                continue;
                             }
-                            i += 2;
-                            break;
                         }
                         i += 1;
                     }
@@ -259,12 +265,20 @@ pub fn build_ttype_response(terminal_type: &str) -> Vec<u8> {
 
 /// Build a NAWS subnegotiation message with the given dimensions
 pub fn build_naws_subnegotiation(width: u16, height: u16) -> Vec<u8> {
-    vec![
-        TELNET_IAC, TELNET_SB, TELNET_OPT_NAWS,
-        (width >> 8) as u8, (width & 0xFF) as u8,   // Width high byte, low byte
-        (height >> 8) as u8, (height & 0xFF) as u8, // Height high byte, low byte
-        TELNET_IAC, TELNET_SE,
-    ]
+    let mut result = vec![TELNET_IAC, TELNET_SB, TELNET_OPT_NAWS];
+    let data_bytes = [
+        (width >> 8) as u8, (width & 0xFF) as u8,
+        (height >> 8) as u8, (height & 0xFF) as u8,
+    ];
+    for &b in &data_bytes {
+        result.push(b);
+        if b == TELNET_IAC {
+            result.push(TELNET_IAC); // Escape 0xFF as 0xFF 0xFF
+        }
+    }
+    result.push(TELNET_IAC);
+    result.push(TELNET_SE);
+    result
 }
 
 /// Check if there's an incomplete ANSI escape sequence or telnet sequence at the end.
@@ -313,6 +327,34 @@ pub fn find_safe_split_point(data: &[u8]) -> usize {
         let cmd = data[len - 1];
         if matches!(cmd, TELNET_WILL | TELNET_WONT | TELNET_DO | TELNET_DONT) {
             return len - 2;
+        }
+    }
+
+    // Check for incomplete subnegotiation (IAC SB without matching IAC SE)
+    // Scan backwards for the last IAC SB
+    if len >= 3 {
+        let mut j = len.saturating_sub(2);
+        while j > 0 {
+            if data[j] == TELNET_IAC && j + 1 < len && data[j + 1] == TELNET_SB {
+                // Found IAC SB - check if there's a matching IAC SE after it
+                let mut k = j + 2;
+                let mut found_se = false;
+                while k + 1 < len {
+                    if data[k] == TELNET_IAC && data[k + 1] == TELNET_SE {
+                        found_se = true;
+                        break;
+                    } else if data[k] == TELNET_IAC && data[k + 1] == TELNET_IAC {
+                        k += 2; // Skip escaped 0xFF
+                        continue;
+                    }
+                    k += 1;
+                }
+                if !found_se {
+                    return j; // Split before incomplete subnegotiation
+                }
+                break; // Found complete subnegotiation, no need to check further
+            }
+            j -= 1;
         }
     }
 

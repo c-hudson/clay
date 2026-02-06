@@ -272,26 +272,25 @@ impl InputArea {
         let width = self.width as usize;
         let first_line_capacity = width.saturating_sub(self.prompt_len);
 
-        // Calculate target character position
-        let target_char_pos = if current_line == 1 {
+        // Calculate target display-width offset from start of buffer
+        let target_display_width = if current_line == 1 {
             // Moving to first line (which has prompt)
             current_col.min(first_line_capacity.saturating_sub(1))
         } else {
             // Moving to a non-first line
-            let chars_before_target_line = if current_line == 1 {
-                0
-            } else {
-                first_line_capacity + (current_line - 2) * width
-            };
-            chars_before_target_line + current_col.min(width - 1)
+            let width_before_target_line = first_line_capacity + (current_line - 2) * width;
+            width_before_target_line + current_col.min(width - 1)
         };
 
-        // Convert character position to byte position
+        // Convert display-width position to byte position
+        let mut accumulated_width = 0;
         let mut byte_pos = 0;
-        for (i, c) in self.buffer.chars().enumerate() {
-            if i >= target_char_pos {
+        for c in self.buffer.chars() {
+            let char_width = UnicodeWidthChar::width(c).unwrap_or(0);
+            if accumulated_width + char_width > target_display_width {
                 break;
             }
+            accumulated_width += char_width;
             byte_pos += c.len_utf8();
         }
         self.cursor_position = byte_pos.min(self.buffer.len());
@@ -304,15 +303,15 @@ impl InputArea {
         let current_col = self.cursor_column();
         let width = self.width as usize;
         let first_line_capacity = width.saturating_sub(self.prompt_len);
-        let total_chars = self.buffer.chars().count();
+        let total_display_width = display_width(&self.buffer);
 
-        // Calculate total lines
+        // Calculate total lines using display width
         let total_lines = if first_line_capacity == 0 {
-            1 + total_chars.div_ceil(width)
-        } else if total_chars <= first_line_capacity {
+            1 + total_display_width.div_ceil(width)
+        } else if total_display_width <= first_line_capacity {
             1
         } else {
-            1 + (total_chars - first_line_capacity).div_ceil(width)
+            1 + (total_display_width - first_line_capacity).div_ceil(width)
         };
 
         if current_line >= total_lines.saturating_sub(1) {
@@ -322,22 +321,25 @@ impl InputArea {
             return;
         }
 
-        // Calculate target character position on next line
-        let target_char_pos = if current_line == 0 {
+        // Calculate target display-width offset on next line
+        let target_display_width = if current_line == 0 {
             // Moving from first line to second line
             first_line_capacity + current_col.min(width - 1)
         } else {
             // Moving from non-first line to next line
-            let chars_before_next_line = first_line_capacity + current_line * width;
-            chars_before_next_line + current_col.min(width - 1)
+            let width_before_next_line = first_line_capacity + current_line * width;
+            width_before_next_line + current_col.min(width - 1)
         };
 
-        // Convert character position to byte position, clamping to buffer length
+        // Convert display-width position to byte position, clamping to buffer length
+        let mut accumulated_width = 0;
         let mut byte_pos = 0;
-        for (i, c) in self.buffer.chars().enumerate() {
-            if i >= target_char_pos {
+        for c in self.buffer.chars() {
+            let char_width = UnicodeWidthChar::width(c).unwrap_or(0);
+            if accumulated_width + char_width > target_display_width {
                 break;
             }
+            accumulated_width += char_width;
             byte_pos += c.len_utf8();
         }
         self.cursor_position = byte_pos.min(self.buffer.len());

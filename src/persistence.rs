@@ -374,9 +374,10 @@ pub fn load_settings(app: &mut App) -> io::Result<()> {
             if in_tf_globals {
                 // Unescape the value
                 let unescaped = value
+                    .replace("\\\\", "\x00")
                     .replace("\\n", "\n")
                     .replace("\\e", "=")
-                    .replace("\\\\", "\\");
+                    .replace("\x00", "\\");
                 app.tf_engine.set_global(key, tf::TfValue::from(unescaped));
                 continue;
             }
@@ -387,7 +388,7 @@ pub fn load_settings(app: &mut App) -> io::Result<()> {
                 if let Some(action) = app.settings.actions.get_mut(action_idx) {
                     // Helper to unescape saved strings
                     fn unescape_action_value(s: &str) -> String {
-                        s.replace("\\n", "\n").replace("\\e", "=").replace("\\\\", "\\")
+                        s.replace("\\\\", "\x00").replace("\\n", "\n").replace("\\e", "=").replace("\x00", "\\")
                     }
                     match key {
                         "name" => action.name = value.to_string(),
@@ -810,7 +811,7 @@ pub fn load_multiuser_settings(app: &mut App) -> io::Result<()> {
             else if let Some(action_idx) = current_action {
                 if let Some(action) = app.settings.actions.get_mut(action_idx) {
                     fn unescape_action_value(s: &str) -> String {
-                        s.replace("\\n", "\n").replace("\\e", "=").replace("\\\\", "\\")
+                        s.replace("\\\\", "\x00").replace("\\n", "\n").replace("\\e", "=").replace("\x00", "\\")
                     }
                     match key {
                         "name" => action.name = value.to_string(),
@@ -1185,6 +1186,16 @@ pub fn save_reload_state(app: &App) -> io::Result<()> {
             writeln!(file, "notes={}", escaped_notes)?;
         }
 
+        // Partial line state (for preserving incomplete lines across reload)
+        if !world.partial_line.is_empty() {
+            let escaped = world.partial_line
+                .replace('\\', "\\\\")
+                .replace('\n', "\\n")
+                .replace('=', "\\e");
+            writeln!(file, "partial_line={}", escaped)?;
+            writeln!(file, "partial_in_pending={}", world.partial_in_pending)?;
+        }
+
         // Output lines count (we'll save the actual lines separately due to size)
         writeln!(file, "output_count={}", world.output_lines.len())?;
         writeln!(file, "pending_count={}", world.pending_lines.len())?;
@@ -1318,6 +1329,8 @@ pub fn load_reload_state(app: &mut App) -> io::Result<bool> {
         prompt: String,
         settings: WorldSettings,
         next_seq: u64,
+        partial_line: String,
+        partial_in_pending: bool,
     }
 
     // Parse a saved output/pending line with timestamp
@@ -1413,6 +1426,8 @@ pub fn load_reload_state(app: &mut App) -> io::Result<bool> {
                         prompt: String::new(),
                         settings: WorldSettings::default(),
                         next_seq: 0,
+                        partial_line: String::new(),
+                        partial_in_pending: false,
                     });
                 }
             } else if let Some(suffix) = section.strip_prefix("output:") {
@@ -1691,6 +1706,8 @@ pub fn load_reload_state(app: &mut App) -> io::Result<bool> {
                             "proxy_socket_path" => tw.proxy_socket_path = Some(PathBuf::from(value)),
                             "proxy_socket_fd" => tw.proxy_socket_fd = value.parse().ok(),
                             "next_seq" => tw.next_seq = value.parse().unwrap_or(0),
+                            "partial_line" => tw.partial_line = unescape_string(value),
+                            "partial_in_pending" => tw.partial_in_pending = value == "true",
                             "world_type" => tw.settings.world_type = WorldType::from_name(value),
                             "hostname" => tw.settings.hostname = value.to_string(),
                             "port" => tw.settings.port = value.to_string(),
@@ -1736,7 +1753,7 @@ pub fn load_reload_state(app: &mut App) -> io::Result<bool> {
                     if let Some(action) = app.settings.actions.get_mut(action_idx) {
                         // Helper to unescape saved strings
                         fn unescape_action_value(s: &str) -> String {
-                            s.replace("\\n", "\n").replace("\\e", "=").replace("\\\\", "\\")
+                            s.replace("\\\\", "\x00").replace("\\n", "\n").replace("\\e", "=").replace("\x00", "\\")
                         }
                         match key {
                             "name" => action.name = value.to_string(),
@@ -1776,6 +1793,8 @@ pub fn load_reload_state(app: &mut App) -> io::Result<bool> {
         world.proxy_socket_fd = tw.proxy_socket_fd;
         world.settings = tw.settings;
         world.next_seq = tw.next_seq;
+        world.partial_line = tw.partial_line;
+        world.partial_in_pending = tw.partial_in_pending;
         // Leave timing fields as None for connected worlds after reload
         // This triggers immediate keepalive since we don't know how long connection was idle
         app.worlds.push(world);

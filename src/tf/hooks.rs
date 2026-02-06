@@ -128,6 +128,17 @@ pub fn parse_key_name(name: &str) -> Result<String, String> {
         return Ok(format!("Alt-{}", rest.to_uppercase()));
     }
 
+    // Alt keys: @A-@Z
+    if let Some(letter) = name.strip_prefix('@') {
+        if letter.len() == 1 {
+            let c = letter.chars().next().unwrap();
+            if c.is_ascii_alphabetic() {
+                return Ok(format!("Alt-{}", c.to_ascii_uppercase()));
+            }
+        }
+        return Err(format!("Invalid alt key: {}", name));
+    }
+
     // Special keys
     match name.to_lowercase().as_str() {
         "enter" | "return" | "cr" => Ok("Enter".to_string()),

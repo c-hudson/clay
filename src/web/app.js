@@ -2613,13 +2613,13 @@
     function openMenuPopup() {
         menuPopupOpen = true;
         menuSelectedIndex = 0;
-        elements.menuModal.classList.add('active');
+        elements.menuModal.classList.add('visible');
         updateMenuSelection();
     }
 
     function closeMenuPopup() {
         menuPopupOpen = false;
-        elements.menuModal.classList.remove('active');
+        elements.menuModal.classList.remove('visible');
         elements.input.focus();
     }
 
@@ -2637,12 +2637,13 @@
     function selectMenuItem() {
         const cmd = menuItems[menuSelectedIndex].command;
         closeMenuPopup();
-        handleLocalCommand(cmd);
+        elements.input.value = cmd;
+        sendCommand();
     }
 
     // Strip ANSI codes for filter matching
     function stripAnsiForFilter(text) {
-        return text.replace(/\x1b\[[0-9;]*[a-zA-Z]/g, '');
+        return text.replace(/\x1b\[[0-9;?]*[@-~]/g, '');
     }
 
     // Convert wildcard filter pattern to regex for F4 filter popup
@@ -2700,14 +2701,20 @@
     function lineMatchesAction(line, worldName) {
         const plainLine = stripAnsiForFilter(line).toLowerCase();
         for (const action of actions) {
+            // Skip disabled actions
+            if (action.enabled === false) continue;
             // Skip actions without patterns
             if (!action.pattern || action.pattern.trim() === '') continue;
             // Check world match (empty = all worlds)
             if (action.world && action.world.trim() !== '' &&
                 action.world.toLowerCase() !== worldName.toLowerCase()) continue;
-            // Try regex match (case-insensitive)
+            // Convert pattern based on match type
             try {
-                const regex = new RegExp(action.pattern, 'i');
+                let pattern = action.pattern;
+                if (action.match_type === 'wildcard') {
+                    pattern = filterWildcardToRegex(action.pattern);
+                }
+                const regex = new RegExp(pattern, 'i');
                 if (regex.test(plainLine)) return true;
             } catch (e) {
                 // Invalid regex, skip

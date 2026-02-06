@@ -29,11 +29,9 @@ pub fn cmd_time(args: &str) -> TfCommandResult {
     let format = args.trim();
 
     if format.is_empty() {
-        // Default format: human readable
-        let secs = now % 60;
-        let mins = (now / 60) % 60;
-        let hours = (now / 3600) % 24;
-        TfCommandResult::Success(Some(format!("{:02}:{:02}:{:02}", hours, mins, secs)))
+        // Default format: human readable (local time)
+        let lt = crate::util::local_time_now();
+        TfCommandResult::Success(Some(format!("{:02}:{:02}:{:02}", lt.hour, lt.minute, lt.second)))
     } else if format == "%s" || format == "epoch" {
         // Unix timestamp
         TfCommandResult::Success(Some(now.to_string()))

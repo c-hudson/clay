@@ -394,7 +394,14 @@ pub fn strip_non_sgr_sequences(s: &str) -> String {
 
                     // Check for ANSI music sequence (ESC [ M or ESC [ N followed by music content)
                     // Preserve these entirely so music parser can process them
-                    if chars.peek() == Some(&'M') || chars.peek() == Some(&'N') {
+                    // Only treat as music if the char after M/N looks like music data
+                    // (notes A-G, O octave, T tempo, L length, digits, spaces, MF/MB modifier, < >)
+                    // Otherwise treat as normal CSI M (Delete Lines) or CSI N
+                    if (chars.peek() == Some(&'M') || chars.peek() == Some(&'N')) && {
+                        let mut lookahead = chars.clone();
+                        lookahead.next(); // skip M/N
+                        matches!(lookahead.peek(), Some(&('A'..='G' | 'a'..='g' | 'O' | 'o' | 'T' | 't' | 'L' | 'l' | '0'..='9' | ' ' | '<' | '>')))
+                    } {
                         let music_prefix = chars.next().unwrap(); // consume M or N
                         // Preserve the sequence - add ESC [ M/N and continue collecting until terminator
                         result.push('\x1b');
@@ -542,13 +549,23 @@ pub fn strip_non_sgr_sequences(s: &str) -> String {
 /// Check if a line is visually empty (contains only ANSI codes and/or whitespace)
 pub fn is_visually_empty(s: &str) -> bool {
     let mut in_escape = false;
+    let mut in_csi = false;
     for c in s.chars() {
         if c == '\x1b' {
             in_escape = true;
-        } else if in_escape {
-            // Wait for end of escape sequence (alphabetic char or ~)
-            if c.is_alphabetic() || c == '~' {
+            in_csi = false;
+        } else if in_escape && !in_csi {
+            if c == '[' {
+                in_csi = true;
+            } else {
+                // Non-CSI escape sequence (e.g., ESC c) - ends after one char
                 in_escape = false;
+            }
+        } else if in_csi {
+            // CSI sequence: parameters then final byte (0x40-0x7E)
+            if ('@'..='~').contains(&c) {
+                in_escape = false;
+                in_csi = false;
             }
         } else if !c.is_whitespace() {
             // Found visible content
@@ -564,14 +581,23 @@ pub fn is_visually_empty(s: &str) -> bool {
 pub fn is_ansi_only_line(s: &str) -> bool {
     let mut has_ansi = false;
     let mut in_escape = false;
+    let mut in_csi = false;
     for c in s.chars() {
         if c == '\x1b' {
             has_ansi = true;
             in_escape = true;
-        } else if in_escape {
-            // Wait for end of escape sequence (alphabetic char or ~)
-            if c.is_alphabetic() || c == '~' {
+            in_csi = false;
+        } else if in_escape && !in_csi {
+            if c == '[' {
+                in_csi = true;
+            } else {
                 in_escape = false;
+            }
+        } else if in_csi {
+            // CSI sequence: parameters then final byte (0x40-0x7E)
+            if ('@'..='~').contains(&c) {
+                in_escape = false;
+                in_csi = false;
             }
         } else if !c.is_whitespace() {
             // Found visible content - not ANSI-only

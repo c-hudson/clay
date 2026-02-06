@@ -919,6 +919,7 @@ fn execute_for_loop(
         }
     };
 
+    engine.push_scope();
     while should_continue(current, end, step) {
         if iterations >= MAX_ITERATIONS {
             results.push(TfCommandResult::Error(format!(
@@ -970,6 +971,7 @@ fn execute_for_loop(
         current += step;
         iterations += 1;
     }
+    engine.pop_scope();
 
     results
 }
@@ -1182,14 +1184,20 @@ pub fn execute_if_encoded(engine: &mut TfEngine, encoded: &str) -> Vec<TfCommand
 
     // No condition matched, execute else if present
     if let Some(body) = else_body {
-        for line in &body {
+        let grouped = group_control_flow_lines(&body);
+        for line in grouped {
+            let line = line.trim();
+            if line.is_empty() {
+                continue;
+            }
+
             // Check if this is a nested control flow block
-            let lower = line.trim().to_lowercase();
+            let lower = line.to_lowercase();
             let is_control_flow = lower.starts_with("#if ") || lower.starts_with("#if(")
                 || lower.starts_with("#while ") || lower.starts_with("#for ");
 
             let line = if is_control_flow {
-                line.clone()
+                line.to_string()
             } else {
                 // Substitute variables first, then expressions
                 let line = engine.substitute_vars(line);
@@ -1243,6 +1251,7 @@ pub fn execute_while_encoded(engine: &mut TfEngine, encoded: &str) -> Vec<TfComm
     }
 
     // Execute while loop with iteration limit
+    let grouped_body = group_body_lines(&body);
     let mut iterations = 0;
     loop {
         if iterations >= MAX_ITERATIONS {
@@ -1267,7 +1276,7 @@ pub fn execute_while_encoded(engine: &mut TfEngine, encoded: &str) -> Vec<TfComm
 
         // Execute body
         let mut should_break = false;
-        for line in &body {
+        for line in &grouped_body {
             if line.trim().to_lowercase() == "#break" {
                 should_break = true;
                 break;
@@ -1371,6 +1380,8 @@ pub fn execute_for_encoded(engine: &mut TfEngine, encoded: &str) -> Vec<TfComman
         }
     };
 
+    let grouped_body = group_body_lines(&body);
+    engine.push_scope();
     while should_continue(current, end, step) {
         if iterations >= MAX_ITERATIONS {
             results.push(TfCommandResult::Error(format!(
@@ -1384,7 +1395,7 @@ pub fn execute_for_encoded(engine: &mut TfEngine, encoded: &str) -> Vec<TfComman
 
         // Execute body
         let mut should_break = false;
-        for line in &body {
+        for line in &grouped_body {
             if line.trim().to_lowercase() == "#break" {
                 should_break = true;
                 break;
@@ -1409,6 +1420,7 @@ pub fn execute_for_encoded(engine: &mut TfEngine, encoded: &str) -> Vec<TfComman
         current += step;
         iterations += 1;
     }
+    engine.pop_scope();
 
     results
 }

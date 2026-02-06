@@ -991,7 +991,7 @@ impl<'a> Evaluator<'a> {
                     return Err("strlen requires 1 argument".to_string());
                 }
                 let s = self.eval(&args[0])?.to_string_value();
-                Ok(TfValue::Integer(s.len() as i64))
+                Ok(TfValue::Integer(s.chars().count() as i64))
             }
 
             "substr" => {
@@ -1089,12 +1089,20 @@ impl<'a> Evaluator<'a> {
                     let s = self.eval(&args[i])?.to_string_value();
                     let width = self.eval(&args[i + 1])?.to_int().unwrap_or(0);
                     let abs_width = width.unsigned_abs() as usize;
-                    if width >= 0 {
-                        // Right-justify (left-pad)
-                        result.push_str(&format!("{:>width$}", s, width = abs_width));
+                    let char_len = s.chars().count();
+                    if char_len >= abs_width {
+                        result.push_str(&s);
                     } else {
-                        // Left-justify (right-pad)
-                        result.push_str(&format!("{:<width$}", s, width = abs_width));
+                        let padding = " ".repeat(abs_width - char_len);
+                        if width >= 0 {
+                            // Right-justify (left-pad)
+                            result.push_str(&padding);
+                            result.push_str(&s);
+                        } else {
+                            // Left-justify (right-pad)
+                            result.push_str(&s);
+                            result.push_str(&padding);
+                        }
                     }
                 }
                 Ok(TfValue::String(result))
@@ -1144,8 +1152,8 @@ impl<'a> Evaluator<'a> {
                     if max < min {
                         return Ok(TfValue::Integer(min));
                     }
-                    let range = (max - min + 1) as u64;
-                    let r = min + ((simple_random() as u64) % range) as i64;
+                    let range = (max as u64).wrapping_sub(min as u64).wrapping_add(1);
+                    let r = min.wrapping_add(((simple_random() as u64) % range) as i64);
                     Ok(TfValue::Integer(r))
                 }
             }
@@ -1483,7 +1491,9 @@ impl<'a> Evaluator<'a> {
                 let text = self.eval(&args[0])?.to_string_value();
                 let substr = self.eval(&args[1])?.to_string_value();
 
-                let pos = text.find(&substr).map(|p| p as i64).unwrap_or(-1);
+                let pos = text.char_indices().zip(0..).find_map(|((byte_pos, _), char_pos)| {
+                    if text[byte_pos..].starts_with(&*substr) { Some(char_pos as i64) } else { None }
+                }).unwrap_or(-1);
                 Ok(TfValue::Integer(pos))
             }
 
@@ -2090,26 +2100,27 @@ impl<'a> Evaluator<'a> {
                     _ => return Err(format!("Invalid file mode: {} (use r, w, or a)", mode_str)),
                 };
 
-                // Verify the file can be opened in the specified mode
-                let can_open = match mode {
-                    super::TfFileMode::Read => std::path::Path::new(&filename).exists(),
+                // Open the file in the specified mode and keep the handle
+                let opened_file = match mode {
+                    super::TfFileMode::Read => {
+                        std::fs::File::open(&filename).ok()
+                    }
                     super::TfFileMode::Write => {
-                        // Try to create/truncate the file
-                        std::fs::File::create(&filename).is_ok()
+                        std::fs::File::create(&filename).ok()
                     }
                     super::TfFileMode::Append => {
-                        // Try to open for appending
                         std::fs::OpenOptions::new()
                             .create(true)
                             .append(true)
                             .open(&filename)
-                            .is_ok()
+                            .ok()
                     }
                 };
 
-                if !can_open {
-                    return Ok(TfValue::Integer(0)); // Return 0 on failure (TF convention)
-                }
+                let opened_file = match opened_file {
+                    Some(f) => f,
+                    None => return Ok(TfValue::Integer(0)), // Return 0 on failure (TF convention)
+                };
 
                 // Allocate a handle
                 let handle = self.engine.next_file_handle;
@@ -2119,6 +2130,7 @@ impl<'a> Evaluator<'a> {
                     path: filename,
                     mode,
                     read_position: 0,
+                    file: Some(opened_file),
                 });
 
                 Ok(TfValue::Integer(handle as i64))
@@ -2151,21 +2163,28 @@ impl<'a> Evaluator<'a> {
                     _ => return Ok(TfValue::Integer(0)),
                 };
 
-                // Open the file and seek to current position
-                let file = match std::fs::File::open(&file_handle.path) {
-                    Ok(f) => f,
-                    Err(_) => return Ok(TfValue::Integer(0)),
+                // Use the stored file handle
+                let file = match file_handle.file.as_mut() {
+                    Some(f) => f,
+                    None => return Ok(TfValue::Integer(0)),
                 };
 
                 use std::io::Seek;
-                let mut reader = BufReader::new(file);
-                if reader.seek(std::io::SeekFrom::Start(file_handle.read_position)).is_err() {
+                if file.seek(std::io::SeekFrom::Start(file_handle.read_position)).is_err() {
                     return Ok(TfValue::Integer(0));
                 }
 
-                // Read one line
+                // Read one line using a temporary BufReader
+                // We need to track bytes read manually
+                let mut buf_reader = BufReader::new(file.try_clone().unwrap_or_else(|_| {
+                    std::fs::File::open(&file_handle.path).unwrap()
+                }));
+                if buf_reader.seek(std::io::SeekFrom::Start(file_handle.read_position)).is_err() {
+                    return Ok(TfValue::Integer(0));
+                }
+
                 let mut line = String::new();
-                match reader.read_line(&mut line) {
+                match buf_reader.read_line(&mut line) {
                     Ok(0) => {
                         // EOF
                         Ok(TfValue::Integer(0))
@@ -2198,35 +2217,15 @@ impl<'a> Evaluator<'a> {
                 let handle = self.eval(&args[0])?.to_int().unwrap_or(-1) as i32;
                 let text = self.eval(&args[1])?.to_string_value();
 
-                let file_handle = match self.engine.open_files.get(&handle) {
+                let file_handle = match self.engine.open_files.get_mut(&handle) {
                     Some(fh) if fh.mode == super::TfFileMode::Write || fh.mode == super::TfFileMode::Append => fh,
                     _ => return Ok(TfValue::Integer(0)),
                 };
 
-                // Open file in appropriate mode
-                let mut file = match file_handle.mode {
-                    super::TfFileMode::Write => {
-                        match std::fs::OpenOptions::new()
-                            
-                            .create(true)
-                            .append(true) // Use append to not overwrite on each write
-                            .open(&file_handle.path)
-                        {
-                            Ok(f) => f,
-                            Err(_) => return Ok(TfValue::Integer(0)),
-                        }
-                    }
-                    super::TfFileMode::Append => {
-                        match std::fs::OpenOptions::new()
-                            .append(true)
-                            .create(true)
-                            .open(&file_handle.path)
-                        {
-                            Ok(f) => f,
-                            Err(_) => return Ok(TfValue::Integer(0)),
-                        }
-                    }
-                    _ => return Ok(TfValue::Integer(0)),
+                // Use the stored file handle
+                let file = match file_handle.file.as_mut() {
+                    Some(f) => f,
+                    None => return Ok(TfValue::Integer(0)),
                 };
 
                 // Write with newline
@@ -2243,12 +2242,15 @@ impl<'a> Evaluator<'a> {
                 }
                 let handle = self.eval(&args[0])?.to_int().unwrap_or(-1) as i32;
 
-                // Check if handle is valid
-                if self.engine.open_files.contains_key(&handle) {
-                    // File operations are not buffered in our implementation, so flush is a no-op
-                    Ok(TfValue::Integer(1))
-                } else {
-                    Ok(TfValue::Integer(0))
+                // Flush the stored file handle
+                match self.engine.open_files.get_mut(&handle) {
+                    Some(fh) => {
+                        if let Some(ref mut f) = fh.file {
+                            let _ = f.flush();
+                        }
+                        Ok(TfValue::Integer(1))
+                    }
+                    None => Ok(TfValue::Integer(0)),
                 }
             }
 
@@ -2398,11 +2400,12 @@ fn format_with_width(s: &str, spec: &str, numeric: bool) -> String {
         width = width_str.parse().unwrap_or(0);
     }
 
-    if width == 0 || s.len() >= width {
+    let char_len = s.chars().count();
+    if width == 0 || char_len >= width {
         return s.to_string();
     }
 
-    let padding = width - s.len();
+    let padding = width - char_len;
     let pad_char = if zero_pad && !left_align { '0' } else { ' ' };
 
     if left_align {

@@ -69,7 +69,7 @@ pub fn process_line(engine: &mut TfEngine, line: &str, world: Option<&str>) -> T
             _ => continue,
         };
 
-        if macros::match_trigger(trigger, line).is_none() {
+        if macros::match_trigger(trigger, plain_line).is_none() {
             continue;
         }
 
