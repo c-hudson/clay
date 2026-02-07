@@ -14,6 +14,8 @@ pub mod persistence;
 pub mod daemon;
 #[cfg(all(feature = "remote-gui", not(target_os = "android")))]
 pub mod remote_gui;
+#[cfg(all(feature = "remote-gui", not(target_os = "android")))]
+pub mod remote_gui2;
 
 // Version information
 const VERSION: &str = "1.0.0-alpha";
@@ -7632,6 +7634,43 @@ async fn main() -> io::Result<()> {
     let daemon_mode = std::env::args().any(|a| a == "-D");
     if daemon_mode {
         return run_daemon_server().await;
+    }
+
+    // Parse --gui2 mode (new GUI design, invoked as --gui2 or --gui2=host:port)
+    let gui2_addr = std::env::args()
+        .find(|a| a.starts_with("--gui2"))
+        .and_then(|a| {
+            if a == "--gui2" {
+                Some(None) // master mode
+            } else if let Some(addr) = a.strip_prefix("--gui2=") {
+                Some(Some(addr.to_string())) // remote mode
+            } else {
+                None
+            }
+        });
+    if let Some(addr_opt) = gui2_addr {
+        #[cfg(all(feature = "remote-gui", not(target_os = "android")))]
+        {
+            // On Windows, detach from the console window
+            #[cfg(windows)]
+            {
+                extern "system" {
+                    fn FreeConsole() -> i32;
+                }
+                unsafe { FreeConsole(); }
+            }
+            return match addr_opt {
+                Some(addr) => remote_gui2::run_remote_gui(&addr),
+                None => remote_gui2::run_master_gui(),
+            };
+        }
+        #[cfg(not(all(feature = "remote-gui", not(target_os = "android"))))]
+        {
+            let _ = addr_opt;
+            eprintln!("Error: --gui2 requires the 'remote-gui' feature.");
+            eprintln!("Rebuild with: cargo build --features remote-gui");
+            return Ok(());
+        }
     }
 
     // Parse interface mode (--gui / --console) and connection mode (--remote=host:port)
