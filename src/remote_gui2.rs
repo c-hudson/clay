@@ -2390,7 +2390,7 @@ impl RemoteGuiApp {
 
         let mut current_color = default_color;
         let mut current_bg = egui::Color32::TRANSPARENT;
-        let mut _bold = false;
+        let mut bold = false;
         let mut chars = text.chars().peekable();
         let mut segment = String::new();
 
@@ -2427,26 +2427,61 @@ impl RemoteGuiApp {
                 let mut i = 0;
                 while i < parts.len() {
                     match parts[i].parse::<u8>().unwrap_or(0) {
-                        0 => { current_color = default_color; current_bg = egui::Color32::TRANSPARENT; _bold = false; }
-                        1 => _bold = true,
-                        22 => _bold = false,
+                        0 => { current_color = default_color; current_bg = egui::Color32::TRANSPARENT; bold = false; }
+                        1 => bold = true,
+                        22 => bold = false,
                         // Standard foreground colors (30-37) - Xubuntu Dark palette
-                        30 => current_color = egui::Color32::from_rgb(0, 0, 0),       // Black #000000
-                        31 => current_color = egui::Color32::from_rgb(170, 0, 0),     // Red #aa0000
-                        32 => current_color = egui::Color32::from_rgb(68, 170, 68),   // Green #44aa44
-                        33 => current_color = if is_light_theme {
+                        // When bold is active, upgrade to bright variants (90-97)
+                        30 => current_color = if bold {
+                            egui::Color32::from_rgb(119, 119, 119)  // Bright Black #777777
+                        } else {
+                            egui::Color32::from_rgb(0, 0, 0)        // Black #000000
+                        },
+                        31 => current_color = if bold {
+                            egui::Color32::from_rgb(255, 135, 135)  // Bright Red #ff8787
+                        } else {
+                            egui::Color32::from_rgb(170, 0, 0)      // Red #aa0000
+                        },
+                        32 => current_color = if bold {
+                            egui::Color32::from_rgb(76, 230, 76)    // Bright Green #4ce64c
+                        } else {
+                            egui::Color32::from_rgb(68, 170, 68)    // Green #44aa44
+                        },
+                        33 => current_color = if bold {
+                            if is_light_theme {
+                                egui::Color32::from_rgb(167, 163, 33)  // Bright Yellow (light)
+                            } else {
+                                egui::Color32::from_rgb(222, 216, 44)  // Bright Yellow #ded82c
+                            }
+                        } else if is_light_theme {
                             egui::Color32::from_rgb(128, 64, 0)  // Darker orange for light theme
                         } else {
                             egui::Color32::from_rgb(170, 85, 0)  // Yellow #aa5500
                         },
-                        34 => current_color = if is_light_theme {
-                            egui::Color32::from_rgb(0, 43, 128)      // Darker blue for light theme
+                        34 => current_color = if bold {
+                            egui::Color32::from_rgb(41, 95, 204)    // Bright Blue #295fcc
+                        } else if is_light_theme {
+                            egui::Color32::from_rgb(0, 43, 128)     // Darker blue for light theme
                         } else {
-                            egui::Color32::from_rgb(0, 57, 170)      // Blue #0039aa
+                            egui::Color32::from_rgb(0, 57, 170)     // Blue #0039aa
                         },
-                        35 => current_color = egui::Color32::from_rgb(170, 34, 170),  // Magenta #aa22aa
-                        36 => current_color = egui::Color32::from_rgb(26, 146, 170),  // Cyan #1a92aa
-                        37 => current_color = if is_light_theme {
+                        35 => current_color = if bold {
+                            egui::Color32::from_rgb(204, 88, 204)   // Bright Magenta #cc58cc
+                        } else {
+                            egui::Color32::from_rgb(170, 34, 170)   // Magenta #aa22aa
+                        },
+                        36 => current_color = if bold {
+                            egui::Color32::from_rgb(76, 204, 230)   // Bright Cyan #4ccce6
+                        } else {
+                            egui::Color32::from_rgb(26, 146, 170)   // Cyan #1a92aa
+                        },
+                        37 => current_color = if bold {
+                            if is_light_theme {
+                                egui::Color32::from_rgb(40, 40, 40)     // Bright White (light)
+                            } else {
+                                egui::Color32::from_rgb(255, 255, 255)  // Bright White #ffffff
+                            }
+                        } else if is_light_theme {
                             egui::Color32::from_rgb(80, 80, 80)  // Dark gray for light theme
                         } else {
                             egui::Color32::from_rgb(170, 170, 170)  // White #aaaaaa
@@ -3282,7 +3317,7 @@ impl eframe::App for RemoteGuiApp {
                     // Ctrl+key shortcuts
                     if i.modifiers.ctrl {
                         if i.consume_key(egui::Modifiers::CTRL, egui::Key::L) {
-                            action = Some("world_list");
+                            action = Some("redraw");
                         } else if i.consume_key(egui::Modifiers::CTRL, egui::Key::E) {
                             action = Some("edit_current");
                         } else if i.consume_key(egui::Modifiers::CTRL, egui::Key::S) {
@@ -4286,7 +4321,7 @@ impl eframe::App for RemoteGuiApp {
                             response.clicked()
                         };
 
-                        if clicked(ui, "Worlds", "Ctrl+L") { action = Some("world_selector"); close_menu = true; }
+                        if clicked(ui, "Worlds", "") { action = Some("world_selector"); close_menu = true; }
                         if clicked(ui, "World Editor", "Ctrl+E") { action = Some("edit_current"); close_menu = true; }
                         if clicked(ui, "Actions", "") { action = Some("actions"); close_menu = true; }
                         ui.separator();
@@ -4359,6 +4394,16 @@ impl eframe::App for RemoteGuiApp {
                         let _ = ws_tx.send(WsMessage::RequestState);
                     }
                 }
+                Some("redraw") => {
+                    // Filter output to only server data (remove client-generated lines)
+                    if let Some(world) = self.worlds.get_mut(self.current_world) {
+                        world.output_lines.retain(|line| line.from_server);
+                    }
+                    // Also request a full resync from server
+                    if let Some(ref ws_tx) = self.ws_tx {
+                        let _ = ws_tx.send(WsMessage::RequestState);
+                    }
+                }
                 Some("help") => self.popup_state = PopupState::Help,
                 _ => {}
             }
@@ -4404,7 +4449,7 @@ impl eframe::App for RemoteGuiApp {
             egui::CentralPanel::default()
                 .frame(egui::Frame::none()
                     .fill(transparent_bg)
-                    .inner_margin(egui::Margin::same(0.0))
+                    .inner_margin(egui::Margin { left: 0.0, right: 0.0, top: 3.0, bottom: 0.0 })
                     .stroke(egui::Stroke::NONE))
                 .show(ctx, |ui| {
                 // Clip output area so scrollbar doesn't bleed into separator bar
