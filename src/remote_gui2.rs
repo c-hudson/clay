@@ -157,7 +157,7 @@ impl GuiTheme {
 
     fn bg(&self) -> Color32 {
         match self {
-            GuiTheme::Dark => Color32::from_rgb(21, 17, 25),   // #151119
+            GuiTheme::Dark => Color32::from_rgb(19, 25, 38),   // #131926
             GuiTheme::Light => Color32::from_rgb(232, 232, 232), // #e8e8e8
         }
     }
@@ -4089,7 +4089,7 @@ impl eframe::App for RemoteGuiApp {
                         ui.add_space(4.0);
                         let menu_btn = ui.add(egui::Button::new(
                             egui::RichText::new("☰").size(fs_icon).color(theme.fg_muted())
-                        ).frame(false));
+                        ).frame(false).min_size(egui::vec2(30.0, 30.0)));
 
                         if menu_btn.clicked() {
                             self.hamburger_menu_open = !self.hamburger_menu_open;
@@ -4269,8 +4269,8 @@ impl eframe::App for RemoteGuiApp {
                 // Position menu: bottom edge at separator bar top, left edge at hamburger button
                 let bar_top = ctx.screen_rect().height() - 34.0 - input_height;
                 let menu_width = 195.0;
-                // 9 items × 24px + 3 separators × 6px + 12px inner margin padding
-                let menu_height = 9.0 * 24.0 + 3.0 * 6.0 + 12.0;
+                // 8 items × 24px + 3 separators × 6px + 12px inner margin padding
+                let menu_height = 8.0 * 24.0 + 3.0 * 6.0 + 12.0;
                 let menu_pos = egui::pos2(0.0, (bar_top - menu_height).max(2.0));
 
                 let mut close_menu = false;
@@ -4329,8 +4329,7 @@ impl eframe::App for RemoteGuiApp {
                         if clicked(ui, "Web Settings", "") { action = Some("web"); close_menu = true; }
                         ui.separator();
                         if clicked(ui, "Toggle Tags", "F2") { action = Some("toggle_tags"); close_menu = true; }
-                        if clicked(ui, "Toggle Highlight", "F8") { action = Some("toggle_highlight"); close_menu = true; }
-                        if clicked(ui, "Filter", "F4") { self.filter_active = !self.filter_active; close_menu = true; }
+                        if clicked(ui, "Search", "F4") { self.filter_active = !self.filter_active; close_menu = true; }
                         ui.separator();
                         if clicked(ui, "Resync", "") { action = Some("resync"); close_menu = true; }
                     });
@@ -4348,7 +4347,7 @@ impl eframe::App for RemoteGuiApp {
 
                 // Close on click outside (skip first 200ms to avoid fighting with open click)
                 let elapsed = self.hamburger_opened_time.elapsed();
-                if elapsed.as_millis() > 200 && ctx.input(|i| i.pointer.any_pressed()) {
+                if elapsed.as_millis() > 100 && ctx.input(|i| i.pointer.any_pressed()) {
                     if let Some(pos) = ctx.input(|i| i.pointer.interact_pos()) {
                         let menu_rect = egui::Rect::from_min_size(menu_pos, egui::vec2(menu_width + 10.0, menu_height));
                         let btn_rect = egui::Rect::from_min_size(
@@ -4406,40 +4405,6 @@ impl eframe::App for RemoteGuiApp {
                 }
                 Some("help") => self.popup_state = PopupState::Help,
                 _ => {}
-            }
-
-            // Filter popup (F4) - separate OS window
-            if self.filter_active {
-                let mut should_close = false;
-                let mut filter_text = self.filter_text.clone();
-
-                ctx.show_viewport_immediate(
-                    egui::ViewportId::from_hash_of("filter_window"),
-                    egui::ViewportBuilder::default()
-                        .with_title("Filter - Clay MUD Client")
-                        .with_inner_size([300.0, 60.0]),
-                    |ctx, _class| {
-                        egui::CentralPanel::default().show(ctx, |ui| {
-                            if ui.input(|i| i.key_pressed(egui::Key::Escape)) ||
-                               ui.input(|i| i.key_pressed(egui::Key::F4)) ||
-                               ui.input(|i| i.viewport().close_requested()) {
-                                should_close = true;
-                            }
-
-                            ui.horizontal(|ui| {
-                                ui.label("Filter:");
-                                let response = ui.text_edit_singleline(&mut filter_text);
-                                response.request_focus();
-                            });
-                        });
-                    },
-                );
-
-                self.filter_text = filter_text;
-                if should_close {
-                    self.filter_active = false;
-                    self.filter_text.clear();
-                }
             }
 
             // Main output area with scrollbar (no frame/border/margin)
@@ -5192,6 +5157,57 @@ impl eframe::App for RemoteGuiApp {
                         // Clamp our tracked offset to valid range
                         self.scroll_offset = Some(current_offset.clamp(0.0, max_offset));
                     }
+                }
+
+                // Inline search box overlay (upper-right corner, like console F4)
+                if self.filter_active {
+                    let panel_rect = ui.max_rect();
+                    let search_width = 220.0;
+                    let search_height = 26.0;
+                    let margin = 8.0;
+                    let search_rect = egui::Rect::from_min_size(
+                        egui::pos2(panel_rect.right() - search_width - margin - 14.0, panel_rect.top() + margin),
+                        egui::vec2(search_width, search_height),
+                    );
+
+                    let painter = ui.painter();
+                    // Background
+                    painter.rect_filled(
+                        search_rect,
+                        egui::Rounding::same(4.0),
+                        theme.bg_surface(),
+                    );
+                    // Border
+                    painter.rect_stroke(
+                        search_rect,
+                        egui::Rounding::same(4.0),
+                        egui::Stroke::new(0.5, theme.border_medium()),
+                    );
+
+                    // Label
+                    let label_pos = egui::pos2(search_rect.left() + 6.0, search_rect.center().y);
+                    painter.text(
+                        label_pos,
+                        egui::Align2::LEFT_CENTER,
+                        "Search:",
+                        egui::FontId::proportional(11.0),
+                        theme.fg_muted(),
+                    );
+
+                    // Text input area
+                    let input_rect = egui::Rect::from_min_max(
+                        egui::pos2(search_rect.left() + 54.0, search_rect.top() + 2.0),
+                        egui::pos2(search_rect.right() - 4.0, search_rect.bottom() - 2.0),
+                    );
+                    let mut child_ui = ui.child_ui(input_rect, egui::Layout::left_to_right(egui::Align::Center));
+                    let response = child_ui.add(
+                        egui::TextEdit::singleline(&mut self.filter_text)
+                            .desired_width(input_rect.width())
+                            .frame(false)
+                            .font(egui::FontId::monospace(11.0))
+                            .text_color(theme.fg())
+                    );
+                    response.request_focus();
                 }
             });
 
