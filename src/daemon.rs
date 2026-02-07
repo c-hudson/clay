@@ -2364,6 +2364,7 @@ pub fn build_multiuser_initial_state(app: &App, username: &str) -> WsMessage {
                 keep_alive_type: world.settings.keep_alive_type.name().to_string(),
                 showing_splash: world.showing_splash,
                 was_connected: world.was_connected,
+                is_proxy: world.proxy_pid.is_some(),
             }
         }).collect();
 

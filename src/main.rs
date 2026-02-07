@@ -3043,6 +3043,8 @@ impl App {
             let mut world = World::new(&w.name);
             world.connected = w.connected;
             world.was_connected = w.was_connected;
+            // Set proxy_pid sentinel if server reports proxy (actual PID not needed for display)
+            world.proxy_pid = if w.is_proxy { Some(0) } else { None };
             let output_lines_count = w.output_lines_ts.len();
             world.output_lines = w.output_lines_ts.into_iter().map(|tl| {
                 OutputLine {
@@ -4019,6 +4021,7 @@ impl App {
                 keep_alive_type: world.settings.keep_alive_type.name().to_string(),
                 showing_splash: world.showing_splash,
                 was_connected: world.was_connected,
+                is_proxy: world.proxy_pid.is_some(),
             }
         }).collect();
 

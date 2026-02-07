@@ -71,6 +71,7 @@ pub struct RemoteWorld {
     pub name: String,
     pub connected: bool,
     pub was_connected: bool,  // Whether world has ever connected (for separator bar display)
+    pub is_proxy: bool,       // Whether the connection uses a TLS proxy
     pub output_lines: Vec<TimestampedLine>,
     pub prompt: String,
     pub settings: RemoteWorldSettings,
@@ -782,7 +783,7 @@ impl RemoteGuiApp {
                     is_current: idx == self.current_world,
                     is_connected: w.connected,
                     is_ssl: w.settings.use_ssl,
-                    is_proxy: false,
+                    is_proxy: w.is_proxy,
                     unseen_lines: w.unseen_lines,
                     last_send,
                     last_recv,
@@ -1078,6 +1079,7 @@ impl RemoteGuiApp {
                             name: w.name,
                             connected: w.connected,
                             was_connected: w.was_connected,
+                            is_proxy: w.is_proxy,
                             // For synchronized more-mode: only use output_lines, NOT pending_lines
                             // Pending lines will be sent as ServerData when released
                             output_lines: {
@@ -1381,7 +1383,7 @@ impl RemoteGuiApp {
                                         connected: world.connected,
                                         is_current: idx == self.current_world,
                                         is_ssl: world.settings.use_ssl,
-                                        is_proxy: false,  // GUI doesn't have access to proxy state
+                                        is_proxy: world.is_proxy,
                                         unseen_lines: world.unseen_lines,
                                         last_send_secs: world.last_send_secs,
                                         last_recv_secs: world.last_recv_secs,
@@ -4024,7 +4026,7 @@ impl eframe::App for RemoteGuiApp {
                                             connected: world.connected,
                                             is_current: idx == self.current_world,
                                             is_ssl: world.settings.use_ssl,
-                                            is_proxy: false,  // GUI doesn't have access to proxy state
+                                            is_proxy: world.is_proxy,
                                             unseen_lines: world.unseen_lines,
                                             last_send_secs: world.last_send_secs,
                                             last_recv_secs: world.last_recv_secs,
@@ -7400,7 +7402,7 @@ impl eframe::App for RemoteGuiApp {
                                     connected: world.connected,
                                     is_current: idx == self.current_world,
                                     is_ssl: world.settings.use_ssl,
-                                    is_proxy: false,
+                                    is_proxy: world.is_proxy,
                                     unseen_lines: world.unseen_lines,
                                     last_send_secs: world.last_send_secs,
                                     last_recv_secs: world.last_recv_secs,

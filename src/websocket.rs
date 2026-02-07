@@ -312,6 +312,9 @@ pub struct WorldStateMsg {
     // Whether world has ever connected (for separator bar display)
     #[serde(default)]
     pub was_connected: bool,
+    // Whether the connection uses a TLS proxy
+    #[serde(default)]
+    pub is_proxy: bool,
 }
 
 /// World settings for WebSocket protocol

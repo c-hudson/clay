@@ -70,7 +70,7 @@ pub fn create_connections_popup(connections: &[ConnectionInfo], visible_height: 
         .map(|c| {
             // SSL/Proxy indicator
             let ssl = if c.is_ssl {
-                if c.is_proxy { "PRX" } else { "SSL" }
+                if c.is_proxy { "PRX" } else { "SSH" }
             } else {
                 ""
             };
