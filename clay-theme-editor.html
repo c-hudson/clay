@@ -1,0 +1,1189 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Clay Theme Editor</title>
+<style>
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+:root {
+  --editor-bg: #0e1220;
+  --editor-bg2: #141828;
+  --editor-bg3: #1a1f33;
+  --editor-bg4: #222840;
+  --editor-fg: #d0ccd6;
+  --editor-fg2: #908a9a;
+  --editor-accent: #d4845a;
+  --editor-border: #2a2f44;
+  --editor-hover: #2a3050;
+  --editor-selected: #33395a;
+  --editor-success: #7ecf8b;
+  --editor-error: #e87070;
+  --editor-warning: #e8c46a;
+}
+
+html, body {
+  height: 100%;
+  overflow: hidden;
+  background: var(--editor-bg);
+  color: var(--editor-fg);
+  font-family: 'Consolas', 'Monaco', 'Courier New', monospace;
+  font-size: 13px;
+}
+
+/* Top toolbar */
+.toolbar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 12px;
+  background: var(--editor-bg2);
+  border-bottom: 1px solid var(--editor-border);
+  flex-shrink: 0;
+  flex-wrap: wrap;
+}
+
+.toolbar-title {
+  font-weight: bold;
+  font-size: 14px;
+  color: var(--editor-accent);
+  margin-right: 12px;
+  white-space: nowrap;
+}
+
+.toolbar-group {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding: 0 8px;
+  border-left: 1px solid var(--editor-border);
+}
+
+.toolbar-group:first-child { border-left: none; padding-left: 0; }
+
+.toolbar-label {
+  color: var(--editor-fg2);
+  font-size: 11px;
+  margin-right: 4px;
+  white-space: nowrap;
+}
+
+button {
+  background: var(--editor-bg3);
+  color: var(--editor-fg);
+  border: 1px solid var(--editor-border);
+  padding: 4px 10px;
+  font-family: inherit;
+  font-size: 12px;
+  cursor: pointer;
+  border-radius: 3px;
+  white-space: nowrap;
+}
+
+button:hover { background: var(--editor-hover); }
+button:active { background: var(--editor-selected); }
+
+button.primary {
+  background: #3a4a30;
+  border-color: #4a6a38;
+}
+button.primary:hover { background: #4a5a40; }
+
+button.danger {
+  background: #4a2020;
+  border-color: #6a3030;
+}
+button.danger:hover { background: #5a3030; }
+
+select {
+  background: var(--editor-bg3);
+  color: var(--editor-fg);
+  border: 1px solid var(--editor-border);
+  padding: 4px 6px;
+  font-family: inherit;
+  font-size: 12px;
+  border-radius: 3px;
+  cursor: pointer;
+}
+
+select:focus, button:focus { outline: 1px solid var(--editor-accent); outline-offset: 1px; }
+
+.unsaved-dot {
+  display: none;
+  width: 8px;
+  height: 8px;
+  background: var(--editor-warning);
+  border-radius: 50%;
+  margin-left: 4px;
+  flex-shrink: 0;
+}
+
+.unsaved-dot.visible { display: inline-block; }
+
+/* Main layout */
+.main-layout {
+  display: flex;
+  height: calc(100% - 37px);
+}
+
+/* Left panel: color list */
+.color-list-panel {
+  width: 340px;
+  min-width: 280px;
+  border-right: 1px solid var(--editor-border);
+  display: flex;
+  flex-direction: column;
+  flex-shrink: 0;
+}
+
+.color-list-scroll {
+  flex: 1;
+  overflow-y: auto;
+  overflow-x: hidden;
+}
+
+.color-list-scroll::-webkit-scrollbar { width: 6px; }
+.color-list-scroll::-webkit-scrollbar-track { background: var(--editor-bg); }
+.color-list-scroll::-webkit-scrollbar-thumb { background: var(--editor-border); border-radius: 3px; }
+
+.color-group {
+  margin-bottom: 2px;
+}
+
+.color-group-header {
+  display: flex;
+  align-items: center;
+  padding: 5px 10px;
+  background: var(--editor-bg2);
+  cursor: pointer;
+  user-select: none;
+  position: sticky;
+  top: 0;
+  z-index: 1;
+  border-bottom: 1px solid var(--editor-border);
+}
+
+.color-group-header:hover { background: var(--editor-bg3); }
+
+.color-group-arrow {
+  font-size: 10px;
+  width: 14px;
+  color: var(--editor-fg2);
+  transition: transform 0.15s;
+}
+
+.color-group-arrow.collapsed { transform: rotate(-90deg); }
+
+.color-group-title {
+  font-size: 11px;
+  font-weight: bold;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  color: var(--editor-fg2);
+}
+
+.color-group-items { }
+.color-group-items.collapsed { display: none; }
+
+.color-item {
+  display: flex;
+  align-items: center;
+  padding: 3px 10px 3px 24px;
+  cursor: pointer;
+  gap: 8px;
+  border-left: 3px solid transparent;
+}
+
+.color-item:hover { background: var(--editor-hover); }
+.color-item.selected {
+  background: var(--editor-selected);
+  border-left-color: var(--editor-accent);
+}
+
+.color-swatch {
+  width: 20px;
+  height: 20px;
+  border-radius: 3px;
+  border: 1px solid rgba(255,255,255,0.15);
+  flex-shrink: 0;
+}
+
+.color-item-info {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.color-item-name {
+  font-size: 12px;
+  color: var(--editor-fg);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.color-item-hex {
+  font-size: 11px;
+  color: var(--editor-fg2);
+  flex-shrink: 0;
+}
+
+/* Right panel */
+.right-panel {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  overflow: hidden;
+}
+
+/* Color picker section */
+.picker-section {
+  padding: 12px 16px;
+  border-bottom: 1px solid var(--editor-border);
+  flex-shrink: 0;
+}
+
+.picker-title {
+  font-size: 12px;
+  color: var(--editor-fg2);
+  margin-bottom: 8px;
+}
+
+.picker-var-name {
+  color: var(--editor-accent);
+  font-weight: bold;
+}
+
+.picker-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin-bottom: 8px;
+}
+
+.picker-color-input {
+  width: 60px;
+  height: 40px;
+  border: 1px solid var(--editor-border);
+  border-radius: 4px;
+  cursor: pointer;
+  padding: 2px;
+  background: var(--editor-bg3);
+}
+
+.picker-color-input::-webkit-color-swatch-wrapper { padding: 0; }
+.picker-color-input::-webkit-color-swatch { border: none; border-radius: 2px; }
+
+.picker-hex-input {
+  background: var(--editor-bg3);
+  color: var(--editor-fg);
+  border: 1px solid var(--editor-border);
+  padding: 6px 8px;
+  font-family: inherit;
+  font-size: 13px;
+  width: 90px;
+  border-radius: 3px;
+}
+
+.picker-hex-input:focus { outline: 1px solid var(--editor-accent); }
+
+.picker-hex-input.invalid { border-color: var(--editor-error); }
+
+.slider-group {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.slider-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.slider-label {
+  width: 14px;
+  font-size: 11px;
+  font-weight: bold;
+}
+
+.slider-label-r { color: #e87070; }
+.slider-label-g { color: #7ecf8b; }
+.slider-label-b { color: #8cb4e0; }
+
+.slider-input {
+  flex: 1;
+  -webkit-appearance: none;
+  appearance: none;
+  height: 4px;
+  border-radius: 2px;
+  outline: none;
+  cursor: pointer;
+  max-width: 180px;
+}
+
+.slider-input::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 14px;
+  height: 14px;
+  border-radius: 50%;
+  background: var(--editor-fg);
+  border: 2px solid var(--editor-bg);
+  cursor: pointer;
+}
+
+.slider-r { background: linear-gradient(to right, #000, #ff0000); }
+.slider-g { background: linear-gradient(to right, #000, #00ff00); }
+.slider-b { background: linear-gradient(to right, #000, #0000ff); }
+
+.slider-value {
+  width: 28px;
+  font-size: 11px;
+  color: var(--editor-fg2);
+  text-align: right;
+}
+
+.picker-no-selection {
+  color: var(--editor-fg2);
+  font-style: italic;
+  padding: 20px 0;
+  text-align: center;
+}
+
+/* Preview section */
+.preview-section {
+  flex: 1;
+  padding: 12px 16px;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+}
+
+.preview-label {
+  font-size: 11px;
+  color: var(--editor-fg2);
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  margin-bottom: 6px;
+  flex-shrink: 0;
+}
+
+.preview-container {
+  flex: 1;
+  border-radius: 4px;
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
+  border: 1px solid var(--editor-border);
+  min-height: 200px;
+}
+
+.preview-output {
+  flex: 1;
+  padding: 8px 10px;
+  overflow-y: auto;
+  font-size: 13px;
+  line-height: 1.4;
+}
+
+.preview-output::-webkit-scrollbar { width: 4px; }
+.preview-output::-webkit-scrollbar-track { background: transparent; }
+.preview-output::-webkit-scrollbar-thumb { background: rgba(255,255,255,0.1); border-radius: 2px; }
+
+.preview-separator {
+  display: flex;
+  align-items: center;
+  padding: 0 4px;
+  height: 20px;
+  font-size: 12px;
+  flex-shrink: 0;
+}
+
+.preview-status-left {
+  padding: 0 4px;
+  font-weight: bold;
+  font-size: 11px;
+}
+
+.preview-world-name {
+  font-weight: bold;
+  padding: 0 6px;
+}
+
+.preview-separator-fill {
+  flex: 1;
+  overflow: hidden;
+  white-space: nowrap;
+}
+
+.preview-time {
+  padding: 0 4px;
+  font-size: 12px;
+}
+
+.preview-input {
+  padding: 4px 10px;
+  min-height: 24px;
+  font-size: 13px;
+  display: flex;
+  align-items: center;
+}
+
+.preview-prompt-text {
+  white-space: pre;
+}
+
+.preview-cursor {
+  display: inline-block;
+  width: 7px;
+  height: 14px;
+  animation: blink 1s step-end infinite;
+}
+
+@keyframes blink {
+  0%, 50% { opacity: 1; }
+  51%, 100% { opacity: 0; }
+}
+
+/* Hidden file input */
+.hidden-input { display: none; }
+
+/* Popup overlay for add theme */
+.popup-overlay {
+  display: none;
+  position: fixed;
+  top: 0; left: 0; right: 0; bottom: 0;
+  background: rgba(0,0,0,0.6);
+  z-index: 100;
+  align-items: center;
+  justify-content: center;
+}
+
+.popup-overlay.visible { display: flex; }
+
+.popup-box {
+  background: var(--editor-bg3);
+  border: 1px solid var(--editor-accent);
+  border-radius: 6px;
+  padding: 16px 20px;
+  min-width: 280px;
+}
+
+.popup-box h3 {
+  color: var(--editor-accent);
+  font-size: 14px;
+  margin-bottom: 12px;
+}
+
+.popup-box input[type="text"] {
+  background: var(--editor-bg);
+  color: var(--editor-fg);
+  border: 1px solid var(--editor-border);
+  padding: 6px 8px;
+  font-family: inherit;
+  font-size: 13px;
+  width: 100%;
+  border-radius: 3px;
+  margin-bottom: 12px;
+}
+
+.popup-box input[type="text"]:focus { outline: 1px solid var(--editor-accent); }
+
+.popup-buttons {
+  display: flex;
+  gap: 8px;
+  justify-content: flex-end;
+}
+</style>
+</head>
+<body>
+
+<div class="toolbar">
+  <span class="toolbar-title">Clay Theme Editor</span>
+  <div class="unsaved-dot" id="unsavedDot" title="Unsaved changes"></div>
+
+  <div class="toolbar-group">
+    <span class="toolbar-label">Theme:</span>
+    <select id="themeSelect" onchange="switchTheme(this.value)"></select>
+    <button onclick="showAddThemePopup()">Add</button>
+    <button class="danger" onclick="deleteTheme()">Delete</button>
+  </div>
+
+  <div class="toolbar-group">
+    <button onclick="loadFile()">Load File</button>
+    <button class="primary" onclick="saveFile()">Save File</button>
+    <button onclick="resetChanges()">Reset</button>
+    <button onclick="loadDefaults()">Load Defaults</button>
+  </div>
+</div>
+
+<div class="main-layout">
+  <div class="color-list-panel">
+    <div class="color-list-scroll" id="colorList"></div>
+  </div>
+
+  <div class="right-panel">
+    <div class="picker-section" id="pickerSection">
+      <div class="picker-no-selection" id="pickerPlaceholder">Select a color variable to edit</div>
+      <div id="pickerControls" style="display:none">
+        <div class="picker-title">Editing: <span class="picker-var-name" id="pickerVarName"></span></div>
+        <div class="picker-row">
+          <input type="color" class="picker-color-input" id="pickerColor" oninput="onPickerColor(this.value)">
+          <input type="text" class="picker-hex-input" id="pickerHex" maxlength="7" oninput="onPickerHex(this.value)" onkeydown="if(event.key==='Enter')this.blur()">
+          <div class="slider-group">
+            <div class="slider-row">
+              <span class="slider-label slider-label-r">R</span>
+              <input type="range" class="slider-input slider-r" id="sliderR" min="0" max="255" oninput="onSlider()">
+              <span class="slider-value" id="valR">0</span>
+            </div>
+            <div class="slider-row">
+              <span class="slider-label slider-label-g">G</span>
+              <input type="range" class="slider-input slider-g" id="sliderG" min="0" max="255" oninput="onSlider()">
+              <span class="slider-value" id="valG">0</span>
+            </div>
+            <div class="slider-row">
+              <span class="slider-label slider-label-b">B</span>
+              <input type="range" class="slider-input slider-b" id="sliderB" min="0" max="255" oninput="onSlider()">
+              <span class="slider-value" id="valB">0</span>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <div class="preview-section">
+      <div class="preview-label">Live Preview</div>
+      <div class="preview-container" id="previewContainer">
+        <div class="preview-output" id="previewOutput"></div>
+        <div class="preview-separator" id="previewSeparator">
+          <span class="preview-status-left" id="previewStatus"></span>
+          <span class="preview-world-name" id="previewWorldName"></span>
+          <span class="preview-separator-fill" id="previewFill"></span>
+          <span class="preview-time" id="previewTime"></span>
+        </div>
+        <div class="preview-input" id="previewInput">
+          <span class="preview-prompt-text" id="previewPrompt"></span>
+          <span class="preview-cursor" id="previewCursor"></span>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<input type="file" class="hidden-input" id="fileInput" accept=".dat,.txt,.theme" onchange="handleFileLoad(this)">
+
+<div class="popup-overlay" id="addThemePopup">
+  <div class="popup-box">
+    <h3>Add New Theme</h3>
+    <input type="text" id="newThemeName" placeholder="Theme name (e.g. midnight)" onkeydown="if(event.key==='Enter')confirmAddTheme();if(event.key==='Escape')closeAddThemePopup()">
+    <div class="popup-buttons">
+      <button onclick="closeAddThemePopup()">Cancel</button>
+      <button class="primary" onclick="confirmAddTheme()">Add</button>
+    </div>
+  </div>
+</div>
+
+<script>
+// ── Data ──────────────────────────────────────────────────────────────────
+
+const ANSI_NAMES = [
+  'black','red','green','yellow','blue','magenta','cyan','white',
+  'bright black','bright red','bright green','bright yellow',
+  'bright blue','bright magenta','bright cyan','bright white'
+];
+
+const VARIABLE_GROUPS = [
+  {
+    name: 'Background',
+    vars: [
+      { key: 'bg', label: 'bg', desc: 'Main content area' },
+      { key: 'bg_deep', label: 'bg_deep', desc: 'Deepest bg layer' },
+      { key: 'bg_surface', label: 'bg_surface', desc: 'Slightly elevated' },
+      { key: 'bg_elevated', label: 'bg_elevated', desc: 'Popups, menus' },
+      { key: 'bg_hover', label: 'bg_hover', desc: 'Hover state' },
+    ]
+  },
+  {
+    name: 'Foreground',
+    vars: [
+      { key: 'fg', label: 'fg', desc: 'Primary text' },
+      { key: 'fg_secondary', label: 'fg_secondary', desc: 'Less prominent' },
+      { key: 'fg_muted', label: 'fg_muted', desc: 'Hints' },
+      { key: 'fg_dim', label: 'fg_dim', desc: 'Disabled' },
+    ]
+  },
+  {
+    name: 'Semantic',
+    vars: [
+      { key: 'accent', label: 'accent', desc: 'Primary accent' },
+      { key: 'accent_dim', label: 'accent_dim', desc: 'Dimmed accent' },
+      { key: 'highlight', label: 'highlight', desc: 'Warning/attention' },
+      { key: 'success', label: 'success', desc: 'Green' },
+      { key: 'error', label: 'error', desc: 'Red' },
+      { key: 'error_dim', label: 'error_dim', desc: 'Dimmed error' },
+    ]
+  },
+  {
+    name: 'UI Elements',
+    vars: [
+      { key: 'status_bar.bg', label: 'status_bar.bg', desc: 'Separator bar' },
+      { key: 'selection.bg', label: 'selection.bg', desc: 'Text selection' },
+      { key: 'link', label: 'link', desc: 'URL color' },
+      { key: 'prompt', label: 'prompt', desc: 'Input prompt' },
+      { key: 'border_subtle', label: 'border_subtle', desc: 'Subtle borders' },
+      { key: 'border_medium', label: 'border_medium', desc: 'Medium borders' },
+      { key: 'button.selected_bg', label: 'button.selected_bg', desc: 'Selected button bg' },
+      { key: 'button.selected_fg', label: 'button.selected_fg', desc: 'Selected button fg' },
+      { key: 'more_indicator.bg', label: 'more_indicator.bg', desc: 'More badge' },
+      { key: 'activity.bg', label: 'activity.bg', desc: 'Activity indicator' },
+    ]
+  },
+  {
+    name: 'ANSI Palette',
+    vars: Array.from({length: 16}, (_, i) => ({
+      key: `ansi.${i}`,
+      label: `ansi.${i}`,
+      desc: ANSI_NAMES[i]
+    }))
+  }
+];
+
+function darkDefaults() {
+  return {
+    bg: '#131926', bg_deep: '#151119', bg_surface: '#1c1722',
+    bg_elevated: '#231d2a', bg_hover: '#2c2535',
+    fg: '#e8e4ec', fg_secondary: '#a89fb4', fg_muted: '#6e6479', fg_dim: '#4a4255',
+    accent: '#d4845a', accent_dim: '#c27a52', highlight: '#e8c46a',
+    success: '#7ecf8b', error: '#e87070', error_dim: '#5f0000',
+    'status_bar.bg': '#284b63', 'selection.bg': '#004080', link: '#8cb4e0',
+    prompt: '#d4845a', border_subtle: '#221c2b', border_medium: '#2e2738',
+    'button.selected_bg': '#e8e4ec', 'button.selected_fg': '#131926',
+    'more_indicator.bg': '#5f0000', 'activity.bg': '#f5f0d8',
+    'ansi.0': '#000000', 'ansi.1': '#aa0000', 'ansi.2': '#44aa44',
+    'ansi.3': '#aa5500', 'ansi.4': '#0039aa', 'ansi.5': '#aa22aa',
+    'ansi.6': '#1a92aa', 'ansi.7': '#aaaaaa', 'ansi.8': '#777777',
+    'ansi.9': '#ff8787', 'ansi.10': '#4ce64c', 'ansi.11': '#ded82c',
+    'ansi.12': '#295fcc', 'ansi.13': '#cc58cc', 'ansi.14': '#4ccce6',
+    'ansi.15': '#ffffff'
+  };
+}
+
+function lightDefaults() {
+  return {
+    bg: '#e8e8e8', bg_deep: '#e8e8e8', bg_surface: '#b3b3b3',
+    bg_elevated: '#f0f0f0', bg_hover: '#d2d2d2',
+    fg: '#1d1d1f', fg_secondary: '#636366', fg_muted: '#8e8e93', fg_dim: '#aeaeb2',
+    accent: '#b86b3f', accent_dim: '#a05a32', highlight: '#e08600',
+    success: '#34c759', error: '#ff3b30', error_dim: '#5f0000',
+    'status_bar.bg': '#9b9b9b', 'selection.bg': '#b4c8e6', link: '#007aff',
+    prompt: '#b86b3f', border_subtle: '#c0c0c0', border_medium: '#b0b0b0',
+    'button.selected_bg': '#1d1d1f', 'button.selected_fg': '#e8e8e8',
+    'more_indicator.bg': '#5f0000', 'activity.bg': '#fcba03',
+    'ansi.0': '#000000', 'ansi.1': '#aa0000', 'ansi.2': '#44aa44',
+    'ansi.3': '#804000', 'ansi.4': '#0039aa', 'ansi.5': '#aa22aa',
+    'ansi.6': '#1a92aa', 'ansi.7': '#505050', 'ansi.8': '#777777',
+    'ansi.9': '#ff8787', 'ansi.10': '#4ce64c', 'ansi.11': '#a7a321',
+    'ansi.12': '#295fcc', 'ansi.13': '#cc58cc', 'ansi.14': '#4ccce6',
+    'ansi.15': '#282828'
+  };
+}
+
+// ── State ──────────────────────────────────────────────────────────────────
+
+let themes = {};             // { name: { key: '#hex', ... }, ... }
+let savedSnapshot = '';      // JSON of themes at last save/load
+let currentTheme = 'dark';
+let selectedVar = null;
+
+// ── Init ──────────────────────────────────────────────────────────────────
+
+function init() {
+  themes = { dark: darkDefaults(), light: lightDefaults() };
+  savedSnapshot = JSON.stringify(themes);
+  currentTheme = 'dark';
+  selectedVar = null;
+  rebuildAll();
+}
+
+function rebuildAll() {
+  populateThemeSelect();
+  buildColorList();
+  updatePicker();
+  updatePreview();
+  updateUnsaved();
+}
+
+// ── Unsaved tracking ──────────────────────────────────────────────────────
+
+function isModified() {
+  return JSON.stringify(themes) !== savedSnapshot;
+}
+
+function updateUnsaved() {
+  document.getElementById('unsavedDot').classList.toggle('visible', isModified());
+  document.title = (isModified() ? '* ' : '') + 'Clay Theme Editor';
+}
+
+window.addEventListener('beforeunload', function(e) {
+  if (isModified()) {
+    e.preventDefault();
+    e.returnValue = '';
+  }
+});
+
+// ── Theme selector ────────────────────────────────────────────────────────
+
+function populateThemeSelect() {
+  const sel = document.getElementById('themeSelect');
+  const prev = sel.value;
+  sel.innerHTML = '';
+  for (const name of Object.keys(themes).sort()) {
+    const opt = document.createElement('option');
+    opt.value = name;
+    opt.textContent = name;
+    if (name === currentTheme) opt.selected = true;
+    sel.appendChild(opt);
+  }
+}
+
+function switchTheme(name) {
+  if (!themes[name]) return;
+  currentTheme = name;
+  selectedVar = null;
+  buildColorList();
+  updatePicker();
+  updatePreview();
+}
+
+function showAddThemePopup() {
+  document.getElementById('addThemePopup').classList.add('visible');
+  const input = document.getElementById('newThemeName');
+  input.value = '';
+  input.focus();
+}
+
+function closeAddThemePopup() {
+  document.getElementById('addThemePopup').classList.remove('visible');
+}
+
+function confirmAddTheme() {
+  const name = document.getElementById('newThemeName').value.trim().toLowerCase().replace(/[^a-z0-9_-]/g, '');
+  if (!name) return;
+  if (themes[name]) { alert('Theme "' + name + '" already exists.'); return; }
+  themes[name] = JSON.parse(JSON.stringify(themes[currentTheme]));
+  currentTheme = name;
+  closeAddThemePopup();
+  rebuildAll();
+}
+
+function deleteTheme() {
+  const names = Object.keys(themes);
+  if (names.length <= 1) { alert('Cannot delete the last theme.'); return; }
+  if (!confirm('Delete theme "' + currentTheme + '"?')) return;
+  delete themes[currentTheme];
+  currentTheme = Object.keys(themes).sort()[0];
+  selectedVar = null;
+  rebuildAll();
+}
+
+// ── Color list ────────────────────────────────────────────────────────────
+
+function buildColorList() {
+  const container = document.getElementById('colorList');
+  container.innerHTML = '';
+  const t = themes[currentTheme];
+  if (!t) return;
+
+  for (const group of VARIABLE_GROUPS) {
+    const groupEl = document.createElement('div');
+    groupEl.className = 'color-group';
+
+    const header = document.createElement('div');
+    header.className = 'color-group-header';
+    header.innerHTML = `<span class="color-group-arrow">&#9660;</span><span class="color-group-title">${group.name}</span>`;
+
+    const items = document.createElement('div');
+    items.className = 'color-group-items';
+
+    header.addEventListener('click', () => {
+      const arrow = header.querySelector('.color-group-arrow');
+      arrow.classList.toggle('collapsed');
+      items.classList.toggle('collapsed');
+    });
+
+    for (const v of group.vars) {
+      const hex = t[v.key] || '#000000';
+      const item = document.createElement('div');
+      item.className = 'color-item' + (selectedVar === v.key ? ' selected' : '');
+      item.dataset.key = v.key;
+      item.innerHTML = `<div class="color-swatch" style="background:${hex}"></div>` +
+        `<div class="color-item-info">` +
+        `<span class="color-item-name" title="${v.desc}">${v.label}</span>` +
+        `<span class="color-item-hex">${hex}</span></div>`;
+      item.addEventListener('click', () => selectVar(v.key));
+      items.appendChild(item);
+    }
+
+    groupEl.appendChild(header);
+    groupEl.appendChild(items);
+    container.appendChild(groupEl);
+  }
+}
+
+function selectVar(key) {
+  selectedVar = key;
+  // Update selection highlight
+  document.querySelectorAll('.color-item').forEach(el => {
+    el.classList.toggle('selected', el.dataset.key === key);
+  });
+  updatePicker();
+}
+
+function updateColorListItem(key, hex) {
+  const item = document.querySelector(`.color-item[data-key="${CSS.escape(key)}"]`);
+  if (!item) return;
+  item.querySelector('.color-swatch').style.background = hex;
+  item.querySelector('.color-item-hex').textContent = hex;
+}
+
+// ── Picker ────────────────────────────────────────────────────────────────
+
+function updatePicker() {
+  const placeholder = document.getElementById('pickerPlaceholder');
+  const controls = document.getElementById('pickerControls');
+  if (!selectedVar || !themes[currentTheme]) {
+    placeholder.style.display = 'block';
+    controls.style.display = 'none';
+    return;
+  }
+  placeholder.style.display = 'none';
+  controls.style.display = 'block';
+
+  document.getElementById('pickerVarName').textContent = selectedVar;
+  const hex = themes[currentTheme][selectedVar] || '#000000';
+  setPickerValues(hex);
+}
+
+function setPickerValues(hex) {
+  document.getElementById('pickerColor').value = hex;
+  document.getElementById('pickerHex').value = hex;
+  document.getElementById('pickerHex').classList.remove('invalid');
+  const [r, g, b] = hexToRgb(hex);
+  document.getElementById('sliderR').value = r;
+  document.getElementById('sliderG').value = g;
+  document.getElementById('sliderB').value = b;
+  document.getElementById('valR').textContent = r;
+  document.getElementById('valG').textContent = g;
+  document.getElementById('valB').textContent = b;
+}
+
+function onPickerColor(hex) {
+  if (!selectedVar) return;
+  setPickerValues(hex);
+  applyColor(hex);
+}
+
+function onPickerHex(val) {
+  if (!selectedVar) return;
+  val = val.trim();
+  if (!val.startsWith('#')) val = '#' + val;
+  const input = document.getElementById('pickerHex');
+  if (/^#[0-9a-fA-F]{6}$/.test(val)) {
+    input.classList.remove('invalid');
+    const hex = val.toLowerCase();
+    document.getElementById('pickerColor').value = hex;
+    const [r, g, b] = hexToRgb(hex);
+    document.getElementById('sliderR').value = r;
+    document.getElementById('sliderG').value = g;
+    document.getElementById('sliderB').value = b;
+    document.getElementById('valR').textContent = r;
+    document.getElementById('valG').textContent = g;
+    document.getElementById('valB').textContent = b;
+    applyColor(hex);
+  } else {
+    input.classList.add('invalid');
+  }
+}
+
+function onSlider() {
+  if (!selectedVar) return;
+  const r = parseInt(document.getElementById('sliderR').value);
+  const g = parseInt(document.getElementById('sliderG').value);
+  const b = parseInt(document.getElementById('sliderB').value);
+  document.getElementById('valR').textContent = r;
+  document.getElementById('valG').textContent = g;
+  document.getElementById('valB').textContent = b;
+  const hex = rgbToHex(r, g, b);
+  document.getElementById('pickerColor').value = hex;
+  document.getElementById('pickerHex').value = hex;
+  document.getElementById('pickerHex').classList.remove('invalid');
+  applyColor(hex);
+}
+
+function applyColor(hex) {
+  if (!selectedVar || !themes[currentTheme]) return;
+  themes[currentTheme][selectedVar] = hex;
+  updateColorListItem(selectedVar, hex);
+  updatePreview();
+  updateUnsaved();
+}
+
+// ── Preview ───────────────────────────────────────────────────────────────
+
+function updatePreview() {
+  const t = themes[currentTheme];
+  if (!t) return;
+
+  const container = document.getElementById('previewContainer');
+  const output = document.getElementById('previewOutput');
+  const sep = document.getElementById('previewSeparator');
+  const input = document.getElementById('previewInput');
+
+  // Output area
+  container.style.background = t.bg;
+  output.style.background = t.bg;
+  output.style.color = t.fg;
+
+  // Build sample MUD output with ANSI colors
+  const lines = [
+    { text: 'Welcome to the Realm of Shadows!', color: t['ansi.11'], bold: true },
+    { text: '' },
+    { text: 'The tavern is dimly lit by flickering candles.', color: t.fg },
+    { text: 'A grizzled dwarf sits in the corner, nursing an ale.', color: t.fg },
+    { text: '[chat] Gandalf says, "Anyone seen my staff?"', color: t['ansi.6'] },
+    { text: '[chat] Frodo says, "Check the lost and found!"', color: t['ansi.6'] },
+    { text: '' },
+    { text: 'Obvious exits: north, south, east', color: t['ansi.2'] },
+    { text: '' },
+    { text: 'A shadowy figure attacks you!', color: t['ansi.1'], bold: true },
+    { text: 'You dodge the blow and counter-attack.', color: t['ansi.3'] },
+    { text: 'You deal 42 damage to the shadow.', color: t.success },
+    { text: 'The shadow flees into the darkness.', color: t.fg_secondary },
+    { text: '' },
+    { text: 'You gain 150 experience points.', color: t.highlight },
+    { text: 'WARNING: Your health is low!', color: t.error, bold: true },
+    { text: '' },
+    { text: 'Type "help" for a list of commands.', color: t.fg_muted },
+    { text: 'Visit https://clay-mud.example.com for more info', color: t.link, underline: true },
+  ];
+
+  let html = '';
+  for (const line of lines) {
+    if (!line.text) { html += '<div style="height:4px"></div>'; continue; }
+    let style = `color:${line.color || t.fg}`;
+    if (line.bold) style += ';font-weight:bold';
+    if (line.underline) style += ';text-decoration:underline';
+    html += `<div style="${style}">${escapeHtml(line.text)}</div>`;
+  }
+  output.innerHTML = html;
+
+  // Separator bar
+  sep.style.background = t['status_bar.bg'];
+  sep.style.color = t.fg;
+
+  const status = document.getElementById('previewStatus');
+  status.style.background = t['more_indicator.bg'];
+  status.style.color = t['ansi.7'];
+  status.textContent = '__________';
+  status.style.background = 'transparent';
+  status.style.color = t.fg_dim;
+
+  const worldName = document.getElementById('previewWorldName');
+  worldName.style.color = '#ffffff';
+  worldName.innerHTML = '<span style="color:' + t.success + '">&#x25CF;</span> MudWorld';
+
+  const fill = document.getElementById('previewFill');
+  let underscores = '';
+  for (let i = 0; i < 60; i++) underscores += '_';
+  fill.style.color = t.fg_dim;
+  fill.textContent = underscores;
+
+  const time = document.getElementById('previewTime');
+  const now = new Date();
+  time.style.color = t['ansi.6'];
+  time.textContent = String(now.getHours()).padStart(2, '0') + ':' + String(now.getMinutes()).padStart(2, '0');
+
+  // Input area
+  input.style.background = t.bg_deep;
+  input.style.color = t.fg;
+  input.style.borderTop = `1px solid ${t.border_subtle}`;
+
+  const promptEl = document.getElementById('previewPrompt');
+  promptEl.style.color = t.prompt;
+  promptEl.textContent = 'HP:142> ';
+
+  const cursor = document.getElementById('previewCursor');
+  cursor.style.background = t.fg;
+}
+
+// ── File operations ───────────────────────────────────────────────────────
+
+function loadFile() {
+  document.getElementById('fileInput').click();
+}
+
+function handleFileLoad(input) {
+  const file = input.files[0];
+  if (!file) return;
+  const reader = new FileReader();
+  reader.onload = function(e) {
+    const content = e.target.result;
+    const parsed = parseThemeFile(content);
+    if (Object.keys(parsed).length === 0) {
+      alert('No valid themes found in the file.');
+      return;
+    }
+    themes = parsed;
+    const names = Object.keys(themes).sort();
+    currentTheme = names.includes('dark') ? 'dark' : names[0];
+    selectedVar = null;
+    savedSnapshot = JSON.stringify(themes);
+    rebuildAll();
+  };
+  reader.readAsText(file);
+  input.value = '';
+}
+
+function parseThemeFile(content) {
+  const result = {};
+  let currentName = null;
+
+  // Start with defaults for dark and light if they appear
+  for (const line of content.split('\n')) {
+    const trimmed = line.trim();
+    if (trimmed.startsWith('[') && trimmed.endsWith(']')) {
+      const inner = trimmed.slice(1, -1);
+      if (inner.startsWith('theme:')) {
+        const name = inner.slice(6).trim();
+        currentName = name;
+        if (!result[name]) {
+          // Start from appropriate defaults
+          if (name === 'light') {
+            result[name] = lightDefaults();
+          } else if (name === 'dark') {
+            result[name] = darkDefaults();
+          } else {
+            result[name] = darkDefaults();
+          }
+        }
+      }
+      continue;
+    }
+
+    if (!currentName || trimmed === '' || trimmed.startsWith('#')) continue;
+
+    const eqIdx = trimmed.indexOf('=');
+    if (eqIdx === -1) continue;
+
+    const key = trimmed.slice(0, eqIdx).trim();
+    let value = trimmed.slice(eqIdx + 1).trim();
+
+    // Strip inline comments (value starts with #hex, so skip first #)
+    if (value.startsWith('#') && value.length > 7) {
+      const commentIdx = value.indexOf('#', 1);
+      if (commentIdx !== -1) value = value.slice(0, commentIdx).trim();
+    }
+
+    if (/^#[0-9a-fA-F]{6}$/.test(value)) {
+      if (result[currentName]) {
+        result[currentName][key] = value.toLowerCase();
+      }
+    }
+  }
+
+  return result;
+}
+
+function saveFile() {
+  let content = '# Clay Theme Configuration\n';
+  content += '# Colors are #RRGGBB hex values. Lines starting with # are comments.\n';
+  content += '# Edit colors and restart Clay (or /reload) to apply changes.\n';
+  content += '# Delete this file to regenerate defaults.\n';
+
+  const orderedKeys = [];
+  for (const group of VARIABLE_GROUPS) {
+    for (const v of group.vars) orderedKeys.push(v.key);
+  }
+
+  const groupComments = {
+    'bg': '# Background hierarchy',
+    'fg': '# Foreground hierarchy',
+    'accent': '# Semantic colors',
+    'status_bar.bg': '# UI elements',
+    'ansi.0': '# ANSI palette (16 standard colors)'
+  };
+
+  for (const name of Object.keys(themes).sort()) {
+    content += `\n[theme:${name}]\n`;
+    const t = themes[name];
+    for (const key of orderedKeys) {
+      if (groupComments[key]) content += `\n${groupComments[key]}\n`;
+      let line = `${key} = ${t[key] || '#000000'}`;
+      if (key.startsWith('ansi.')) {
+        const idx = parseInt(key.split('.')[1]);
+        line += `  # ${ANSI_NAMES[idx]}`;
+      }
+      content += line + '\n';
+    }
+  }
+
+  const blob = new Blob([content], { type: 'text/plain' });
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = 'clay.theme.dat';
+  a.click();
+  URL.revokeObjectURL(a.href);
+
+  savedSnapshot = JSON.stringify(themes);
+  updateUnsaved();
+}
+
+function resetChanges() {
+  if (!isModified()) return;
+  if (!confirm('Revert all changes since last load/save?')) return;
+  themes = JSON.parse(savedSnapshot);
+  const names = Object.keys(themes).sort();
+  if (!themes[currentTheme]) currentTheme = names[0];
+  selectedVar = null;
+  rebuildAll();
+}
+
+function loadDefaults() {
+  if (isModified() && !confirm('Discard current changes and load built-in defaults?')) return;
+  themes = { dark: darkDefaults(), light: lightDefaults() };
+  savedSnapshot = JSON.stringify(themes);
+  currentTheme = 'dark';
+  selectedVar = null;
+  rebuildAll();
+}
+
+// ── Utility ───────────────────────────────────────────────────────────────
+
+function hexToRgb(hex) {
+  hex = hex.replace('#', '');
+  return [
+    parseInt(hex.slice(0, 2), 16),
+    parseInt(hex.slice(2, 4), 16),
+    parseInt(hex.slice(4, 6), 16)
+  ];
+}
+
+function rgbToHex(r, g, b) {
+  return '#' + [r, g, b].map(v => v.toString(16).padStart(2, '0')).join('');
+}
+
+function escapeHtml(s) {
+  return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+}
+
+// ── Start ─────────────────────────────────────────────────────────────────
+
+init();
+</script>
+</body>
+</html>

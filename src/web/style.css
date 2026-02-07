@@ -1,15 +1,15 @@
 /* Clay MUD Client Web Interface - Console-style */
 
 :root {
-    --bg-color: #000000;
-    --text-color: #c0c0c0;
-    --input-bg: #000000;
-    --border-color: #404040;
-    --accent-color: #00cdcd;
-    --error-color: #cd0000;
-    --success-color: #00cd00;
-    --warning-color: #cdcd00;
-    --separator-color: #404040;
+    --bg-color: var(--theme-bg, #000000);
+    --text-color: var(--theme-fg, #c0c0c0);
+    --input-bg: var(--theme-bg, #000000);
+    --border-color: var(--theme-border-medium, #404040);
+    --accent-color: var(--theme-accent, #00cdcd);
+    --error-color: var(--theme-error, #cd0000);
+    --success-color: var(--theme-success, #00cd00);
+    --warning-color: var(--theme-highlight, #cdcd00);
+    --separator-color: var(--theme-border-medium, #404040);
 }
 
 * {
@@ -334,59 +334,60 @@ body {
     min-height: 1em;
 }
 
-/* ANSI color classes - Xubuntu Dark color palette */
-.ansi-black { color: #000000; }
-.ansi-red { color: #aa0000; }
-.ansi-green { color: #44aa44; }
-.ansi-yellow { color: #aa5500; }
-.ansi-blue { color: #0039aa; }
-.ansi-magenta { color: #aa22aa; }
-.ansi-cyan { color: #1a92aa; }
-.ansi-white { color: #aaaaaa; }
-.ansi-bright-black { color: #777777; }
-.ansi-bright-red { color: #ff8787; }
-.ansi-bright-green { color: #4ce64c; }
-.ansi-bright-yellow { color: #ded82c; }
-.ansi-bright-blue { color: #295fcc; }
-.ansi-bright-magenta { color: #cc58cc; }
-.ansi-bright-cyan { color: #4ccce6; }
-.ansi-bright-white { color: #ffffff; }
+/* ANSI color classes - use theme variables with fallbacks */
+.ansi-black { color: var(--theme-ansi-0, #000000); }
+.ansi-red { color: var(--theme-ansi-1, #aa0000); }
+.ansi-green { color: var(--theme-ansi-2, #44aa44); }
+.ansi-yellow { color: var(--theme-ansi-3, #aa5500); }
+.ansi-blue { color: var(--theme-ansi-4, #0039aa); }
+.ansi-magenta { color: var(--theme-ansi-5, #aa22aa); }
+.ansi-cyan { color: var(--theme-ansi-6, #1a92aa); }
+.ansi-white { color: var(--theme-ansi-7, #aaaaaa); }
+.ansi-bright-black { color: var(--theme-ansi-8, #777777); }
+.ansi-bright-red { color: var(--theme-ansi-9, #ff8787); }
+.ansi-bright-green { color: var(--theme-ansi-10, #4ce64c); }
+.ansi-bright-yellow { color: var(--theme-ansi-11, #ded82c); }
+.ansi-bright-blue { color: var(--theme-ansi-12, #295fcc); }
+.ansi-bright-magenta { color: var(--theme-ansi-13, #cc58cc); }
+.ansi-bright-cyan { color: var(--theme-ansi-14, #4ccce6); }
+.ansi-bright-white { color: var(--theme-ansi-15, #ffffff); }
 .ansi-bold { font-weight: bold; }
 .ansi-italic { font-style: italic; }
 .ansi-underline { text-decoration: underline; }
 
-/* ANSI background colors - Xubuntu Dark palette */
-.ansi-bg-black { background-color: #000000; }
-.ansi-bg-red { background-color: #aa0000; }
-.ansi-bg-green { background-color: #44aa44; }
-.ansi-bg-yellow { background-color: #aa5500; }
-.ansi-bg-blue { background-color: #0039aa; }
-.ansi-bg-magenta { background-color: #aa22aa; }
-.ansi-bg-cyan { background-color: #1a92aa; }
-.ansi-bg-white { background-color: #aaaaaa; }
-.ansi-bg-bright-black { background-color: #777777; }
-.ansi-bg-bright-red { background-color: #ff8787; }
-.ansi-bg-bright-green { background-color: #4ce64c; }
-.ansi-bg-bright-yellow { background-color: #ded82c; }
-.ansi-bg-bright-blue { background-color: #295fcc; }
-.ansi-bg-bright-magenta { background-color: #cc58cc; }
-.ansi-bg-bright-cyan { background-color: #4ccce6; }
-.ansi-bg-bright-white { background-color: #ffffff; }
+/* ANSI background colors - use theme variables with fallbacks */
+.ansi-bg-black { background-color: var(--theme-ansi-0, #000000); }
+.ansi-bg-red { background-color: var(--theme-ansi-1, #aa0000); }
+.ansi-bg-green { background-color: var(--theme-ansi-2, #44aa44); }
+.ansi-bg-yellow { background-color: var(--theme-ansi-3, #aa5500); }
+.ansi-bg-blue { background-color: var(--theme-ansi-4, #0039aa); }
+.ansi-bg-magenta { background-color: var(--theme-ansi-5, #aa22aa); }
+.ansi-bg-cyan { background-color: var(--theme-ansi-6, #1a92aa); }
+.ansi-bg-white { background-color: var(--theme-ansi-7, #aaaaaa); }
+.ansi-bg-bright-black { background-color: var(--theme-ansi-8, #777777); }
+.ansi-bg-bright-red { background-color: var(--theme-ansi-9, #ff8787); }
+.ansi-bg-bright-green { background-color: var(--theme-ansi-10, #4ce64c); }
+.ansi-bg-bright-yellow { background-color: var(--theme-ansi-11, #ded82c); }
+.ansi-bg-bright-blue { background-color: var(--theme-ansi-12, #295fcc); }
+.ansi-bg-bright-magenta { background-color: var(--theme-ansi-13, #cc58cc); }
+.ansi-bg-bright-cyan { background-color: var(--theme-ansi-14, #4ccce6); }
+.ansi-bg-bright-white { background-color: var(--theme-ansi-15, #ffffff); }
 
 /* Clickable URLs in output */
 .output-link {
-    color: #00cdcd;
+    color: var(--theme-link, #00cdcd);
     text-decoration: underline;
     cursor: pointer;
 }
 
 .output-link:hover {
-    color: #00ffff;
+    color: var(--theme-link, #00ffff);
+    filter: brightness(1.3);
 }
 
 /* Timestamp prefix shown when tags are visible */
 .timestamp {
-    color: #00cdcd;
+    color: var(--theme-accent, #00cdcd);
 }
 
 /* Separator bar - matches console layout */

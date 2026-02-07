@@ -4,7 +4,7 @@
 
 use ratatui::{
     layout::Rect,
-    style::{Color, Modifier, Style},
+    style::{Modifier, Style},
     text::{Line, Span},
     widgets::{Block, Borders, Clear, Paragraph},
     Frame,
@@ -13,10 +13,10 @@ use ratatui::{
 use super::{
     ButtonStyle, ElementSelection, FieldKind, PopupLayout, PopupState,
 };
-use crate::encoding::Theme;
+use crate::theme::ThemeColors;
 
 /// Render a popup to the console
-pub fn render_popup(f: &mut Frame, state: &mut PopupState, theme: Theme) {
+pub fn render_popup(f: &mut Frame, state: &mut PopupState, theme: &ThemeColors) {
     if !state.visible {
         return;
     }
@@ -210,7 +210,7 @@ fn calculate_content_height(state: &PopupState) -> usize {
 }
 
 /// Render popup content (fields and buttons)
-fn render_popup_content(f: &mut Frame, state: &PopupState, area: Rect, theme: Theme) {
+fn render_popup_content(f: &mut Frame, state: &PopupState, area: Rect, theme: &ThemeColors) {
     let mut y = area.y;
     let available_width = area.width as usize;
     let layout = &state.definition.layout;
@@ -284,7 +284,7 @@ fn render_popup_content(f: &mut Frame, state: &PopupState, area: Rect, theme: Th
         let error_area = Rect::new(area.x, error_y, area.width, 1);
         let error_line = Line::from(Span::styled(
             truncate_str(error, available_width),
-            Style::default().fg(Color::Red),
+            Style::default().fg(theme.fg_error()),
         ));
         f.render_widget(Paragraph::new(error_line), error_area);
     }
@@ -297,7 +297,7 @@ fn render_field(
     field: &super::Field,
     area: Rect,
     is_selected: bool,
-    theme: Theme,
+    theme: &ThemeColors,
 ) {
     let layout = &state.definition.layout;
     let label_width = layout.label_width;
@@ -627,7 +627,7 @@ fn render_labeled_field_with_shortcut(
     label_width: usize,
     is_selected: bool,
     shortcut: Option<char>,
-    theme: Theme,
+    theme: &ThemeColors,
 ) {
     let label_style = Style::default().fg(theme.fg_dim());
     let shortcut_style = Style::default().fg(theme.fg_dim()).add_modifier(Modifier::UNDERLINED);
@@ -694,7 +694,7 @@ fn render_labeled_field(
     area: Rect,
     label_width: usize,
     is_selected: bool,
-    theme: Theme,
+    theme: &ThemeColors,
 ) {
     render_labeled_field_with_shortcut(f, label, value, area, label_width, is_selected, None, theme);
 }
@@ -711,7 +711,7 @@ fn render_list_field(
     stored_column_widths: &Option<Vec<usize>>,
     area: Rect,
     _is_selected: bool,
-    theme: Theme,
+    theme: &ThemeColors,
 ) {
     let prefix_width = 2; // "* " or "  "
 
@@ -835,7 +835,7 @@ fn render_list_field(
                 .bg(theme.selection_bg())
                 .add_modifier(Modifier::BOLD)
         } else if item.style.is_connected {
-            Style::default().fg(Color::Green)
+            Style::default().fg(theme.fg_success())
         } else if item.style.is_disabled {
             Style::default().fg(theme.fg_dim())
         } else {
@@ -889,7 +889,7 @@ fn render_scrollable_content(
     scroll_offset: usize,
     visible_height: usize,
     area: Rect,
-    theme: Theme,
+    theme: &ThemeColors,
 ) {
     let actual_height = visible_height.min(area.height as usize);
     let total_lines = lines.len();
@@ -944,7 +944,7 @@ fn render_scrollable_content(
 }
 
 /// Render button row
-fn build_button_spans(button: &super::Button, state: &PopupState, theme: Theme) -> Vec<Span<'static>> {
+fn build_button_spans(button: &super::Button, state: &PopupState, theme: &ThemeColors) -> Vec<Span<'static>> {
     let mut spans = Vec::new();
     let is_selected = matches!(&state.selected, ElementSelection::Button(id) if *id == button.id);
 
@@ -974,7 +974,7 @@ fn build_button_spans(button: &super::Button, state: &PopupState, theme: Theme) 
     spans
 }
 
-fn render_buttons(f: &mut Frame, state: &PopupState, area: Rect, theme: Theme) {
+fn render_buttons(f: &mut Frame, state: &PopupState, area: Rect, theme: &ThemeColors) {
     let button_spacing = "  ";
     let bg_style = Style::default().bg(theme.popup_bg());
 
@@ -1048,10 +1048,10 @@ fn render_buttons(f: &mut Frame, state: &PopupState, area: Rect, theme: Theme) {
 }
 
 /// Get button style based on type and selection state
-fn get_button_style(button_style: ButtonStyle, is_selected: bool, theme: Theme) -> Style {
+fn get_button_style(button_style: ButtonStyle, is_selected: bool, theme: &ThemeColors) -> Style {
     let base = match button_style {
         ButtonStyle::Primary => Style::default().fg(theme.fg_accent()).bg(theme.popup_bg()),
-        ButtonStyle::Danger => Style::default().fg(Color::Red).bg(theme.popup_bg()),
+        ButtonStyle::Danger => Style::default().fg(theme.fg_error()).bg(theme.popup_bg()),
         ButtonStyle::Secondary => Style::default().fg(theme.fg()).bg(theme.popup_bg()),
     };
 
@@ -1084,7 +1084,7 @@ pub fn render_filter_popup_new(
     f: &mut Frame,
     filter_text: &str,
     cursor: usize,
-    theme: Theme,
+    theme: &ThemeColors,
 ) {
     let area = f.size();
 

@@ -12,6 +12,7 @@ pub mod actions;
 pub mod http;
 pub mod persistence;
 pub mod daemon;
+pub mod theme;
 #[cfg(all(feature = "remote-gui", not(target_os = "android")))]
 pub mod remote_gui;
 #[cfg(all(feature = "remote-gui", not(target_os = "android")))]
@@ -98,7 +99,7 @@ use futures::StreamExt;
 use ratatui::{
     backend::CrosstermBackend,
     layout::{Alignment, Constraint, Direction, Layout, Rect},
-    style::{Color, Modifier, Style},
+    style::{Modifier, Style},
     text::{Line, Span, Text},
     widgets::{Block, Borders, Paragraph},
     Frame, Terminal,
@@ -2258,6 +2259,8 @@ pub struct App {
     pub user_connections: std::collections::HashMap<(usize, String), UserConnection>,
     /// TinyFugue scripting engine
     pub tf_engine: tf::TfEngine,
+    /// Loaded theme colors from ~/clay.theme.dat
+    pub theme_file: theme::ThemeFile,
     /// Remote client mode: WebSocket transmitter for sending commands to server
     pub ws_client_tx: Option<mpsc::UnboundedSender<WsMessage>>,
     /// Activity count from server (used in remote client mode, i.e. --console)
@@ -2308,12 +2311,23 @@ impl App {
             ban_list: BanList::new(),
             user_connections: std::collections::HashMap::new(),
             tf_engine: tf::TfEngine::new(),
+            theme_file: theme::ThemeFile::with_defaults(),
             ws_client_tx: None, // Set when running as remote client (--console mode)
             server_activity_count: 0, // Activity count from server (remote client mode)
             gui_tx: None, // Set when running in master GUI mode (--gui)
         }
         // Note: No initial world created here - it will be created after persistence::load_settings()
         // if no worlds are configured
+    }
+
+    /// Get theme colors for the current console theme
+    pub fn theme_colors(&self) -> &theme::ThemeColors {
+        self.theme_file.get(self.settings.theme.name())
+    }
+
+    /// Get theme colors for the current GUI theme
+    pub fn gui_theme_colors(&self) -> &theme::ThemeColors {
+        self.theme_file.get(self.settings.gui_theme.name())
     }
 
     /// Ensure there's at least one world (creates initial world if needed)
@@ -4053,6 +4067,7 @@ impl App {
             ws_key_file: self.settings.websocket_key_file.clone(),
             tls_proxy_enabled: self.settings.tls_proxy_enabled,
             dictionary_path: self.settings.dictionary_path.clone(),
+            theme_colors_json: self.gui_theme_colors().to_json(),
         };
 
         (WsMessage::InitialState {
@@ -4607,6 +4622,19 @@ fn debug_log(debug_enabled: bool, message: &str) {
             eprintln!("Failed to open debug log {:?}: {}", path, e);
         }
     }
+}
+
+/// Load theme file from ~/clay.theme.dat into app.theme_file
+/// If the file doesn't exist, generates a default one and loads defaults
+fn load_theme_file(app: &mut App) {
+    let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
+    let theme_path = std::path::Path::new(&home).join("clay.theme.dat");
+    if !theme_path.exists() {
+        // Generate default theme file
+        let content = theme::ThemeFile::generate_default_file();
+        let _ = std::fs::write(&theme_path, content);
+    }
+    app.theme_file = theme::ThemeFile::load(&theme_path);
 }
 
 // Hot reload helper - not available on Android/Termux
@@ -7916,6 +7944,9 @@ pub async fn run_app_headless(
         }
     }
 
+    // Load theme file (~/clay.theme.dat)
+    load_theme_file(&mut app);
+
     app.ensure_has_world();
 
     // Re-create spell checker with custom dictionary path if configured
@@ -8159,6 +8190,7 @@ pub async fn run_app_headless(
                     &app.settings.websocket_key_file,
                     app.settings.ws_port,
                     true,
+                    app.gui_theme_colors().to_css_vars(),
                 ).await {
                     Ok(()) => { app.https_server = Some(https_server); }
                     Err(e) => {
@@ -8178,6 +8210,7 @@ pub async fn run_app_headless(
                     &app.settings.websocket_key_file,
                     app.settings.ws_port,
                     true,
+                    app.gui_theme_colors().to_css_vars(),
                 ).await {
                     Ok(()) => { app.https_server = Some(https_server); }
                     Err(e) => {
@@ -8195,6 +8228,7 @@ pub async fn run_app_headless(
                 app.settings.ws_port,
                 false,
                 app.ban_list.clone(),
+                app.gui_theme_colors().to_css_vars(),
             ).await {
                 Ok(()) => { app.http_server = Some(http_server); }
                 Err(e) => {
@@ -8880,6 +8914,9 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
         }
     }
 
+    // Load theme file (~/clay.theme.dat)
+    load_theme_file(&mut app);
+
     // Ensure we have at least one world (creates initial world only if no worlds loaded)
     debug_log(true, "STARTUP: Ensuring has world...");
     app.ensure_has_world();
@@ -9437,6 +9474,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                     &app.settings.websocket_key_file,
                     app.settings.ws_port,
                     true, // HTTPS uses secure WebSocket (wss://)
+                    app.gui_theme_colors().to_css_vars(),
                 ).await {
                     Ok(()) => {
                         if !app.is_reload {
@@ -9461,6 +9499,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                     &app.settings.websocket_key_file,
                     app.settings.ws_port,
                     true, // HTTPS uses secure WebSocket (wss://)
+                    app.gui_theme_colors().to_css_vars(),
                 ).await {
                     Ok(()) => {
                         if !app.is_reload {
@@ -9484,6 +9523,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                 app.settings.ws_port,
                 false, // HTTP uses non-secure WebSocket (ws://)
                 app.ban_list.clone(),
+                app.gui_theme_colors().to_css_vars(),
             ).await {
                 Ok(()) => {
                     if !app.is_reload {
@@ -11407,6 +11447,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                     ws_key_file: app.settings.websocket_key_file.clone(),
                                     tls_proxy_enabled: app.settings.tls_proxy_enabled,
                                     dictionary_path: app.settings.dictionary_path.clone(),
+                                    theme_colors_json: app.gui_theme_colors().to_json(),
                                 };
                                 // Broadcast update to all clients
                                 app.ws_broadcast(WsMessage::GlobalSettingsUpdated {
@@ -13585,6 +13626,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                 ws_key_file: app.settings.websocket_key_file.clone(),
                                 tls_proxy_enabled: app.settings.tls_proxy_enabled,
                                 dictionary_path: app.settings.dictionary_path.clone(),
+                                theme_colors_json: app.gui_theme_colors().to_json(),
                             };
                             app.ws_broadcast(WsMessage::GlobalSettingsUpdated { settings: settings_msg, input_height: app.input_height });
                         }
@@ -18137,7 +18179,7 @@ fn render_output_area(f: &mut Frame, app: &App, area: Rect) {
 
     // Popup or editor is visible - render output with ratatui (crossterm is skipped in these cases)
     // First, fill the entire output area with background to cover any crossterm remnants
-    let theme = app.settings.theme;
+    let theme = app.theme_colors();
     let background = ratatui::widgets::Block::default().style(Style::default().bg(theme.bg()));
     f.render_widget(background, area);
 
@@ -18189,7 +18231,7 @@ fn render_output_area(f: &mut Frame, app: &App, area: Rect) {
 
 /// Render the split-screen editor panel
 fn render_editor_panel(f: &mut Frame, app: &App, area: Rect) {
-    let theme = app.settings.theme;
+    let theme = app.theme_colors();
 
     // Get editor title with world name if editing notes
     let world_name = app.editor.world_index.map(|idx| app.worlds[idx].name.as_str());
@@ -18204,9 +18246,9 @@ fn render_editor_panel(f: &mut Frame, app: &App, area: Rect) {
 
     // Create bordered block - highlight border when focused
     let border_style = if app.editor.focus == EditorFocus::Editor {
-        Style::default().fg(Color::Yellow)
+        Style::default().fg(theme.fg_highlight())
     } else {
-        Style::default().fg(Color::DarkGray)
+        Style::default().fg(theme.fg_dim())
     };
 
     let block = Block::default()
@@ -18315,7 +18357,7 @@ fn render_editor_panel(f: &mut Frame, app: &App, area: Rect) {
 
             let spans = vec![
                 Span::raw(before),
-                Span::styled("│", Style::default().fg(Color::Yellow)),
+                Span::styled("│", Style::default().fg(theme.fg_highlight())),
                 Span::raw(after),
             ];
             display_lines.push(Line::from(spans));
@@ -18335,8 +18377,8 @@ fn render_editor_panel(f: &mut Frame, app: &App, area: Rect) {
     f.render_widget(content_paragraph, content_area);
 
     // Render button row with proper background
-    let save_style = Style::default().fg(Color::Green);
-    let cancel_style = Style::default().fg(Color::Red);
+    let save_style = Style::default().fg(theme.fg_success());
+    let cancel_style = Style::default().fg(theme.fg_error());
     let button_text = Line::from(vec![
         Span::raw(" "),
         Span::styled("[S]", save_style),
@@ -18426,7 +18468,7 @@ fn format_more_count(count: usize) -> String {
 fn render_separator_bar(f: &mut Frame, app: &App, area: Rect) {
     let width = area.width as usize;
     let world = app.current_world();
-    let theme = app.settings.theme;
+    let theme = app.theme_colors();
 
     // Build bar components
     let time_str = get_current_time_12hr();
@@ -18488,7 +18530,7 @@ fn render_separator_bar(f: &mut Frame, app: &App, area: Rect) {
     spans.push(Span::styled(
         status_str.clone(),
         if status_active {
-            Style::default().fg(Color::Black).bg(theme.fg_error())
+            Style::default().fg(theme.button_selected_fg()).bg(theme.fg_error())
         } else {
             Style::default().fg(theme.fg_dim())
         },
@@ -18503,7 +18545,7 @@ fn render_separator_bar(f: &mut Frame, app: &App, area: Rect) {
         // Connection status ball (green when connected, red when disconnected)
         spans.push(Span::styled(
             "● ",
-            Style::default().fg(if is_connected { Color::Green } else { Color::Red }),
+            Style::default().fg(if is_connected { theme.fg_success() } else { theme.fg_error() }),
         ));
 
         // World name
@@ -18617,6 +18659,7 @@ fn render_input_area(f: &mut Frame, app: &mut App, area: Rect) {
 }
 
 fn render_input(app: &mut App, width: usize, prompt: &str) -> Text<'static> {
+    let tc = app.theme_colors().clone();
     let misspelled = app.find_misspelled_words();
     let chars: Vec<char> = app.input.buffer.chars().collect();
 
@@ -18650,18 +18693,18 @@ fn render_input(app: &mut App, width: usize, prompt: &str) -> Text<'static> {
                     }
                 }
                 Err(_) => {
-                    // Fallback to cyan if parsing fails
+                    // Fallback to accent color if parsing fails
                     lines.push(Line::from(Span::styled(
                         prompt.to_string(),
-                        Style::default().fg(Color::Cyan),
+                        Style::default().fg(tc.fg_accent()),
                     )));
                 }
             }
         } else {
-            // No ANSI codes, use cyan
+            // No ANSI codes, use accent color
             lines.push(Line::from(Span::styled(
                 prompt.to_string(),
-                Style::default().fg(Color::Cyan),
+                Style::default().fg(tc.fg_accent()),
             )));
         }
     }
@@ -18705,7 +18748,7 @@ fn render_input(app: &mut App, width: usize, prompt: &str) -> Text<'static> {
                         }
                         if s < e {
                             let text: String = chars[s..e].iter().collect();
-                            new_spans.push(Span::styled(text, Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)));
+                            new_spans.push(Span::styled(text, Style::default().fg(tc.fg_error()).add_modifier(Modifier::BOLD)));
                         }
                         pos = e;
                     }
@@ -18742,7 +18785,7 @@ fn render_input(app: &mut App, width: usize, prompt: &str) -> Text<'static> {
                         let mis_start = word_start.max(char_pos);
                         let mis_end = word_end.min(line_end);
                         let text: String = chars[mis_start..mis_end].iter().collect();
-                        spans.push(Span::styled(text, Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)));
+                        spans.push(Span::styled(text, Style::default().fg(tc.fg_error()).add_modifier(Modifier::BOLD)));
                         current_pos = mis_end;
                     } else {
                         let next_mis = misspelled
@@ -18803,7 +18846,7 @@ fn render_input(app: &mut App, width: usize, prompt: &str) -> Text<'static> {
                     let mis_start = word_start.max(char_pos);
                     let mis_end = word_end.min(line_end);
                     let text: String = chars[mis_start..mis_end].iter().collect();
-                    spans.push(Span::styled(text, Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)));
+                    spans.push(Span::styled(text, Style::default().fg(tc.fg_error()).add_modifier(Modifier::BOLD)));
                     current_pos = mis_end;
                 } else {
                     let next_mis = misspelled
@@ -18866,7 +18909,7 @@ fn render_input(app: &mut App, width: usize, prompt: &str) -> Text<'static> {
                     let mis_start = word_start.max(char_pos);
                     let mis_end = word_end.min(line_end);
                     let text: String = chars[mis_start..mis_end].iter().collect();
-                    spans.push(Span::styled(text, Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)));
+                    spans.push(Span::styled(text, Style::default().fg(tc.fg_error()).add_modifier(Modifier::BOLD)));
                     current_pos = mis_end;
                 } else {
                     let next_mis = misspelled
@@ -18906,7 +18949,7 @@ fn render_confirm_dialog(f: &mut Frame, app: &App) {
 
     let area = f.size();
     let dialog = &app.confirm_dialog;
-    let theme = app.settings.theme;
+    let theme = app.theme_colors();
 
     // Build button styles with background highlight
     let yes_style = if dialog.yes_selected {
@@ -18964,7 +19007,7 @@ fn render_filter_popup(f: &mut Frame, app: &App) {
 
     let area = f.size();
     let filter = &app.filter_popup;
-    let theme = app.settings.theme;
+    let theme = app.theme_colors();
 
     // Small popup in upper right corner
     let popup_width = 40u16.min(area.width);
@@ -19002,8 +19045,9 @@ fn render_filter_popup(f: &mut Frame, app: &App) {
 
 /// Render new unified popup system
 fn render_new_popup(f: &mut Frame, app: &mut App) {
+    let tc = app.theme_colors().clone();
     if let Some(state) = app.popup_manager.current_mut() {
-        popup::console_renderer::render_popup(f, state, app.settings.theme);
+        popup::console_renderer::render_popup(f, state, &tc);
     }
 }
 

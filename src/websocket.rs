@@ -372,6 +372,9 @@ pub struct GlobalSettingsMsg {
     pub tls_proxy_enabled: bool,
     #[serde(default)]
     pub dictionary_path: String,
+    /// Theme colors from ~/clay.theme.dat (serialized as hex strings)
+    #[serde(default)]
+    pub theme_colors_json: String,
 }
 
 fn default_gui_transparency() -> f32 {

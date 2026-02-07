@@ -2894,18 +2894,34 @@
             return ''; // Strip other CSI sequences
         });
 
+        // Read ANSI 16-color palette from CSS theme variables (set by server)
+        function getThemeAnsiPalette() {
+            const fallback = [
+                [0, 0, 0], [170, 0, 0], [68, 170, 68], [170, 85, 0],
+                [0, 57, 170], [170, 34, 170], [26, 146, 170], [170, 170, 170],
+                [119, 119, 119], [255, 135, 135], [76, 230, 76], [222, 216, 44],
+                [41, 95, 204], [204, 88, 204], [76, 204, 230], [255, 255, 255]
+            ];
+            const style = getComputedStyle(document.documentElement);
+            const palette = [];
+            for (let i = 0; i < 16; i++) {
+                const val = style.getPropertyValue('--theme-ansi-' + i).trim();
+                if (val && val.startsWith('#') && val.length === 7) {
+                    palette.push([parseInt(val.slice(1,3), 16), parseInt(val.slice(3,5), 16), parseInt(val.slice(5,7), 16)]);
+                } else {
+                    palette.push(fallback[i]);
+                }
+            }
+            return palette;
+        }
+        let themeAnsiPalette = null;
+
         // 256-color palette (first 16 are standard, 16-231 are RGB cube, 232-255 are grayscale)
-        // Uses standard xterm 256-color palette values
         function color256ToRgb(n) {
             if (n < 16) {
-                // Standard 16 colors (same as basic ANSI)
-                const standard = [
-                    [0, 0, 0], [170, 0, 0], [68, 170, 68], [170, 85, 0],
-                    [0, 57, 170], [170, 34, 170], [26, 146, 170], [170, 170, 170],
-                    [119, 119, 119], [255, 135, 135], [76, 230, 76], [222, 216, 44],
-                    [41, 95, 204], [204, 88, 204], [76, 204, 230], [255, 255, 255]
-                ];
-                return standard[n];
+                // Standard 16 colors from theme
+                if (!themeAnsiPalette) themeAnsiPalette = getThemeAnsiPalette();
+                return themeAnsiPalette[n];
             } else if (n < 232) {
                 // 216 color cube (6x6x6) - xterm uses specific values, not linear
                 // The 6 levels are: 0, 95, 135, 175, 215, 255
@@ -2922,17 +2938,23 @@
             }
         }
 
-        // Color name to RGB mapping (Xubuntu Dark palette)
-        const colorNameToRgb = {
-            'black': [0, 0, 0], 'red': [170, 0, 0], 'green': [68, 170, 68], 'yellow': [170, 85, 0],
-            'blue': [0, 57, 170], 'magenta': [170, 34, 170], 'cyan': [26, 146, 170], 'white': [170, 170, 170],
-            'bright-black': [119, 119, 119], 'bright-red': [255, 135, 135], 'bright-green': [76, 230, 76],
-            'bright-yellow': [222, 216, 44], 'bright-blue': [41, 95, 204], 'bright-magenta': [204, 88, 204],
-            'bright-cyan': [76, 204, 230], 'bright-white': [255, 255, 255]
-        };
+        // Color name to RGB mapping - reads from theme palette
+        function getColorNameToRgb() {
+            if (!themeAnsiPalette) themeAnsiPalette = getThemeAnsiPalette();
+            const p = themeAnsiPalette;
+            return {
+                'black': p[0], 'red': p[1], 'green': p[2], 'yellow': p[3],
+                'blue': p[4], 'magenta': p[5], 'cyan': p[6], 'white': p[7],
+                'bright-black': p[8], 'bright-red': p[9], 'bright-green': p[10],
+                'bright-yellow': p[11], 'bright-blue': p[12], 'bright-magenta': p[13],
+                'bright-cyan': p[14], 'bright-white': p[15]
+            };
+        }
+        let colorNameToRgb = null;
 
         // Get RGB from class name or style
         function getFgRgb(classes, style) {
+            if (!colorNameToRgb) colorNameToRgb = getColorNameToRgb();
             // Check inline style first
             const styleMatch = style.match(/color:\s*rgb\((\d+),(\d+),(\d+)\)/);
             if (styleMatch) return [parseInt(styleMatch[1]), parseInt(styleMatch[2]), parseInt(styleMatch[3])];
@@ -2947,6 +2969,7 @@
         }
 
         function getBgRgb(classes, style) {
+            if (!colorNameToRgb) colorNameToRgb = getColorNameToRgb();
             // Check inline style first
             const styleMatch = style.match(/background-color:\s*rgb\((\d+),(\d+),(\d+)\)/);
             if (styleMatch) return [parseInt(styleMatch[1]), parseInt(styleMatch[2]), parseInt(styleMatch[3])];

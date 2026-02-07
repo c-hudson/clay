@@ -107,194 +107,74 @@ enum PopupState {
 
 /// Remote GUI client application state
 /// GUI Theme - mirrors the TUI Theme but with egui colors
-#[derive(Clone, Copy, PartialEq)]
-enum GuiTheme {
-    Dark,
-    Light,
+/// GUI theme wrapper that delegates to ThemeColors from the theme file.
+#[derive(Clone)]
+struct GuiTheme {
+    colors: theme::ThemeColors,
+    dark: bool,
 }
 
 #[allow(dead_code)]
 impl GuiTheme {
     fn from_name(name: &str) -> Self {
-        match name {
-            "light" => GuiTheme::Light,
-            _ => GuiTheme::Dark,
+        let dark = name != "light";
+        Self {
+            colors: if dark { theme::ThemeColors::dark_default() } else { theme::ThemeColors::light_default() },
+            dark,
         }
     }
 
     fn name(&self) -> &'static str {
-        match self {
-            GuiTheme::Dark => "Dark",
-            GuiTheme::Light => "Light",
-        }
+        if self.dark { "Dark" } else { "Light" }
     }
 
     fn next(&self) -> Self {
-        match self {
-            GuiTheme::Dark => GuiTheme::Light,
-            GuiTheme::Light => GuiTheme::Dark,
-        }
+        Self::from_name(if self.dark { "light" } else { "dark" })
     }
 
     fn is_dark(&self) -> bool {
-        matches!(self, GuiTheme::Dark)
+        self.dark
     }
 
-    fn to_string_value(self) -> String {
-        match self {
-            GuiTheme::Dark => "dark".to_string(),
-            GuiTheme::Light => "light".to_string(),
-        }
+    fn to_string_value(&self) -> String {
+        if self.dark { "dark".to_string() } else { "light".to_string() }
     }
 
-    // Background hierarchy (deep -> base -> surface -> elevated -> hover)
-    fn bg_deep(&self) -> Color32 {
-        match self {
-            GuiTheme::Dark => Color32::from_rgb(8, 8, 10),
-            GuiTheme::Light => Color32::from_rgb(255, 255, 255),
-        }
+    fn update_from_json(&mut self, json: &str) {
+        let base = if self.dark { theme::ThemeColors::dark_default() } else { theme::ThemeColors::light_default() };
+        self.colors = theme::ThemeColors::from_json(json, &base);
     }
 
-    fn bg(&self) -> Color32 {
-        match self {
-            GuiTheme::Dark => Color32::from_rgb(13, 17, 28),
-            GuiTheme::Light => Color32::from_rgb(250, 250, 250),
-        }
+    fn c(tc: &theme::ThemeColor) -> Color32 {
+        Color32::from_rgb(tc.r, tc.g, tc.b)
     }
 
-    fn bg_surface(&self) -> Color32 {
-        match self {
-            GuiTheme::Dark => Color32::from_rgb(20, 20, 24),
-            GuiTheme::Light => Color32::from_rgb(245, 245, 245),
-        }
-    }
+    fn bg_deep(&self) -> Color32 { Self::c(&self.colors.bg_deep) }
+    fn bg(&self) -> Color32 { Self::c(&self.colors.bg) }
+    fn bg_surface(&self) -> Color32 { Self::c(&self.colors.bg_surface) }
+    fn bg_elevated(&self) -> Color32 { Self::c(&self.colors.bg_elevated) }
+    fn bg_hover(&self) -> Color32 { Self::c(&self.colors.bg_hover) }
 
-    fn bg_elevated(&self) -> Color32 {
-        match self {
-            GuiTheme::Dark => Color32::from_rgb(26, 26, 31),
-            GuiTheme::Light => Color32::from_rgb(240, 240, 240),
-        }
-    }
+    fn fg(&self) -> Color32 { Self::c(&self.colors.fg) }
+    fn fg_secondary(&self) -> Color32 { Self::c(&self.colors.fg_secondary) }
+    fn fg_muted(&self) -> Color32 { Self::c(&self.colors.fg_muted) }
+    fn fg_dim(&self) -> Color32 { Self::c(&self.colors.fg_dim) }
 
-    fn bg_hover(&self) -> Color32 {
-        match self {
-            GuiTheme::Dark => Color32::from_rgb(34, 34, 40),
-            GuiTheme::Light => Color32::from_rgb(230, 230, 230),
-        }
-    }
+    fn accent(&self) -> Color32 { Self::c(&self.colors.accent) }
+    fn accent_dim(&self) -> Color32 { Self::c(&self.colors.accent_dim) }
+    fn highlight(&self) -> Color32 { Self::c(&self.colors.highlight) }
+    fn success(&self) -> Color32 { Self::c(&self.colors.success) }
+    fn error(&self) -> Color32 { Self::c(&self.colors.error) }
+    fn error_dim(&self) -> Color32 { Self::c(&self.colors.error_dim) }
 
-    // Text hierarchy (primary -> secondary -> muted -> dim)
-    fn fg(&self) -> Color32 {
-        match self {
-            GuiTheme::Dark => Color32::from_rgb(228, 228, 231),
-            GuiTheme::Light => Color32::BLACK,
-        }
-    }
+    fn border_subtle(&self) -> Color32 { Self::c(&self.colors.border_subtle) }
+    fn border_medium(&self) -> Color32 { Self::c(&self.colors.border_medium) }
 
-    fn fg_secondary(&self) -> Color32 {
-        match self {
-            GuiTheme::Dark => Color32::from_rgb(161, 161, 170),
-            GuiTheme::Light => Color32::from_rgb(80, 80, 80),
-        }
-    }
-
-    fn fg_muted(&self) -> Color32 {
-        match self {
-            GuiTheme::Dark => Color32::from_rgb(113, 113, 122),
-            GuiTheme::Light => Color32::from_rgb(120, 120, 120),
-        }
-    }
-
-    fn fg_dim(&self) -> Color32 {
-        match self {
-            GuiTheme::Dark => Color32::from_rgb(82, 82, 91),
-            GuiTheme::Light => Color32::DARK_GRAY,
-        }
-    }
-
-    // Accent colors
-    fn accent(&self) -> Color32 {
-        match self {
-            GuiTheme::Dark => Color32::from_rgb(34, 211, 238),  // Softer cyan
-            GuiTheme::Light => Color32::from_rgb(0, 100, 180),
-        }
-    }
-
-    fn accent_dim(&self) -> Color32 {
-        match self {
-            GuiTheme::Dark => Color32::from_rgb(8, 145, 178),
-            GuiTheme::Light => Color32::from_rgb(0, 80, 140),
-        }
-    }
-
-    fn highlight(&self) -> Color32 {
-        match self {
-            GuiTheme::Dark => Color32::from_rgb(251, 191, 36),  // Amber
-            GuiTheme::Light => Color32::from_rgb(180, 100, 0),
-        }
-    }
-
-    fn success(&self) -> Color32 {
-        match self {
-            GuiTheme::Dark => Color32::from_rgb(74, 222, 128),  // Softer green
-            GuiTheme::Light => Color32::from_rgb(0, 128, 0),
-        }
-    }
-
-    fn error(&self) -> Color32 {
-        match self {
-            GuiTheme::Dark => Color32::from_rgb(248, 113, 113),  // Softer red
-            GuiTheme::Light => Color32::from_rgb(180, 0, 0),
-        }
-    }
-
-    fn error_dim(&self) -> Color32 {
-        match self {
-            GuiTheme::Dark => Color32::from_rgb(239, 68, 68),
-            GuiTheme::Light => Color32::from_rgb(200, 0, 0),
-        }
-    }
-
-    // Borders
-    fn border_subtle(&self) -> Color32 {
-        match self {
-            GuiTheme::Dark => Color32::from_rgba_unmultiplied(255, 255, 255, 15),
-            GuiTheme::Light => Color32::from_rgba_unmultiplied(0, 0, 0, 15),
-        }
-    }
-
-    fn border_medium(&self) -> Color32 {
-        match self {
-            GuiTheme::Dark => Color32::from_rgba_unmultiplied(255, 255, 255, 26),
-            GuiTheme::Light => Color32::from_rgba_unmultiplied(0, 0, 0, 26),
-        }
-    }
-
-    fn panel_bg(&self) -> Color32 {
-        self.bg_surface()
-    }
-
-    fn button_bg(&self) -> Color32 {
-        self.bg_hover()
-    }
-
-    fn selection_bg(&self) -> Color32 {
-        match self {
-            GuiTheme::Dark => Color32::from_rgb(0, 64, 128),
-            GuiTheme::Light => Color32::from_rgb(180, 200, 230),
-        }
-    }
-
-    fn prompt(&self) -> Color32 {
-        self.accent()
-    }
-
-    fn link(&self) -> Color32 {
-        match self {
-            GuiTheme::Dark => Color32::from_rgb(100, 149, 237),
-            GuiTheme::Light => Color32::from_rgb(0, 0, 238),
-        }
-    }
+    fn panel_bg(&self) -> Color32 { self.bg_surface() }
+    fn button_bg(&self) -> Color32 { self.bg_hover() }
+    fn selection_bg(&self) -> Color32 { Self::c(&self.colors.selection_bg) }
+    fn prompt(&self) -> Color32 { Self::c(&self.colors.prompt) }
+    fn link(&self) -> Color32 { Self::c(&self.colors.link) }
 }
 
 /// Wrapper to mimic TextEdit output for custom text rendering
@@ -610,8 +490,8 @@ impl RemoteGuiApp {
             edit_keep_alive_type: KeepAliveType::Nop,
             edit_keep_alive_cmd: String::new(),
             input_height: 3,
-            console_theme: GuiTheme::Dark,
-            theme: GuiTheme::Dark,
+            console_theme: GuiTheme::from_name("dark"),
+            theme: GuiTheme::from_name("dark"),
             #[cfg(target_os = "windows")]
             titlebar_theme: None,
             font_name: String::new(),
@@ -1121,6 +1001,9 @@ impl RemoteGuiApp {
                         }
                         self.console_theme = GuiTheme::from_name(&settings.console_theme);
                         self.theme = GuiTheme::from_name(&settings.gui_theme);
+                        if !settings.theme_colors_json.is_empty() {
+                            self.theme.update_from_json(&settings.theme_colors_json);
+                        }
                         self.font_name = settings.font_name;
                         self.font_size = settings.font_size;
                         self.web_font_size_phone = settings.web_font_size_phone;
@@ -1283,6 +1166,9 @@ impl RemoteGuiApp {
                         // Update local global settings from server confirmation
                         self.console_theme = GuiTheme::from_name(&settings.console_theme);
                         self.theme = GuiTheme::from_name(&settings.gui_theme);
+                        if !settings.theme_colors_json.is_empty() {
+                            self.theme.update_from_json(&settings.theme_colors_json);
+                        }
                         self.input_height = input_height;
                         self.font_name = settings.font_name;
                         self.font_size = settings.font_size;
@@ -2994,9 +2880,9 @@ impl eframe::App for RemoteGuiApp {
         // Process incoming WebSocket messages
         self.process_messages();
 
-        // Apply theme to egui visuals
-        let theme = self.theme;
-        let mut visuals = if theme == GuiTheme::Dark {
+        // Apply theme to egui visuals (clone to avoid borrowing self)
+        let theme = self.theme.clone();
+        let mut visuals = if theme.is_dark() {
             egui::Visuals::dark()
         } else {
             egui::Visuals::light()
@@ -3025,9 +2911,9 @@ impl eframe::App for RemoteGuiApp {
 
         // Update Windows title bar color to match theme
         #[cfg(target_os = "windows")]
-        if self.titlebar_theme != Some(theme) {
-            self.titlebar_theme = Some(theme);
-            windows_titlebar::set_dark_mode(theme == GuiTheme::Dark);
+        if self.titlebar_theme.as_ref().map(|t| t.is_dark()) != Some(theme.is_dark()) {
+            self.titlebar_theme = Some(theme.clone());
+            windows_titlebar::set_dark_mode(theme.is_dark());
         }
 
         // Make scrollbars always visible and solid (not floating)
@@ -4185,9 +4071,10 @@ impl eframe::App for RemoteGuiApp {
                 });
 
             // Separator bar (matches TUI style)
-            let separator_bg = match theme {
-                GuiTheme::Dark => egui::Color32::from_rgb(40, 40, 40),
-                GuiTheme::Light => egui::Color32::from_rgb(200, 200, 200),  // Darker for light theme
+            let separator_bg = if theme.is_dark() {
+                egui::Color32::from_rgb(40, 40, 40)
+            } else {
+                egui::Color32::from_rgb(200, 200, 200)  // Darker for light theme
             };
             let separator_bg_transparent = egui::Color32::from_rgba_unmultiplied(separator_bg.r(), separator_bg.g(), separator_bg.b(), alpha);
             egui::TopBottomPanel::bottom("separator_bar")
@@ -4502,7 +4389,7 @@ impl eframe::App for RemoteGuiApp {
                         }
                     }).collect();
 
-                    let is_light_theme = matches!(theme, GuiTheme::Light);
+                    let is_light_theme = !theme.is_dark();
 
                     // Build combined LayoutJob from display_lines
                     let mut combined_job = combined_job;
@@ -4573,7 +4460,7 @@ impl eframe::App for RemoteGuiApp {
                     let emoji_lines = display_lines.clone();
                     let emoji_font_id = font_id.clone();
                     let emoji_default_color = default_color;
-                    let emoji_is_light = matches!(theme, GuiTheme::Light);
+                    let emoji_is_light = !theme.is_dark();
                     let emoji_link_color = theme.link();
                     let emoji_plain_text = plain_text.clone();
                     let emoji_color_offset = self.color_offset_percent;
@@ -6127,7 +6014,7 @@ impl eframe::App for RemoteGuiApp {
                 let mut ansi_music = self.ansi_music_enabled;
                 let mut tls_proxy = self.tls_proxy_enabled;
                 let mut input_height = self.input_height;
-                let mut gui_theme = self.theme;
+                let mut gui_theme = self.theme.clone();
                 let mut transparency = self.transparency;
                 let mut color_offset = self.color_offset_percent;
                 let mut color_offset_dec = false;
@@ -6341,10 +6228,7 @@ impl eframe::App for RemoteGuiApp {
 
                                     ui.painter().rect_filled(button_rect, egui::Rounding::same(4.0), theme.bg_deep());
 
-                                    let theme_name = match gui_theme {
-                                        GuiTheme::Dark => "Dark",
-                                        GuiTheme::Light => "Light",
-                                    };
+                                    let theme_name = gui_theme.name();
                                     ui.painter().text(
                                         egui::pos2(button_rect.min.x + 12.0, button_rect.center().y),
                                         egui::Align2::LEFT_CENTER,
@@ -6364,14 +6248,14 @@ impl eframe::App for RemoteGuiApp {
                                         ui.style_mut().visuals.widgets.inactive.fg_stroke = egui::Stroke::new(1.0, theme.fg());
                                         ui.style_mut().visuals.widgets.hovered.fg_stroke = egui::Stroke::new(1.0, theme.fg());
                                         ui.style_mut().visuals.widgets.active.fg_stroke = egui::Stroke::new(1.0, theme.fg());
-                                        if ui.selectable_label(gui_theme == GuiTheme::Dark,
+                                        if ui.selectable_label(gui_theme.is_dark(),
                                             egui::RichText::new("Dark").size(11.0).color(theme.fg()).family(egui::FontFamily::Monospace)).clicked() {
-                                            gui_theme = GuiTheme::Dark;
+                                            gui_theme = GuiTheme::from_name("dark");
                                             ui.memory_mut(|mem| mem.close_popup());
                                         }
-                                        if ui.selectable_label(gui_theme == GuiTheme::Light,
+                                        if ui.selectable_label(!gui_theme.is_dark(),
                                             egui::RichText::new("Light").size(11.0).color(theme.fg()).family(egui::FontFamily::Monospace)).clicked() {
-                                            gui_theme = GuiTheme::Light;
+                                            gui_theme = GuiTheme::from_name("light");
                                             ui.memory_mut(|mem| mem.close_popup());
                                         }
                                     });

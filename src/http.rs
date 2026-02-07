@@ -131,6 +131,7 @@ async fn handle_https_client(
     ws_port: u16,
     ws_use_tls: bool,
     _client_ip: String,
+    theme_css_vars: Arc<String>,
 ) {
     let mut buf = [0u8; 4096];
     let n = match stream.read(&mut buf).await {
@@ -150,11 +151,12 @@ async fn handle_https_client(
         let host = get_host_from_request(&request);
         let response = match path {
             "/" | "/index.html" => {
-                // Inject WebSocket configuration into the HTML
+                // Inject WebSocket configuration and theme CSS vars into the HTML
                 let html = WEB_INDEX_HTML
                     .replace("{{WS_HOST}}", &host.replace(['\\', '\'', '<', '>'], ""))
                     .replace("{{WS_PORT}}", &ws_port.to_string())
-                    .replace("{{WS_PROTOCOL}}", if ws_use_tls { "wss" } else { "ws" });
+                    .replace("{{WS_PROTOCOL}}", if ws_use_tls { "wss" } else { "ws" })
+                    .replace("{{THEME_CSS_VARS}}", &theme_css_vars);
                 build_http_response(200, "OK", "text/html", &html)
             }
             "/style.css" => {
@@ -187,6 +189,7 @@ pub async fn start_https_server(
     key_file: &str,
     ws_port: u16,
     ws_use_tls: bool,
+    theme_css_vars: String,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     use std::fs::File;
     use std::io::Read;
@@ -213,6 +216,7 @@ pub async fn start_https_server(
     let running = Arc::clone(&server.running);
     *running.write().await = true;
 
+    let theme_css_vars = Arc::new(theme_css_vars);
     tokio::spawn(async move {
         loop {
             tokio::select! {
@@ -223,10 +227,11 @@ pub async fn start_https_server(
                             let _ = stream.set_nodelay(true);
                             let tls_acceptor = tls_acceptor.clone();
                             let client_ip = addr.ip().to_string();
+                            let theme_css_vars = theme_css_vars.clone();
                             tokio::spawn(async move {
                                 match tls_acceptor.accept(stream).await {
                                     Ok(tls_stream) => {
-                                        handle_https_client(tls_stream, ws_port, ws_use_tls, client_ip).await;
+                                        handle_https_client(tls_stream, ws_port, ws_use_tls, client_ip, theme_css_vars).await;
                                     }
                                     Err(e) => {
                                         log_remote_event("TLS-ERROR", &client_ip, &format!("{}", e));
@@ -331,6 +336,7 @@ async fn handle_https_client(
     ws_port: u16,
     ws_use_tls: bool,
     _client_ip: String,
+    theme_css_vars: Arc<String>,
 ) {
     let mut buf = [0u8; 4096];
     let n = match stream.read(&mut buf).await {
@@ -350,11 +356,12 @@ async fn handle_https_client(
         let host = get_host_from_request(&request);
         let response = match path {
             "/" | "/index.html" => {
-                // Inject WebSocket configuration into the HTML
+                // Inject WebSocket configuration and theme CSS vars into the HTML
                 let html = WEB_INDEX_HTML
                     .replace("{{WS_HOST}}", &host.replace(['\\', '\'', '<', '>'], ""))
                     .replace("{{WS_PORT}}", &ws_port.to_string())
-                    .replace("{{WS_PROTOCOL}}", if ws_use_tls { "wss" } else { "ws" });
+                    .replace("{{WS_PROTOCOL}}", if ws_use_tls { "wss" } else { "ws" })
+                    .replace("{{THEME_CSS_VARS}}", &theme_css_vars);
                 build_http_response(200, "OK", "text/html", &html)
             }
             "/style.css" => {
@@ -387,6 +394,7 @@ pub async fn start_https_server(
     key_file: &str,
     ws_port: u16,
     ws_use_tls: bool,
+    theme_css_vars: String,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     use std::fs::File;
     use std::io::BufReader;
@@ -446,6 +454,7 @@ pub async fn start_https_server(
     let running = Arc::clone(&server.running);
     *running.write().await = true;
 
+    let theme_css_vars = Arc::new(theme_css_vars);
     tokio::spawn(async move {
         loop {
             tokio::select! {
@@ -456,10 +465,11 @@ pub async fn start_https_server(
                             let _ = stream.set_nodelay(true);
                             let tls_acceptor = tls_acceptor.clone();
                             let client_ip = addr.ip().to_string();
+                            let theme_css_vars = theme_css_vars.clone();
                             tokio::spawn(async move {
                                 match tls_acceptor.accept(stream).await {
                                     Ok(tls_stream) => {
-                                        handle_https_client(tls_stream, ws_port, ws_use_tls, client_ip).await;
+                                        handle_https_client(tls_stream, ws_port, ws_use_tls, client_ip, theme_css_vars).await;
                                     }
                                     Err(e) => {
                                         log_remote_event("TLS-ERROR", &client_ip, &format!("{}", e));
@@ -664,6 +674,7 @@ async fn handle_http_client(
     ws_use_tls: bool,
     ban_list: BanList,
     client_ip: String,
+    theme_css_vars: Arc<String>,
 ) {
     // Check if IP is banned
     if ban_list.is_banned(&client_ip) {
@@ -730,11 +741,12 @@ async fn handle_http_client(
         let host = get_host(&request);
         let response = match path {
             "/" | "/index.html" => {
-                // Inject WebSocket configuration into the HTML
+                // Inject WebSocket configuration and theme CSS vars into the HTML
                 let html = HTTP_INDEX_HTML
                     .replace("{{WS_HOST}}", &host.replace(['\\', '\'', '<', '>'], ""))
                     .replace("{{WS_PORT}}", &ws_port.to_string())
-                    .replace("{{WS_PROTOCOL}}", if ws_use_tls { "wss" } else { "ws" });
+                    .replace("{{WS_PROTOCOL}}", if ws_use_tls { "wss" } else { "ws" })
+                    .replace("{{THEME_CSS_VARS}}", &theme_css_vars);
                 build_response(200, "OK", "text/html", &html)
             }
             "/style.css" => {
@@ -769,6 +781,7 @@ pub async fn start_http_server(
     ws_port: u16,
     ws_use_tls: bool,
     ban_list: BanList,
+    theme_css_vars: String,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let addr = format!("0.0.0.0:{}", server.port);
     let listener = tokio::net::TcpListener::bind(&addr).await
@@ -780,6 +793,7 @@ pub async fn start_http_server(
     let running = Arc::clone(&server.running);
     *running.write().await = true;
 
+    let theme_css_vars = Arc::new(theme_css_vars);
     tokio::spawn(async move {
         loop {
             tokio::select! {
@@ -796,8 +810,9 @@ pub async fn start_http_server(
                             // Disable Nagle's algorithm for lower latency
                             let _ = stream.set_nodelay(true);
                             let ban_list_clone = ban_list.clone();
+                            let theme_css_vars = theme_css_vars.clone();
                             tokio::spawn(async move {
-                                handle_http_client(stream, ws_port, ws_use_tls, ban_list_clone, client_ip).await;
+                                handle_http_client(stream, ws_port, ws_use_tls, ban_list_clone, client_ip, theme_css_vars).await;
                             });
                         }
                         Err(_) => break,

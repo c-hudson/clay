@@ -110,6 +110,7 @@ pub async fn run_daemon_server() -> io::Result<()> {
                     &app.settings.websocket_key_file,
                     app.settings.ws_port,
                     true,
+                    app.gui_theme_colors().to_css_vars(),
                 ).await {
                     Ok(()) => {
                         println!("HTTPS: https://0.0.0.0:{}", app.settings.http_port);
@@ -123,7 +124,7 @@ pub async fn run_daemon_server() -> io::Result<()> {
         } else {
             // Start HTTP
             let mut http_server = HttpServer::new(app.settings.http_port);
-            match start_http_server(&mut http_server, app.settings.ws_port, false, app.ban_list.clone()).await {
+            match start_http_server(&mut http_server, app.settings.ws_port, false, app.ban_list.clone(), app.gui_theme_colors().to_css_vars()).await {
                 Ok(()) => {
                     println!("HTTP: http://0.0.0.0:{}", app.settings.http_port);
                     app.http_server = Some(http_server);
@@ -1220,6 +1221,7 @@ pub async fn handle_daemon_ws_message(
                 ws_key_file: app.settings.websocket_key_file.clone(),
                 tls_proxy_enabled: app.settings.tls_proxy_enabled,
                 dictionary_path: app.settings.dictionary_path.clone(),
+                theme_colors_json: app.gui_theme_colors().to_json(),
             };
             app.ws_broadcast(WsMessage::GlobalSettingsUpdated { settings, input_height: app.input_height });
         }
@@ -1613,7 +1615,7 @@ keep_alive_type=Generic
     // Start HTTP server if enabled
     if app.settings.http_enabled {
         let mut http_server = HttpServer::new(app.settings.http_port);
-        match start_http_server(&mut http_server, app.settings.ws_port, false, app.ban_list.clone()).await {
+        match start_http_server(&mut http_server, app.settings.ws_port, false, app.ban_list.clone(), app.gui_theme_colors().to_css_vars()).await {
             Ok(()) => {
                 println!("HTTP server started on port {}", app.settings.http_port);
                 app.http_server = Some(http_server);
@@ -2403,6 +2405,7 @@ pub fn build_multiuser_initial_state(app: &App, username: &str) -> WsMessage {
         ws_key_file: app.settings.websocket_key_file.clone(),
         tls_proxy_enabled: app.settings.tls_proxy_enabled,
         dictionary_path: app.settings.dictionary_path.clone(),
+        theme_colors_json: app.gui_theme_colors().to_json(),
     };
 
     // Find current world index for this user
