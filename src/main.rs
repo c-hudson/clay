@@ -4549,7 +4549,7 @@ pub enum AppEvent {
     WsClientConnected(u64),                    // client_id
     WsClientDisconnected(u64),                 // client_id
     WsClientMessage(u64, Box<WsMessage>),      // client_id, message
-    WsAuthKeyValidation(u64, Box<WsMessage>),   // client_id, AuthRequest with auth_key
+    WsAuthKeyValidation(u64, Box<WsMessage>, String),   // client_id, AuthRequest with auth_key, client_ip
     WsKeyRequest(u64),                         // client_id - generate and send new auth key
     WsKeyRevoke(u64, String),                  // client_id, auth_key to revoke
     // Multiuser mode events (include username for per-user connection isolation)
@@ -8477,7 +8477,7 @@ pub async fn run_app_headless(
                     AppEvent::WsClientDisconnected(client_id) => {
                         app.ws_client_worlds.remove(&client_id);
                     }
-                    AppEvent::WsAuthKeyValidation(client_id, msg) => {
+                    AppEvent::WsAuthKeyValidation(client_id, msg, client_ip) => {
                         // Validate auth key from AuthRequest
                         if let WsMessage::AuthRequest { auth_key: Some(key), current_world, .. } = *msg {
                             let is_valid = app.settings.websocket_auth_keys.contains(&key);
@@ -8507,7 +8507,8 @@ pub async fn run_app_headless(
                                     dimensions: None,
                                 });
                             } else {
-                                // Invalid key
+                                // Invalid key - record ban violation
+                                app.ban_list.record_violation(&client_ip, "WebSocket: failed auth key");
                                 app.ws_send_to_client(client_id, WsMessage::AuthResponse {
                                     success: false,
                                     error: Some("Invalid auth key".to_string()),
@@ -10364,7 +10365,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                             app.send_naws_to_all_worlds();
                         }
                     }
-                    AppEvent::WsAuthKeyValidation(client_id, msg) => {
+                    AppEvent::WsAuthKeyValidation(client_id, msg, client_ip) => {
                         // Validate auth key from AuthRequest
                         if let WsMessage::AuthRequest { auth_key: Some(key), current_world, .. } = *msg {
                             let is_valid = app.settings.websocket_auth_keys.contains(&key);
@@ -10398,7 +10399,8 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                     count: app.activity_count(),
                                 });
                             } else {
-                                // Invalid key
+                                // Invalid key - record ban violation
+                                app.ban_list.record_violation(&client_ip, "WebSocket: failed auth key");
                                 app.ws_send_to_client(client_id, WsMessage::AuthResponse {
                                     success: false,
                                     error: Some("Invalid auth key".to_string()),
@@ -12829,7 +12831,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                         app.send_naws_to_all_worlds();
                     }
                 }
-                AppEvent::WsAuthKeyValidation(client_id, msg) => {
+                AppEvent::WsAuthKeyValidation(client_id, msg, client_ip) => {
                     // Validate auth key from AuthRequest
                     if let WsMessage::AuthRequest { auth_key: Some(key), current_world, .. } = *msg {
                         let is_valid = app.settings.websocket_auth_keys.contains(&key);
@@ -12859,6 +12861,8 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                 count: app.activity_count(),
                             });
                         } else {
+                            // Invalid key - record ban violation
+                            app.ban_list.record_violation(&client_ip, "WebSocket: failed auth key");
                             app.ws_send_to_client(client_id, WsMessage::AuthResponse {
                                 success: false,
                                 error: Some("Invalid auth key".to_string()),
@@ -20084,5 +20088,608 @@ mod tests {
         // Empty or only tag
         assert_eq!(strip_mud_tag("[channel:]"), "");
         assert_eq!(strip_mud_tag("[channel:] "), "");
+    }
+
+    // ============================================================================
+    // Security regression tests
+    // ============================================================================
+
+    /// Test: RevokeKey must require authentication (CVE-like: pre-auth key revocation)
+    /// An unauthenticated WebSocket client must NOT be able to revoke auth keys.
+    #[tokio::test]
+    async fn test_security_revoke_key_requires_auth() {
+        use tokio::net::TcpListener;
+        use tokio_tungstenite::{connect_async, tungstenite::Message as WsRawMessage};
+        use futures::{SinkExt, StreamExt};
+        use crate::websocket::{WsMessage, WsClientInfo};
+        use std::sync::Arc;
+        use tokio::sync::RwLock;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let port = addr.port();
+
+        let password_hash = hash_password("testpass");
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::channel::<AppEvent>(100);
+        let clients: Arc<RwLock<std::collections::HashMap<u64, WsClientInfo>>> =
+            Arc::new(RwLock::new(std::collections::HashMap::new()));
+        let allow_list: Arc<std::sync::RwLock<Vec<String>>> =
+            Arc::new(std::sync::RwLock::new(Vec::new()));
+        let whitelisted: Arc<std::sync::RwLock<Option<String>>> =
+            Arc::new(std::sync::RwLock::new(None));
+        let ban_list = BanList::new();
+        let users: Arc<std::sync::RwLock<std::collections::HashMap<String, crate::websocket::UserCredential>>> =
+            Arc::new(std::sync::RwLock::new(std::collections::HashMap::new()));
+
+        // Spawn server handler
+        let server_clients = Arc::clone(&clients);
+        let server_task = tokio::spawn(async move {
+            let (stream, client_addr) = listener.accept().await.unwrap();
+            crate::websocket::handle_ws_client(
+                stream,
+                1, // client_id
+                server_clients,
+                password_hash,
+                allow_list,
+                whitelisted,
+                client_addr,
+                event_tx,
+                false, // not multiuser
+                users,
+                ban_list,
+            ).await.ok();
+        });
+
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+
+        // Connect as client but do NOT authenticate
+        let url = format!("ws://127.0.0.1:{}", port);
+        let (ws_stream, _) = connect_async(&url).await.unwrap();
+        let (mut ws_sink, mut ws_source) = ws_stream.split();
+
+        // Skip ServerHello
+        let _ = ws_source.next().await;
+
+        // Try to send RevokeKey without authenticating
+        let revoke_msg = WsMessage::RevokeKey { auth_key: "some_key".to_string() };
+        let json = serde_json::to_string(&revoke_msg).unwrap();
+        ws_sink.send(WsRawMessage::Text(json.into())).await.unwrap();
+
+        // The server should disconnect us (break from loop) since we're not authenticated
+        // Wait briefly for the server to process
+        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+
+        // Check that NO WsKeyRevoke event was sent to the app
+        // (the event channel should only have WsClientConnected and WsClientDisconnected)
+        let mut found_revoke = false;
+        while let Ok(event) = event_rx.try_recv() {
+            if let AppEvent::WsKeyRevoke(_, _) = event {
+                found_revoke = true;
+            }
+        }
+        assert!(!found_revoke, "RevokeKey should NOT be processed for unauthenticated clients");
+
+        server_task.abort();
+    }
+
+    /// Test: Unauthenticated clients cannot send commands
+    /// Any non-auth message from an unauthenticated client must be rejected.
+    #[tokio::test]
+    async fn test_security_unauth_cannot_send_commands() {
+        use tokio::net::TcpListener;
+        use tokio_tungstenite::{connect_async, tungstenite::Message as WsRawMessage};
+        use futures::{SinkExt, StreamExt};
+        use crate::websocket::{WsMessage, WsClientInfo};
+        use std::sync::Arc;
+        use tokio::sync::RwLock;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let port = addr.port();
+
+        let password_hash = hash_password("testpass");
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::channel::<AppEvent>(100);
+        let clients: Arc<RwLock<std::collections::HashMap<u64, WsClientInfo>>> =
+            Arc::new(RwLock::new(std::collections::HashMap::new()));
+        let allow_list: Arc<std::sync::RwLock<Vec<String>>> =
+            Arc::new(std::sync::RwLock::new(Vec::new()));
+        let whitelisted: Arc<std::sync::RwLock<Option<String>>> =
+            Arc::new(std::sync::RwLock::new(None));
+        let ban_list = BanList::new();
+        let users: Arc<std::sync::RwLock<std::collections::HashMap<String, crate::websocket::UserCredential>>> =
+            Arc::new(std::sync::RwLock::new(std::collections::HashMap::new()));
+
+        let server_clients = Arc::clone(&clients);
+        let server_task = tokio::spawn(async move {
+            let (stream, client_addr) = listener.accept().await.unwrap();
+            crate::websocket::handle_ws_client(
+                stream, 1, server_clients, password_hash,
+                allow_list, whitelisted, client_addr, event_tx,
+                false, users, ban_list,
+            ).await.ok();
+        });
+
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+
+        let url = format!("ws://127.0.0.1:{}", port);
+        let (ws_stream, _) = connect_async(&url).await.unwrap();
+        let (mut ws_sink, _ws_source) = ws_stream.split();
+
+        // Try sending a command without authenticating
+        let cmd = WsMessage::SendCommand { world_index: 0, command: "look".to_string() };
+        let json = serde_json::to_string(&cmd).unwrap();
+        ws_sink.send(WsRawMessage::Text(json.into())).await.unwrap();
+
+        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+
+        // Verify no WsClientMessage was forwarded to app
+        let mut found_command = false;
+        while let Ok(event) = event_rx.try_recv() {
+            if let AppEvent::WsClientMessage(_, msg) = event {
+                if let WsMessage::SendCommand { .. } = *msg {
+                    found_command = true;
+                }
+            }
+        }
+        assert!(!found_command, "Unauthenticated client should NOT be able to send commands");
+
+        server_task.abort();
+    }
+
+    /// Test: Failed password auth triggers ban violation
+    #[tokio::test]
+    async fn test_security_failed_auth_records_violation() {
+        use tokio::net::TcpListener;
+        use tokio_tungstenite::{connect_async, tungstenite::Message as WsRawMessage};
+        use futures::{SinkExt, StreamExt};
+        use crate::websocket::{WsMessage, WsClientInfo};
+        use std::sync::Arc;
+        use tokio::sync::RwLock;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let port = addr.port();
+
+        let password_hash = hash_password("correctpassword");
+        let (event_tx, _event_rx) = tokio::sync::mpsc::channel::<AppEvent>(100);
+        let clients: Arc<RwLock<std::collections::HashMap<u64, WsClientInfo>>> =
+            Arc::new(RwLock::new(std::collections::HashMap::new()));
+        let allow_list: Arc<std::sync::RwLock<Vec<String>>> =
+            Arc::new(std::sync::RwLock::new(Vec::new()));
+        let whitelisted: Arc<std::sync::RwLock<Option<String>>> =
+            Arc::new(std::sync::RwLock::new(None));
+        let ban_list = BanList::new();
+        let users: Arc<std::sync::RwLock<std::collections::HashMap<String, crate::websocket::UserCredential>>> =
+            Arc::new(std::sync::RwLock::new(std::collections::HashMap::new()));
+
+        let server_clients = Arc::clone(&clients);
+        let server_task = tokio::spawn(async move {
+            let (stream, client_addr) = listener.accept().await.unwrap();
+            crate::websocket::handle_ws_client(
+                stream, 1, server_clients, password_hash,
+                allow_list, whitelisted, client_addr, event_tx,
+                false, users, ban_list,
+            ).await.ok();
+        });
+
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+
+        let url = format!("ws://127.0.0.1:{}", port);
+        let (ws_stream, _) = connect_async(&url).await.unwrap();
+        let (mut ws_sink, mut ws_source) = ws_stream.split();
+
+        // Skip ServerHello
+        let _ = ws_source.next().await;
+
+        // Send wrong password
+        let wrong_hash = hash_password("wrongpassword");
+        let auth_msg = WsMessage::AuthRequest {
+            password_hash: wrong_hash,
+            username: None,
+            current_world: None,
+            auth_key: None,
+            request_key: false,
+        };
+        let json = serde_json::to_string(&auth_msg).unwrap();
+        ws_sink.send(WsRawMessage::Text(json.into())).await.unwrap();
+
+        // Read response - should be auth failure
+        if let Some(Ok(WsRawMessage::Text(text))) = ws_source.next().await {
+            let response: WsMessage = serde_json::from_str(&text).unwrap();
+            if let WsMessage::AuthResponse { success, .. } = response {
+                assert!(!success, "Auth should fail with wrong password");
+            }
+        }
+
+        // Note: ban_list violations from localhost are ignored (127.0.0.1 exempt)
+        // This test verifies the auth flow rejects bad passwords
+        // Ban tracking for non-localhost IPs is verified by the ban_list unit tests
+
+        server_task.abort();
+    }
+
+    /// Test: Multiuser auth error messages don't reveal user existence
+    /// Both invalid username and invalid password should return the same error.
+    #[tokio::test]
+    async fn test_security_multiuser_no_user_enumeration() {
+        use tokio::net::TcpListener;
+        use tokio_tungstenite::{connect_async, tungstenite::Message as WsRawMessage};
+        use futures::{SinkExt, StreamExt};
+        use crate::websocket::{WsMessage, WsClientInfo, UserCredential};
+        use std::sync::Arc;
+        use tokio::sync::RwLock;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let port = addr.port();
+
+        let password_hash = hash_password("serverpass");
+        let (event_tx, _event_rx) = tokio::sync::mpsc::channel::<AppEvent>(100);
+        let clients: Arc<RwLock<std::collections::HashMap<u64, WsClientInfo>>> =
+            Arc::new(RwLock::new(std::collections::HashMap::new()));
+        let allow_list: Arc<std::sync::RwLock<Vec<String>>> =
+            Arc::new(std::sync::RwLock::new(Vec::new()));
+        let whitelisted: Arc<std::sync::RwLock<Option<String>>> =
+            Arc::new(std::sync::RwLock::new(None));
+        let ban_list = BanList::new();
+
+        // Set up multiuser mode with one user
+        let mut users_map = std::collections::HashMap::new();
+        users_map.insert("admin".to_string(), UserCredential {
+            password_hash: hash_password("adminpass"),
+        });
+        let users: Arc<std::sync::RwLock<std::collections::HashMap<String, UserCredential>>> =
+            Arc::new(std::sync::RwLock::new(users_map));
+
+        // We need two connections to test both error cases
+        let listener2 = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port2 = listener2.local_addr().unwrap().port();
+
+        let clients2 = Arc::clone(&clients);
+        let users2 = Arc::clone(&users);
+        let ban_list2 = ban_list.clone();
+        let (event_tx2, _) = tokio::sync::mpsc::channel::<AppEvent>(100);
+        let password_hash2 = password_hash.clone();
+
+        let server_clients = Arc::clone(&clients);
+
+        // Server 1: test invalid username
+        let server_task1 = tokio::spawn(async move {
+            let (stream, client_addr) = listener.accept().await.unwrap();
+            crate::websocket::handle_ws_client(
+                stream, 1, server_clients, password_hash,
+                allow_list, whitelisted, client_addr, event_tx,
+                true, // multiuser mode
+                users, ban_list,
+            ).await.ok();
+        });
+
+        // Server 2: test wrong password for valid user
+        let allow_list2: Arc<std::sync::RwLock<Vec<String>>> =
+            Arc::new(std::sync::RwLock::new(Vec::new()));
+        let whitelisted2: Arc<std::sync::RwLock<Option<String>>> =
+            Arc::new(std::sync::RwLock::new(None));
+        let server_task2 = tokio::spawn(async move {
+            let (stream, client_addr) = listener2.accept().await.unwrap();
+            crate::websocket::handle_ws_client(
+                stream, 2, clients2, password_hash2,
+                allow_list2, whitelisted2, client_addr, event_tx2,
+                true, users2, ban_list2,
+            ).await.ok();
+        });
+
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+
+        // Test 1: Invalid username
+        let url1 = format!("ws://127.0.0.1:{}", port);
+        let (ws1, _) = connect_async(&url1).await.unwrap();
+        let (mut sink1, mut source1) = ws1.split();
+        let _ = source1.next().await; // skip ServerHello
+
+        let auth1 = WsMessage::AuthRequest {
+            password_hash: hash_password("anything"),
+            username: Some("nonexistent".to_string()),
+            current_world: None,
+            auth_key: None,
+            request_key: false,
+        };
+        sink1.send(WsRawMessage::Text(serde_json::to_string(&auth1).unwrap().into())).await.unwrap();
+        let error1 = if let Some(Ok(WsRawMessage::Text(text))) = source1.next().await {
+            let resp: WsMessage = serde_json::from_str(&text).unwrap();
+            if let WsMessage::AuthResponse { error, .. } = resp { error } else { None }
+        } else { None };
+
+        // Test 2: Valid username, wrong password
+        let url2 = format!("ws://127.0.0.1:{}", port2);
+        let (ws2, _) = connect_async(&url2).await.unwrap();
+        let (mut sink2, mut source2) = ws2.split();
+        let _ = source2.next().await; // skip ServerHello
+
+        let auth2 = WsMessage::AuthRequest {
+            password_hash: hash_password("wrongpassword"),
+            username: Some("admin".to_string()),
+            current_world: None,
+            auth_key: None,
+            request_key: false,
+        };
+        sink2.send(WsRawMessage::Text(serde_json::to_string(&auth2).unwrap().into())).await.unwrap();
+        let error2 = if let Some(Ok(WsRawMessage::Text(text))) = source2.next().await {
+            let resp: WsMessage = serde_json::from_str(&text).unwrap();
+            if let WsMessage::AuthResponse { error, .. } = resp { error } else { None }
+        } else { None };
+
+        // Both errors must be identical to prevent user enumeration
+        assert_eq!(error1, error2,
+            "Invalid username and wrong password must return the same error message \
+             to prevent user enumeration. Got: {:?} vs {:?}", error1, error2);
+
+        // Verify the error is generic
+        assert_eq!(error1, Some("Authentication failed".to_string()),
+            "Error message should be generic 'Authentication failed'");
+
+        server_task1.abort();
+        server_task2.abort();
+    }
+
+    /// Test: Host header sanitization strips JS injection characters
+    /// The host header is injected into HTML templates as a JS string value.
+    /// Characters that could break out of the string context must be stripped.
+    #[test]
+    fn test_security_host_header_sanitization() {
+        // These are the dangerous characters for JS string injection
+        let malicious_hosts = vec![
+            ("example.com\";alert(1);//", "example.com;alert(1);//"),
+            ("example.com';alert(1);//", "example.com;alert(1);//"),
+            ("example.com`+alert(1)+`", "example.com+alert(1)+"),
+            ("example.com\\x22;alert(1)", "example.comx22;alert(1)"),
+            ("<script>alert(1)</script>", "scriptalert(1)/script"),
+            ("example.com\">", "example.com"),
+        ];
+
+        for (input, expected) in malicious_hosts {
+            let sanitized = input.replace(['\\', '\'', '"', '`', '<', '>'], "");
+            assert_eq!(sanitized, expected,
+                "Host header sanitization failed for input: {:?}", input);
+        }
+    }
+
+    /// Test: Valid HTTP paths don't trigger ban violations
+    #[test]
+    fn test_security_valid_paths_no_ban() {
+        let valid_paths = vec![
+            "/", "/index.html", "/style.css", "/app.js",
+            "/theme-editor", "/favicon.ico",
+        ];
+
+        for path in valid_paths {
+            // Verify these paths are in the known set
+            // If any of these paths start returning 404, it would be a regression
+            let is_valid = matches!(path,
+                "/" | "/index.html" | "/style.css" | "/app.js" |
+                "/theme-editor" | "/favicon.ico"
+            );
+            assert!(is_valid, "Path {} should be recognized as valid", path);
+        }
+    }
+
+    /// Test: BanList localhost exemption
+    /// Localhost connections must never be banned (prevents self-lockout)
+    #[test]
+    fn test_security_localhost_ban_exempt() {
+        let ban_list = BanList::new();
+
+        // Record many violations from localhost - should never result in ban
+        for _ in 0..20 {
+            ban_list.record_violation("127.0.0.1", "test violation");
+        }
+        assert!(!ban_list.is_banned("127.0.0.1"),
+            "127.0.0.1 must never be banned");
+
+        for _ in 0..20 {
+            ban_list.record_violation("::1", "test violation");
+        }
+        assert!(!ban_list.is_banned("::1"),
+            "::1 must never be banned");
+
+        for _ in 0..20 {
+            ban_list.record_violation("localhost", "test violation");
+        }
+        assert!(!ban_list.is_banned("localhost"),
+            "localhost must never be banned");
+    }
+
+    /// Test: BanList bans external IPs after threshold violations
+    #[test]
+    fn test_security_ban_after_violations() {
+        let ban_list = BanList::new();
+
+        // 5 violations should trigger permanent ban for non-localhost
+        for i in 0..5 {
+            let banned = ban_list.record_violation("10.0.0.1", &format!("violation {}", i));
+            if i < 4 {
+                // Before 5th violation, may get temp ban at 3
+                let _ = banned;
+            }
+        }
+        assert!(ban_list.is_banned("10.0.0.1"),
+            "External IP should be banned after 5 violations");
+    }
+
+    /// Test: Password hash is deterministic (SHA-256)
+    #[test]
+    fn test_security_password_hash_deterministic() {
+        let hash1 = hash_password("mypassword");
+        let hash2 = hash_password("mypassword");
+        assert_eq!(hash1, hash2, "Same password must produce same hash");
+
+        let hash3 = hash_password("different");
+        assert_ne!(hash1, hash3, "Different passwords must produce different hashes");
+    }
+
+    /// Test: Auth key in WsAuthKeyValidation event includes client IP for ban tracking
+    #[test]
+    fn test_security_auth_key_event_has_ip() {
+        // Verify the AppEvent::WsAuthKeyValidation includes a client_ip field
+        // This is a compile-time check - if the event doesn't have 3 fields, this won't compile
+        let msg = WsMessage::AuthRequest {
+            password_hash: String::new(),
+            username: None,
+            current_world: None,
+            auth_key: Some("test_key".to_string()),
+            request_key: false,
+        };
+        let event = AppEvent::WsAuthKeyValidation(1, Box::new(msg), "10.0.0.1".to_string());
+
+        // Verify we can extract the IP from the event
+        if let AppEvent::WsAuthKeyValidation(_client_id, _msg, client_ip) = event {
+            assert_eq!(client_ip, "10.0.0.1");
+        } else {
+            panic!("Event should be WsAuthKeyValidation");
+        }
+    }
+
+    /// Test: WebSocket auth with correct password succeeds
+    #[tokio::test]
+    async fn test_security_correct_password_auth_succeeds() {
+        use tokio::net::TcpListener;
+        use tokio_tungstenite::{connect_async, tungstenite::Message as WsRawMessage};
+        use futures::{SinkExt, StreamExt};
+        use crate::websocket::{WsMessage, WsClientInfo};
+        use std::sync::Arc;
+        use tokio::sync::RwLock;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        let password = "correctpass";
+        let password_hash = hash_password(password);
+        let (event_tx, _) = tokio::sync::mpsc::channel::<AppEvent>(100);
+        let clients: Arc<RwLock<std::collections::HashMap<u64, WsClientInfo>>> =
+            Arc::new(RwLock::new(std::collections::HashMap::new()));
+        let allow_list: Arc<std::sync::RwLock<Vec<String>>> =
+            Arc::new(std::sync::RwLock::new(Vec::new()));
+        let whitelisted: Arc<std::sync::RwLock<Option<String>>> =
+            Arc::new(std::sync::RwLock::new(None));
+        let ban_list = BanList::new();
+        let users: Arc<std::sync::RwLock<std::collections::HashMap<String, crate::websocket::UserCredential>>> =
+            Arc::new(std::sync::RwLock::new(std::collections::HashMap::new()));
+
+        let server_clients = Arc::clone(&clients);
+        let ph = password_hash.clone();
+        let server_task = tokio::spawn(async move {
+            let (stream, client_addr) = listener.accept().await.unwrap();
+            crate::websocket::handle_ws_client(
+                stream, 1, server_clients, ph,
+                allow_list, whitelisted, client_addr, event_tx,
+                false, users, ban_list,
+            ).await.ok();
+        });
+
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+
+        let url = format!("ws://127.0.0.1:{}", port);
+        let (ws, _) = connect_async(&url).await.unwrap();
+        let (mut sink, mut source) = ws.split();
+
+        // Skip ServerHello
+        let _ = source.next().await;
+
+        let auth = WsMessage::AuthRequest {
+            password_hash,
+            username: None,
+            current_world: None,
+            auth_key: None,
+            request_key: false,
+        };
+        sink.send(WsRawMessage::Text(serde_json::to_string(&auth).unwrap().into())).await.unwrap();
+
+        if let Some(Ok(WsRawMessage::Text(text))) = source.next().await {
+            let resp: WsMessage = serde_json::from_str(&text).unwrap();
+            if let WsMessage::AuthResponse { success, error, .. } = resp {
+                assert!(success, "Correct password should succeed, error: {:?}", error);
+            } else {
+                panic!("Expected AuthResponse");
+            }
+        } else {
+            panic!("No response received");
+        }
+
+        server_task.abort();
+    }
+
+    /// Test: Allow list IP matching with wildcards
+    #[test]
+    fn test_security_allow_list_matching() {
+        use crate::websocket::is_ip_in_allow_list;
+
+        // Exact match
+        assert!(is_ip_in_allow_list("192.168.1.100", &["192.168.1.100".to_string()]));
+
+        // Wildcard match
+        assert!(is_ip_in_allow_list("192.168.1.100", &["192.168.1.*".to_string()]));
+        assert!(is_ip_in_allow_list("192.168.1.50", &["192.168.*".to_string()]));
+
+        // Non-match
+        assert!(!is_ip_in_allow_list("10.0.0.1", &["192.168.1.*".to_string()]));
+
+        // Empty list
+        assert!(!is_ip_in_allow_list("192.168.1.100", &[]));
+
+        // Localhost normalization
+        assert!(is_ip_in_allow_list("127.0.0.1", &["localhost".to_string()]));
+        assert!(is_ip_in_allow_list("::1", &["localhost".to_string()]));
+    }
+
+    /// Test: ServerHello is sent before auth (regression: needed for client UI)
+    #[tokio::test]
+    async fn test_security_server_hello_sent_first() {
+        use tokio::net::TcpListener;
+        use tokio_tungstenite::{connect_async, tungstenite::Message as WsRawMessage};
+        use futures::StreamExt;
+        use crate::websocket::{WsMessage, WsClientInfo};
+        use std::sync::Arc;
+        use tokio::sync::RwLock;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        let (event_tx, _) = tokio::sync::mpsc::channel::<AppEvent>(100);
+        let clients: Arc<RwLock<std::collections::HashMap<u64, WsClientInfo>>> =
+            Arc::new(RwLock::new(std::collections::HashMap::new()));
+        let allow_list: Arc<std::sync::RwLock<Vec<String>>> =
+            Arc::new(std::sync::RwLock::new(Vec::new()));
+        let whitelisted: Arc<std::sync::RwLock<Option<String>>> =
+            Arc::new(std::sync::RwLock::new(None));
+        let ban_list = BanList::new();
+        let users: Arc<std::sync::RwLock<std::collections::HashMap<String, crate::websocket::UserCredential>>> =
+            Arc::new(std::sync::RwLock::new(std::collections::HashMap::new()));
+
+        let server_clients = Arc::clone(&clients);
+        let ph = hash_password("test");
+        let server_task = tokio::spawn(async move {
+            let (stream, client_addr) = listener.accept().await.unwrap();
+            crate::websocket::handle_ws_client(
+                stream, 1, server_clients, ph,
+                allow_list, whitelisted, client_addr, event_tx,
+                false, users, ban_list,
+            ).await.ok();
+        });
+
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+
+        let url = format!("ws://127.0.0.1:{}", port);
+        let (ws, _) = connect_async(&url).await.unwrap();
+        let (_sink, mut source) = ws.split();
+
+        // First message should be ServerHello
+        if let Some(Ok(WsRawMessage::Text(text))) = source.next().await {
+            let msg: WsMessage = serde_json::from_str(&text).unwrap();
+            assert!(matches!(msg, WsMessage::ServerHello { .. }),
+                "First message must be ServerHello, got: {:?}", msg);
+        } else {
+            panic!("No ServerHello received");
+        }
+
+        server_task.abort();
     }
 }

@@ -1159,7 +1159,7 @@ where
                             if auth_key.is_some() && !auth_key.as_ref().unwrap().is_empty() {
                                 // Forward to app for key validation
                                 // App will send AuthResponse directly
-                                let _ = event_tx.send(AppEvent::WsAuthKeyValidation(client_id, Box::new(ws_msg.clone()))).await;
+                                let _ = event_tx.send(AppEvent::WsAuthKeyValidation(client_id, Box::new(ws_msg.clone()), client_ip.clone())).await;
                                 continue;
                             }
 
@@ -1173,10 +1173,10 @@ where
                                             if user_cred.password_hash == *client_hash {
                                                 (true, None, Some(uname.clone()))
                                             } else {
-                                                (false, Some("Invalid password".to_string()), None)
+                                                (false, Some("Authentication failed".to_string()), None)
                                             }
                                         } else {
-                                            (false, Some("Unknown user".to_string()), None)
+                                            (false, Some("Authentication failed".to_string()), None)
                                         }
                                     }
                                     _ => (false, Some("Username required".to_string()), None),
@@ -1241,10 +1241,6 @@ where
                                 }
                             }
                         }
-                        WsMessage::RevokeKey { auth_key } => {
-                            // Forward key revocation to app
-                            let _ = event_tx.send(AppEvent::WsKeyRevoke(client_id, auth_key.clone())).await;
-                        }
                         WsMessage::Ping => {
                             let _ = tx.send(WsMessage::Pong);
                         }
@@ -1255,7 +1251,12 @@ where
                                 clients_guard.get(&client_id).map(|c| c.authenticated).unwrap_or(false)
                             };
                             if is_authed {
-                                let _ = event_tx.send(AppEvent::WsClientMessage(client_id, Box::new(ws_msg))).await;
+                                // Handle RevokeKey inside auth check
+                                if let WsMessage::RevokeKey { ref auth_key } = ws_msg {
+                                    let _ = event_tx.send(AppEvent::WsKeyRevoke(client_id, auth_key.clone())).await;
+                                } else {
+                                    let _ = event_tx.send(AppEvent::WsClientMessage(client_id, Box::new(ws_msg))).await;
+                                }
                             } else {
                                 // Unauthenticated client trying to send non-auth messages - disconnect but don't ban
                                 break;

@@ -157,7 +157,7 @@ async fn handle_https_client(
             "/" | "/index.html" => {
                 // Inject WebSocket configuration and theme CSS vars into the HTML
                 let html = WEB_INDEX_HTML
-                    .replace("{{WS_HOST}}", &host.replace(['\\', '\'', '<', '>'], ""))
+                    .replace("{{WS_HOST}}", &host.replace(['\\', '\'', '"', '`', '<', '>'], ""))
                     .replace("{{WS_PORT}}", &ws_port.to_string())
                     .replace("{{WS_PROTOCOL}}", if ws_use_tls { "wss" } else { "ws" })
                     .replace("{{THEME_CSS_VARS}}", &theme_css_vars);
@@ -171,7 +171,7 @@ async fn handle_https_client(
             }
             "/theme-editor" => {
                 let html = WEB_THEME_EDITOR_HTML
-                    .replace("{{WS_HOST}}", &host.replace(['\\', '\'', '<', '>'], ""))
+                    .replace("{{WS_HOST}}", &host.replace(['\\', '\'', '"', '`', '<', '>'], ""))
                     .replace("{{WS_PORT}}", &ws_port.to_string())
                     .replace("{{WS_PROTOCOL}}", if ws_use_tls { "wss" } else { "ws" });
                 build_http_response(200, "OK", "text/html", &html)
@@ -373,7 +373,7 @@ async fn handle_https_client(
             "/" | "/index.html" => {
                 // Inject WebSocket configuration and theme CSS vars into the HTML
                 let html = WEB_INDEX_HTML
-                    .replace("{{WS_HOST}}", &host.replace(['\\', '\'', '<', '>'], ""))
+                    .replace("{{WS_HOST}}", &host.replace(['\\', '\'', '"', '`', '<', '>'], ""))
                     .replace("{{WS_PORT}}", &ws_port.to_string())
                     .replace("{{WS_PROTOCOL}}", if ws_use_tls { "wss" } else { "ws" })
                     .replace("{{THEME_CSS_VARS}}", &theme_css_vars);
@@ -387,7 +387,7 @@ async fn handle_https_client(
             }
             "/theme-editor" => {
                 let html = WEB_THEME_EDITOR_HTML
-                    .replace("{{WS_HOST}}", &host.replace(['\\', '\'', '<', '>'], ""))
+                    .replace("{{WS_HOST}}", &host.replace(['\\', '\'', '"', '`', '<', '>'], ""))
                     .replace("{{WS_PORT}}", &ws_port.to_string())
                     .replace("{{WS_PROTOCOL}}", if ws_use_tls { "wss" } else { "ws" });
                 build_http_response(200, "OK", "text/html", &html)
@@ -766,7 +766,7 @@ async fn handle_http_client(
             "/" | "/index.html" => {
                 // Inject WebSocket configuration and theme CSS vars into the HTML
                 let html = HTTP_INDEX_HTML
-                    .replace("{{WS_HOST}}", &host.replace(['\\', '\'', '<', '>'], ""))
+                    .replace("{{WS_HOST}}", &host.replace(['\\', '\'', '"', '`', '<', '>'], ""))
                     .replace("{{WS_PORT}}", &ws_port.to_string())
                     .replace("{{WS_PROTOCOL}}", if ws_use_tls { "wss" } else { "ws" })
                     .replace("{{THEME_CSS_VARS}}", &theme_css_vars);
@@ -780,7 +780,7 @@ async fn handle_http_client(
             }
             "/theme-editor" => {
                 let html = HTTP_THEME_EDITOR_HTML
-                    .replace("{{WS_HOST}}", &host.replace(['\\', '\'', '<', '>'], ""))
+                    .replace("{{WS_HOST}}", &host.replace(['\\', '\'', '"', '`', '<', '>'], ""))
                     .replace("{{WS_PORT}}", &ws_port.to_string())
                     .replace("{{WS_PROTOCOL}}", if ws_use_tls { "wss" } else { "ws" });
                 build_response(200, "OK", "text/html", &html)

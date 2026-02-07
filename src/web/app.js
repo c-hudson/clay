@@ -1471,7 +1471,7 @@
                         window.Android.clearSavedUsername();
                     }
                     // Detect multiuser mode from error messages
-                    if (msg.error === 'Username required' || msg.error === 'Unknown user' || msg.multiuser_mode) {
+                    if (msg.error === 'Username required' || msg.multiuser_mode) {
                         enableMultiuserAuthUI();
                     }
                     // Show auth modal (may have been hidden during auto-login attempt)
