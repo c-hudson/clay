@@ -490,6 +490,47 @@ impl ThemeFile {
         })
     }
 
+    /// Serialize all themes as JSON: {"dark": {...}, "light": {...}, ...}
+    pub fn to_json_all(&self) -> String {
+        let mut map = serde_json::Map::new();
+        for (name, colors) in &self.themes {
+            if let Ok(serde_json::Value::Object(obj)) = serde_json::from_str::<serde_json::Value>(&colors.to_json()) {
+                map.insert(name.clone(), serde_json::Value::Object(obj));
+            }
+        }
+        serde_json::Value::Object(map).to_string()
+    }
+
+    /// Generate complete .ini file content from current state
+    pub fn generate_file_content(&self) -> String {
+        let mut s = String::new();
+        s.push_str("# Clay Theme Configuration\n");
+        s.push_str("# Colors are #RRGGBB hex values. Lines starting with # are comments.\n");
+        s.push_str("# Edit colors and restart Clay (or /reload) to apply changes.\n");
+        s.push_str("# Delete this file to regenerate defaults.\n");
+
+        let mut names: Vec<&String> = self.themes.keys().collect();
+        names.sort();
+        for name in names {
+            s.push_str(&format!("\n[theme:{}]\n", name));
+            s.push_str(&self.themes[name].to_theme_file_section());
+        }
+        s
+    }
+
+    /// Add or update a theme
+    pub fn set_theme(&mut self, name: &str, colors: ThemeColors) {
+        self.themes.insert(name.to_string(), colors);
+    }
+
+    /// Remove a theme (refuses if it's the last one). Returns true if removed.
+    pub fn remove_theme(&mut self, name: &str) -> bool {
+        if self.themes.len() <= 1 {
+            return false;
+        }
+        self.themes.remove(name).is_some()
+    }
+
     /// Generate a complete default theme file with comments
     pub fn generate_default_file() -> String {
         let mut s = String::new();

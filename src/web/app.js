@@ -1887,6 +1887,20 @@
                 }
                 break;
 
+            case 'ThemeCssVarsUpdated':
+                // Live theme update from theme editor
+                if (msg.css_vars) {
+                    var themeVarsEl = document.getElementById('theme-vars');
+                    if (themeVarsEl) {
+                        themeVarsEl.textContent = ':root { ' + msg.css_vars + ' }';
+                    }
+                    // Reset cached ANSI palette so it re-reads from CSS vars
+                    themeAnsiPalette = null;
+                    colorNameToRgb = null;
+                    renderOutput();
+                }
+                break;
+
             case 'GlobalSettingsUpdated':
                 if (msg.settings) {
                     if (msg.settings.input_height) {

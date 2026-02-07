@@ -263,6 +263,18 @@ pub enum WsMessage {
         paused: bool,
     },
 
+    // Theme editor (client -> server)
+    RequestThemeEditorState,
+    UpdateThemeColors { theme_name: String, colors_json: String },
+    AddTheme { name: String, copy_from: String },
+    DeleteTheme { name: String },
+    SaveThemeFile,
+
+    // Theme editor (server -> client)
+    ThemeEditorState { themes_json: String, theme_names: Vec<String>, active_theme: String },
+    ThemeFileSaved { success: bool, error: Option<String> },
+    ThemeCssVarsUpdated { css_vars: String, colors_json: String },
+
     // Keepalive
     Ping,
     Pong,

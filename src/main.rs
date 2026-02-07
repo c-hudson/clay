@@ -2330,6 +2330,40 @@ impl App {
         self.theme_file.get(self.settings.gui_theme.name())
     }
 
+    /// Build a GlobalSettingsMsg from current app state
+    pub fn build_global_settings_msg(&self) -> GlobalSettingsMsg {
+        GlobalSettingsMsg {
+            more_mode_enabled: self.settings.more_mode_enabled,
+            spell_check_enabled: self.settings.spell_check_enabled,
+            temp_convert_enabled: self.settings.temp_convert_enabled,
+            world_switch_mode: self.settings.world_switch_mode.name().to_string(),
+            debug_enabled: self.settings.debug_enabled,
+            show_tags: self.show_tags,
+            ansi_music_enabled: self.settings.ansi_music_enabled,
+            console_theme: self.settings.theme.name().to_string(),
+            gui_theme: self.settings.gui_theme.name().to_string(),
+            gui_transparency: self.settings.gui_transparency,
+            color_offset_percent: self.settings.color_offset_percent,
+            input_height: self.input_height,
+            font_name: self.settings.font_name.clone(),
+            font_size: self.settings.font_size,
+            web_font_size_phone: self.settings.web_font_size_phone,
+            web_font_size_tablet: self.settings.web_font_size_tablet,
+            web_font_size_desktop: self.settings.web_font_size_desktop,
+            ws_allow_list: self.settings.websocket_allow_list.clone(),
+            web_secure: self.settings.web_secure,
+            http_enabled: self.settings.http_enabled,
+            http_port: self.settings.http_port,
+            ws_enabled: self.settings.ws_enabled,
+            ws_port: self.settings.ws_port,
+            ws_cert_file: self.settings.websocket_cert_file.clone(),
+            ws_key_file: self.settings.websocket_key_file.clone(),
+            tls_proxy_enabled: self.settings.tls_proxy_enabled,
+            dictionary_path: self.settings.dictionary_path.clone(),
+            theme_colors_json: self.gui_theme_colors().to_json(),
+        }
+    }
+
     /// Ensure there's at least one world (creates initial world if needed)
     /// Also adds splash screen to current world if it has no output
     fn ensure_has_world(&mut self) {
@@ -11603,6 +11637,78 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                     app.ws_send_to_client(client_id, WsMessage::UnbanResult { success: false, host, error: Some("No ban found".to_string()) });
                                 }
                             }
+                            // Theme editor messages
+                            WsMessage::RequestThemeEditorState => {
+                                let themes_json = app.theme_file.to_json_all();
+                                let theme_names: Vec<String> = app.theme_file.themes.keys().cloned().collect();
+                                let active_theme = app.settings.gui_theme.name().to_string();
+                                app.ws_send_to_client(client_id, WsMessage::ThemeEditorState {
+                                    themes_json,
+                                    theme_names,
+                                    active_theme,
+                                });
+                            }
+                            WsMessage::UpdateThemeColors { theme_name, colors_json } => {
+                                let base = if theme_name == "light" {
+                                    theme::ThemeColors::light_default()
+                                } else {
+                                    theme::ThemeColors::dark_default()
+                                };
+                                let colors = theme::ThemeColors::from_json(&colors_json, &base);
+                                app.theme_file.set_theme(&theme_name, colors);
+                                // If updated theme is the active GUI theme, broadcast CSS vars update
+                                if theme_name == app.settings.gui_theme.name() {
+                                    let css_vars = app.gui_theme_colors().to_css_vars();
+                                    let colors_json = app.gui_theme_colors().to_json();
+                                    app.ws_broadcast(WsMessage::ThemeCssVarsUpdated {
+                                        css_vars,
+                                        colors_json: colors_json.clone(),
+                                    });
+                                    // Also broadcast GlobalSettingsUpdated for GUI clients
+                                    let settings_msg = app.build_global_settings_msg();
+                                    app.ws_broadcast(WsMessage::GlobalSettingsUpdated {
+                                        settings: settings_msg,
+                                        input_height: app.input_height,
+                                    });
+                                }
+                            }
+                            WsMessage::AddTheme { name, copy_from } => {
+                                let base_colors = app.theme_file.get(&copy_from).clone();
+                                app.theme_file.set_theme(&name, base_colors);
+                                // Send updated state back to editor
+                                let themes_json = app.theme_file.to_json_all();
+                                let theme_names: Vec<String> = app.theme_file.themes.keys().cloned().collect();
+                                let active_theme = app.settings.gui_theme.name().to_string();
+                                app.ws_send_to_client(client_id, WsMessage::ThemeEditorState {
+                                    themes_json,
+                                    theme_names,
+                                    active_theme,
+                                });
+                            }
+                            WsMessage::DeleteTheme { name } => {
+                                app.theme_file.remove_theme(&name);
+                                // Send updated state back to editor
+                                let themes_json = app.theme_file.to_json_all();
+                                let theme_names: Vec<String> = app.theme_file.themes.keys().cloned().collect();
+                                let active_theme = app.settings.gui_theme.name().to_string();
+                                app.ws_send_to_client(client_id, WsMessage::ThemeEditorState {
+                                    themes_json,
+                                    theme_names,
+                                    active_theme,
+                                });
+                            }
+                            WsMessage::SaveThemeFile => {
+                                let content = app.theme_file.generate_file_content();
+                                let path = std::path::Path::new(&get_home_dir()).join("clay.theme.dat");
+                                match std::fs::write(&path, &content) {
+                                    Ok(_) => {
+                                        app.ws_send_to_client(client_id, WsMessage::ThemeFileSaved { success: true, error: None });
+                                    }
+                                    Err(e) => {
+                                        app.ws_send_to_client(client_id, WsMessage::ThemeFileSaved { success: false, error: Some(e.to_string()) });
+                                    }
+                                }
+                            }
                             WsMessage::RequestConnectionsList => {
                                 // Generate connections list using same format as master console
                                 let current_idx = app.current_world_index;
@@ -13765,6 +13871,75 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                 app.ws_send_to_client(client_id, WsMessage::UnbanResult { success: true, host, error: None });
                             } else {
                                 app.ws_send_to_client(client_id, WsMessage::UnbanResult { success: false, host, error: Some("No ban found".to_string()) });
+                            }
+                        }
+                        // Theme editor messages
+                        WsMessage::RequestThemeEditorState => {
+                            let themes_json = app.theme_file.to_json_all();
+                            let theme_names: Vec<String> = app.theme_file.themes.keys().cloned().collect();
+                            let active_theme = app.settings.gui_theme.name().to_string();
+                            app.ws_send_to_client(client_id, WsMessage::ThemeEditorState {
+                                themes_json,
+                                theme_names,
+                                active_theme,
+                            });
+                        }
+                        WsMessage::UpdateThemeColors { theme_name, colors_json } => {
+                            let base = if theme_name == "light" {
+                                theme::ThemeColors::light_default()
+                            } else {
+                                theme::ThemeColors::dark_default()
+                            };
+                            let colors = theme::ThemeColors::from_json(&colors_json, &base);
+                            app.theme_file.set_theme(&theme_name, colors);
+                            // If updated theme is the active GUI theme, broadcast CSS vars update
+                            if theme_name == app.settings.gui_theme.name() {
+                                let css_vars = app.gui_theme_colors().to_css_vars();
+                                let colors_json = app.gui_theme_colors().to_json();
+                                app.ws_broadcast(WsMessage::ThemeCssVarsUpdated {
+                                    css_vars,
+                                    colors_json: colors_json.clone(),
+                                });
+                                let settings_msg = app.build_global_settings_msg();
+                                app.ws_broadcast(WsMessage::GlobalSettingsUpdated {
+                                    settings: settings_msg,
+                                    input_height: app.input_height,
+                                });
+                            }
+                        }
+                        WsMessage::AddTheme { name, copy_from } => {
+                            let base_colors = app.theme_file.get(&copy_from).clone();
+                            app.theme_file.set_theme(&name, base_colors);
+                            let themes_json = app.theme_file.to_json_all();
+                            let theme_names: Vec<String> = app.theme_file.themes.keys().cloned().collect();
+                            let active_theme = app.settings.gui_theme.name().to_string();
+                            app.ws_send_to_client(client_id, WsMessage::ThemeEditorState {
+                                themes_json,
+                                theme_names,
+                                active_theme,
+                            });
+                        }
+                        WsMessage::DeleteTheme { name } => {
+                            app.theme_file.remove_theme(&name);
+                            let themes_json = app.theme_file.to_json_all();
+                            let theme_names: Vec<String> = app.theme_file.themes.keys().cloned().collect();
+                            let active_theme = app.settings.gui_theme.name().to_string();
+                            app.ws_send_to_client(client_id, WsMessage::ThemeEditorState {
+                                themes_json,
+                                theme_names,
+                                active_theme,
+                            });
+                        }
+                        WsMessage::SaveThemeFile => {
+                            let content = app.theme_file.generate_file_content();
+                            let path = std::path::Path::new(&get_home_dir()).join("clay.theme.dat");
+                            match std::fs::write(&path, &content) {
+                                Ok(_) => {
+                                    app.ws_send_to_client(client_id, WsMessage::ThemeFileSaved { success: true, error: None });
+                                }
+                                Err(e) => {
+                                    app.ws_send_to_client(client_id, WsMessage::ThemeFileSaved { success: false, error: Some(e.to_string()) });
+                                }
                             }
                         }
                         WsMessage::RequestConnectionsList => {

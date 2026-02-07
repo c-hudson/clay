@@ -1,0 +1,1520 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Clay Theme Editor</title>
+<style>
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+:root {
+  --editor-bg: #0e1220;
+  --editor-bg2: #141828;
+  --editor-bg3: #1a1f33;
+  --editor-bg4: #222840;
+  --editor-fg: #d0ccd6;
+  --editor-fg2: #908a9a;
+  --editor-accent: #d4845a;
+  --editor-border: #2a2f44;
+  --editor-hover: #2a3050;
+  --editor-selected: #33395a;
+  --editor-success: #7ecf8b;
+  --editor-error: #e87070;
+  --editor-warning: #e8c46a;
+}
+
+html, body {
+  height: 100%;
+  overflow: hidden;
+  background: var(--editor-bg);
+  color: var(--editor-fg);
+  font-family: 'Consolas', 'Monaco', 'Courier New', monospace;
+  font-size: 13px;
+}
+
+/* Auth overlay */
+.auth-overlay {
+  position: fixed;
+  top: 0; left: 0; right: 0; bottom: 0;
+  background: var(--editor-bg);
+  z-index: 200;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-direction: column;
+  gap: 16px;
+}
+
+.auth-overlay.hidden { display: none; }
+
+.auth-box {
+  background: var(--editor-bg3);
+  border: 1px solid var(--editor-accent);
+  border-radius: 6px;
+  padding: 24px 32px;
+  min-width: 300px;
+  text-align: center;
+}
+
+.auth-box h2 {
+  color: var(--editor-accent);
+  font-size: 16px;
+  margin-bottom: 16px;
+}
+
+.auth-box input[type="password"] {
+  background: var(--editor-bg);
+  color: var(--editor-fg);
+  border: 1px solid var(--editor-border);
+  padding: 8px 12px;
+  font-family: inherit;
+  font-size: 14px;
+  width: 100%;
+  border-radius: 3px;
+  margin-bottom: 12px;
+}
+
+.auth-box input[type="password"]:focus { outline: 1px solid var(--editor-accent); }
+
+.auth-error {
+  color: var(--editor-error);
+  font-size: 12px;
+  margin-bottom: 8px;
+  min-height: 16px;
+}
+
+.auth-status {
+  color: var(--editor-fg2);
+  font-size: 12px;
+  margin-top: 8px;
+}
+
+/* Top toolbar */
+.toolbar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 12px;
+  background: var(--editor-bg2);
+  border-bottom: 1px solid var(--editor-border);
+  flex-shrink: 0;
+  flex-wrap: wrap;
+}
+
+.toolbar-title {
+  font-weight: bold;
+  font-size: 14px;
+  color: var(--editor-accent);
+  margin-right: 12px;
+  white-space: nowrap;
+}
+
+.toolbar-group {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding: 0 8px;
+  border-left: 1px solid var(--editor-border);
+}
+
+.toolbar-group:first-child { border-left: none; padding-left: 0; }
+
+.toolbar-label {
+  color: var(--editor-fg2);
+  font-size: 11px;
+  margin-right: 4px;
+  white-space: nowrap;
+}
+
+button {
+  background: var(--editor-bg3);
+  color: var(--editor-fg);
+  border: 1px solid var(--editor-border);
+  padding: 4px 10px;
+  font-family: inherit;
+  font-size: 12px;
+  cursor: pointer;
+  border-radius: 3px;
+  white-space: nowrap;
+}
+
+button:hover { background: var(--editor-hover); }
+button:active { background: var(--editor-selected); }
+
+button.primary {
+  background: #3a4a30;
+  border-color: #4a6a38;
+}
+button.primary:hover { background: #4a5a40; }
+
+button.danger {
+  background: #4a2020;
+  border-color: #6a3030;
+}
+button.danger:hover { background: #5a3030; }
+
+select {
+  background: var(--editor-bg3);
+  color: var(--editor-fg);
+  border: 1px solid var(--editor-border);
+  padding: 4px 6px;
+  font-family: inherit;
+  font-size: 12px;
+  border-radius: 3px;
+  cursor: pointer;
+}
+
+select:focus, button:focus { outline: 1px solid var(--editor-accent); outline-offset: 1px; }
+
+.unsaved-dot {
+  display: none;
+  width: 8px;
+  height: 8px;
+  background: var(--editor-warning);
+  border-radius: 50%;
+  margin-left: 4px;
+  flex-shrink: 0;
+}
+
+.unsaved-dot.visible { display: inline-block; }
+
+.save-status {
+  color: var(--editor-success);
+  font-size: 11px;
+  margin-left: 8px;
+  opacity: 0;
+  transition: opacity 0.3s;
+}
+
+.save-status.visible { opacity: 1; }
+
+/* Main layout */
+.main-layout {
+  display: flex;
+  height: calc(100% - 37px);
+}
+
+/* Left panel: color list */
+.color-list-panel {
+  width: 340px;
+  min-width: 280px;
+  border-right: 1px solid var(--editor-border);
+  display: flex;
+  flex-direction: column;
+  flex-shrink: 0;
+}
+
+.color-list-scroll {
+  flex: 1;
+  overflow-y: auto;
+  overflow-x: hidden;
+}
+
+.color-list-scroll::-webkit-scrollbar { width: 6px; }
+.color-list-scroll::-webkit-scrollbar-track { background: var(--editor-bg); }
+.color-list-scroll::-webkit-scrollbar-thumb { background: var(--editor-border); border-radius: 3px; }
+
+.color-group {
+  margin-bottom: 2px;
+}
+
+.color-group-header {
+  display: flex;
+  align-items: center;
+  padding: 5px 10px;
+  background: var(--editor-bg2);
+  cursor: pointer;
+  user-select: none;
+  position: sticky;
+  top: 0;
+  z-index: 1;
+  border-bottom: 1px solid var(--editor-border);
+}
+
+.color-group-header:hover { background: var(--editor-bg3); }
+
+.color-group-arrow {
+  font-size: 10px;
+  width: 14px;
+  color: var(--editor-fg2);
+  transition: transform 0.15s;
+}
+
+.color-group-arrow.collapsed { transform: rotate(-90deg); }
+
+.color-group-title {
+  font-size: 11px;
+  font-weight: bold;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  color: var(--editor-fg2);
+}
+
+.color-group-items { }
+.color-group-items.collapsed { display: none; }
+
+.color-item {
+  display: flex;
+  align-items: center;
+  padding: 3px 10px 3px 24px;
+  cursor: pointer;
+  gap: 8px;
+  border-left: 3px solid transparent;
+}
+
+.color-item:hover { background: var(--editor-hover); }
+.color-item.selected {
+  background: var(--editor-selected);
+  border-left-color: var(--editor-accent);
+}
+
+.color-swatch {
+  width: 20px;
+  height: 20px;
+  border-radius: 3px;
+  border: 1px solid rgba(255,255,255,0.15);
+  flex-shrink: 0;
+}
+
+.color-item-info {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.color-item-name {
+  font-size: 12px;
+  color: var(--editor-fg);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.color-item-hex {
+  font-size: 11px;
+  color: var(--editor-fg2);
+  flex-shrink: 0;
+}
+
+/* Right panel */
+.right-panel {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  overflow: hidden;
+}
+
+/* Color picker section */
+.picker-section {
+  padding: 12px 16px;
+  border-bottom: 1px solid var(--editor-border);
+  flex-shrink: 0;
+}
+
+.picker-title {
+  font-size: 12px;
+  color: var(--editor-fg2);
+  margin-bottom: 8px;
+}
+
+.picker-var-name {
+  color: var(--editor-accent);
+  font-weight: bold;
+}
+
+.picker-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin-bottom: 8px;
+}
+
+.picker-color-input {
+  width: 60px;
+  height: 40px;
+  border: 1px solid var(--editor-border);
+  border-radius: 4px;
+  cursor: pointer;
+  padding: 2px;
+  background: var(--editor-bg3);
+}
+
+.picker-color-input::-webkit-color-swatch-wrapper { padding: 0; }
+.picker-color-input::-webkit-color-swatch { border: none; border-radius: 2px; }
+
+.picker-hex-input {
+  background: var(--editor-bg3);
+  color: var(--editor-fg);
+  border: 1px solid var(--editor-border);
+  padding: 6px 8px;
+  font-family: inherit;
+  font-size: 13px;
+  width: 90px;
+  border-radius: 3px;
+}
+
+.picker-hex-input:focus { outline: 1px solid var(--editor-accent); }
+
+.picker-hex-input.invalid { border-color: var(--editor-error); }
+
+.slider-group {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.slider-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.slider-label {
+  width: 14px;
+  font-size: 11px;
+  font-weight: bold;
+}
+
+.slider-label-r { color: #e87070; }
+.slider-label-g { color: #7ecf8b; }
+.slider-label-b { color: #8cb4e0; }
+
+.slider-input {
+  flex: 1;
+  -webkit-appearance: none;
+  appearance: none;
+  height: 4px;
+  border-radius: 2px;
+  outline: none;
+  cursor: pointer;
+  max-width: 180px;
+}
+
+.slider-input::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 14px;
+  height: 14px;
+  border-radius: 50%;
+  background: var(--editor-fg);
+  border: 2px solid var(--editor-bg);
+  cursor: pointer;
+}
+
+.slider-r { background: linear-gradient(to right, #000, #ff0000); }
+.slider-g { background: linear-gradient(to right, #000, #00ff00); }
+.slider-b { background: linear-gradient(to right, #000, #0000ff); }
+
+.slider-value {
+  width: 28px;
+  font-size: 11px;
+  color: var(--editor-fg2);
+  text-align: right;
+}
+
+.picker-no-selection {
+  color: var(--editor-fg2);
+  font-style: italic;
+  padding: 20px 0;
+  text-align: center;
+}
+
+/* Preview section */
+.preview-section {
+  flex: 1;
+  padding: 12px 16px;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+}
+
+.preview-label {
+  font-size: 11px;
+  color: var(--editor-fg2);
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  margin-bottom: 6px;
+  flex-shrink: 0;
+}
+
+.preview-container {
+  flex: 1;
+  border-radius: 4px;
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
+  border: 1px solid var(--editor-border);
+  min-height: 200px;
+}
+
+.preview-output {
+  flex: 1;
+  padding: 8px 10px;
+  overflow-y: auto;
+  font-size: 13px;
+  line-height: 1.4;
+}
+
+.preview-output::-webkit-scrollbar { width: 4px; }
+.preview-output::-webkit-scrollbar-track { background: transparent; }
+.preview-output::-webkit-scrollbar-thumb { background: rgba(255,255,255,0.1); border-radius: 2px; }
+
+.preview-separator {
+  display: flex;
+  align-items: center;
+  padding: 0 4px;
+  height: 20px;
+  font-size: 12px;
+  flex-shrink: 0;
+}
+
+.preview-status-left {
+  padding: 0 4px;
+  font-weight: bold;
+  font-size: 11px;
+}
+
+.preview-world-name {
+  font-weight: bold;
+  padding: 0 6px;
+}
+
+.preview-separator-fill {
+  flex: 1;
+  overflow: hidden;
+  white-space: nowrap;
+}
+
+.preview-time {
+  padding: 0 4px;
+  font-size: 12px;
+}
+
+.preview-input {
+  padding: 4px 10px;
+  min-height: 24px;
+  font-size: 13px;
+  display: flex;
+  align-items: center;
+}
+
+.preview-prompt-text {
+  white-space: pre;
+}
+
+.preview-cursor {
+  display: inline-block;
+  width: 7px;
+  height: 14px;
+  animation: blink 1s step-end infinite;
+}
+
+@keyframes blink {
+  0%, 50% { opacity: 1; }
+  51%, 100% { opacity: 0; }
+}
+
+/* Hidden file input */
+.hidden-input { display: none; }
+
+/* Popup overlay for add theme */
+.popup-overlay {
+  display: none;
+  position: fixed;
+  top: 0; left: 0; right: 0; bottom: 0;
+  background: rgba(0,0,0,0.6);
+  z-index: 100;
+  align-items: center;
+  justify-content: center;
+}
+
+.popup-overlay.visible { display: flex; }
+
+.popup-box {
+  background: var(--editor-bg3);
+  border: 1px solid var(--editor-accent);
+  border-radius: 6px;
+  padding: 16px 20px;
+  min-width: 280px;
+}
+
+.popup-box h3 {
+  color: var(--editor-accent);
+  font-size: 14px;
+  margin-bottom: 12px;
+}
+
+.popup-box input[type="text"] {
+  background: var(--editor-bg);
+  color: var(--editor-fg);
+  border: 1px solid var(--editor-border);
+  padding: 6px 8px;
+  font-family: inherit;
+  font-size: 13px;
+  width: 100%;
+  border-radius: 3px;
+  margin-bottom: 12px;
+}
+
+.popup-box input[type="text"]:focus { outline: 1px solid var(--editor-accent); }
+
+.popup-buttons {
+  display: flex;
+  gap: 8px;
+  justify-content: flex-end;
+}
+</style>
+</head>
+<body>
+
+<!-- Auth overlay -->
+<div class="auth-overlay" id="authOverlay">
+  <div class="auth-box">
+    <h2>Clay Theme Editor</h2>
+    <div class="auth-error" id="authError"></div>
+    <input type="password" id="authPassword" placeholder="WebSocket password" onkeydown="if(event.key==='Enter')doAuth()">
+    <button class="primary" onclick="doAuth()" style="width:100%;padding:8px">Connect</button>
+    <div class="auth-status" id="authStatus">Connecting...</div>
+  </div>
+</div>
+
+<!-- Main editor (hidden until auth) -->
+<div id="editorMain" style="display:none;height:100%;flex-direction:column">
+<div class="toolbar">
+  <span class="toolbar-title">Clay Theme Editor</span>
+  <div class="unsaved-dot" id="unsavedDot" title="Unsaved changes"></div>
+  <span class="save-status" id="saveStatus"></span>
+
+  <div class="toolbar-group">
+    <span class="toolbar-label">Theme:</span>
+    <select id="themeSelect" onchange="switchTheme(this.value)"></select>
+    <button onclick="showAddThemePopup()">Add</button>
+    <button class="danger" onclick="deleteTheme()">Delete</button>
+  </div>
+
+  <div class="toolbar-group" id="fileOpsGroup" style="display:none">
+    <button onclick="loadFile()">Load File</button>
+    <button class="primary" onclick="saveFile()">Save File</button>
+    <button onclick="resetChanges()">Reset</button>
+    <button onclick="loadDefaults()">Load Defaults</button>
+  </div>
+
+  <div class="toolbar-group" id="remoteOpsGroup">
+    <button class="primary" onclick="remoteSave()">Save</button>
+    <button onclick="resetChanges()">Reset</button>
+    <button onclick="loadDefaults()">Load Defaults</button>
+  </div>
+</div>
+
+<div class="main-layout">
+  <div class="color-list-panel">
+    <div class="color-list-scroll" id="colorList"></div>
+  </div>
+
+  <div class="right-panel">
+    <div class="picker-section" id="pickerSection">
+      <div class="picker-no-selection" id="pickerPlaceholder">Select a color variable to edit</div>
+      <div id="pickerControls" style="display:none">
+        <div class="picker-title">Editing: <span class="picker-var-name" id="pickerVarName"></span></div>
+        <div class="picker-row">
+          <input type="color" class="picker-color-input" id="pickerColor" oninput="onPickerColor(this.value)">
+          <input type="text" class="picker-hex-input" id="pickerHex" maxlength="7" oninput="onPickerHex(this.value)" onkeydown="if(event.key==='Enter')this.blur()">
+          <div class="slider-group">
+            <div class="slider-row">
+              <span class="slider-label slider-label-r">R</span>
+              <input type="range" class="slider-input slider-r" id="sliderR" min="0" max="255" oninput="onSlider()">
+              <span class="slider-value" id="valR">0</span>
+            </div>
+            <div class="slider-row">
+              <span class="slider-label slider-label-g">G</span>
+              <input type="range" class="slider-input slider-g" id="sliderG" min="0" max="255" oninput="onSlider()">
+              <span class="slider-value" id="valG">0</span>
+            </div>
+            <div class="slider-row">
+              <span class="slider-label slider-label-b">B</span>
+              <input type="range" class="slider-input slider-b" id="sliderB" min="0" max="255" oninput="onSlider()">
+              <span class="slider-value" id="valB">0</span>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <div class="preview-section">
+      <div class="preview-label">Live Preview</div>
+      <div class="preview-container" id="previewContainer">
+        <div class="preview-output" id="previewOutput"></div>
+        <div class="preview-separator" id="previewSeparator">
+          <span class="preview-status-left" id="previewStatus"></span>
+          <span class="preview-world-name" id="previewWorldName"></span>
+          <span class="preview-separator-fill" id="previewFill"></span>
+          <span class="preview-time" id="previewTime"></span>
+        </div>
+        <div class="preview-input" id="previewInput">
+          <span class="preview-prompt-text" id="previewPrompt"></span>
+          <span class="preview-cursor" id="previewCursor"></span>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+</div>
+
+<input type="file" class="hidden-input" id="fileInput" accept=".dat,.txt,.theme" onchange="handleFileLoad(this)">
+
+<div class="popup-overlay" id="addThemePopup">
+  <div class="popup-box">
+    <h3>Add New Theme</h3>
+    <input type="text" id="newThemeName" placeholder="Theme name (e.g. midnight)" onkeydown="if(event.key==='Enter')confirmAddTheme();if(event.key==='Escape')closeAddThemePopup()">
+    <div class="popup-buttons">
+      <button onclick="closeAddThemePopup()">Cancel</button>
+      <button class="primary" onclick="confirmAddTheme()">Add</button>
+    </div>
+  </div>
+</div>
+
+<script>
+// ── Data ──────────────────────────────────────────────────────────────────
+
+const ANSI_NAMES = [
+  'black','red','green','yellow','blue','magenta','cyan','white',
+  'bright black','bright red','bright green','bright yellow',
+  'bright blue','bright magenta','bright cyan','bright white'
+];
+
+const VARIABLE_GROUPS = [
+  {
+    name: 'Background',
+    vars: [
+      { key: 'bg', label: 'bg', desc: 'Main content area' },
+      { key: 'bg_deep', label: 'bg_deep', desc: 'Deepest bg layer' },
+      { key: 'bg_surface', label: 'bg_surface', desc: 'Slightly elevated' },
+      { key: 'bg_elevated', label: 'bg_elevated', desc: 'Popups, menus' },
+      { key: 'bg_hover', label: 'bg_hover', desc: 'Hover state' },
+    ]
+  },
+  {
+    name: 'Foreground',
+    vars: [
+      { key: 'fg', label: 'fg', desc: 'Primary text' },
+      { key: 'fg_secondary', label: 'fg_secondary', desc: 'Less prominent' },
+      { key: 'fg_muted', label: 'fg_muted', desc: 'Hints' },
+      { key: 'fg_dim', label: 'fg_dim', desc: 'Disabled' },
+    ]
+  },
+  {
+    name: 'Semantic',
+    vars: [
+      { key: 'accent', label: 'accent', desc: 'Primary accent' },
+      { key: 'accent_dim', label: 'accent_dim', desc: 'Dimmed accent' },
+      { key: 'highlight', label: 'highlight', desc: 'Warning/attention' },
+      { key: 'success', label: 'success', desc: 'Green' },
+      { key: 'error', label: 'error', desc: 'Red' },
+      { key: 'error_dim', label: 'error_dim', desc: 'Dimmed error' },
+    ]
+  },
+  {
+    name: 'UI Elements',
+    vars: [
+      { key: 'status_bar.bg', label: 'status_bar.bg', desc: 'Separator bar' },
+      { key: 'selection.bg', label: 'selection.bg', desc: 'Text selection' },
+      { key: 'link', label: 'link', desc: 'URL color' },
+      { key: 'prompt', label: 'prompt', desc: 'Input prompt' },
+      { key: 'border_subtle', label: 'border_subtle', desc: 'Subtle borders' },
+      { key: 'border_medium', label: 'border_medium', desc: 'Medium borders' },
+      { key: 'button.selected_bg', label: 'button.selected_bg', desc: 'Selected button bg' },
+      { key: 'button.selected_fg', label: 'button.selected_fg', desc: 'Selected button fg' },
+      { key: 'more_indicator.bg', label: 'more_indicator.bg', desc: 'More badge' },
+      { key: 'activity.bg', label: 'activity.bg', desc: 'Activity indicator' },
+    ]
+  },
+  {
+    name: 'ANSI Palette',
+    vars: Array.from({length: 16}, (_, i) => ({
+      key: `ansi.${i}`,
+      label: `ansi.${i}`,
+      desc: ANSI_NAMES[i]
+    }))
+  }
+];
+
+function darkDefaults() {
+  return {
+    bg: '#131926', bg_deep: '#151119', bg_surface: '#1c1722',
+    bg_elevated: '#231d2a', bg_hover: '#2c2535',
+    fg: '#e8e4ec', fg_secondary: '#a89fb4', fg_muted: '#6e6479', fg_dim: '#4a4255',
+    accent: '#d4845a', accent_dim: '#c27a52', highlight: '#e8c46a',
+    success: '#7ecf8b', error: '#e87070', error_dim: '#5f0000',
+    'status_bar.bg': '#284b63', 'selection.bg': '#004080', link: '#8cb4e0',
+    prompt: '#d4845a', border_subtle: '#221c2b', border_medium: '#2e2738',
+    'button.selected_bg': '#e8e4ec', 'button.selected_fg': '#131926',
+    'more_indicator.bg': '#5f0000', 'activity.bg': '#f5f0d8',
+    'ansi.0': '#000000', 'ansi.1': '#aa0000', 'ansi.2': '#44aa44',
+    'ansi.3': '#aa5500', 'ansi.4': '#0039aa', 'ansi.5': '#aa22aa',
+    'ansi.6': '#1a92aa', 'ansi.7': '#aaaaaa', 'ansi.8': '#777777',
+    'ansi.9': '#ff8787', 'ansi.10': '#4ce64c', 'ansi.11': '#ded82c',
+    'ansi.12': '#295fcc', 'ansi.13': '#cc58cc', 'ansi.14': '#4ccce6',
+    'ansi.15': '#ffffff'
+  };
+}
+
+function lightDefaults() {
+  return {
+    bg: '#e8e8e8', bg_deep: '#e8e8e8', bg_surface: '#b3b3b3',
+    bg_elevated: '#f0f0f0', bg_hover: '#d2d2d2',
+    fg: '#1d1d1f', fg_secondary: '#636366', fg_muted: '#8e8e93', fg_dim: '#aeaeb2',
+    accent: '#b86b3f', accent_dim: '#a05a32', highlight: '#e08600',
+    success: '#34c759', error: '#ff3b30', error_dim: '#5f0000',
+    'status_bar.bg': '#9b9b9b', 'selection.bg': '#b4c8e6', link: '#007aff',
+    prompt: '#b86b3f', border_subtle: '#c0c0c0', border_medium: '#b0b0b0',
+    'button.selected_bg': '#1d1d1f', 'button.selected_fg': '#e8e8e8',
+    'more_indicator.bg': '#5f0000', 'activity.bg': '#fcba03',
+    'ansi.0': '#000000', 'ansi.1': '#aa0000', 'ansi.2': '#44aa44',
+    'ansi.3': '#804000', 'ansi.4': '#0039aa', 'ansi.5': '#aa22aa',
+    'ansi.6': '#1a92aa', 'ansi.7': '#505050', 'ansi.8': '#777777',
+    'ansi.9': '#ff8787', 'ansi.10': '#4ce64c', 'ansi.11': '#a7a321',
+    'ansi.12': '#295fcc', 'ansi.13': '#cc58cc', 'ansi.14': '#4ccce6',
+    'ansi.15': '#282828'
+  };
+}
+
+// ── State ──────────────────────────────────────────────────────────────────
+
+let themes = {};
+let savedSnapshot = '';
+let currentTheme = 'dark';
+let selectedVar = null;
+let ws = null;
+let isRemoteMode = false;
+let activeThemeName = 'dark';  // Which theme the server is currently using
+let updateDebounceTimer = null;
+
+// ── WebSocket / Auth ──────────────────────────────────────────────────────
+
+function initConnection() {
+  const host = window.WS_HOST || window.location.hostname;
+  const protocol = window.WS_PROTOCOL || 'ws';
+  const port = window.WS_PORT || 9003;
+
+  // Check if we have WS config (remote mode) or standalone
+  if (!window.WS_HOST && !window.WS_PORT) {
+    // Standalone mode - show file ops, hide remote ops
+    isRemoteMode = false;
+    document.getElementById('authOverlay').classList.add('hidden');
+    document.getElementById('editorMain').style.display = 'flex';
+    document.getElementById('fileOpsGroup').style.display = 'flex';
+    document.getElementById('remoteOpsGroup').style.display = 'none';
+    initStandalone();
+    return;
+  }
+
+  isRemoteMode = true;
+  document.getElementById('fileOpsGroup').style.display = 'none';
+  document.getElementById('remoteOpsGroup').style.display = 'flex';
+
+  const wsUrl = protocol + '://' + host + ':' + port;
+  document.getElementById('authStatus').textContent = 'Connecting to ' + host + ':' + port + '...';
+
+  ws = new WebSocket(wsUrl);
+
+  ws.onopen = function() {
+    document.getElementById('authStatus').textContent = 'Connected. Enter password.';
+    document.getElementById('authPassword').focus();
+  };
+
+  ws.onmessage = function(event) {
+    try {
+      const msg = JSON.parse(event.data);
+      handleWsMessage(msg);
+    } catch (e) {
+      // ignore parse errors
+    }
+  };
+
+  ws.onclose = function() {
+    document.getElementById('authStatus').textContent = 'Disconnected. Refresh to reconnect.';
+  };
+
+  ws.onerror = function() {
+    document.getElementById('authStatus').textContent = 'Connection failed.';
+  };
+}
+
+function handleWsMessage(msg) {
+  switch (msg.type) {
+    case 'ServerHello':
+      // Ready for auth
+      break;
+
+    case 'AuthResponse':
+      if (msg.success) {
+        document.getElementById('authOverlay').classList.add('hidden');
+        document.getElementById('editorMain').style.display = 'flex';
+        // Request theme state
+        wsSend({ type: 'RequestThemeEditorState' });
+      } else {
+        document.getElementById('authError').textContent = msg.error || 'Authentication failed';
+      }
+      break;
+
+    case 'ThemeEditorState':
+      // Received all themes from server
+      if (msg.themes_json) {
+        const parsed = JSON.parse(msg.themes_json);
+        // Convert to our format (fill in missing keys from defaults)
+        themes = {};
+        for (const [name, colors] of Object.entries(parsed)) {
+          const base = name === 'light' ? lightDefaults() : darkDefaults();
+          themes[name] = Object.assign({}, base, colors);
+        }
+      }
+      if (msg.active_theme) {
+        activeThemeName = msg.active_theme;
+      }
+      const names = Object.keys(themes).sort();
+      currentTheme = names.includes(activeThemeName) ? activeThemeName : (names.includes('dark') ? 'dark' : names[0]);
+      selectedVar = null;
+      savedSnapshot = JSON.stringify(themes);
+      rebuildAll();
+      break;
+
+    case 'ThemeFileSaved':
+      if (msg.success) {
+        savedSnapshot = JSON.stringify(themes);
+        updateUnsaved();
+        showSaveStatus('Saved');
+      } else {
+        showSaveStatus('Error: ' + (msg.error || 'unknown'));
+      }
+      break;
+
+    case 'Pong':
+      break;
+
+    default:
+      break;
+  }
+}
+
+function wsSend(msg) {
+  if (ws && ws.readyState === WebSocket.OPEN) {
+    ws.send(JSON.stringify(msg));
+  }
+}
+
+async function doAuth() {
+  const password = document.getElementById('authPassword').value;
+  if (!password) return;
+  document.getElementById('authError').textContent = '';
+
+  try {
+    const hash = await hashPassword(password);
+    wsSend({ type: 'AuthRequest', password_hash: hash });
+  } catch (e) {
+    const hash = sha256Fallback(password);
+    wsSend({ type: 'AuthRequest', password_hash: hash });
+  }
+}
+
+// SHA-256 hash
+async function hashPassword(password) {
+  if (window.crypto && window.crypto.subtle) {
+    try {
+      const encoder = new TextEncoder();
+      const data = encoder.encode(password);
+      const hashBuffer = await crypto.subtle.digest('SHA-256', data);
+      const hashArray = Array.from(new Uint8Array(hashBuffer));
+      return hashArray.map(b => b.toString(16).padStart(2, '0')).join('');
+    } catch (e) {
+      return sha256Fallback(password);
+    }
+  }
+  return sha256Fallback(password);
+}
+
+function sha256Fallback(message) {
+  const utf8 = unescape(encodeURIComponent(message));
+  const bytes = [];
+  for (let i = 0; i < utf8.length; i++) bytes.push(utf8.charCodeAt(i));
+
+  const K = [
+    0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
+    0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
+    0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
+    0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967,
+    0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85,
+    0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
+    0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
+    0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2
+  ];
+
+  let H = [0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19];
+
+  const bitLength = bytes.length * 8;
+  bytes.push(0x80);
+  while ((bytes.length % 64) !== 56) bytes.push(0);
+  for (let i = 7; i >= 0; i--) bytes.push((bitLength / Math.pow(2, i * 8)) & 0xff);
+
+  function rotr(x, n) { return ((x >>> n) | (x << (32 - n))) >>> 0; }
+  function ch(x, y, z) { return ((x & y) ^ (~x & z)) >>> 0; }
+  function maj(x, y, z) { return ((x & y) ^ (x & z) ^ (y & z)) >>> 0; }
+  function sig0(x) { return (rotr(x, 2) ^ rotr(x, 13) ^ rotr(x, 22)) >>> 0; }
+  function sig1(x) { return (rotr(x, 6) ^ rotr(x, 11) ^ rotr(x, 25)) >>> 0; }
+  function s0(x) { return (rotr(x, 7) ^ rotr(x, 18) ^ (x >>> 3)) >>> 0; }
+  function s1(x) { return (rotr(x, 17) ^ rotr(x, 19) ^ (x >>> 10)) >>> 0; }
+
+  for (let offset = 0; offset < bytes.length; offset += 64) {
+    const W = new Array(64);
+    for (let t = 0; t < 16; t++) {
+      W[t] = (bytes[offset + t * 4] << 24) | (bytes[offset + t * 4 + 1] << 16) |
+             (bytes[offset + t * 4 + 2] << 8) | bytes[offset + t * 4 + 3];
+      W[t] = W[t] >>> 0;
+    }
+    for (let t = 16; t < 64; t++) {
+      W[t] = (s1(W[t-2]) + W[t-7] + s0(W[t-15]) + W[t-16]) >>> 0;
+    }
+    let [a, b, c, d, e, f, g, h] = H;
+    for (let t = 0; t < 64; t++) {
+      const T1 = (h + sig1(e) + ch(e, f, g) + K[t] + W[t]) >>> 0;
+      const T2 = (sig0(a) + maj(a, b, c)) >>> 0;
+      h = g; g = f; f = e; e = (d + T1) >>> 0; d = c; c = b; b = a; a = (T1 + T2) >>> 0;
+    }
+    H[0] = (H[0] + a) >>> 0; H[1] = (H[1] + b) >>> 0; H[2] = (H[2] + c) >>> 0; H[3] = (H[3] + d) >>> 0;
+    H[4] = (H[4] + e) >>> 0; H[5] = (H[5] + f) >>> 0; H[6] = (H[6] + g) >>> 0; H[7] = (H[7] + h) >>> 0;
+  }
+
+  return H.map(v => v.toString(16).padStart(8, '0')).join('');
+}
+
+// ── Standalone mode ────────────────────────────────────────────────────────
+
+function initStandalone() {
+  themes = { dark: darkDefaults(), light: lightDefaults() };
+  savedSnapshot = JSON.stringify(themes);
+  currentTheme = 'dark';
+  selectedVar = null;
+  rebuildAll();
+}
+
+// ── Init ──────────────────────────────────────────────────────────────────
+
+function rebuildAll() {
+  populateThemeSelect();
+  buildColorList();
+  updatePicker();
+  updatePreview();
+  updateUnsaved();
+}
+
+// ── Save status flash ─────────────────────────────────────────────────────
+
+function showSaveStatus(text) {
+  const el = document.getElementById('saveStatus');
+  el.textContent = text;
+  el.classList.add('visible');
+  setTimeout(function() { el.classList.remove('visible'); }, 2000);
+}
+
+// ── Unsaved tracking ──────────────────────────────────────────────────────
+
+function isModified() {
+  return JSON.stringify(themes) !== savedSnapshot;
+}
+
+function updateUnsaved() {
+  document.getElementById('unsavedDot').classList.toggle('visible', isModified());
+  document.title = (isModified() ? '* ' : '') + 'Clay Theme Editor';
+}
+
+window.addEventListener('beforeunload', function(e) {
+  if (isModified()) {
+    e.preventDefault();
+    e.returnValue = '';
+  }
+});
+
+// ── Theme selector ────────────────────────────────────────────────────────
+
+function populateThemeSelect() {
+  const sel = document.getElementById('themeSelect');
+  sel.innerHTML = '';
+  for (const name of Object.keys(themes).sort()) {
+    const opt = document.createElement('option');
+    opt.value = name;
+    opt.textContent = name;
+    if (name === currentTheme) opt.selected = true;
+    sel.appendChild(opt);
+  }
+}
+
+function switchTheme(name) {
+  if (!themes[name]) return;
+  currentTheme = name;
+  selectedVar = null;
+  buildColorList();
+  updatePicker();
+  updatePreview();
+}
+
+function showAddThemePopup() {
+  document.getElementById('addThemePopup').classList.add('visible');
+  const input = document.getElementById('newThemeName');
+  input.value = '';
+  input.focus();
+}
+
+function closeAddThemePopup() {
+  document.getElementById('addThemePopup').classList.remove('visible');
+}
+
+function confirmAddTheme() {
+  const name = document.getElementById('newThemeName').value.trim().toLowerCase().replace(/[^a-z0-9_-]/g, '');
+  if (!name) return;
+  if (themes[name]) { alert('Theme "' + name + '" already exists.'); return; }
+
+  if (isRemoteMode) {
+    wsSend({ type: 'AddTheme', name: name, copy_from: currentTheme });
+  }
+
+  themes[name] = JSON.parse(JSON.stringify(themes[currentTheme]));
+  currentTheme = name;
+  closeAddThemePopup();
+  rebuildAll();
+}
+
+function deleteTheme() {
+  const names = Object.keys(themes);
+  if (names.length <= 1) { alert('Cannot delete the last theme.'); return; }
+  if (!confirm('Delete theme "' + currentTheme + '"?')) return;
+
+  if (isRemoteMode) {
+    wsSend({ type: 'DeleteTheme', name: currentTheme });
+  }
+
+  delete themes[currentTheme];
+  currentTheme = Object.keys(themes).sort()[0];
+  selectedVar = null;
+  rebuildAll();
+}
+
+// ── Color list ────────────────────────────────────────────────────────────
+
+function buildColorList() {
+  const container = document.getElementById('colorList');
+  container.innerHTML = '';
+  const t = themes[currentTheme];
+  if (!t) return;
+
+  for (const group of VARIABLE_GROUPS) {
+    const groupEl = document.createElement('div');
+    groupEl.className = 'color-group';
+
+    const header = document.createElement('div');
+    header.className = 'color-group-header';
+    header.innerHTML = '<span class="color-group-arrow">&#9660;</span><span class="color-group-title">' + escapeHtml(group.name) + '</span>';
+
+    const items = document.createElement('div');
+    items.className = 'color-group-items';
+
+    header.addEventListener('click', function() {
+      var arrow = header.querySelector('.color-group-arrow');
+      arrow.classList.toggle('collapsed');
+      items.classList.toggle('collapsed');
+    });
+
+    for (const v of group.vars) {
+      const hex = t[v.key] || '#000000';
+      const item = document.createElement('div');
+      item.className = 'color-item' + (selectedVar === v.key ? ' selected' : '');
+      item.dataset.key = v.key;
+      item.innerHTML = '<div class="color-swatch" style="background:' + hex + '"></div>' +
+        '<div class="color-item-info">' +
+        '<span class="color-item-name" title="' + escapeHtml(v.desc) + '">' + escapeHtml(v.label) + '</span>' +
+        '<span class="color-item-hex">' + hex + '</span></div>';
+      item.addEventListener('click', function() { selectVar(v.key); });
+      items.appendChild(item);
+    }
+
+    groupEl.appendChild(header);
+    groupEl.appendChild(items);
+    container.appendChild(groupEl);
+  }
+}
+
+function selectVar(key) {
+  selectedVar = key;
+  document.querySelectorAll('.color-item').forEach(function(el) {
+    el.classList.toggle('selected', el.dataset.key === key);
+  });
+  updatePicker();
+}
+
+function updateColorListItem(key, hex) {
+  var item = document.querySelector('.color-item[data-key="' + CSS.escape(key) + '"]');
+  if (!item) return;
+  item.querySelector('.color-swatch').style.background = hex;
+  item.querySelector('.color-item-hex').textContent = hex;
+}
+
+// ── Picker ────────────────────────────────────────────────────────────────
+
+function updatePicker() {
+  var placeholder = document.getElementById('pickerPlaceholder');
+  var controls = document.getElementById('pickerControls');
+  if (!selectedVar || !themes[currentTheme]) {
+    placeholder.style.display = 'block';
+    controls.style.display = 'none';
+    return;
+  }
+  placeholder.style.display = 'none';
+  controls.style.display = 'block';
+
+  document.getElementById('pickerVarName').textContent = selectedVar;
+  var hex = themes[currentTheme][selectedVar] || '#000000';
+  setPickerValues(hex);
+}
+
+function setPickerValues(hex) {
+  document.getElementById('pickerColor').value = hex;
+  document.getElementById('pickerHex').value = hex;
+  document.getElementById('pickerHex').classList.remove('invalid');
+  var rgb = hexToRgb(hex);
+  document.getElementById('sliderR').value = rgb[0];
+  document.getElementById('sliderG').value = rgb[1];
+  document.getElementById('sliderB').value = rgb[2];
+  document.getElementById('valR').textContent = rgb[0];
+  document.getElementById('valG').textContent = rgb[1];
+  document.getElementById('valB').textContent = rgb[2];
+}
+
+function onPickerColor(hex) {
+  if (!selectedVar) return;
+  setPickerValues(hex);
+  applyColor(hex);
+}
+
+function onPickerHex(val) {
+  if (!selectedVar) return;
+  val = val.trim();
+  if (!val.startsWith('#')) val = '#' + val;
+  var input = document.getElementById('pickerHex');
+  if (/^#[0-9a-fA-F]{6}$/.test(val)) {
+    input.classList.remove('invalid');
+    var hex = val.toLowerCase();
+    document.getElementById('pickerColor').value = hex;
+    var rgb = hexToRgb(hex);
+    document.getElementById('sliderR').value = rgb[0];
+    document.getElementById('sliderG').value = rgb[1];
+    document.getElementById('sliderB').value = rgb[2];
+    document.getElementById('valR').textContent = rgb[0];
+    document.getElementById('valG').textContent = rgb[1];
+    document.getElementById('valB').textContent = rgb[2];
+    applyColor(hex);
+  } else {
+    input.classList.add('invalid');
+  }
+}
+
+function onSlider() {
+  if (!selectedVar) return;
+  var r = parseInt(document.getElementById('sliderR').value);
+  var g = parseInt(document.getElementById('sliderG').value);
+  var b = parseInt(document.getElementById('sliderB').value);
+  document.getElementById('valR').textContent = r;
+  document.getElementById('valG').textContent = g;
+  document.getElementById('valB').textContent = b;
+  var hex = rgbToHex(r, g, b);
+  document.getElementById('pickerColor').value = hex;
+  document.getElementById('pickerHex').value = hex;
+  document.getElementById('pickerHex').classList.remove('invalid');
+  applyColor(hex);
+}
+
+function applyColor(hex) {
+  if (!selectedVar || !themes[currentTheme]) return;
+  themes[currentTheme][selectedVar] = hex;
+  updateColorListItem(selectedVar, hex);
+  updatePreview();
+  updateUnsaved();
+
+  // Send update to server (debounced)
+  if (isRemoteMode) {
+    clearTimeout(updateDebounceTimer);
+    updateDebounceTimer = setTimeout(function() {
+      wsSend({
+        type: 'UpdateThemeColors',
+        theme_name: currentTheme,
+        colors_json: JSON.stringify(themes[currentTheme])
+      });
+    }, 50);
+  }
+}
+
+// ── Preview ───────────────────────────────────────────────────────────────
+
+function updatePreview() {
+  var t = themes[currentTheme];
+  if (!t) return;
+
+  var container = document.getElementById('previewContainer');
+  var output = document.getElementById('previewOutput');
+  var sep = document.getElementById('previewSeparator');
+  var input = document.getElementById('previewInput');
+
+  container.style.background = t.bg;
+  output.style.background = t.bg;
+  output.style.color = t.fg;
+
+  var lines = [
+    { text: 'Welcome to the Realm of Shadows!', color: t['ansi.11'], bold: true },
+    { text: '' },
+    { text: 'The tavern is dimly lit by flickering candles.', color: t.fg },
+    { text: 'A grizzled dwarf sits in the corner, nursing an ale.', color: t.fg },
+    { text: '[chat] Gandalf says, "Anyone seen my staff?"', color: t['ansi.6'] },
+    { text: '[chat] Frodo says, "Check the lost and found!"', color: t['ansi.6'] },
+    { text: '' },
+    { text: 'Obvious exits: north, south, east', color: t['ansi.2'] },
+    { text: '' },
+    { text: 'A shadowy figure attacks you!', color: t['ansi.1'], bold: true },
+    { text: 'You dodge the blow and counter-attack.', color: t['ansi.3'] },
+    { text: 'You deal 42 damage to the shadow.', color: t.success },
+    { text: 'The shadow flees into the darkness.', color: t.fg_secondary },
+    { text: '' },
+    { text: 'You gain 150 experience points.', color: t.highlight },
+    { text: 'WARNING: Your health is low!', color: t.error, bold: true },
+    { text: '' },
+    { text: 'Type "help" for a list of commands.', color: t.fg_muted },
+    { text: 'Visit https://clay-mud.example.com for more info', color: t.link, underline: true },
+  ];
+
+  var html = '';
+  for (var i = 0; i < lines.length; i++) {
+    var line = lines[i];
+    if (!line.text) { html += '<div style="height:4px"></div>'; continue; }
+    var style = 'color:' + (line.color || t.fg);
+    if (line.bold) style += ';font-weight:bold';
+    if (line.underline) style += ';text-decoration:underline';
+    html += '<div style="' + style + '">' + escapeHtml(line.text) + '</div>';
+  }
+  output.innerHTML = html;
+
+  sep.style.background = t['status_bar.bg'];
+  sep.style.color = t.fg;
+
+  var status = document.getElementById('previewStatus');
+  status.textContent = '__________';
+  status.style.background = 'transparent';
+  status.style.color = t.fg_dim;
+
+  var worldName = document.getElementById('previewWorldName');
+  worldName.style.color = '#ffffff';
+  worldName.innerHTML = '<span style="color:' + t.success + '">&#x25CF;</span> MudWorld';
+
+  var fill = document.getElementById('previewFill');
+  var underscores = '';
+  for (var j = 0; j < 60; j++) underscores += '_';
+  fill.style.color = t.fg_dim;
+  fill.textContent = underscores;
+
+  var time = document.getElementById('previewTime');
+  var now = new Date();
+  time.style.color = t['ansi.6'];
+  time.textContent = String(now.getHours()).padStart(2, '0') + ':' + String(now.getMinutes()).padStart(2, '0');
+
+  input.style.background = t.bg_deep;
+  input.style.color = t.fg;
+  input.style.borderTop = '1px solid ' + t.border_subtle;
+
+  var promptEl = document.getElementById('previewPrompt');
+  promptEl.style.color = t.prompt;
+  promptEl.textContent = 'HP:142> ';
+
+  var cursor = document.getElementById('previewCursor');
+  cursor.style.background = t.fg;
+}
+
+// ── Remote save ───────────────────────────────────────────────────────────
+
+function remoteSave() {
+  if (!isRemoteMode) return;
+  wsSend({ type: 'SaveThemeFile' });
+}
+
+// ── File operations (standalone mode) ─────────────────────────────────────
+
+function loadFile() {
+  document.getElementById('fileInput').click();
+}
+
+function handleFileLoad(input) {
+  var file = input.files[0];
+  if (!file) return;
+  var reader = new FileReader();
+  reader.onload = function(e) {
+    var content = e.target.result;
+    var parsed = parseThemeFile(content);
+    if (Object.keys(parsed).length === 0) {
+      alert('No valid themes found in the file.');
+      return;
+    }
+    themes = parsed;
+    var names = Object.keys(themes).sort();
+    currentTheme = names.includes('dark') ? 'dark' : names[0];
+    selectedVar = null;
+    savedSnapshot = JSON.stringify(themes);
+    rebuildAll();
+  };
+  reader.readAsText(file);
+  input.value = '';
+}
+
+function parseThemeFile(content) {
+  var result = {};
+  var currentName = null;
+
+  for (var line of content.split('\n')) {
+    var trimmed = line.trim();
+    if (trimmed.startsWith('[') && trimmed.endsWith(']')) {
+      var inner = trimmed.slice(1, -1);
+      if (inner.startsWith('theme:')) {
+        var name = inner.slice(6).trim();
+        currentName = name;
+        if (!result[name]) {
+          result[name] = name === 'light' ? lightDefaults() : darkDefaults();
+        }
+      }
+      continue;
+    }
+
+    if (!currentName || trimmed === '' || trimmed.startsWith('#')) continue;
+
+    var eqIdx = trimmed.indexOf('=');
+    if (eqIdx === -1) continue;
+
+    var key = trimmed.slice(0, eqIdx).trim();
+    var value = trimmed.slice(eqIdx + 1).trim();
+
+    if (value.startsWith('#') && value.length > 7) {
+      var commentIdx = value.indexOf('#', 1);
+      if (commentIdx !== -1) value = value.slice(0, commentIdx).trim();
+    }
+
+    if (/^#[0-9a-fA-F]{6}$/.test(value)) {
+      if (result[currentName]) {
+        result[currentName][key] = value.toLowerCase();
+      }
+    }
+  }
+
+  return result;
+}
+
+function saveFile() {
+  var content = '# Clay Theme Configuration\n';
+  content += '# Colors are #RRGGBB hex values. Lines starting with # are comments.\n';
+  content += '# Edit colors and restart Clay (or /reload) to apply changes.\n';
+  content += '# Delete this file to regenerate defaults.\n';
+
+  var orderedKeys = [];
+  for (var g of VARIABLE_GROUPS) {
+    for (var v of g.vars) orderedKeys.push(v.key);
+  }
+
+  var groupComments = {
+    'bg': '# Background hierarchy',
+    'fg': '# Foreground hierarchy',
+    'accent': '# Semantic colors',
+    'status_bar.bg': '# UI elements',
+    'ansi.0': '# ANSI palette (16 standard colors)'
+  };
+
+  for (var name of Object.keys(themes).sort()) {
+    content += '\n[theme:' + name + ']\n';
+    var t = themes[name];
+    for (var key of orderedKeys) {
+      if (groupComments[key]) content += '\n' + groupComments[key] + '\n';
+      var line = key + ' = ' + (t[key] || '#000000');
+      if (key.startsWith('ansi.')) {
+        var idx = parseInt(key.split('.')[1]);
+        line += '  # ' + ANSI_NAMES[idx];
+      }
+      content += line + '\n';
+    }
+  }
+
+  var blob = new Blob([content], { type: 'text/plain' });
+  var a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = 'clay.theme.dat';
+  a.click();
+  URL.revokeObjectURL(a.href);
+
+  savedSnapshot = JSON.stringify(themes);
+  updateUnsaved();
+}
+
+function resetChanges() {
+  if (!isModified()) return;
+  if (!confirm('Revert all changes since last load/save?')) return;
+  themes = JSON.parse(savedSnapshot);
+  var names = Object.keys(themes).sort();
+  if (!themes[currentTheme]) currentTheme = names[0];
+  selectedVar = null;
+  rebuildAll();
+}
+
+function loadDefaults() {
+  if (isModified() && !confirm('Discard current changes and load built-in defaults?')) return;
+  themes = { dark: darkDefaults(), light: lightDefaults() };
+  currentTheme = 'dark';
+  selectedVar = null;
+
+  if (isRemoteMode) {
+    // Send defaults to server
+    for (var name of Object.keys(themes)) {
+      wsSend({
+        type: 'UpdateThemeColors',
+        theme_name: name,
+        colors_json: JSON.stringify(themes[name])
+      });
+    }
+    savedSnapshot = JSON.stringify(themes);
+  } else {
+    savedSnapshot = JSON.stringify(themes);
+  }
+  rebuildAll();
+}
+
+// ── Utility ───────────────────────────────────────────────────────────────
+
+function hexToRgb(hex) {
+  hex = hex.replace('#', '');
+  return [
+    parseInt(hex.slice(0, 2), 16),
+    parseInt(hex.slice(2, 4), 16),
+    parseInt(hex.slice(4, 6), 16)
+  ];
+}
+
+function rgbToHex(r, g, b) {
+  return '#' + [r, g, b].map(function(v) { return v.toString(16).padStart(2, '0'); }).join('');
+}
+
+function escapeHtml(s) {
+  return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+}
+
+// ── Start ─────────────────────────────────────────────────────────────────
+
+// WebSocket configuration injected by server (or empty for standalone)
+window.WS_HOST = '{{WS_HOST}}';
+window.WS_PORT = {{WS_PORT}};
+window.WS_PROTOCOL = '{{WS_PROTOCOL}}';
+
+initConnection();
+</script>
+</body>
+</html>

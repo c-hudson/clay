@@ -83,6 +83,10 @@ const WEB_STYLE_CSS: &str = include_str!("web/style.css");
 #[cfg(feature = "native-tls-backend")]
 const WEB_APP_JS: &str = include_str!("web/app.js");
 
+/// Embedded theme editor HTML
+#[cfg(feature = "native-tls-backend")]
+const WEB_THEME_EDITOR_HTML: &str = include_str!("web/theme-editor.html");
+
 /// Parse an HTTP request line and return the method and path
 #[cfg(feature = "native-tls-backend")]
 fn parse_http_request(request: &str) -> Option<(&str, &str)> {
@@ -164,6 +168,13 @@ async fn handle_https_client(
             }
             "/app.js" => {
                 build_http_response(200, "OK", "application/javascript", WEB_APP_JS)
+            }
+            "/theme-editor" => {
+                let html = WEB_THEME_EDITOR_HTML
+                    .replace("{{WS_HOST}}", &host.replace(['\\', '\'', '<', '>'], ""))
+                    .replace("{{WS_PORT}}", &ws_port.to_string())
+                    .replace("{{WS_PROTOCOL}}", if ws_use_tls { "wss" } else { "ws" });
+                build_http_response(200, "OK", "text/html", &html)
             }
             "/favicon.ico" => {
                 build_http_response(204, "No Content", "image/x-icon", "")
@@ -288,6 +299,10 @@ const WEB_STYLE_CSS: &str = include_str!("web/style.css");
 #[cfg(feature = "rustls-backend")]
 const WEB_APP_JS: &str = include_str!("web/app.js");
 
+/// Embedded theme editor HTML (rustls version)
+#[cfg(feature = "rustls-backend")]
+const WEB_THEME_EDITOR_HTML: &str = include_str!("web/theme-editor.html");
+
 /// Parse an HTTP request line and return the method and path (rustls version)
 #[cfg(feature = "rustls-backend")]
 fn parse_http_request(request: &str) -> Option<(&str, &str)> {
@@ -369,6 +384,13 @@ async fn handle_https_client(
             }
             "/app.js" => {
                 build_http_response(200, "OK", "application/javascript", WEB_APP_JS)
+            }
+            "/theme-editor" => {
+                let html = WEB_THEME_EDITOR_HTML
+                    .replace("{{WS_HOST}}", &host.replace(['\\', '\'', '<', '>'], ""))
+                    .replace("{{WS_PORT}}", &ws_port.to_string())
+                    .replace("{{WS_PROTOCOL}}", if ws_use_tls { "wss" } else { "ws" });
+                build_http_response(200, "OK", "text/html", &html)
             }
             "/favicon.ico" => {
                 build_http_response(204, "No Content", "image/x-icon", "")
@@ -737,6 +759,7 @@ async fn handle_http_client(
         const HTTP_INDEX_HTML: &str = include_str!("web/index.html");
         const HTTP_STYLE_CSS: &str = include_str!("web/style.css");
         const HTTP_APP_JS: &str = include_str!("web/app.js");
+        const HTTP_THEME_EDITOR_HTML: &str = include_str!("web/theme-editor.html");
 
         let host = get_host(&request);
         let response = match path {
@@ -754,6 +777,13 @@ async fn handle_http_client(
             }
             "/app.js" => {
                 build_response(200, "OK", "application/javascript", HTTP_APP_JS)
+            }
+            "/theme-editor" => {
+                let html = HTTP_THEME_EDITOR_HTML
+                    .replace("{{WS_HOST}}", &host.replace(['\\', '\'', '<', '>'], ""))
+                    .replace("{{WS_PORT}}", &ws_port.to_string())
+                    .replace("{{WS_PROTOCOL}}", if ws_use_tls { "wss" } else { "ws" });
+                build_response(200, "OK", "text/html", &html)
             }
             "/favicon.ico" => {
                 // Return 204 No Content for favicon requests (browsers/WebViews request this)
