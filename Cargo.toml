@@ -88,3 +88,7 @@ native-tls-backend = ["tokio-native-tls", "native-tls", "tokio-tungstenite/nativ
 rustls-backend = ["tokio-rustls", "rustls", "rustls-pemfile", "webpki-roots", "tokio-tungstenite/rustls-tls-webpki-roots"]
 remote-gui = ["eframe", "egui", "egui_extras", "image"]
 remote-gui-audio = ["remote-gui", "rodio"]
+
+[[bin]]
+name = "clay-test-server"
+path = "src/bin/clay-test-server.rs"

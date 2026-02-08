@@ -325,34 +325,77 @@ select:focus, button:focus { outline: 1px solid var(--editor-accent); outline-of
   font-weight: bold;
 }
 
-.picker-row {
-  display: flex;
-  align-items: center;
-  gap: 12px;
+.picker-sv-wrap {
+  position: relative;
+  width: 200px;
+  height: 140px;
+  border-radius: 4px;
+  overflow: hidden;
+  cursor: crosshair;
+  border: 1px solid var(--editor-border);
   margin-bottom: 8px;
 }
 
-.picker-color-input {
-  width: 60px;
-  height: 40px;
-  border: 1px solid var(--editor-border);
-  border-radius: 4px;
-  cursor: pointer;
-  padding: 2px;
-  background: var(--editor-bg3);
+.picker-sv-wrap canvas {
+  display: block;
+  width: 100%;
+  height: 100%;
 }
 
-.picker-color-input::-webkit-color-swatch-wrapper { padding: 0; }
-.picker-color-input::-webkit-color-swatch { border: none; border-radius: 2px; }
+.picker-sv-cursor {
+  position: absolute;
+  width: 12px;
+  height: 12px;
+  border-radius: 50%;
+  border: 2px solid #fff;
+  box-shadow: 0 0 0 1px rgba(0,0,0,0.3), inset 0 0 0 1px rgba(0,0,0,0.3);
+  pointer-events: none;
+  transform: translate(-50%, -50%);
+}
+
+.picker-hue-wrap {
+  position: relative;
+  width: 200px;
+  height: 14px;
+  border-radius: 7px;
+  overflow: hidden;
+  cursor: pointer;
+  border: 1px solid var(--editor-border);
+  margin-bottom: 8px;
+}
+
+.picker-hue-wrap canvas {
+  display: block;
+  width: 100%;
+  height: 100%;
+}
+
+.picker-hue-cursor {
+  position: absolute;
+  top: -1px;
+  width: 6px;
+  height: 16px;
+  border-radius: 3px;
+  border: 2px solid #fff;
+  box-shadow: 0 0 0 1px rgba(0,0,0,0.3);
+  pointer-events: none;
+  transform: translateX(-50%);
+}
+
+.picker-hex-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
 
 .picker-hex-input {
   background: var(--editor-bg3);
   color: var(--editor-fg);
   border: 1px solid var(--editor-border);
-  padding: 6px 8px;
+  padding: 5px 8px;
   font-family: inherit;
   font-size: 13px;
-  width: 90px;
+  width: 80px;
   border-radius: 3px;
 }
 
@@ -360,59 +403,11 @@ select:focus, button:focus { outline: 1px solid var(--editor-accent); outline-of
 
 .picker-hex-input.invalid { border-color: var(--editor-error); }
 
-.slider-group {
-  display: flex;
-  flex-direction: column;
-  gap: 4px;
-}
-
-.slider-row {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-}
-
-.slider-label {
-  width: 14px;
-  font-size: 11px;
-  font-weight: bold;
-}
-
-.slider-label-r { color: #e87070; }
-.slider-label-g { color: #7ecf8b; }
-.slider-label-b { color: #8cb4e0; }
-
-.slider-input {
-  flex: 1;
-  -webkit-appearance: none;
-  appearance: none;
-  height: 4px;
-  border-radius: 2px;
-  outline: none;
-  cursor: pointer;
-  max-width: 180px;
-}
-
-.slider-input::-webkit-slider-thumb {
-  -webkit-appearance: none;
-  appearance: none;
-  width: 14px;
-  height: 14px;
-  border-radius: 50%;
-  background: var(--editor-fg);
-  border: 2px solid var(--editor-bg);
-  cursor: pointer;
-}
-
-.slider-r { background: linear-gradient(to right, #000, #ff0000); }
-.slider-g { background: linear-gradient(to right, #000, #00ff00); }
-.slider-b { background: linear-gradient(to right, #000, #0000ff); }
-
-.slider-value {
+.picker-swatch {
   width: 28px;
-  font-size: 11px;
-  color: var(--editor-fg2);
-  text-align: right;
+  height: 28px;
+  border-radius: 4px;
+  border: 1px solid var(--editor-border);
 }
 
 .picker-no-selection {
@@ -448,6 +443,7 @@ select:focus, button:focus { outline: 1px solid var(--editor-accent); outline-of
   flex-direction: column;
   border: 1px solid var(--editor-border);
   min-height: 200px;
+  position: relative;
 }
 
 .preview-output {
@@ -515,6 +511,179 @@ select:focus, button:focus { outline: 1px solid var(--editor-accent); outline-of
 @keyframes blink {
   0%, 50% { opacity: 1; }
   51%, 100% { opacity: 0; }
+}
+
+/* Preview popup mockups - GUI style */
+.preview-popup-overlay {
+  position: absolute;
+  top: 0; left: 0; right: 0; bottom: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  pointer-events: none;
+}
+
+.preview-popup, .preview-menu {
+  font-size: 11px;
+  line-height: 1;
+  font-family: inherit;
+  pointer-events: none;
+  border-radius: 4px;
+}
+
+.preview-popup {
+  padding: 14px 12px 10px;
+  min-width: 220px;
+}
+
+.preview-menu {
+  position: absolute;
+  padding: 10px 12px 8px;
+}
+
+.pp-title {
+  font-size: 12px;
+  font-weight: bold;
+  margin-bottom: 10px;
+}
+
+.pp-row {
+  display: flex;
+  align-items: center;
+  height: 22px;
+  margin-bottom: 4px;
+}
+
+.pp-label {
+  width: 72px;
+  text-align: right;
+  margin-right: 8px;
+  flex-shrink: 0;
+  font-size: 10px;
+}
+
+.pp-value {
+  flex: 1;
+  height: 20px;
+  border-radius: 3px;
+  padding: 0 6px;
+  display: flex;
+  align-items: center;
+  font-size: 10px;
+}
+
+.pp-toggle-slider {
+  width: 28px;
+  height: 14px;
+  border-radius: 7px;
+  position: relative;
+  flex-shrink: 0;
+}
+
+.pp-toggle-knob {
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  position: absolute;
+  top: 2px;
+}
+
+.pp-toggle-knob.on { right: 2px; }
+.pp-toggle-knob.off { left: 2px; }
+
+.pp-select {
+  flex: 1;
+  height: 20px;
+  border-radius: 3px;
+  padding: 0 6px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  font-size: 10px;
+}
+
+.pp-chevron {
+  font-size: 7px;
+  margin-left: 4px;
+}
+
+.pp-buttons {
+  display: flex;
+  justify-content: flex-end;
+  gap: 6px;
+  margin-top: 10px;
+}
+
+.pp-buttons-split {
+  display: flex;
+  justify-content: space-between;
+  margin-top: 10px;
+}
+
+.pp-buttons-right {
+  display: flex;
+  gap: 6px;
+}
+
+.pp-btn {
+  height: 20px;
+  min-width: 48px;
+  border-radius: 3px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 10px;
+  padding: 0 8px;
+}
+
+.pp-btn-sel {
+  outline: 1.5px solid;
+}
+
+.pp-list {
+  border-radius: 3px;
+  margin-top: 4px;
+  overflow: hidden;
+}
+
+.pp-list-header {
+  display: flex;
+  height: 18px;
+  align-items: center;
+  padding: 0 6px;
+  font-size: 9px;
+  gap: 8px;
+}
+
+.pp-list-item {
+  display: flex;
+  height: 18px;
+  align-items: center;
+  padding: 0 6px;
+  font-size: 10px;
+  gap: 8px;
+}
+
+.pp-list-col {
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+
+.pp-menu-item {
+  height: 22px;
+  display: flex;
+  align-items: center;
+  padding: 0 8px;
+  border-radius: 3px;
+  font-size: 10px;
+  margin-bottom: 2px;
+}
+
+.pp-menu-buttons {
+  display: flex;
+  justify-content: center;
+  margin-top: 6px;
 }
 
 /* Hidden file input */
@@ -619,26 +788,17 @@ select:focus, button:focus { outline: 1px solid var(--editor-accent); outline-of
       <div class="picker-no-selection" id="pickerPlaceholder">Select a color variable to edit</div>
       <div id="pickerControls" style="display:none">
         <div class="picker-title">Editing: <span class="picker-var-name" id="pickerVarName"></span></div>
-        <div class="picker-row">
-          <input type="color" class="picker-color-input" id="pickerColor" oninput="onPickerColor(this.value)">
+        <div class="picker-sv-wrap" id="svWrap">
+          <canvas id="svCanvas" width="200" height="140"></canvas>
+          <div class="picker-sv-cursor" id="svCursor"></div>
+        </div>
+        <div class="picker-hue-wrap" id="hueWrap">
+          <canvas id="hueCanvas" width="200" height="14"></canvas>
+          <div class="picker-hue-cursor" id="hueCursor"></div>
+        </div>
+        <div class="picker-hex-row">
           <input type="text" class="picker-hex-input" id="pickerHex" maxlength="7" oninput="onPickerHex(this.value)" onkeydown="if(event.key==='Enter')this.blur()">
-          <div class="slider-group">
-            <div class="slider-row">
-              <span class="slider-label slider-label-r">R</span>
-              <input type="range" class="slider-input slider-r" id="sliderR" min="0" max="255" oninput="onSlider()">
-              <span class="slider-value" id="valR">0</span>
-            </div>
-            <div class="slider-row">
-              <span class="slider-label slider-label-g">G</span>
-              <input type="range" class="slider-input slider-g" id="sliderG" min="0" max="255" oninput="onSlider()">
-              <span class="slider-value" id="valG">0</span>
-            </div>
-            <div class="slider-row">
-              <span class="slider-label slider-label-b">B</span>
-              <input type="range" class="slider-input slider-b" id="sliderB" min="0" max="255" oninput="onSlider()">
-              <span class="slider-value" id="valB">0</span>
-            </div>
-          </div>
+          <div class="picker-swatch" id="pickerSwatch"></div>
         </div>
       </div>
     </div>
@@ -657,6 +817,10 @@ select:focus, button:focus { outline: 1px solid var(--editor-accent); outline-of
           <span class="preview-prompt-text" id="previewPrompt"></span>
           <span class="preview-cursor" id="previewCursor"></span>
         </div>
+        <div class="preview-popup-overlay">
+          <div class="preview-popup" id="previewPopup"></div>
+        </div>
+        <div class="preview-menu" id="previewMenu"></div>
       </div>
     </div>
   </div>
@@ -1135,6 +1299,7 @@ function buildColorList() {
         '<span class="color-item-name" title="' + escapeHtml(v.desc) + '">' + escapeHtml(v.label) + '</span>' +
         '<span class="color-item-hex">' + hex + '</span></div>';
       item.addEventListener('click', function() { selectVar(v.key); });
+      item.addEventListener('dblclick', function(e) { e.preventDefault(); flashVariable(v.key); });
       items.appendChild(item);
     }
 
@@ -1159,7 +1324,179 @@ function updateColorListItem(key, hex) {
   item.querySelector('.color-item-hex').textContent = hex;
 }
 
+// ── Flash variable highlight ─────────────────────────────────────────────
+
+var flashTimer = null;
+var flashKey = null;
+var flashOriginalColor = null;
+
+function flashVariable(key) {
+  // Cancel any running flash and restore its color
+  if (flashTimer) {
+    clearInterval(flashTimer);
+    if (flashKey && flashOriginalColor !== null && themes[currentTheme]) {
+      themes[currentTheme][flashKey] = flashOriginalColor;
+      updateColorListItem(flashKey, flashOriginalColor);
+    }
+    flashTimer = null;
+  }
+
+  if (!themes[currentTheme] || !themes[currentTheme][key]) return;
+
+  flashOriginalColor = themes[currentTheme][key];
+  flashKey = key;
+  var startTime = Date.now();
+
+  flashTimer = setInterval(function() {
+    var elapsed = Date.now() - startTime;
+    if (elapsed >= 2000) {
+      clearInterval(flashTimer);
+      flashTimer = null;
+      themes[currentTheme][key] = flashOriginalColor;
+      updatePreview();
+      updateColorListItem(key, flashOriginalColor);
+      if (selectedVar === key) setPickerValues(flashOriginalColor);
+      flashKey = null;
+      flashOriginalColor = null;
+      return;
+    }
+    // Cycle through hues: 3 full rotations over 2 seconds
+    var hue = (elapsed / 2000 * 360 * 3) % 360;
+    var rgb = hsvToRgb(hue, 1, 1);
+    var hex = rgbToHex(rgb[0], rgb[1], rgb[2]);
+    themes[currentTheme][key] = hex;
+    updatePreview();
+    updateColorListItem(key, hex);
+  }, 40);
+}
+
 // ── Picker ────────────────────────────────────────────────────────────────
+
+var pickerHsv = { h: 0, s: 1, v: 1 };
+var svDragging = false;
+var hueDragging = false;
+
+function rgbToHsv(r, g, b) {
+  r /= 255; g /= 255; b /= 255;
+  var max = Math.max(r, g, b), min = Math.min(r, g, b);
+  var d = max - min, h = 0, s = max === 0 ? 0 : d / max, v = max;
+  if (d !== 0) {
+    if (max === r) h = ((g - b) / d + 6) % 6;
+    else if (max === g) h = (b - r) / d + 2;
+    else h = (r - g) / d + 4;
+    h *= 60;
+  }
+  return { h: h, s: s, v: v };
+}
+
+function hsvToRgb(h, s, v) {
+  var c = v * s, x = c * (1 - Math.abs((h / 60) % 2 - 1)), m = v - c;
+  var r = 0, g = 0, b = 0;
+  if (h < 60) { r = c; g = x; }
+  else if (h < 120) { r = x; g = c; }
+  else if (h < 180) { g = c; b = x; }
+  else if (h < 240) { g = x; b = c; }
+  else if (h < 300) { r = x; b = c; }
+  else { r = c; b = x; }
+  return [Math.round((r + m) * 255), Math.round((g + m) * 255), Math.round((b + m) * 255)];
+}
+
+function drawSvCanvas() {
+  var canvas = document.getElementById('svCanvas');
+  if (!canvas) return;
+  var ctx = canvas.getContext('2d');
+  var w = canvas.width, h = canvas.height;
+  // Base hue color
+  var rgb = hsvToRgb(pickerHsv.h, 1, 1);
+  var hueColor = 'rgb(' + rgb[0] + ',' + rgb[1] + ',' + rgb[2] + ')';
+  // White to hue horizontal gradient
+  var gradH = ctx.createLinearGradient(0, 0, w, 0);
+  gradH.addColorStop(0, '#fff');
+  gradH.addColorStop(1, hueColor);
+  ctx.fillStyle = gradH;
+  ctx.fillRect(0, 0, w, h);
+  // Black vertical gradient overlay
+  var gradV = ctx.createLinearGradient(0, 0, 0, h);
+  gradV.addColorStop(0, 'rgba(0,0,0,0)');
+  gradV.addColorStop(1, '#000');
+  ctx.fillStyle = gradV;
+  ctx.fillRect(0, 0, w, h);
+  // Position cursor
+  var cursor = document.getElementById('svCursor');
+  cursor.style.left = (pickerHsv.s * 100) + '%';
+  cursor.style.top = ((1 - pickerHsv.v) * 100) + '%';
+}
+
+function drawHueCanvas() {
+  var canvas = document.getElementById('hueCanvas');
+  if (!canvas) return;
+  var ctx = canvas.getContext('2d');
+  var w = canvas.width, h = canvas.height;
+  var grad = ctx.createLinearGradient(0, 0, w, 0);
+  for (var i = 0; i <= 6; i++) {
+    var rgb = hsvToRgb(i * 60, 1, 1);
+    grad.addColorStop(i / 6, 'rgb(' + rgb[0] + ',' + rgb[1] + ',' + rgb[2] + ')');
+  }
+  ctx.fillStyle = grad;
+  ctx.fillRect(0, 0, w, h);
+  // Position cursor
+  var cursor = document.getElementById('hueCursor');
+  cursor.style.left = (pickerHsv.h / 360 * 100) + '%';
+}
+
+function updatePickerFromHsv() {
+  var rgb = hsvToRgb(pickerHsv.h, pickerHsv.s, pickerHsv.v);
+  var hex = rgbToHex(rgb[0], rgb[1], rgb[2]);
+  document.getElementById('pickerHex').value = hex;
+  document.getElementById('pickerHex').classList.remove('invalid');
+  document.getElementById('pickerSwatch').style.background = hex;
+  drawSvCanvas();
+  drawHueCanvas();
+  applyColor(hex);
+}
+
+function svPointerHandler(e) {
+  var wrap = document.getElementById('svWrap');
+  var rect = wrap.getBoundingClientRect();
+  var x = Math.max(0, Math.min(1, (e.clientX - rect.left) / rect.width));
+  var y = Math.max(0, Math.min(1, (e.clientY - rect.top) / rect.height));
+  pickerHsv.s = x;
+  pickerHsv.v = 1 - y;
+  updatePickerFromHsv();
+}
+
+function huePointerHandler(e) {
+  var wrap = document.getElementById('hueWrap');
+  var rect = wrap.getBoundingClientRect();
+  var x = Math.max(0, Math.min(1, (e.clientX - rect.left) / rect.width));
+  pickerHsv.h = x * 360;
+  updatePickerFromHsv();
+}
+
+function initPickerEvents() {
+  var svWrap = document.getElementById('svWrap');
+  var hueWrap = document.getElementById('hueWrap');
+
+  svWrap.addEventListener('pointerdown', function(e) {
+    svDragging = true;
+    svWrap.setPointerCapture(e.pointerId);
+    svPointerHandler(e);
+  });
+  svWrap.addEventListener('pointermove', function(e) {
+    if (svDragging) svPointerHandler(e);
+  });
+  svWrap.addEventListener('pointerup', function() { svDragging = false; });
+
+  hueWrap.addEventListener('pointerdown', function(e) {
+    hueDragging = true;
+    hueWrap.setPointerCapture(e.pointerId);
+    huePointerHandler(e);
+  });
+  hueWrap.addEventListener('pointermove', function(e) {
+    if (hueDragging) huePointerHandler(e);
+  });
+  hueWrap.addEventListener('pointerup', function() { hueDragging = false; });
+}
 
 function updatePicker() {
   var placeholder = document.getElementById('pickerPlaceholder');
@@ -1178,22 +1515,13 @@ function updatePicker() {
 }
 
 function setPickerValues(hex) {
-  document.getElementById('pickerColor').value = hex;
   document.getElementById('pickerHex').value = hex;
   document.getElementById('pickerHex').classList.remove('invalid');
+  document.getElementById('pickerSwatch').style.background = hex;
   var rgb = hexToRgb(hex);
-  document.getElementById('sliderR').value = rgb[0];
-  document.getElementById('sliderG').value = rgb[1];
-  document.getElementById('sliderB').value = rgb[2];
-  document.getElementById('valR').textContent = rgb[0];
-  document.getElementById('valG').textContent = rgb[1];
-  document.getElementById('valB').textContent = rgb[2];
-}
-
-function onPickerColor(hex) {
-  if (!selectedVar) return;
-  setPickerValues(hex);
-  applyColor(hex);
+  pickerHsv = rgbToHsv(rgb[0], rgb[1], rgb[2]);
+  drawSvCanvas();
+  drawHueCanvas();
 }
 
 function onPickerHex(val) {
@@ -1204,33 +1532,15 @@ function onPickerHex(val) {
   if (/^#[0-9a-fA-F]{6}$/.test(val)) {
     input.classList.remove('invalid');
     var hex = val.toLowerCase();
-    document.getElementById('pickerColor').value = hex;
     var rgb = hexToRgb(hex);
-    document.getElementById('sliderR').value = rgb[0];
-    document.getElementById('sliderG').value = rgb[1];
-    document.getElementById('sliderB').value = rgb[2];
-    document.getElementById('valR').textContent = rgb[0];
-    document.getElementById('valG').textContent = rgb[1];
-    document.getElementById('valB').textContent = rgb[2];
+    pickerHsv = rgbToHsv(rgb[0], rgb[1], rgb[2]);
+    document.getElementById('pickerSwatch').style.background = hex;
+    drawSvCanvas();
+    drawHueCanvas();
     applyColor(hex);
   } else {
     input.classList.add('invalid');
   }
-}
-
-function onSlider() {
-  if (!selectedVar) return;
-  var r = parseInt(document.getElementById('sliderR').value);
-  var g = parseInt(document.getElementById('sliderG').value);
-  var b = parseInt(document.getElementById('sliderB').value);
-  document.getElementById('valR').textContent = r;
-  document.getElementById('valG').textContent = g;
-  document.getElementById('valB').textContent = b;
-  var hex = rgbToHex(r, g, b);
-  document.getElementById('pickerColor').value = hex;
-  document.getElementById('pickerHex').value = hex;
-  document.getElementById('pickerHex').classList.remove('invalid');
-  applyColor(hex);
 }
 
 function applyColor(hex) {
@@ -1329,11 +1639,134 @@ function updatePreview() {
   input.style.borderTop = '1px solid ' + t.border_subtle;
 
   var promptEl = document.getElementById('previewPrompt');
-  promptEl.style.color = t.prompt;
-  promptEl.textContent = 'HP:142> ';
+  promptEl.textContent = '';
 
   var cursor = document.getElementById('previewCursor');
   cursor.style.background = t.fg;
+
+  // World Settings popup mockup (GUI style)
+  var popup = document.getElementById('previewPopup');
+  var popupBg = t.bg_elevated || t.bg;
+  var inputBg = t.bg_deep || t.bg;
+  var hoverBg = t.bg_hover || t.bg;
+  var selBg = t['selection.bg'] || '#28283c';
+  var accentC = t.accent;
+  var accentDimC = t.accent_dim || t.accent;
+  var fgC = t.fg;
+  var fgSecC = t.fg_secondary || t.fg_muted || t.fg_dim;
+  var fgDimC = t.fg_dim;
+  var errC = t.error;
+
+  popup.style.background = popupBg;
+  popup.style.color = fgC;
+
+  // GUI-style text input row
+  function textRow(label, value, selected) {
+    var borderStyle = selected ? 'outline:1.5px solid ' + accentC : '';
+    return '<div class="pp-row">' +
+      '<div class="pp-label" style="color:' + fgSecC + '">' + escapeHtml(label) + '</div>' +
+      '<div class="pp-value" style="background:' + inputBg + ';color:' + fgC + ';' + borderStyle + '">' + escapeHtml(value) + '</div>' +
+    '</div>';
+  }
+
+  // GUI-style toggle slider row
+  function toggleRow(label, checked) {
+    var trackBg = checked ? accentDimC : hoverBg;
+    var knobBg = checked ? fgC : fgSecC;
+    var knobClass = checked ? 'on' : 'off';
+    return '<div class="pp-row">' +
+      '<div class="pp-label" style="color:' + fgSecC + '">' + escapeHtml(label) + '</div>' +
+      '<div class="pp-toggle-slider" style="background:' + trackBg + '">' +
+        '<div class="pp-toggle-knob ' + knobClass + '" style="background:' + knobBg + '"></div>' +
+      '</div>' +
+    '</div>';
+  }
+
+  // GUI-style select row
+  function selectRow(label, value) {
+    return '<div class="pp-row">' +
+      '<div class="pp-label" style="color:' + fgSecC + '">' + escapeHtml(label) + '</div>' +
+      '<div class="pp-select" style="background:' + inputBg + ';color:' + fgC + '">' +
+        '<span>' + escapeHtml(value) + '</span>' +
+        '<span class="pp-chevron" style="color:' + fgDimC + '">&#x25BC;</span>' +
+      '</div>' +
+    '</div>';
+  }
+
+  // GUI-style button
+  function ppBtn(label, style, selected) {
+    var bg, fg;
+    if (style === 'primary') { bg = accentDimC; fg = inputBg; }
+    else if (style === 'danger') { bg = errC; fg = fgC; }
+    else { bg = hoverBg; fg = fgSecC; }
+    var sel = selected ? 'outline:1.5px solid ' + accentC + ';' : '';
+    return '<div class="pp-btn" style="background:' + bg + ';color:' + fg + ';' + sel + '">' + label + '</div>';
+  }
+
+  // List item row builder
+  var listBg = t.bg_surface || inputBg;
+  function listItem(cols, widths, selected) {
+    var bg = selected ? selBg : 'transparent';
+    var fg = selected ? fgC : fgSecC;
+    var row = '<div class="pp-list-item" style="background:' + bg + ';color:' + fg + '">';
+    for (var ci = 0; ci < cols.length; ci++) {
+      row += '<div class="pp-list-col" style="width:' + widths[ci] + 'px">' + escapeHtml(cols[ci]) + '</div>';
+    }
+    return row + '</div>';
+  }
+  function listHeader(cols, widths) {
+    var row = '<div class="pp-list-header" style="color:' + fgDimC + '">';
+    for (var ci = 0; ci < cols.length; ci++) {
+      row += '<div class="pp-list-col" style="width:' + widths[ci] + 'px">' + escapeHtml(cols[ci]) + '</div>';
+    }
+    return row + '</div>';
+  }
+
+  var ph = '<div class="pp-title" style="color:' + fgC + '">Actions</div>';
+  // Filter field (no label)
+  ph += '<div class="pp-row"><div class="pp-value" style="background:' + inputBg + ';color:' + fgDimC + ';flex:1">Filter Actions...</div></div>';
+  // List with headers
+  var cw = [20, 68, 48, 80];
+  ph += '<div class="pp-list" style="background:' + listBg + '">';
+  ph += listHeader(['', 'Name', 'World', 'Pattern'], cw);
+  ph += listItem(['\u2713', 'auto_heal', 'TestMUD', '^You are bleeding'], cw, false);
+  ph += listItem(['\u2713', 'page_alert', '', '*pages you*'], cw, true);
+  ph += listItem(['', 'highlight_says', '', '* says *'], cw, false);
+  ph += listItem(['\u2713', 'greet_login', 'TestMUD', '^\\w+ has connected'], cw, false);
+  ph += listItem(['', 'spam_filter', '', '^\\[advert\\]'], cw, false);
+  ph += '</div>';
+  // Buttons: Delete(danger,left)  Add Edit Ok(primary,selected)
+  ph += '<div class="pp-buttons-split">' +
+    '<div>' + ppBtn('Delete', 'danger', false) + '</div>' +
+    '<div class="pp-buttons-right">' +
+      ppBtn('Add', 'secondary', false) +
+      ppBtn('Edit', 'secondary', false) +
+      ppBtn('Ok', 'primary', true) +
+    '</div>' +
+  '</div>';
+  popup.innerHTML = ph;
+
+  // Menu mockup - positioned bottom-left, above separator bar
+  var menu = document.getElementById('previewMenu');
+  menu.style.background = t['status_bar.bg'] || popupBg;
+  menu.style.color = fgC;
+  // Position: left side, just above separator bar
+  menu.style.top = '';
+  menu.style.right = '';
+  menu.style.left = '0px';
+  menu.style.bottom = '45px';
+
+  var menuItems = ['Help', 'Settings', 'Web Settings', 'Actions', 'World Selector', 'Connected Worlds'];
+  var selectedMenu = 1; // "Settings" selected
+  var mh = '<div class="pp-title" style="color:' + fgC + '">Menu</div>';
+  for (var mi = 0; mi < menuItems.length; mi++) {
+    if (mi === selectedMenu) {
+      mh += '<div class="pp-menu-item" style="background:' + selBg + ';color:' + fgC + '">' + escapeHtml(menuItems[mi]) + '</div>';
+    } else {
+      mh += '<div class="pp-menu-item" style="color:' + fgSecC + '">' + escapeHtml(menuItems[mi]) + '</div>';
+    }
+  }
+  menu.innerHTML = mh;
 }
 
 // ── Remote save ───────────────────────────────────────────────────────────
@@ -1514,6 +1947,7 @@ window.WS_HOST = '{{WS_HOST}}';
 window.WS_PORT = {{WS_PORT}};
 window.WS_PROTOCOL = '{{WS_PROTOCOL}}';
 
+initPickerEvents();
 initConnection();
 </script>
 </body>

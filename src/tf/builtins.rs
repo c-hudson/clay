@@ -1373,6 +1373,10 @@ pub fn cmd_repeat(engine: &mut TfEngine, args: &str) -> TfCommandResult {
     let _ = no_initial_delay;
     let next_run = Instant::now();
 
+    // If no -w was specified, capture the current world so the repeat
+    // stays bound to the world it was invoked on.
+    let world = world.or_else(|| engine.current_world.clone());
+
     let process = TfProcess {
         id,
         command,

@@ -989,6 +989,7 @@
 
     // Connect to WebSocket server
     let connectionTimeout = null;
+    let wakePongTimeout = null;  // Timeout for wake-from-background health check
 
     // Track if we should try ws:// fallback (for self-signed cert issues)
     let triedWsFallback = false;
@@ -1329,6 +1330,10 @@
                     clearTimeout(connectionTimeout);
                     connectionTimeout = null;
                 }
+                if (wakePongTimeout) {
+                    clearTimeout(wakePongTimeout);
+                    wakePongTimeout = null;
+                }
                 authenticated = false;
                 hasReceivedInitialState = false;  // Reset so we use server's world on reconnect
                 showConnecting(false);
@@ -1555,18 +1560,9 @@
                     } else {
                         world.output_lines = [];
                     }
-                    // Append pending_lines to output_lines (each client handles more mode locally)
-                    let pendingLines = [];
-                    if (world.pending_lines_ts && world.pending_lines_ts.length > 0) {
-                        pendingLines = world.pending_lines_ts;
-                    } else if (world.pending_lines && world.pending_lines.length > 0) {
-                        pendingLines = world.pending_lines.map(line =>
-                            typeof line === 'string' ? { text: line, ts: currentTs } : line
-                        );
-                    }
-                    // Combine output and pending lines - server's more mode shouldn't affect clients
-                    world.output_lines = world.output_lines.concat(pendingLines);
-                    world.pending_count = pendingLines.length;
+                    // Don't merge pending_lines - they stay on the server and are
+                    // released via PgDn/Tab, then broadcast as ServerData.
+                    // This avoids duplicate lines when pending is released.
                     // Use server's centralized unseen tracking - don't reset to 0
                     // world.unseen_lines comes from server, keep it as-is
                 });
@@ -1790,17 +1786,8 @@
                     } else {
                         world.output_lines = [];
                     }
-                    // Handle pending lines
-                    let pendingLines = [];
-                    if (world.pending_lines_ts && world.pending_lines_ts.length > 0) {
-                        pendingLines = world.pending_lines_ts;
-                    } else if (world.pending_lines && world.pending_lines.length > 0) {
-                        pendingLines = world.pending_lines.map(line =>
-                            typeof line === 'string' ? { text: line, ts: currentTs } : line
-                        );
-                    }
-                    world.output_lines = world.output_lines.concat(pendingLines);
-                    world.pending_count = pendingLines.length;
+                    // Don't merge pending_lines - they stay on the server
+                    // and are released via PgDn/Tab to avoid duplicates
                     // Insert at the correct index
                     const insertIndex = world.index !== undefined ? world.index : worlds.length;
                     worlds.splice(insertIndex, 0, world);
@@ -1971,7 +1958,13 @@
                 break;
 
             case 'Pong':
-                // Keepalive response
+                // Keepalive response - also used for connection health check on wake
+                if (wakePongTimeout) {
+                    clearTimeout(wakePongTimeout);
+                    wakePongTimeout = null;
+                    // Connection is alive, resync state
+                    ws.send(JSON.stringify({ type: 'RequestState' }));
+                }
                 break;
 
             case 'ActionsUpdated':
@@ -6406,20 +6399,41 @@
         }, 30000);
 
         // Handle visibility change (browser sleep/wake)
-        // When page becomes visible, check connection and resync if needed
+        // When page becomes visible, ping the server to verify the connection is alive.
+        // If pong arrives in time, resync. If not, reconnect.
         document.addEventListener('visibilitychange', function() {
             if (document.visibilityState === 'visible') {
-                // Page is now visible - check WebSocket state
-                if (!ws || ws.readyState !== WebSocket.OPEN) {
-                    // WebSocket is closed, reconnect will happen via onclose handler
-                    // but we can trigger it immediately if needed
-                    if (ws && ws.readyState === WebSocket.CLOSED) {
+                // Clear any previous wake check
+                if (wakePongTimeout) {
+                    clearTimeout(wakePongTimeout);
+                    wakePongTimeout = null;
+                }
+
+                if (!ws || ws.readyState === WebSocket.CLOSED) {
+                    // WebSocket is already closed, reconnect immediately
+                    connectionFailures = 0;
+                    connect();
+                } else if (ws.readyState === WebSocket.OPEN && authenticated) {
+                    // Socket looks open - verify with a ping
+                    try {
+                        ws.send(JSON.stringify({ type: 'Ping' }));
+                    } catch (e) {
+                        // Send failed, connection is dead
+                        ws.close();
+                        connectionFailures = 0;
                         connect();
+                        return;
                     }
-                } else if (authenticated) {
-                    // WebSocket is open, but we may have missed messages while sleeping
-                    // Request a full state resync to ensure we have all data
-                    ws.send(JSON.stringify({ type: 'RequestState' }));
+                    // Wait up to 3 seconds for Pong response
+                    wakePongTimeout = setTimeout(function() {
+                        wakePongTimeout = null;
+                        // No pong received - connection is stale
+                        if (ws) {
+                            ws.close();
+                        }
+                        connectionFailures = 0;
+                        connect();
+                    }, 3000);
                 }
             }
         });

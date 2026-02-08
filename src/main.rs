@@ -17,6 +17,9 @@ pub mod theme;
 pub mod remote_gui;
 #[cfg(all(feature = "remote-gui", not(target_os = "android")))]
 pub mod remote_gui2;
+pub mod testserver;
+#[cfg(test)]
+pub mod testharness;
 
 // Version information
 const VERSION: &str = "1.0.0-alpha";
@@ -77,7 +80,6 @@ pub use daemon::{
     generate_splash_strings,
 };
 
-use std::collections::HashMap;
 use std::io::{self, stdout, Write as IoWrite};
 #[cfg(unix)]
 use std::os::unix::io::{FromRawFd, RawFd};
@@ -789,7 +791,7 @@ pub fn enable_tcp_keepalive(tcp_stream: &TcpStream) {
 
 #[derive(Clone)]
 pub struct Settings {
-    more_mode_enabled: bool,
+    pub more_mode_enabled: bool,
     spell_check_enabled: bool,
     temp_convert_enabled: bool,  // Temperature conversion (e.g., 32F -> 32F (0C))
     world_switch_mode: WorldSwitchMode,
@@ -898,18 +900,18 @@ impl WorldType {
 
 #[derive(Clone)]
 pub struct WorldSettings {
-    world_type: WorldType,
+    pub world_type: WorldType,
     // MUD settings
-    hostname: String,
-    port: String,
-    user: String,
-    password: String,
-    use_ssl: bool,
-    log_enabled: bool,
-    encoding: Encoding,
-    auto_connect_type: AutoConnectType,
-    keep_alive_type: KeepAliveType,
-    keep_alive_cmd: String,
+    pub hostname: String,
+    pub port: String,
+    pub user: String,
+    pub password: String,
+    pub use_ssl: bool,
+    pub log_enabled: bool,
+    pub encoding: Encoding,
+    pub auto_connect_type: AutoConnectType,
+    pub keep_alive_type: KeepAliveType,
+    pub keep_alive_cmd: String,
     // Slack settings
     slack_token: String,
     slack_channel: String,
@@ -1604,7 +1606,7 @@ impl OutputLine {
         }
     }
 
-    fn new(text: String, seq: u64) -> Self {
+    pub fn new(text: String, seq: u64) -> Self {
         Self {
             text: Self::truncate_if_needed(text),
             timestamp: SystemTime::now(),
@@ -1615,7 +1617,7 @@ impl OutputLine {
         }
     }
 
-    fn new_client(text: String, seq: u64) -> Self {
+    pub fn new_client(text: String, seq: u64) -> Self {
         Self {
             text: Self::truncate_if_needed(text),
             timestamp: SystemTime::now(),
@@ -1669,17 +1671,17 @@ impl CachedNow {
 }
 
 pub struct World {
-    name: String,
-    output_lines: Vec<OutputLine>,
-    scroll_offset: usize,
-    connected: bool,
-    command_tx: Option<mpsc::Sender<WriteCommand>>,
-    unseen_lines: usize,
-    paused: bool,
-    pending_lines: Vec<OutputLine>,
-    pending_count: usize, // For remote client mode: daemon's pending line count (not in pending_lines)
-    lines_since_pause: usize,
-    settings: WorldSettings,
+    pub name: String,
+    pub output_lines: Vec<OutputLine>,
+    pub scroll_offset: usize,
+    pub connected: bool,
+    pub command_tx: Option<mpsc::Sender<WriteCommand>>,
+    pub unseen_lines: usize,
+    pub paused: bool,
+    pub pending_lines: Vec<OutputLine>,
+    pub pending_count: usize, // For remote client mode: daemon's pending line count (not in pending_lines)
+    pub lines_since_pause: usize,
+    pub settings: WorldSettings,
     log_handle: Option<std::sync::Arc<std::sync::Mutex<std::fs::File>>>,
     log_date: Option<String>,    // Current log file date (MMDDYY) for day rollover detection
     #[cfg(unix)]
@@ -1692,25 +1694,25 @@ pub struct World {
     proxy_socket_fd: Option<i64>,   // Placeholder on non-Unix (never used)
     is_tls: bool,                // Track if using TLS
     telnet_mode: bool,           // True if telnet negotiation detected
-    prompt: String,              // Current prompt detected via telnet GA
-    prompt_count: usize,         // Number of prompts received since connect (for auto-login)
+    pub prompt: String,              // Current prompt detected via telnet GA
+    pub prompt_count: usize,         // Number of prompts received since connect (for auto-login)
     last_send_time: Option<std::time::Instant>, // For keepalive timing
     last_receive_time: Option<std::time::Instant>, // Last time server data was received
     last_nop_time: Option<std::time::Instant>,     // Last time NOP keepalive was sent
     last_user_command_time: Option<std::time::Instant>, // Last time user sent a command
-    partial_line: String,        // Buffer for incomplete lines (no trailing newline)
-    partial_in_pending: bool,    // True if partial_line is in pending_lines (vs output_lines)
+    pub partial_line: String,        // Buffer for incomplete lines (no trailing newline)
+    pub partial_in_pending: bool,    // True if partial_line is in pending_lines (vs output_lines)
     trigger_partial_line: String, // Buffer for incomplete lines for action trigger checking
     just_filtered_idler: bool,   // True if we just filtered an idler message (for filtering trailing newline)
     wont_echo_time: Option<std::time::Instant>, // When WONT ECHO was seen (for timeout-based prompt detection)
     uses_wont_echo_prompt: bool, // True if this world uses WONT ECHO for prompts (auto-detected)
-    is_initial_world: bool,      // True for the auto-created world before first connection
-    was_connected: bool,         // True if world has ever been connected (for world cycling)
-    skip_auto_login: bool,       // True to skip auto-login on next connect (for /worlds -l)
-    showing_splash: bool,        // True when showing startup splash (for centering)
+    pub is_initial_world: bool,      // True for the auto-created world before first connection
+    pub was_connected: bool,         // True if world has ever been connected (for world cycling)
+    pub skip_auto_login: bool,       // True to skip auto-login on next connect (for /worlds -l)
+    pub showing_splash: bool,        // True when showing startup splash (for centering)
     needs_redraw: bool,          // True when terminal needs full redraw (after splash clear)
     pending_since: Option<std::time::Instant>, // When pending output first appeared (for Alt-w)
-    first_unseen_at: Option<std::time::Instant>, // When unseen output first arrived (for Unseen First switching)
+    pub first_unseen_at: Option<std::time::Instant>, // When unseen output first arrived (for Unseen First switching)
     last_pending_broadcast: Option<std::time::Instant>, // Last time pending count was broadcast (for 2s timer)
     last_pending_count_broadcast: usize, // Last pending count that was broadcast (to detect changes)
     owner: Option<String>,       // Username who owns this world (multiuser mode)
@@ -1718,16 +1720,16 @@ pub struct World {
     proxy_socket_path: Option<std::path::PathBuf>, // Unix socket path for TLS proxy
     naws_enabled: bool,          // True if NAWS telnet option was negotiated
     naws_sent_size: Option<(u16, u16)>, // Last sent window size (width, height) to avoid duplicates
-    next_seq: u64,               // Next sequence number for output lines (for debugging)
+    pub next_seq: u64,               // Next sequence number for output lines (for debugging)
     reader_name: Option<String>, // Name used by active reader task (for lookup after rename)
 }
 
 impl World {
-    fn new(name: &str) -> Self {
+    pub fn new(name: &str) -> Self {
         Self::new_with_splash(name, false)
     }
 
-    fn new_with_splash(name: &str, show_splash: bool) -> Self {
+    pub fn new_with_splash(name: &str, show_splash: bool) -> Self {
         let output_lines = if show_splash {
             Self::generate_splash_lines()
         } else {
@@ -1916,7 +1918,7 @@ impl World {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn add_output(
+    pub fn add_output(
         &mut self,
         text: &str,
         is_current: bool,
@@ -2105,7 +2107,7 @@ impl World {
         self.scroll_offset = self.output_lines.len().saturating_sub(1);
     }
 
-    fn mark_seen(&mut self) {
+    pub fn mark_seen(&mut self) {
         self.unseen_lines = 0;
         self.first_unseen_at = None;
     }
@@ -2115,7 +2117,7 @@ impl World {
         self.unseen_lines > 0 || !self.pending_lines.is_empty()
     }
 
-    fn release_pending(&mut self, count: usize) {
+    pub fn release_pending(&mut self, count: usize) {
         let to_release: Vec<OutputLine> = self
             .pending_lines
             .drain(..count.min(self.pending_lines.len()))
@@ -2140,7 +2142,7 @@ impl World {
         self.scroll_to_bottom();
     }
 
-    fn release_all_pending(&mut self) {
+    pub fn release_all_pending(&mut self) {
         self.log_more_debug("RESET_release_all_pending", "", 0);
         self.output_lines.append(&mut self.pending_lines);
         self.paused = false;
@@ -2270,7 +2272,7 @@ pub struct App {
 }
 
 impl App {
-    fn new() -> Self {
+    pub fn new() -> Self {
         Self {
             worlds: Vec::new(),
             current_world_index: 0,
@@ -2382,7 +2384,7 @@ impl App {
         }
     }
 
-    fn current_world(&self) -> &World {
+    pub fn current_world(&self) -> &World {
         // Safety: clamp index to valid range to prevent panic
         let idx = if self.worlds.is_empty() {
             0  // Will panic below, but ensure_has_world() should prevent this
@@ -2392,7 +2394,7 @@ impl App {
         &self.worlds[idx]
     }
 
-    fn current_world_mut(&mut self) -> &mut World {
+    pub fn current_world_mut(&mut self) -> &mut World {
         // Safety: clamp index to valid range to prevent panic
         let idx = if self.worlds.is_empty() {
             0  // Will panic below, but ensure_has_world() should prevent this
@@ -3173,14 +3175,14 @@ impl App {
     }
 
     /// Find world index by name (case-insensitive), also checks reader_name for renamed worlds
-    fn find_world_index(&self, name: &str) -> Option<usize> {
+    pub fn find_world_index(&self, name: &str) -> Option<usize> {
         self.worlds.iter().position(|w| {
             w.name.eq_ignore_ascii_case(name) ||
             w.reader_name.as_ref().is_some_and(|rn| rn.eq_ignore_ascii_case(name))
         })
     }
 
-    fn switch_world(&mut self, index: usize) {
+    pub fn switch_world(&mut self, index: usize) {
         if index < self.worlds.len() && index != self.current_world_index {
             // Reset lines_since_pause for the old world if more-mode hasn't triggered
             let old_index = self.current_world_index;
@@ -3390,7 +3392,7 @@ impl App {
         crate::util::calculate_prev_world(&world_info, from_index, self.settings.world_switch_mode)
     }
 
-    fn activity_count(&self) -> usize {
+    pub fn activity_count(&self) -> usize {
         self.worlds
             .iter()
             .enumerate()
@@ -3580,28 +3582,6 @@ impl App {
         }
     }
 
-    /// Set the pending merged seqs for a client (tracks which pending lines were in InitialState)
-    fn ws_set_pending_merged_seqs(&self, client_id: u64, seqs: &HashMap<usize, u64>) {
-        if client_id == 0 {
-            return;  // Embedded GUI doesn't need this
-        }
-        if let Some(ref server) = self.ws_server {
-            for (&world_index, &max_seq) in seqs {
-                server.set_pending_merged_seq(client_id, world_index, max_seq);
-            }
-        }
-    }
-
-    /// Clear pending merged tracking for a client (they've synced via command)
-    fn ws_clear_pending_merged(&self, client_id: u64) {
-        if client_id == 0 {
-            return;
-        }
-        if let Some(ref server) = self.ws_server {
-            server.clear_pending_merged(client_id);
-        }
-    }
-
     /// Set the client type for a connected WebSocket client
     fn ws_set_client_type(&self, client_id: u64, client_type: websocket::RemoteClientType) {
         if client_id == 0 {
@@ -3654,32 +3634,6 @@ impl App {
         }
     }
 
-    /// Broadcast released pending lines to clients viewing a world, skipping clients
-    /// that already received those lines in their InitialState.
-    fn ws_broadcast_released_to_world(&self, world_index: usize, max_seq: u64, msg: WsMessage) {
-        // Send to embedded GUI if it's viewing this world (GUI doesn't track pending_merged)
-        if let Some(ref tx) = self.gui_tx {
-            let _ = tx.send(msg.clone());
-        }
-        // Broadcast to WebSocket clients, filtering by pending_merged
-        if let Some(ref server) = self.ws_server {
-            server.broadcast_released_to_viewers(world_index, max_seq, msg);
-        }
-    }
-
-    /// Broadcast PendingLinesUpdate, but skip clients that have pending_merged tracking
-    /// for this world (they received those lines in InitialState).
-    fn ws_broadcast_pending_update(&self, world_index: usize, count: usize) {
-        // Send to embedded GUI (doesn't track pending_merged)
-        if let Some(ref tx) = self.gui_tx {
-            let _ = tx.send(WsMessage::PendingLinesUpdate { world_index, count });
-        }
-        // Broadcast to WebSocket clients with filtering
-        if let Some(ref server) = self.ws_server {
-            server.broadcast_pending_update(world_index, count);
-        }
-    }
-
     /// Check if any WS client is currently viewing a specific world
     fn ws_client_viewing(&self, world_index: usize) -> bool {
         self.ws_client_worlds.values().any(|v| v.world_index == world_index)
@@ -3698,7 +3652,7 @@ impl App {
 
     /// Process incoming server data - shared logic for both console and daemon modes
     /// Returns commands that need to be executed (for trigger processing)
-    fn process_server_data(
+    pub fn process_server_data(
         &mut self,
         world_idx: usize,
         bytes: &[u8],
@@ -3951,7 +3905,7 @@ impl App {
             // Broadcast pending count update if it changed (for synchronized more-mode indicator)
             // Use filtered broadcast to skip clients that received pending in InitialState
             if lines_to_pending > 0 || pending_after != pending_before {
-                self.ws_broadcast_pending_update(world_idx, pending_after);
+                self.ws_broadcast(WsMessage::PendingLinesUpdate { world_index: world_idx, count: pending_after });
             }
 
             // Broadcast updated unseen count so all clients stay in sync
@@ -3991,27 +3945,18 @@ impl App {
     }
 
     /// Build initial state message for a newly authenticated client.
-    /// Returns (WsMessage, pending_merged_seqs) where pending_merged_seqs maps world_index
-    /// to the max seq of pending lines that were merged into output (for avoiding duplicates).
-    fn build_initial_state(&self) -> (WsMessage, HashMap<usize, u64>) {
-        let mut pending_merged_seqs: HashMap<usize, u64> = HashMap::new();
+    /// Only sends output_lines (not pending_lines) - clients see the More indicator
+    /// and release pending via PgDn/Tab, avoiding duplicate line bugs.
+    fn build_initial_state(&self) -> WsMessage {
         let worlds: Vec<WorldStateMsg> = self.worlds.iter().enumerate().map(|(idx, world)| {
-            // Strip carriage returns from output/pending lines for web clients
+            // Strip carriage returns from output lines for web clients
             let clean_output: Vec<String> = world.output_lines.iter()
                 .map(|s| s.text.replace('\r', ""))
                 .collect();
-            let _clean_pending: Vec<String> = world.pending_lines.iter()
-                .map(|s| s.text.replace('\r', ""))
-                .collect();
-            // Track max seq of pending lines being merged (for duplicate detection)
-            if !world.pending_lines.is_empty() {
-                let max_pending_seq = world.pending_lines.iter().map(|l| l.seq).max().unwrap_or(0);
-                pending_merged_seqs.insert(idx, max_pending_seq);
-            }
-            // Create timestamped versions (add red % prefix for client-generated messages)
-            // Combine output_lines and pending_lines, then sort by timestamp to ensure chronological order
-            let mut all_lines: Vec<TimestampedLine> = world.output_lines.iter()
-                .chain(world.pending_lines.iter())
+            // Create timestamped versions (add sparkle prefix for client-generated messages)
+            // Only include output_lines - pending_lines stay on the server and are
+            // released via PgDn/Tab, then broadcast to clients normally.
+            let output_lines_ts: Vec<TimestampedLine> = world.output_lines.iter()
                 .map(|s| {
                     let text = s.text.replace('\r', "");
                     let text = if !s.from_server {
@@ -4029,27 +3974,21 @@ impl App {
                     }
                 })
                 .collect();
-            // Sort by timestamp to ensure chronological order
-            all_lines.sort_by_key(|line| line.ts);
-            // Send all lines as output_lines_ts, pending_lines_ts is empty (clients handle more-mode locally)
-            // Also clear the string versions since output_lines_ts contains everything
-            // This prevents clients from appending pending_lines again (they're already in output_lines_ts)
-            let combined_len = all_lines.len();
-            let output_lines_ts = all_lines;
+            let output_len = output_lines_ts.len();
             let pending_lines_ts: Vec<TimestampedLine> = Vec::new();
             WorldStateMsg {
                 index: idx,
                 name: world.name.clone(),
                 connected: world.connected,
                 output_lines: clean_output,
-                pending_lines: Vec::new(),  // Empty - pending is already in output_lines_ts
+                pending_lines: Vec::new(),
                 output_lines_ts,
                 pending_lines_ts,
                 prompt: world.prompt.replace('\r', ""),
-                // Set scroll_offset to end of combined lines so client starts at bottom
-                scroll_offset: combined_len.saturating_sub(1),
-                // Client starts unpaused since pending is empty in output_lines_ts
-                paused: false,
+                // Set scroll_offset to end of output lines so client starts at bottom
+                scroll_offset: output_len.saturating_sub(1),
+                // Report server's paused state so client shows More indicator
+                paused: world.paused,
                 unseen_lines: world.unseen_lines,
                 settings: WorldSettingsMsg {
                     hostname: world.settings.hostname.clone(),
@@ -4104,13 +4043,13 @@ impl App {
             theme_colors_json: self.gui_theme_colors().to_json(),
         };
 
-        (WsMessage::InitialState {
+        WsMessage::InitialState {
             worlds,
             settings,
             current_world_index: self.current_world_index,
             actions: self.settings.actions.clone(),
             splash_lines: generate_splash_strings(),
-        }, pending_merged_seqs)
+        }
     }
 
     fn increase_input_height(&mut self) {
@@ -8279,7 +8218,7 @@ pub async fn run_app_headless(
     app.gui_tx = Some(gui_tx);
 
     // Send initial state to the GUI
-    let (initial_state, _) = app.build_initial_state();
+    let initial_state = app.build_initial_state();
     app.ws_broadcast(initial_state);
 
     // Keepalive interval
@@ -8451,12 +8390,10 @@ pub async fn run_app_headless(
                     }
                     AppEvent::WsClientMessage(client_id, msg) => {
                         if let WsMessage::AuthRequest { current_world, .. } = &*msg {
-                            let (initial_state, pending_merged_seqs) = app.build_initial_state();
+                            let initial_state = app.build_initial_state();
                             app.ws_send_to_client(client_id, initial_state);
                             // Mark client as having received initial state so it receives broadcasts
                             app.ws_mark_initial_state_sent(client_id);
-                            // Track pending lines merged into InitialState to avoid duplicates
-                            app.ws_set_pending_merged_seqs(client_id, &pending_merged_seqs);
                             // Use client's world if provided, otherwise default to console's world
                             let world_idx = current_world
                                 .filter(|&w| w < app.worlds.len())
@@ -8491,11 +8428,9 @@ pub async fn run_app_headless(
                                     multiuser_mode: false,
                                 });
                                 // Send initial state
-                                let (initial_state, pending_merged_seqs) = app.build_initial_state();
+                                let initial_state = app.build_initial_state();
                                 app.ws_send_to_client(client_id, initial_state);
                                 app.ws_mark_initial_state_sent(client_id);
-                                // Track pending lines merged into InitialState to avoid duplicates
-                                app.ws_set_pending_merged_seqs(client_id, &pending_merged_seqs);
                                 // Set client's world
                                 let world_idx = current_world
                                     .filter(|&w| w < app.worlds.len())
@@ -8788,6 +8723,7 @@ pub async fn run_app_headless(
                         } else {
                             Some(app.current_world_index)
                         };
+                        let world_idx = target_idx.unwrap_or(app.current_world_index);
                         match result {
                             tf::TfCommandResult::SendToMud(text) => {
                                 if let Some(idx) = target_idx {
@@ -8797,7 +8733,6 @@ pub async fn run_app_headless(
                                 }
                             }
                             tf::TfCommandResult::Success(Some(msg)) => {
-                                let world_idx = app.current_world_index;
                                 let seq = app.worlds[world_idx].next_seq;
                                 app.worlds[world_idx].next_seq += 1;
                                 app.worlds[world_idx].output_lines.push(OutputLine::new_client(msg.clone(), seq));
@@ -8810,7 +8745,6 @@ pub async fn run_app_headless(
                                 });
                             }
                             tf::TfCommandResult::Error(err) => {
-                                let world_idx = app.current_world_index;
                                 let seq = app.worlds[world_idx].next_seq;
                                 app.worlds[world_idx].next_seq += 1;
                                 let err_msg = format!("Error: {}", err);
@@ -10302,7 +10236,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                 // Broadcast pending count update if it changed
                                 // Use filtered broadcast to skip clients that received pending in InitialState
                                 if lines_to_pending > 0 || pending_after != pending_before {
-                                    app.ws_broadcast_pending_update(world_idx, pending_after);
+                                    app.ws_broadcast(WsMessage::PendingLinesUpdate { world_index: world_idx, count: pending_after });
                                 }
 
                                 // Broadcast updated unseen count so all clients stay in sync
@@ -10379,11 +10313,9 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                     multiuser_mode: false,
                                 });
                                 // Send initial state
-                                let (initial_state, pending_merged_seqs) = app.build_initial_state();
+                                let initial_state = app.build_initial_state();
                                 app.ws_send_to_client(client_id, initial_state);
                                 app.ws_mark_initial_state_sent(client_id);
-                                // Track pending lines merged into InitialState to avoid duplicates
-                                app.ws_set_pending_merged_seqs(client_id, &pending_merged_seqs);
                                 // Set client's world
                                 let world_idx = current_world
                                     .filter(|&w| w < app.worlds.len())
@@ -10441,12 +10373,10 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                         match *msg {
                             WsMessage::AuthRequest { .. } => {
                                 // Client just authenticated - send initial state
-                                let (initial_state, pending_merged_seqs) = app.build_initial_state();
+                                let initial_state = app.build_initial_state();
                                 app.ws_send_to_client(client_id, initial_state);
                                 // Mark client as having received initial state so it receives broadcasts
                                 app.ws_mark_initial_state_sent(client_id);
-                                // Track pending lines merged into InitialState to avoid duplicates
-                                app.ws_set_pending_merged_seqs(client_id, &pending_merged_seqs);
                                 // Use client's world if provided, otherwise default to console's world
                                 let world_idx = auth_current_world
                                     .filter(|&w| w < app.worlds.len())
@@ -10465,8 +10395,6 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                 });
                             }
                             WsMessage::SendCommand { world_index, ref command } => {
-                                // Clear pending_merged tracking since client is actively interacting
-                                app.ws_clear_pending_merged(client_id);
 
                                 // Reset more-mode counter when ANY client sends a command
                                 if world_index < app.worlds.len() {
@@ -11314,23 +11242,11 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                             }
                             WsMessage::ReleasePending { world_index, count } => {
                                 // A remote client is releasing pending lines - sync across all interfaces
-                                // Clear pending_merged tracking for this client since they're actively interacting
-                                app.ws_clear_pending_merged(client_id);
-
                                 if world_index < app.worlds.len() {
                                     let pending_count = app.worlds[world_index].pending_lines.len();
                                     if pending_count > 0 {
                                         // Determine how many lines to release
                                         let to_release = if count == 0 { pending_count } else { count.min(pending_count) };
-
-                                        // Get the max seq of lines being released (for filtering clients)
-                                        let max_seq = app.worlds[world_index]
-                                            .pending_lines
-                                            .iter()
-                                            .take(to_release)
-                                            .map(|line| line.seq)
-                                            .max()
-                                            .unwrap_or(0);
 
                                         // Get the lines that will be released (for broadcasting as ServerData)
                                         let lines_to_broadcast: Vec<String> = app.worlds[world_index]
@@ -11343,11 +11259,10 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                         // Release the lines on the server
                                         app.worlds[world_index].release_pending(to_release);
 
-                                        // Broadcast the released lines to clients viewing this world,
-                                        // but skip clients that already have these lines from InitialState
+                                        // Broadcast the released lines to clients viewing this world
                                         if !lines_to_broadcast.is_empty() {
                                             let ws_data = lines_to_broadcast.join("\n") + "\n";
-                                            app.ws_broadcast_released_to_world(world_index, max_seq, WsMessage::ServerData {
+                                            app.ws_broadcast_to_world(world_index, WsMessage::ServerData {
                                                 world_index,
                                                 data: ws_data,
                                                 is_viewed: true,
@@ -11358,9 +11273,9 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
 
                                         // Broadcast to all clients so they know how many were released
                                         app.ws_broadcast(WsMessage::PendingReleased { world_index, count: to_release });
-                                        // Also update pending count (filtered broadcast to skip clients with pending_merged)
                                         let new_count = app.worlds[world_index].pending_lines.len();
-                                        app.ws_broadcast_pending_update(world_index, new_count);
+                                        app.ws_broadcast(WsMessage::PendingLinesUpdate { world_index, count: new_count });
+
                                         // Broadcast activity count since pending lines changed
                                         app.broadcast_activity();
 
@@ -11579,12 +11494,10 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                             }
                             WsMessage::RequestState => {
                                 // Client requested full state resync - send initial state
-                                let (initial_state, pending_merged_seqs) = app.build_initial_state();
+                                let initial_state = app.build_initial_state();
                                 app.ws_send_to_client(client_id, initial_state);
                                 // Mark client as having received initial state so it receives broadcasts
                                 app.ws_mark_initial_state_sent(client_id);
-                                // Track pending lines merged into InitialState to avoid duplicates
-                                app.ws_set_pending_merged_seqs(client_id, &pending_merged_seqs);
                                 // Set client's initial world so broadcast_to_world_viewers works immediately
                                 app.ws_set_client_world(client_id, Some(app.current_world_index));
                                 // Also send current activity count
@@ -11614,9 +11527,11 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                         .rev()
                                         .collect();
 
+                                    let pending_count = world.pending_lines.len();
+
                                     app.ws_send_to_client(client_id, WsMessage::WorldStateResponse {
                                         world_index,
-                                        pending_count: world.pending_lines.len(),
+                                        pending_count,
                                         prompt: world.prompt.clone(),
                                         scroll_offset: world.scroll_offset,
                                         recent_lines,
@@ -12511,7 +12426,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                             // Broadcast pending count update if it changed
                             // Use filtered broadcast to skip clients that received pending in InitialState
                             if lines_to_pending > 0 || pending_after != pending_before {
-                                app.ws_broadcast_pending_update(world_idx, pending_after);
+                                app.ws_broadcast(WsMessage::PendingLinesUpdate { world_index: world_idx, count: pending_after });
                             }
 
                             // Broadcast updated unseen count so all clients stay in sync
@@ -12843,11 +12758,9 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                 username: None,
                                 multiuser_mode: false,
                             });
-                            let (initial_state, pending_merged_seqs) = app.build_initial_state();
+                            let initial_state = app.build_initial_state();
                             app.ws_send_to_client(client_id, initial_state);
                             app.ws_mark_initial_state_sent(client_id);
-                            // Track pending lines merged into InitialState to avoid duplicates
-                            app.ws_set_pending_merged_seqs(client_id, &pending_merged_seqs);
                             let world_idx = current_world
                                 .filter(|&w| w < app.worlds.len())
                                 .unwrap_or(app.current_world_index);
@@ -12902,12 +12815,10 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                     };
                     match *msg {
                         WsMessage::AuthRequest { .. } => {
-                            let (initial_state, pending_merged_seqs) = app.build_initial_state();
+                            let initial_state = app.build_initial_state();
                             app.ws_send_to_client(client_id, initial_state);
                             // Mark client as having received initial state so it receives broadcasts
                             app.ws_mark_initial_state_sent(client_id);
-                            // Track pending lines merged into InitialState to avoid duplicates
-                            app.ws_set_pending_merged_seqs(client_id, &pending_merged_seqs);
                             // Use client's world if provided, otherwise default to console's world
                             let world_idx = auth_current_world
                                 .filter(|&w| w < app.worlds.len())
@@ -12926,9 +12837,6 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                             });
                         }
                         WsMessage::SendCommand { world_index, ref command } => {
-                            // Clear pending_merged tracking since client is actively interacting
-                            app.ws_clear_pending_merged(client_id);
-
                             // Reset more-mode counter when ANY client sends a command
                             if world_index < app.worlds.len() {
                                 app.worlds[world_index].lines_since_pause = 0;
@@ -13817,12 +13725,10 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                         }
                         WsMessage::RequestState => {
                             // Client requested full state resync - send initial state
-                            let (initial_state, pending_merged_seqs) = app.build_initial_state();
+                            let initial_state = app.build_initial_state();
                             app.ws_send_to_client(client_id, initial_state);
                             // Mark client as having received initial state so it receives broadcasts
                             app.ws_mark_initial_state_sent(client_id);
-                            // Track pending lines merged into InitialState to avoid duplicates
-                            app.ws_set_pending_merged_seqs(client_id, &pending_merged_seqs);
                             // Set client's initial world so broadcast_to_world_viewers works immediately
                             app.ws_set_client_world(client_id, Some(app.current_world_index));
                             // Also send current activity count
@@ -13852,9 +13758,11 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                     .rev()
                                     .collect();
 
+                                let pending_count = world.pending_lines.len();
+
                                 app.ws_send_to_client(client_id, WsMessage::WorldStateResponse {
                                     world_index,
-                                    pending_count: world.pending_lines.len(),
+                                    pending_count,
                                     prompt: world.prompt.clone(),
                                     scroll_offset: world.scroll_offset,
                                     recent_lines,
@@ -15006,9 +14914,8 @@ fn handle_key_event(key: KeyEvent, app: &mut App) -> KeyAction {
 
             // Broadcast release event so other clients sync
             app.ws_broadcast(WsMessage::PendingReleased { world_index: world_idx, count: released });
-            // Also broadcast updated pending count (filtered to skip clients with pending_merged)
             let pending = app.worlds[world_idx].pending_lines.len();
-            app.ws_broadcast_pending_update(world_idx, pending);
+            app.ws_broadcast(WsMessage::PendingLinesUpdate { world_index: world_idx, count: pending });
             // Broadcast activity count since pending lines changed
             app.broadcast_activity();
             app.needs_output_redraw = true;
@@ -15203,8 +15110,7 @@ fn handle_key_event(key: KeyEvent, app: &mut App) -> KeyAction {
 
             // Broadcast release event so other clients sync
             app.ws_broadcast(WsMessage::PendingReleased { world_index: world_idx, count: released });
-            // Also broadcast updated pending count (filtered to skip clients with pending_merged)
-            app.ws_broadcast_pending_update(world_idx, 0);
+            app.ws_broadcast(WsMessage::PendingLinesUpdate { world_index: world_idx, count: 0 });
             // Broadcast activity count since pending lines changed
             app.broadcast_activity();
             app.needs_output_redraw = true;
@@ -18358,7 +18264,7 @@ fn render_output_area(f: &mut Frame, app: &App, area: Rect) {
 
     // Popup or editor is visible - render output with ratatui (crossterm is skipped in these cases)
     // First, fill the entire output area with background to cover any crossterm remnants
-    let theme = app.theme_colors();
+    let theme = app.settings.theme;
     let background = ratatui::widgets::Block::default().style(Style::default().bg(theme.bg()));
     f.render_widget(background, area);
 
@@ -18410,7 +18316,7 @@ fn render_output_area(f: &mut Frame, app: &App, area: Rect) {
 
 /// Render the split-screen editor panel
 fn render_editor_panel(f: &mut Frame, app: &App, area: Rect) {
-    let theme = app.theme_colors();
+    let theme = app.settings.theme;
 
     // Get editor title with world name if editing notes
     let world_name = app.editor.world_index.map(|idx| app.worlds[idx].name.as_str());
@@ -18647,7 +18553,7 @@ fn format_more_count(count: usize) -> String {
 fn render_separator_bar(f: &mut Frame, app: &App, area: Rect) {
     let width = area.width as usize;
     let world = app.current_world();
-    let theme = app.theme_colors();
+    let theme = app.settings.theme;
 
     // Build bar components
     let time_str = get_current_time_12hr();
@@ -18838,7 +18744,7 @@ fn render_input_area(f: &mut Frame, app: &mut App, area: Rect) {
 }
 
 fn render_input(app: &mut App, width: usize, prompt: &str) -> Text<'static> {
-    let tc = app.theme_colors().clone();
+    let tc = app.settings.theme;
     let misspelled = app.find_misspelled_words();
     let chars: Vec<char> = app.input.buffer.chars().collect();
 
@@ -19128,7 +19034,7 @@ fn render_confirm_dialog(f: &mut Frame, app: &App) {
 
     let area = f.size();
     let dialog = &app.confirm_dialog;
-    let theme = app.theme_colors();
+    let theme = app.settings.theme;
 
     // Build button styles with background highlight
     let yes_style = if dialog.yes_selected {
@@ -19186,7 +19092,7 @@ fn render_filter_popup(f: &mut Frame, app: &App) {
 
     let area = f.size();
     let filter = &app.filter_popup;
-    let theme = app.theme_colors();
+    let theme = app.settings.theme;
 
     // Small popup in upper right corner
     let popup_width = 40u16.min(area.width);
@@ -19224,7 +19130,7 @@ fn render_filter_popup(f: &mut Frame, app: &App) {
 
 /// Render new unified popup system
 fn render_new_popup(f: &mut Frame, app: &mut App) {
-    let tc = app.theme_colors().clone();
+    let tc = app.settings.theme;
     if let Some(state) = app.popup_manager.current_mut() {
         popup::console_renderer::render_popup(f, state, &tc);
     }
@@ -20691,5 +20597,456 @@ mod tests {
         }
 
         server_task.abort();
+    }
+
+    // ========== Regression Tests ==========
+    // These tests use the testserver + testharness for end-to-end testing
+
+    use crate::testserver;
+    use crate::testharness::{self, TestConfig, TestWorldConfig, TestEvent, TestAction, WaitCondition};
+
+    /// Helper: find a free TCP port
+    fn find_free_port() -> u16 {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.local_addr().unwrap().port()
+    }
+
+    #[tokio::test]
+    async fn test_regression_more_mode_triggers_on_flood() {
+        let port = find_free_port();
+        let scenario = testserver::get_scenario("more_flood");
+
+        // Start server
+        let server = tokio::spawn(testserver::run_server_port(port, scenario));
+
+        // Give server time to bind
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let config = TestConfig {
+            worlds: vec![TestWorldConfig {
+                name: "test".to_string(),
+                host: "127.0.0.1".to_string(),
+                port,
+                use_ssl: false,
+                auto_login_type: AutoConnectType::Connect,
+                username: String::new(),
+                password: String::new(),
+            }],
+            output_height: 24,
+            output_width: 80,
+            more_mode_enabled: true,
+            max_duration: Duration::from_secs(10),
+        };
+
+        let events = testharness::run_test_scenario(config, vec![]).await;
+
+        // Should have Connected event
+        assert!(events.iter().any(|e| matches!(e, TestEvent::Connected(n) if n == "test")),
+            "Expected Connected event");
+
+        // Should have TextReceived events
+        let text_count = events.iter().filter(|e| matches!(e, TestEvent::TextReceived(_, _))).count();
+        assert!(text_count > 0, "Expected TextReceived events, got 0");
+
+        // Should have MoreTriggered event (30 lines with output_height=24 should trigger)
+        assert!(events.iter().any(|e| matches!(e, TestEvent::MoreTriggered(_, _))),
+            "Expected MoreTriggered event. Events: {:?}", events);
+
+        // Should have Disconnected event
+        assert!(events.iter().any(|e| matches!(e, TestEvent::Disconnected(_))),
+            "Expected Disconnected event");
+
+        let _ = server.await;
+    }
+
+    #[tokio::test]
+    async fn test_regression_more_mode_disabled_no_pause() {
+        let port = find_free_port();
+        let scenario = testserver::get_scenario("more_flood");
+
+        let server = tokio::spawn(testserver::run_server_port(port, scenario));
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let config = TestConfig {
+            worlds: vec![TestWorldConfig {
+                name: "test".to_string(),
+                host: "127.0.0.1".to_string(),
+                port,
+                use_ssl: false,
+                auto_login_type: AutoConnectType::Connect,
+                username: String::new(),
+                password: String::new(),
+            }],
+            output_height: 24,
+            output_width: 80,
+            more_mode_enabled: false,  // Disabled!
+            max_duration: Duration::from_secs(10),
+        };
+
+        let events = testharness::run_test_scenario(config, vec![]).await;
+
+        // Should NOT have MoreTriggered event
+        assert!(!events.iter().any(|e| matches!(e, TestEvent::MoreTriggered(_, _))),
+            "Should NOT have MoreTriggered with more_mode disabled. Events: {:?}", events);
+
+        // Should still get all 30 lines
+        let text_count = events.iter().filter(|e| matches!(e, TestEvent::TextReceived(_, _))).count();
+        assert_eq!(text_count, 30, "Expected 30 TextReceived events, got {}", text_count);
+
+        let _ = server.await;
+    }
+
+    #[tokio::test]
+    async fn test_regression_activity_count_multiple_worlds() {
+        let port1 = find_free_port();
+        let port2 = find_free_port();
+        let port3 = find_free_port();
+
+        // World 1: idle (we'll be viewing this one)
+        // World 2,3: basic output (generates unseen lines)
+        let server1 = tokio::spawn(testserver::run_server_port(port1, testserver::get_scenario("idle")));
+        let server2 = tokio::spawn(testserver::run_server_port(port2, testserver::get_scenario("basic_output")));
+        let server3 = tokio::spawn(testserver::run_server_port(port3, testserver::get_scenario("basic_output")));
+
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let config = TestConfig {
+            worlds: vec![
+                TestWorldConfig {
+                    name: "world1".to_string(),
+                    host: "127.0.0.1".to_string(),
+                    port: port1,
+                    use_ssl: false,
+                    auto_login_type: AutoConnectType::Connect,
+                    username: String::new(),
+                    password: String::new(),
+                },
+                TestWorldConfig {
+                    name: "world2".to_string(),
+                    host: "127.0.0.1".to_string(),
+                    port: port2,
+                    use_ssl: false,
+                    auto_login_type: AutoConnectType::Connect,
+                    username: String::new(),
+                    password: String::new(),
+                },
+                TestWorldConfig {
+                    name: "world3".to_string(),
+                    host: "127.0.0.1".to_string(),
+                    port: port3,
+                    use_ssl: false,
+                    auto_login_type: AutoConnectType::Connect,
+                    username: String::new(),
+                    password: String::new(),
+                },
+            ],
+            output_height: 24,
+            output_width: 80,
+            more_mode_enabled: false,
+            max_duration: Duration::from_secs(10),
+        };
+
+        let events = testharness::run_test_scenario(config, vec![]).await;
+
+        // Should have UnseenChanged events for worlds 2 and 3 (since we're viewing world 1)
+        let unseen_events: Vec<_> = events.iter()
+            .filter(|e| matches!(e, TestEvent::UnseenChanged(_, n) if *n > 0))
+            .collect();
+        assert!(!unseen_events.is_empty(),
+            "Expected UnseenChanged events for non-current worlds. Events: {:?}", events);
+
+        // Should have ActivityChanged events
+        assert!(events.iter().any(|e| matches!(e, TestEvent::ActivityChanged(n) if *n > 0)),
+            "Expected ActivityChanged > 0. Events: {:?}", events);
+
+        server1.abort();
+        let _ = server2.await;
+        let _ = server3.await;
+    }
+
+    #[tokio::test]
+    async fn test_regression_unseen_cleared_on_switch() {
+        let port1 = find_free_port();
+        let port2 = find_free_port();
+
+        let server1 = tokio::spawn(testserver::run_server_port(port1, testserver::get_scenario("idle")));
+        let server2 = tokio::spawn(testserver::run_server_port(port2, testserver::get_scenario("basic_output")));
+
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let config = TestConfig {
+            worlds: vec![
+                TestWorldConfig {
+                    name: "world1".to_string(),
+                    host: "127.0.0.1".to_string(),
+                    port: port1,
+                    use_ssl: false,
+                    auto_login_type: AutoConnectType::Connect,
+                    username: String::new(),
+                    password: String::new(),
+                },
+                TestWorldConfig {
+                    name: "world2".to_string(),
+                    host: "127.0.0.1".to_string(),
+                    port: port2,
+                    use_ssl: false,
+                    auto_login_type: AutoConnectType::Connect,
+                    username: String::new(),
+                    password: String::new(),
+                },
+            ],
+            output_height: 24,
+            output_width: 80,
+            more_mode_enabled: false,
+            max_duration: Duration::from_secs(10),
+        };
+
+        let actions = vec![
+            // Wait for some text from world2 to generate unseen
+            TestAction::WaitForEvent(WaitCondition::TextReceivedCount(3)),
+            // Wait a bit more for all output
+            TestAction::Sleep(Duration::from_millis(500)),
+            // Switch to world2 - should clear unseen
+            TestAction::SwitchWorld("world2".to_string()),
+        ];
+
+        let events = testharness::run_test_scenario(config, actions).await;
+
+        // Should have unseen increased for world2 while viewing world1
+        assert!(events.iter().any(|e| matches!(e, TestEvent::UnseenChanged(n, count) if n == "world2" && *count > 0)),
+            "Expected UnseenChanged(world2, >0). Events: {:?}", events);
+
+        // Should have WorldSwitched
+        assert!(events.iter().any(|e| matches!(e, TestEvent::WorldSwitched(n) if n == "world2")),
+            "Expected WorldSwitched(world2)");
+
+        // After switching, unseen should be cleared
+        // Find the last UnseenChanged for world2 after WorldSwitched
+        let switch_idx = events.iter().position(|e| matches!(e, TestEvent::WorldSwitched(n) if n == "world2"));
+        if let Some(idx) = switch_idx {
+            let unseen_after: Vec<_> = events[idx..].iter()
+                .filter(|e| matches!(e, TestEvent::UnseenChanged(n, _) if n == "world2"))
+                .collect();
+            if let Some(TestEvent::UnseenChanged(_, count)) = unseen_after.last() {
+                assert_eq!(*count, 0, "Unseen should be 0 after switching to world2");
+            }
+        }
+
+        server1.abort();
+        let _ = server2.await;
+    }
+
+    #[tokio::test]
+    async fn test_regression_auto_login_connect_type() {
+        let port = find_free_port();
+        let scenario = testserver::get_scenario("auto_login_connect");
+
+        let server = tokio::spawn(testserver::run_server_port(port, scenario));
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let config = TestConfig {
+            worlds: vec![TestWorldConfig {
+                name: "test".to_string(),
+                host: "127.0.0.1".to_string(),
+                port,
+                use_ssl: false,
+                auto_login_type: AutoConnectType::Connect,
+                username: "testuser".to_string(),
+                password: "testpass".to_string(),
+            }],
+            output_height: 24,
+            output_width: 80,
+            more_mode_enabled: false,
+            max_duration: Duration::from_secs(10),
+        };
+
+        let events = testharness::run_test_scenario(config, vec![]).await;
+
+        // Should have auto-login sent
+        assert!(events.iter().any(|e| matches!(e, TestEvent::AutoLoginSent(_, cmd) if cmd == "connect testuser testpass")),
+            "Expected AutoLoginSent with 'connect testuser testpass'. Events: {:?}", events);
+
+        let _ = server.await;
+    }
+
+    #[tokio::test]
+    async fn test_regression_auto_login_prompt_type() {
+        let port = find_free_port();
+        let scenario = testserver::get_scenario("auto_login_prompt");
+
+        let server = tokio::spawn(testserver::run_server_port(port, scenario));
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let config = TestConfig {
+            worlds: vec![TestWorldConfig {
+                name: "test".to_string(),
+                host: "127.0.0.1".to_string(),
+                port,
+                use_ssl: false,
+                auto_login_type: AutoConnectType::Prompt,
+                username: "testuser".to_string(),
+                password: "testpass".to_string(),
+            }],
+            output_height: 24,
+            output_width: 80,
+            more_mode_enabled: false,
+            max_duration: Duration::from_secs(10),
+        };
+
+        let events = testharness::run_test_scenario(config, vec![]).await;
+
+        // Should have username sent on first prompt
+        assert!(events.iter().any(|e| matches!(e, TestEvent::AutoLoginSent(_, cmd) if cmd == "testuser")),
+            "Expected AutoLoginSent with 'testuser'. Events: {:?}", events);
+
+        // Should have password sent on second prompt
+        assert!(events.iter().any(|e| matches!(e, TestEvent::AutoLoginSent(_, cmd) if cmd == "testpass")),
+            "Expected AutoLoginSent with 'testpass'. Events: {:?}", events);
+
+        let _ = server.await;
+    }
+
+    #[tokio::test]
+    async fn test_regression_disconnect_detection() {
+        let port = find_free_port();
+        let scenario = testserver::get_scenario("disconnect_after");
+
+        let server = tokio::spawn(testserver::run_server_port(port, scenario));
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let config = TestConfig {
+            worlds: vec![TestWorldConfig {
+                name: "test".to_string(),
+                host: "127.0.0.1".to_string(),
+                port,
+                use_ssl: false,
+                auto_login_type: AutoConnectType::Connect,
+                username: String::new(),
+                password: String::new(),
+            }],
+            output_height: 24,
+            output_width: 80,
+            more_mode_enabled: false,
+            max_duration: Duration::from_secs(10),
+        };
+
+        let events = testharness::run_test_scenario(config, vec![]).await;
+
+        // Should have Connected
+        assert!(events.iter().any(|e| matches!(e, TestEvent::Connected(_))),
+            "Expected Connected event");
+
+        // Should have TextReceived (at least "Hello!" and "Goodbye!")
+        let text_count = events.iter().filter(|e| matches!(e, TestEvent::TextReceived(_, _))).count();
+        assert!(text_count >= 2, "Expected at least 2 TextReceived events, got {}", text_count);
+
+        // Should have Disconnected
+        assert!(events.iter().any(|e| matches!(e, TestEvent::Disconnected(_))),
+            "Expected Disconnected event");
+
+        let _ = server.await;
+    }
+
+    #[tokio::test]
+    async fn test_regression_more_mode_500_lines_scroll_through() {
+        let port = find_free_port();
+        let scenario = testserver::get_scenario("more_flood_500");
+
+        let server = tokio::spawn(testserver::run_server_port(port, scenario));
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let config = TestConfig {
+            worlds: vec![TestWorldConfig {
+                name: "test".to_string(),
+                host: "127.0.0.1".to_string(),
+                port,
+                use_ssl: false,
+                auto_login_type: AutoConnectType::Connect,
+                username: String::new(),
+                password: String::new(),
+            }],
+            output_height: 24,
+            output_width: 80,
+            more_mode_enabled: true,
+            max_duration: Duration::from_secs(30),
+        };
+
+        // Build actions: wait for more-mode to trigger, then Tab through all pages
+        let mut actions = vec![
+            TestAction::WaitForEvent(WaitCondition::MoreTriggered),
+            // Wait a moment for all data to arrive
+            TestAction::Sleep(Duration::from_millis(500)),
+        ];
+
+        // Tab release enough times to drain all pending lines
+        // 500 lines / 22 per page = ~23 tabs needed (with margin)
+        for _ in 0..30 {
+            actions.push(TestAction::TabRelease);
+        }
+
+        let events = testharness::run_test_scenario(config, actions).await;
+
+        // Should have MoreTriggered
+        assert!(events.iter().any(|e| matches!(e, TestEvent::MoreTriggered(_, _))),
+            "Expected MoreTriggered event");
+
+        // Should have received all 500 lines
+        let text_count = events.iter().filter(|e| matches!(e, TestEvent::TextReceived(_, _))).count();
+        assert_eq!(text_count, 500, "Expected 500 TextReceived events, got {}", text_count);
+
+        // Should have MoreReleased at least once (final release)
+        assert!(events.iter().any(|e| matches!(e, TestEvent::MoreReleased(_))),
+            "Expected MoreReleased event");
+
+        let _ = server.await;
+    }
+
+    #[tokio::test]
+    async fn test_regression_more_mode_500_lines_jump_to_end() {
+        let port = find_free_port();
+        let scenario = testserver::get_scenario("more_flood_500");
+
+        let server = tokio::spawn(testserver::run_server_port(port, scenario));
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let config = TestConfig {
+            worlds: vec![TestWorldConfig {
+                name: "test".to_string(),
+                host: "127.0.0.1".to_string(),
+                port,
+                use_ssl: false,
+                auto_login_type: AutoConnectType::Connect,
+                username: String::new(),
+                password: String::new(),
+            }],
+            output_height: 24,
+            output_width: 80,
+            more_mode_enabled: true,
+            max_duration: Duration::from_secs(30),
+        };
+
+        let actions = vec![
+            TestAction::WaitForEvent(WaitCondition::MoreTriggered),
+            // Wait for all data to arrive
+            TestAction::Sleep(Duration::from_millis(500)),
+            // Jump to end (Escape+j) - release all at once
+            TestAction::JumpToEnd,
+        ];
+
+        let events = testharness::run_test_scenario(config, actions).await;
+
+        // Should have MoreTriggered
+        assert!(events.iter().any(|e| matches!(e, TestEvent::MoreTriggered(_, _))),
+            "Expected MoreTriggered event");
+
+        // Should have received all 500 lines
+        let text_count = events.iter().filter(|e| matches!(e, TestEvent::TextReceived(_, _))).count();
+        assert_eq!(text_count, 500, "Expected 500 TextReceived events, got {}", text_count);
+
+        // Should have MoreReleased
+        assert!(events.iter().any(|e| matches!(e, TestEvent::MoreReleased(_))),
+            "Expected MoreReleased event after JumpToEnd");
+
+        let _ = server.await;
     }
 }
