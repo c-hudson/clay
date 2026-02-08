@@ -377,14 +377,17 @@ Prompts that are auto-answered are immediately cleared and not displayed in the 
 ### Files
 
 - `src/main.rs` - Main application
-- `src/encoding.rs` - Character encoding (UTF-8, Latin1, Fansi) and colored emoji handling
+- `src/encoding.rs` - Character encoding (UTF-8, Latin1, Fansi), colored emoji handling, and console `Theme` enum (Dark/Light with hardcoded ratatui colors)
+- `src/theme.rs` - `ThemeColors` struct (41 customizable color vars), `ThemeFile` for loading `~/clay.theme.dat` (INI format). Used by GUI/web only; console uses `Theme` from encoding.rs
 - `src/web/index.html` - Web interface HTML template
-- `src/web/style.css` - Web interface CSS styles
+- `src/web/style.css` - Web interface CSS styles (uses `var(--theme-*)` CSS variables)
 - `src/web/app.js` - Web interface JavaScript client
+- `src/web/theme-editor.html` - Standalone browser-based theme color editor with live preview
 - `clay2.png` - Logo image used in remote GUI login screen and Android app icon
 - `android/app/src/main/res/mipmap-*/` - Android launcher icons (generated from clay2.png)
 - `websockets.readme` - WebSocket protocol documentation
 - `~/.clay.dat` - Settings file (created on first save)
+- `~/clay.theme.dat` - Theme file (INI format with `[theme:name]` sections, editable via theme editor)
 - `/usr/share/dict/words` - System dictionary for spell checking (fallback: american-english, british-english)
 
 ### Controls
@@ -704,8 +707,10 @@ The client includes an embedded WebSocket server that allows remote GUI clients 
 - Listens on 0.0.0.0 (all interfaces) on the configured port
 - Requires password authentication before sending any data
 - Multiple clients can connect simultaneously
-- Clients receive all scrollback history and settings on connection
+- On auth, clients receive `InitialState` with output_lines only (pending_lines are NOT merged to avoid duplicates)
+- Clients see pending line count via `pending_count` field and release via PgDn/Tab (released lines broadcast as ServerData)
 - All MUD data is broadcast to authenticated clients in real-time
+- Keepalive: clients send Ping every 30s, server responds with Pong
 
 **Protocol:**
 - JSON over WebSocket
@@ -802,7 +807,7 @@ Note: HTTP automatically starts the non-secure WebSocket server if not already r
 - `-webkit-overflow-scrolling: touch` for smooth iOS scrolling
 - `interactive-widget=resizes-content` viewport meta for proper keyboard handling
 - Hamburger icon uses inline SVG for reliable cross-browser rendering
-- Visibility change detection: auto-resync when browser tab becomes visible (handles sleep/wake)
+- Wake-from-background health check: sends Ping on visibility change, waits 3s for Pong, auto-reconnects if stale
 
 **Mobile Toolbar Layout:**
 - Left side: Menu (hamburger), PgUp, PgDn
@@ -1031,8 +1036,8 @@ Opened with `/worlds -e` command (uses unified popup system):
 - World Switching - World cycling behavior (Unseen First, Alphabetical)
 - Show tags - Show/hide MUD tags at start of lines (default: hidden)
 - Input height - Default input area height (1-15 lines)
-- Console Theme - Theme for console interface (dark, light)
-- GUI Theme - Theme for remote GUI client (dark, light)
+- Console Theme - Theme for console interface (dark, light) — uses hardcoded `Theme` enum from `encoding.rs`
+- GUI Theme - Theme for remote GUI/web client (dark, light) — uses customizable `ThemeColors` from `theme.rs` / `~/clay.theme.dat`
 - TLS Proxy - Enable TLS proxy for preserving TLS connections across hot reload
 
 **Actions (right-aligned buttons):**
