@@ -1794,6 +1794,7 @@ pub struct World {
     pub gmcp_data: std::collections::HashMap<String, String>, // GMCP package -> last JSON data
     pub mcmp_default_url: String,    // MCMP default URL from Client.Media.Default
     pub gmcp_user_enabled: bool,     // True if user has enabled GMCP processing (F9 toggle)
+    pub connection_id: u64,          // Incremented on each connection, used to ignore stale disconnect events
 }
 
 impl World {
@@ -1861,6 +1862,7 @@ impl World {
             gmcp_data: std::collections::HashMap::new(),
             mcmp_default_url: String::new(),
             gmcp_user_enabled: false,
+            connection_id: 0,
         }
     }
 
@@ -4877,7 +4879,7 @@ impl App {
 
 pub enum AppEvent {
     ServerData(String, Vec<u8>),  // world_name, raw bytes
-    Disconnected(String),         // world_name
+    Disconnected(String, u64),     // world_name, connection_id
     TelnetDetected(String),       // world_name - telnet negotiation detected
     Prompt(String, Vec<u8>),      // world_name, prompt bytes (from telnet GA)
     WontEchoSeen(String),         // world_name - IAC WONT ECHO detected (for timeout-based prompts)
@@ -8381,17 +8383,19 @@ pub async fn run_app_headless(
                 app.worlds[world_idx].open_log_file();
                 let _telnet_tx = cmd_tx;
                 let world_name = app.worlds[world_idx].name.clone();
+                app.worlds[world_idx].connection_id += 1;
                 app.worlds[world_idx].reader_name = Some(world_name.clone());
 
                 // Spawn reader task
                 let reader_tx = event_tx.clone();
                 let reader_world_name = world_name.clone();
+                let reader_conn_id = app.worlds[world_idx].connection_id;
                 tokio::spawn(async move {
                     let mut buf = vec![0u8; 4096];
                     loop {
                         match read_half.read(&mut buf).await {
                             Ok(0) => {
-                                let _ = reader_tx.send(AppEvent::Disconnected(reader_world_name)).await;
+                                let _ = reader_tx.send(AppEvent::Disconnected(reader_world_name, reader_conn_id)).await;
                                 break;
                             }
                             Ok(n) => {
@@ -8399,7 +8403,7 @@ pub async fn run_app_headless(
                                 let _ = reader_tx.send(AppEvent::ServerData(reader_world_name.clone(), data)).await;
                             }
                             Err(_) => {
-                                let _ = reader_tx.send(AppEvent::Disconnected(reader_world_name)).await;
+                                let _ = reader_tx.send(AppEvent::Disconnected(reader_world_name, reader_conn_id)).await;
                                 break;
                             }
                         }
@@ -8443,16 +8447,18 @@ pub async fn run_app_headless(
                                 app.worlds[world_idx].skip_auto_login = true;
                                 app.worlds[world_idx].open_log_file();
                                 let world_name = app.worlds[world_idx].name.clone();
+                                app.worlds[world_idx].connection_id += 1;
                                 app.worlds[world_idx].reader_name = Some(world_name.clone());
 
                                 let reader_tx = event_tx.clone();
                                 let reader_world_name = world_name.clone();
+                                let reader_conn_id = app.worlds[world_idx].connection_id;
                                 tokio::spawn(async move {
                                     let mut buf = vec![0u8; 4096];
                                     loop {
                                         match read_half.read(&mut buf).await {
                                             Ok(0) => {
-                                                let _ = reader_tx.send(AppEvent::Disconnected(reader_world_name)).await;
+                                                let _ = reader_tx.send(AppEvent::Disconnected(reader_world_name, reader_conn_id)).await;
                                                 break;
                                             }
                                             Ok(n) => {
@@ -8460,7 +8466,7 @@ pub async fn run_app_headless(
                                                 let _ = reader_tx.send(AppEvent::ServerData(reader_world_name.clone(), data)).await;
                                             }
                                             Err(_) => {
-                                                let _ = reader_tx.send(AppEvent::Disconnected(reader_world_name)).await;
+                                                let _ = reader_tx.send(AppEvent::Disconnected(reader_world_name, reader_conn_id)).await;
                                                 break;
                                             }
                                         }
@@ -8754,8 +8760,12 @@ pub async fn run_app_headless(
                             app.current_world_index = saved_current_world;
                         }
                     }
-                    AppEvent::Disconnected(ref world_name) => {
+                    AppEvent::Disconnected(ref world_name, conn_id) => {
                         if let Some(world_idx) = app.find_world_index(world_name) {
+                            // Ignore stale disconnect from a previous connection
+                            if conn_id != app.worlds[world_idx].connection_id {
+                                continue;
+                            }
                             // Fire TF DISCONNECT hook
                             let hook_result = tf::bridge::fire_event(&mut app.tf_engine, tf::TfHookEvent::Disconnect);
                             for cmd in hook_result.clay_commands {
@@ -9483,7 +9493,9 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
 
                 // Capture world name for the reader task (stable across world deletions)
                 let world_name = app.worlds[world_idx].name.clone();
+                app.worlds[world_idx].connection_id += 1;
                 app.worlds[world_idx].reader_name = Some(world_name.clone());
+                let reader_conn_id = app.worlds[world_idx].connection_id;
 
                 // Spawn reader task
                 let event_tx_read = event_tx.clone();
@@ -9531,7 +9543,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                         "Connection closed by server.\n".as_bytes().to_vec(),
                                     ))
                                     .await;
-                                let _ = event_tx_read.send(AppEvent::Disconnected(world_name.clone())).await;
+                                let _ = event_tx_read.send(AppEvent::Disconnected(world_name.clone(), reader_conn_id)).await;
                                 break;
                             }
                             Ok(n) => {
@@ -9618,7 +9630,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                 let _ = event_tx_read
                                     .send(AppEvent::ServerData(world_name.clone(), msg.into_bytes()))
                                     .await;
-                                let _ = event_tx_read.send(AppEvent::Disconnected(world_name.clone())).await;
+                                let _ = event_tx_read.send(AppEvent::Disconnected(world_name.clone(), reader_conn_id)).await;
                                 break;
                             }
                         }
@@ -9722,7 +9734,9 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                         app.worlds[world_idx].open_log_file();
 
                         let world_name = app.worlds[world_idx].name.clone();
+                        app.worlds[world_idx].connection_id += 1;
                         app.worlds[world_idx].reader_name = Some(world_name.clone());
+                        let reader_conn_id = app.worlds[world_idx].connection_id;
 
                         // Spawn reader task with telnet processing
                         let event_tx_read = event_tx.clone();
@@ -9760,7 +9774,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                                 let _ = event_tx_read.send(AppEvent::ServerData(world_name.clone(), result.cleaned)).await;
                                             }
                                         }
-                                        let _ = event_tx_read.send(AppEvent::Disconnected(world_name.clone())).await;
+                                        let _ = event_tx_read.send(AppEvent::Disconnected(world_name.clone(), reader_conn_id)).await;
                                         break;
                                     }
                                     Ok(n) => {
@@ -9808,7 +9822,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                         }
                                     }
                                     Err(_) => {
-                                        let _ = event_tx_read.send(AppEvent::Disconnected(world_name.clone())).await;
+                                        let _ = event_tx_read.send(AppEvent::Disconnected(world_name.clone(), reader_conn_id)).await;
                                         break;
                                     }
                                 }
@@ -10541,8 +10555,12 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                             app.current_world_index = saved_current_world;
                         }
                     }
-                    AppEvent::Disconnected(ref world_name) => {
+                    AppEvent::Disconnected(ref world_name, conn_id) => {
                         if let Some(world_idx) = app.find_world_index(world_name) {
+                            // Ignore stale disconnect from a previous connection
+                            if conn_id != app.worlds[world_idx].connection_id {
+                                continue;
+                            }
                             // Fire TF DISCONNECT hook before cleaning up
                             let hook_result = tf::bridge::fire_event(&mut app.tf_engine, tf::TfHookEvent::Disconnect);
                             for cmd in hook_result.clay_commands {
@@ -13136,8 +13154,12 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                         }
                     }
                 }
-                AppEvent::Disconnected(ref world_name) => {
+                AppEvent::Disconnected(ref world_name, conn_id) => {
                     if let Some(world_idx) = app.find_world_index(world_name) {
+                        // Ignore stale disconnect from a previous connection
+                        if conn_id != app.worlds[world_idx].connection_id {
+                            continue;
+                        }
                         // Fire TF DISCONNECT hook before cleaning up
                         let hook_result = tf::bridge::fire_event(&mut app.tf_engine, tf::TfHookEvent::Disconnect);
                         for cmd in hook_result.clay_commands {
@@ -16099,6 +16121,8 @@ async fn connect_slack(app: &mut App, event_tx: mpsc::Sender<AppEvent>) -> bool 
     app.current_world_mut().command_tx = Some(cmd_tx);
 
     // Spawn reader task
+    app.current_world_mut().connection_id += 1;
+    let reader_conn_id = app.current_world().connection_id;
     let event_tx_clone = event_tx.clone();
     let _token_clone = token.clone(); // Reserved for future use (user lookup, etc.)
     let channel_clone = channel.clone();
@@ -16138,11 +16162,11 @@ async fn connect_slack(app: &mut App, event_tx: mpsc::Sender<AppEvent>) -> bool 
                     }
                 }
                 Ok(WsMsg::Close(_)) => {
-                    let _ = event_tx_clone.send(AppEvent::Disconnected(world_name.clone())).await;
+                    let _ = event_tx_clone.send(AppEvent::Disconnected(world_name.clone(), reader_conn_id)).await;
                     break;
                 }
                 Err(_) => {
-                    let _ = event_tx_clone.send(AppEvent::Disconnected(world_name.clone())).await;
+                    let _ = event_tx_clone.send(AppEvent::Disconnected(world_name.clone(), reader_conn_id)).await;
                     break;
                 }
                 _ => {}
@@ -16359,6 +16383,8 @@ async fn connect_discord(app: &mut App, event_tx: mpsc::Sender<AppEvent>) -> boo
     let world_name_for_writer = world_name.clone();
 
     // Spawn reader/heartbeat task
+    app.current_world_mut().connection_id += 1;
+    let reader_conn_id = app.current_world().connection_id;
     let event_tx_clone = event_tx.clone();
     let token_clone = token.clone();
     let channel_id_clone = channel_id.clone();
@@ -16443,11 +16469,11 @@ async fn connect_discord(app: &mut App, event_tx: mpsc::Sender<AppEvent>) -> boo
                     }
                 }
                 Ok(WsMsg::Close(_)) => {
-                    let _ = event_tx_clone.send(AppEvent::Disconnected(world_name.clone())).await;
+                    let _ = event_tx_clone.send(AppEvent::Disconnected(world_name.clone(), reader_conn_id)).await;
                     break;
                 }
                 Err(_) => {
-                    let _ = event_tx_clone.send(AppEvent::Disconnected(world_name.clone())).await;
+                    let _ = event_tx_clone.send(AppEvent::Disconnected(world_name.clone(), reader_conn_id)).await;
                     break;
                 }
                 _ => {}
@@ -17229,6 +17255,8 @@ async fn handle_command(cmd: &str, app: &mut App, event_tx: mpsc::Sender<AppEven
                                 }
 
                                 // Start reader task with telnet processing
+                                app.current_world_mut().connection_id += 1;
+                                let reader_conn_id = app.current_world().connection_id;
                                 let event_tx_read = event_tx.clone();
                                 let read_world_name = world_name.clone();
                                 let telnet_tx = cmd_tx;
@@ -17266,7 +17294,7 @@ async fn handle_command(cmd: &str, app: &mut App, event_tx: mpsc::Sender<AppEven
                                                         let _ = event_tx_read.send(AppEvent::ServerData(read_world_name.clone(), result.cleaned)).await;
                                                     }
                                                 }
-                                                let _ = event_tx_read.send(AppEvent::Disconnected(read_world_name.clone())).await;
+                                                let _ = event_tx_read.send(AppEvent::Disconnected(read_world_name.clone(), reader_conn_id)).await;
                                                 break;
                                             }
                                             Ok(n) => {
@@ -17314,7 +17342,7 @@ async fn handle_command(cmd: &str, app: &mut App, event_tx: mpsc::Sender<AppEven
                                                 }
                                             }
                                             Err(_) => {
-                                                let _ = event_tx_read.send(AppEvent::Disconnected(read_world_name.clone())).await;
+                                                let _ = event_tx_read.send(AppEvent::Disconnected(read_world_name.clone(), reader_conn_id)).await;
                                                 break;
                                             }
                                         }
@@ -17360,6 +17388,8 @@ async fn handle_command(cmd: &str, app: &mut App, event_tx: mpsc::Sender<AppEven
             }
 
             // Spawn connection in background to avoid blocking the UI
+            app.current_world_mut().connection_id += 1;
+            let reader_conn_id = app.current_world().connection_id;
             let world_name = app.current_world().name.clone();
             let connect_host = host.clone();
             let connect_port = port.clone();
@@ -17509,7 +17539,7 @@ async fn handle_command(cmd: &str, app: &mut App, event_tx: mpsc::Sender<AppEven
                                                         "Connection closed by server.\n".as_bytes().to_vec(),
                                                     ))
                                                     .await;
-                                                let _ = event_tx_read.send(AppEvent::Disconnected(read_world_name.clone())).await;
+                                                let _ = event_tx_read.send(AppEvent::Disconnected(read_world_name.clone(), reader_conn_id)).await;
                                                 break;
                                             }
                                             Ok(n) => {
@@ -17563,7 +17593,7 @@ async fn handle_command(cmd: &str, app: &mut App, event_tx: mpsc::Sender<AppEven
                                             Err(e) => {
                                                 let msg = format!("Read error: {}", e);
                                                 let _ = event_tx_read.send(AppEvent::ServerData(read_world_name.clone(), msg.into_bytes())).await;
-                                                let _ = event_tx_read.send(AppEvent::Disconnected(read_world_name.clone())).await;
+                                                let _ = event_tx_read.send(AppEvent::Disconnected(read_world_name.clone(), reader_conn_id)).await;
                                                 break;
                                             }
                                         }

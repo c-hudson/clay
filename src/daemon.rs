@@ -290,8 +290,12 @@ pub async fn run_daemon_server() -> io::Result<()> {
                             app.current_world_index = saved_current_world;
                         }
                     }
-                    AppEvent::Disconnected(ref world_name) => {
+                    AppEvent::Disconnected(ref world_name, conn_id) => {
                         if let Some(world_idx) = app.find_world_index(world_name) {
+                            // Ignore stale disconnect from a previous connection
+                            if conn_id != app.worlds[world_idx].connection_id {
+                                continue;
+                            }
                             app.worlds[world_idx].connected = false;
                             app.worlds[world_idx].command_tx = None;
 
@@ -994,11 +998,13 @@ pub async fn handle_daemon_ws_message(
                                 from_server: false,
                             });
 
+                            app.worlds[world_index].connection_id += 1;
                             if let Some(cmd_tx) = connect_daemon_world(
                                 world_index,
                                 world_name.clone(),
                                 &settings,
                                 event_tx.clone(),
+                                app.worlds[world_index].connection_id,
                             ).await {
                                 app.worlds[world_index].connected = true;
                                 app.worlds[world_index].command_tx = Some(cmd_tx);
@@ -1050,11 +1056,13 @@ pub async fn handle_daemon_ws_message(
                                 from_server: false,
                             });
 
+                            app.worlds[idx].connection_id += 1;
                             if let Some(cmd_tx) = connect_daemon_world(
                                 idx,
                                 world_name.clone(),
                                 &settings,
                                 event_tx.clone(),
+                                app.worlds[idx].connection_id,
                             ).await {
                                 app.worlds[idx].connected = true;
                                 app.worlds[idx].command_tx = Some(cmd_tx);
@@ -1112,11 +1120,13 @@ pub async fn handle_daemon_ws_message(
                 });
 
                 // Attempt connection
+                app.worlds[world_index].connection_id += 1;
                 if let Some(cmd_tx) = connect_daemon_world(
                     world_index,
                     world_name.clone(),
                     &settings,
                     event_tx.clone(),
+                    app.worlds[world_index].connection_id,
                 ).await {
                     // Connection succeeded
                     app.worlds[world_index].connected = true;
@@ -1764,7 +1774,7 @@ keep_alive_type=Generic
                     }
                     // Legacy events - not used in multiuser mode (we use Multiuser* variants)
                     AppEvent::ServerData(_, _) => {}
-                    AppEvent::Disconnected(_) => {}
+                    AppEvent::Disconnected(..) => {}
                     AppEvent::ConnectWorldRequest(world_index, requesting_username) => {
                         // Connect a world on behalf of a user (per-user isolated connection)
                         let key = (world_index, requesting_username.clone());
@@ -2117,6 +2127,7 @@ pub async fn connect_daemon_world(
     world_name: String,
     settings: &WorldSettings,
     event_tx: mpsc::Sender<AppEvent>,
+    connection_id: u64,
 ) -> Option<mpsc::Sender<WriteCommand>> {
     let host = &settings.hostname;
     let port = &settings.port;
@@ -2212,6 +2223,7 @@ pub async fn connect_daemon_world(
             let telnet_tx = cmd_tx.clone();
             let event_tx_read = event_tx.clone();
             let world_name_read = world_name.clone();
+            let reader_conn_id = connection_id;
 
             // Spawn reader task
             tokio::spawn(async move {
@@ -2236,7 +2248,7 @@ pub async fn connect_daemon_world(
                                 world_name_read.clone(),
                                 "Connection closed by server.\n".as_bytes().to_vec(),
                             )).await;
-                            let _ = event_tx_read.send(AppEvent::Disconnected(world_name_read.clone())).await;
+                            let _ = event_tx_read.send(AppEvent::Disconnected(world_name_read.clone(), reader_conn_id)).await;
                             break;
                         }
                         Ok(n) => {
@@ -2263,7 +2275,7 @@ pub async fn connect_daemon_world(
                         Err(e) => {
                             let msg = format!("Read error: {}", e);
                             let _ = event_tx_read.send(AppEvent::ServerData(world_name_read.clone(), msg.into_bytes())).await;
-                            let _ = event_tx_read.send(AppEvent::Disconnected(world_name_read.clone())).await;
+                            let _ = event_tx_read.send(AppEvent::Disconnected(world_name_read.clone(), reader_conn_id)).await;
                             break;
                         }
                     }
