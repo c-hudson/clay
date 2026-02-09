@@ -15899,10 +15899,17 @@ fn handle_key_event(key: KeyEvent, app: &mut App) -> KeyAction {
 
         // F9 to toggle GMCP user processing for current world
         (_, KeyCode::F(9)) => {
-            if let Some(ref tx) = app.ws_client_tx {
-                let _ = tx.send(WsMessage::ToggleWorldGmcp { world_index: app.current_world_index });
+            let idx = app.current_world_index;
+            app.worlds[idx].gmcp_user_enabled = !app.worlds[idx].gmcp_user_enabled;
+            if !app.worlds[idx].gmcp_user_enabled {
+                app.stop_world_media(idx);
             }
-            KeyAction::None
+            app.needs_output_redraw = true;
+            app.ws_broadcast(WsMessage::GmcpUserToggled {
+                world_index: idx,
+                enabled: app.worlds[idx].gmcp_user_enabled,
+            });
+            KeyAction::Redraw
         }
 
         // F4 to open filter popup
