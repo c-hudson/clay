@@ -3974,6 +3974,22 @@ impl App {
         }
     }
 
+    /// Send active media for a world to a specific client (for world switch restart)
+    fn ws_send_active_media_to_client(&self, client_id: u64, world_idx: usize) {
+        if world_idx >= self.worlds.len() || !self.worlds[world_idx].gmcp_user_enabled {
+            return;
+        }
+        let default_url = self.worlds[world_idx].mcmp_default_url.clone();
+        for (_key, json_data) in &self.worlds[world_idx].active_media {
+            self.ws_send_to_client(client_id, WsMessage::McmpMedia {
+                world_index: world_idx,
+                action: "Play".to_string(),
+                data: json_data.clone(),
+                default_url: default_url.clone(),
+            });
+        }
+    }
+
     /// Mark a client as having received its InitialState
     /// After this, the client will receive broadcasts (prevents duplicate messages)
     fn ws_mark_initial_state_sent(&self, client_id: u64) {
@@ -11752,6 +11768,8 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                     app.ws_client_worlds.insert(client_id, ClientViewState { world_index, visible_lines, dimensions });
                                     app.ws_set_client_world(client_id, Some(world_index));
                                     app.ws_send_to_client(client_id, WsMessage::WorldSwitched { new_index: world_index });
+                                    // Send active media for the new world
+                                    app.ws_send_active_media_to_client(client_id, world_index);
                                 }
                             }
                             WsMessage::ConnectWorld { world_index } => {
@@ -11826,9 +11844,11 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                             WsMessage::MarkWorldSeen { world_index } => {
                                 // A remote client has viewed this world - update their current_world
                                 if world_index < app.worlds.len() {
+                                    // Check if client is switching to a different world
+                                    let old_world_idx = app.ws_client_worlds.get(&client_id).map(|s| s.world_index);
+                                    let switched = old_world_idx.map(|old| old != world_index).unwrap_or(true);
                                     // Reset lines_since_pause for the old world if switching away and more-mode hasn't triggered
-                                    if let Some(old_state) = app.ws_client_worlds.get(&client_id) {
-                                        let old_idx = old_state.world_index;
+                                    if let Some(old_idx) = old_world_idx {
                                         if old_idx != world_index && old_idx < app.worlds.len()
                                             && app.worlds[old_idx].pending_lines.is_empty()
                                         {
@@ -11852,6 +11872,9 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                     app.broadcast_activity();
                                     // Trigger console redraw to update activity indicator
                                     app.needs_output_redraw = true;
+                                    if switched {
+                                        app.ws_send_active_media_to_client(client_id, world_index);
+                                    }
                                 }
                             }
                             WsMessage::UpdateViewState { world_index, visible_lines } => {
@@ -14270,6 +14293,8 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                 app.ws_client_worlds.insert(client_id, ClientViewState { world_index, visible_lines, dimensions });
                                 app.ws_set_client_world(client_id, Some(world_index));
                                 app.ws_send_to_client(client_id, WsMessage::WorldSwitched { new_index: world_index });
+                                // Send active media for the new world
+                                app.ws_send_active_media_to_client(client_id, world_index);
                             }
                         }
                         WsMessage::UpdateWorldSettings { world_index, name, hostname, port, user, password, use_ssl, log_enabled, encoding, auto_login, keep_alive_type, keep_alive_cmd, gmcp_packages } => {
@@ -14712,9 +14737,11 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                         WsMessage::MarkWorldSeen { world_index } => {
                             // A remote client has viewed this world - update their current_world
                             if world_index < app.worlds.len() {
+                                // Check if client is switching to a different world
+                                let old_world_idx = app.ws_client_worlds.get(&client_id).map(|s| s.world_index);
+                                let switched = old_world_idx.map(|old| old != world_index).unwrap_or(true);
                                 // Reset lines_since_pause for the old world if switching away and more-mode hasn't triggered
-                                if let Some(old_state) = app.ws_client_worlds.get(&client_id) {
-                                    let old_idx = old_state.world_index;
+                                if let Some(old_idx) = old_world_idx {
                                     if old_idx != world_index && old_idx < app.worlds.len()
                                         && app.worlds[old_idx].pending_lines.is_empty()
                                     {
@@ -14738,6 +14765,9 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                 app.broadcast_activity();
                                 // Trigger console redraw to update activity indicator
                                 app.needs_output_redraw = true;
+                                if switched {
+                                    app.ws_send_active_media_to_client(client_id, world_index);
+                                }
                             }
                         }
                         WsMessage::UpdateViewState { world_index, visible_lines } => {
