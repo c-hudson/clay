@@ -3201,16 +3201,26 @@
                     currentBgStyle = '';
                 } else if (code === 1) {
                     currentClasses.push('ansi-bold');
+                    // Bold upgrades standard colors to bright variants
+                    const stdColors = ['black', 'red', 'green', 'yellow', 'blue', 'magenta', 'cyan', 'white'];
+                    for (const c of stdColors) {
+                        const idx = currentClasses.indexOf('ansi-' + c);
+                        if (idx !== -1) {
+                            currentClasses[idx] = 'ansi-bright-' + c;
+                            break;
+                        }
+                    }
                 } else if (code === 3) {
                     currentClasses.push('ansi-italic');
                 } else if (code === 4) {
                     currentClasses.push('ansi-underline');
                 } else if (code >= 30 && code <= 37) {
-                    // Basic foreground colors
+                    // Basic foreground colors - use bright variant if bold is active
                     currentClasses = currentClasses.filter(c => !c.startsWith('ansi-') || c.startsWith('ansi-bg-') || c === 'ansi-bold' || c === 'ansi-italic' || c === 'ansi-underline');
                     currentFgStyle = '';
                     const colors = ['black', 'red', 'green', 'yellow', 'blue', 'magenta', 'cyan', 'white'];
-                    currentClasses.push('ansi-' + colors[code - 30]);
+                    const isBold = currentClasses.includes('ansi-bold');
+                    currentClasses.push((isBold ? 'ansi-bright-' : 'ansi-') + colors[code - 30]);
                 } else if (code === 38) {
                     // Extended foreground color
                     if (codes[i + 1] === 5 && codes.length > i + 2) {
