@@ -167,6 +167,9 @@ pub fn save_settings(app: &App) -> io::Result<()> {
         if !world.settings.keep_alive_cmd.is_empty() {
             writeln!(file, "keep_alive_cmd={}", world.settings.keep_alive_cmd)?;
         }
+        if world.settings.gmcp_packages != "Client.Media 1" {
+            writeln!(file, "gmcp_packages={}", world.settings.gmcp_packages)?;
+        }
         if world.settings.log_enabled {
             writeln!(file, "log_enabled=true")?;
         }
@@ -608,6 +611,9 @@ pub fn load_settings(app: &mut App) -> io::Result<()> {
                         "keep_alive_cmd" => {
                             world.settings.keep_alive_cmd = value.to_string();
                         }
+                        "gmcp_packages" => {
+                            world.settings.gmcp_packages = value.to_string();
+                        }
                         // Slack settings
                         "slack_token" => world.settings.slack_token = decrypt_password(value),
                         "slack_channel" => world.settings.slack_channel = value.to_string(),
@@ -852,6 +858,9 @@ pub fn load_multiuser_settings(app: &mut App) -> io::Result<()> {
                         "keep_alive_cmd" => {
                             world.settings.keep_alive_cmd = value.to_string();
                         }
+                        "gmcp_packages" => {
+                            world.settings.gmcp_packages = value.to_string();
+                        }
                         _ => {}
                     }
                 }
@@ -956,6 +965,9 @@ pub fn save_multiuser_settings(app: &App) -> io::Result<()> {
             writeln!(file, "keep_alive_type={}", world.settings.keep_alive_type.name())?;
             if !world.settings.keep_alive_cmd.is_empty() {
                 writeln!(file, "keep_alive_cmd={}", world.settings.keep_alive_cmd)?;
+            }
+            if world.settings.gmcp_packages != "Client.Media 1" {
+                writeln!(file, "gmcp_packages={}", world.settings.gmcp_packages)?;
             }
             // Slack settings
             if !world.settings.slack_token.is_empty() {
@@ -1151,6 +1163,22 @@ pub fn save_reload_state(app: &App) -> io::Result<()> {
         if !world.settings.keep_alive_cmd.is_empty() {
             writeln!(file, "keep_alive_cmd={}", world.settings.keep_alive_cmd.replace('=', "\\e"))?;
         }
+        if world.settings.gmcp_packages != "Client.Media 1" {
+            writeln!(file, "gmcp_packages={}", world.settings.gmcp_packages.replace('=', "\\e"))?;
+        }
+        // Save GMCP/MSDP runtime state
+        if world.gmcp_enabled {
+            writeln!(file, "gmcp_enabled=true")?;
+        }
+        if world.msdp_enabled {
+            writeln!(file, "msdp_enabled=true")?;
+        }
+        if !world.mcmp_default_url.is_empty() {
+            writeln!(file, "mcmp_default_url={}", world.mcmp_default_url.replace('=', "\\e"))?;
+        }
+        if world.gmcp_user_enabled {
+            writeln!(file, "gmcp_user_enabled=true")?;
+        }
         if world.settings.log_enabled {
             writeln!(file, "log_enabled=true")?;
         }
@@ -1331,6 +1359,10 @@ pub fn load_reload_state(app: &mut App) -> io::Result<bool> {
         next_seq: u64,
         partial_line: String,
         partial_in_pending: bool,
+        gmcp_enabled: bool,
+        msdp_enabled: bool,
+        mcmp_default_url: String,
+        gmcp_user_enabled: bool,
     }
 
     // Parse a saved output/pending line with timestamp
@@ -1428,6 +1460,10 @@ pub fn load_reload_state(app: &mut App) -> io::Result<bool> {
                         next_seq: 0,
                         partial_line: String::new(),
                         partial_in_pending: false,
+                        gmcp_enabled: false,
+                        msdp_enabled: false,
+                        mcmp_default_url: String::new(),
+                        gmcp_user_enabled: false,
                     });
                 }
             } else if let Some(suffix) = section.strip_prefix("output:") {
@@ -1732,6 +1768,21 @@ pub fn load_reload_state(app: &mut App) -> io::Result<bool> {
                             "keep_alive_cmd" => {
                                 tw.settings.keep_alive_cmd = value.replace("\\e", "=");
                             }
+                            "gmcp_packages" => {
+                                tw.settings.gmcp_packages = unescape_string(value);
+                            }
+                            "gmcp_enabled" => {
+                                tw.gmcp_enabled = value == "true";
+                            }
+                            "msdp_enabled" => {
+                                tw.msdp_enabled = value == "true";
+                            }
+                            "mcmp_default_url" => {
+                                tw.mcmp_default_url = unescape_string(value);
+                            }
+                            "gmcp_user_enabled" => {
+                                tw.gmcp_user_enabled = value == "true";
+                            }
                             // Slack settings
                             "slack_token" => tw.settings.slack_token = unescape_string(value),
                             "slack_channel" => tw.settings.slack_channel = unescape_string(value),
@@ -1795,6 +1846,10 @@ pub fn load_reload_state(app: &mut App) -> io::Result<bool> {
         world.next_seq = tw.next_seq;
         world.partial_line = tw.partial_line;
         world.partial_in_pending = tw.partial_in_pending;
+        world.gmcp_enabled = tw.gmcp_enabled;
+        world.msdp_enabled = tw.msdp_enabled;
+        world.mcmp_default_url = tw.mcmp_default_url;
+        world.gmcp_user_enabled = tw.gmcp_user_enabled;
         // Leave timing fields as None for connected worlds after reload
         // This triggers immediate keepalive since we don't know how long connection was idle
         app.worlds.push(world);

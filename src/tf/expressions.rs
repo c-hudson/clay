@@ -1679,6 +1679,7 @@ impl<'a> Evaluator<'a> {
                             "host" => TfValue::String(w.host.clone()),
                             "port" => TfValue::String(w.port.clone()),
                             "character" | "char" => TfValue::String(w.user.clone()),
+                            "password" | "pass" => TfValue::String(w.password.clone()),
                             "login" => TfValue::Integer(if w.is_connected { 1 } else { 0 }),
                             "ssl" | "secure" => TfValue::Integer(if w.use_ssl { 1 } else { 0 }),
                             _ => TfValue::String(String::new()),

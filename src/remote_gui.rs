@@ -63,6 +63,7 @@ pub struct RemoteWorldSettings {
     pub auto_login: String,
     pub keep_alive_type: String,
     pub keep_alive_cmd: String,
+    pub gmcp_packages: String,
 }
 
 /// State for a remote world
@@ -85,6 +86,8 @@ pub struct RemoteWorld {
     pub partial_line: String,
     // Whether to show centered splash screen
     pub showing_splash: bool,
+    // Whether GMCP user processing is enabled (F9 toggle)
+    pub gmcp_user_enabled: bool,
 }
 
 /// Which popup is currently open
@@ -250,6 +253,7 @@ pub struct RemoteGuiApp {
     edit_auto_login: AutoConnectType,
     edit_keep_alive_type: KeepAliveType,
     edit_keep_alive_cmd: String,
+    edit_gmcp_packages: String,
     /// Input area height in lines
     input_height: u16,
     /// Console theme (for TUI on server)
@@ -489,6 +493,7 @@ impl RemoteGuiApp {
             edit_auto_login: AutoConnectType::Connect,
             edit_keep_alive_type: KeepAliveType::Nop,
             edit_keep_alive_cmd: String::new(),
+            edit_gmcp_packages: String::new(),
             input_height: 3,
             console_theme: GuiTheme::from_name("dark"),
             theme: GuiTheme::from_name("dark"),
@@ -983,6 +988,7 @@ impl RemoteGuiApp {
                                 auto_login: w.settings.auto_connect_type,
                                 keep_alive_type: w.keep_alive_type.clone(),
                                 keep_alive_cmd: w.settings.keep_alive_cmd.clone(),
+                                gmcp_packages: w.settings.gmcp_packages.clone(),
                             },
                             unseen_lines: w.unseen_lines,  // Use server's centralized unseen tracking
                             pending_count,
@@ -991,6 +997,7 @@ impl RemoteGuiApp {
                             last_nop_secs: w.last_nop_secs,
                             partial_line: String::new(),
                             showing_splash: w.showing_splash,
+                            gmcp_user_enabled: w.gmcp_user_enabled,
                         }}).collect();
                         // On first InitialState, use server's world index
                         // On resync, preserve current world (bounded by new world count)
@@ -1160,6 +1167,7 @@ impl RemoteGuiApp {
                             self.worlds[world_index].settings.use_ssl = settings.use_ssl;
                             self.worlds[world_index].settings.keep_alive_type = settings.keep_alive_type;
                             self.worlds[world_index].settings.keep_alive_cmd = settings.keep_alive_cmd;
+                            self.worlds[world_index].settings.gmcp_packages = settings.gmcp_packages;
                         }
                     }
                     WsMessage::GlobalSettingsUpdated { settings, input_height } => {
@@ -1237,6 +1245,11 @@ impl RemoteGuiApp {
                     WsMessage::ShowTagsChanged { show_tags } => {
                         // Server toggled show_tags (F2 or /tag command)
                         self.show_tags = show_tags;
+                    }
+                    WsMessage::GmcpUserToggled { world_index, enabled } => {
+                        if world_index < self.worlds.len() {
+                            self.worlds[world_index].gmcp_user_enabled = enabled;
+                        }
                     }
                     WsMessage::CalculatedWorld { index: Some(idx) } => {
                         // Server calculated the next/prev world for us
@@ -1820,6 +1833,7 @@ impl RemoteGuiApp {
                 auto_login: self.edit_auto_login.name().to_string(),
                 keep_alive_type: self.edit_keep_alive_type.name().to_string(),
                 keep_alive_cmd: self.edit_keep_alive_cmd.clone(),
+                gmcp_packages: self.edit_gmcp_packages.clone(),
             });
         }
     }
@@ -1883,6 +1897,7 @@ impl RemoteGuiApp {
             self.edit_auto_login = AutoConnectType::from_name(&world.settings.auto_login);
             self.edit_keep_alive_type = KeepAliveType::from_name(&world.settings.keep_alive_type);
             self.edit_keep_alive_cmd = world.settings.keep_alive_cmd.clone();
+            self.edit_gmcp_packages = world.settings.gmcp_packages.clone();
             self.popup_state = PopupState::WorldEditor(world_index);
         }
     }
@@ -3224,6 +3239,11 @@ impl eframe::App for RemoteGuiApp {
                         } else if i.consume_key(egui::Modifiers::NONE, egui::Key::F8) {
                             // F8 - toggle action pattern highlighting
                             self.highlight_actions = !self.highlight_actions;
+                        } else if i.consume_key(egui::Modifiers::NONE, egui::Key::F9) {
+                            // F9 - toggle GMCP user processing for current world
+                            if let Some(ref tx) = self.ws_tx {
+                                let _ = tx.send(WsMessage::ToggleWorldGmcp { world_index: self.current_world });
+                            }
                         } else if i.consume_key(egui::Modifiers::NONE, egui::Key::Tab) {
                             // Tab - command completion if input starts with / or #
                             // Otherwise release pending lines or scroll down if viewing history
@@ -4163,6 +4183,10 @@ impl eframe::App for RemoteGuiApp {
                             // Tag indicator (only shown when F2 toggled to show tags)
                             if self.show_tags {
                                 ui.label(egui::RichText::new(" [tag]").monospace().color(theme.prompt()));
+                            }
+                            // GMCP indicator (only shown when F9 toggled to enable GMCP processing)
+                            if self.worlds.get(self.current_world).map_or(false, |w| w.gmcp_user_enabled) {
+                                ui.label(egui::RichText::new(" [g]").monospace().color(theme.prompt()));
                             }
                         }
 
@@ -5351,6 +5375,7 @@ impl eframe::App for RemoteGuiApp {
                 let mut edit_auto_login = self.edit_auto_login;
                 let mut edit_keep_alive_type = self.edit_keep_alive_type;
                 let mut edit_keep_alive_cmd = self.edit_keep_alive_cmd.clone();
+                let mut edit_gmcp_packages = self.edit_gmcp_packages.clone();
                 let can_delete = self.worlds.len() > 1;
 
                 // Dynamic height based on whether keep-alive cmd is shown
@@ -5762,6 +5787,11 @@ impl eframe::App for RemoteGuiApp {
                                             edit_auto_login = AutoConnectType::MooPrompt;
                                             ui.memory_mut(|mem| mem.close_popup());
                                         }
+                                        if ui.selectable_label(edit_auto_login == AutoConnectType::NoLogin,
+                                            egui::RichText::new("None").size(11.0).color(theme.fg()).family(egui::FontFamily::Monospace)).clicked() {
+                                            edit_auto_login = AutoConnectType::NoLogin;
+                                            ui.memory_mut(|mem| mem.close_popup());
+                                        }
                                     });
                                 });
 
@@ -5820,6 +5850,10 @@ impl eframe::App for RemoteGuiApp {
                                         styled_text_input(ui, &mut edit_keep_alive_cmd, None, "keep_alive_cmd_input");
                                     });
                                 }
+
+                                form_row(ui, "GMCP Packages", &mut |ui| {
+                                    styled_text_input(ui, &mut edit_gmcp_packages, None, "gmcp_packages_input");
+                                });
                         });
                     },
                 );
@@ -5836,6 +5870,7 @@ impl eframe::App for RemoteGuiApp {
                 self.edit_auto_login = edit_auto_login;
                 self.edit_keep_alive_type = edit_keep_alive_type;
                 self.edit_keep_alive_cmd = edit_keep_alive_cmd;
+                self.edit_gmcp_packages = edit_gmcp_packages;
 
                 if should_save {
                     // Update local world settings and send to server
@@ -5851,6 +5886,7 @@ impl eframe::App for RemoteGuiApp {
                         world.settings.auto_login = self.edit_auto_login.name().to_string();
                         world.settings.keep_alive_type = self.edit_keep_alive_type.name().to_string();
                         world.settings.keep_alive_cmd = self.edit_keep_alive_cmd.clone();
+                        world.settings.gmcp_packages = self.edit_gmcp_packages.clone();
                     }
                     // Send update to server
                     self.update_world_settings(world_idx);

@@ -25,6 +25,12 @@ fn get_special_var(engine: &TfEngine, name: &str) -> Option<String> {
                 .find(|w| &w.name == current)
                 .map(|w| w.user.clone())
         }
+        "world_password" | "world_pass" => {
+            let current = engine.current_world.as_ref()?;
+            engine.world_info_cache.iter()
+                .find(|w| &w.name == current)
+                .map(|w| w.password.clone())
+        }
         // Process info
         "pid" => Some(std::process::id().to_string()),
         // Time

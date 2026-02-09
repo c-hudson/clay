@@ -219,6 +219,8 @@ pub enum TfHookEvent {
     Load,
     Redef,
     Background,
+    Gmcp,
+    Msdp,
 }
 
 impl TfHookEvent {
@@ -236,6 +238,8 @@ impl TfHookEvent {
             "LOAD" => Some(TfHookEvent::Load),
             "REDEF" => Some(TfHookEvent::Redef),
             "BACKGROUND" => Some(TfHookEvent::Background),
+            "GMCP" => Some(TfHookEvent::Gmcp),
+            "MSDP" => Some(TfHookEvent::Msdp),
             _ => None,
         }
     }
@@ -378,6 +382,7 @@ pub struct WorldInfoCache {
     pub host: String,
     pub port: String,
     pub user: String,
+    pub password: String,
     pub is_connected: bool,
     pub use_ssl: bool,
 }

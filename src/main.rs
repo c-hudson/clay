@@ -49,6 +49,7 @@ pub use encoding::{Encoding, Theme, WorldSwitchMode, convert_discord_emojis, con
 pub use telnet::{
     WriteCommand, StreamReader, StreamWriter, AutoConnectType, KeepAliveType,
     process_telnet, find_safe_split_point, build_naws_subnegotiation, build_ttype_response, TelnetResult,
+    build_gmcp_message, build_msdp_request, build_msdp_set,
     TELNET_IAC, TELNET_NOP, TELNET_GA, TELNET_OPT_NAWS,
 };
 pub use spell::{SpellChecker, SpellState};
@@ -778,6 +779,67 @@ pub fn clay_filename(name: &str) -> String {
     { name.to_string() }
 }
 
+/// Generate a WAV file from ANSI music notes (square wave, matching web client's oscillator)
+fn generate_wav_from_notes(notes: &[crate::ansi_music::MusicNote]) -> Vec<u8> {
+    let sample_rate: u32 = 22050;
+    let mut samples: Vec<i16> = Vec::new();
+
+    for note in notes {
+        let num_samples = (sample_rate as f64 * note.duration_ms as f64 / 1000.0) as usize;
+        if note.frequency <= 0.0 {
+            // Rest/silence
+            samples.extend(std::iter::repeat(0i16).take(num_samples));
+        } else {
+            let period = sample_rate as f64 / note.frequency as f64;
+            for i in 0..num_samples {
+                // Square wave: +amplitude for first half of period, -amplitude for second half
+                let phase = (i as f64 % period) / period;
+                let sample = if phase < 0.5 { 8000i16 } else { -8000i16 };
+                samples.push(sample);
+            }
+        }
+    }
+
+    // Build WAV header + data
+    let data_size = (samples.len() * 2) as u32;
+    let file_size = 36 + data_size;
+    let mut wav = Vec::with_capacity(44 + data_size as usize);
+    wav.extend_from_slice(b"RIFF");
+    wav.extend_from_slice(&file_size.to_le_bytes());
+    wav.extend_from_slice(b"WAVE");
+    wav.extend_from_slice(b"fmt ");
+    wav.extend_from_slice(&16u32.to_le_bytes()); // chunk size
+    wav.extend_from_slice(&1u16.to_le_bytes());  // PCM format
+    wav.extend_from_slice(&1u16.to_le_bytes());  // mono
+    wav.extend_from_slice(&sample_rate.to_le_bytes());
+    wav.extend_from_slice(&(sample_rate * 2).to_le_bytes()); // byte rate
+    wav.extend_from_slice(&2u16.to_le_bytes());  // block align
+    wav.extend_from_slice(&16u16.to_le_bytes()); // bits per sample
+    wav.extend_from_slice(b"data");
+    wav.extend_from_slice(&data_size.to_le_bytes());
+    for s in &samples {
+        wav.extend_from_slice(&s.to_le_bytes());
+    }
+    wav
+}
+
+/// Detect available system media player for console audio playback
+fn detect_media_player() -> Option<String> {
+    for cmd in &["mpv", "ffplay"] {
+        if std::process::Command::new("which")
+            .arg(cmd)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+        {
+            return Some(cmd.to_string());
+        }
+    }
+    None
+}
+
 pub fn enable_tcp_keepalive(tcp_stream: &TcpStream) {
     use socket2::SockRef;
     let keepalive = socket2::TcpKeepalive::new()
@@ -923,6 +985,8 @@ pub struct WorldSettings {
     discord_dm_user: String, // User ID for DM (creates DM channel on connect)
     // User notes (stored per-world, edited with /edit command)
     pub notes: String,
+    // GMCP packages to request (comma-separated, e.g. "Client.Media 1, Char.Vitals 1")
+    pub gmcp_packages: String,
 }
 
 impl Default for WorldSettings {
@@ -947,6 +1011,7 @@ impl Default for WorldSettings {
             discord_channel: String::new(),
             discord_dm_user: String::new(),
             notes: String::new(),
+            gmcp_packages: "Client.Media 1".to_string(),
         }
     }
 }
@@ -1722,6 +1787,13 @@ pub struct World {
     naws_sent_size: Option<(u16, u16)>, // Last sent window size (width, height) to avoid duplicates
     pub next_seq: u64,               // Next sequence number for output lines (for debugging)
     reader_name: Option<String>, // Name used by active reader task (for lookup after rename)
+    pub gmcp_enabled: bool,          // True if GMCP was negotiated with the server
+    pub msdp_enabled: bool,          // True if MSDP was negotiated with the server
+    pub gmcp_supported_packages: Vec<String>, // GMCP packages we told the server we support
+    pub msdp_variables: std::collections::HashMap<String, String>, // MSDP var -> JSON value
+    pub gmcp_data: std::collections::HashMap<String, String>, // GMCP package -> last JSON data
+    pub mcmp_default_url: String,    // MCMP default URL from Client.Media.Default
+    pub gmcp_user_enabled: bool,     // True if user has enabled GMCP processing (F9 toggle)
 }
 
 impl World {
@@ -1782,6 +1854,13 @@ impl World {
             naws_sent_size: None,
             next_seq: 0,
             reader_name: None,
+            gmcp_enabled: false,
+            msdp_enabled: false,
+            gmcp_supported_packages: Vec::new(),
+            msdp_variables: std::collections::HashMap::new(),
+            gmcp_data: std::collections::HashMap::new(),
+            mcmp_default_url: String::new(),
+            gmcp_user_enabled: false,
         }
     }
 
@@ -1894,29 +1973,6 @@ impl World {
         }
     }
 
-    /// Log more-mode debug info to clay.more.log
-    fn log_more_debug(&self, event: &str, line: &str, visual_lines: usize) {
-        use std::io::Write;
-        if let Ok(mut file) = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open("clay.more.log")
-        {
-            let lt = local_time_now();
-            let truncated: String = strip_ansi_codes(line).chars().take(50).collect();
-            let _ = writeln!(
-                file,
-                "[{:02}:{:02}:{:02}] world={} lines_since_pause={} event={} text={:?} [lines:{}]",
-                lt.hour, lt.minute, lt.second,
-                self.name,
-                self.lines_since_pause,
-                event,
-                truncated,
-                visual_lines
-            );
-        }
-    }
-
     #[allow(clippy::too_many_arguments)]
     pub fn add_output(
         &mut self,
@@ -1984,7 +2040,7 @@ impl World {
                     self.output_lines.pop();
                 }
             } else {
-                // Update the partial line with complete content
+                // Update the partial line with combined content
                 if partial_was_in_pending {
                     if let Some(last) = self.pending_lines.last_mut() {
                         last.text = completed_line.to_string();
@@ -1993,6 +2049,15 @@ impl World {
                     last.text = completed_line.to_string();
                 }
             }
+
+            // If the combined text is still partial (no trailing newline) and there's
+            // only one line, we need to preserve the partial tracking. The for loop below
+            // won't run (skip(1) with 1 line), so partial_line must be restored here.
+            if !ends_with_newline && lines.len() == 1 && !should_filter {
+                self.partial_line = completed_line.to_string();
+                self.partial_in_pending = partial_was_in_pending;
+            }
+
             1 // Skip first line since we handled it
         } else {
             0
@@ -2026,8 +2091,68 @@ impl World {
             // Use projected line count (current + this line's visual lines) for pause trigger
             let triggers_pause = !goes_to_pending
                 && settings.more_mode_enabled
-                && (self.lines_since_pause + visual_lines) > max_lines
-                && self.output_lines.len() >= max_lines;
+                && (self.lines_since_pause + visual_lines) > max_lines;
+
+            // Pre-wrap oversized lines: call wrap_ansi_line once and store each visual
+            // line as a separate OutputLine. This caches the wrap result so the renderer
+            // doesn't need to re-wrap, and allows more-mode to paginate per visual line.
+            let needs_split = !is_partial
+                && settings.more_mode_enabled
+                && max_lines > 0
+                && visual_lines > max_lines;
+
+            if needs_split {
+                let wrapped = wrap_ansi_line(line, output_width as usize);
+
+                if goes_to_pending {
+                    // All visual lines go to pending
+                    if self.pending_lines.is_empty() {
+                        self.pending_since = Some(std::time::Instant::now());
+                        if !is_current && self.first_unseen_at.is_none() {
+                            self.first_unseen_at = Some(std::time::Instant::now());
+                        }
+                    }
+                    for vl in &wrapped {
+                        let seq = self.next_seq; self.next_seq += 1;
+                        let cl = if from_server { OutputLine::new(vl.clone(), seq) }
+                                 else { OutputLine::new_client(vl.clone(), seq) };
+                        self.pending_lines.push(cl);
+                    }
+                    if !is_current { self.unseen_lines += wrapped.len(); }
+                } else {
+                    // First max_lines visual lines -> output, rest -> pending
+                    for vl in wrapped.iter().take(max_lines) {
+                        let seq = self.next_seq; self.next_seq += 1;
+                        let fl = if from_server { OutputLine::new(vl.clone(), seq) }
+                                 else { OutputLine::new_client(vl.clone(), seq) };
+                        self.output_lines.push(fl);
+                        self.lines_since_pause += 1; // each pre-wrapped line is 1 visual line
+                    }
+                    if !is_current {
+                        if self.unseen_lines == 0 && self.first_unseen_at.is_none() {
+                            self.first_unseen_at = Some(std::time::Instant::now());
+                        }
+                        self.unseen_lines += wrapped.len().min(max_lines);
+                    }
+                    self.scroll_to_bottom();
+                    self.paused = true;
+
+                    // Remaining visual lines -> pending
+                    if wrapped.len() > max_lines {
+                        if self.pending_lines.is_empty() {
+                            self.pending_since = Some(std::time::Instant::now());
+                        }
+                        for vl in wrapped.iter().skip(max_lines) {
+                            let seq = self.next_seq; self.next_seq += 1;
+                            let cl = if from_server { OutputLine::new(vl.clone(), seq) }
+                                     else { OutputLine::new_client(vl.clone(), seq) };
+                            self.pending_lines.push(cl);
+                            if !is_current { self.unseen_lines += 1; }
+                        }
+                    }
+                }
+                continue;
+            }
 
             // Create OutputLine with appropriate from_server flag
             let seq = self.next_seq;
@@ -2047,7 +2172,7 @@ impl World {
                         self.first_unseen_at = Some(std::time::Instant::now());
                     }
                 }
-                self.log_more_debug("to_pending", line, visual_lines);
+
                 self.pending_lines.push(new_line);
                 if is_partial {
                     self.partial_line = line.to_string();
@@ -2055,7 +2180,6 @@ impl World {
                 }
             } else if triggers_pause {
                 // Add line to output_lines BEFORE pausing so it's visible when we scroll to bottom
-                self.log_more_debug("TRIGGERS_MORE", line, visual_lines);
                 self.output_lines.push(new_line);
                 self.lines_since_pause += visual_lines;
                 if !is_current {
@@ -2073,7 +2197,7 @@ impl World {
                     self.partial_in_pending = false; // It went to output_lines, not pending
                 }
             } else {
-                self.log_more_debug("to_output", line, visual_lines);
+
                 self.output_lines.push(new_line);
                 self.lines_since_pause += visual_lines;
                 if !is_current {
@@ -2097,6 +2221,14 @@ impl World {
                 self.output_lines.append(&mut self.pending_lines);
             }
         }
+        // If paused but nothing in pending, unpause — there's nothing to paginate.
+        // This prevents the world from being stuck paused with no "More" indicator
+        // when a single oversized line triggered the pause.
+        // (lines_since_pause is preserved so the NEXT add_output call will
+        // immediately re-trigger if more data arrives)
+        if self.paused && self.pending_lines.is_empty() {
+            self.paused = false;
+        }
         // Always scroll to bottom unless paused (and more mode is on)
         if !self.paused {
             self.scroll_to_bottom();
@@ -2117,10 +2249,38 @@ impl World {
         self.unseen_lines > 0 || !self.pending_lines.is_empty()
     }
 
-    pub fn release_pending(&mut self, count: usize) {
+    /// Release pending lines, counting by VISUAL lines (wrapped line count) to fill
+    /// approximately one screenful. Always releases at least one logical line.
+    pub fn release_pending(&mut self, visual_budget: usize, output_width: usize) {
+        if self.pending_lines.is_empty() {
+            return;
+        }
+        let width = output_width.max(1);
+        let mut visual_total = 0;
+        let mut logical_count = 0;
+
+        for line in &self.pending_lines {
+            let vl = visual_line_count(&line.text, width);
+            // If adding this line would exceed budget AND we already have at least one,
+            // stop before adding it. Always release at least 1 line.
+            if visual_total > 0 && visual_total + vl > visual_budget {
+                break;
+            }
+            visual_total += vl;
+            logical_count += 1;
+            if visual_total >= visual_budget {
+                break;
+            }
+        }
+
+        // Always release at least 1 line
+        if logical_count == 0 {
+            logical_count = 1;
+        }
+
         let to_release: Vec<OutputLine> = self
             .pending_lines
-            .drain(..count.min(self.pending_lines.len()))
+            .drain(..logical_count.min(self.pending_lines.len()))
             .collect();
         for line in to_release {
             self.output_lines.push(line);
@@ -2128,7 +2288,7 @@ impl World {
         if self.pending_lines.is_empty() {
             self.paused = false;
             self.pending_since = None;
-            self.log_more_debug("RESET_release_pending_all", "", 0);
+
             self.lines_since_pause = 0;
             // If partial was in pending, it's now in output
             if self.partial_in_pending {
@@ -2136,14 +2296,14 @@ impl World {
             }
         } else {
             // Reset counter for next batch
-            self.log_more_debug("RESET_release_pending_batch", "", 0);
+
             self.lines_since_pause = 0;
         }
         self.scroll_to_bottom();
     }
 
     pub fn release_all_pending(&mut self) {
-        self.log_more_debug("RESET_release_all_pending", "", 0);
+
         self.output_lines.append(&mut self.pending_lines);
         self.paused = false;
         self.lines_since_pause = 0;
@@ -2269,6 +2429,14 @@ pub struct App {
     pub server_activity_count: usize,
     /// Master GUI mode: channel to send messages to the embedded GUI
     pub gui_tx: Option<mpsc::UnboundedSender<WsMessage>>,
+    /// Console media player command ("mpv", "ffplay", or None)
+    pub media_player_cmd: Option<String>,
+    /// Directory for cached media files
+    pub media_cache_dir: PathBuf,
+    /// Running media processes keyed by identifier (for Stop) - value is (world_idx, child)
+    pub media_processes: std::collections::HashMap<String, (usize, std::process::Child)>,
+    /// Current music process key (only one music track at a time) - (world_idx, key)
+    pub media_music_key: Option<(usize, String)>,
 }
 
 impl App {
@@ -2317,6 +2485,13 @@ impl App {
             ws_client_tx: None, // Set when running as remote client (--console mode)
             server_activity_count: 0, // Activity count from server (remote client mode)
             gui_tx: None, // Set when running in master GUI mode (--gui)
+            media_player_cmd: detect_media_player(),
+            media_cache_dir: {
+                let home = get_home_dir();
+                PathBuf::from(home).join(clay_filename("clay")).join("media")
+            },
+            media_processes: std::collections::HashMap::new(),
+            media_music_key: None,
         }
         // Note: No initial world created here - it will be created after persistence::load_settings()
         // if no worlds are configured
@@ -2421,6 +2596,7 @@ impl App {
                 host: world.settings.hostname.clone(),
                 port: world.settings.port.clone(),
                 user: world.settings.user.clone(),
+                password: world.settings.password.clone(),
                 is_connected: world.connected,
                 use_ssl: world.settings.use_ssl,
             });
@@ -2633,6 +2809,7 @@ impl App {
             AutoConnectType::Connect => "connect",
             AutoConnectType::Prompt => "prompt",
             AutoConnectType::MooPrompt => "moo_prompt",
+            AutoConnectType::NoLogin => "none",
         };
 
         // Map keep_alive type to lowercase value for popup
@@ -2656,6 +2833,7 @@ impl App {
             auto_connect: auto_connect.to_string(),
             keep_alive: keep_alive.to_string(),
             keep_alive_cmd: world.settings.keep_alive_cmd.clone(),
+            gmcp_packages: world.settings.gmcp_packages.clone(),
             slack_token: world.settings.slack_token.clone(),
             slack_channel: world.settings.slack_channel.clone(),
             slack_workspace: world.settings.slack_workspace.clone(),
@@ -2959,6 +3137,12 @@ impl App {
                 self.show_tags = show_tags;
                 self.needs_output_redraw = true;
             }
+            WsMessage::GmcpUserToggled { world_index, enabled } => {
+                if world_index < self.worlds.len() {
+                    self.worlds[world_index].gmcp_user_enabled = enabled;
+                    self.needs_output_redraw = true;
+                }
+            }
             WsMessage::ConnectionsListResponse { lines } => {
                 // Display the connections list from server
                 let was_at_bottom = self.current_world().is_at_bottom();
@@ -3132,6 +3316,7 @@ impl App {
             world.paused = w.paused;
             world.prompt = w.prompt;
             world.showing_splash = w.showing_splash;
+            world.gmcp_user_enabled = w.gmcp_user_enabled;
             world.settings = WorldSettings {
                 hostname: w.settings.hostname,
                 port: w.settings.port,
@@ -3184,6 +3369,8 @@ impl App {
 
     pub fn switch_world(&mut self, index: usize) {
         if index < self.worlds.len() && index != self.current_world_index {
+            // Stop media for old world (audio only plays for current world)
+            self.stop_world_media(self.current_world_index);
             // Reset lines_since_pause for the old world if more-mode hasn't triggered
             let old_index = self.current_world_index;
             if self.worlds[old_index].pending_lines.is_empty() {
@@ -3507,6 +3694,195 @@ impl App {
         }
     }
 
+    /// Handle GMCP Client.Media.* messages (MCMP protocol)
+    fn handle_gmcp_media(&mut self, world_idx: usize, package: &str, json_data: &str) {
+        match package {
+            "Client.Media.Default" => {
+                // Store default URL for resolving relative media paths
+                if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(json_data) {
+                    if let Some(url) = parsed.get("url").and_then(|v| v.as_str()) {
+                        self.worlds[world_idx].mcmp_default_url = url.to_string();
+                    }
+                }
+            }
+            "Client.Media.Play" | "Client.Media.Stop" | "Client.Media.Load" => {
+                let action = package.rsplit('.').next().unwrap_or("Play").to_string();
+                let default_url = self.worlds[world_idx].mcmp_default_url.clone();
+                // Console audio playback
+                if let Some(ref player_cmd) = self.media_player_cmd {
+                    if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(json_data) {
+                        let name = parsed.get("name").and_then(|v| v.as_str()).unwrap_or("");
+                        let url = parsed.get("url").and_then(|v| v.as_str()).unwrap_or("");
+                        let media_type = parsed.get("type").and_then(|v| v.as_str()).unwrap_or("sound");
+                        let key = parsed.get("key").and_then(|v| v.as_str()).unwrap_or(name);
+                        let volume = parsed.get("volume").and_then(|v| v.as_i64()).unwrap_or(50);
+                        let loops = parsed.get("loops").and_then(|v| v.as_i64()).unwrap_or(1);
+                        let cont = parsed.get("continue").and_then(|v| v.as_bool()).unwrap_or(false);
+
+                        match action.as_str() {
+                            "Play" => {
+                                // Resolve full URL
+                                let full_url = if !url.is_empty() {
+                                    format!("{}{}", url, name)
+                                } else if !default_url.is_empty() {
+                                    format!("{}{}", default_url, name)
+                                } else if !name.is_empty() {
+                                    name.to_string()
+                                } else {
+                                    return;
+                                };
+
+                                // For music type: stop previous music (unless continue)
+                                if media_type == "music" {
+                                    if cont {
+                                        // If continuing and same key, skip
+                                        if self.media_music_key.as_ref().map(|(_, k)| k.as_str()) == Some(key) {
+                                            return;
+                                        }
+                                    }
+                                    // Stop previous music
+                                    if let Some((_, prev_key)) = self.media_music_key.take() {
+                                        if let Some((_, mut child)) = self.media_processes.remove(&prev_key) {
+                                            let _ = child.kill();
+                                        }
+                                    }
+                                }
+
+                                // Cache dir setup
+                                let _ = std::fs::create_dir_all(&self.media_cache_dir);
+
+                                // Create a safe filename from the URL
+                                let safe_name = full_url.replace(|c: char| !c.is_alphanumeric() && c != '.', "_");
+                                let cache_path = self.media_cache_dir.join(&safe_name);
+
+                                let player = player_cmd.clone();
+                                let key_owned = key.to_string();
+                                let cache_path_str = cache_path.to_string_lossy().to_string();
+
+                                // Download and play in a blocking thread
+                                let vol = volume;
+                                let loop_count = loops;
+                                let is_music = media_type == "music";
+
+                                // Use a channel to send back the child process
+                                let (child_tx, child_rx) = std::sync::mpsc::channel();
+
+                                std::thread::spawn(move || {
+                                    // Download if not cached
+                                    if !cache_path.exists() {
+                                        let output = std::process::Command::new("curl")
+                                            .args(["-sL", "-o", &cache_path_str, &full_url])
+                                            .output();
+                                        if output.is_err() || !cache_path.exists() {
+                                            return;
+                                        }
+                                    }
+                                    // Build player command
+                                    let mut cmd = std::process::Command::new(&player);
+                                    match player.as_str() {
+                                        "mpv" => {
+                                            cmd.args(["--no-video", "--no-terminal"]);
+                                            cmd.arg(format!("--volume={}", vol));
+                                            if loop_count == -1 {
+                                                cmd.arg("--loop=inf");
+                                            } else if loop_count > 1 {
+                                                cmd.arg(format!("--loop={}", loop_count));
+                                            }
+                                        }
+                                        "ffplay" => {
+                                            cmd.args(["-nodisp", "-autoexit"]);
+                                            cmd.arg("-volume").arg(format!("{}", vol));
+                                            if loop_count == -1 || loop_count > 1 {
+                                                cmd.arg("-loop").arg(
+                                                    if loop_count == -1 { "0".to_string() }
+                                                    else { loop_count.to_string() }
+                                                );
+                                            }
+                                        }
+                                        _ => {}
+                                    }
+                                    cmd.arg(&cache_path_str);
+                                    cmd.stdout(std::process::Stdio::null());
+                                    cmd.stderr(std::process::Stdio::null());
+                                    if let Ok(child) = cmd.spawn() {
+                                        let _ = child_tx.send((key_owned.clone(), child, is_music));
+                                    }
+                                });
+
+                                // Try to receive the child (non-blocking, will be picked up on next tick)
+                                if let Ok((k, child, is_music_flag)) = child_rx.recv_timeout(std::time::Duration::from_millis(100)) {
+                                    if is_music_flag {
+                                        self.media_music_key = Some((world_idx, k.clone()));
+                                    }
+                                    self.media_processes.insert(k, (world_idx, child));
+                                }
+                            }
+                            "Stop" => {
+                                if !key.is_empty() {
+                                    if let Some((_, mut child)) = self.media_processes.remove(key) {
+                                        let _ = child.kill();
+                                    }
+                                    if self.media_music_key.as_ref().map(|(_, k)| k.as_str()) == Some(key) {
+                                        self.media_music_key = None;
+                                    }
+                                } else if media_type == "music" {
+                                    // Stop all music
+                                    if let Some((_, mk)) = self.media_music_key.take() {
+                                        if let Some((_, mut child)) = self.media_processes.remove(&mk) {
+                                            let _ = child.kill();
+                                        }
+                                    }
+                                }
+                            }
+                            "Load" => {
+                                // Pre-cache only, no playback
+                                let full_url = if !url.is_empty() {
+                                    format!("{}{}", url, name)
+                                } else if !default_url.is_empty() {
+                                    format!("{}{}", default_url, name)
+                                } else {
+                                    return;
+                                };
+                                let _ = std::fs::create_dir_all(&self.media_cache_dir);
+                                let safe_name = full_url.replace(|c: char| !c.is_alphanumeric() && c != '.', "_");
+                                let cache_path_str = self.media_cache_dir.join(&safe_name).to_string_lossy().to_string();
+                                std::thread::spawn(move || {
+                                    let _ = std::process::Command::new("curl")
+                                        .args(["-sL", "-o", &cache_path_str, &full_url])
+                                        .stdout(std::process::Stdio::null())
+                                        .stderr(std::process::Stdio::null())
+                                        .status();
+                                });
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+            }
+            _ => {} // Other GMCP packages handled by hook system
+        }
+    }
+
+    /// Stop all media processes for a specific world
+    fn stop_world_media(&mut self, world_idx: usize) {
+        // Kill media processes belonging to this world
+        let keys_to_remove: Vec<String> = self.media_processes.iter()
+            .filter(|(_, (idx, _))| *idx == world_idx)
+            .map(|(k, _)| k.clone())
+            .collect();
+        for key in keys_to_remove {
+            if let Some((_, mut child)) = self.media_processes.remove(&key) {
+                let _ = child.kill();
+            }
+        }
+        // Clear music key if it belongs to this world
+        if let Some((idx, _)) = &self.media_music_key {
+            if *idx == world_idx {
+                self.media_music_key = None;
+            }
+        }
+    }
+
     /// Broadcast a message to all authenticated WebSocket clients and the embedded GUI (if any)
     fn ws_broadcast(&self, msg: WsMessage) {
         // Send to embedded GUI channel (master GUI mode)
@@ -3674,11 +4050,37 @@ impl App {
         };
 
         // Broadcast music to WebSocket clients (web/GUI play audio)
-        for notes in music_sequences {
+        for notes in &music_sequences {
             self.ws_broadcast(WsMessage::AnsiMusic {
                 world_index: world_idx,
-                notes,
+                notes: notes.clone(),
             });
+        }
+
+        // Console ANSI music playback via system player
+        if !music_sequences.is_empty() {
+            if let Some(ref player_cmd) = self.media_player_cmd {
+                for notes in &music_sequences {
+                    let wav_data = generate_wav_from_notes(notes);
+                    let _ = std::fs::create_dir_all(&self.media_cache_dir);
+                    let wav_path = self.media_cache_dir.join("ansi_music.wav");
+                    if std::fs::write(&wav_path, &wav_data).is_ok() {
+                        let wav_path_str = wav_path.to_string_lossy().to_string();
+                        let player = player_cmd.clone();
+                        std::thread::spawn(move || {
+                            let mut cmd = std::process::Command::new(&player);
+                            match player.as_str() {
+                                "mpv" => { cmd.args(["--no-video", "--no-terminal", &wav_path_str]); }
+                                "ffplay" => { cmd.args(["-nodisp", "-autoexit", &wav_path_str]); }
+                                _ => { cmd.arg(&wav_path_str); }
+                            }
+                            cmd.stdout(std::process::Stdio::null());
+                            cmd.stderr(std::process::Stdio::null());
+                            let _ = cmd.status();
+                        });
+                    }
+                }
+            }
         }
 
         let world_name_for_triggers = self.worlds[world_idx].name.clone();
@@ -4001,6 +4403,7 @@ impl App {
                     auto_connect_type: world.settings.auto_connect_type.name().to_string(),
                     keep_alive_type: world.settings.keep_alive_type.name().to_string(),
                     keep_alive_cmd: world.settings.keep_alive_cmd.clone(),
+                    gmcp_packages: world.settings.gmcp_packages.clone(),
                 },
                 last_send_secs: world.last_send_time.map(|t| t.elapsed().as_secs()),
                 last_recv_secs: world.last_receive_time.map(|t| t.elapsed().as_secs()),
@@ -4009,6 +4412,7 @@ impl App {
                 showing_splash: world.showing_splash,
                 was_connected: world.was_connected,
                 is_proxy: world.proxy_pid.is_some(),
+                gmcp_user_enabled: world.gmcp_user_enabled,
             }
         }).collect();
 
@@ -4500,6 +4904,11 @@ pub enum AppEvent {
     // Slack/Discord events
     SlackMessage(String, String), // world_name, formatted message
     DiscordMessage(String, String), // world_name, formatted message
+    // GMCP/MSDP events
+    GmcpNegotiated(String),                   // world_name
+    MsdpNegotiated(String),                   // world_name
+    GmcpReceived(String, String, String),     // world_name, package, json_data
+    MsdpReceived(String, String, String),     // world_name, variable, value_json
 }
 
 /// Per-user connection state for multiuser mode
@@ -5782,6 +6191,7 @@ fn handle_remote_client_key(
                     app.worlds[idx].settings.auto_connect_type = AutoConnectType::from_name(&settings.auto_connect);
                     app.worlds[idx].settings.keep_alive_type = KeepAliveType::from_name(&settings.keep_alive);
                     app.worlds[idx].settings.keep_alive_cmd = settings.keep_alive_cmd.clone();
+                    app.worlds[idx].settings.gmcp_packages = settings.gmcp_packages.clone();
 
                     // Send UpdateWorldSettings to daemon
                     let _ = ws_tx.send(WsMessage::UpdateWorldSettings {
@@ -5797,6 +6207,7 @@ fn handle_remote_client_key(
                         auto_login: settings.auto_connect,
                         keep_alive_type: settings.keep_alive,
                         keep_alive_cmd: settings.keep_alive_cmd,
+                        gmcp_packages: settings.gmcp_packages,
                     });
                 }
             }
@@ -6097,6 +6508,19 @@ fn handle_remote_client_key(
             app.highlight_actions = !app.highlight_actions;
             app.needs_output_redraw = true;
         }
+        (_, KeyCode::F(9)) => {
+            // Toggle GMCP user processing for current world
+            let idx = app.current_world_index;
+            app.worlds[idx].gmcp_user_enabled = !app.worlds[idx].gmcp_user_enabled;
+            if !app.worlds[idx].gmcp_user_enabled {
+                app.stop_world_media(idx);
+            }
+            app.needs_output_redraw = true;
+            app.ws_broadcast(WsMessage::GmcpUserToggled {
+                world_index: idx,
+                enabled: app.worlds[idx].gmcp_user_enabled,
+            });
+        }
         (_, Char(c)) => {
             app.input.insert_char(c);
             app.last_input_was_delete = false;
@@ -6183,6 +6607,7 @@ struct WorldEditorSettings {
     auto_connect: String,
     keep_alive: String,
     keep_alive_cmd: String,
+    gmcp_packages: String,
     // Slack fields
     slack_token: String,
     slack_channel: String,
@@ -6244,6 +6669,7 @@ fn handle_new_popup_key(app: &mut App, key: KeyEvent) -> NewPopupAction {
         WORLD_FIELD_NAME, WORLD_FIELD_TYPE, WORLD_FIELD_HOSTNAME, WORLD_FIELD_PORT,
         WORLD_FIELD_USER, WORLD_FIELD_PASSWORD, WORLD_FIELD_USE_SSL, WORLD_FIELD_LOG_ENABLED,
         WORLD_FIELD_ENCODING, WORLD_FIELD_AUTO_CONNECT, WORLD_FIELD_KEEP_ALIVE, WORLD_FIELD_KEEP_ALIVE_CMD,
+        WORLD_FIELD_GMCP_PACKAGES,
         WORLD_FIELD_SLACK_TOKEN, WORLD_FIELD_SLACK_CHANNEL, WORLD_FIELD_SLACK_WORKSPACE,
         WORLD_FIELD_DISCORD_TOKEN, WORLD_FIELD_DISCORD_GUILD, WORLD_FIELD_DISCORD_CHANNEL, WORLD_FIELD_DISCORD_DM_USER,
         WORLD_BTN_SAVE, WORLD_BTN_CANCEL, WORLD_BTN_DELETE, WORLD_BTN_CONNECT,
@@ -7225,6 +7651,7 @@ fn handle_new_popup_key(app: &mut App, key: KeyEvent) -> NewPopupAction {
                     auto_connect: state.get_selected(WORLD_FIELD_AUTO_CONNECT).unwrap_or("connect").to_string(),
                     keep_alive: state.get_selected(WORLD_FIELD_KEEP_ALIVE).unwrap_or("nop").to_string(),
                     keep_alive_cmd: state.get_text(WORLD_FIELD_KEEP_ALIVE_CMD).unwrap_or("").to_string(),
+                    gmcp_packages: state.get_text(WORLD_FIELD_GMCP_PACKAGES).unwrap_or("Client.Media 1").to_string(),
                     slack_token: state.get_text(WORLD_FIELD_SLACK_TOKEN).unwrap_or("").to_string(),
                     slack_channel: state.get_text(WORLD_FIELD_SLACK_CHANNEL).unwrap_or("").to_string(),
                     slack_workspace: state.get_text(WORLD_FIELD_SLACK_WORKSPACE).unwrap_or("").to_string(),
@@ -8558,6 +8985,112 @@ pub async fn run_app_headless(
                             app.add_output_to_world(world_idx, &format!("Connection failed: {}", error));
                         }
                     }
+                    AppEvent::GmcpNegotiated(ref world_name) => {
+                        if let Some(world_idx) = app.find_world_index(world_name) {
+                            app.worlds[world_idx].gmcp_enabled = true;
+                            let packages_str = app.worlds[world_idx].settings.gmcp_packages.clone();
+                            let packages: Vec<String> = packages_str
+                                .split(',')
+                                .map(|s| s.trim().to_string())
+                                .filter(|s| !s.is_empty())
+                                .collect();
+                            app.worlds[world_idx].gmcp_supported_packages = packages.clone();
+                            if let Some(ref tx) = app.worlds[world_idx].command_tx {
+                                let hello = build_gmcp_message("Core.Hello", &format!(
+                                    "{{\"client\":\"Clay\",\"version\":\"{}\"}}",
+                                    VERSION
+                                ));
+                                let _ = tx.try_send(WriteCommand::Raw(hello));
+                                let json_list: Vec<String> = packages.iter()
+                                    .map(|p| format!("\"{}\"", p))
+                                    .collect();
+                                let supports = build_gmcp_message(
+                                    "Core.Supports.Set",
+                                    &format!("[{}]", json_list.join(",")),
+                                );
+                                let _ = tx.try_send(WriteCommand::Raw(supports));
+                            }
+                        }
+                    }
+                    AppEvent::MsdpNegotiated(ref world_name) => {
+                        if let Some(world_idx) = app.find_world_index(world_name) {
+                            app.worlds[world_idx].msdp_enabled = true;
+                        }
+                    }
+                    AppEvent::GmcpReceived(ref world_name, ref package, ref json_data) => {
+                        if let Some(world_idx) = app.find_world_index(world_name) {
+                            // Always store GMCP data
+                            app.worlds[world_idx].gmcp_data.insert(package.clone(), json_data.clone());
+                            // Always store Client.Media.Default URL (just URL storage, no playback)
+                            if package == "Client.Media.Default" {
+                                if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(json_data) {
+                                    if let Some(url) = parsed.get("url").and_then(|v| v.as_str()) {
+                                        app.worlds[world_idx].mcmp_default_url = url.to_string();
+                                    }
+                                }
+                            }
+                            // Always broadcast to remote clients (they decide locally)
+                            app.ws_broadcast(WsMessage::GmcpData {
+                                world_index: world_idx,
+                                package: package.clone(),
+                                data: json_data.clone(),
+                            });
+                            if package.starts_with("Client.Media.") {
+                                let action = package.rsplit('.').next().unwrap_or("Play").to_string();
+                                let default_url = app.worlds[world_idx].mcmp_default_url.clone();
+                                app.ws_broadcast(WsMessage::McmpMedia {
+                                    world_index: world_idx,
+                                    action,
+                                    data: json_data.clone(),
+                                    default_url,
+                                });
+                            }
+                            // Gate on gmcp_user_enabled
+                            if app.worlds[world_idx].gmcp_user_enabled {
+                                // Console media: only for current world
+                                if world_idx == app.current_world_index {
+                                    let package_clone = package.clone();
+                                    let json_clone = json_data.clone();
+                                    app.handle_gmcp_media(world_idx, &package_clone, &json_clone);
+                                }
+                                // TF hooks
+                                app.tf_engine.set_global("gmcp_package", crate::tf::TfValue::String(package.clone()));
+                                app.tf_engine.set_global("gmcp_data", crate::tf::TfValue::String(json_data.clone()));
+                                let results = crate::tf::hooks::fire_hook(&mut app.tf_engine, crate::tf::TfHookEvent::Gmcp);
+                                for r in results {
+                                    if let crate::tf::TfCommandResult::SendToMud(text) = r {
+                                        if let Some(world) = app.worlds.get(world_idx) {
+                                            if let Some(ref tx) = world.command_tx {
+                                                let _ = tx.try_send(WriteCommand::Text(text));
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    AppEvent::MsdpReceived(ref world_name, ref variable, ref value_json) => {
+                        if let Some(world_idx) = app.find_world_index(world_name) {
+                            app.worlds[world_idx].msdp_variables.insert(variable.clone(), value_json.clone());
+                            app.tf_engine.set_global("msdp_var", crate::tf::TfValue::String(variable.clone()));
+                            app.tf_engine.set_global("msdp_val", crate::tf::TfValue::String(value_json.clone()));
+                            let results = crate::tf::hooks::fire_hook(&mut app.tf_engine, crate::tf::TfHookEvent::Msdp);
+                            for r in results {
+                                if let crate::tf::TfCommandResult::SendToMud(text) = r {
+                                    if let Some(world) = app.worlds.get(world_idx) {
+                                        if let Some(ref tx) = world.command_tx {
+                                            let _ = tx.try_send(WriteCommand::Text(text));
+                                        }
+                                    }
+                                }
+                            }
+                            app.ws_broadcast(WsMessage::MsdpData {
+                                world_index: world_idx,
+                                variable: variable.clone(),
+                                value: value_json.clone(),
+                            });
+                        }
+                    }
                     _ => {}
                 }
             }
@@ -8683,7 +9216,7 @@ pub async fn run_app_headless(
                                                     _ => None,
                                                 }
                                             }
-                                            AutoConnectType::Connect => None,
+                                            AutoConnectType::Connect | AutoConnectType::NoLogin => None,
                                         };
 
                                         if let Some(cmd) = cmd_to_send {
@@ -8994,6 +9527,18 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                     if result.telnet_detected {
                                         let _ = event_tx_read.send(AppEvent::TelnetDetected(world_name.clone())).await;
                                     }
+                                    if result.gmcp_negotiated {
+                                        let _ = event_tx_read.send(AppEvent::GmcpNegotiated(world_name.clone())).await;
+                                    }
+                                    if result.msdp_negotiated {
+                                        let _ = event_tx_read.send(AppEvent::MsdpNegotiated(world_name.clone())).await;
+                                    }
+                                    for (pkg, json) in &result.gmcp_data {
+                                        let _ = event_tx_read.send(AppEvent::GmcpReceived(world_name.clone(), pkg.clone(), json.clone())).await;
+                                    }
+                                    for (var, val) in &result.msdp_data {
+                                        let _ = event_tx_read.send(AppEvent::MsdpReceived(world_name.clone(), var.clone(), val.clone())).await;
+                                    }
                                     // Send prompt FIRST for immediate auto-login response
                                     if let Some(prompt_bytes) = result.prompt {
                                         let _ = event_tx_read.send(AppEvent::Prompt(world_name.clone(), prompt_bytes)).await;
@@ -9057,6 +9602,20 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                         let _ = event_tx_read
                                             .send(AppEvent::TtypeRequested(world_name.clone()))
                                             .await;
+                                    }
+
+                                    // Notify GMCP/MSDP negotiation and data
+                                    if result.gmcp_negotiated {
+                                        let _ = event_tx_read.send(AppEvent::GmcpNegotiated(world_name.clone())).await;
+                                    }
+                                    if result.msdp_negotiated {
+                                        let _ = event_tx_read.send(AppEvent::MsdpNegotiated(world_name.clone())).await;
+                                    }
+                                    for (pkg, json) in &result.gmcp_data {
+                                        let _ = event_tx_read.send(AppEvent::GmcpReceived(world_name.clone(), pkg.clone(), json.clone())).await;
+                                    }
+                                    for (var, val) in &result.msdp_data {
+                                        let _ = event_tx_read.send(AppEvent::MsdpReceived(world_name.clone(), var.clone(), val.clone())).await;
                                     }
 
                                     // Send prompt FIRST if detected via telnet GA/EOR
@@ -9205,6 +9764,18 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                             if result.telnet_detected {
                                                 let _ = event_tx_read.send(AppEvent::TelnetDetected(world_name.clone())).await;
                                             }
+                                            if result.gmcp_negotiated {
+                                                let _ = event_tx_read.send(AppEvent::GmcpNegotiated(world_name.clone())).await;
+                                            }
+                                            if result.msdp_negotiated {
+                                                let _ = event_tx_read.send(AppEvent::MsdpNegotiated(world_name.clone())).await;
+                                            }
+                                            for (pkg, json) in &result.gmcp_data {
+                                                let _ = event_tx_read.send(AppEvent::GmcpReceived(world_name.clone(), pkg.clone(), json.clone())).await;
+                                            }
+                                            for (var, val) in &result.msdp_data {
+                                                let _ = event_tx_read.send(AppEvent::MsdpReceived(world_name.clone(), var.clone(), val.clone())).await;
+                                            }
                                             if let Some(prompt_bytes) = result.prompt {
                                                 let _ = event_tx_read.send(AppEvent::Prompt(world_name.clone(), prompt_bytes)).await;
                                             }
@@ -9238,6 +9809,18 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                             }
                                             if result.ttype_requested {
                                                 let _ = event_tx_read.send(AppEvent::TtypeRequested(world_name.clone())).await;
+                                            }
+                                            if result.gmcp_negotiated {
+                                                let _ = event_tx_read.send(AppEvent::GmcpNegotiated(world_name.clone())).await;
+                                            }
+                                            if result.msdp_negotiated {
+                                                let _ = event_tx_read.send(AppEvent::MsdpNegotiated(world_name.clone())).await;
+                                            }
+                                            for (pkg, json) in &result.gmcp_data {
+                                                let _ = event_tx_read.send(AppEvent::GmcpReceived(world_name.clone(), pkg.clone(), json.clone())).await;
+                                            }
+                                            for (var, val) in &result.msdp_data {
+                                                let _ = event_tx_read.send(AppEvent::MsdpReceived(world_name.clone(), var.clone(), val.clone())).await;
                                             }
                                             if let Some(prompt_bytes) = result.prompt {
                                                 let _ = event_tx_read.send(AppEvent::Prompt(world_name.clone(), prompt_bytes)).await;
@@ -10055,6 +10638,115 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                             }
                         }
                     }
+                    AppEvent::GmcpNegotiated(ref world_name) => {
+                        if let Some(world_idx) = app.find_world_index(world_name) {
+                            app.worlds[world_idx].gmcp_enabled = true;
+                            // Build supports list from world settings
+                            let packages_str = app.worlds[world_idx].settings.gmcp_packages.clone();
+                            let packages: Vec<String> = packages_str
+                                .split(',')
+                                .map(|s| s.trim().to_string())
+                                .filter(|s| !s.is_empty())
+                                .collect();
+                            app.worlds[world_idx].gmcp_supported_packages = packages.clone();
+                            // Send Core.Hello and Core.Supports.Set
+                            if let Some(ref tx) = app.worlds[world_idx].command_tx {
+                                let hello = build_gmcp_message("Core.Hello", &format!(
+                                    "{{\"client\":\"Clay\",\"version\":\"{}\"}}",
+                                    VERSION
+                                ));
+                                let _ = tx.try_send(WriteCommand::Raw(hello));
+                                let json_list: Vec<String> = packages.iter()
+                                    .map(|p| format!("\"{}\"", p))
+                                    .collect();
+                                let supports = build_gmcp_message(
+                                    "Core.Supports.Set",
+                                    &format!("[{}]", json_list.join(",")),
+                                );
+                                let _ = tx.try_send(WriteCommand::Raw(supports));
+                            }
+                        }
+                    }
+                    AppEvent::MsdpNegotiated(ref world_name) => {
+                        if let Some(world_idx) = app.find_world_index(world_name) {
+                            app.worlds[world_idx].msdp_enabled = true;
+                        }
+                    }
+                    AppEvent::GmcpReceived(ref world_name, ref package, ref json_data) => {
+                        if let Some(world_idx) = app.find_world_index(world_name) {
+                            // Always store GMCP data
+                            app.worlds[world_idx].gmcp_data.insert(package.clone(), json_data.clone());
+                            // Always store Client.Media.Default URL
+                            if package == "Client.Media.Default" {
+                                if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(json_data) {
+                                    if let Some(url) = parsed.get("url").and_then(|v| v.as_str()) {
+                                        app.worlds[world_idx].mcmp_default_url = url.to_string();
+                                    }
+                                }
+                            }
+                            // Always broadcast to remote clients
+                            app.ws_broadcast(WsMessage::GmcpData {
+                                world_index: world_idx,
+                                package: package.clone(),
+                                data: json_data.clone(),
+                            });
+                            if package.starts_with("Client.Media.") {
+                                let action = package.rsplit('.').next().unwrap_or("Play").to_string();
+                                let default_url = app.worlds[world_idx].mcmp_default_url.clone();
+                                app.ws_broadcast(WsMessage::McmpMedia {
+                                    world_index: world_idx,
+                                    action,
+                                    data: json_data.clone(),
+                                    default_url,
+                                });
+                            }
+                            // Gate on gmcp_user_enabled
+                            if app.worlds[world_idx].gmcp_user_enabled {
+                                if world_idx == app.current_world_index {
+                                    let package_clone = package.clone();
+                                    let json_clone = json_data.clone();
+                                    app.handle_gmcp_media(world_idx, &package_clone, &json_clone);
+                                }
+                                app.tf_engine.set_global("gmcp_package", crate::tf::TfValue::String(package.clone()));
+                                app.tf_engine.set_global("gmcp_data", crate::tf::TfValue::String(json_data.clone()));
+                                let results = crate::tf::hooks::fire_hook(&mut app.tf_engine, crate::tf::TfHookEvent::Gmcp);
+                                for r in results {
+                                    if let crate::tf::TfCommandResult::SendToMud(text) = r {
+                                        if let Some(world) = app.worlds.get(world_idx) {
+                                            if let Some(ref tx) = world.command_tx {
+                                                let _ = tx.try_send(WriteCommand::Text(text));
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    AppEvent::MsdpReceived(ref world_name, ref variable, ref value_json) => {
+                        if let Some(world_idx) = app.find_world_index(world_name) {
+                            // Store MSDP variable
+                            app.worlds[world_idx].msdp_variables.insert(variable.clone(), value_json.clone());
+                            // Fire TF MSDP hook
+                            app.tf_engine.set_global("msdp_var", crate::tf::TfValue::String(variable.clone()));
+                            app.tf_engine.set_global("msdp_val", crate::tf::TfValue::String(value_json.clone()));
+                            let results = crate::tf::hooks::fire_hook(&mut app.tf_engine, crate::tf::TfHookEvent::Msdp);
+                            for r in results {
+                                if let crate::tf::TfCommandResult::SendToMud(text) = r {
+                                    if let Some(world) = app.worlds.get(world_idx) {
+                                        if let Some(ref tx) = world.command_tx {
+                                            let _ = tx.try_send(WriteCommand::Text(text));
+                                        }
+                                    }
+                                }
+                            }
+                            // Broadcast to WebSocket clients
+                            app.ws_broadcast(WsMessage::MsdpData {
+                                world_index: world_idx,
+                                variable: variable.clone(),
+                                value: value_json.clone(),
+                            });
+                        }
+                    }
                     AppEvent::Prompt(ref world_name, prompt_bytes) => {
                         if let Some(world_idx) = app.find_world_index(world_name) {
                             app.worlds[world_idx].last_receive_time = Some(std::time::Instant::now());
@@ -10109,7 +10801,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                             _ => None,
                                         }
                                     }
-                                    AutoConnectType::Connect => None,
+                                    AutoConnectType::Connect | AutoConnectType::NoLogin => None,
                                 };
 
                                 if let Some(cmd) = cmd_to_send {
@@ -11245,8 +11937,35 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                 if world_index < app.worlds.len() {
                                     let pending_count = app.worlds[world_index].pending_lines.len();
                                     if pending_count > 0 {
-                                        // Determine how many lines to release
-                                        let to_release = if count == 0 { pending_count } else { count.min(pending_count) };
+                                        // Get client's output width for visual line calculation
+                                        let client_width = app.ws_client_worlds.get(&client_id)
+                                            .and_then(|s| s.dimensions)
+                                            .map(|(w, _)| w as usize)
+                                            .unwrap_or(app.output_width as usize);
+
+                                        // count == 0 means release all; otherwise treat count as visual budget
+                                        let visual_budget = if count == 0 { usize::MAX } else { count };
+
+                                        // Pre-calculate logical lines to release (same logic as release_pending)
+                                        let width = client_width.max(1);
+                                        let mut visual_total = 0;
+                                        let mut logical_count = 0;
+                                        for line in &app.worlds[world_index].pending_lines {
+                                            let vl = visual_line_count(&line.text, width);
+                                            if visual_total > 0 && visual_total + vl > visual_budget {
+                                                break;
+                                            }
+                                            visual_total += vl;
+                                            logical_count += 1;
+                                            if visual_total >= visual_budget {
+                                                break;
+                                            }
+                                        }
+                                        if logical_count == 0 && pending_count > 0 {
+                                            logical_count = 1;
+                                        }
+                                        // For release-all, cap at pending_count
+                                        let to_release = logical_count.min(pending_count);
 
                                         // Get the lines that will be released (for broadcasting as ServerData)
                                         let lines_to_broadcast: Vec<String> = app.worlds[world_index]
@@ -11257,7 +11976,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                             .collect();
 
                                         // Release the lines on the server
-                                        app.worlds[world_index].release_pending(to_release);
+                                        app.worlds[world_index].release_pending(visual_budget, client_width);
 
                                         // Broadcast the released lines to clients viewing this world
                                         if !lines_to_broadcast.is_empty() {
@@ -11267,7 +11986,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                                 data: ws_data,
                                                 is_viewed: true,
                                                 ts: current_timestamp_secs(),
-                                                from_server: false,
+                                                from_server: true,
                                             });
                                         }
 
@@ -11286,7 +12005,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                     }
                                 }
                             }
-                            WsMessage::UpdateWorldSettings { world_index, name, hostname, port, user, password, use_ssl, log_enabled, encoding, auto_login, keep_alive_type, keep_alive_cmd } => {
+                            WsMessage::UpdateWorldSettings { world_index, name, hostname, port, user, password, use_ssl, log_enabled, encoding, auto_login, keep_alive_type, keep_alive_cmd, gmcp_packages } => {
                                 // Update world settings from remote client
                                 if world_index < app.worlds.len() {
                                     app.worlds[world_index].name = name.clone();
@@ -11304,6 +12023,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                     app.worlds[world_index].settings.auto_connect_type = AutoConnectType::from_name(&auto_login);
                                     app.worlds[world_index].settings.keep_alive_type = KeepAliveType::from_name(&keep_alive_type);
                                     app.worlds[world_index].settings.keep_alive_cmd = keep_alive_cmd.clone();
+                                    app.worlds[world_index].settings.gmcp_packages = gmcp_packages.clone();
                                     // Save settings to persist changes
                                     let _ = persistence::save_settings(&app);
                                     // Build settings message for broadcast (encrypt password)
@@ -11318,6 +12038,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                         auto_connect_type: auto_login,
                                         keep_alive_type,
                                         keep_alive_cmd,
+                                        gmcp_packages,
                                     };
                                     // Broadcast update to all clients
                                     app.ws_broadcast(WsMessage::WorldSettingsUpdated {
@@ -11812,6 +12533,35 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                     });
                                 }
                             }
+                            WsMessage::ToggleWorldGmcp { world_index } => {
+                                if world_index < app.worlds.len() {
+                                    app.worlds[world_index].gmcp_user_enabled = !app.worlds[world_index].gmcp_user_enabled;
+                                    if !app.worlds[world_index].gmcp_user_enabled {
+                                        app.stop_world_media(world_index);
+                                    }
+                                    app.needs_output_redraw = true;
+                                    app.ws_broadcast(WsMessage::GmcpUserToggled {
+                                        world_index,
+                                        enabled: app.worlds[world_index].gmcp_user_enabled,
+                                    });
+                                }
+                            }
+                            WsMessage::SendGmcp { world_index, ref package, ref data } => {
+                                if world_index < app.worlds.len() {
+                                    if let Some(ref tx) = app.worlds[world_index].command_tx {
+                                        let msg = build_gmcp_message(package, data);
+                                        let _ = tx.try_send(WriteCommand::Raw(msg));
+                                    }
+                                }
+                            }
+                            WsMessage::SendMsdp { world_index, ref variable, ref value } => {
+                                if world_index < app.worlds.len() {
+                                    if let Some(ref tx) = app.worlds[world_index].command_tx {
+                                        let msg = build_msdp_set(variable, value);
+                                        let _ = tx.try_send(WriteCommand::Raw(msg));
+                                    }
+                                }
+                            }
                             _ => {
                                 // Other message types handled elsewhere or ignored
                             }
@@ -12007,7 +12757,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                                     _ => None,
                                                 }
                                             }
-                                            AutoConnectType::Connect => None,
+                                            AutoConnectType::Connect | AutoConnectType::NoLogin => None,
                                         };
 
                                         if let Some(cmd) = cmd_to_send {
@@ -12613,7 +13363,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                         _ => None,
                                     }
                                 }
-                                AutoConnectType::Connect => None,
+                                AutoConnectType::Connect | AutoConnectType::NoLogin => None,
                             };
 
                             if let Some(cmd) = cmd_to_send {
@@ -12639,6 +13389,110 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                 AppEvent::MultiuserPrompt(_, _, _) => {}
                 // SIGUSR1 - only relevant in main console mode, ignore in daemon mode
                 AppEvent::Sigusr1Received => {}
+                AppEvent::GmcpNegotiated(ref world_name) => {
+                    if let Some(world_idx) = app.find_world_index(world_name) {
+                        app.worlds[world_idx].gmcp_enabled = true;
+                        let packages_str = app.worlds[world_idx].settings.gmcp_packages.clone();
+                        let packages: Vec<String> = packages_str
+                            .split(',')
+                            .map(|s| s.trim().to_string())
+                            .filter(|s| !s.is_empty())
+                            .collect();
+                        app.worlds[world_idx].gmcp_supported_packages = packages.clone();
+                        if let Some(ref tx) = app.worlds[world_idx].command_tx {
+                            let hello = build_gmcp_message("Core.Hello", &format!(
+                                "{{\"client\":\"Clay\",\"version\":\"{}\"}}",
+                                VERSION
+                            ));
+                            let _ = tx.try_send(WriteCommand::Raw(hello));
+                            let json_list: Vec<String> = packages.iter()
+                                .map(|p| format!("\"{}\"", p))
+                                .collect();
+                            let supports = build_gmcp_message(
+                                "Core.Supports.Set",
+                                &format!("[{}]", json_list.join(",")),
+                            );
+                            let _ = tx.try_send(WriteCommand::Raw(supports));
+                        }
+                    }
+                }
+                AppEvent::MsdpNegotiated(ref world_name) => {
+                    if let Some(world_idx) = app.find_world_index(world_name) {
+                        app.worlds[world_idx].msdp_enabled = true;
+                    }
+                }
+                AppEvent::GmcpReceived(ref world_name, ref package, ref json_data) => {
+                    if let Some(world_idx) = app.find_world_index(world_name) {
+                        // Always store GMCP data
+                        app.worlds[world_idx].gmcp_data.insert(package.clone(), json_data.clone());
+                        // Always store Client.Media.Default URL
+                        if package == "Client.Media.Default" {
+                            if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(json_data) {
+                                if let Some(url) = parsed.get("url").and_then(|v| v.as_str()) {
+                                    app.worlds[world_idx].mcmp_default_url = url.to_string();
+                                }
+                            }
+                        }
+                        // Always broadcast to remote clients
+                        app.ws_broadcast(WsMessage::GmcpData {
+                            world_index: world_idx,
+                            package: package.clone(),
+                            data: json_data.clone(),
+                        });
+                        if package.starts_with("Client.Media.") {
+                            let action = package.rsplit('.').next().unwrap_or("Play").to_string();
+                            let default_url = app.worlds[world_idx].mcmp_default_url.clone();
+                            app.ws_broadcast(WsMessage::McmpMedia {
+                                world_index: world_idx,
+                                action,
+                                data: json_data.clone(),
+                                default_url,
+                            });
+                        }
+                        // Gate on gmcp_user_enabled
+                        if app.worlds[world_idx].gmcp_user_enabled {
+                            if world_idx == app.current_world_index {
+                                let package_clone = package.clone();
+                                let json_clone = json_data.clone();
+                                app.handle_gmcp_media(world_idx, &package_clone, &json_clone);
+                            }
+                            app.tf_engine.set_global("gmcp_package", crate::tf::TfValue::String(package.clone()));
+                            app.tf_engine.set_global("gmcp_data", crate::tf::TfValue::String(json_data.clone()));
+                            let results = crate::tf::hooks::fire_hook(&mut app.tf_engine, crate::tf::TfHookEvent::Gmcp);
+                            for r in results {
+                                if let crate::tf::TfCommandResult::SendToMud(text) = r {
+                                    if let Some(world) = app.worlds.get(world_idx) {
+                                        if let Some(ref tx) = world.command_tx {
+                                            let _ = tx.try_send(WriteCommand::Text(text));
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                AppEvent::MsdpReceived(ref world_name, ref variable, ref value_json) => {
+                    if let Some(world_idx) = app.find_world_index(world_name) {
+                        app.worlds[world_idx].msdp_variables.insert(variable.clone(), value_json.clone());
+                        app.tf_engine.set_global("msdp_var", crate::tf::TfValue::String(variable.clone()));
+                        app.tf_engine.set_global("msdp_val", crate::tf::TfValue::String(value_json.clone()));
+                        let results = crate::tf::hooks::fire_hook(&mut app.tf_engine, crate::tf::TfHookEvent::Msdp);
+                        for r in results {
+                            if let crate::tf::TfCommandResult::SendToMud(text) = r {
+                                if let Some(world) = app.worlds.get(world_idx) {
+                                    if let Some(ref tx) = world.command_tx {
+                                        let _ = tx.try_send(WriteCommand::Text(text));
+                                    }
+                                }
+                            }
+                        }
+                        app.ws_broadcast(WsMessage::MsdpData {
+                            world_index: world_idx,
+                            variable: variable.clone(),
+                            value: value_json.clone(),
+                        });
+                    }
+                }
                 // Slack/Discord events
                 AppEvent::SlackMessage(ref world_name, message) | AppEvent::DiscordMessage(ref world_name, message) => {
                     if let Some(world_idx) = app.find_world_index(world_name) {
@@ -13549,7 +14403,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                 app.ws_send_to_client(client_id, WsMessage::WorldSwitched { new_index: world_index });
                             }
                         }
-                        WsMessage::UpdateWorldSettings { world_index, name, hostname, port, user, password, use_ssl, log_enabled, encoding, auto_login, keep_alive_type, keep_alive_cmd } => {
+                        WsMessage::UpdateWorldSettings { world_index, name, hostname, port, user, password, use_ssl, log_enabled, encoding, auto_login, keep_alive_type, keep_alive_cmd, gmcp_packages } => {
                             if world_index < app.worlds.len() {
                                 app.worlds[world_index].name = name.clone();
                                 app.worlds[world_index].settings.hostname = hostname.clone();
@@ -13566,6 +14420,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                 app.worlds[world_index].settings.auto_connect_type = AutoConnectType::from_name(&auto_login);
                                 app.worlds[world_index].settings.keep_alive_type = KeepAliveType::from_name(&keep_alive_type);
                                 app.worlds[world_index].settings.keep_alive_cmd = keep_alive_cmd.clone();
+                                app.worlds[world_index].settings.gmcp_packages = gmcp_packages.clone();
                                 let _ = persistence::save_settings(&app);
                                 let settings_msg = WorldSettingsMsg {
                                     hostname, port, user,
@@ -13576,6 +14431,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                     auto_connect_type: auto_login,
                                     keep_alive_type,
                                     keep_alive_cmd,
+                                    gmcp_packages,
                                 };
                                 app.ws_broadcast(WsMessage::WorldSettingsUpdated { world_index, settings: settings_msg, name });
                             }
@@ -14742,6 +15598,7 @@ fn handle_key_event(key: KeyEvent, app: &mut App) -> KeyAction {
                     app.worlds[idx].settings.auto_connect_type = match settings.auto_connect.as_str() {
                         "prompt" => AutoConnectType::Prompt,
                         "moo_prompt" => AutoConnectType::MooPrompt,
+                        "none" => AutoConnectType::NoLogin,
                         _ => AutoConnectType::Connect,
                     };
 
@@ -14753,6 +15610,7 @@ fn handle_key_event(key: KeyEvent, app: &mut App) -> KeyAction {
                         _ => KeepAliveType::Nop,
                     };
                     app.worlds[idx].settings.keep_alive_cmd = settings.keep_alive_cmd;
+                    app.worlds[idx].settings.gmcp_packages = settings.gmcp_packages;
 
                     // Update Slack settings
                     app.worlds[idx].settings.slack_token = settings.slack_token;
@@ -14883,21 +15741,41 @@ fn handle_key_event(key: KeyEvent, app: &mut App) -> KeyAction {
             app.needs_output_redraw = true;
             return KeyAction::None;
         } else if app.current_world().paused && !app.current_world().pending_lines.is_empty() {
-            // At bottom and paused with pending lines - release screenful minus 2 lines
-            let batch_size = (app.output_height as usize).saturating_sub(2);
+            // At bottom and paused with pending lines - release one screenful of VISUAL lines
+            let visual_budget = (app.output_height as usize).saturating_sub(2);
+            let output_width = app.output_width as usize;
             let world_idx = app.current_world_index;
 
+            // Pre-calculate how many logical lines fit in the visual budget
+            // (mirrors the logic in release_pending so we can collect lines for broadcasting)
+            let width = output_width.max(1);
+            let mut visual_total = 0;
+            let mut logical_count = 0;
+            for line in &app.worlds[world_idx].pending_lines {
+                let vl = visual_line_count(&line.text, width);
+                if visual_total > 0 && visual_total + vl > visual_budget {
+                    break;
+                }
+                visual_total += vl;
+                logical_count += 1;
+                if visual_total >= visual_budget {
+                    break;
+                }
+            }
+            if logical_count == 0 && !app.worlds[world_idx].pending_lines.is_empty() {
+                logical_count = 1;
+            }
+
             // Get the lines that will be released (for broadcasting as ServerData)
-            let to_release = batch_size.min(app.worlds[world_idx].pending_lines.len());
             let lines_to_broadcast: Vec<String> = app.worlds[world_idx]
                 .pending_lines
                 .iter()
-                .take(to_release)
+                .take(logical_count)
                 .map(|line| line.text.replace('\r', ""))
                 .collect();
 
             let pending_before = app.worlds[world_idx].pending_lines.len();
-            app.current_world_mut().release_pending(batch_size);
+            app.current_world_mut().release_pending(visual_budget, output_width);
             let released = pending_before - app.worlds[world_idx].pending_lines.len();
 
             // Broadcast the released lines to clients viewing this world
@@ -14908,7 +15786,7 @@ fn handle_key_event(key: KeyEvent, app: &mut App) -> KeyAction {
                     data: ws_data,
                     is_viewed: true,
                     ts: current_timestamp_secs(),
-                    from_server: false,
+                    from_server: true,
                 });
             }
 
@@ -15104,7 +15982,7 @@ fn handle_key_event(key: KeyEvent, app: &mut App) -> KeyAction {
                     data: ws_data,
                     is_viewed: true,
                     ts: current_timestamp_secs(),
-                    from_server: false,
+                    from_server: true,
                 });
             }
 
@@ -15186,6 +16064,14 @@ fn handle_key_event(key: KeyEvent, app: &mut App) -> KeyAction {
             KeyAction::Redraw // Force full screen redraw to apply change
         }
 
+        // F9 to toggle GMCP user processing for current world
+        (_, KeyCode::F(9)) => {
+            if let Some(ref tx) = app.ws_client_tx {
+                let _ = tx.send(WsMessage::ToggleWorldGmcp { world_index: app.current_world_index });
+            }
+            KeyAction::None
+        }
+
         // F4 to open filter popup
         (_, KeyCode::F(4)) => {
             app.filter_popup.open();
@@ -15247,7 +16133,6 @@ fn handle_key_event(key: KeyEvent, app: &mut App) -> KeyAction {
             if !input.is_empty() || app.current_world().connected {
                 // Always reset counter when user sends a command
                 // This matches daemon.rs behavior and prevents spurious pausing
-                app.current_world_mut().log_more_debug("RESET_user_command", &input, 0);
                 app.current_world_mut().lines_since_pause = 0;
                 // Also clear paused flag if no pending lines
                 // This prevents staying paused after the triggering line when user sends a command
@@ -16551,6 +17436,18 @@ async fn handle_command(cmd: &str, app: &mut App, event_tx: mpsc::Sender<AppEven
                                                     if result.telnet_detected {
                                                         let _ = event_tx_read.send(AppEvent::TelnetDetected(read_world_name.clone())).await;
                                                     }
+                                                    if result.gmcp_negotiated {
+                                                        let _ = event_tx_read.send(AppEvent::GmcpNegotiated(read_world_name.clone())).await;
+                                                    }
+                                                    if result.msdp_negotiated {
+                                                        let _ = event_tx_read.send(AppEvent::MsdpNegotiated(read_world_name.clone())).await;
+                                                    }
+                                                    for (pkg, json) in &result.gmcp_data {
+                                                        let _ = event_tx_read.send(AppEvent::GmcpReceived(read_world_name.clone(), pkg.clone(), json.clone())).await;
+                                                    }
+                                                    for (var, val) in &result.msdp_data {
+                                                        let _ = event_tx_read.send(AppEvent::MsdpReceived(read_world_name.clone(), var.clone(), val.clone())).await;
+                                                    }
                                                     if let Some(prompt_bytes) = result.prompt {
                                                         let _ = event_tx_read.send(AppEvent::Prompt(read_world_name.clone(), prompt_bytes)).await;
                                                     }
@@ -16584,6 +17481,18 @@ async fn handle_command(cmd: &str, app: &mut App, event_tx: mpsc::Sender<AppEven
                                                     }
                                                     if result.ttype_requested {
                                                         let _ = event_tx_read.send(AppEvent::TtypeRequested(read_world_name.clone())).await;
+                                                    }
+                                                    if result.gmcp_negotiated {
+                                                        let _ = event_tx_read.send(AppEvent::GmcpNegotiated(read_world_name.clone())).await;
+                                                    }
+                                                    if result.msdp_negotiated {
+                                                        let _ = event_tx_read.send(AppEvent::MsdpNegotiated(read_world_name.clone())).await;
+                                                    }
+                                                    for (pkg, json) in &result.gmcp_data {
+                                                        let _ = event_tx_read.send(AppEvent::GmcpReceived(read_world_name.clone(), pkg.clone(), json.clone())).await;
+                                                    }
+                                                    for (var, val) in &result.msdp_data {
+                                                        let _ = event_tx_read.send(AppEvent::MsdpReceived(read_world_name.clone(), var.clone(), val.clone())).await;
                                                     }
                                                     if let Some(prompt_bytes) = result.prompt {
                                                         let _ = event_tx_read.send(AppEvent::Prompt(read_world_name.clone(), prompt_bytes)).await;
@@ -16764,6 +17673,18 @@ async fn handle_command(cmd: &str, app: &mut App, event_tx: mpsc::Sender<AppEven
                                                     if result.telnet_detected {
                                                         let _ = event_tx_read.send(AppEvent::TelnetDetected(read_world_name.clone())).await;
                                                     }
+                                                    if result.gmcp_negotiated {
+                                                        let _ = event_tx_read.send(AppEvent::GmcpNegotiated(read_world_name.clone())).await;
+                                                    }
+                                                    if result.msdp_negotiated {
+                                                        let _ = event_tx_read.send(AppEvent::MsdpNegotiated(read_world_name.clone())).await;
+                                                    }
+                                                    for (pkg, json) in &result.gmcp_data {
+                                                        let _ = event_tx_read.send(AppEvent::GmcpReceived(read_world_name.clone(), pkg.clone(), json.clone())).await;
+                                                    }
+                                                    for (var, val) in &result.msdp_data {
+                                                        let _ = event_tx_read.send(AppEvent::MsdpReceived(read_world_name.clone(), var.clone(), val.clone())).await;
+                                                    }
                                                     if let Some(prompt_bytes) = result.prompt {
                                                         let _ = event_tx_read.send(AppEvent::Prompt(read_world_name.clone(), prompt_bytes)).await;
                                                     }
@@ -16807,6 +17728,18 @@ async fn handle_command(cmd: &str, app: &mut App, event_tx: mpsc::Sender<AppEven
                                                     }
                                                     if result.wont_echo_seen {
                                                         let _ = event_tx_read.send(AppEvent::WontEchoSeen(read_world_name.clone())).await;
+                                                    }
+                                                    if result.gmcp_negotiated {
+                                                        let _ = event_tx_read.send(AppEvent::GmcpNegotiated(read_world_name.clone())).await;
+                                                    }
+                                                    if result.msdp_negotiated {
+                                                        let _ = event_tx_read.send(AppEvent::MsdpNegotiated(read_world_name.clone())).await;
+                                                    }
+                                                    for (pkg, json) in &result.gmcp_data {
+                                                        let _ = event_tx_read.send(AppEvent::GmcpReceived(read_world_name.clone(), pkg.clone(), json.clone())).await;
+                                                    }
+                                                    for (var, val) in &result.msdp_data {
+                                                        let _ = event_tx_read.send(AppEvent::MsdpReceived(read_world_name.clone(), var.clone(), val.clone())).await;
                                                     }
                                                     if let Some(prompt_bytes) = result.prompt {
                                                         let _ = event_tx_read.send(AppEvent::Prompt(read_world_name.clone(), prompt_bytes)).await;
@@ -17512,6 +18445,239 @@ fn process_pending_tf_commands(app: &mut App) {
     }
 }
 
+// Break characters for word wrapping within long words
+const BREAK_CHARS: &[char] = &['[', ']', '(', ')', ',', '\\', '/', '-', '&', '=', '?', '.', ';'];
+
+// Wrap a line with ANSI codes by visible width, preferring to break at word boundaries
+// Similar to CSS white-space: pre-wrap; word-wrap: break-word
+// Optimized to track byte positions instead of cloning the full string at every break point
+// (still clones the small active_codes vector, but that's typically 0-5 elements)
+fn wrap_ansi_line(line: &str, max_width: usize) -> Vec<String> {
+    if max_width == 0 {
+        return vec![line.to_string()];
+    }
+
+    let mut result = Vec::new();
+    let mut current_line = String::new();
+    let mut current_width = 0;
+    let mut in_csi = false;      // CSI sequence: \x1b[...
+    let mut in_osc = false;      // OSC sequence: \x1b]...
+    let mut escape_seq = String::new();
+    let mut active_codes: Vec<String> = Vec::new();
+    let mut active_hyperlink: Option<String> = None;  // Track active OSC 8 hyperlink URL
+
+    // Track last word boundary (space) for wrapping - byte position instead of string clone
+    let mut last_space_byte_pos: usize = 0;
+    let mut last_space_width = 0;
+    let mut last_space_codes: Vec<String> = Vec::new();  // small vec, ok to clone
+    let mut last_space_hyperlink: Option<String> = None;
+    let mut has_space_on_line = false;
+
+    // Track break opportunities within long words (for BREAK_CHARS)
+    let mut last_break_byte_pos: usize = 0;
+    let mut last_break_width = 0;
+    let mut last_break_codes: Vec<String> = Vec::new();
+    let mut last_break_hyperlink: Option<String> = None;
+
+    // Helper to build line prefix (color codes + hyperlink)
+    // Using BEL (0x07) as OSC terminator for better terminal compatibility
+    let build_prefix = |codes: &[String], hyperlink: &Option<String>| -> String {
+        let mut prefix = codes.join("");
+        if let Some(url) = hyperlink {
+            prefix.push_str("\x1b]8;;");
+            prefix.push_str(url);
+            prefix.push('\x07');
+        }
+        prefix
+    };
+
+    // Helper to build line suffix (close hyperlink + reset colors)
+    let build_suffix = |hyperlink: &Option<String>| -> String {
+        let mut suffix = String::new();
+        if hyperlink.is_some() {
+            suffix.push_str("\x1b]8;;\x07");
+        }
+        suffix.push_str("\x1b[0m");
+        suffix
+    };
+
+    let chars: Vec<char> = line.chars().collect();
+    let mut i = 0;
+
+    while i < chars.len() {
+        let c = chars[i];
+
+        // Handle CSI/OSC continuations first, before checking for new ESC
+        if in_csi {
+            escape_seq.push(c);
+            // CSI ends with alphabetic char or ~
+            if c.is_alphabetic() || c == '~' {
+                in_csi = false;
+                current_line.push_str(&escape_seq);
+                if c == 'm' {
+                    if escape_seq == "\x1b[0m" || escape_seq == "\x1b[m" {
+                        active_codes.clear();
+                    } else {
+                        active_codes.push(escape_seq.clone());
+                    }
+                }
+                escape_seq.clear();
+            }
+            i += 1;
+            continue;
+        } else if in_osc {
+            // OSC ends with BEL (\x07) or ST (\x1b\\)
+            if c == '\x07' {
+                escape_seq.push(c);
+                in_osc = false;
+                // Check if this is an OSC 8 hyperlink
+                if escape_seq.starts_with("\x1b]8;;") {
+                    let url = &escape_seq[5..escape_seq.len()-1];
+                    if url.is_empty() {
+                        active_hyperlink = None;
+                    } else {
+                        active_hyperlink = Some(url.to_string());
+                    }
+                }
+                current_line.push_str(&escape_seq);
+                escape_seq.clear();
+                i += 1;
+                continue;
+            } else if c == '\x1b' && i + 1 < chars.len() && chars[i + 1] == '\\' {
+                // ST terminator
+                escape_seq.push(c);
+                escape_seq.push('\\');
+                in_osc = false;
+                // Check if this is an OSC 8 hyperlink
+                if escape_seq.starts_with("\x1b]8;;") {
+                    let url = &escape_seq[5..escape_seq.len()-2];
+                    if url.is_empty() {
+                        active_hyperlink = None;
+                    } else {
+                        active_hyperlink = Some(url.to_string());
+                    }
+                }
+                current_line.push_str(&escape_seq);
+                escape_seq.clear();
+                i += 2;
+                continue;
+            } else {
+                escape_seq.push(c);
+                i += 1;
+                continue;
+            }
+        } else if c == '\x1b' {
+            escape_seq.push(c);
+            // Check next char to determine sequence type
+            if i + 1 < chars.len() {
+                let next = chars[i + 1];
+                if next == '[' {
+                    in_csi = true;
+                    escape_seq.push(next);
+                    i += 2;
+                    continue;
+                } else if next == ']' {
+                    in_osc = true;
+                    escape_seq.push(next);
+                    i += 2;
+                    continue;
+                } else if next == '\\' {
+                    // ST (String Terminator) - standalone, pass through
+                    escape_seq.push(next);
+                    current_line.push_str(&escape_seq);
+                    escape_seq.clear();
+                    i += 2;
+                    continue;
+                }
+            }
+            // Lone ESC or unknown sequence
+            current_line.push(c);
+            escape_seq.clear();
+            i += 1;
+            continue;
+        } else {
+            let char_width = unicode_width::UnicodeWidthChar::width(c).unwrap_or(0);
+
+            // Check if we need to wrap before adding this character
+            if current_width + char_width > max_width && current_width > 0 {
+                // Prefer break char over space when it's further along (packs more on line)
+                if last_break_width > last_space_width {
+                    // Break at period/hyphen/etc within the current word
+                    let mut break_line = current_line[..last_break_byte_pos].to_string();
+                    break_line.push_str(&build_suffix(&last_break_hyperlink));
+                    result.push(break_line);
+
+                    let prefix = build_prefix(&last_break_codes, &last_break_hyperlink);
+                    let remainder = &current_line[last_break_byte_pos..];
+                    current_line = prefix + remainder;
+                    current_width -= last_break_width;
+                } else if has_space_on_line && last_space_width > 0 {
+                    // Break at word boundary - emit up to and including the space
+                    let mut break_line = current_line[..last_space_byte_pos].to_string();
+                    break_line.push_str(&build_suffix(&last_space_hyperlink));
+                    result.push(break_line);
+
+                    // Start new line with content after the space
+                    let prefix = build_prefix(&last_space_codes, &last_space_hyperlink);
+                    let remainder = &current_line[last_space_byte_pos..];
+                    current_line = prefix + remainder;
+                    current_width -= last_space_width;
+                } else {
+                    // No break point at all - hard wrap at current position
+                    current_line.push_str(&build_suffix(&active_hyperlink));
+                    result.push(current_line);
+                    current_line = build_prefix(&active_codes, &active_hyperlink);
+                    current_width = 0;
+                }
+
+                // Reset tracking for new line
+                has_space_on_line = false;
+                last_space_byte_pos = 0;
+                last_space_width = 0;
+                last_space_codes.clear();
+                last_space_hyperlink = None;
+                last_break_byte_pos = 0;
+                last_break_width = 0;
+                last_break_codes.clear();
+                last_break_hyperlink = None;
+            }
+
+            // Add the character
+            current_line.push(c);
+            current_width += char_width;
+
+            // Track break opportunities - save byte position (not string clone)
+            if c.is_whitespace() {
+                // Save position AFTER the space as a word boundary
+                last_space_byte_pos = current_line.len();
+                last_space_width = current_width;
+                last_space_codes = active_codes.clone();  // small vec
+                last_space_hyperlink = active_hyperlink.clone();
+                has_space_on_line = true;
+                // Reset break char tracking since we have a new word
+                last_break_byte_pos = 0;
+                last_break_width = 0;
+            } else if BREAK_CHARS.contains(&c) {
+                // Save as potential break point within a word (after this char)
+                last_break_byte_pos = current_line.len();
+                last_break_width = current_width;
+                last_break_codes = active_codes.clone();
+                last_break_hyperlink = active_hyperlink.clone();
+            }
+
+            i += 1;
+        }
+    }
+
+    if !current_line.is_empty() || result.is_empty() {
+        // Add suffix to close any active hyperlink and reset colors
+        current_line.push_str(&build_suffix(&active_hyperlink));
+        result.push(current_line);
+    }
+
+    result
+}
+
 fn ui(f: &mut Frame, app: &mut App) {
     let total_height = f.size().height.max(3);  // Minimum 3 lines for output + separator + input
 
@@ -17688,239 +18854,6 @@ fn render_output_crossterm(app: &App) {
             }
         }
         width
-    }
-
-    // Break characters for word wrapping within long words
-    const BREAK_CHARS: &[char] = &['[', ']', '(', ')', ',', '\\', '/', '-', '&', '=', '?', '.', ';'];
-
-    // Wrap a line with ANSI codes by visible width, preferring to break at word boundaries
-    // Similar to CSS white-space: pre-wrap; word-wrap: break-word
-    // Optimized to track byte positions instead of cloning the full string at every break point
-    // (still clones the small active_codes vector, but that's typically 0-5 elements)
-    fn wrap_ansi_line(line: &str, max_width: usize) -> Vec<String> {
-        if max_width == 0 {
-            return vec![line.to_string()];
-        }
-
-        let mut result = Vec::new();
-        let mut current_line = String::new();
-        let mut current_width = 0;
-        let mut in_csi = false;      // CSI sequence: \x1b[...
-        let mut in_osc = false;      // OSC sequence: \x1b]...
-        let mut escape_seq = String::new();
-        let mut active_codes: Vec<String> = Vec::new();
-        let mut active_hyperlink: Option<String> = None;  // Track active OSC 8 hyperlink URL
-
-        // Track last word boundary (space) for wrapping - byte position instead of string clone
-        let mut last_space_byte_pos: usize = 0;
-        let mut last_space_width = 0;
-        let mut last_space_codes: Vec<String> = Vec::new();  // small vec, ok to clone
-        let mut last_space_hyperlink: Option<String> = None;
-        let mut has_space_on_line = false;
-
-        // Track break opportunities within long words (for BREAK_CHARS)
-        let mut last_break_byte_pos: usize = 0;
-        let mut last_break_width = 0;
-        let mut last_break_codes: Vec<String> = Vec::new();
-        let mut last_break_hyperlink: Option<String> = None;
-
-        // Helper to build line prefix (color codes + hyperlink)
-        // Using BEL (0x07) as OSC terminator for better terminal compatibility
-        let build_prefix = |codes: &[String], hyperlink: &Option<String>| -> String {
-            let mut prefix = codes.join("");
-            if let Some(url) = hyperlink {
-                prefix.push_str("\x1b]8;;");
-                prefix.push_str(url);
-                prefix.push('\x07');
-            }
-            prefix
-        };
-
-        // Helper to build line suffix (close hyperlink + reset colors)
-        let build_suffix = |hyperlink: &Option<String>| -> String {
-            let mut suffix = String::new();
-            if hyperlink.is_some() {
-                suffix.push_str("\x1b]8;;\x07");
-            }
-            suffix.push_str("\x1b[0m");
-            suffix
-        };
-
-        let chars: Vec<char> = line.chars().collect();
-        let mut i = 0;
-
-        while i < chars.len() {
-            let c = chars[i];
-
-            // Handle CSI/OSC continuations first, before checking for new ESC
-            if in_csi {
-                escape_seq.push(c);
-                // CSI ends with alphabetic char or ~
-                if c.is_alphabetic() || c == '~' {
-                    in_csi = false;
-                    current_line.push_str(&escape_seq);
-                    if c == 'm' {
-                        if escape_seq == "\x1b[0m" || escape_seq == "\x1b[m" {
-                            active_codes.clear();
-                        } else {
-                            active_codes.push(escape_seq.clone());
-                        }
-                    }
-                    escape_seq.clear();
-                }
-                i += 1;
-                continue;
-            } else if in_osc {
-                // OSC ends with BEL (\x07) or ST (\x1b\\)
-                if c == '\x07' {
-                    escape_seq.push(c);
-                    in_osc = false;
-                    // Check if this is an OSC 8 hyperlink
-                    if escape_seq.starts_with("\x1b]8;;") {
-                        let url = &escape_seq[5..escape_seq.len()-1];
-                        if url.is_empty() {
-                            active_hyperlink = None;
-                        } else {
-                            active_hyperlink = Some(url.to_string());
-                        }
-                    }
-                    current_line.push_str(&escape_seq);
-                    escape_seq.clear();
-                    i += 1;
-                    continue;
-                } else if c == '\x1b' && i + 1 < chars.len() && chars[i + 1] == '\\' {
-                    // ST terminator
-                    escape_seq.push(c);
-                    escape_seq.push('\\');
-                    in_osc = false;
-                    // Check if this is an OSC 8 hyperlink
-                    if escape_seq.starts_with("\x1b]8;;") {
-                        let url = &escape_seq[5..escape_seq.len()-2];
-                        if url.is_empty() {
-                            active_hyperlink = None;
-                        } else {
-                            active_hyperlink = Some(url.to_string());
-                        }
-                    }
-                    current_line.push_str(&escape_seq);
-                    escape_seq.clear();
-                    i += 2;
-                    continue;
-                } else {
-                    escape_seq.push(c);
-                    i += 1;
-                    continue;
-                }
-            } else if c == '\x1b' {
-                escape_seq.push(c);
-                // Check next char to determine sequence type
-                if i + 1 < chars.len() {
-                    let next = chars[i + 1];
-                    if next == '[' {
-                        in_csi = true;
-                        escape_seq.push(next);
-                        i += 2;
-                        continue;
-                    } else if next == ']' {
-                        in_osc = true;
-                        escape_seq.push(next);
-                        i += 2;
-                        continue;
-                    } else if next == '\\' {
-                        // ST (String Terminator) - standalone, pass through
-                        escape_seq.push(next);
-                        current_line.push_str(&escape_seq);
-                        escape_seq.clear();
-                        i += 2;
-                        continue;
-                    }
-                }
-                // Lone ESC or unknown sequence
-                current_line.push(c);
-                escape_seq.clear();
-                i += 1;
-                continue;
-            } else {
-                let char_width = unicode_width::UnicodeWidthChar::width(c).unwrap_or(0);
-
-                // Check if we need to wrap before adding this character
-                if current_width + char_width > max_width && current_width > 0 {
-                    // Prefer break char over space when it's further along (packs more on line)
-                    if last_break_width > last_space_width {
-                        // Break at period/hyphen/etc within the current word
-                        let mut break_line = current_line[..last_break_byte_pos].to_string();
-                        break_line.push_str(&build_suffix(&last_break_hyperlink));
-                        result.push(break_line);
-
-                        let prefix = build_prefix(&last_break_codes, &last_break_hyperlink);
-                        let remainder = &current_line[last_break_byte_pos..];
-                        current_line = prefix + remainder;
-                        current_width -= last_break_width;
-                    } else if has_space_on_line && last_space_width > 0 {
-                        // Break at word boundary - emit up to and including the space
-                        let mut break_line = current_line[..last_space_byte_pos].to_string();
-                        break_line.push_str(&build_suffix(&last_space_hyperlink));
-                        result.push(break_line);
-
-                        // Start new line with content after the space
-                        let prefix = build_prefix(&last_space_codes, &last_space_hyperlink);
-                        let remainder = &current_line[last_space_byte_pos..];
-                        current_line = prefix + remainder;
-                        current_width -= last_space_width;
-                    } else {
-                        // No break point at all - hard wrap at current position
-                        current_line.push_str(&build_suffix(&active_hyperlink));
-                        result.push(current_line);
-                        current_line = build_prefix(&active_codes, &active_hyperlink);
-                        current_width = 0;
-                    }
-
-                    // Reset tracking for new line
-                    has_space_on_line = false;
-                    last_space_byte_pos = 0;
-                    last_space_width = 0;
-                    last_space_codes.clear();
-                    last_space_hyperlink = None;
-                    last_break_byte_pos = 0;
-                    last_break_width = 0;
-                    last_break_codes.clear();
-                    last_break_hyperlink = None;
-                }
-
-                // Add the character
-                current_line.push(c);
-                current_width += char_width;
-
-                // Track break opportunities - save byte position (not string clone)
-                if c.is_whitespace() {
-                    // Save position AFTER the space as a word boundary
-                    last_space_byte_pos = current_line.len();
-                    last_space_width = current_width;
-                    last_space_codes = active_codes.clone();  // small vec
-                    last_space_hyperlink = active_hyperlink.clone();
-                    has_space_on_line = true;
-                    // Reset break char tracking since we have a new word
-                    last_break_byte_pos = 0;
-                    last_break_width = 0;
-                } else if BREAK_CHARS.contains(&c) {
-                    // Save as potential break point within a word (after this char)
-                    last_break_byte_pos = current_line.len();
-                    last_break_width = current_width;
-                    last_break_codes = active_codes.clone();
-                    last_break_hyperlink = active_hyperlink.clone();
-                }
-
-                i += 1;
-            }
-        }
-
-        if !current_line.is_empty() || result.is_empty() {
-            // Add suffix to close any active hyperlink and reset colors
-            current_line.push_str(&build_suffix(&active_hyperlink));
-            result.push(current_line);
-        }
-
-        result
     }
 
     // Collect wrapped lines centered around scroll_offset to fill the screen
@@ -18581,6 +19514,9 @@ fn render_separator_bar(f: &mut Frame, app: &App, area: Rect) {
     // Tag indicator (only shown when F2 toggled to show tags)
     let tag_indicator = if app.show_tags { " [tag]" } else { "" };
 
+    // GMCP indicator (only shown when F9 toggled to enable GMCP processing)
+    let gmcp_indicator = if world.gmcp_user_enabled { " [g]" } else { "" };
+
     // Activity indicator - positioned at column 24
     const ACTIVITY_POSITION: usize = 24;
     // In remote client mode, use the server's activity count
@@ -18647,8 +19583,16 @@ fn render_separator_bar(f: &mut Frame, app: &App, area: Rect) {
             ));
         }
 
-        // Calculate position: status + ball (2 chars) + world name + tag indicator
-        status_str.len() + 2 + world_display.len() + tag_indicator.len()
+        // GMCP indicator (cyan, like prompt)
+        if !gmcp_indicator.is_empty() {
+            spans.push(Span::styled(
+                gmcp_indicator.to_string(),
+                Style::default().fg(theme.fg_accent()),
+            ));
+        }
+
+        // Calculate position: status + ball (2 chars) + world name + tag indicator + gmcp indicator
+        status_str.len() + 2 + world_display.len() + tag_indicator.len() + gmcp_indicator.len()
     } else {
         // World never connected - don't show ball or name
         status_str.len()
@@ -20609,6 +21553,341 @@ mod tests {
     fn find_free_port() -> u16 {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         listener.local_addr().unwrap().port()
+    }
+
+    #[test]
+    fn test_more_mode_add_output_unit() {
+        // Test that add_output correctly triggers more-mode after max_lines visual lines
+        let mut world = World::new("test");
+        let settings = Settings { more_mode_enabled: true, ..Settings::default() };
+
+        // 100 short lines, each fits in one visual line
+        let data: String = (1..=100).map(|i| format!("fffff{}\n", i)).collect();
+        world.add_output(&data, true, &settings, 24, 80, false, true);
+
+        // max_lines = 24 - 2 = 22
+        // After 22 visual lines, pause triggers on the 23rd line.
+        // Lines 1-22 go to output without triggering (lines_since_pause accumulates).
+        // Line 23: lines_since_pause(22) + 1 > 22 → triggers_pause → goes to output, then paused=true.
+        // Lines 24-100 (77 lines) go to pending.
+        assert!(world.paused, "Should be paused after 100 lines with max_lines=22");
+        assert_eq!(world.output_lines.len(), 23,
+            "Expected 23 output lines (22 before trigger + 1 triggering), got {}", world.output_lines.len());
+        assert_eq!(world.pending_lines.len(), 77,
+            "Expected 77 pending lines, got {}", world.pending_lines.len());
+    }
+
+    #[test]
+    fn test_more_mode_long_wrapped_lines_unit() {
+        // Test that add_output correctly triggers more-mode with long lines that wrap
+        let mut world = World::new("test");
+        let settings = Settings { more_mode_enabled: true, ..Settings::default() };
+
+        // 50 lines, each ~120 chars (wraps to 2 visual lines at width 80)
+        let data: String = (1..=50).map(|i| {
+            format!("{}{}\n", "x".repeat(100), format!("LINE{:03}", i))
+        }).collect();
+        world.add_output(&data, true, &settings, 24, 80, false, true);
+
+        // max_lines = 22. Each line is 107 chars → wraps to ceil(107/80)=2 visual lines.
+        // Line 1: lines_since_pause(0) + 2 = 2, not > 22
+        // Line 11: lines_since_pause(20) + 2 = 22, not > 22
+        // Line 12: lines_since_pause(22) + 2 = 24, > 22 → triggers_pause!
+        // So 12 lines go to output (24 visual lines), 38 go to pending.
+        assert!(world.paused, "Should be paused with long wrapped lines");
+        assert_eq!(world.output_lines.len(), 12,
+            "Expected 12 output lines (each wrapping to 2 visual), got {}", world.output_lines.len());
+        assert_eq!(world.pending_lines.len(), 38,
+            "Expected 38 pending lines, got {}", world.pending_lines.len());
+    }
+
+    #[test]
+    fn test_partial_line_tracking_across_chunks() {
+        // Simulate a single long MUD line arriving in multiple TCP chunks.
+        // The line is: "fffff1 fffff2 ... fffff100\n" (~1000 bytes)
+        // Arriving in 3 chunks without intermediate newlines.
+        let mut world = World::new("test");
+        let settings = Settings { more_mode_enabled: true, ..Settings::default() };
+
+        // Build the full line
+        let full_line: String = (1..=100).map(|i| format!("fffff{}", i)).collect::<Vec<_>>().join(" ");
+        let full_with_newline = format!("{}\n", full_line);
+        let bytes = full_with_newline.as_bytes();
+
+        // Split into 3 roughly equal chunks (no newline until the very end)
+        let chunk1 = std::str::from_utf8(&bytes[..333]).unwrap();
+        let chunk2 = std::str::from_utf8(&bytes[333..666]).unwrap();
+        let chunk3 = std::str::from_utf8(&bytes[666..]).unwrap();
+
+        // Verify chunks don't have intermediate newlines
+        assert!(!chunk1.contains('\n'), "chunk1 should not contain newline");
+        assert!(!chunk2.contains('\n'), "chunk2 should not contain newline");
+        assert!(chunk3.ends_with('\n'), "chunk3 should end with newline");
+
+        // Process each chunk separately (simulating TCP reads)
+        world.add_output(chunk1, true, &settings, 48, 80, false, true);
+        assert_eq!(world.output_lines.len(), 1, "Chunk 1: should have 1 output line (partial)");
+        assert!(!world.partial_line.is_empty(), "Chunk 1: partial_line should be set");
+
+        world.add_output(chunk2, true, &settings, 48, 80, false, true);
+        assert_eq!(world.output_lines.len(), 1, "Chunk 2: should STILL have 1 output line (updated partial)");
+        assert!(!world.partial_line.is_empty(), "Chunk 2: partial_line should STILL be set (not lost)");
+
+        world.add_output(chunk3, true, &settings, 48, 80, false, true);
+        assert_eq!(world.output_lines.len(), 1, "Chunk 3: should STILL have 1 output line (completed)");
+        assert!(world.partial_line.is_empty(), "Chunk 3: partial_line should be empty (line complete)");
+        assert_eq!(world.pending_lines.len(), 0, "Should have 0 pending lines (just 1 logical line)");
+
+        // Verify the final line content matches the original
+        assert_eq!(world.output_lines[0].text, full_line,
+            "Output line should be the complete original line");
+    }
+
+    #[test]
+    fn test_partial_line_many_small_chunks() {
+        // Simulate a single long line arriving in many small TCP chunks.
+        // Without the fix, each chunk after the 2nd would create a new logical line.
+        let mut world = World::new("test");
+        let settings = Settings { more_mode_enabled: true, ..Settings::default() };
+
+        let full_line: String = (1..=200).map(|i| format!("w{}", i)).collect::<Vec<_>>().join(" ");
+        let full_with_newline = format!("{}\n", full_line);
+        let bytes = full_with_newline.as_bytes();
+
+        // Send in 20 small chunks
+        let chunk_size = bytes.len() / 20;
+        for i in 0..20 {
+            let start = i * chunk_size;
+            let end = if i == 19 { bytes.len() } else { (i + 1) * chunk_size };
+            let chunk = std::str::from_utf8(&bytes[start..end]).unwrap();
+            world.add_output(chunk, true, &settings, 48, 80, false, true);
+        }
+
+        // Should be exactly 1 logical line, not 10+ fragmented lines
+        assert_eq!(world.output_lines.len(), 1,
+            "Should have exactly 1 output line, not {} (fragmented by partial bug)",
+            world.output_lines.len());
+        assert_eq!(world.pending_lines.len(), 0, "Should have 0 pending lines");
+        assert_eq!(world.output_lines[0].text, full_line);
+    }
+
+    #[test]
+    fn test_more_mode_multiple_chunks() {
+        // Test that more-mode works correctly when add_output is called multiple times
+        // (simulating multiple TCP chunks arriving from the MUD server)
+        let mut world = World::new("test");
+        let settings = Settings { more_mode_enabled: true, ..Settings::default() };
+
+        // Simulate 10 TCP chunks of 100 lines each = 1000 total lines
+        for chunk in 0..10 {
+            let data: String = (1..=100).map(|i| {
+                format!("fffff{}\n", chunk * 100 + i)
+            }).collect();
+            world.add_output(&data, true, &settings, 48, 80, false, true);
+        }
+
+        // max_lines = 46. After 46+1=47 lines, pause triggers.
+        // First chunk (100 lines): 47 go to output, 53 go to pending
+        // Subsequent chunks: all go to pending (paused is true)
+        // Total pending: 53 + 9*100 = 953
+        assert!(world.paused, "Should be paused after 1000 lines across 10 chunks");
+        assert_eq!(world.output_lines.len(), 47,
+            "Expected 47 output lines (max_lines=46, trigger on line 47), got {}", world.output_lines.len());
+        assert_eq!(world.pending_lines.len(), 953,
+            "Expected 953 pending lines, got {}", world.pending_lines.len());
+    }
+
+    #[test]
+    fn test_more_mode_1000_lines_single_call() {
+        // Test that more-mode works with 1000 lines in a single add_output call
+        // (simulating a TF #for loop generating all output at once)
+        let mut world = World::new("test");
+        let settings = Settings { more_mode_enabled: true, ..Settings::default() };
+
+        let data: String = (1..=1000).map(|i| {
+            format!("fffff{}\n", i)
+        }).collect();
+        world.add_output(&data, true, &settings, 48, 80, false, true);
+
+        assert!(world.paused, "Should be paused after 1000 lines");
+        assert_eq!(world.output_lines.len(), 47,
+            "Expected 47 output lines, got {}", world.output_lines.len());
+        assert_eq!(world.pending_lines.len(), 953,
+            "Expected 953 pending lines, got {}", world.pending_lines.len());
+    }
+
+    #[test]
+    fn test_release_pending_counts_visual_lines() {
+        // Test that release_pending counts visual lines, not logical lines.
+        // With output_width=80, a 500-char line wraps to ceil(500/80) = 7 visual lines.
+        let mut world = World::new("test");
+        let settings = Settings { more_mode_enabled: true, ..Settings::default() };
+
+        // Create 10 long lines, each ~500 chars (7 visual lines each at width 80)
+        let long_word = "x".repeat(500);
+        let data: String = (0..10).map(|_| format!("{}\n", long_word)).collect();
+        world.add_output(&data, true, &settings, 48, 80, false, true);
+
+        // max_lines = 46. Each line = 7 visual lines.
+        // Lines 1-6: 42 visual lines (< 46), go to output
+        // Line 7: 42+7=49 > 46, triggers more. But 7 > 46? No, 7 < 46, so normal trigger.
+        // Lines 8-10: go to pending
+        assert!(world.paused, "Should be paused");
+
+        let output_count = world.output_lines.len();
+        let pending_count = world.pending_lines.len();
+        assert!(output_count > 0 && pending_count > 0,
+            "Should have both output ({}) and pending ({}) lines", output_count, pending_count);
+
+        // Now test release_pending with visual budget of 46 (output_height - 2)
+        // Each pending line is 7 visual lines. Budget=46 fits 6 lines (42 visual) or 7 lines (49 visual).
+        // Since 42+7=49 > 46, it should stop at 6 lines (the 7th would exceed budget).
+        let pending_before = world.pending_lines.len();
+        world.release_pending(46, 80);
+        let released = pending_before - world.pending_lines.len();
+
+        // Should release 6 lines (42 visual lines fits in 46 budget, 49 would exceed)
+        assert!(released <= 7, "Should release at most 7 lines (visual budget), got {}", released);
+        assert!(released >= 1, "Should release at least 1 line, got {}", released);
+    }
+
+    #[test]
+    fn test_oversized_single_line_splits() {
+        // Test that a single oversized line gets pre-wrapped into individual visual lines
+        // stored as separate OutputLines, so more-mode can paginate with Tab.
+        let mut world = World::new("test");
+        let settings = Settings { more_mode_enabled: true, ..Settings::default() };
+
+        // Create a single very long line: 10000 chars at width 80, max_lines = 46
+        // wrap_ansi_line produces ceil(10000/80) = 125 visual lines
+        // First 46 go to output_lines, remaining 79 go to pending_lines
+        let long_line = "x".repeat(10000) + "\n";
+        world.add_output(&long_line, true, &settings, 48, 80, false, true);
+
+        // Should be paused with first max_lines visual lines in output, rest in pending
+        assert!(world.paused, "Should be paused");
+        assert_eq!(world.output_lines.len(), 46, "First 46 visual lines in output");
+        assert_eq!(world.pending_lines.len(), 79, "Remaining 79 visual lines in pending");
+
+        // Each output line should be exactly 1 visual line (pre-wrapped)
+        for (i, ol) in world.output_lines.iter().enumerate() {
+            let vl = visual_line_count(&ol.text, 80);
+            assert_eq!(vl, 1, "Output line {} should be 1 visual line, got {}", i, vl);
+        }
+
+        // Tab should release one screenful at a time
+        let pending_before = world.pending_lines.len();
+        world.release_pending(46, 80);
+        assert!(world.pending_lines.len() < pending_before, "Tab should release pending lines");
+    }
+
+    #[test]
+    fn test_release_pending_visual_lines_mixed() {
+        // Test release_pending with a mix of short and long lines
+        let mut world = World::new("test");
+        let settings = Settings { more_mode_enabled: true, ..Settings::default() };
+
+        // Add 3 short lines to trigger more-mode, then add long lines to pending
+        // First fill output to near max_lines
+        let short_data: String = (0..45).map(|i| format!("short line {}\n", i)).collect();
+        world.add_output(&short_data, true, &settings, 48, 80, false, true);
+
+        // Now add mixed content: 1 short line, then 1 very long line, then 1 short line
+        let mixed: String = format!("short\n{}\nafter\n", "x".repeat(500));
+        world.add_output(&mixed, true, &settings, 48, 80, false, true);
+
+        assert!(world.paused, "Should be paused");
+        let pending = world.pending_lines.len();
+        assert!(pending > 0, "Should have pending lines");
+
+        // Release with visual budget of 46
+        // "short" = 1 visual line
+        // 500-char line = ceil(500/80) = 7 visual lines
+        // "after" = 1 visual line
+        // total = 9 visual lines < 46, so all should be released
+        world.release_pending(46, 80);
+        assert_eq!(world.pending_lines.len(), 0,
+            "All {} pending lines should fit in visual budget of 46", pending);
+    }
+
+    #[test]
+    fn test_wrap_ansi_line_no_spaces() {
+        // No spaces = hard wrap at character boundary
+        let line = "a".repeat(100);
+        let lines = wrap_ansi_line(&line, 10);
+        assert_eq!(lines.len(), 10, "Should produce 10 visual lines");
+        for (i, vl) in lines.iter().enumerate() {
+            let stripped = strip_ansi_codes(vl);
+            if i < 9 {
+                assert_eq!(stripped.len(), 10, "Line {} should be 10 chars", i);
+            } else {
+                assert_eq!(stripped.len(), 10, "Last line should be 10 chars");
+            }
+        }
+    }
+
+    #[test]
+    fn test_wrap_ansi_line_word_boundary() {
+        // Word wrapping at width 10:
+        //   "aaa bbb ccc ddd eee fff"
+        //   Line 1: "aaa bbb " (wraps at space before "ccc")
+        //   Line 2: "ccc ddd " (wraps at space before "eee")
+        //   Line 3: "eee fff"
+        let line = "aaa bbb ccc ddd eee fff";
+        let lines = wrap_ansi_line(line, 10);
+        assert!(lines.len() >= 2, "Should produce multiple lines, got {}", lines.len());
+        // First line should break at word boundary
+        let first_stripped = strip_ansi_codes(&lines[0]);
+        assert!(first_stripped.starts_with("aaa bbb"),
+            "First line should start with 'aaa bbb': {:?}", first_stripped);
+    }
+
+    #[test]
+    fn test_wrap_ansi_line_with_ansi() {
+        // Test ANSI color codes carried across line boundaries
+        let line = format!("\x1b[31m{}\x1b[0m", "r".repeat(25));
+        let lines = wrap_ansi_line(&line, 10);
+        assert_eq!(lines.len(), 3, "Should produce 3 lines");
+        // Second line should carry the red color code
+        assert!(lines[1].contains("\x1b[31m"),
+            "Second line should carry color code: {:?}", lines[1]);
+        // First line should end with reset
+        assert!(lines[0].ends_with("\x1b[0m"),
+            "First line should end with reset: {:?}", lines[0]);
+    }
+
+    #[test]
+    fn test_wrap_ansi_line_short_passthrough() {
+        let line = "hello world";
+        let lines = wrap_ansi_line(line, 80);
+        assert_eq!(lines.len(), 1);
+        // Should contain the original text (plus trailing reset)
+        assert!(strip_ansi_codes(&lines[0]).contains("hello world"));
+    }
+
+    #[test]
+    fn test_wrap_ansi_line_fffff_pattern() {
+        // Simulate the actual test case: space-separated fffff words at width 80
+        let words: Vec<String> = (0..1000).map(|i| format!("fffff{}", i)).collect();
+        let line = words.join(" ");
+        let lines = wrap_ansi_line(&line, 80);
+        assert!(lines.len() > 1, "Should produce multiple visual lines");
+        // Each visual line (except last) should be <= 80 display width
+        for (i, vl) in lines.iter().enumerate() {
+            let stripped = strip_ansi_codes(vl);
+            let dw: usize = stripped.chars().map(|c| unicode_width::UnicodeWidthChar::width(c).unwrap_or(0)).sum();
+            assert!(dw <= 80, "Line {} has display width {} (max 80): {:?}",
+                i, dw, &stripped[..40.min(stripped.len())]);
+        }
+        // Verify word boundaries: no line should start with a partial word
+        for (i, vl) in lines.iter().enumerate() {
+            if i > 0 {
+                let stripped = strip_ansi_codes(vl);
+                assert!(stripped.starts_with("fffff"),
+                    "Line {} should start at a word boundary: {:?}",
+                    i, &stripped[..20.min(stripped.len())]);
+            }
+        }
     }
 
     #[tokio::test]

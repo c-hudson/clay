@@ -1220,6 +1220,35 @@ pub async fn handle_daemon_ws_message(
             };
             app.ws_broadcast(WsMessage::GlobalSettingsUpdated { settings, input_height: app.input_height });
         }
+        WsMessage::ToggleWorldGmcp { world_index } => {
+            if world_index < app.worlds.len() {
+                app.worlds[world_index].gmcp_user_enabled = !app.worlds[world_index].gmcp_user_enabled;
+                if !app.worlds[world_index].gmcp_user_enabled {
+                    app.stop_world_media(world_index);
+                }
+                app.needs_output_redraw = true;
+                app.ws_broadcast(WsMessage::GmcpUserToggled {
+                    world_index,
+                    enabled: app.worlds[world_index].gmcp_user_enabled,
+                });
+            }
+        }
+        WsMessage::SendGmcp { world_index, package, data } => {
+            if world_index < app.worlds.len() {
+                if let Some(ref tx) = app.worlds[world_index].command_tx {
+                    let msg = crate::telnet::build_gmcp_message(&package, &data);
+                    let _ = tx.try_send(WriteCommand::Raw(msg));
+                }
+            }
+        }
+        WsMessage::SendMsdp { world_index, variable, value } => {
+            if world_index < app.worlds.len() {
+                if let Some(ref tx) = app.worlds[world_index].command_tx {
+                    let msg = crate::telnet::build_msdp_set(&variable, &value);
+                    let _ = tx.try_send(WriteCommand::Raw(msg));
+                }
+            }
+        }
         WsMessage::Ping => {
             app.ws_send_to_client(client_id, WsMessage::Pong);
         }
@@ -1245,7 +1274,34 @@ pub async fn handle_daemon_ws_message(
             if world_index < app.worlds.len() {
                 let pending_count = app.worlds[world_index].pending_lines.len();
                 if pending_count > 0 {
-                    let to_release = if count == 0 { pending_count } else { count.min(pending_count) };
+                    // Get client's output width for visual line calculation
+                    let client_width = app.ws_client_worlds.get(&client_id)
+                        .and_then(|s| s.dimensions)
+                        .map(|(w, _)| w as usize)
+                        .unwrap_or(app.output_width as usize);
+
+                    // count == 0 means release all; otherwise treat count as visual budget
+                    let visual_budget = if count == 0 { usize::MAX } else { count };
+
+                    // Pre-calculate logical lines to release (mirrors release_pending logic)
+                    let width = client_width.max(1);
+                    let mut visual_total = 0;
+                    let mut logical_count = 0;
+                    for line in &app.worlds[world_index].pending_lines {
+                        let vl = visual_line_count(&line.text, width);
+                        if visual_total > 0 && visual_total + vl > visual_budget {
+                            break;
+                        }
+                        visual_total += vl;
+                        logical_count += 1;
+                        if visual_total >= visual_budget {
+                            break;
+                        }
+                    }
+                    if logical_count == 0 && pending_count > 0 {
+                        logical_count = 1;
+                    }
+                    let to_release = logical_count.min(pending_count);
 
                     // Get the lines that will be released (for broadcasting)
                     let lines_to_broadcast: Vec<String> = app.worlds[world_index]
@@ -1256,7 +1312,7 @@ pub async fn handle_daemon_ws_message(
                         .collect();
 
                     // Release the lines
-                    app.worlds[world_index].release_pending(to_release);
+                    app.worlds[world_index].release_pending(visual_budget, client_width);
 
                     // Broadcast the released lines to clients viewing this world,
                     // but skip clients that already have these lines from InitialState
@@ -2342,6 +2398,7 @@ pub fn build_multiuser_initial_state(app: &App, username: &str) -> WsMessage {
                     auto_connect_type: world.settings.auto_connect_type.name().to_string(),
                     keep_alive_type: world.settings.keep_alive_type.name().to_string(),
                     keep_alive_cmd: world.settings.keep_alive_cmd.clone(),
+                    gmcp_packages: world.settings.gmcp_packages.clone(),
                 },
                 last_send_secs: last_send.map(|t| t.elapsed().as_secs()),
                 last_recv_secs: last_recv.map(|t| t.elapsed().as_secs()),
@@ -2350,6 +2407,7 @@ pub fn build_multiuser_initial_state(app: &App, username: &str) -> WsMessage {
                 showing_splash: world.showing_splash,
                 was_connected: world.was_connected,
                 is_proxy: world.proxy_pid.is_some(),
+                gmcp_user_enabled: world.gmcp_user_enabled,
             }
         }).collect();
 
@@ -2644,6 +2702,35 @@ pub async fn handle_multiuser_ws_message(
                 let _ = writeln!(f, "SEQ MISMATCH [{}] in '{}': expected seq>{}, got seq={}, text={:?}",
                     source, world_name, expected_seq_gt, actual_seq,
                     line_text.chars().take(80).collect::<String>());
+            }
+        }
+        WsMessage::ToggleWorldGmcp { world_index } => {
+            if world_index < app.worlds.len() {
+                app.worlds[world_index].gmcp_user_enabled = !app.worlds[world_index].gmcp_user_enabled;
+                if !app.worlds[world_index].gmcp_user_enabled {
+                    app.stop_world_media(world_index);
+                }
+                app.needs_output_redraw = true;
+                app.ws_broadcast(WsMessage::GmcpUserToggled {
+                    world_index,
+                    enabled: app.worlds[world_index].gmcp_user_enabled,
+                });
+            }
+        }
+        WsMessage::SendGmcp { world_index, package, data } => {
+            if world_index < app.worlds.len() {
+                if let Some(ref tx) = app.worlds[world_index].command_tx {
+                    let msg = crate::telnet::build_gmcp_message(&package, &data);
+                    let _ = tx.try_send(WriteCommand::Raw(msg));
+                }
+            }
+        }
+        WsMessage::SendMsdp { world_index, variable, value } => {
+            if world_index < app.worlds.len() {
+                if let Some(ref tx) = app.worlds[world_index].command_tx {
+                    let msg = crate::telnet::build_msdp_set(&variable, &value);
+                    let _ = tx.try_send(WriteCommand::Raw(msg));
+                }
             }
         }
         _ => {} // Handle other messages as needed

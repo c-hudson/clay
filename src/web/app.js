@@ -137,6 +137,7 @@
         worldEditKeepAliveCmd: document.getElementById('world-edit-keep-alive-cmd'),
         worldEditEncodingSelect: document.getElementById('world-edit-encoding-select'),
         worldEditLoggingToggle: document.getElementById('world-edit-logging-toggle'),
+        worldEditGmcpPackages: document.getElementById('world-edit-gmcp-packages'),
         worldEditCloseBtn: document.getElementById('world-edit-close-btn'),
         worldEditDeleteBtn: document.getElementById('world-edit-delete-btn'),
         worldEditCancelBtn: document.getElementById('world-edit-cancel-btn'),
@@ -339,6 +340,13 @@
     // ANSI Music audio context (lazily initialized)
     let audioContext = null;
     let ansiMusicEnabled = true;  // Will be synced from server settings
+
+    // MCMP (MUD Client Media Protocol) state
+    let mcmpDefaultUrl = '';
+    let mcmpMusicPlayer = null;    // { audio, key, name } - one music track at a time
+    let mcmpSoundPlayers = {};     // key -> { audio, name }
+    let mcmpMusicFadeTimer = null;
+
     let tlsProxyEnabled = false;  // TLS proxy for connection preservation over hot reload
     let tempConvertEnabled = false;  // Temperature conversion (32F -> 32F(0C))
     let prevInputLen = 0;  // Track previous input length for temp conversion
@@ -2038,6 +2046,34 @@
                 }
                 break;
 
+            case 'GmcpData':
+                // Store GMCP data for script access
+                break;
+
+            case 'MsdpData':
+                // Store MSDP data for script access
+                break;
+
+            case 'McmpMedia':
+                // Handle MCMP media commands (Play/Stop/Load/Default)
+                if (msg.action === 'Default') {
+                    handleMcmpMedia(msg.action, msg.data, msg.default_url);
+                } else if (worlds[msg.world_index] && worlds[msg.world_index].gmcp_user_enabled
+                           && msg.world_index === currentWorldIndex) {
+                    handleMcmpMedia(msg.action, msg.data, msg.default_url);
+                }
+                break;
+
+            case 'GmcpUserToggled':
+                if (worlds[msg.world_index]) {
+                    worlds[msg.world_index].gmcp_user_enabled = msg.enabled;
+                    if (!msg.enabled && msg.world_index === currentWorldIndex) {
+                        mcmpStopAll();
+                    }
+                    updateStatusBar();
+                }
+                break;
+
             case 'BanListResponse':
                 // Ban list received - output is already sent via ServerData
                 // This message can be used for future UI enhancements
@@ -2570,6 +2606,7 @@
     // Switch world locally (does not affect console)
     function switchWorldLocal(index) {
         if (index >= 0 && index < worlds.length && index !== currentWorldIndex) {
+            mcmpStopAll();
             currentWorldIndex = index;
             // Reset more-mode state for new world
             paused = false;
@@ -2871,13 +2908,10 @@
         const html = tsPrefix + (showTags ? processed : convertDiscordEmojis(processed));
 
         // Append to output with a <br> prefix (if not first line)
-        if (elements.output.innerHTML.length > 0) {
-            elements.output.innerHTML += '<br>' + html;
-        } else {
-            elements.output.innerHTML = html;
-        }
+        const prefix = elements.output.childNodes.length > 0 ? '<br>' : '';
+        elements.output.insertAdjacentHTML('beforeend', prefix + html);
 
-        scrollToBottom();
+        scheduleScrollToBottom();
     }
 
     // Parse ANSI escape codes (supports 16, 256, and true color)
@@ -3408,6 +3442,199 @@
         });
     }
 
+    // ============================================================================
+    // MCMP (MUD Client Media Protocol) - Media playback via GMCP
+    // ============================================================================
+
+    function ensureAudioContext() {
+        if (!audioContext) {
+            try {
+                audioContext = new (window.AudioContext || window.webkitAudioContext)();
+            } catch (e) {
+                return false;
+            }
+        }
+        if (audioContext.state === 'suspended') {
+            audioContext.resume();
+        }
+        return true;
+    }
+
+    function handleMcmpMedia(action, dataStr, defaultUrl) {
+        let data;
+        try {
+            data = JSON.parse(dataStr);
+        } catch (e) {
+            return;
+        }
+
+        switch (action) {
+            case 'Default':
+                if (data.url) {
+                    mcmpDefaultUrl = data.url;
+                }
+                break;
+            case 'Play':
+                mcmpPlay(data, defaultUrl);
+                break;
+            case 'Stop':
+                mcmpStop(data);
+                break;
+            case 'Load':
+                mcmpLoad(data, defaultUrl);
+                break;
+        }
+    }
+
+    function mcmpResolveUrl(data, defaultUrl) {
+        let baseUrl = data.url || mcmpDefaultUrl || defaultUrl || '';
+        if (!baseUrl) return '';
+        // Ensure base URL ends with /
+        if (baseUrl && !baseUrl.endsWith('/')) baseUrl += '/';
+        let name = data.name || '';
+        if (!name) return baseUrl;
+        // If name is already a full URL, use it directly
+        if (name.startsWith('http://') || name.startsWith('https://')) return name;
+        return baseUrl + name;
+    }
+
+    function mcmpPlay(data, defaultUrl) {
+        let url = mcmpResolveUrl(data, defaultUrl);
+        if (!url) return;
+
+        let type = (data.type || 'sound').toLowerCase();
+        let volume = data.volume !== undefined ? Math.max(0, Math.min(100, data.volume)) / 100 : 0.5;
+        let loops = data.loops !== undefined ? data.loops : 1;
+        let key = data.key || data.name || url;
+        let continuePlay = data.continue !== undefined ? data.continue : true;
+
+        if (type === 'music') {
+            // Only one music track at a time
+            if (mcmpMusicPlayer) {
+                // If same file and continue:true, just adjust volume
+                if (continuePlay && mcmpMusicPlayer.name === (data.name || url)) {
+                    mcmpMusicPlayer.audio.volume = volume;
+                    return;
+                }
+                // Stop current music
+                mcmpStopAudio(mcmpMusicPlayer);
+            }
+            let audio = new Audio(url);
+            audio.volume = volume;
+            audio.loop = (loops === -1);
+            if (loops > 1) {
+                let playCount = 0;
+                audio.addEventListener('ended', function() {
+                    playCount++;
+                    if (playCount < loops) {
+                        audio.currentTime = 0;
+                        audio.play().catch(() => {});
+                    }
+                });
+            }
+            audio.play().catch(() => {});
+            mcmpMusicPlayer = { audio: audio, key: key, name: data.name || url };
+        } else {
+            // Sound - multiple simultaneous allowed
+            let audio = new Audio(url);
+            audio.volume = volume;
+            audio.loop = (loops === -1);
+            if (loops > 1) {
+                let playCount = 0;
+                audio.addEventListener('ended', function() {
+                    playCount++;
+                    if (playCount < loops) {
+                        audio.currentTime = 0;
+                        audio.play().catch(() => {});
+                    } else {
+                        delete mcmpSoundPlayers[key];
+                    }
+                });
+            } else if (loops !== -1) {
+                audio.addEventListener('ended', function() {
+                    delete mcmpSoundPlayers[key];
+                });
+            }
+            audio.play().catch(() => {});
+            // Stop existing sound with same key
+            if (mcmpSoundPlayers[key]) {
+                mcmpStopAudio(mcmpSoundPlayers[key]);
+            }
+            mcmpSoundPlayers[key] = { audio: audio, key: key, name: data.name || url };
+        }
+    }
+
+    function mcmpStop(data) {
+        let type = data.type ? data.type.toLowerCase() : '';
+        let key = data.key || '';
+        let name = data.name || '';
+
+        if (type === 'music' || (!type && !key && !name)) {
+            // Stop music
+            if (mcmpMusicPlayer) {
+                mcmpStopAudio(mcmpMusicPlayer);
+                mcmpMusicPlayer = null;
+            }
+        }
+        if (type === 'sound' || (!type && !key && !name)) {
+            // Stop all sounds
+            for (let k in mcmpSoundPlayers) {
+                mcmpStopAudio(mcmpSoundPlayers[k]);
+            }
+            mcmpSoundPlayers = {};
+        }
+        if (key) {
+            // Stop by key
+            if (mcmpMusicPlayer && mcmpMusicPlayer.key === key) {
+                mcmpStopAudio(mcmpMusicPlayer);
+                mcmpMusicPlayer = null;
+            }
+            if (mcmpSoundPlayers[key]) {
+                mcmpStopAudio(mcmpSoundPlayers[key]);
+                delete mcmpSoundPlayers[key];
+            }
+        }
+        if (name && !key) {
+            // Stop by name
+            if (mcmpMusicPlayer && mcmpMusicPlayer.name === name) {
+                mcmpStopAudio(mcmpMusicPlayer);
+                mcmpMusicPlayer = null;
+            }
+            for (let k in mcmpSoundPlayers) {
+                if (mcmpSoundPlayers[k].name === name) {
+                    mcmpStopAudio(mcmpSoundPlayers[k]);
+                    delete mcmpSoundPlayers[k];
+                }
+            }
+        }
+    }
+
+    function mcmpStopAudio(player) {
+        if (!player || !player.audio) return;
+        player.audio.pause();
+        player.audio.src = '';
+    }
+
+    function mcmpStopAll() {
+        if (mcmpMusicPlayer) {
+            mcmpStopAudio(mcmpMusicPlayer);
+            mcmpMusicPlayer = null;
+        }
+        for (let k in mcmpSoundPlayers) {
+            mcmpStopAudio(mcmpSoundPlayers[k]);
+        }
+        mcmpSoundPlayers = {};
+    }
+
+    function mcmpLoad(data, defaultUrl) {
+        // Pre-cache by creating and immediately pausing
+        let url = mcmpResolveUrl(data, defaultUrl);
+        if (!url) return;
+        let audio = new Audio(url);
+        audio.preload = 'auto';
+        audio.load();
+    }
+
     // Linkify URLs in HTML text (after ANSI parsing)
     // Matches http://, https://, and www. URLs
     function linkifyUrls(html) {
@@ -3594,6 +3821,18 @@
         elements.outputContainer.scrollTop = elements.outputContainer.scrollHeight;
     }
 
+    // Batched scroll-to-bottom via requestAnimationFrame (avoids forced layout per line)
+    let scrollRafPending = false;
+    function scheduleScrollToBottom() {
+        if (!scrollRafPending) {
+            scrollRafPending = true;
+            requestAnimationFrame(() => {
+                scrollRafPending = false;
+                scrollToBottom();
+            });
+        }
+    }
+
     // Format count for status indicator (right-justified, 4 chars)
     function formatCount(n) {
         if (n >= 1000000) return 'Alot';
@@ -3629,7 +3868,8 @@
         // Only show connection ball and world name if world has ever connected
         if (world && world.name && world.was_connected) {
             elements.connectionStatus.textContent = world.connected ? '🟢' : '🔴';
-            elements.worldName.textContent = ' ' + world.name;
+            const gmcpInd = (world && world.gmcp_user_enabled) ? ' [g]' : '';
+            elements.worldName.textContent = ' ' + world.name + gmcpInd;
         } else {
             elements.connectionStatus.textContent = '';
             elements.worldName.textContent = '';
@@ -4771,6 +5011,9 @@
             elements.worldEditLoggingToggle.classList.remove('active');
         }
         elements.worldEditKeepAliveCmd.value = world.settings?.keep_alive_cmd || '';
+        if (elements.worldEditGmcpPackages) {
+            elements.worldEditGmcpPackages.value = world.settings?.gmcp_packages || '';
+        }
 
         // Set toggle and selects
         const useSsl = world.settings?.use_ssl || false;
@@ -4831,7 +5074,8 @@
             encoding: elements.worldEditEncodingSelect.value,
             auto_login: elements.worldEditAutoLoginSelect.value,
             keep_alive_type: elements.worldEditKeepAliveSelect.value,
-            keep_alive_cmd: elements.worldEditKeepAliveCmd.value
+            keep_alive_cmd: elements.worldEditKeepAliveCmd.value,
+            gmcp_packages: elements.worldEditGmcpPackages ? elements.worldEditGmcpPackages.value : ''
         });
 
         // Update local state
@@ -4848,6 +5092,9 @@
         world.settings.auto_login = elements.worldEditAutoLoginSelect.value;
         world.settings.keep_alive_type = elements.worldEditKeepAliveSelect.value;
         world.settings.keep_alive_cmd = elements.worldEditKeepAliveCmd.value;
+        if (elements.worldEditGmcpPackages) {
+            world.settings.gmcp_packages = elements.worldEditGmcpPackages.value;
+        }
 
         closeWorldEditorPopup();
     }
@@ -5725,6 +5972,11 @@
                 e.stopPropagation();
                 highlightActions = !highlightActions;
                 renderOutput();
+                return;
+            } else if (e.key === 'F9') {
+                // F9: Toggle GMCP user processing for current world
+                e.preventDefault();
+                send({ type: 'ToggleWorldGmcp', world_index: currentWorldIndex });
                 return;
             } else if (e.key === 'F4') {
                 // F4: Toggle filter popup

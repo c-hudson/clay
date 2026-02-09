@@ -117,7 +117,22 @@ pub enum WsMessage {
     /// ANSI Music sequence to play (server -> client)
     AnsiMusic { world_index: usize, notes: Vec<MusicNote> },
 
+    /// GMCP data received from MUD server (server -> client)
+    GmcpData { world_index: usize, package: String, data: String },
+    /// MSDP variable update from MUD server (server -> client)
+    MsdpData { world_index: usize, variable: String, value: String },
+    /// MCMP media action (server -> client, specialized for Client.Media.*)
+    McmpMedia { world_index: usize, action: String, data: String, default_url: String },
+    /// GMCP user toggle state changed (server -> client broadcast)
+    GmcpUserToggled { world_index: usize, enabled: bool },
+
     // Commands (client -> server)
+    /// Toggle GMCP user-enabled for a world (client -> server)
+    ToggleWorldGmcp { world_index: usize },
+    /// Send GMCP message to MUD server (client -> server)
+    SendGmcp { world_index: usize, package: String, data: String },
+    /// Send MSDP message to MUD server (client -> server)
+    SendMsdp { world_index: usize, variable: String, value: String },
     SendCommand { world_index: usize, command: String },
     SwitchWorld { world_index: usize },
     ConnectWorld { world_index: usize },
@@ -158,6 +173,8 @@ pub enum WsMessage {
         auto_login: String,
         keep_alive_type: String,
         keep_alive_cmd: String,
+        #[serde(default)]
+        gmcp_packages: String,
     },
     UpdateGlobalSettings {
         more_mode_enabled: bool,
@@ -327,6 +344,9 @@ pub struct WorldStateMsg {
     // Whether the connection uses a TLS proxy
     #[serde(default)]
     pub is_proxy: bool,
+    // Whether GMCP user processing is enabled (F9 toggle)
+    #[serde(default)]
+    pub gmcp_user_enabled: bool,
 }
 
 /// World settings for WebSocket protocol
@@ -344,6 +364,8 @@ pub struct WorldSettingsMsg {
     pub auto_connect_type: String,
     pub keep_alive_type: String,
     pub keep_alive_cmd: String,
+    #[serde(default)]
+    pub gmcp_packages: String,
 }
 
 /// Global settings for WebSocket protocol

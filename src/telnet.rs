@@ -28,6 +28,16 @@ pub const TELNET_OPT_SGA: u8 = 3;     // Suppress Go Ahead
 pub const TELNET_OPT_TTYPE: u8 = 24;  // Terminal Type
 pub const TELNET_OPT_EOR: u8 = 25;    // End of Record
 pub const TELNET_OPT_NAWS: u8 = 31;   // Negotiate About Window Size
+pub const TELNET_OPT_MSDP: u8 = 69;   // MUD Server Data Protocol
+pub const TELNET_OPT_GMCP: u8 = 201;  // Generic MUD Communication Protocol
+
+// MSDP sub-negotiation markers
+pub const MSDP_VAR: u8 = 1;
+pub const MSDP_VAL: u8 = 2;
+pub const MSDP_TABLE_OPEN: u8 = 3;
+pub const MSDP_TABLE_CLOSE: u8 = 4;
+pub const MSDP_ARRAY_OPEN: u8 = 5;
+pub const MSDP_ARRAY_CLOSE: u8 = 6;
 
 // TTYPE subnegotiation commands
 pub const TTYPE_IS: u8 = 0;    // Terminal type IS (response)
@@ -112,6 +122,10 @@ pub struct TelnetResult {
     pub wont_echo_seen: bool,   // True if IAC WONT ECHO was received
     pub naws_requested: bool,   // True if server sent DO NAWS (we responded WILL NAWS)
     pub ttype_requested: bool,  // True if server sent SB TTYPE SEND (we need to send terminal type)
+    pub gmcp_data: Vec<(String, String)>,  // (package.message, json_data)
+    pub msdp_data: Vec<(String, String)>,  // (variable_name, value_json)
+    pub gmcp_negotiated: bool,  // True if server sent WILL GMCP
+    pub msdp_negotiated: bool,  // True if server sent WILL MSDP
 }
 
 /// Process telnet sequences in incoming data.
@@ -124,6 +138,10 @@ pub fn process_telnet(data: &[u8]) -> TelnetResult {
     let mut wont_echo_seen = false;
     let mut naws_requested = false;
     let mut ttype_requested = false;
+    let mut gmcp_data = Vec::new();
+    let mut msdp_data = Vec::new();
+    let mut gmcp_negotiated = false;
+    let mut msdp_negotiated = false;
     let mut i = 0;
 
     while i < data.len() {
@@ -151,6 +169,14 @@ pub fn process_telnet(data: &[u8]) -> TelnetResult {
                             if option == TELNET_OPT_SGA || option == TELNET_OPT_EOR {
                                 // Accept Suppress Go Ahead and End of Record
                                 responses.extend_from_slice(&[TELNET_IAC, TELNET_DO, option]);
+                            } else if option == TELNET_OPT_GMCP {
+                                // Accept GMCP
+                                responses.extend_from_slice(&[TELNET_IAC, TELNET_DO, option]);
+                                gmcp_negotiated = true;
+                            } else if option == TELNET_OPT_MSDP {
+                                // Accept MSDP
+                                responses.extend_from_slice(&[TELNET_IAC, TELNET_DO, option]);
+                                msdp_negotiated = true;
                             } else {
                                 responses.extend_from_slice(&[TELNET_IAC, TELNET_DONT, option]);
                             }
@@ -193,6 +219,26 @@ pub fn process_telnet(data: &[u8]) -> TelnetResult {
                                 // Check for TTYPE SEND request
                                 if sb_data.len() >= 2 && sb_data[0] == TELNET_OPT_TTYPE && sb_data[1] == TTYPE_SEND {
                                     ttype_requested = true;
+                                }
+                                // Check for GMCP data (option 201)
+                                if sb_data.len() >= 2 && sb_data[0] == TELNET_OPT_GMCP {
+                                    let payload = &sb_data[1..];
+                                    // GMCP format: "package.message json_data"
+                                    // Split at first space to separate package from JSON
+                                    if let Ok(text) = std::str::from_utf8(payload) {
+                                        let (package, json) = if let Some(pos) = text.find(' ') {
+                                            (text[..pos].to_string(), text[pos+1..].trim().to_string())
+                                        } else {
+                                            (text.to_string(), String::new())
+                                        };
+                                        gmcp_data.push((package, json));
+                                    }
+                                }
+                                // Check for MSDP data (option 69)
+                                if sb_data.len() >= 2 && sb_data[0] == TELNET_OPT_MSDP {
+                                    let payload = &sb_data[1..];
+                                    let pairs = parse_msdp_pairs(payload);
+                                    msdp_data.extend(pairs);
                                 }
                                 i += 2;
                                 break;
@@ -252,6 +298,10 @@ pub fn process_telnet(data: &[u8]) -> TelnetResult {
         wont_echo_seen,
         naws_requested,
         ttype_requested,
+        gmcp_data,
+        msdp_data,
+        gmcp_negotiated,
+        msdp_negotiated,
     }
 }
 
@@ -279,6 +329,147 @@ pub fn build_naws_subnegotiation(width: u16, height: u16) -> Vec<u8> {
     result.push(TELNET_IAC);
     result.push(TELNET_SE);
     result
+}
+
+/// Parse MSDP VAR/VAL pairs from subnegotiation payload
+pub fn parse_msdp_pairs(data: &[u8]) -> Vec<(String, String)> {
+    let mut pairs = Vec::new();
+    let mut i = 0;
+    while i < data.len() {
+        if data[i] == MSDP_VAR {
+            i += 1;
+            // Read variable name until MSDP_VAL
+            let name_start = i;
+            while i < data.len() && data[i] != MSDP_VAL {
+                i += 1;
+            }
+            let name = String::from_utf8_lossy(&data[name_start..i]).to_string();
+            if i < data.len() && data[i] == MSDP_VAL {
+                i += 1;
+                let value = parse_msdp_value(data, &mut i);
+                pairs.push((name, value));
+            }
+        } else {
+            i += 1;
+        }
+    }
+    pairs
+}
+
+/// Recursively parse an MSDP value (string, table, or array) into a JSON string
+fn parse_msdp_value(data: &[u8], i: &mut usize) -> String {
+    if *i >= data.len() {
+        return "\"\"".to_string();
+    }
+    match data[*i] {
+        MSDP_TABLE_OPEN => {
+            *i += 1;
+            let mut entries = Vec::new();
+            while *i < data.len() && data[*i] != MSDP_TABLE_CLOSE {
+                if data[*i] == MSDP_VAR {
+                    *i += 1;
+                    let key_start = *i;
+                    while *i < data.len() && data[*i] != MSDP_VAL {
+                        *i += 1;
+                    }
+                    let key = String::from_utf8_lossy(&data[key_start..*i]).to_string();
+                    if *i < data.len() && data[*i] == MSDP_VAL {
+                        *i += 1;
+                        let val = parse_msdp_value(data, i);
+                        entries.push(format!("\"{}\":{}", escape_json_string(&key), val));
+                    }
+                } else {
+                    *i += 1;
+                }
+            }
+            if *i < data.len() && data[*i] == MSDP_TABLE_CLOSE {
+                *i += 1;
+            }
+            format!("{{{}}}", entries.join(","))
+        }
+        MSDP_ARRAY_OPEN => {
+            *i += 1;
+            let mut elements = Vec::new();
+            while *i < data.len() && data[*i] != MSDP_ARRAY_CLOSE {
+                if data[*i] == MSDP_VAL {
+                    *i += 1;
+                    let val = parse_msdp_value(data, i);
+                    elements.push(val);
+                } else {
+                    *i += 1;
+                }
+            }
+            if *i < data.len() && data[*i] == MSDP_ARRAY_CLOSE {
+                *i += 1;
+            }
+            format!("[{}]", elements.join(","))
+        }
+        _ => {
+            // Plain string value - read until next MSDP marker or end
+            let start = *i;
+            while *i < data.len()
+                && data[*i] != MSDP_VAR
+                && data[*i] != MSDP_VAL
+                && data[*i] != MSDP_TABLE_OPEN
+                && data[*i] != MSDP_TABLE_CLOSE
+                && data[*i] != MSDP_ARRAY_OPEN
+                && data[*i] != MSDP_ARRAY_CLOSE
+            {
+                *i += 1;
+            }
+            let s = String::from_utf8_lossy(&data[start..*i]).to_string();
+            format!("\"{}\"", escape_json_string(&s))
+        }
+    }
+}
+
+/// Escape a string for JSON output
+fn escape_json_string(s: &str) -> String {
+    let mut result = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '"' => result.push_str("\\\""),
+            '\\' => result.push_str("\\\\"),
+            '\n' => result.push_str("\\n"),
+            '\r' => result.push_str("\\r"),
+            '\t' => result.push_str("\\t"),
+            c if (c as u32) < 0x20 => {
+                result.push_str(&format!("\\u{:04x}", c as u32));
+            }
+            c => result.push(c),
+        }
+    }
+    result
+}
+
+/// Build a GMCP subnegotiation message: IAC SB 201 <package> <json> IAC SE
+pub fn build_gmcp_message(package: &str, json: &str) -> Vec<u8> {
+    let mut msg = vec![TELNET_IAC, TELNET_SB, TELNET_OPT_GMCP];
+    msg.extend_from_slice(package.as_bytes());
+    if !json.is_empty() {
+        msg.push(b' ');
+        msg.extend_from_slice(json.as_bytes());
+    }
+    msg.extend_from_slice(&[TELNET_IAC, TELNET_SE]);
+    msg
+}
+
+/// Build an MSDP request message: IAC SB 69 MSDP_VAR <name> IAC SE
+pub fn build_msdp_request(variable: &str) -> Vec<u8> {
+    let mut msg = vec![TELNET_IAC, TELNET_SB, TELNET_OPT_MSDP, MSDP_VAR];
+    msg.extend_from_slice(variable.as_bytes());
+    msg.extend_from_slice(&[TELNET_IAC, TELNET_SE]);
+    msg
+}
+
+/// Build an MSDP set message: IAC SB 69 MSDP_VAR <name> MSDP_VAL <value> IAC SE
+pub fn build_msdp_set(variable: &str, value: &str) -> Vec<u8> {
+    let mut msg = vec![TELNET_IAC, TELNET_SB, TELNET_OPT_MSDP, MSDP_VAR];
+    msg.extend_from_slice(variable.as_bytes());
+    msg.push(MSDP_VAL);
+    msg.extend_from_slice(value.as_bytes());
+    msg.extend_from_slice(&[TELNET_IAC, TELNET_SE]);
+    msg
 }
 
 /// Check if there's an incomplete ANSI escape sequence or telnet sequence at the end.
@@ -369,6 +560,7 @@ pub enum AutoConnectType {
     Connect,   // Send "connect <user> <password>" after connection
     Prompt,    // Send username on 1st prompt, password on 2nd prompt
     MooPrompt, // Like Prompt but also send username on 3rd prompt
+    NoLogin,   // No auto-login even if credentials are set
 }
 
 impl AutoConnectType {
@@ -377,6 +569,7 @@ impl AutoConnectType {
             AutoConnectType::Connect => "Connect",
             AutoConnectType::Prompt => "Prompt",
             AutoConnectType::MooPrompt => "MOO_prompt",
+            AutoConnectType::NoLogin => "None",
         }
     }
 
@@ -384,15 +577,17 @@ impl AutoConnectType {
         match self {
             AutoConnectType::Connect => AutoConnectType::Prompt,
             AutoConnectType::Prompt => AutoConnectType::MooPrompt,
-            AutoConnectType::MooPrompt => AutoConnectType::Connect,
+            AutoConnectType::MooPrompt => AutoConnectType::NoLogin,
+            AutoConnectType::NoLogin => AutoConnectType::Connect,
         }
     }
 
     pub fn prev(&self) -> Self {
         match self {
-            AutoConnectType::Connect => AutoConnectType::MooPrompt,
+            AutoConnectType::Connect => AutoConnectType::NoLogin,
             AutoConnectType::Prompt => AutoConnectType::Connect,
             AutoConnectType::MooPrompt => AutoConnectType::Prompt,
+            AutoConnectType::NoLogin => AutoConnectType::MooPrompt,
         }
     }
 
@@ -400,6 +595,7 @@ impl AutoConnectType {
         match name.to_lowercase().as_str() {
             "prompt" => AutoConnectType::Prompt,
             "moo_prompt" | "mooprompt" => AutoConnectType::MooPrompt,
+            "none" | "nologin" | "no_login" => AutoConnectType::NoLogin,
             _ => AutoConnectType::Connect,
         }
     }
