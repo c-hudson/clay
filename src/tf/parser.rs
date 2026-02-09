@@ -56,10 +56,10 @@ fn parse_macro_args(args: &str) -> Vec<&str> {
     words
 }
 
-/// Check if input is a TF command (starts with # or is a unified / command)
+/// Check if input is a TF command (starts with / prefix)
 pub fn is_tf_command(input: &str) -> bool {
     let trimmed = input.trim_start();
-    trimmed.starts_with('#') || trimmed.starts_with('/')
+    trimmed.starts_with('/')
 }
 
 /// Check if a command name (without prefix) is a TF command
@@ -174,7 +174,14 @@ fn execute_command_impl(engine: &mut TfEngine, input: &str, skip_substitution: b
             return execute_command_impl(engine, tf_cmd.trim(), skip_substitution);
         }
 
-        // Not a TF command - route to Clay
+        // Check if it's a user-defined macro
+        if let Some(macro_def) = engine.macros.iter().find(|m| m.name.eq_ignore_ascii_case(&cmd_name)).cloned() {
+            let macro_args: Vec<&str> = parse_macro_args(args);
+            let results = super::macros::execute_macro(engine, &macro_def, &macro_args, None);
+            return aggregate_results_with_engine(engine, results);
+        }
+
+        // Not a TF command or macro - route to Clay
         return TfCommandResult::ClayCommand(input.to_string());
     }
 
@@ -1720,12 +1727,12 @@ mod tests {
 
     #[test]
     fn test_is_tf_command() {
-        // With unified command system, both # and / prefixes are TF commands
-        // (TF parser routes Clay-only commands back via ClayCommand result)
-        assert!(is_tf_command("#set foo bar"));
-        assert!(is_tf_command("  #echo hello"));
-        assert!(is_tf_command("/quit"));  // Now routes through TF parser
-        assert!(is_tf_command("/set foo"));  // TF command with / prefix
+        // Only / prefix is recognized as TF command from user input
+        // (# prefix is only used internally in macro bodies and scripts)
+        assert!(is_tf_command("/quit"));
+        assert!(is_tf_command("/set foo"));
+        assert!(is_tf_command("  /echo hello"));
+        assert!(!is_tf_command("#set foo bar"));  // # no longer recognized from user input
         assert!(!is_tf_command("say hello"));  // Plain text, not a command
     }
 

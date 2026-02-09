@@ -3379,7 +3379,7 @@ impl eframe::App for RemoteGuiApp {
                         } else if i.consume_key(egui::Modifiers::NONE, egui::Key::Tab) {
                             // Tab - command completion if input starts with / or #
                             // Otherwise release pending lines or scroll down if viewing history
-                            if self.input_buffer.starts_with('/') || self.input_buffer.starts_with('#') {
+                            if self.input_buffer.starts_with('/') {
                                 tab_complete = true;
                             } else if self.current_world < self.worlds.len()
                                 && self.worlds[self.current_world].pending_count > 0
@@ -3449,7 +3449,7 @@ impl eframe::App for RemoteGuiApp {
                 }
 
                 // Apply tab completion
-                let is_cmd_prefix = self.input_buffer.starts_with('/') || self.input_buffer.starts_with('#');
+                let is_cmd_prefix = self.input_buffer.starts_with('/');
                 if tab_complete && is_cmd_prefix {
                     // Get the partial command (everything up to first space)
                     let input = self.input_buffer.clone();
@@ -3459,25 +3459,7 @@ impl eframe::App for RemoteGuiApp {
                         (input.as_str(), "")
                     };
 
-                    let matches = if input.starts_with('#') {
-                        // TF commands (backward compatibility with # prefix)
-                        let tf_commands = vec![
-                            "#set", "#unset", "#let", "#echo", "#send", "#beep", "#quote",
-                            "#expr", "#test", "#eval", "#if", "#elseif", "#else", "#endif",
-                            "#while", "#done", "#for", "#break", "#def", "#undef", "#undefn",
-                            "#undeft", "#list", "#purge", "#bind", "#unbind", "#load", "#save",
-                            "#lcd", "#time", "#version", "#help", "#ps", "#kill", "#sh", "#recall",
-                            "#setenv", "#listvar", "#repeat",
-                        ];
-                        let partial_lower = partial.to_lowercase();
-                        let mut m: Vec<String> = tf_commands.iter()
-                            .filter(|cmd| cmd.to_lowercase().starts_with(&partial_lower))
-                            .map(|s| s.to_string())
-                            .collect();
-                        m.sort();
-                        m.dedup();
-                        m
-                    } else {
+                    let matches = {
                         // Unified / commands: Clay commands + TF commands + manual actions
                         let internal_commands = vec![
                             // Clay-specific commands
