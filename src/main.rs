@@ -3706,7 +3706,8 @@ impl App {
     }
 
     /// Handle GMCP Client.Media.* messages (MCMP protocol)
-    fn handle_gmcp_media(&mut self, world_idx: usize, package: &str, json_data: &str) {
+    /// When play_audio is false, only tracks state in active_media without spawning processes
+    fn handle_gmcp_media(&mut self, world_idx: usize, package: &str, json_data: &str, play_audio: bool) {
         match package {
             "Client.Media.Default" => {
                 // Store default URL for resolving relative media paths
@@ -3719,157 +3720,148 @@ impl App {
             "Client.Media.Play" | "Client.Media.Stop" | "Client.Media.Load" => {
                 let action = package.rsplit('.').next().unwrap_or("Play").to_string();
                 let default_url = self.worlds[world_idx].mcmp_default_url.clone();
-                // Console audio playback
-                if let Some(ref player_cmd) = self.media_player_cmd {
-                    if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(json_data) {
-                        let name = parsed.get("name").and_then(|v| v.as_str()).unwrap_or("");
-                        let url = parsed.get("url").and_then(|v| v.as_str()).unwrap_or("");
-                        let media_type = parsed.get("type").and_then(|v| v.as_str()).unwrap_or("sound");
-                        let key = parsed.get("key").and_then(|v| v.as_str()).unwrap_or(name);
-                        let volume = parsed.get("volume").and_then(|v| v.as_i64()).unwrap_or(50);
-                        let loops = parsed.get("loops").and_then(|v| v.as_i64()).unwrap_or(1);
-                        let cont = parsed.get("continue").and_then(|v| v.as_bool()).unwrap_or(false);
+                // Parse JSON unconditionally - we always track state in active_media
+                if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(json_data) {
+                    let name = parsed.get("name").and_then(|v| v.as_str()).unwrap_or("");
+                    let url = parsed.get("url").and_then(|v| v.as_str()).unwrap_or("");
+                    let media_type = parsed.get("type").and_then(|v| v.as_str()).unwrap_or("sound");
+                    let key = parsed.get("key").and_then(|v| v.as_str()).unwrap_or(name);
+                    let volume = parsed.get("volume").and_then(|v| v.as_i64()).unwrap_or(50);
+                    let loops = parsed.get("loops").and_then(|v| v.as_i64()).unwrap_or(1);
+                    let cont = parsed.get("continue").and_then(|v| v.as_bool()).unwrap_or(false);
 
-                        match action.as_str() {
-                            "Play" => {
-                                // Resolve full URL
-                                let full_url = if !url.is_empty() {
-                                    format!("{}{}", url, name)
-                                } else if !default_url.is_empty() {
-                                    format!("{}{}", default_url, name)
-                                } else if !name.is_empty() {
-                                    name.to_string()
-                                } else {
-                                    return;
-                                };
+                    match action.as_str() {
+                        "Play" => {
+                            // Resolve full URL
+                            let full_url = if !url.is_empty() {
+                                format!("{}{}", url, name)
+                            } else if !default_url.is_empty() {
+                                format!("{}{}", default_url, name)
+                            } else if !name.is_empty() {
+                                name.to_string()
+                            } else {
+                                return;
+                            };
 
-                                // For music type: stop previous music (unless continue)
-                                if media_type == "music" {
-                                    if cont {
-                                        // If continuing and same key, skip
-                                        if self.media_music_key.as_ref().map(|(_, k)| k.as_str()) == Some(key) {
-                                            return;
-                                        }
-                                    }
-                                    // Stop previous music
-                                    if let Some((_, prev_key)) = self.media_music_key.take() {
-                                        if let Some((_, mut child)) = self.media_processes.remove(&prev_key) {
-                                            let _ = child.kill();
-                                        }
-                                    }
-                                }
-
-                                // Cache dir setup
-                                let _ = std::fs::create_dir_all(&self.media_cache_dir);
-
-                                // Create a safe filename from the URL
-                                let safe_name = full_url.replace(|c: char| !c.is_alphanumeric() && c != '.', "_");
-                                let cache_path = self.media_cache_dir.join(&safe_name);
-
-                                let player = player_cmd.clone();
-                                let key_owned = key.to_string();
-                                let cache_path_str = cache_path.to_string_lossy().to_string();
-
-                                // Download and play in a blocking thread
-                                let vol = volume;
-                                let loop_count = loops;
-                                let is_music = media_type == "music";
-
-                                // Track looping media for restart on world switch
-                                if loops == -1 || loops > 1 {
-                                    self.worlds[world_idx].active_media.insert(key.to_string(), json_data.to_string());
-                                }
-
-                                // Send child process handle via event channel for reliable delivery
-                                let event_tx = self.event_tx.clone();
-
-                                std::thread::spawn(move || {
-                                    // Download if not cached
-                                    if !cache_path.exists() {
-                                        let output = std::process::Command::new("curl")
-                                            .args(["-sL", "-o", &cache_path_str, &full_url])
-                                            .output();
-                                        if output.is_err() || !cache_path.exists() {
-                                            return;
-                                        }
-                                    }
-                                    // Build player command
-                                    let mut cmd = std::process::Command::new(&player);
-                                    match player.as_str() {
-                                        "mpv" => {
-                                            cmd.args(["--no-video", "--no-terminal"]);
-                                            cmd.arg(format!("--volume={}", vol));
-                                            if loop_count == -1 {
-                                                cmd.arg("--loop=inf");
-                                            } else if loop_count > 1 {
-                                                cmd.arg(format!("--loop={}", loop_count));
-                                            }
-                                        }
-                                        "ffplay" => {
-                                            cmd.args(["-nodisp", "-autoexit"]);
-                                            cmd.arg("-volume").arg(format!("{}", vol));
-                                            if loop_count == -1 || loop_count > 1 {
-                                                cmd.arg("-loop").arg(
-                                                    if loop_count == -1 { "0".to_string() }
-                                                    else { loop_count.to_string() }
-                                                );
-                                            }
-                                        }
-                                        _ => {}
-                                    }
-                                    cmd.arg(&cache_path_str);
-                                    cmd.stdout(std::process::Stdio::null());
-                                    cmd.stderr(std::process::Stdio::null());
-                                    if let Ok(child) = cmd.spawn() {
-                                        if let Some(tx) = event_tx {
-                                            let _ = tx.blocking_send(AppEvent::MediaProcessReady(
-                                                world_idx, key_owned, child, is_music,
-                                            ));
-                                        }
-                                    }
-                                });
+                            // Always track looping media for restart on world switch/F9 toggle
+                            if loops == -1 || loops > 1 {
+                                self.worlds[world_idx].active_media.insert(key.to_string(), json_data.to_string());
                             }
-                            "Stop" => {
-                                if !key.is_empty() {
-                                    if let Some((_, mut child)) = self.media_processes.remove(key) {
+
+                            // Only spawn audio processes when play_audio is true and a player is available
+                            if play_audio {
+                                if let Some(ref player_cmd) = self.media_player_cmd {
+                                    // For music type: stop previous music (unless continue)
+                                    if media_type == "music" {
+                                        if cont {
+                                            if self.media_music_key.as_ref().map(|(_, k)| k.as_str()) == Some(key) {
+                                                return;
+                                            }
+                                        }
+                                        if let Some((_, prev_key)) = self.media_music_key.take() {
+                                            if let Some((_, mut child)) = self.media_processes.remove(&prev_key) {
+                                                let _ = child.kill();
+                                            }
+                                        }
+                                    }
+
+                                    let _ = std::fs::create_dir_all(&self.media_cache_dir);
+                                    let safe_name = full_url.replace(|c: char| !c.is_alphanumeric() && c != '.', "_");
+                                    let cache_path = self.media_cache_dir.join(&safe_name);
+                                    let player = player_cmd.clone();
+                                    let key_owned = key.to_string();
+                                    let cache_path_str = cache_path.to_string_lossy().to_string();
+                                    let vol = volume;
+                                    let loop_count = loops;
+                                    let is_music = media_type == "music";
+                                    let event_tx = self.event_tx.clone();
+
+                                    std::thread::spawn(move || {
+                                        if !cache_path.exists() {
+                                            let output = std::process::Command::new("curl")
+                                                .args(["-sL", "-o", &cache_path_str, &full_url])
+                                                .output();
+                                            if output.is_err() || !cache_path.exists() {
+                                                return;
+                                            }
+                                        }
+                                        let mut cmd = std::process::Command::new(&player);
+                                        match player.as_str() {
+                                            "mpv" => {
+                                                cmd.args(["--no-video", "--no-terminal"]);
+                                                cmd.arg(format!("--volume={}", vol));
+                                                if loop_count == -1 {
+                                                    cmd.arg("--loop=inf");
+                                                } else if loop_count > 1 {
+                                                    cmd.arg(format!("--loop={}", loop_count));
+                                                }
+                                            }
+                                            "ffplay" => {
+                                                cmd.args(["-nodisp", "-autoexit"]);
+                                                cmd.arg("-volume").arg(format!("{}", vol));
+                                                if loop_count == -1 || loop_count > 1 {
+                                                    cmd.arg("-loop").arg(
+                                                        if loop_count == -1 { "0".to_string() }
+                                                        else { loop_count.to_string() }
+                                                    );
+                                                }
+                                            }
+                                            _ => {}
+                                        }
+                                        cmd.arg(&cache_path_str);
+                                        cmd.stdout(std::process::Stdio::null());
+                                        cmd.stderr(std::process::Stdio::null());
+                                        if let Ok(child) = cmd.spawn() {
+                                            if let Some(tx) = event_tx {
+                                                let _ = tx.blocking_send(AppEvent::MediaProcessReady(
+                                                    world_idx, key_owned, child, is_music,
+                                                ));
+                                            }
+                                        }
+                                    });
+                                }
+                            }
+                        }
+                        "Stop" => {
+                            // Always update tracking state and kill processes
+                            if !key.is_empty() {
+                                if let Some((_, mut child)) = self.media_processes.remove(key) {
+                                    let _ = child.kill();
+                                }
+                                self.worlds[world_idx].active_media.remove(key);
+                                if self.media_music_key.as_ref().map(|(_, k)| k.as_str()) == Some(key) {
+                                    self.media_music_key = None;
+                                }
+                            } else if media_type == "music" {
+                                if let Some((_, mk)) = self.media_music_key.take() {
+                                    self.worlds[world_idx].active_media.remove(&mk);
+                                    if let Some((_, mut child)) = self.media_processes.remove(&mk) {
                                         let _ = child.kill();
                                     }
-                                    self.worlds[world_idx].active_media.remove(key);
-                                    if self.media_music_key.as_ref().map(|(_, k)| k.as_str()) == Some(key) {
-                                        self.media_music_key = None;
-                                    }
-                                } else if media_type == "music" {
-                                    // Stop all music
-                                    if let Some((_, mk)) = self.media_music_key.take() {
-                                        self.worlds[world_idx].active_media.remove(&mk);
-                                        if let Some((_, mut child)) = self.media_processes.remove(&mk) {
-                                            let _ = child.kill();
-                                        }
-                                    }
                                 }
                             }
-                            "Load" => {
-                                // Pre-cache only, no playback
-                                let full_url = if !url.is_empty() {
-                                    format!("{}{}", url, name)
-                                } else if !default_url.is_empty() {
-                                    format!("{}{}", default_url, name)
-                                } else {
-                                    return;
-                                };
-                                let _ = std::fs::create_dir_all(&self.media_cache_dir);
-                                let safe_name = full_url.replace(|c: char| !c.is_alphanumeric() && c != '.', "_");
-                                let cache_path_str = self.media_cache_dir.join(&safe_name).to_string_lossy().to_string();
-                                std::thread::spawn(move || {
-                                    let _ = std::process::Command::new("curl")
-                                        .args(["-sL", "-o", &cache_path_str, &full_url])
-                                        .stdout(std::process::Stdio::null())
-                                        .stderr(std::process::Stdio::null())
-                                        .status();
-                                });
-                            }
-                            _ => {}
                         }
+                        "Load" => {
+                            // Pre-cache only, no playback
+                            let full_url = if !url.is_empty() {
+                                format!("{}{}", url, name)
+                            } else if !default_url.is_empty() {
+                                format!("{}{}", default_url, name)
+                            } else {
+                                return;
+                            };
+                            let _ = std::fs::create_dir_all(&self.media_cache_dir);
+                            let safe_name = full_url.replace(|c: char| !c.is_alphanumeric() && c != '.', "_");
+                            let cache_path_str = self.media_cache_dir.join(&safe_name).to_string_lossy().to_string();
+                            std::thread::spawn(move || {
+                                let _ = std::process::Command::new("curl")
+                                    .args(["-sL", "-o", &cache_path_str, &full_url])
+                                    .stdout(std::process::Stdio::null())
+                                    .stderr(std::process::Stdio::null())
+                                    .status();
+                            });
+                        }
+                        _ => {}
                     }
                 }
             }
@@ -3907,8 +3899,8 @@ impl App {
             .map(|(k, v)| (k.clone(), v.clone()))
             .collect();
         for (_key, json_data) in plays {
-            // Restart console media (ffplay/mpv)
-            self.handle_gmcp_media(world_idx, "Client.Media.Play", &json_data);
+            // Restart console media (ffplay/mpv) - play_audio=true since restart implies enabled
+            self.handle_gmcp_media(world_idx, "Client.Media.Play", &json_data, true);
             // Broadcast to web/GUI clients
             self.ws_broadcast_to_world(world_idx, WsMessage::McmpMedia {
                 world_index: world_idx,
@@ -9087,15 +9079,14 @@ pub async fn run_app_headless(
                                     default_url,
                                 });
                             }
-                            // Gate on gmcp_user_enabled
+                            // Always track media state; only play audio when enabled + current world
+                            if package.starts_with("Client.Media.") {
+                                let play_audio = app.worlds[world_idx].gmcp_user_enabled
+                                    && world_idx == app.current_world_index;
+                                app.handle_gmcp_media(world_idx, package, json_data, play_audio);
+                            }
+                            // Gate TF hooks on gmcp_user_enabled
                             if app.worlds[world_idx].gmcp_user_enabled {
-                                // Console media: only for current world
-                                if world_idx == app.current_world_index {
-                                    let package_clone = package.clone();
-                                    let json_clone = json_data.clone();
-                                    app.handle_gmcp_media(world_idx, &package_clone, &json_clone);
-                                }
-                                // TF hooks
                                 app.tf_engine.set_global("gmcp_package", crate::tf::TfValue::String(package.clone()));
                                 app.tf_engine.set_global("gmcp_data", crate::tf::TfValue::String(json_data.clone()));
                                 let results = crate::tf::hooks::fire_hook(&mut app.tf_engine, crate::tf::TfHookEvent::Gmcp);
@@ -10757,13 +10748,14 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                     default_url,
                                 });
                             }
-                            // Gate on gmcp_user_enabled
+                            // Always track media state; only play audio when enabled + current world
+                            if package.starts_with("Client.Media.") {
+                                let play_audio = app.worlds[world_idx].gmcp_user_enabled
+                                    && world_idx == app.current_world_index;
+                                app.handle_gmcp_media(world_idx, package, json_data, play_audio);
+                            }
+                            // Gate TF hooks on gmcp_user_enabled
                             if app.worlds[world_idx].gmcp_user_enabled {
-                                if world_idx == app.current_world_index {
-                                    let package_clone = package.clone();
-                                    let json_clone = json_data.clone();
-                                    app.handle_gmcp_media(world_idx, &package_clone, &json_clone);
-                                }
                                 app.tf_engine.set_global("gmcp_package", crate::tf::TfValue::String(package.clone()));
                                 app.tf_engine.set_global("gmcp_data", crate::tf::TfValue::String(json_data.clone()));
                                 let results = crate::tf::hooks::fire_hook(&mut app.tf_engine, crate::tf::TfHookEvent::Gmcp);
@@ -13448,13 +13440,14 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                 default_url,
                             });
                         }
-                        // Gate on gmcp_user_enabled
+                        // Always track media state; only play audio when enabled + current world
+                        if package.starts_with("Client.Media.") {
+                            let play_audio = app.worlds[world_idx].gmcp_user_enabled
+                                && world_idx == app.current_world_index;
+                            app.handle_gmcp_media(world_idx, package, json_data, play_audio);
+                        }
+                        // Gate TF hooks on gmcp_user_enabled
                         if app.worlds[world_idx].gmcp_user_enabled {
-                            if world_idx == app.current_world_index {
-                                let package_clone = package.clone();
-                                let json_clone = json_data.clone();
-                                app.handle_gmcp_media(world_idx, &package_clone, &json_clone);
-                            }
                             app.tf_engine.set_global("gmcp_package", crate::tf::TfValue::String(package.clone()));
                             app.tf_engine.set_global("gmcp_data", crate::tf::TfValue::String(json_data.clone()));
                             let results = crate::tf::hooks::fire_hook(&mut app.tf_engine, crate::tf::TfHookEvent::Gmcp);
