@@ -2443,6 +2443,8 @@ pub struct App {
     pub media_processes: std::collections::HashMap<String, (usize, std::process::Child)>,
     /// Current music process key (only one music track at a time) - (world_idx, key)
     pub media_music_key: Option<(usize, String)>,
+    /// Event channel sender for async media process delivery
+    pub event_tx: Option<mpsc::Sender<AppEvent>>,
 }
 
 impl App {
@@ -2498,6 +2500,7 @@ impl App {
             },
             media_processes: std::collections::HashMap::new(),
             media_music_key: None,
+            event_tx: None,
         }
         // Note: No initial world created here - it will be created after persistence::load_settings()
         // if no worlds are configured
@@ -3772,8 +3775,13 @@ impl App {
                                 let loop_count = loops;
                                 let is_music = media_type == "music";
 
-                                // Use a channel to send back the child process
-                                let (child_tx, child_rx) = std::sync::mpsc::channel();
+                                // Track looping media for restart on world switch
+                                if loops == -1 || loops > 1 {
+                                    self.worlds[world_idx].active_media.insert(key.to_string(), json_data.to_string());
+                                }
+
+                                // Send child process handle via event channel for reliable delivery
+                                let event_tx = self.event_tx.clone();
 
                                 std::thread::spawn(move || {
                                     // Download if not cached
@@ -3813,22 +3821,13 @@ impl App {
                                     cmd.stdout(std::process::Stdio::null());
                                     cmd.stderr(std::process::Stdio::null());
                                     if let Ok(child) = cmd.spawn() {
-                                        let _ = child_tx.send((key_owned.clone(), child, is_music));
+                                        if let Some(tx) = event_tx {
+                                            let _ = tx.blocking_send(AppEvent::MediaProcessReady(
+                                                world_idx, key_owned, child, is_music,
+                                            ));
+                                        }
                                     }
                                 });
-
-                                // Try to receive the child (non-blocking, will be picked up on next tick)
-                                if let Ok((k, child, is_music_flag)) = child_rx.recv_timeout(std::time::Duration::from_millis(100)) {
-                                    if is_music_flag {
-                                        self.media_music_key = Some((world_idx, k.clone()));
-                                    }
-                                    self.media_processes.insert(k, (world_idx, child));
-                                    // Track looping media for restart on world switch
-                                    // Only track sounds that loop (loops=-1 or loops>1), not one-shots
-                                    if loops == -1 || loops > 1 {
-                                        self.worlds[world_idx].active_media.insert(key.to_string(), json_data.to_string());
-                                    }
-                                }
                             }
                             "Stop" => {
                                 if !key.is_empty() {
@@ -3903,11 +3902,20 @@ impl App {
         if !self.worlds[world_idx].gmcp_user_enabled {
             return;
         }
+        let default_url = self.worlds[world_idx].mcmp_default_url.clone();
         let plays: Vec<(String, String)> = self.worlds[world_idx].active_media.iter()
             .map(|(k, v)| (k.clone(), v.clone()))
             .collect();
         for (_key, json_data) in plays {
+            // Restart console media (ffplay/mpv)
             self.handle_gmcp_media(world_idx, "Client.Media.Play", &json_data);
+            // Broadcast to web/GUI clients
+            self.ws_broadcast_to_world(world_idx, WsMessage::McmpMedia {
+                world_index: world_idx,
+                action: "Play".to_string(),
+                data: json_data,
+                default_url: default_url.clone(),
+            });
         }
     }
 
@@ -4953,6 +4961,8 @@ pub enum AppEvent {
     MsdpNegotiated(String),                   // world_name
     GmcpReceived(String, String, String),     // world_name, package, json_data
     MsdpReceived(String, String, String),     // world_name, variable, value_json
+    // Media process ready from background download/spawn thread
+    MediaProcessReady(usize, String, std::process::Child, bool),  // world_idx, key, child, is_music
 }
 
 /// Per-user connection state for multiuser mode
@@ -6556,14 +6566,16 @@ fn handle_remote_client_key(
             // Toggle GMCP user processing for current world
             let idx = app.current_world_index;
             app.worlds[idx].gmcp_user_enabled = !app.worlds[idx].gmcp_user_enabled;
-            if !app.worlds[idx].gmcp_user_enabled {
-                app.stop_world_media(idx);
-            }
-            app.needs_output_redraw = true;
             app.ws_broadcast(WsMessage::GmcpUserToggled {
                 world_index: idx,
                 enabled: app.worlds[idx].gmcp_user_enabled,
             });
+            if app.worlds[idx].gmcp_user_enabled {
+                app.restart_world_media(idx);
+            } else {
+                app.stop_world_media(idx);
+            }
+            app.needs_output_redraw = true;
         }
         (_, Char(c)) => {
             app.input.insert_char(c);
@@ -8376,6 +8388,7 @@ pub async fn run_app_headless(
     }
 
     let (event_tx, mut event_rx) = mpsc::channel::<AppEvent>(100);
+    app.event_tx = Some(event_tx.clone());
 
     // Reconstruct connections from saved fds if in reload/crash mode
     #[cfg(unix)]
@@ -9120,6 +9133,12 @@ pub async fn run_app_headless(
                             });
                         }
                     }
+                    AppEvent::MediaProcessReady(world_idx, key, child, is_music) => {
+                        if is_music {
+                            app.media_music_key = Some((world_idx, key.clone()));
+                        }
+                        app.media_processes.insert(key, (world_idx, child));
+                    }
                     _ => {}
                 }
             }
@@ -9470,6 +9489,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
 
     debug_log(true, "STARTUP: Creating event channel...");
     let (event_tx, mut event_rx) = mpsc::channel::<AppEvent>(100);
+    app.event_tx = Some(event_tx.clone());
 
     // If in reload or crash recovery mode, reconstruct connections from saved fds
     // FD reconstruction is Unix-only (reload/crash recovery requires exec() which is Unix-only)
@@ -12502,14 +12522,17 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                             WsMessage::ToggleWorldGmcp { world_index } => {
                                 if world_index < app.worlds.len() {
                                     app.worlds[world_index].gmcp_user_enabled = !app.worlds[world_index].gmcp_user_enabled;
-                                    if !app.worlds[world_index].gmcp_user_enabled {
-                                        app.stop_world_media(world_index);
-                                    }
-                                    app.needs_output_redraw = true;
+                                    // Broadcast toggle state first so clients update before receiving media
                                     app.ws_broadcast(WsMessage::GmcpUserToggled {
                                         world_index,
                                         enabled: app.worlds[world_index].gmcp_user_enabled,
                                     });
+                                    if app.worlds[world_index].gmcp_user_enabled {
+                                        app.restart_world_media(world_index);
+                                    } else {
+                                        app.stop_world_media(world_index);
+                                    }
+                                    app.needs_output_redraw = true;
                                 }
                             }
                             WsMessage::SendGmcp { world_index, ref package, ref data } => {
@@ -12590,6 +12613,12 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                         if let Some(world_idx) = app.find_world_index(&world_name) {
                             app.add_output_to_world(world_idx, &format!("Connection failed: {}", error));
                         }
+                    }
+                    AppEvent::MediaProcessReady(world_idx, key, child, is_music) => {
+                        if is_music {
+                            app.media_music_key = Some((world_idx, key.clone()));
+                        }
+                        app.media_processes.insert(key, (world_idx, child));
                     }
                 }
             }
@@ -14898,6 +14927,12 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                         app.add_output_to_world(world_idx, &format!("Connection failed: {}", error));
                     }
                 }
+                AppEvent::MediaProcessReady(world_idx, key, child, is_music) => {
+                    if is_music {
+                        app.media_music_key = Some((world_idx, key.clone()));
+                    }
+                    app.media_processes.insert(key, (world_idx, child));
+                }
             }
         }
 
@@ -15957,14 +15992,16 @@ fn handle_key_event(key: KeyEvent, app: &mut App) -> KeyAction {
         (_, KeyCode::F(9)) => {
             let idx = app.current_world_index;
             app.worlds[idx].gmcp_user_enabled = !app.worlds[idx].gmcp_user_enabled;
-            if !app.worlds[idx].gmcp_user_enabled {
-                app.stop_world_media(idx);
-            }
-            app.needs_output_redraw = true;
             app.ws_broadcast(WsMessage::GmcpUserToggled {
                 world_index: idx,
                 enabled: app.worlds[idx].gmcp_user_enabled,
             });
+            if app.worlds[idx].gmcp_user_enabled {
+                app.restart_world_media(idx);
+            } else {
+                app.stop_world_media(idx);
+            }
+            app.needs_output_redraw = true;
             KeyAction::Redraw
         }
 
