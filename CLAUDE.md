@@ -428,6 +428,7 @@ This logic applies to all interfaces (console, web, GUI). Remote clients query t
 - `F1` - Open help popup
 - `F2` - Toggle MUD tag display (show/hide tags like `[channel:]` and timestamps)
 - `F8` - Toggle action pattern highlighting (highlight lines matching action patterns without running commands)
+- `F9` - Toggle GMCP media audio (master mute switch, starts muted)
 - `Ctrl+C` - Press twice within 15 seconds to quit
 - `Ctrl+L` - Redraw screen (filters out client-generated output, keeps only MUD server data)
 - `Ctrl+R` - Hot reload (same as /reload)
@@ -636,6 +637,43 @@ The client supports ANSI music sequences (BBS-style PC speaker music). When enab
 cargo build --features remote-gui-audio  # Requires libasound2-dev on Linux
 ```
 
+### GMCP Media (MCMP Protocol)
+
+The client supports GMCP-based media playback using the Client.Media.* protocol (MCMP). MUD servers can send sound effects and music to be played locally.
+
+**Supported GMCP Packages:**
+- `Client.Media.Default` - Sets default URL for resolving relative media paths
+- `Client.Media.Play` - Play a sound effect or music track
+- `Client.Media.Stop` - Stop playing a sound by key or type
+- `Client.Media.Load` - Pre-cache a media file without playing
+
+**F9 Master Mute Switch:**
+- F9 toggles audio on/off (starts muted/disabled)
+- Media state (`active_media`) is always tracked regardless of F9 state
+- When F9 enables: active media for the current world starts playing
+- When F9 disables: all running media processes are killed
+- World switching handles per-world play/stop, but only when F9 is enabled
+
+**World Switching Media Behavior:**
+- Switching away from a world stops its media processes
+- Switching back restarts active looping media (if F9 is enabled)
+- Looping media (loops=-1 or loops>1) is tracked in `active_media` per world
+- Web/GUI clients also receive media restart on world switch
+
+**Console Playback:**
+- Uses ffplay or mpv (auto-detected at startup)
+- Media files are cached in `~/.clay_media_cache/`
+- Download and playback happen in background threads
+- Child process handles delivered via `AppEvent::MediaProcessReady` for reliable tracking
+
+**Implementation:**
+- `handle_gmcp_media(world_idx, package, json_data, play_audio)` - Central handler; always tracks state, only spawns processes when `play_audio=true`
+- `active_media: HashMap<String, String>` on World - Maps key to Play JSON for restart
+- `media_processes: HashMap<String, (usize, Child)>` on App - Running player processes
+- `stop_world_media(world_idx)` - Kill all processes for a world
+- `restart_world_media(world_idx)` - Replay active_media entries (checks gmcp_user_enabled)
+- `ws_send_active_media_to_client()` - Send active media to a specific WebSocket client
+
 ### Hot Reload
 
 The `/reload` command performs a true hot code reload:
@@ -827,6 +865,7 @@ Note: HTTP automatically starts the non-secure WebSocket server if not already r
 - `F2` - Toggle MUD tag display (show/hide tags and timestamps)
 - `F4` - Open filter popup to search output
 - `F8` - Toggle action pattern highlighting
+- `F9` - Toggle GMCP media audio (master mute switch)
 - `Enter` - Send command
 
 **Web Popup Controls:**
@@ -966,6 +1005,7 @@ The remote GUI client supports keyboard shortcuts similar to the console client:
 - `F2` - Toggle MUD tag display (show/hide `[channel:]` tags and timestamps)
 - `F4` - Open filter popup to search output
 - `F8` - Toggle action pattern highlighting
+- `F9` - Toggle GMCP media audio (master mute switch)
 - `Esc` or `F4` - Close filter popup
 
 **Menu Shortcuts:**
