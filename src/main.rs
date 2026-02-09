@@ -1793,6 +1793,7 @@ pub struct World {
     pub msdp_variables: std::collections::HashMap<String, String>, // MSDP var -> JSON value
     pub gmcp_data: std::collections::HashMap<String, String>, // GMCP package -> last JSON data
     pub mcmp_default_url: String,    // MCMP default URL from Client.Media.Default
+    pub active_media: std::collections::HashMap<String, String>, // key -> Client.Media.Play JSON (for restart on world switch)
     pub gmcp_user_enabled: bool,     // True if user has enabled GMCP processing (F9 toggle)
     pub connection_id: u64,          // Incremented on each connection, used to ignore stale disconnect events
 }
@@ -1861,6 +1862,7 @@ impl World {
             msdp_variables: std::collections::HashMap::new(),
             gmcp_data: std::collections::HashMap::new(),
             mcmp_default_url: String::new(),
+            active_media: std::collections::HashMap::new(),
             gmcp_user_enabled: false,
             connection_id: 0,
         }
@@ -1941,6 +1943,8 @@ impl World {
         self.reader_name = None;
         // Reset skip_auto_login so next fresh connection triggers auto-login
         self.skip_auto_login = false;
+        // Clear active media tracking (processes already killed by stop_world_media)
+        self.active_media.clear();
         if clear_prompt {
             self.close_log_file();
             self.prompt.clear();
@@ -3387,6 +3391,8 @@ impl App {
             // Broadcast activity count since switching worlds changes which world is "current"
             // and activity_count() excludes the current world
             self.broadcast_activity();
+            // Restart active media for the new world
+            self.restart_world_media(index);
         }
     }
 
@@ -3817,6 +3823,11 @@ impl App {
                                         self.media_music_key = Some((world_idx, k.clone()));
                                     }
                                     self.media_processes.insert(k, (world_idx, child));
+                                    // Track looping media for restart on world switch
+                                    // Only track sounds that loop (loops=-1 or loops>1), not one-shots
+                                    if loops == -1 || loops > 1 {
+                                        self.worlds[world_idx].active_media.insert(key.to_string(), json_data.to_string());
+                                    }
                                 }
                             }
                             "Stop" => {
@@ -3824,12 +3835,14 @@ impl App {
                                     if let Some((_, mut child)) = self.media_processes.remove(key) {
                                         let _ = child.kill();
                                     }
+                                    self.worlds[world_idx].active_media.remove(key);
                                     if self.media_music_key.as_ref().map(|(_, k)| k.as_str()) == Some(key) {
                                         self.media_music_key = None;
                                     }
                                 } else if media_type == "music" {
                                     // Stop all music
                                     if let Some((_, mk)) = self.media_music_key.take() {
+                                        self.worlds[world_idx].active_media.remove(&mk);
                                         if let Some((_, mut child)) = self.media_processes.remove(&mk) {
                                             let _ = child.kill();
                                         }
@@ -3882,6 +3895,19 @@ impl App {
             if *idx == world_idx {
                 self.media_music_key = None;
             }
+        }
+    }
+
+    /// Restart active media for a world (called when switching back to it)
+    fn restart_world_media(&mut self, world_idx: usize) {
+        if !self.worlds[world_idx].gmcp_user_enabled {
+            return;
+        }
+        let plays: Vec<(String, String)> = self.worlds[world_idx].active_media.iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+        for (_key, json_data) in plays {
+            self.handle_gmcp_media(world_idx, "Client.Media.Play", &json_data);
         }
     }
 
