@@ -112,6 +112,7 @@ body {
     padding: 6px 10px;
     min-width: 40px;
     min-height: 36px;
+    margin-left: 5px;
 }
 
 .hamburger-btn svg {
