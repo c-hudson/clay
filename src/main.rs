@@ -4394,15 +4394,18 @@ impl App {
     /// Only sends output_lines (not pending_lines) - clients see the More indicator
     /// and release pending via PgDn/Tab, avoiding duplicate line bugs.
     fn build_initial_state(&self) -> WsMessage {
+        // Cap output lines to prevent massive InitialState messages that exceed WebSocket limits.
+        // 5000 lines per world keeps the message well under the 16MB frame size.
+        const MAX_INITIAL_LINES: usize = 5000;
+
         let worlds: Vec<WorldStateMsg> = self.worlds.iter().enumerate().map(|(idx, world)| {
-            // Strip carriage returns from output lines for web clients
-            let clean_output: Vec<String> = world.output_lines.iter()
-                .map(|s| s.text.replace('\r', ""))
-                .collect();
             // Create timestamped versions (add sparkle prefix for client-generated messages)
             // Only include output_lines - pending_lines stay on the server and are
             // released via PgDn/Tab, then broadcast to clients normally.
+            let total_lines = world.output_lines.len();
+            let skip = total_lines.saturating_sub(MAX_INITIAL_LINES);
             let output_lines_ts: Vec<TimestampedLine> = world.output_lines.iter()
+                .skip(skip)
                 .map(|s| {
                     let text = s.text.replace('\r', "");
                     let text = if !s.from_server {
@@ -4426,7 +4429,8 @@ impl App {
                 index: idx,
                 name: world.name.clone(),
                 connected: world.connected,
-                output_lines: clean_output,
+                // Legacy output_lines left empty - all clients prefer output_lines_ts
+                output_lines: Vec::new(),
                 pending_lines: Vec::new(),
                 output_lines_ts,
                 pending_lines_ts,

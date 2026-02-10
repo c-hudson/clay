@@ -380,6 +380,8 @@ pub struct RemoteGuiApp {
     debug_text: String,
     /// Whether initial settings have been received from the server
     settings_received: bool,
+    /// Frame counter for waiting screen diagnostic
+    frame_count: u32,
     /// Window transparency (0.0 = fully transparent, 1.0 = fully opaque)
     transparency: f32,
     /// Original transparency when setup popup opened (for cancel/revert)
@@ -582,6 +584,7 @@ impl RemoteGuiApp {
             action_error: None,
             debug_text: String::new(),
             settings_received: false,
+            frame_count: 0,
             transparency: 1.0,
             original_transparency: None,
             color_offset_percent: 0,
@@ -3149,7 +3152,20 @@ impl eframe::App for RemoteGuiApp {
         if self.authenticated && !self.settings_received {
             egui::CentralPanel::default()
                 .frame(egui::Frame::none().fill(theme.bg()))
-                .show(ctx, |_ui| {});
+                .show(ctx, |ui| {
+                    // Show waiting indicator after a brief delay
+                    if self.connect_time.is_some_and(|t| t.elapsed().as_millis() > 500)
+                        || (self.is_master && self.frame_count > 30)
+                    {
+                        ui.vertical_centered(|ui| {
+                            ui.add_space(ui.available_height() / 3.0);
+                            ui.label(egui::RichText::new("Waiting for server state...")
+                                .color(theme.fg_muted())
+                                .size(14.0));
+                        });
+                    }
+                });
+            self.frame_count += 1;
             ctx.request_repaint();
             return;
         }
