@@ -768,7 +768,10 @@ impl RemoteGuiApp {
             .map(|(idx, w)| {
                 let last_send = w.last_send_secs.map(|s| format_elapsed(Some(s))).unwrap_or_else(|| "-".to_string());
                 let last_recv = w.last_recv_secs.map(|s| format_elapsed(Some(s))).unwrap_or_else(|| "-".to_string());
-                let ka_next = format_next_nop(w.last_send_secs, w.last_recv_secs);
+                let last = format!("{}/{}", last_recv, last_send);
+                let last_nop = w.last_nop_secs.map(|s| format_elapsed(Some(s))).unwrap_or_else(|| "-".to_string());
+                let next_nop = format_next_nop(w.last_send_secs, w.last_recv_secs);
+                let ka = format!("{}/{}", last_nop, next_nop);
 
                 ConnectionInfo {
                     name: w.name.clone(),
@@ -777,9 +780,9 @@ impl RemoteGuiApp {
                     is_ssl: w.settings.use_ssl,
                     is_proxy: w.is_proxy,
                     unseen_lines: w.unseen_lines,
-                    last_send,
-                    last_recv,
-                    ka_next,
+                    last,
+                    ka,
+                    buffer_size: w.output_lines.len(),
                 }
             })
             .collect();
@@ -1401,6 +1404,7 @@ impl RemoteGuiApp {
                                         last_recv_secs: world.last_recv_secs,
                                         last_nop_secs: world.last_nop_secs,
                                         next_nop_secs: None,
+                                        buffer_size: world.output_lines.len(),
                                     }
                                 }).collect();
                                 let output = super::util::format_worlds_list(&worlds_info);
@@ -3943,6 +3947,7 @@ impl eframe::App for RemoteGuiApp {
                                             last_recv_secs: world.last_recv_secs,
                                             last_nop_secs: world.last_nop_secs,
                                             next_nop_secs: None,
+                                            buffer_size: world.output_lines.len(),
                                         }
                                     }).collect();
                                     let output = super::util::format_worlds_list(&worlds_info);
@@ -7596,6 +7601,7 @@ impl eframe::App for RemoteGuiApp {
                                     last_recv_secs: world.last_recv_secs,
                                     last_nop_secs: world.last_nop_secs,
                                     next_nop_secs: None,
+                                    buffer_size: world.output_lines.len(),
                                 }
                             }).collect();
                             let output = super::util::format_worlds_list(&worlds_info);

@@ -22,9 +22,9 @@ pub struct ConnectionInfo {
     pub is_ssl: bool,
     pub is_proxy: bool,
     pub unseen_lines: usize,
-    pub last_send: String,
-    pub last_recv: String,
-    pub ka_next: String,
+    pub last: String,
+    pub ka: String,
+    pub buffer_size: usize,
 }
 
 /// Format elapsed time in a human-readable format
@@ -85,15 +85,13 @@ pub fn create_connections_popup(connections: &[ConnectionInfo], visible_height: 
                 String::new()
             };
 
-            // Combine send/recv
-            let send_recv = format!("{}/{}", c.last_send, c.last_recv);
-
             let columns = vec![
                 format!("{}{:3}", current, ssl),
                 c.name.clone(),
                 unseen,
-                send_recv,
-                c.ka_next.clone(),
+                c.last.clone(),
+                c.ka.clone(),
+                c.buffer_size.to_string(),
             ];
 
             ListItem {
@@ -124,8 +122,8 @@ pub fn create_connections_popup(connections: &[ConnectionInfo], visible_height: 
                 FieldKind::list_with_headers_and_widths(
                     items,
                     visible_height,
-                    &["", "World", "Unseen", "Send/Recv", "KA/Next"],
-                    vec![4, 20, 6, 10, 8],
+                    &["", "World", "Unseen", "Last", "KA", "Buffer"],
+                    vec![4, 20, 6, 9, 9, 7],
                 ),
             )
         })
@@ -157,9 +155,9 @@ mod tests {
                 is_ssl: true,
                 is_proxy: false,
                 unseen_lines: 0,
-                last_send: "5s".to_string(),
-                last_recv: "2s".to_string(),
-                ka_next: "4m".to_string(),
+                last: "2s/5s".to_string(),
+                ka: "4m/4m".to_string(),
+                buffer_size: 1500,
             },
             ConnectionInfo {
                 name: "AnotherWorld".to_string(),
@@ -168,9 +166,9 @@ mod tests {
                 is_ssl: false,
                 is_proxy: false,
                 unseen_lines: 15,
-                last_send: "1m".to_string(),
-                last_recv: "30s".to_string(),
-                ka_next: "3m".to_string(),
+                last: "30s/1m".to_string(),
+                ka: "3m/4m".to_string(),
+                buffer_size: 3200,
             },
         ]
     }

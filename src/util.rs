@@ -595,6 +595,7 @@ pub struct WorldListInfo {
     pub last_recv_secs: Option<u64>,
     pub last_nop_secs: Option<u64>,
     pub next_nop_secs: Option<u64>,
+    pub buffer_size: usize,
 }
 
 /// Format the connected worlds list for /l command output
@@ -625,10 +626,9 @@ pub fn format_worlds_list(worlds: &[WorldListInfo]) -> String {
         name: String,
         unseen: String,
         unseen_raw: String,  // Without color codes for width calculation
-        last_send: String,
-        last_recv: String,
-        last_ak: String,
-        next_ak: String,
+        last: String,        // recv/send combined
+        ka: String,          // lastAK/nextAK combined
+        buffer: String,
     }
 
     let formatted: Vec<FormattedWorld> = connected_worlds.iter().map(|world| {
@@ -658,6 +658,7 @@ pub fn format_worlds_list(worlds: &[WorldListInfo]) -> String {
         let last_recv = world.last_recv_secs
             .map(format_duration_short)
             .unwrap_or_else(|| "—".to_string());
+        let last = format!("{}/{}", last_recv, last_send);
         let last_ak = world.last_nop_secs
             .map(format_duration_short)
             .unwrap_or_else(|| "—".to_string());
@@ -674,52 +675,50 @@ pub fn format_worlds_list(worlds: &[WorldListInfo]) -> String {
             }
             None => "—".to_string(),
         };
+        let ka = format!("{}/{}", last_ak, next_ak);
+        let buffer = world.buffer_size.to_string();
         FormattedWorld {
             ssh,
             current_marker,
             name: world.name.clone(),
             unseen,
             unseen_raw,
-            last_send,
-            last_recv,
-            last_ak,
-            next_ak,
+            last,
+            ka,
+            buffer,
         }
     }).collect();
 
     // Calculate dynamic column widths (minimum is header width)
     let name_width = formatted.iter().map(|w| w.name.len()).max().unwrap_or(5).max(5);
     let unseen_width = formatted.iter().map(|w| w.unseen_raw.len()).max().unwrap_or(6).max(6);
-    let send_width = formatted.iter().map(|w| w.last_send.len()).max().unwrap_or(8).max(8);
-    let recv_width = formatted.iter().map(|w| w.last_recv.len()).max().unwrap_or(8).max(8);
-    let last_ak_width = formatted.iter().map(|w| w.last_ak.len()).max().unwrap_or(6).max(6);
-    let next_ak_width = formatted.iter().map(|w| w.next_ak.len()).max().unwrap_or(6).max(6);
+    let last_width = formatted.iter().map(|w| w.last.len()).max().unwrap_or(4).max(4);
+    let ka_width = formatted.iter().map(|w| w.ka.len()).max().unwrap_or(2).max(2);
+    let buffer_width = formatted.iter().map(|w| w.buffer.len()).max().unwrap_or(6).max(6);
 
     let mut lines = Vec::new();
 
     // Header line with dynamic widths
     lines.push(format!(
-        "  SSH  {:name_w$}  {:>unseen_w$}  {:>send_w$}  {:>recv_w$}  {:>last_ak_w$}  {:>next_ak_w$}",
-        "World", "Unseen", "LastSend", "LastRecv", "LastAK", "NextAK",
+        "  SSH  {:name_w$}  {:>unseen_w$}  {:>last_w$}  {:>ka_w$}  {:>buf_w$}",
+        "World", "Unseen", "Last", "KA", "Buffer",
         name_w = name_width,
         unseen_w = unseen_width,
-        send_w = send_width,
-        recv_w = recv_width,
-        last_ak_w = last_ak_width,
-        next_ak_w = next_ak_width
+        last_w = last_width,
+        ka_w = ka_width,
+        buf_w = buffer_width
     ));
 
     for world in &formatted {
         lines.push(format!(
-            "{} {}  {:name_w$}  {:>unseen_w$}  {:>send_w$}  {:>recv_w$}  {:>last_ak_w$}  {:>next_ak_w$}",
+            "{} {}  {:name_w$}  {:>unseen_w$}  {:>last_w$}  {:>ka_w$}  {:>buf_w$}",
             world.current_marker, world.ssh, world.name, world.unseen,
-            world.last_send, world.last_recv, world.last_ak, world.next_ak,
+            world.last, world.ka, world.buffer,
             name_w = name_width,
             unseen_w = unseen_width + (world.unseen.len() - world.unseen_raw.len()),  // Account for color codes
-            send_w = send_width,
-            recv_w = recv_width,
-            last_ak_w = last_ak_width,
-            next_ak_w = next_ak_width
+            last_w = last_width,
+            ka_w = ka_width,
+            buf_w = buffer_width
         ));
     }
 

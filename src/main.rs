@@ -12388,6 +12388,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                         last_recv_secs: world.last_receive_time.map(|t| now.duration_since(t).as_secs()),
                                         last_nop_secs: world.last_nop_time.map(|t| now.duration_since(t).as_secs()),
                                         next_nop_secs: None,
+                                        buffer_size: world.output_lines.len() + world.pending_lines.len(),
                                     }
                                 }).collect();
                                 let output = util::format_worlds_list(&worlds_info);
@@ -14689,6 +14690,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                     last_recv_secs: world.last_receive_time.map(|t| now.duration_since(t).as_secs()),
                                     last_nop_secs: world.last_nop_time.map(|t| now.duration_since(t).as_secs()),
                                     next_nop_secs: None,
+                                    buffer_size: world.output_lines.len() + world.pending_lines.len(),
                                 }
                             }).collect();
                             let output = util::format_worlds_list(&worlds_info);
@@ -17172,7 +17174,8 @@ async fn handle_command(cmd: &str, app: &mut App, event_tx: mpsc::Sender<AppEven
                     last_send_secs: world.last_user_command_time.map(|t| now.duration_since(t).as_secs()),
                     last_recv_secs: world.last_receive_time.map(|t| now.duration_since(t).as_secs()),
                     last_nop_secs: world.last_nop_time.map(|t| now.duration_since(t).as_secs()),
-                    next_nop_secs: None, // Calculated in format function
+                    next_nop_secs: None,
+                    buffer_size: world.output_lines.len() + world.pending_lines.len(),
                 }
             }).collect();
             let output = util::format_worlds_list(&worlds_info);

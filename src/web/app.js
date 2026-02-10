@@ -4632,8 +4632,8 @@
 
         // Header line
         lines.push(padRight('World', 20) + padLeft('Unseen', 6) + '  ' +
-            padLeft('LastSend', 8) + '  ' + padLeft('LastRecv', 8) + '  ' +
-            padLeft('LastNOP', 8) + '  ' + padLeft('NextNOP', 8));
+            padLeft('Last', 9) + '  ' + padLeft('KA', 9) + '  ' +
+            padLeft('Buffer', 7));
 
         connectedWorlds.forEach(({ world, idx }) => {
             // Current marker
@@ -4647,25 +4647,30 @@
                 YELLOW + padLeft(unseen.toString(), 6) + RESET :
                 GRAY + padLeft('—', 6) + RESET;
 
-            // Time columns
+            // Last (recv/send combined)
             const lastSend = formatDurationShort(world.last_send_secs);
             const lastRecv = formatDurationShort(world.last_recv_secs);
-            const lastNop = formatDurationShort(world.last_nop_secs);
+            const last = lastRecv + '/' + lastSend;
 
-            // NextNOP calculation
+            // KA (lastNOP/nextNOP combined)
+            const lastNop = formatDurationShort(world.last_nop_secs);
             const lastSendVal = world.last_send_secs !== null && world.last_send_secs !== undefined ? world.last_send_secs : KEEPALIVE_SECS;
             const lastRecvVal = world.last_recv_secs !== null && world.last_recv_secs !== undefined ? world.last_recv_secs : KEEPALIVE_SECS;
             const lastActivity = Math.min(lastSendVal, lastRecvVal);
             const remaining = Math.max(0, KEEPALIVE_SECS - lastActivity);
             const nextNop = formatDurationShort(remaining);
+            const ka = lastNop + '/' + nextNop;
+
+            // Buffer size
+            const bufferSize = (world.output_lines || []).length;
 
             // Truncate world name
             const name = world.name || '';
             const nameDisplay = name.length > 18 ? name.substring(0, 15) + '...' : name;
 
             lines.push(currentMarker + ' ' + padRight(nameDisplay, 18) + ' ' + unseenStr + '  ' +
-                padLeft(lastSend, 8) + '  ' + padLeft(lastRecv, 8) + '  ' +
-                padLeft(lastNop, 8) + '  ' + padLeft(nextNop, 8));
+                padLeft(last, 9) + '  ' + padLeft(ka, 9) + '  ' +
+                padLeft(bufferSize.toString(), 7));
         });
 
         return lines;
@@ -4762,20 +4767,20 @@
             if (unseen > 0) tdUnseen.className = 'unseen-count';
             tr.appendChild(tdUnseen);
 
-            // Send/Recv
-            const tdSendRecv = document.createElement('td');
-            tdSendRecv.textContent = formatElapsed(world.last_send_secs) + '/' + formatElapsed(world.last_recv_secs);
-            tr.appendChild(tdSendRecv);
+            // Last (recv/send)
+            const tdLast = document.createElement('td');
+            tdLast.textContent = formatElapsed(world.last_recv_secs) + '/' + formatElapsed(world.last_send_secs);
+            tr.appendChild(tdLast);
 
-            // KeepAlive type
+            // KA (last/next)
             const tdKA = document.createElement('td');
-            tdKA.textContent = world.keep_alive_type || 'NOP';
+            tdKA.textContent = formatElapsed(world.last_nop_secs) + '/' + formatNextKA(world.last_send_secs, world.last_recv_secs);
             tr.appendChild(tdKA);
 
-            // Last/Next KA
-            const tdLastNext = document.createElement('td');
-            tdLastNext.textContent = formatElapsed(world.last_nop_secs) + '/' + formatNextKA(world.last_send_secs, world.last_recv_secs);
-            tr.appendChild(tdLastNext);
+            // Buffer
+            const tdBuffer = document.createElement('td');
+            tdBuffer.textContent = (world.output_lines || []).length.toString();
+            tr.appendChild(tdBuffer);
 
             // Store the actual world index for switching
             tr.dataset.worldIndex = index;
