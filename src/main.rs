@@ -4901,12 +4901,67 @@ impl App {
         // new_offset is one past the last line counted, so subtract 1
         world.scroll_offset = (new_offset - 1).min(max_scroll);
 
-        // If we've scrolled to bottom with no pending lines, unpause
-        if world.is_at_bottom() && world.pending_lines.is_empty() {
-            world.paused = false;
-            world.lines_since_pause = 0;
-        }
         // Mark output for redraw
+        self.needs_output_redraw = true;
+    }
+
+    /// Release one screenful of pending lines and broadcast to WebSocket clients.
+    /// Used by both Tab and PgDn when at the bottom and paused.
+    fn release_pending_screenful(&mut self) {
+        let visual_budget = (self.output_height as usize).saturating_sub(2);
+        let output_width = self.output_width as usize;
+        let world_idx = self.current_world_index;
+
+        // Pre-calculate how many logical lines fit in the visual budget
+        // (mirrors the logic in release_pending so we can collect lines for broadcasting)
+        let width = output_width.max(1);
+        let mut visual_total = 0;
+        let mut logical_count = 0;
+        for line in &self.worlds[world_idx].pending_lines {
+            let vl = visual_line_count(&line.text, width);
+            if visual_total > 0 && visual_total + vl > visual_budget {
+                break;
+            }
+            visual_total += vl;
+            logical_count += 1;
+            if visual_total >= visual_budget {
+                break;
+            }
+        }
+        if logical_count == 0 && !self.worlds[world_idx].pending_lines.is_empty() {
+            logical_count = 1;
+        }
+
+        // Get the lines that will be released (for broadcasting as ServerData)
+        let lines_to_broadcast: Vec<String> = self.worlds[world_idx]
+            .pending_lines
+            .iter()
+            .take(logical_count)
+            .map(|line| line.text.replace('\r', ""))
+            .collect();
+
+        let pending_before = self.worlds[world_idx].pending_lines.len();
+        self.current_world_mut().release_pending(visual_budget, output_width);
+        let released = pending_before - self.worlds[world_idx].pending_lines.len();
+
+        // Broadcast the released lines to clients viewing this world
+        if !lines_to_broadcast.is_empty() {
+            let ws_data = lines_to_broadcast.join("\n") + "\n";
+            self.ws_broadcast_to_world(world_idx, WsMessage::ServerData {
+                world_index: world_idx,
+                data: ws_data,
+                is_viewed: true,
+                ts: current_timestamp_secs(),
+                from_server: true,
+            });
+        }
+
+        // Broadcast release event so other clients sync
+        self.ws_broadcast(WsMessage::PendingReleased { world_index: world_idx, count: released });
+        let pending = self.worlds[world_idx].pending_lines.len();
+        self.ws_broadcast(WsMessage::PendingLinesUpdate { world_index: world_idx, count: pending });
+        // Broadcast activity count since pending lines changed
+        self.broadcast_activity();
         self.needs_output_redraw = true;
     }
 }
@@ -15660,62 +15715,8 @@ fn handle_key_event(key: KeyEvent, app: &mut App) -> KeyAction {
             app.needs_output_redraw = true;
             return KeyAction::None;
         } else if app.current_world().paused {
-            // At bottom and paused - release one screenful of VISUAL lines (or just unpause if pending is empty)
-            let visual_budget = (app.output_height as usize).saturating_sub(2);
-            let output_width = app.output_width as usize;
-            let world_idx = app.current_world_index;
-
-            // Pre-calculate how many logical lines fit in the visual budget
-            // (mirrors the logic in release_pending so we can collect lines for broadcasting)
-            let width = output_width.max(1);
-            let mut visual_total = 0;
-            let mut logical_count = 0;
-            for line in &app.worlds[world_idx].pending_lines {
-                let vl = visual_line_count(&line.text, width);
-                if visual_total > 0 && visual_total + vl > visual_budget {
-                    break;
-                }
-                visual_total += vl;
-                logical_count += 1;
-                if visual_total >= visual_budget {
-                    break;
-                }
-            }
-            if logical_count == 0 && !app.worlds[world_idx].pending_lines.is_empty() {
-                logical_count = 1;
-            }
-
-            // Get the lines that will be released (for broadcasting as ServerData)
-            let lines_to_broadcast: Vec<String> = app.worlds[world_idx]
-                .pending_lines
-                .iter()
-                .take(logical_count)
-                .map(|line| line.text.replace('\r', ""))
-                .collect();
-
-            let pending_before = app.worlds[world_idx].pending_lines.len();
-            app.current_world_mut().release_pending(visual_budget, output_width);
-            let released = pending_before - app.worlds[world_idx].pending_lines.len();
-
-            // Broadcast the released lines to clients viewing this world
-            if !lines_to_broadcast.is_empty() {
-                let ws_data = lines_to_broadcast.join("\n") + "\n";
-                app.ws_broadcast_to_world(world_idx, WsMessage::ServerData {
-                    world_index: world_idx,
-                    data: ws_data,
-                    is_viewed: true,
-                    ts: current_timestamp_secs(),
-                    from_server: true,
-                });
-            }
-
-            // Broadcast release event so other clients sync
-            app.ws_broadcast(WsMessage::PendingReleased { world_index: world_idx, count: released });
-            let pending = app.worlds[world_idx].pending_lines.len();
-            app.ws_broadcast(WsMessage::PendingLinesUpdate { world_index: world_idx, count: pending });
-            // Broadcast activity count since pending lines changed
-            app.broadcast_activity();
-            app.needs_output_redraw = true;
+            // At bottom and paused - release one screenful (or just unpause if pending is empty)
+            app.release_pending_screenful();
             return KeyAction::None;
         }
     }
@@ -16099,7 +16100,12 @@ fn handle_key_event(key: KeyEvent, app: &mut App) -> KeyAction {
             KeyAction::None
         }
         (_, KeyCode::PageDown) => {
-            app.scroll_output_down();
+            if app.current_world().is_at_bottom() && app.current_world().paused {
+                // At bottom and paused - release one screenful (same as Tab)
+                app.release_pending_screenful();
+            } else {
+                app.scroll_output_down();
+            }
             KeyAction::None
         }
 

@@ -6229,6 +6229,9 @@
                         paused = false;
                         linesSincePause = 0;
                         updateStatusBar();
+                    } else {
+                        // Release one screenful when at bottom with pending (same as Tab)
+                        releaseScreenful();
                     }
                 }
             } else if (e.key === 'ArrowUp' && !e.ctrlKey && !e.shiftKey && !e.altKey && document.activeElement !== elements.input) {
@@ -6355,7 +6358,7 @@
                 // PageDown: Scroll output down
                 e.preventDefault();
                 elements.outputContainer.scrollBy(0, elements.outputContainer.clientHeight);
-                // If at bottom now and no pending (local or server), unpause
+                // If at bottom now, unpause or release pending (same as Tab)
                 if (isAtBottom()) {
                     const world = worlds[currentWorldIndex];
                     const serverPending = world ? (world.pending_count || 0) : 0;
@@ -6363,6 +6366,9 @@
                         paused = false;
                         linesSincePause = 0;
                         updateStatusBar();
+                    } else {
+                        // Release one screenful when at bottom with pending (same as Tab)
+                        releaseScreenful();
                     }
                 }
             }
