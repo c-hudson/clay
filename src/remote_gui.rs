@@ -377,6 +377,22 @@ pub struct RemoteGuiApp {
     server_activity_count: usize,
     /// Unified popup state for new popup system
     unified_popup: Option<crate::popup::PopupState>,
+    /// Whether output needs rebuilding (dirty flag for caching)
+    output_dirty: bool,
+    /// Cached LayoutJob for output area
+    cached_output_job: Option<egui::text::LayoutJob>,
+    /// Cached plain text for copy operations
+    cached_plain_text: String,
+    /// Cached display lines (for emoji rendering path)
+    cached_display_lines: Vec<String>,
+    /// Cached has_discord_emojis flag
+    cached_has_emojis: bool,
+    /// Last available width used for output layout
+    cached_output_width: f32,
+    /// Cached spell check results
+    cached_misspelled: Vec<(usize, usize)>,
+    /// Last input buffer for spell check invalidation
+    cached_spell_input: String,
 }
 
 /// Square wave audio source for ANSI music playback
@@ -561,6 +577,14 @@ impl RemoteGuiApp {
             last_sent_view_state: None,
             server_activity_count: 0,
             unified_popup: None,
+            output_dirty: true,
+            cached_output_job: None,
+            cached_plain_text: String::new(),
+            cached_display_lines: Vec::new(),
+            cached_has_emojis: false,
+            cached_output_width: 0.0,
+            cached_misspelled: Vec::new(),
+            cached_spell_input: String::new(),
         }
     }
 
@@ -923,7 +947,7 @@ impl RemoteGuiApp {
         }
     }
 
-    fn process_messages(&mut self) {
+    fn process_messages(&mut self) -> bool {
         // Collect deferred actions to avoid borrow issues
         let mut deferred_switch: Option<usize> = None;
         let mut deferred_connect: Option<usize> = None;
@@ -931,9 +955,11 @@ impl RemoteGuiApp {
         let mut deferred_music: Vec<crate::ansi_music::MusicNote> = Vec::new();
         let mut deferred_open_actions = false;
         let deferred_open_connections = false;
+        let mut had_messages = false;
 
         if let Some(ref mut rx) = self.ws_rx {
             while let Ok(msg) = rx.try_recv() {
+                had_messages = true;
                 match msg {
                     WsMessage::ServerHello { multiuser_mode } => {
                         self.multiuser_mode = multiuser_mode;
@@ -1039,6 +1065,7 @@ impl RemoteGuiApp {
                         self.tls_proxy_enabled = settings.tls_proxy_enabled;
                         self.dictionary_path = settings.dictionary_path.clone();
                         self.actions = actions;
+                        self.output_dirty = true;
                         // Send initial view state for synchronized more-mode
                         if let Some(ref tx) = self.ws_tx {
                             let _ = tx.send(WsMessage::UpdateViewState {
@@ -1106,6 +1133,7 @@ impl RemoteGuiApp {
 
                             // Note: Don't track unseen_lines locally - server handles centralized tracking
                             // and will broadcast UnseenUpdate/UnseenCleared when counts change
+                            self.output_dirty = true;
                         }
                     }
                     WsMessage::WorldConnected { world_index, name } => {
@@ -1113,6 +1141,7 @@ impl RemoteGuiApp {
                             self.worlds[world_index].connected = true;
                             self.worlds[world_index].was_connected = true;
                             self.worlds[world_index].name = name;
+                            self.output_dirty = true;
                         }
                     }
                     WsMessage::WorldDisconnected { world_index } => {
@@ -1125,6 +1154,7 @@ impl RemoteGuiApp {
                             self.worlds[world_index].output_lines.clear();
                             self.worlds[world_index].pending_count = 0;
                             self.worlds[world_index].partial_line.clear();
+                            self.output_dirty = true;
                         }
                     }
                     WsMessage::AnsiMusic { world_index: _, notes } => {
@@ -1146,6 +1176,7 @@ impl RemoteGuiApp {
                             } else if self.world_list_selected > world_index {
                                 self.world_list_selected -= 1;
                             }
+                            self.output_dirty = true;
                         }
                     }
                     WsMessage::WorldSwitched { new_index } => {
@@ -1154,6 +1185,7 @@ impl RemoteGuiApp {
                         if new_index < self.worlds.len() {
                             self.worlds[new_index].unseen_lines = 0;
                         }
+                        self.output_dirty = true;
                     }
                     WsMessage::PromptUpdate { world_index, prompt } => {
                         if world_index < self.worlds.len() {
@@ -1205,6 +1237,7 @@ impl RemoteGuiApp {
                         self.ansi_music_enabled = settings.ansi_music_enabled;
                         self.tls_proxy_enabled = settings.tls_proxy_enabled;
                         self.dictionary_path = settings.dictionary_path.clone();
+                        self.output_dirty = true;
                     }
                     WsMessage::PendingLinesUpdate { world_index, count } => {
                         // Update pending count for world
@@ -1228,6 +1261,9 @@ impl RemoteGuiApp {
                     WsMessage::ActionsUpdated { actions } => {
                         // Update local actions from server
                         self.actions = actions;
+                        if self.highlight_actions {
+                            self.output_dirty = true;
+                        }
                     }
                     WsMessage::UnseenCleared { world_index } => {
                         // Another client (console or web) has viewed this world
@@ -1248,6 +1284,7 @@ impl RemoteGuiApp {
                     WsMessage::ShowTagsChanged { show_tags } => {
                         // Server toggled show_tags (F2 or /tag command)
                         self.show_tags = show_tags;
+                        self.output_dirty = true;
                     }
                     WsMessage::GmcpUserToggled { world_index, enabled } => {
                         if world_index < self.worlds.len() {
@@ -1260,6 +1297,7 @@ impl RemoteGuiApp {
                             self.current_world = idx;
                             self.worlds[idx].unseen_lines = 0;
                             self.scroll_offset = None; // Reset scroll
+                            self.output_dirty = true;
                             // Notify server and request current state
                             if let Some(ref tx) = self.ws_tx {
                                 let _ = tx.send(WsMessage::MarkWorldSeen { world_index: idx });
@@ -1308,12 +1346,14 @@ impl RemoteGuiApp {
                                             highlight_color: None,
                                         });
                                     }
+                                    self.output_dirty = true;
                                 }
                             }
                             Command::WorldSwitch { ref name } | Command::WorldConnectNoLogin { ref name } => {
                                 // Switch to world locally, connect if needed
                                 if let Some(idx) = self.worlds.iter().position(|w| w.name.eq_ignore_ascii_case(name)) {
                                     self.current_world = idx;
+                                    self.output_dirty = true;
                                     deferred_switch = Some(idx);
                                     if !self.worlds[idx].connected {
                                         deferred_connect = Some(idx);
@@ -1342,6 +1382,7 @@ impl RemoteGuiApp {
                                     self.worlds[self.current_world].output_lines.push(
                                         TimestampedLine { text: super::get_version_string(), ts, gagged: false, from_server: false, seq, highlight_color: None }
                                     );
+                                    self.output_dirty = true;
                                 }
                             }
                             Command::Menu => {
@@ -1390,6 +1431,7 @@ impl RemoteGuiApp {
                             self.worlds[world_index].pending_count = pending_count;
                             self.worlds[world_index].unseen_lines = 0;
                             self.scroll_offset = None; // Reset scroll on world switch
+                            self.output_dirty = true;
                         }
                     }
                     WsMessage::OutputLines { world_index, lines, is_initial: _ } => {
@@ -1398,6 +1440,7 @@ impl RemoteGuiApp {
                             for line in lines {
                                 self.worlds[world_index].output_lines.push(line);
                             }
+                            self.output_dirty = true;
                         }
                     }
                     WsMessage::PendingCountUpdate { world_index, count } => {
@@ -1434,6 +1477,7 @@ impl RemoteGuiApp {
         if deferred_open_connections {
             self.open_connections_unified();
         }
+        had_messages
     }
 
     fn send_command(&mut self, world_index: usize, command: String) {
@@ -2897,7 +2941,10 @@ impl eframe::App for RemoteGuiApp {
         }
 
         // Process incoming WebSocket messages
-        self.process_messages();
+        let had_messages = self.process_messages();
+        if had_messages {
+            ctx.request_repaint(); // Immediate repaint when data arrives
+        }
 
         // Apply theme to egui visuals (clone to avoid borrowing self)
         let theme = self.theme.clone();
@@ -3023,8 +3070,9 @@ impl eframe::App for RemoteGuiApp {
         }
         ctx.set_style(style);
 
-        // Request repaint to keep polling messages
-        ctx.request_repaint();
+        // Poll for messages at 100ms intervals when idle;
+        // immediate repaint is triggered when messages arrive or on user input
+        ctx.request_repaint_after(std::time::Duration::from_millis(100));
 
         if !self.connected || !self.authenticated {
             // Show login dialog with dog and Clay branding
@@ -3236,13 +3284,16 @@ impl eframe::App for RemoteGuiApp {
                         } else if i.consume_key(egui::Modifiers::NONE, egui::Key::F2) {
                             // F2 - toggle MUD tag display
                             self.show_tags = !self.show_tags;
+                            self.output_dirty = true;
                         } else if i.consume_key(egui::Modifiers::NONE, egui::Key::F4) {
                             // F4 - toggle filter popup
                             self.filter_active = true;
                             self.filter_text.clear();
+                            self.output_dirty = true;
                         } else if i.consume_key(egui::Modifiers::NONE, egui::Key::F8) {
                             // F8 - toggle action pattern highlighting
                             self.highlight_actions = !self.highlight_actions;
+                            self.output_dirty = true;
                         } else if i.consume_key(egui::Modifiers::NONE, egui::Key::F9) {
                             // F9 - toggle GMCP user processing for current world
                             if let Some(ref tx) = self.ws_tx {
@@ -3448,6 +3499,7 @@ impl eframe::App for RemoteGuiApp {
                         self.current_world = new_world;
                         self.worlds[new_world].unseen_lines = 0;
                         self.scroll_offset = None; // Reset scroll
+                        self.output_dirty = true;
                         // Notify server and request current state
                         if let Some(ref tx) = self.ws_tx {
                             let _ = tx.send(WsMessage::MarkWorldSeen { world_index: new_world });
@@ -3493,6 +3545,7 @@ impl eframe::App for RemoteGuiApp {
                     if i.key_pressed(egui::Key::Escape) || i.key_pressed(egui::Key::F4) {
                         self.filter_active = false;
                         self.filter_text.clear();
+                        self.output_dirty = true;
                     }
                 });
             }
@@ -3648,6 +3701,7 @@ impl eframe::App for RemoteGuiApp {
                                     let new_size = FONT_SIZES[new_pos as usize];
                                     if (new_size - self.font_size).abs() > 0.5 {
                                         self.font_size = new_size;
+                                        self.output_dirty = true;
                                         action = Some("font_changed");
                                     }
                                 }
@@ -3689,8 +3743,8 @@ impl eframe::App for RemoteGuiApp {
                 }
                 Some("connect") => self.connect_world(self.current_world),
                 Some("disconnect") => self.disconnect_world(self.current_world),
-                Some("toggle_tags") => self.show_tags = !self.show_tags,
-                Some("toggle_highlight") => self.highlight_actions = !self.highlight_actions,
+                Some("toggle_tags") => { self.show_tags = !self.show_tags; self.output_dirty = true; }
+                Some("toggle_highlight") => { self.highlight_actions = !self.highlight_actions; self.output_dirty = true; }
                 Some("resync") => {
                     // Request full state resync from server
                     if let Some(ref ws_tx) = self.ws_tx {
@@ -3747,7 +3801,11 @@ impl eframe::App for RemoteGuiApp {
                     // Text input takes full area
                     // Build layout job with spell check coloring (misspelled words in red)
                     let input_id = egui::Id::new("main_input");
-                    let misspelled = self.find_misspelled_words();
+                    if self.input_buffer != self.cached_spell_input {
+                        self.cached_misspelled = self.find_misspelled_words();
+                        self.cached_spell_input = self.input_buffer.clone();
+                    }
+                    let misspelled = self.cached_misspelled.clone();
                     let font_id = egui::FontId::monospace(self.font_size);
                     let default_color = theme.fg();
                     let line_height = 16.0_f32; // Approximate line height for scrolling calc
@@ -4040,6 +4098,7 @@ impl eframe::App for RemoteGuiApp {
                                     if let Some(idx) = self.worlds.iter().position(|w| w.name.eq_ignore_ascii_case(name)) {
                                         // Switch locally
                                         self.current_world = idx;
+                                        self.output_dirty = true;
                                         // If not connected, send connect command to server
                                         if !self.worlds[idx].connected {
                                             self.connect_world(idx);
@@ -4059,6 +4118,7 @@ impl eframe::App for RemoteGuiApp {
                                     // /worlds -l <name> - switch to world, connect without auto-login
                                     if let Some(idx) = self.worlds.iter().position(|w| w.name.eq_ignore_ascii_case(name)) {
                                         self.current_world = idx;
+                                        self.output_dirty = true;
                                         if !self.worlds[idx].connected {
                                             // Send the command to server (it handles -l flag)
                                             self.send_command(idx, cmd);
@@ -4264,10 +4324,14 @@ impl eframe::App for RemoteGuiApp {
                     },
                 );
 
+                if filter_text != self.filter_text {
+                    self.output_dirty = true;
+                }
                 self.filter_text = filter_text;
                 if should_close {
                     self.filter_active = false;
                     self.filter_text.clear();
+                    self.output_dirty = true;
                 }
             }
 
@@ -4308,140 +4372,165 @@ impl eframe::App for RemoteGuiApp {
                         return;  // Skip regular output rendering
                     }
 
-                    // Cache "now" for timestamp formatting - compute once per frame
-                    let cached_now = GuiCachedNow::new();
+                    // Check if available width changed (invalidates layout)
+                    let available_width = ui.available_width();
+                    if (available_width - self.cached_output_width).abs() > 1.0 {
+                        self.output_dirty = true;
+                    }
 
-                    // Keep original lines with ANSI for coloring
-                    let colored_lines: Vec<&TimestampedLine> = world.output_lines.iter()
-                        .filter(|line| {
-                            // Skip gagged lines unless show_tags is enabled (F2)
-                            if line.gagged && !self.show_tags {
-                                return false;
-                            }
-                            // Apply filter if active (filter on stripped text)
-                            if self.filter_active && !self.filter_text.is_empty() {
-                                let stripped = crate::util::strip_ansi_codes(&line.text);
-                                // Check if pattern has wildcards
-                                let has_wildcards = self.filter_text.contains('*') || self.filter_text.contains('?');
-                                if has_wildcards {
-                                    // Use wildcard matching
-                                    if let Some(regex) = filter_wildcard_to_regex(&self.filter_text) {
-                                        regex.is_match(&stripped)
-                                    } else {
-                                        false // Invalid regex
-                                    }
-                                } else {
-                                    // Simple substring match
-                                    stripped.to_lowercase().contains(&self.filter_text.to_lowercase())
-                                }
-                            } else {
-                                true
-                            }
-                        })
-                        .collect();
-
-                    // Build plain text version for selection (strip ANSI codes and empty lines)
-                    let lines: Vec<String> = colored_lines.iter()
-                        .map(|line| {
-                            let stripped = crate::util::strip_ansi_codes(&line.text);
-                            if self.show_tags {
-                                // Add timestamp prefix when showing tags
-                                // Convert temperatures only if enabled
-                                let ts_prefix = Self::format_timestamp_gui_cached(line.ts, &cached_now);
-                                let with_temps = if self.temp_convert_enabled {
-                                    convert_temperatures(&stripped)
-                                } else {
-                                    stripped.clone()
-                                };
-                                format!("{} {}", ts_prefix, with_temps)
-                            } else {
-                                // Strip MUD tags like [channel:] or [channel(player)]
-                                Self::strip_mud_tags(&stripped)
-                            }
-                        })
-                        .collect();
-                    let plain_text: String = lines.join("\n");
-
-                    // Build combined LayoutJob with ANSI colors
                     let default_color = theme.fg();
                     let font_id = egui::FontId::monospace(self.font_size);
-                    let combined_job = egui::text::LayoutJob {
-                        wrap: egui::text::TextWrapping {
-                            max_width: ui.available_width(),
+
+                    let (combined_job, plain_text, display_lines, has_any_discord_emojis): (egui::text::LayoutJob, String, Vec<String>, bool);
+
+                    if self.output_dirty {
+                        // Cache "now" for timestamp formatting - compute once per frame
+                        let cached_now = GuiCachedNow::new();
+
+                        // Keep original lines with ANSI for coloring
+                        let colored_lines: Vec<&TimestampedLine> = world.output_lines.iter()
+                            .filter(|line| {
+                                // Skip gagged lines unless show_tags is enabled (F2)
+                                if line.gagged && !self.show_tags {
+                                    return false;
+                                }
+                                // Apply filter if active (filter on stripped text)
+                                if self.filter_active && !self.filter_text.is_empty() {
+                                    let stripped = crate::util::strip_ansi_codes(&line.text);
+                                    // Check if pattern has wildcards
+                                    let has_wildcards = self.filter_text.contains('*') || self.filter_text.contains('?');
+                                    if has_wildcards {
+                                        // Use wildcard matching
+                                        if let Some(regex) = filter_wildcard_to_regex(&self.filter_text) {
+                                            regex.is_match(&stripped)
+                                        } else {
+                                            false // Invalid regex
+                                        }
+                                    } else {
+                                        // Simple substring match
+                                        stripped.to_lowercase().contains(&self.filter_text.to_lowercase())
+                                    }
+                                } else {
+                                    true
+                                }
+                            })
+                            .collect();
+
+                        // Build plain text version for selection (strip ANSI codes and empty lines)
+                        let lines: Vec<String> = colored_lines.iter()
+                            .map(|line| {
+                                let stripped = crate::util::strip_ansi_codes(&line.text);
+                                if self.show_tags {
+                                    // Add timestamp prefix when showing tags
+                                    // Convert temperatures only if enabled
+                                    let ts_prefix = Self::format_timestamp_gui_cached(line.ts, &cached_now);
+                                    let with_temps = if self.temp_convert_enabled {
+                                        convert_temperatures(&stripped)
+                                    } else {
+                                        stripped.clone()
+                                    };
+                                    format!("{} {}", ts_prefix, with_temps)
+                                } else {
+                                    // Strip MUD tags like [channel:] or [channel(player)]
+                                    Self::strip_mud_tags(&stripped)
+                                }
+                            })
+                            .collect();
+                        plain_text = lines.join("\n");
+
+                        // Build combined LayoutJob with ANSI colors
+                        let mut job = egui::text::LayoutJob {
+                            wrap: egui::text::TextWrapping {
+                                max_width: available_width,
+                                ..Default::default()
+                            },
                             ..Default::default()
-                        },
-                        ..Default::default()
-                    };
-
-                    // Check if any line has Discord emojis (skip when show_tags enabled to show original text)
-                    let has_any_discord_emojis = !self.show_tags && colored_lines.iter()
-                        .any(|line| Self::has_discord_emojis(&line.text));
-
-                    // Build display lines for both paths
-                    let world_name = &world.name;
-                    let highlight_actions = self.highlight_actions;
-                    // Pre-compile action patterns once (not per-line)
-                    let compiled_patterns = if highlight_actions {
-                        compile_action_patterns(world_name, &self.actions)
-                    } else {
-                        Vec::new()
-                    };
-                    let display_lines: Vec<String> = colored_lines.iter().map(|line| {
-                        let base_line = if self.show_tags {
-                            let ts_prefix = Self::format_timestamp_gui_cached(line.ts, &cached_now);
-                            // Convert temperatures only if enabled
-                            let with_temps = if self.temp_convert_enabled {
-                                convert_temperatures(&line.text)
-                            } else {
-                                line.text.clone()
-                            };
-                            format!("\x1b[36m{}\x1b[0m {}", ts_prefix, with_temps)
-                        } else {
-                            Self::strip_mud_tags_ansi(&line.text)
                         };
-                        // Apply /highlight color from action command (takes priority)
-                        if let Some(ref hl_color) = line.highlight_color {
-                            let bg_code = Self::color_name_to_ansi_bg(hl_color);
-                            // Replace any resets to preserve background
-                            let highlighted = base_line.replace("\x1b[0m", &format!("\x1b[0m{}", bg_code));
-                            format!("{}{}\x1b[0m", bg_code, highlighted)
-                        }
-                        // Apply F8 action highlighting if enabled (and no explicit highlight color)
-                        else if highlight_actions && line_matches_compiled_patterns(&line.text, &compiled_patterns) {
-                            // Dark yellow/brown background (same as console: 48;5;58)
-                            let bg_code = "\x1b[48;5;58m";
-                            // Replace any resets to preserve background
-                            let highlighted = base_line.replace("\x1b[0m", &format!("\x1b[0m{}", bg_code));
-                            format!("{}{}\x1b[0m", bg_code, highlighted)
+
+                        // Check if any line has Discord emojis (skip when show_tags enabled to show original text)
+                        has_any_discord_emojis = !self.show_tags && colored_lines.iter()
+                            .any(|line| Self::has_discord_emojis(&line.text));
+
+                        // Build display lines for both paths
+                        let world_name = &world.name;
+                        let highlight_actions = self.highlight_actions;
+                        // Pre-compile action patterns once (not per-line)
+                        let compiled_patterns = if highlight_actions {
+                            compile_action_patterns(world_name, &self.actions)
                         } else {
-                            base_line
-                        }
-                    }).collect();
-
-                    let is_light_theme = !theme.is_dark();
-
-                    // Build combined LayoutJob from display_lines
-                    let mut combined_job = combined_job;
-                    if !has_any_discord_emojis {
-                        for (i, display_line) in display_lines.iter().enumerate() {
-                            // Skip Discord emoji conversion when show_tags enabled to show original text
-                            let line_text = if self.show_tags {
-                                display_line.clone()
+                            Vec::new()
+                        };
+                        display_lines = colored_lines.iter().map(|line| {
+                            let base_line = if self.show_tags {
+                                let ts_prefix = Self::format_timestamp_gui_cached(line.ts, &cached_now);
+                                // Convert temperatures only if enabled
+                                let with_temps = if self.temp_convert_enabled {
+                                    convert_temperatures(&line.text)
+                                } else {
+                                    line.text.clone()
+                                };
+                                format!("\x1b[36m{}\x1b[0m {}", ts_prefix, with_temps)
                             } else {
-                                convert_discord_emojis(display_line)
+                                Self::strip_mud_tags_ansi(&line.text)
                             };
-                            // Apply word breaks for long words
-                            let line_text = Self::insert_word_breaks(&line_text);
-                            Self::append_ansi_to_job(&line_text, default_color, font_id.clone(), &mut combined_job, is_light_theme, self.color_offset_percent);
+                            // Apply /highlight color from action command (takes priority)
+                            if let Some(ref hl_color) = line.highlight_color {
+                                let bg_code = Self::color_name_to_ansi_bg(hl_color);
+                                // Replace any resets to preserve background
+                                let highlighted = base_line.replace("\x1b[0m", &format!("\x1b[0m{}", bg_code));
+                                format!("{}{}\x1b[0m", bg_code, highlighted)
+                            }
+                            // Apply F8 action highlighting if enabled (and no explicit highlight color)
+                            else if highlight_actions && line_matches_compiled_patterns(&line.text, &compiled_patterns) {
+                                // Dark yellow/brown background (same as console: 48;5;58)
+                                let bg_code = "\x1b[48;5;58m";
+                                // Replace any resets to preserve background
+                                let highlighted = base_line.replace("\x1b[0m", &format!("\x1b[0m{}", bg_code));
+                                format!("{}{}\x1b[0m", bg_code, highlighted)
+                            } else {
+                                base_line
+                            }
+                        }).collect();
 
-                            if i < display_lines.len() - 1 {
-                                combined_job.append("\n", 0.0, egui::TextFormat {
-                                    font_id: font_id.clone(),
-                                    color: default_color,
-                                    ..Default::default()
-                                });
+                        let is_light_theme = !theme.is_dark();
+
+                        // Build combined LayoutJob from display_lines
+                        if !has_any_discord_emojis {
+                            for (i, display_line) in display_lines.iter().enumerate() {
+                                // Skip Discord emoji conversion when show_tags enabled to show original text
+                                let line_text = if self.show_tags {
+                                    display_line.clone()
+                                } else {
+                                    convert_discord_emojis(display_line)
+                                };
+                                // Apply word breaks for long words
+                                let line_text = Self::insert_word_breaks(&line_text);
+                                Self::append_ansi_to_job(&line_text, default_color, font_id.clone(), &mut job, is_light_theme, self.color_offset_percent);
+
+                                if i < display_lines.len() - 1 {
+                                    job.append("\n", 0.0, egui::TextFormat {
+                                        font_id: font_id.clone(),
+                                        color: default_color,
+                                        ..Default::default()
+                                    });
+                                }
                             }
                         }
+                        combined_job = job;
+
+                        // Cache the results
+                        self.cached_output_job = Some(combined_job.clone());
+                        self.cached_plain_text = plain_text.clone();
+                        self.cached_display_lines = display_lines.clone();
+                        self.cached_has_emojis = has_any_discord_emojis;
+                        self.cached_output_width = available_width;
+                        self.output_dirty = false;
+                    } else {
+                        // Reuse cached values
+                        combined_job = self.cached_output_job.clone().unwrap_or_default();
+                        plain_text = self.cached_plain_text.clone();
+                        display_lines = self.cached_display_lines.clone();
+                        has_any_discord_emojis = self.cached_has_emojis;
                     }
 
                     // Calculate approximate visible lines based on available height and font size
@@ -4791,7 +4880,7 @@ impl eframe::App for RemoteGuiApp {
                                         result
                                     }
 
-                                    // Build selection from raw lines
+                                    // Build selection from raw lines (use cached display_lines which contain ANSI codes)
                                     let mut raw_selected_parts = Vec::new();
                                     let mut char_pos = 0;
                                     for (i, galley_line) in galley_text.lines().enumerate() {
@@ -4800,13 +4889,13 @@ impl eframe::App for RemoteGuiApp {
 
                                         // Check if this line overlaps with selection
                                         if line_end > start_char && line_start < end_char {
-                                            if let Some(ts_line) = colored_lines.get(i) {
+                                            if let Some(raw_line) = display_lines.get(i) {
                                                 // Calculate visible char range within this line
                                                 let sel_start_in_line = start_char.saturating_sub(line_start);
                                                 let sel_end_in_line = (end_char - line_start).min(galley_line.chars().count());
 
                                                 let raw_part = extract_raw_selection(
-                                                    &ts_line.text,
+                                                    raw_line,
                                                     sel_start_in_line,
                                                     sel_end_in_line
                                                 );
@@ -6503,6 +6592,12 @@ impl eframe::App for RemoteGuiApp {
                 }
 
                 // Apply changes back (live preview for transparency)
+                if temp_convert != self.temp_convert_enabled
+                    || color_offset != self.color_offset_percent
+                    || gui_theme.name() != self.theme.name()
+                {
+                    self.output_dirty = true;
+                }
                 self.more_mode = more_mode;
                 self.spell_check_enabled = spell_check;
                 self.temp_convert_enabled = temp_convert;
@@ -7033,6 +7128,7 @@ impl eframe::App for RemoteGuiApp {
                     if let Ok(size) = self.edit_font_size.parse::<f32>() {
                         self.font_size = size.clamp(8.0, 48.0);
                     }
+                    self.output_dirty = true;
                     // Send updated settings to server
                     self.update_global_settings();
                     close_popup = true;
@@ -8626,6 +8722,7 @@ impl eframe::App for RemoteGuiApp {
                     "edit" => self.open_world_editor(idx),
                     "switch" => {
                         self.current_world = idx;
+                        self.output_dirty = true;
                         self.switch_world(idx);
                     }
                     "delete" => {
