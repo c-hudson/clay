@@ -6229,9 +6229,6 @@
                         paused = false;
                         linesSincePause = 0;
                         updateStatusBar();
-                    } else {
-                        // Release any pending (local or server) when at bottom
-                        releaseAll();
                     }
                 }
             } else if (e.key === 'ArrowUp' && !e.ctrlKey && !e.shiftKey && !e.altKey && document.activeElement !== elements.input) {
@@ -6366,9 +6363,6 @@
                         paused = false;
                         linesSincePause = 0;
                         updateStatusBar();
-                    } else {
-                        // Release any pending (local or server) when at bottom
-                        releaseAll();
                     }
                 }
             }

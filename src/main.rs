@@ -2227,14 +2227,6 @@ impl World {
                 self.output_lines.append(&mut self.pending_lines);
             }
         }
-        // If paused but nothing in pending, unpause — there's nothing to paginate.
-        // This prevents the world from being stuck paused with no "More" indicator
-        // when a single oversized line triggered the pause.
-        // (lines_since_pause is preserved so the NEXT add_output call will
-        // immediately re-trigger if more data arrives)
-        if self.paused && self.pending_lines.is_empty() {
-            self.paused = false;
-        }
         // Always scroll to bottom unless paused (and more mode is on)
         if !self.paused {
             self.scroll_to_bottom();
@@ -2259,6 +2251,8 @@ impl World {
     /// approximately one screenful. Always releases at least one logical line.
     pub fn release_pending(&mut self, visual_budget: usize, output_width: usize) {
         if self.pending_lines.is_empty() {
+            self.paused = false;
+            self.lines_since_pause = 0;
             return;
         }
         let width = output_width.max(1);
@@ -4907,14 +4901,8 @@ impl App {
         // new_offset is one past the last line counted, so subtract 1
         world.scroll_offset = (new_offset - 1).min(max_scroll);
 
-        // If we've scrolled to bottom, unpause and release any pending lines
-        if world.is_at_bottom() {
-            if !world.pending_lines.is_empty() {
-                world.output_lines.append(&mut world.pending_lines);
-                world.pending_since = None;
-                // Update scroll_offset to the new end after appending
-                world.scroll_offset = world.output_lines.len().saturating_sub(1);
-            }
+        // If we've scrolled to bottom with no pending lines, unpause
+        if world.is_at_bottom() && world.pending_lines.is_empty() {
             world.paused = false;
             world.lines_since_pause = 0;
         }
@@ -15671,8 +15659,8 @@ fn handle_key_event(key: KeyEvent, app: &mut App) -> KeyAction {
             app.scroll_output_down();
             app.needs_output_redraw = true;
             return KeyAction::None;
-        } else if app.current_world().paused && !app.current_world().pending_lines.is_empty() {
-            // At bottom and paused with pending lines - release one screenful of VISUAL lines
+        } else if app.current_world().paused {
+            // At bottom and paused - release one screenful of VISUAL lines (or just unpause if pending is empty)
             let visual_budget = (app.output_height as usize).saturating_sub(2);
             let output_width = app.output_width as usize;
             let world_idx = app.current_world_index;
@@ -21652,6 +21640,49 @@ mod tests {
             "Expected 47 output lines, got {}", world.output_lines.len());
         assert_eq!(world.pending_lines.len(), 953,
             "Expected 953 pending lines, got {}", world.pending_lines.len());
+    }
+
+    #[test]
+    fn test_more_mode_multi_chunk() {
+        // Test that more-mode works correctly when data arrives in multiple TCP chunks.
+        // Each chunk is a separate add_output call. The pause trigger must not leak
+        // extra lines into output when the triggering line is the last in a chunk.
+        let mut world = World::new("test");
+        let settings = Settings { more_mode_enabled: true, ..Settings::default() };
+
+        // output_height=24, max_lines=22
+        // Send 200 lines in chunks of varying sizes
+        let all_lines: Vec<String> = (0..200).map(|i| format!("{}\n", i)).collect();
+
+        // Chunk 1: lines 0-22 (23 lines). Line 22 triggers pause (lsp=22, 22+1=23>22).
+        // This is the LAST line of the chunk, so pending is empty after the trigger.
+        let chunk1: String = all_lines[0..23].concat();
+        world.add_output(&chunk1, true, &settings, 24, 80, false, true);
+
+        // After chunk 1: should have 23 output lines and be paused.
+        // The key assertion: paused must remain true even though pending is empty.
+        assert_eq!(world.output_lines.len(), 23,
+            "Chunk 1: Expected 23 output lines, got {}", world.output_lines.len());
+
+        // Chunk 2: lines 23-99 (77 lines). Already paused, all should go to pending.
+        let chunk2: String = all_lines[23..100].concat();
+        world.add_output(&chunk2, true, &settings, 24, 80, false, true);
+
+        assert!(world.paused, "Should still be paused after chunk 2");
+        assert_eq!(world.output_lines.len(), 23,
+            "Chunk 2: Expected still 23 output lines, got {}", world.output_lines.len());
+        assert_eq!(world.pending_lines.len(), 77,
+            "Chunk 2: Expected 77 pending lines, got {}", world.pending_lines.len());
+
+        // Chunk 3: lines 100-199 (100 lines). Still paused, all go to pending.
+        let chunk3: String = all_lines[100..200].concat();
+        world.add_output(&chunk3, true, &settings, 24, 80, false, true);
+
+        assert!(world.paused, "Should still be paused after chunk 3");
+        assert_eq!(world.output_lines.len(), 23,
+            "Chunk 3: Expected still 23 output lines, got {}", world.output_lines.len());
+        assert_eq!(world.pending_lines.len(), 177,
+            "Chunk 3: Expected 177 pending lines, got {}", world.pending_lines.len());
     }
 
     #[test]
