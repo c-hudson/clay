@@ -378,7 +378,7 @@ Prompts that are auto-answered are immediately cleared and not displayed in the 
 
 - `src/main.rs` - Main application
 - `src/encoding.rs` - Character encoding (UTF-8, Latin1, Fansi), colored emoji handling, and console `Theme` enum (Dark/Light with hardcoded ratatui colors)
-- `src/theme.rs` - `ThemeColors` struct (41 customizable color vars), `ThemeFile` for loading `~/clay.theme.dat` (INI format). Used by GUI/web only; console uses `Theme` from encoding.rs
+- `src/theme.rs` - `ThemeColors` struct (42 customizable color vars), `ThemeFile` for loading `~/clay.theme.dat` (INI format). Used by GUI/web only; console uses `Theme` from encoding.rs
 - `src/web/index.html` - Web interface HTML template
 - `src/web/style.css` - Web interface CSS styles (uses `var(--theme-*)` CSS variables)
 - `src/web/app.js` - Web interface JavaScript client
