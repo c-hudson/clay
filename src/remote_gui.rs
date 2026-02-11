@@ -1134,7 +1134,9 @@ impl RemoteGuiApp {
 
                             // Note: Don't track unseen_lines locally - server handles centralized tracking
                             // and will broadcast UnseenUpdate/UnseenCleared when counts change
-                            self.output_dirty = true;
+                            if world_index == self.current_world {
+                                self.output_dirty = true;
+                            }
                         }
                     }
                     WsMessage::WorldConnected { world_index, name } => {
@@ -1142,7 +1144,9 @@ impl RemoteGuiApp {
                             self.worlds[world_index].connected = true;
                             self.worlds[world_index].was_connected = true;
                             self.worlds[world_index].name = name;
-                            self.output_dirty = true;
+                            if world_index == self.current_world {
+                                self.output_dirty = true;
+                            }
                         }
                     }
                     WsMessage::WorldDisconnected { world_index } => {
@@ -1155,7 +1159,9 @@ impl RemoteGuiApp {
                             self.worlds[world_index].output_lines.clear();
                             self.worlds[world_index].pending_count = 0;
                             self.worlds[world_index].partial_line.clear();
-                            self.output_dirty = true;
+                            if world_index == self.current_world {
+                                self.output_dirty = true;
+                            }
                         }
                     }
                     WsMessage::AnsiMusic { world_index: _, notes } => {
@@ -1441,7 +1447,9 @@ impl RemoteGuiApp {
                             for line in lines {
                                 self.worlds[world_index].output_lines.push(line);
                             }
-                            self.output_dirty = true;
+                            if world_index == self.current_world {
+                                self.output_dirty = true;
+                            }
                         }
                     }
                     WsMessage::PendingCountUpdate { world_index, count } => {
@@ -4416,6 +4424,16 @@ impl eframe::App for RemoteGuiApp {
                                 }
                             })
                             .collect();
+
+                        // Cap rendered lines to avoid slow layout on large buffers.
+                        // When not filtering, only render the last N lines (scrollback still works
+                        // within this range). Filtering needs all matching lines.
+                        const MAX_RENDER_LINES: usize = 1000;
+                        let colored_lines = if !self.filter_active && colored_lines.len() > MAX_RENDER_LINES {
+                            colored_lines[colored_lines.len() - MAX_RENDER_LINES..].to_vec()
+                        } else {
+                            colored_lines
+                        };
 
                         // Build plain text version for selection (strip ANSI codes and empty lines)
                         let lines: Vec<String> = colored_lines.iter()
