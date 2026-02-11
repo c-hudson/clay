@@ -415,6 +415,36 @@ pub struct RemoteGuiApp {
     server_activity_count: usize,
     /// Unified popup state for new popup system
     unified_popup: Option<crate::popup::PopupState>,
+    /// Cached URL positions from galley text (computed once per frame)
+    cached_urls: Vec<(usize, usize, String)>,
+    /// Whether cached URLs need recomputation
+    urls_dirty: bool,
+    /// Whether output needs rebuilding (dirty flag for caching)
+    output_dirty: bool,
+    /// Cached LayoutJob for output area
+    cached_output_job: Option<egui::text::LayoutJob>,
+    /// Cached plain text for copy operations
+    cached_plain_text: String,
+    /// Cached display lines (for emoji rendering path)
+    cached_display_lines: Vec<String>,
+    /// Cached has_discord_emojis flag
+    cached_has_emojis: bool,
+    /// Last available width used for output layout
+    cached_output_width: f32,
+    /// Last output line count (to detect changes without explicit dirty flag)
+    cached_output_len: usize,
+    /// Last world index rendered (to detect world switches)
+    cached_world_index: usize,
+    /// Last show_tags state
+    cached_show_tags: bool,
+    /// Last highlight_actions state
+    cached_highlight_actions: bool,
+    /// Last filter text
+    cached_filter_text: String,
+    /// Last font size
+    cached_font_size: f32,
+    /// Last color_offset_percent
+    cached_color_offset: u8,
 }
 
 /// Square wave audio source for ANSI music playback
@@ -603,6 +633,21 @@ impl RemoteGuiApp {
             last_sent_view_state: None,
             server_activity_count: 0,
             unified_popup: None,
+            cached_urls: Vec::new(),
+            urls_dirty: true,
+            output_dirty: true,
+            cached_output_job: None,
+            cached_plain_text: String::new(),
+            cached_display_lines: Vec::new(),
+            cached_has_emojis: false,
+            cached_output_width: 0.0,
+            cached_output_len: 0,
+            cached_world_index: usize::MAX,
+            cached_show_tags: false,
+            cached_highlight_actions: false,
+            cached_filter_text: String::new(),
+            cached_font_size: 0.0,
+            cached_color_offset: 0,
         };
         app.load_remote_settings();
         app
@@ -2626,45 +2671,39 @@ impl RemoteGuiApp {
 
     /// Find URLs in text and return their character positions (not byte positions)
     /// Returns (start_char_idx, end_char_idx, url_string)
+    /// O(n) algorithm: searches directly on &str byte offsets, no per-iteration allocations
     fn find_urls(text: &str) -> Vec<(usize, usize, String)> {
         let mut urls = Vec::new();
-        let chars: Vec<char> = text.chars().collect();
-        let mut i = 0;
+        let mut search_start = 0usize; // byte offset
 
-        while i < chars.len() {
-            // Look for http:// or https://
-            let remaining: String = chars[i..].iter().collect();
-            let http_pos = remaining.find("http://");
-            let https_pos = remaining.find("https://");
-
-            // Find earliest match (in bytes), then convert to char position
-            let byte_pos = match (http_pos, https_pos) {
+        while search_start < text.len() {
+            let remaining = &text[search_start..];
+            let byte_pos = match (remaining.find("http://"), remaining.find("https://")) {
                 (Some(h), Some(hs)) => Some(h.min(hs)),
                 (Some(h), None) => Some(h),
                 (None, Some(hs)) => Some(hs),
                 (None, None) => None,
             };
 
-            if let Some(byte_offset) = byte_pos {
-                // Convert byte offset to char offset within remaining
-                let char_offset = remaining[..byte_offset].chars().count();
-                let start = i + char_offset;
-
-                // Find end of URL (whitespace or certain punctuation)
-                let mut end = start;
-                while end < chars.len() {
-                    let c = chars[end];
-                    if c.is_whitespace() || c == '>' || c == '"' || c == '\'' || c == ')' || c == ']' {
+            if let Some(offset) = byte_pos {
+                let url_start_byte = search_start + offset;
+                let mut url_end_byte = url_start_byte;
+                for (i, c) in text[url_start_byte..].char_indices() {
+                    if c.is_whitespace() || matches!(c, '>' | '"' | '\'' | ')' | ']') {
+                        url_end_byte = url_start_byte + i;
                         break;
                     }
-                    end += 1;
+                    url_end_byte = url_start_byte + i + c.len_utf8();
                 }
 
-                if end > start {
-                    let url: String = chars[start..end].iter().collect();
-                    urls.push((start, end, url));
+                if url_end_byte > url_start_byte {
+                    // Convert byte offsets to char indices
+                    let start_char = text[..url_start_byte].chars().count();
+                    let url_str = &text[url_start_byte..url_end_byte];
+                    let end_char = start_char + url_str.chars().count();
+                    urls.push((start_char, end_char, url_str.to_string()));
                 }
-                i = end;
+                search_start = url_end_byte;
             } else {
                 break;
             }
@@ -4481,140 +4520,195 @@ impl eframe::App for RemoteGuiApp {
                         return;  // Skip regular output rendering
                     }
 
-                    // Cache "now" for timestamp formatting - compute once per frame
-                    let cached_now = GuiCachedNow::new();
+                    // Check if output needs rebuilding by detecting any state change
+                    let available_width = ui.available_width();
+                    let current_line_count = world.output_lines.len();
+                    if current_line_count != self.cached_output_len
+                        || self.current_world != self.cached_world_index
+                        || self.show_tags != self.cached_show_tags
+                        || self.highlight_actions != self.cached_highlight_actions
+                        || self.filter_text != self.cached_filter_text
+                        || self.font_size != self.cached_font_size
+                        || self.color_offset_percent != self.cached_color_offset
+                        || (available_width - self.cached_output_width).abs() > 1.0 {
+                        self.output_dirty = true;
+                    }
 
-                    // Keep original lines with ANSI for coloring
-                    let colored_lines: Vec<&TimestampedLine> = world.output_lines.iter()
-                        .filter(|line| {
-                            // Skip gagged lines unless show_tags is enabled (F2)
-                            if line.gagged && !self.show_tags {
-                                return false;
-                            }
-                            // Apply filter if active (filter on stripped text)
-                            if self.filter_active && !self.filter_text.is_empty() {
-                                let stripped = crate::util::strip_ansi_codes(&line.text);
-                                // Check if pattern has wildcards
-                                let has_wildcards = self.filter_text.contains('*') || self.filter_text.contains('?');
-                                if has_wildcards {
-                                    // Use wildcard matching
-                                    if let Some(regex) = filter_wildcard_to_regex(&self.filter_text) {
-                                        regex.is_match(&stripped)
-                                    } else {
-                                        false // Invalid regex
-                                    }
-                                } else {
-                                    // Simple substring match
-                                    stripped.to_lowercase().contains(&self.filter_text.to_lowercase())
-                                }
-                            } else {
-                                true
-                            }
-                        })
-                        .collect();
-
-                    // Build plain text version for selection (strip ANSI codes and empty lines)
-                    let lines: Vec<String> = colored_lines.iter()
-                        .map(|line| {
-                            let stripped = crate::util::strip_ansi_codes(&line.text);
-                            if self.show_tags {
-                                // Add timestamp prefix when showing tags
-                                // Convert temperatures only if enabled
-                                let ts_prefix = Self::format_timestamp_gui_cached(line.ts, &cached_now);
-                                let with_temps = if self.temp_convert_enabled {
-                                    convert_temperatures(&stripped)
-                                } else {
-                                    stripped.clone()
-                                };
-                                format!("{} {}", ts_prefix, with_temps)
-                            } else {
-                                // Strip MUD tags like [channel:] or [channel(player)]
-                                Self::strip_mud_tags(&stripped)
-                            }
-                        })
-                        .collect();
-                    let plain_text: String = lines.join("\n");
-
-                    // Build combined LayoutJob with ANSI colors
                     let default_color = theme.fg();
                     let font_id = egui::FontId::monospace(self.font_size);
-                    let combined_job = egui::text::LayoutJob {
-                        wrap: egui::text::TextWrapping {
-                            max_width: ui.available_width(),
-                            ..Default::default()
-                        },
-                        ..Default::default()
-                    };
-
-                    // Check if any line has Discord emojis (skip when show_tags enabled to show original text)
-                    let has_any_discord_emojis = !self.show_tags && colored_lines.iter()
-                        .any(|line| Self::has_discord_emojis(&line.text));
-
-                    // Build display lines for both paths
-                    let world_name = &world.name;
-                    let highlight_actions = self.highlight_actions;
-                    // Pre-compile action patterns once (not per-line)
-                    let compiled_patterns = if highlight_actions {
-                        compile_action_patterns(world_name, &self.actions)
-                    } else {
-                        Vec::new()
-                    };
-                    let display_lines: Vec<String> = colored_lines.iter().map(|line| {
-                        let base_line = if self.show_tags {
-                            let ts_prefix = Self::format_timestamp_gui_cached(line.ts, &cached_now);
-                            // Convert temperatures only if enabled
-                            let with_temps = if self.temp_convert_enabled {
-                                convert_temperatures(&line.text)
-                            } else {
-                                line.text.clone()
-                            };
-                            format!("\x1b[36m{}\x1b[0m {}", ts_prefix, with_temps)
-                        } else {
-                            Self::strip_mud_tags_ansi(&line.text)
-                        };
-                        // Apply /highlight color from action command (takes priority)
-                        if let Some(ref hl_color) = line.highlight_color {
-                            let bg_code = Self::color_name_to_ansi_bg(hl_color);
-                            // Replace any resets to preserve background
-                            let highlighted = base_line.replace("\x1b[0m", &format!("\x1b[0m{}", bg_code));
-                            format!("{}{}\x1b[0m", bg_code, highlighted)
-                        }
-                        // Apply F8 action highlighting if enabled (and no explicit highlight color)
-                        else if highlight_actions && line_matches_compiled_patterns(&line.text, &compiled_patterns) {
-                            // Dark yellow/brown background (same as console: 48;5;58)
-                            let bg_code = "\x1b[48;5;58m";
-                            // Replace any resets to preserve background
-                            let highlighted = base_line.replace("\x1b[0m", &format!("\x1b[0m{}", bg_code));
-                            format!("{}{}\x1b[0m", bg_code, highlighted)
-                        } else {
-                            base_line
-                        }
-                    }).collect();
-
                     let is_light_theme = !theme.is_dark();
 
-                    // Build combined LayoutJob from display_lines
-                    let mut combined_job = combined_job;
-                    if !has_any_discord_emojis {
-                        for (i, display_line) in display_lines.iter().enumerate() {
-                            // Skip Discord emoji conversion when show_tags enabled to show original text
-                            let line_text = if self.show_tags {
-                                display_line.clone()
-                            } else {
-                                convert_discord_emojis(display_line)
-                            };
-                            // Apply word breaks for long words
-                            let line_text = Self::insert_word_breaks(&line_text);
-                            Self::append_ansi_to_job(&line_text, default_color, font_id.clone(), &mut combined_job, is_light_theme, self.color_offset_percent);
+                    if self.output_dirty {
+                        // Cache "now" for timestamp formatting - compute once per frame
+                        let cached_now = GuiCachedNow::new();
 
-                            if i < display_lines.len() - 1 {
-                                combined_job.append("\n", 0.0, egui::TextFormat {
-                                    font_id: font_id.clone(),
-                                    color: default_color,
-                                    ..Default::default()
-                                });
+                        const MAX_RENDER_LINES: usize = 2000;
+
+                        // Keep original lines with ANSI for coloring
+                        let filtering = self.filter_active && !self.filter_text.is_empty();
+
+                        // Pre-truncate to avoid iterating thousands of lines when not filtering
+                        let lines_slice: &[TimestampedLine] = if !filtering && world.output_lines.len() > MAX_RENDER_LINES + 100 {
+                            &world.output_lines[world.output_lines.len() - MAX_RENDER_LINES - 100..]
+                        } else {
+                            &world.output_lines
+                        };
+
+                        // Pre-compile filter regex once (not per-line)
+                        let filter_regex = if filtering {
+                            let has_wildcards = self.filter_text.contains('*') || self.filter_text.contains('?');
+                            if has_wildcards {
+                                filter_wildcard_to_regex(&self.filter_text)
+                            } else {
+                                None
+                            }
+                        } else {
+                            None
+                        };
+                        let filter_lower = if filtering { self.filter_text.to_lowercase() } else { String::new() };
+
+                        let colored_lines: Vec<&TimestampedLine> = lines_slice.iter()
+                            .filter(|line| {
+                                // Skip gagged lines unless show_tags is enabled (F2)
+                                if line.gagged && !self.show_tags {
+                                    return false;
+                                }
+                                // Apply filter if active (filter on stripped text)
+                                if filtering {
+                                    let stripped = crate::util::strip_ansi_codes(&line.text);
+                                    if let Some(ref regex) = filter_regex {
+                                        regex.is_match(&stripped)
+                                    } else {
+                                        // Simple substring match
+                                        stripped.to_lowercase().contains(&filter_lower)
+                                    }
+                                } else {
+                                    true
+                                }
+                            })
+                            .collect();
+
+                        // Cap rendered lines
+                        let colored_lines = if !filtering && colored_lines.len() > MAX_RENDER_LINES {
+                            colored_lines[colored_lines.len() - MAX_RENDER_LINES..].to_vec()
+                        } else {
+                            colored_lines
+                        };
+
+                        // Build plain text version for selection (strip ANSI codes and empty lines)
+                        let lines: Vec<String> = colored_lines.iter()
+                            .map(|line| {
+                                let stripped = crate::util::strip_ansi_codes(&line.text);
+                                if self.show_tags {
+                                    // Add timestamp prefix when showing tags
+                                    // Convert temperatures only if enabled
+                                    let ts_prefix = Self::format_timestamp_gui_cached(line.ts, &cached_now);
+                                    let with_temps = if self.temp_convert_enabled {
+                                        convert_temperatures(&stripped)
+                                    } else {
+                                        stripped.clone()
+                                    };
+                                    format!("{} {}", ts_prefix, with_temps)
+                                } else {
+                                    // Strip MUD tags like [channel:] or [channel(player)]
+                                    Self::strip_mud_tags(&stripped)
+                                }
+                            })
+                            .collect();
+                        let plain_text: String = lines.join("\n");
+
+                        // Build combined LayoutJob with ANSI colors
+                        let mut combined_job = egui::text::LayoutJob {
+                            wrap: egui::text::TextWrapping {
+                                max_width: available_width,
+                                ..Default::default()
+                            },
+                            ..Default::default()
+                        };
+
+                        // Check if any line has Discord emojis (skip when show_tags enabled to show original text)
+                        let has_any_discord_emojis = !self.show_tags && colored_lines.iter()
+                            .any(|line| Self::has_discord_emojis(&line.text));
+
+                        // Build display lines for both paths
+                        let world_name = &world.name;
+                        let highlight_actions = self.highlight_actions;
+                        // Pre-compile action patterns once (not per-line)
+                        let compiled_patterns = if highlight_actions {
+                            compile_action_patterns(world_name, &self.actions)
+                        } else {
+                            Vec::new()
+                        };
+                        let display_lines: Vec<String> = colored_lines.iter().map(|line| {
+                            let base_line = if self.show_tags {
+                                let ts_prefix = Self::format_timestamp_gui_cached(line.ts, &cached_now);
+                                // Convert temperatures only if enabled
+                                let with_temps = if self.temp_convert_enabled {
+                                    convert_temperatures(&line.text)
+                                } else {
+                                    line.text.clone()
+                                };
+                                format!("\x1b[36m{}\x1b[0m {}", ts_prefix, with_temps)
+                            } else {
+                                Self::strip_mud_tags_ansi(&line.text)
+                            };
+                            // Apply /highlight color from action command (takes priority)
+                            if let Some(ref hl_color) = line.highlight_color {
+                                let bg_code = Self::color_name_to_ansi_bg(hl_color);
+                                // Replace any resets to preserve background
+                                let highlighted = base_line.replace("\x1b[0m", &format!("\x1b[0m{}", bg_code));
+                                format!("{}{}\x1b[0m", bg_code, highlighted)
+                            }
+                            // Apply F8 action highlighting if enabled (and no explicit highlight color)
+                            else if highlight_actions && line_matches_compiled_patterns(&line.text, &compiled_patterns) {
+                                // Dark yellow/brown background (same as console: 48;5;58)
+                                let bg_code = "\x1b[48;5;58m";
+                                // Replace any resets to preserve background
+                                let highlighted = base_line.replace("\x1b[0m", &format!("\x1b[0m{}", bg_code));
+                                format!("{}{}\x1b[0m", bg_code, highlighted)
+                            } else {
+                                base_line
+                            }
+                        }).collect();
+
+                        // Build combined LayoutJob from display_lines
+                        if !has_any_discord_emojis {
+                            for (i, display_line) in display_lines.iter().enumerate() {
+                                // Skip Discord emoji conversion when show_tags enabled to show original text
+                                let line_text = if self.show_tags {
+                                    display_line.clone()
+                                } else {
+                                    convert_discord_emojis(display_line)
+                                };
+                                // Apply word breaks for long words
+                                let line_text = Self::insert_word_breaks(&line_text);
+                                Self::append_ansi_to_job(&line_text, default_color, font_id.clone(), &mut combined_job, is_light_theme, self.color_offset_percent);
+
+                                if i < display_lines.len() - 1 {
+                                    combined_job.append("\n", 0.0, egui::TextFormat {
+                                        font_id: font_id.clone(),
+                                        color: default_color,
+                                        ..Default::default()
+                                    });
+                                }
                             }
                         }
+
+                        // Cache the results
+                        self.cached_output_job = Some(combined_job);
+                        self.cached_plain_text = plain_text;
+                        self.cached_display_lines = display_lines;
+                        self.cached_has_emojis = has_any_discord_emojis;
+                        self.cached_output_width = available_width;
+                        self.cached_output_len = current_line_count;
+                        self.cached_world_index = self.current_world;
+                        self.cached_show_tags = self.show_tags;
+                        self.cached_highlight_actions = self.highlight_actions;
+                        self.cached_filter_text = self.filter_text.clone();
+                        self.cached_font_size = self.font_size;
+                        self.cached_color_offset = self.color_offset_percent;
+                        self.urls_dirty = true;
+                        self.output_dirty = false;
                     }
 
                     // Calculate approximate visible lines based on available height and font size
@@ -4654,17 +4748,16 @@ impl eframe::App for RemoteGuiApp {
                         scroll_area = scroll_area.vertical_scroll_offset(delta);
                     }
 
-                    // Clone the job for the custom rendering
-                    let layout_job = combined_job.clone();
+                    // Use cached values for rendering
+                    let layout_job = self.cached_output_job.clone().unwrap_or_default();
 
-                    // Clone values needed in the closure
-                    let has_emojis = has_any_discord_emojis;
-                    let emoji_lines = display_lines.clone();
+                    let has_emojis = self.cached_has_emojis;
+                    let emoji_lines = self.cached_display_lines.clone();
                     let emoji_font_id = font_id.clone();
                     let emoji_default_color = default_color;
-                    let emoji_is_light = !theme.is_dark();
+                    let emoji_is_light = is_light_theme;
                     let emoji_link_color = theme.link();
-                    let emoji_plain_text = plain_text.clone();
+                    let emoji_plain_text = self.cached_plain_text.clone();
                     let emoji_color_offset = self.color_offset_percent;
 
                     let scroll_output = scroll_area.show(ui, |ui| {
@@ -4761,9 +4854,12 @@ impl eframe::App for RemoteGuiApp {
                                 self.selection_dragging = false;
                             }
 
-                            // Find URLs in the galley text for click handling
-                            let galley_text = galley.text();
-                            let url_ranges = Self::find_urls(galley_text);
+                            // Cache URLs from galley text (only recompute when output changed)
+                            if self.urls_dirty {
+                                self.cached_urls = Self::find_urls(galley.text());
+                                self.urls_dirty = false;
+                            }
+                            let url_ranges = &self.cached_urls;
 
                             // Handle URL clicks - on single click (not drag), check if clicking on URL
                             if alloc_response.clicked_by(egui::PointerButton::Primary) {
@@ -4772,10 +4868,10 @@ impl eframe::App for RemoteGuiApp {
                                     let cursor = galley.cursor_from_pos(relative_pos);
                                     let click_char = cursor.ccursor.index;
 
-                                    for (start, end, url) in &url_ranges {
+                                    for (start, end, url) in url_ranges {
                                         if click_char >= *start && click_char < *end {
                                             // Strip zero-width spaces that were inserted for word breaking
-                                            let clean_url = url.replace('\u{200B}', "");
+                                            let clean_url: String = url.replace('\u{200B}', "");
                                             Self::open_url(&clean_url);
                                             break;
                                         }
@@ -4791,7 +4887,7 @@ impl eframe::App for RemoteGuiApp {
                                     let cursor = galley.cursor_from_pos(relative_pos);
                                     let hover_char = cursor.ccursor.index;
 
-                                    for (start, end, _) in &url_ranges {
+                                    for (start, end, _) in url_ranges {
                                         if hover_char >= *start && hover_char < *end {
                                             ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
                                             break;
@@ -4973,13 +5069,13 @@ impl eframe::App for RemoteGuiApp {
 
                                         // Check if this line overlaps with selection
                                         if line_end > start_char && line_start < end_char {
-                                            if let Some(ts_line) = colored_lines.get(i) {
+                                            if let Some(raw_line) = self.cached_display_lines.get(i) {
                                                 // Calculate visible char range within this line
                                                 let sel_start_in_line = start_char.saturating_sub(line_start);
                                                 let sel_end_in_line = (end_char - line_start).min(galley_line.chars().count());
 
                                                 let raw_part = extract_raw_selection(
-                                                    &ts_line.text,
+                                                    raw_line,
                                                     sel_start_in_line,
                                                     sel_end_in_line
                                                 );
@@ -5007,13 +5103,10 @@ impl eframe::App for RemoteGuiApp {
                                     if cursor_range.primary == cursor_range.secondary {
                                         let click_pos = cursor_range.primary.ccursor.index;
 
-                                        // Check if clicking on a URL
-                                        // Use galley text (not plain_text) to match cursor positions
-                                        let galley_text = response.galley.text();
-                                        let urls = Self::find_urls(galley_text);
+                                        // Check if clicking on a URL (use cached URLs)
                                         let mut url_clicked = false;
-                                        for (start, end, url) in urls {
-                                            if click_pos >= start && click_pos <= end {
+                                        for (start, end, url) in &self.cached_urls {
+                                            if click_pos >= *start && click_pos <= *end {
                                                 // Strip zero-width spaces that were inserted for word breaking
                                                 let clean_url = url.replace('\u{200B}', "");
                                                 Self::open_url(&clean_url);
@@ -5080,18 +5173,15 @@ impl eframe::App for RemoteGuiApp {
 
                             // Draw URL underlines and handle hover cursor
                             {
-                                // Use galley text (not plain_text) to match cursor positions
                                 let galley = &response.galley;
-                                let galley_text = galley.text();
-                                let urls = Self::find_urls(galley_text);
 
-                                if !urls.is_empty() {
+                                if !self.cached_urls.is_empty() {
                                     let text_pos = response.galley_pos;
                                     let painter = ui.painter();
                                     let link_color = theme.link();
                                     let hover_pos = ui.input(|i| i.pointer.hover_pos());
 
-                                    for (start, end, _url) in &urls {
+                                    for (start, end, _url) in &self.cached_urls {
                                         let start_cursor = galley.from_ccursor(egui::text::CCursor::new(*start));
                                         let end_cursor = galley.from_ccursor(egui::text::CCursor::new(*end));
 
@@ -5135,7 +5225,7 @@ impl eframe::App for RemoteGuiApp {
                             }
 
                             // Right-click context menu
-                            let plain_text_for_menu = plain_text.clone();
+                            let plain_text_for_menu = self.cached_plain_text.clone();
                             let debug_request_id = egui::Id::new("debug_text_request");
 
                             response.response.context_menu(|ui| {

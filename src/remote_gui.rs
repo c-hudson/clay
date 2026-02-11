@@ -390,6 +390,10 @@ pub struct RemoteGuiApp {
     cached_has_emojis: bool,
     /// Last available width used for output layout
     cached_output_width: f32,
+    /// Cached URL positions from galley text (computed once on dirty)
+    cached_urls: Vec<(usize, usize, String)>,
+    /// Whether cached URLs need recomputation
+    urls_dirty: bool,
     /// Cached spell check results
     cached_misspelled: Vec<(usize, usize)>,
     /// Last input buffer for spell check invalidation
@@ -584,6 +588,8 @@ impl RemoteGuiApp {
             cached_display_lines: Vec::new(),
             cached_has_emojis: false,
             cached_output_width: 0.0,
+            cached_urls: Vec::new(),
+            urls_dirty: true,
             cached_misspelled: Vec::new(),
             cached_spell_input: String::new(),
         }
@@ -2561,45 +2567,39 @@ impl RemoteGuiApp {
 
     /// Find URLs in text and return their character positions (not byte positions)
     /// Returns (start_char_idx, end_char_idx, url_string)
+    /// O(n) algorithm: searches directly on &str byte offsets, no per-iteration allocations
     fn find_urls(text: &str) -> Vec<(usize, usize, String)> {
         let mut urls = Vec::new();
-        let chars: Vec<char> = text.chars().collect();
-        let mut i = 0;
+        let mut search_start = 0usize; // byte offset
 
-        while i < chars.len() {
-            // Look for http:// or https://
-            let remaining: String = chars[i..].iter().collect();
-            let http_pos = remaining.find("http://");
-            let https_pos = remaining.find("https://");
-
-            // Find earliest match (in bytes), then convert to char position
-            let byte_pos = match (http_pos, https_pos) {
+        while search_start < text.len() {
+            let remaining = &text[search_start..];
+            let byte_pos = match (remaining.find("http://"), remaining.find("https://")) {
                 (Some(h), Some(hs)) => Some(h.min(hs)),
                 (Some(h), None) => Some(h),
                 (None, Some(hs)) => Some(hs),
                 (None, None) => None,
             };
 
-            if let Some(byte_offset) = byte_pos {
-                // Convert byte offset to char offset within remaining
-                let char_offset = remaining[..byte_offset].chars().count();
-                let start = i + char_offset;
-
-                // Find end of URL (whitespace or certain punctuation)
-                let mut end = start;
-                while end < chars.len() {
-                    let c = chars[end];
-                    if c.is_whitespace() || c == '>' || c == '"' || c == '\'' || c == ')' || c == ']' {
+            if let Some(offset) = byte_pos {
+                let url_start_byte = search_start + offset;
+                let mut url_end_byte = url_start_byte;
+                for (i, c) in text[url_start_byte..].char_indices() {
+                    if c.is_whitespace() || matches!(c, '>' | '"' | '\'' | ')' | ']') {
+                        url_end_byte = url_start_byte + i;
                         break;
                     }
-                    end += 1;
+                    url_end_byte = url_start_byte + i + c.len_utf8();
                 }
 
-                if end > start {
-                    let url: String = chars[start..end].iter().collect();
-                    urls.push((start, end, url));
+                if url_end_byte > url_start_byte {
+                    // Convert byte offsets to char indices
+                    let start_char = text[..url_start_byte].chars().count();
+                    let url_str = &text[url_start_byte..url_end_byte];
+                    let end_char = start_char + url_str.chars().count();
+                    urls.push((start_char, end_char, url_str.to_string()));
                 }
-                i = end;
+                search_start = url_end_byte;
             } else {
                 break;
             }
@@ -4428,7 +4428,7 @@ impl eframe::App for RemoteGuiApp {
                         // Cap rendered lines to avoid slow layout on large buffers.
                         // When not filtering, only render the last N lines (scrollback still works
                         // within this range). Filtering needs all matching lines.
-                        const MAX_RENDER_LINES: usize = 1000;
+                        const MAX_RENDER_LINES: usize = 2000;
                         let colored_lines = if !self.filter_active && colored_lines.len() > MAX_RENDER_LINES {
                             colored_lines[colored_lines.len() - MAX_RENDER_LINES..].to_vec()
                         } else {
@@ -4543,6 +4543,7 @@ impl eframe::App for RemoteGuiApp {
                         self.cached_display_lines = display_lines.clone();
                         self.cached_has_emojis = has_any_discord_emojis;
                         self.cached_output_width = available_width;
+                        self.urls_dirty = true;
                         self.output_dirty = false;
                     } else {
                         // Reuse cached values
@@ -4696,9 +4697,12 @@ impl eframe::App for RemoteGuiApp {
                                 self.selection_dragging = false;
                             }
 
-                            // Find URLs in the galley text for click handling
-                            let galley_text = galley.text();
-                            let url_ranges = Self::find_urls(galley_text);
+                            // Cache URLs from galley text (only recompute when output changed)
+                            if self.urls_dirty {
+                                self.cached_urls = Self::find_urls(galley.text());
+                                self.urls_dirty = false;
+                            }
+                            let url_ranges = &self.cached_urls;
 
                             // Handle URL clicks - on single click (not drag), check if clicking on URL
                             if alloc_response.clicked_by(egui::PointerButton::Primary) {
@@ -4707,10 +4711,10 @@ impl eframe::App for RemoteGuiApp {
                                     let cursor = galley.cursor_from_pos(relative_pos);
                                     let click_char = cursor.ccursor.index;
 
-                                    for (start, end, url) in &url_ranges {
+                                    for (start, end, url) in url_ranges {
                                         if click_char >= *start && click_char < *end {
                                             // Strip zero-width spaces that were inserted for word breaking
-                                            let clean_url = url.replace('\u{200B}', "");
+                                            let clean_url: String = url.replace('\u{200B}', "");
                                             Self::open_url(&clean_url);
                                             break;
                                         }
@@ -4726,7 +4730,7 @@ impl eframe::App for RemoteGuiApp {
                                     let cursor = galley.cursor_from_pos(relative_pos);
                                     let hover_char = cursor.ccursor.index;
 
-                                    for (start, end, _) in &url_ranges {
+                                    for (start, end, _) in url_ranges {
                                         if hover_char >= *start && hover_char < *end {
                                             ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
                                             break;
@@ -4942,13 +4946,10 @@ impl eframe::App for RemoteGuiApp {
                                     if cursor_range.primary == cursor_range.secondary {
                                         let click_pos = cursor_range.primary.ccursor.index;
 
-                                        // Check if clicking on a URL
-                                        // Use galley text (not plain_text) to match cursor positions
-                                        let galley_text = response.galley.text();
-                                        let urls = Self::find_urls(galley_text);
+                                        // Check if clicking on a URL (use cached URLs)
                                         let mut url_clicked = false;
-                                        for (start, end, url) in urls {
-                                            if click_pos >= start && click_pos <= end {
+                                        for (start, end, url) in &self.cached_urls {
+                                            if click_pos >= *start && click_pos <= *end {
                                                 // Strip zero-width spaces that were inserted for word breaking
                                                 let clean_url = url.replace('\u{200B}', "");
                                                 Self::open_url(&clean_url);
@@ -5015,18 +5016,15 @@ impl eframe::App for RemoteGuiApp {
 
                             // Draw URL underlines and handle hover cursor
                             {
-                                // Use galley text (not plain_text) to match cursor positions
                                 let galley = &response.galley;
-                                let galley_text = galley.text();
-                                let urls = Self::find_urls(galley_text);
 
-                                if !urls.is_empty() {
+                                if !self.cached_urls.is_empty() {
                                     let text_pos = response.galley_pos;
                                     let painter = ui.painter();
                                     let link_color = theme.link();
                                     let hover_pos = ui.input(|i| i.pointer.hover_pos());
 
-                                    for (start, end, _url) in &urls {
+                                    for (start, end, _url) in &self.cached_urls {
                                         let start_cursor = galley.from_ccursor(egui::text::CCursor::new(*start));
                                         let end_cursor = galley.from_ccursor(egui::text::CCursor::new(*end));
 
