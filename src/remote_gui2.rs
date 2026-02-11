@@ -5455,22 +5455,22 @@ impl eframe::App for RemoteGuiApp {
                                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                                         ui.spacing_mut().item_spacing = egui::vec2(8.0, 0.0);
 
-                                        // Close button
+                                        // Ok button (primary)
                                         if ui.add(egui::Button::new(
-                                            egui::RichText::new("CLOSE").size(11.0).color(theme.fg_secondary()).family(egui::FontFamily::Monospace))
-                                            .fill(theme.bg_hover())
-                                            .stroke(egui::Stroke::new(1.0, theme.border_medium()))
+                                            egui::RichText::new("OK").size(11.0).color(theme.bg_deep()).strong().family(egui::FontFamily::Monospace))
+                                            .fill(theme.accent_dim())
+                                            .stroke(egui::Stroke::NONE)
                                             .rounding(egui::Rounding::same(4.0))
                                             .min_size(egui::vec2(70.0, 28.0))
                                         ).clicked() {
                                             should_close = true;
                                         }
 
-                                        // Connect button (primary)
+                                        // Connect button
                                         if ui.add(egui::Button::new(
-                                            egui::RichText::new("CONNECT").size(11.0).color(theme.bg_deep()).strong().family(egui::FontFamily::Monospace))
-                                            .fill(theme.accent_dim())
-                                            .stroke(egui::Stroke::NONE)
+                                            egui::RichText::new("CONNECT").size(11.0).color(theme.fg_secondary()).family(egui::FontFamily::Monospace))
+                                            .fill(theme.bg_hover())
+                                            .stroke(egui::Stroke::new(1.0, theme.border_medium()))
                                             .rounding(egui::Rounding::same(4.0))
                                             .min_size(egui::vec2(80.0, 28.0))
                                         ).clicked() {
