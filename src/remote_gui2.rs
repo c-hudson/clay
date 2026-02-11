@@ -193,6 +193,10 @@ impl GuiTheme {
     fn selection_bg(&self) -> Color32 { Self::c(&self.colors.selection_bg) }
     fn prompt(&self) -> Color32 { Self::c(&self.colors.prompt) }
     fn link(&self) -> Color32 { Self::c(&self.colors.link) }
+    fn list_selection_bg(&self) -> Color32 {
+        let a = self.accent();
+        Color32::from_rgba_unmultiplied(a.r(), a.g(), a.b(), 38)
+    }
 
     // Status bar and indicators
     fn status_bar_bg(&self) -> Color32 { Self::c(&self.colors.status_bar_bg) }
@@ -263,6 +267,8 @@ pub struct RemoteGuiApp {
     connect_time: Option<std::time::Instant>,
     /// Current popup state
     popup_state: PopupState,
+    /// When true, scroll the selected item to center when rendering a popup list
+    popup_scroll_to_selected: bool,
     /// Hamburger menu open state (gui2)
     hamburger_menu_open: bool,
     /// Time when hamburger menu was opened (to avoid immediate close)
@@ -546,6 +552,7 @@ impl RemoteGuiApp {
             auto_connect_attempted: false,
             connect_time: None,
             popup_state: PopupState::None,
+            popup_scroll_to_selected: false,
             hamburger_menu_open: false,
             hamburger_opened_time: std::time::Instant::now(),
             menu_selected: 0,
@@ -784,6 +791,7 @@ impl RemoteGuiApp {
         self.popup_state = PopupState::ConnectedWorlds;
         self.world_list_selected = self.current_world;
         self.only_connected_worlds = false;
+        self.popup_scroll_to_selected = true;
     }
 
     /// Open the actions list popup using unified system
@@ -804,6 +812,7 @@ impl RemoteGuiApp {
         let visible_height = 10.min(actions.len().max(3));
         let def = create_actions_list_popup(&actions, visible_height);
         self.unified_popup = Some(crate::popup::PopupState::new(def));
+        self.popup_scroll_to_selected = true;
     }
 
     /// Open the connections popup using unified system
@@ -836,6 +845,7 @@ impl RemoteGuiApp {
         let visible_height = 10.min(connections.iter().filter(|c| c.is_connected).count().max(3));
         let def = create_connections_popup(&connections, visible_height);
         self.unified_popup = Some(crate::popup::PopupState::new(def));
+        self.popup_scroll_to_selected = true;
     }
 
     /// Try to find a system font file by name
@@ -1435,6 +1445,7 @@ impl RemoteGuiApp {
                                 self.popup_state = PopupState::ConnectedWorlds;
                                 self.world_list_selected = self.current_world;
                                 self.only_connected_worlds = false;
+                                self.popup_scroll_to_selected = true;
                             }
                             Command::WorldsList => {
                                 // Output connected worlds list as text
@@ -3675,6 +3686,7 @@ impl eframe::App for RemoteGuiApp {
                     self.popup_state = PopupState::ConnectedWorlds;
                     self.world_list_selected = self.current_world;
                     self.only_connected_worlds = false;
+                    self.popup_scroll_to_selected = true;
                 }
                 Some("connected_worlds") => {
                     self.open_connections_unified();
@@ -3683,6 +3695,7 @@ impl eframe::App for RemoteGuiApp {
                     self.popup_state = PopupState::ConnectedWorlds;
                     self.world_list_selected = self.current_world;
                     self.only_connected_worlds = false;
+                    self.popup_scroll_to_selected = true;
                 }
                 Some("actions") => {
                     self.open_actions_list_unified();
@@ -3694,6 +3707,7 @@ impl eframe::App for RemoteGuiApp {
                     self.edit_font_name = self.font_name.clone();
                     self.edit_font_size = self.font_size.to_string();
                     self.popup_state = PopupState::Font;
+                    self.popup_scroll_to_selected = true;
                 }
                 Some("font_changed") => {
                     // Font size was changed via S/M/L buttons - update server settings
@@ -3972,6 +3986,7 @@ impl eframe::App for RemoteGuiApp {
                                     self.popup_state = PopupState::ConnectedWorlds;
                                     self.world_list_selected = self.current_world;
                                     self.only_connected_worlds = false;
+                                    self.popup_scroll_to_selected = true;
                                 }
                                 super::Command::WorldsList => {
                                     // Output connected worlds list as text
@@ -4080,6 +4095,7 @@ impl eframe::App for RemoteGuiApp {
                                         self.edit_font_name = self.font_name.clone();
                                         self.edit_font_size = format!("{:.1}", self.font_size);
                                         self.popup_state = PopupState::Font;
+                                        self.popup_scroll_to_selected = true;
                                     } else {
                                         // Send other commands to server
                                         self.send_command(self.current_world, cmd);
@@ -4442,6 +4458,7 @@ impl eframe::App for RemoteGuiApp {
                     self.popup_state = PopupState::ConnectedWorlds;
                     self.world_list_selected = self.current_world;
                     self.only_connected_worlds = false;
+                    self.popup_scroll_to_selected = true;
                 }
                 Some("connected_worlds") => {
                     self.open_connections_unified();
@@ -4450,6 +4467,7 @@ impl eframe::App for RemoteGuiApp {
                     self.popup_state = PopupState::ConnectedWorlds;
                     self.world_list_selected = self.current_world;
                     self.only_connected_worlds = false;
+                    self.popup_scroll_to_selected = true;
                 }
                 Some("actions") => {
                     self.open_actions_list_unified();
@@ -5581,6 +5599,7 @@ impl eframe::App for RemoteGuiApp {
                                         .color(theme.fg_muted())
                                         .family(egui::FontFamily::Monospace));
                                 } else {
+                                    let scroll_to = self.popup_scroll_to_selected;
                                     ScrollArea::vertical().auto_shrink([false; 2]).show(ui, |ui| {
                                         for (idx, world) in filtered_worlds.iter() {
                                             let is_current = *idx == current_world;
@@ -5590,10 +5609,15 @@ impl eframe::App for RemoteGuiApp {
                                             let row_rect = ui.allocate_space(egui::vec2(ui.available_width(), row_height)).1;
                                             let response = ui.interact(row_rect, ui.id().with(idx), egui::Sense::click());
 
+                                            // Scroll selected item to center when popup first opens
+                                            if is_selected && scroll_to {
+                                                ui.scroll_to_rect(row_rect, Some(egui::Align::Center));
+                                            }
+
                                             // Draw selection/hover background for full row
                                             if is_selected {
                                                 ui.painter().rect_filled(row_rect, egui::Rounding::same(2.0),
-                                                    Color32::from_rgba_unmultiplied(34, 211, 238, 38));
+                                                    theme.list_selection_bg());
                                             } else if response.hovered() {
                                                 ui.painter().rect_filled(row_rect, egui::Rounding::same(2.0), theme.bg_hover());
                                             }
@@ -5658,6 +5682,7 @@ impl eframe::App for RemoteGuiApp {
                 );
 
                 self.world_list_selected = selected;
+                self.popup_scroll_to_selected = false;
                 if toggle_only_connected {
                     self.only_connected_worlds = !self.only_connected_worlds;
                 }
@@ -6346,9 +6371,11 @@ impl eframe::App for RemoteGuiApp {
                     }
                     // Return to Worlds popup
                     self.popup_state = PopupState::ConnectedWorlds;
+                    self.popup_scroll_to_selected = true;
                 } else if should_cancel {
                     // Return to Worlds popup
                     self.popup_state = PopupState::ConnectedWorlds;
+                    self.popup_scroll_to_selected = true;
                 }
             }
 
@@ -7166,6 +7193,7 @@ impl eframe::App for RemoteGuiApp {
                 // Copy mutable state for viewport
                 let mut edit_font_name = self.edit_font_name.clone();
                 let mut edit_font_size = self.edit_font_size.clone();
+                let scroll_to_selected = self.popup_scroll_to_selected;
 
                 ctx.show_viewport_immediate(
                     egui::ViewportId::from_hash_of("font_settings_window"),
@@ -7284,14 +7312,19 @@ impl eframe::App for RemoteGuiApp {
                                     .rounding(egui::Rounding::same(4.0))
                                     .inner_margin(egui::Margin::same(4.0))
                                     .show(ui, |ui| {
+                                        let scroll_to = scroll_to_selected;
                                         egui::ScrollArea::vertical()
                                             .max_height(288.0)
                                             .show(ui, |ui| {
                                                 ui.set_min_width(ui.available_width());
                                                 for (value, label) in FONT_FAMILIES {
                                                     let is_selected = *value == edit_font_name;
-                                                    if ui.selectable_label(is_selected,
-                                                        egui::RichText::new(*label).size(11.0).color(theme.fg()).family(egui::FontFamily::Monospace)).clicked() {
+                                                    let resp = ui.selectable_label(is_selected,
+                                                        egui::RichText::new(*label).size(11.0).color(theme.fg()).family(egui::FontFamily::Monospace));
+                                                    if is_selected && scroll_to {
+                                                        resp.scroll_to_me(Some(egui::Align::Center));
+                                                    }
+                                                    if resp.clicked() {
                                                         edit_font_name = value.to_string();
                                                     }
                                                 }
@@ -7340,6 +7373,7 @@ impl eframe::App for RemoteGuiApp {
                 // Apply changes back to self
                 self.edit_font_name = edit_font_name;
                 self.edit_font_size = edit_font_size;
+                self.popup_scroll_to_selected = false;
 
                 if should_save {
                     // Parse and apply font settings
@@ -7677,6 +7711,7 @@ impl eframe::App for RemoteGuiApp {
                             self.popup_state = PopupState::ConnectedWorlds;
                             self.world_list_selected = self.current_world;
                             self.only_connected_worlds = false;
+                            self.popup_scroll_to_selected = true;
                         }
                         super::Command::WorldsList => {
                             // Output connected worlds list as text (no window)
@@ -7871,6 +7906,7 @@ impl eframe::App for RemoteGuiApp {
                 let mut actions_selected = self.actions_selected;
                 let mut actions_list_filter = self.actions_list_filter.clone();
                 let actions_clone = self.actions.clone();
+                let scroll_to_selected = self.popup_scroll_to_selected;
 
                 // State for opening editor
                 let mut open_editor_idx: Option<usize> = None;
@@ -8064,6 +8100,7 @@ impl eframe::App for RemoteGuiApp {
                                         .color(theme.fg_muted())
                                         .family(egui::FontFamily::Monospace));
                                 } else {
+                                    let scroll_to = scroll_to_selected;
                                     ScrollArea::vertical().auto_shrink([false; 2]).show(ui, |ui| {
                                         for (idx, action) in filtered_actions.iter() {
                                             let is_selected = *idx == actions_selected;
@@ -8072,10 +8109,15 @@ impl eframe::App for RemoteGuiApp {
                                             let row_rect = ui.allocate_space(egui::vec2(ui.available_width(), row_height)).1;
                                             let response = ui.interact(row_rect, ui.id().with(idx), egui::Sense::click());
 
+                                            // Scroll selected item to center when popup first opens
+                                            if is_selected && scroll_to {
+                                                ui.scroll_to_rect(row_rect, Some(egui::Align::Center));
+                                            }
+
                                             // Draw selection/hover background for full row
                                             if is_selected {
                                                 ui.painter().rect_filled(row_rect, egui::Rounding::same(2.0),
-                                                    Color32::from_rgba_unmultiplied(34, 211, 238, 38));
+                                                    theme.list_selection_bg());
                                             } else if response.hovered() {
                                                 ui.painter().rect_filled(row_rect, egui::Rounding::same(2.0), theme.bg_hover());
                                             }
@@ -8124,6 +8166,7 @@ impl eframe::App for RemoteGuiApp {
                 // Apply changes back to self
                 self.actions_selected = actions_selected;
                 self.actions_list_filter = actions_list_filter;
+                self.popup_scroll_to_selected = false;
 
                 if let Some(state) = new_popup_state {
                     self.popup_state = state;
@@ -8524,8 +8567,10 @@ impl eframe::App for RemoteGuiApp {
                     // Send updated actions to server
                     self.update_actions();
                     self.popup_state = PopupState::ActionsList;
+                    self.popup_scroll_to_selected = true;
                 } else if should_close {
                     self.popup_state = PopupState::ActionsList;
+                    self.popup_scroll_to_selected = true;
                 }
             }
 
@@ -8656,8 +8701,10 @@ impl eframe::App for RemoteGuiApp {
                         self.update_actions();
                     }
                     self.popup_state = PopupState::ActionsList;
+                    self.popup_scroll_to_selected = true;
                 } else if should_close {
                     self.popup_state = PopupState::ActionsList;
+                    self.popup_scroll_to_selected = true;
                 }
             }
 
@@ -8671,6 +8718,7 @@ impl eframe::App for RemoteGuiApp {
                 // Calculate popup size based on layout
                 let min_width = popup_state.definition.layout.min_width as f32;
                 let label_width = popup_state.definition.layout.label_width as f32;
+                let scroll_to_selected = self.popup_scroll_to_selected;
 
                 ctx.show_viewport_immediate(
                     egui::ViewportId::from_hash_of(format!("unified_popup_{}", popup_id_str)),
@@ -8737,11 +8785,12 @@ impl eframe::App for RemoteGuiApp {
                                     theme.error(),
                                 );
 
-                                let actions = crate::popup::gui_renderer::render_popup_content(
+                                let actions = crate::popup::gui_renderer::render_popup_content_with_scroll(
                                     ui,
                                     popup_state,
                                     &gui_theme,
                                     label_width.max(80.0),
+                                    scroll_to_selected,
                                 );
 
                                 // Store clicked button for processing outside viewport
@@ -8754,6 +8803,8 @@ impl eframe::App for RemoteGuiApp {
                             });
                     },
                 );
+
+                self.popup_scroll_to_selected = false;
 
                 // Handle button clicks outside viewport closure
                 if let Some(btn_id) = clicked_button {

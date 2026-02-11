@@ -110,6 +110,17 @@ pub fn render_popup_content(
     theme: &GuiPopupTheme,
     label_width: f32,
 ) -> PopupActions {
+    render_popup_content_with_scroll(ui, state, theme, label_width, false)
+}
+
+/// Render popup content with optional scroll-to-selected behavior
+pub fn render_popup_content_with_scroll(
+    ui: &mut Ui,
+    state: &PopupState,
+    theme: &GuiPopupTheme,
+    label_width: f32,
+    scroll_to_selected: bool,
+) -> PopupActions {
     let mut actions = PopupActions::default();
 
     let row_height = 28.0;
@@ -395,6 +406,11 @@ pub fn render_popup_content(
                                 egui::vec2(scroll_width, row_height),
                                 egui::Sense::click()
                             );
+
+                            // Scroll selected item to center when popup first opens
+                            if is_item_selected && scroll_to_selected {
+                                ui.scroll_to_rect(rect, Some(egui::Align::Center));
+                            }
 
                             // Draw selection background
                             if is_item_selected {
