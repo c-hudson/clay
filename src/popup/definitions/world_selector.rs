@@ -82,8 +82,8 @@ pub fn create_world_selector_popup(worlds: &[WorldInfo], visible_height: usize) 
         .with_button(Button::new(SELECTOR_BTN_ADD, "Add").with_shortcut('A').with_tab_index(0))
         .with_button(Button::new(SELECTOR_BTN_EDIT, "Edit").with_shortcut('E').with_tab_index(1))
         .with_button(Button::new(SELECTOR_BTN_DELETE, "Delete").danger().with_shortcut('D').left_align().with_tab_index(5))
-        .with_button(Button::new(SELECTOR_BTN_CONNECT, "Connect").primary().with_shortcut('O').with_tab_index(2))
         .with_button(Button::new(SELECTOR_BTN_CANCEL, "Cancel").with_shortcut('C').with_tab_index(3))
+        .with_button(Button::new(SELECTOR_BTN_CONNECT, "Connect").primary().with_shortcut('O').with_tab_index(2))
         .with_layout(PopupLayout {
             label_width: 8,
             min_width: 60,
@@ -224,7 +224,7 @@ mod tests {
         assert!(state.is_button_focused(SELECTOR_BTN_CONNECT), "After Edit, should be on Connect");
 
         state.cycle_field_buttons();
-        assert!(state.is_button_focused(SELECTOR_BTN_CANCEL), "After Connect, should be on Cancel");
+        assert!(state.is_button_focused(SELECTOR_BTN_CANCEL), "After Connect, should be on Cancel (swapped position, same tab order)");
 
         state.cycle_field_buttons();
         assert!(state.is_field_selected(SELECTOR_FIELD_FILTER), "After Cancel, should be on Filter");
