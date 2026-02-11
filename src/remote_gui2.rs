@@ -4347,7 +4347,7 @@ impl eframe::App for RemoteGuiApp {
                 let menu_width = 195.0;
                 // 8 items × 24px + 3 separators × 6px + 12px inner margin padding
                 let menu_height = 8.0 * 24.0 + 3.0 * 6.0 + 12.0;
-                let menu_pos = egui::pos2(0.0, (bar_top - menu_height).max(2.0));
+                let menu_pos = egui::pos2(8.0, (bar_top - menu_height + 2.0).max(2.0));
 
                 let mut close_menu = false;
                 egui::Window::new("##hamburger_menu")
