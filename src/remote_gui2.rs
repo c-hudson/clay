@@ -196,6 +196,7 @@ impl GuiTheme {
 
     // Status bar and indicators
     fn status_bar_bg(&self) -> Color32 { Self::c(&self.colors.status_bar_bg) }
+    fn menu_bar_bg(&self) -> Color32 { Self::c(&self.colors.menu_bar_bg) }
     fn more_indicator_bg(&self) -> Color32 { Self::c(&self.colors.more_indicator_bg) }
     fn activity_label_bg(&self) -> Color32 { Self::c(&self.colors.activity_bg) }
 
@@ -4301,7 +4302,7 @@ impl eframe::App for RemoteGuiApp {
 
             // Hamburger menu popup (gui2)
             if self.hamburger_menu_open {
-                let menu_bg = theme.status_bar_bg();
+                let menu_bg = theme.menu_bar_bg();
                 // Position menu: bottom edge at separator bar top, left edge at hamburger button
                 let bar_top = ctx.screen_rect().height() - 34.0 - input_height;
                 let menu_width = 195.0;

@@ -78,6 +78,7 @@ pub struct ThemeColors {
 
     // UI elements
     pub status_bar_bg: ThemeColor,
+    pub menu_bar_bg: ThemeColor,
     pub selection_bg: ThemeColor,
     pub link: ThemeColor,
     pub prompt: ThemeColor,
@@ -119,6 +120,7 @@ impl ThemeColors {
 
             // UI elements
             status_bar_bg: ThemeColor::new(40, 75, 99), // #284b63
+            menu_bar_bg: ThemeColor::new(17, 17, 17),    // #111111
             selection_bg: ThemeColor::new(0, 64, 128),   // #004080
             link: ThemeColor::new(140, 180, 224),        // #8cb4e0
             prompt: ThemeColor::new(212, 132, 90),       // #d4845a (same as accent)
@@ -177,6 +179,7 @@ impl ThemeColors {
 
             // UI elements
             status_bar_bg: ThemeColor::new(155, 155, 155), // #9b9b9b
+            menu_bar_bg: ThemeColor::new(220, 220, 220),    // #dcdcdc
             selection_bg: ThemeColor::new(180, 200, 230),   // #b4c8e6
             link: ThemeColor::new(0, 122, 255),             // #007aff
             prompt: ThemeColor::new(184, 107, 63),          // #b86b3f (same as accent)
@@ -228,6 +231,7 @@ impl ThemeColors {
             "error" => self.error = color,
             "error_dim" => self.error_dim = color,
             "status_bar.bg" => self.status_bar_bg = color,
+            "menu_bar.bg" => self.menu_bar_bg = color,
             "selection.bg" => self.selection_bg = color,
             "link" => self.link = color,
             "prompt" => self.prompt = color,
@@ -289,6 +293,7 @@ impl ThemeColors {
         css.push_str(&format!("--theme-error: {};\n", self.error.to_css()));
         css.push_str(&format!("--theme-error-dim: {};\n", self.error_dim.to_css()));
         css.push_str(&format!("--theme-status-bar-bg: {};\n", self.status_bar_bg.to_css()));
+        css.push_str(&format!("--theme-menu-bar-bg: {};\n", self.menu_bar_bg.to_css()));
         css.push_str(&format!("--theme-selection-bg: {};\n", self.selection_bg.to_css()));
         css.push_str(&format!("--theme-link: {};\n", self.link.to_css()));
         css.push_str(&format!("--theme-prompt: {};\n", self.prompt.to_css()));
@@ -328,6 +333,7 @@ impl ThemeColors {
         s.push_str(&format!("error_dim = {}\n", self.error_dim.to_css()));
         s.push_str("\n# UI elements\n");
         s.push_str(&format!("status_bar.bg = {}\n", self.status_bar_bg.to_css()));
+        s.push_str(&format!("menu_bar.bg = {}\n", self.menu_bar_bg.to_css()));
         s.push_str(&format!("selection.bg = {}\n", self.selection_bg.to_css()));
         s.push_str(&format!("link = {}\n", self.link.to_css()));
         s.push_str(&format!("prompt = {}\n", self.prompt.to_css()));
@@ -371,6 +377,7 @@ impl ThemeColors {
         add("error", &self.error);
         add("error_dim", &self.error_dim);
         add("status_bar.bg", &self.status_bar_bg);
+        add("menu_bar.bg", &self.menu_bar_bg);
         add("selection.bg", &self.selection_bg);
         add("link", &self.link);
         add("prompt", &self.prompt);

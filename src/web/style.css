@@ -55,7 +55,7 @@ body {
     display: flex;
     align-items: center;
     padding: 4px 8px;
-    background-color: #111;
+    background-color: var(--theme-menu-bar-bg, #111);
     border-bottom: 1px solid var(--separator-color);
     min-height: 36px;
     font-size: 14px;
@@ -222,7 +222,7 @@ body {
     align-items: center;
     justify-content: space-between;
     padding: 4px 8px;
-    background-color: #111;
+    background-color: var(--theme-menu-bar-bg, #111);
     border-top: 2px solid #ffffff;
     min-height: 36px;
     flex-shrink: 0;
@@ -2002,7 +2002,10 @@ body.theme-light {
 }
 
 body.theme-light #toolbar,
-body.theme-light #mobile-toolbar,
+body.theme-light #mobile-toolbar {
+    background-color: var(--theme-menu-bar-bg, #e8e8e8);
+}
+
 body.theme-light #status-bar {
     background-color: #e8e8e8;
 }

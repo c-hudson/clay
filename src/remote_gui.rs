@@ -174,6 +174,7 @@ impl GuiTheme {
     fn border_medium(&self) -> Color32 { Self::c(&self.colors.border_medium) }
 
     fn panel_bg(&self) -> Color32 { self.bg_surface() }
+    fn menu_bar_bg(&self) -> Color32 { Self::c(&self.colors.menu_bar_bg) }
     fn button_bg(&self) -> Color32 { self.bg_hover() }
     fn selection_bg(&self) -> Color32 { Self::c(&self.colors.selection_bg) }
     fn prompt(&self) -> Color32 { Self::c(&self.colors.prompt) }
@@ -3551,7 +3552,7 @@ impl eframe::App for RemoteGuiApp {
             }
 
             let alpha = (self.transparency * 255.0) as u8;
-            let menu_bg = theme.panel_bg();
+            let menu_bg = theme.menu_bar_bg();
             let menu_bg_transparent = egui::Color32::from_rgba_unmultiplied(menu_bg.r(), menu_bg.g(), menu_bg.b(), alpha);
             egui::TopBottomPanel::top("menu_bar")
                 .frame(egui::Frame::none()

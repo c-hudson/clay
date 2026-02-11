@@ -884,6 +884,7 @@ const VARIABLE_GROUPS = [
     name: 'UI Elements',
     vars: [
       { key: 'status_bar.bg', label: 'status_bar.bg', desc: 'Separator bar' },
+      { key: 'menu_bar.bg', label: 'menu_bar.bg', desc: 'Menu/toolbar bar' },
       { key: 'selection.bg', label: 'selection.bg', desc: 'Text selection' },
       { key: 'link', label: 'link', desc: 'URL color' },
       { key: 'prompt', label: 'prompt', desc: 'Input prompt' },
@@ -912,7 +913,7 @@ function darkDefaults() {
     fg: '#e8e4ec', fg_secondary: '#a89fb4', fg_muted: '#6e6479', fg_dim: '#4a4255',
     accent: '#d4845a', accent_dim: '#c27a52', highlight: '#e8c46a',
     success: '#7ecf8b', error: '#e87070', error_dim: '#5f0000',
-    'status_bar.bg': '#284b63', 'selection.bg': '#004080', link: '#8cb4e0',
+    'status_bar.bg': '#284b63', 'menu_bar.bg': '#111111', 'selection.bg': '#004080', link: '#8cb4e0',
     prompt: '#d4845a', border_subtle: '#221c2b', border_medium: '#2e2738',
     'button.selected_bg': '#e8e4ec', 'button.selected_fg': '#131926',
     'more_indicator.bg': '#5f0000', 'activity.bg': '#f5f0d8',
@@ -932,7 +933,7 @@ function lightDefaults() {
     fg: '#1d1d1f', fg_secondary: '#636366', fg_muted: '#8e8e93', fg_dim: '#aeaeb2',
     accent: '#b86b3f', accent_dim: '#a05a32', highlight: '#e08600',
     success: '#34c759', error: '#ff3b30', error_dim: '#5f0000',
-    'status_bar.bg': '#9b9b9b', 'selection.bg': '#b4c8e6', link: '#007aff',
+    'status_bar.bg': '#9b9b9b', 'menu_bar.bg': '#dcdcdc', 'selection.bg': '#b4c8e6', link: '#007aff',
     prompt: '#b86b3f', border_subtle: '#c0c0c0', border_medium: '#b0b0b0',
     'button.selected_bg': '#1d1d1f', 'button.selected_fg': '#e8e8e8',
     'more_indicator.bg': '#5f0000', 'activity.bg': '#fcba03',
@@ -1748,7 +1749,7 @@ function updatePreview() {
 
   // Menu mockup - positioned bottom-left, above separator bar
   var menu = document.getElementById('previewMenu');
-  menu.style.background = t['status_bar.bg'] || popupBg;
+  menu.style.background = t['menu_bar.bg'] || popupBg;
   menu.style.color = fgC;
   // Position: left side, just above separator bar
   menu.style.top = '';
