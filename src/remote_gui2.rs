@@ -5755,7 +5755,7 @@ impl eframe::App for RemoteGuiApp {
                 let can_delete = self.worlds.len() > 1;
 
                 // Dynamic height based on whether keep-alive cmd is shown
-                let popup_height = if edit_keep_alive_type == KeepAliveType::Custom { 510.0 } else { 470.0 };
+                let popup_height = if edit_keep_alive_type == KeepAliveType::Custom { 531.0 } else { 491.0 };
 
                 ctx.show_viewport_immediate(
                     egui::ViewportId::from_hash_of("world_editor_window"),
@@ -5904,7 +5904,7 @@ impl eframe::App for RemoteGuiApp {
                         egui::CentralPanel::default()
                             .frame(egui::Frame::none()
                                 .fill(theme.bg_elevated())
-                                .inner_margin(egui::Margin { left: 20.0, right: 16.0, top: 20.0, bottom: 20.0 }))
+                                .inner_margin(egui::Margin { left: 20.0, right: 16.0, top: 20.0, bottom: 6.0 }))
                             .show(ctx, |ui| {
                                 // Header
                                 ui.label(egui::RichText::new("WORLD EDITOR")
