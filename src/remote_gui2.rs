@@ -6528,18 +6528,6 @@ impl eframe::App for RemoteGuiApp {
                                         ui.add_space(18.0);  // Right padding
                                         ui.spacing_mut().item_spacing = egui::vec2(8.0, 0.0);
 
-                                        // Cancel button
-                                        if ui.add(egui::Button::new(
-                                            egui::RichText::new("CANCEL").size(11.0).color(theme.fg_secondary()).family(egui::FontFamily::Monospace))
-                                            .fill(theme.bg_hover())
-                                            .stroke(egui::Stroke::new(1.0, theme.border_medium()))
-                                            .rounding(egui::Rounding::same(4.0))
-                                            .min_size(egui::vec2(70.0, 28.0))
-                                        ).clicked() {
-                                            should_cancel = true;
-                                            should_close = true;
-                                        }
-
                                         // Save button (primary)
                                         if ui.add(egui::Button::new(
                                             egui::RichText::new("SAVE").size(11.0).color(theme.bg_deep()).strong().family(egui::FontFamily::Monospace))
@@ -6549,6 +6537,18 @@ impl eframe::App for RemoteGuiApp {
                                             .min_size(egui::vec2(70.0, 28.0))
                                         ).clicked() {
                                             should_save = true;
+                                            should_close = true;
+                                        }
+
+                                        // Cancel button
+                                        if ui.add(egui::Button::new(
+                                            egui::RichText::new("CANCEL").size(11.0).color(theme.fg_secondary()).family(egui::FontFamily::Monospace))
+                                            .fill(theme.bg_hover())
+                                            .stroke(egui::Stroke::new(1.0, theme.border_medium()))
+                                            .rounding(egui::Rounding::same(4.0))
+                                            .min_size(egui::vec2(70.0, 28.0))
+                                        ).clicked() {
+                                            should_cancel = true;
                                             should_close = true;
                                         }
                                     });
