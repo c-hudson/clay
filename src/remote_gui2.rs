@@ -3496,6 +3496,15 @@ impl eframe::App for RemoteGuiApp {
                             }
                         }
                     }
+
+                    // Remove Up/Down events from the event list entirely so the multiline
+                    // TextEdit can't process them for cursor movement (consume_key alone
+                    // isn't sufficient since TextEdit iterates the raw event list directly)
+                    i.events.retain(|e| !matches!(e,
+                        egui::Event::Key { key: egui::Key::ArrowUp, pressed: true, modifiers, .. }
+                        | egui::Event::Key { key: egui::Key::ArrowDown, pressed: true, modifiers, .. }
+                        if !modifiers.ctrl && !modifiers.alt && !modifiers.shift
+                    ));
                 });
 
                 // Apply clear input
