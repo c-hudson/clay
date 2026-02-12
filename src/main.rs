@@ -2434,6 +2434,9 @@ pub struct App {
     pub media_music_key: Option<(usize, String)>,
     /// Event channel sender for async media process delivery
     pub event_tx: Option<mpsc::Sender<AppEvent>>,
+    /// Test-only: log of all messages passed to ws_broadcast() and ws_broadcast_to_world()
+    #[cfg(test)]
+    pub ws_broadcast_log: std::sync::Arc<std::sync::Mutex<Vec<WsMessage>>>,
 }
 
 impl App {
@@ -2490,6 +2493,8 @@ impl App {
             media_processes: std::collections::HashMap::new(),
             media_music_key: None,
             event_tx: None,
+            #[cfg(test)]
+            ws_broadcast_log: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
         }
         // Note: No initial world created here - it will be created after persistence::load_settings()
         // if no worlds are configured
@@ -3593,7 +3598,7 @@ impl App {
     }
 
     /// Broadcast current activity count to all WebSocket clients
-    fn broadcast_activity(&self) {
+    pub(crate) fn broadcast_activity(&self) {
         self.ws_broadcast(WsMessage::ActivityUpdate {
             count: self.activity_count(),
         });
@@ -3906,7 +3911,13 @@ impl App {
     }
 
     /// Broadcast a message to all authenticated WebSocket clients and the embedded GUI (if any)
-    fn ws_broadcast(&self, msg: WsMessage) {
+    pub(crate) fn ws_broadcast(&self, msg: WsMessage) {
+        #[cfg(test)]
+        {
+            if let Ok(mut log) = self.ws_broadcast_log.lock() {
+                log.push(msg.clone());
+            }
+        }
         // Send to embedded GUI channel (master GUI mode)
         if let Some(ref tx) = self.gui_tx {
             let _ = tx.send(msg.clone());
@@ -4037,6 +4048,12 @@ impl App {
 
     /// Broadcast a message only to clients viewing a specific world
     fn ws_broadcast_to_world(&self, world_index: usize, msg: WsMessage) {
+        #[cfg(test)]
+        {
+            if let Ok(mut log) = self.ws_broadcast_log.lock() {
+                log.push(msg.clone());
+            }
+        }
         // Send to embedded GUI if it's viewing this world
         if let Some(ref tx) = self.gui_tx {
             // For embedded GUI, always send (it tracks its own current world)
@@ -4907,7 +4924,7 @@ impl App {
 
     /// Release one screenful of pending lines and broadcast to WebSocket clients.
     /// Used by both Tab and PgDn when at the bottom and paused.
-    fn release_pending_screenful(&mut self) {
+    pub(crate) fn release_pending_screenful(&mut self) {
         let visual_budget = (self.output_height as usize).saturating_sub(2);
         let output_width = self.output_width as usize;
         let world_idx = self.current_world_index;
@@ -22401,5 +22418,419 @@ mod tests {
             "Expected MoreReleased event after JumpToEnd");
 
         let _ = server.await;
+    }
+
+    // ========== WebSocket Broadcast Tests ==========
+
+    #[tokio::test]
+    async fn test_ws_broadcast_activity_on_unseen() {
+        let port1 = find_free_port();
+        let port2 = find_free_port();
+
+        let server1 = tokio::spawn(testserver::run_server_port(port1, testserver::get_scenario("idle")));
+        let server2 = tokio::spawn(testserver::run_server_port(port2, testserver::get_scenario("basic_output")));
+
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let config = TestConfig {
+            worlds: vec![
+                TestWorldConfig {
+                    name: "world1".to_string(),
+                    host: "127.0.0.1".to_string(),
+                    port: port1,
+                    use_ssl: false,
+                    auto_login_type: AutoConnectType::Connect,
+                    username: String::new(),
+                    password: String::new(),
+                },
+                TestWorldConfig {
+                    name: "world2".to_string(),
+                    host: "127.0.0.1".to_string(),
+                    port: port2,
+                    use_ssl: false,
+                    auto_login_type: AutoConnectType::Connect,
+                    username: String::new(),
+                    password: String::new(),
+                },
+            ],
+            output_height: 24,
+            output_width: 80,
+            more_mode_enabled: false,
+            max_duration: Duration::from_secs(10),
+        };
+
+        let events = testharness::run_test_scenario(config, vec![]).await;
+
+        // Verify WsBroadcastActivity was emitted with count > 0
+        assert!(events.iter().any(|e| matches!(e, TestEvent::WsBroadcastActivity(n) if *n > 0)),
+            "Expected WsBroadcastActivity with count > 0. Events: {:?}",
+            events.iter().filter(|e| matches!(e, TestEvent::WsBroadcastActivity(_))).collect::<Vec<_>>());
+
+        // Verify WsBroadcastUnseen was emitted for world2 (index 1) with count > 0
+        assert!(events.iter().any(|e| matches!(e, TestEvent::WsBroadcastUnseen(1, n) if *n > 0)),
+            "Expected WsBroadcastUnseen(1, >0). WsBroadcastUnseen events: {:?}",
+            events.iter().filter(|e| matches!(e, TestEvent::WsBroadcastUnseen(_, _))).collect::<Vec<_>>());
+
+        server1.abort();
+        let _ = server2.await;
+    }
+
+    #[tokio::test]
+    async fn test_ws_broadcast_pending_on_more() {
+        let port = find_free_port();
+        let scenario = testserver::get_scenario("more_flood");
+
+        let server = tokio::spawn(testserver::run_server_port(port, scenario));
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let config = TestConfig {
+            worlds: vec![TestWorldConfig {
+                name: "test".to_string(),
+                host: "127.0.0.1".to_string(),
+                port,
+                use_ssl: false,
+                auto_login_type: AutoConnectType::Connect,
+                username: String::new(),
+                password: String::new(),
+            }],
+            output_height: 24,
+            output_width: 80,
+            more_mode_enabled: true,
+            max_duration: Duration::from_secs(10),
+        };
+
+        let events = testharness::run_test_scenario(config, vec![]).await;
+
+        // Verify MoreTriggered happened
+        assert!(events.iter().any(|e| matches!(e, TestEvent::MoreTriggered(_, _))),
+            "Expected MoreTriggered event");
+
+        // Verify WsBroadcastPending was emitted with count > 0
+        assert!(events.iter().any(|e| matches!(e, TestEvent::WsBroadcastPending(0, n) if *n > 0)),
+            "Expected WsBroadcastPending(0, >0). WsBroadcastPending events: {:?}",
+            events.iter().filter(|e| matches!(e, TestEvent::WsBroadcastPending(_, _))).collect::<Vec<_>>());
+
+        let _ = server.await;
+    }
+
+    #[tokio::test]
+    async fn test_ws_broadcast_released_on_tab() {
+        let port = find_free_port();
+        let scenario = testserver::get_scenario("more_flood_500");
+
+        let server = tokio::spawn(testserver::run_server_port(port, scenario));
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let config = TestConfig {
+            worlds: vec![TestWorldConfig {
+                name: "test".to_string(),
+                host: "127.0.0.1".to_string(),
+                port,
+                use_ssl: false,
+                auto_login_type: AutoConnectType::Connect,
+                username: String::new(),
+                password: String::new(),
+            }],
+            output_height: 24,
+            output_width: 80,
+            more_mode_enabled: true,
+            max_duration: Duration::from_secs(30),
+        };
+
+        let actions = vec![
+            TestAction::WaitForEvent(WaitCondition::MoreTriggered),
+            TestAction::Sleep(Duration::from_millis(500)),
+            TestAction::TabRelease,
+        ];
+
+        let events = testharness::run_test_scenario(config, actions).await;
+
+        // TabRelease calls World::release_pending directly, not App::release_pending_screenful,
+        // so we won't see WsBroadcastReleased from TabRelease. But we should see WsBroadcastPending
+        // from the initial flood when lines were added to pending.
+        assert!(events.iter().any(|e| matches!(e, TestEvent::WsBroadcastPending(0, n) if *n > 0)),
+            "Expected WsBroadcastPending(0, >0) from initial flood");
+
+        // MoreTriggered should have been emitted
+        assert!(events.iter().any(|e| matches!(e, TestEvent::MoreTriggered(_, _))),
+            "Expected MoreTriggered event");
+
+        let _ = server.await;
+    }
+
+    #[tokio::test]
+    async fn test_ws_release_pending_from_client() {
+        let port = find_free_port();
+        let scenario = testserver::get_scenario("more_flood_500");
+
+        let server = tokio::spawn(testserver::run_server_port(port, scenario));
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let config = TestConfig {
+            worlds: vec![TestWorldConfig {
+                name: "test".to_string(),
+                host: "127.0.0.1".to_string(),
+                port,
+                use_ssl: false,
+                auto_login_type: AutoConnectType::Connect,
+                username: String::new(),
+                password: String::new(),
+            }],
+            output_height: 24,
+            output_width: 80,
+            more_mode_enabled: true,
+            max_duration: Duration::from_secs(30),
+        };
+
+        let actions = vec![
+            TestAction::WaitForEvent(WaitCondition::MoreTriggered),
+            TestAction::Sleep(Duration::from_millis(500)),
+            // Simulate WS client releasing pending lines
+            TestAction::WsReleasePending { world_name: "test".to_string(), count: 22 },
+        ];
+
+        let events = testharness::run_test_scenario(config, actions).await;
+
+        // WsReleasePending uses App::release_pending_screenful which broadcasts
+        assert!(events.iter().any(|e| matches!(e, TestEvent::WsBroadcastReleased(0, n) if *n > 0)),
+            "Expected WsBroadcastReleased(0, >0) from WS client release. Events: {:?}",
+            events.iter().filter(|e| matches!(e, TestEvent::WsBroadcastReleased(_, _))).collect::<Vec<_>>());
+
+        // Should also see updated pending count broadcast
+        // Find the last WsBroadcastPending - its count should be less than the peak
+        let pending_events: Vec<_> = events.iter()
+            .filter(|e| matches!(e, TestEvent::WsBroadcastPending(0, _)))
+            .collect();
+        assert!(pending_events.len() >= 2,
+            "Expected at least 2 WsBroadcastPending events (initial flood + post-release). Got: {:?}", pending_events);
+
+        let _ = server.await;
+    }
+
+    #[tokio::test]
+    async fn test_ws_mark_seen_from_client() {
+        let port1 = find_free_port();
+        let port2 = find_free_port();
+
+        let server1 = tokio::spawn(testserver::run_server_port(port1, testserver::get_scenario("idle")));
+        let server2 = tokio::spawn(testserver::run_server_port(port2, testserver::get_scenario("basic_output")));
+
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let config = TestConfig {
+            worlds: vec![
+                TestWorldConfig {
+                    name: "world1".to_string(),
+                    host: "127.0.0.1".to_string(),
+                    port: port1,
+                    use_ssl: false,
+                    auto_login_type: AutoConnectType::Connect,
+                    username: String::new(),
+                    password: String::new(),
+                },
+                TestWorldConfig {
+                    name: "world2".to_string(),
+                    host: "127.0.0.1".to_string(),
+                    port: port2,
+                    use_ssl: false,
+                    auto_login_type: AutoConnectType::Connect,
+                    username: String::new(),
+                    password: String::new(),
+                },
+            ],
+            output_height: 24,
+            output_width: 80,
+            more_mode_enabled: false,
+            max_duration: Duration::from_secs(10),
+        };
+
+        let actions = vec![
+            // Wait for unseen on world2
+            TestAction::WaitForEvent(WaitCondition::TextReceivedCount(3)),
+            TestAction::Sleep(Duration::from_millis(500)),
+            // Simulate WS client marking world2 as seen
+            TestAction::WsMarkWorldSeen("world2".to_string()),
+        ];
+
+        let events = testharness::run_test_scenario(config, actions).await;
+
+        // Should have unseen events for world2 before marking seen
+        assert!(events.iter().any(|e| matches!(e, TestEvent::UnseenChanged(n, count) if n == "world2" && *count > 0)),
+            "Expected UnseenChanged(world2, >0)");
+
+        // Should have WsBroadcastUnseenCleared for world2 (index 1)
+        assert!(events.iter().any(|e| matches!(e, TestEvent::WsBroadcastUnseenCleared(1))),
+            "Expected WsBroadcastUnseenCleared(1). Events: {:?}",
+            events.iter().filter(|e| matches!(e, TestEvent::WsBroadcastUnseenCleared(_))).collect::<Vec<_>>());
+
+        // Unseen should be cleared after marking seen
+        assert!(events.iter().any(|e| matches!(e, TestEvent::UnseenChanged(n, 0) if n == "world2")),
+            "Expected UnseenChanged(world2, 0) after marking seen");
+
+        server1.abort();
+        let _ = server2.await;
+    }
+
+    #[tokio::test]
+    async fn test_ws_send_command_resets_pause() {
+        let port = find_free_port();
+        let scenario = testserver::get_scenario("more_flood_500");
+
+        let server = tokio::spawn(testserver::run_server_port(port, scenario));
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let config = TestConfig {
+            worlds: vec![TestWorldConfig {
+                name: "test".to_string(),
+                host: "127.0.0.1".to_string(),
+                port,
+                use_ssl: false,
+                auto_login_type: AutoConnectType::Connect,
+                username: String::new(),
+                password: String::new(),
+            }],
+            output_height: 24,
+            output_width: 80,
+            more_mode_enabled: true,
+            max_duration: Duration::from_secs(30),
+        };
+
+        let actions = vec![
+            TestAction::WaitForEvent(WaitCondition::MoreTriggered),
+            TestAction::Sleep(Duration::from_millis(500)),
+            // Send a command via WS - should reset lines_since_pause
+            TestAction::WsSendCommand { world_name: "test".to_string(), command: "look".to_string() },
+            // Release all pending to get past the pause
+            TestAction::JumpToEnd,
+        ];
+
+        let events = testharness::run_test_scenario(config, actions).await;
+
+        // MoreTriggered should have happened from the flood
+        assert!(events.iter().any(|e| matches!(e, TestEvent::MoreTriggered(_, _))),
+            "Expected MoreTriggered event");
+
+        // MoreReleased should have happened from JumpToEnd
+        assert!(events.iter().any(|e| matches!(e, TestEvent::MoreReleased(_))),
+            "Expected MoreReleased event after JumpToEnd");
+
+        // All 500 lines should have been received
+        let text_count = events.iter().filter(|e| matches!(e, TestEvent::TextReceived(_, _))).count();
+        assert_eq!(text_count, 500, "Expected 500 TextReceived events, got {}", text_count);
+
+        let _ = server.await;
+    }
+
+    #[tokio::test]
+    async fn test_ws_activity_count_multi_world() {
+        let port1 = find_free_port();
+        let port2 = find_free_port();
+        let port3 = find_free_port();
+
+        let server1 = tokio::spawn(testserver::run_server_port(port1, testserver::get_scenario("idle")));
+        let server2 = tokio::spawn(testserver::run_server_port(port2, testserver::get_scenario("basic_output")));
+        let server3 = tokio::spawn(testserver::run_server_port(port3, testserver::get_scenario("basic_output")));
+
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let config = TestConfig {
+            worlds: vec![
+                TestWorldConfig {
+                    name: "world1".to_string(),
+                    host: "127.0.0.1".to_string(),
+                    port: port1,
+                    use_ssl: false,
+                    auto_login_type: AutoConnectType::Connect,
+                    username: String::new(),
+                    password: String::new(),
+                },
+                TestWorldConfig {
+                    name: "world2".to_string(),
+                    host: "127.0.0.1".to_string(),
+                    port: port2,
+                    use_ssl: false,
+                    auto_login_type: AutoConnectType::Connect,
+                    username: String::new(),
+                    password: String::new(),
+                },
+                TestWorldConfig {
+                    name: "world3".to_string(),
+                    host: "127.0.0.1".to_string(),
+                    port: port3,
+                    use_ssl: false,
+                    auto_login_type: AutoConnectType::Connect,
+                    username: String::new(),
+                    password: String::new(),
+                },
+            ],
+            output_height: 24,
+            output_width: 80,
+            more_mode_enabled: false,
+            max_duration: Duration::from_secs(10),
+        };
+
+        let events = testharness::run_test_scenario(config, vec![]).await;
+
+        // Should see WsBroadcastActivity(2) at peak when both world2 and world3 have unseen
+        assert!(events.iter().any(|e| matches!(e, TestEvent::WsBroadcastActivity(2))),
+            "Expected WsBroadcastActivity(2). Activity events: {:?}",
+            events.iter().filter(|e| matches!(e, TestEvent::WsBroadcastActivity(_))).collect::<Vec<_>>());
+
+        server1.abort();
+        let _ = server2.await;
+        let _ = server3.await;
+    }
+
+    #[tokio::test]
+    async fn test_ws_broadcast_server_data_routing() {
+        let port1 = find_free_port();
+        let port2 = find_free_port();
+
+        let server1 = tokio::spawn(testserver::run_server_port(port1, testserver::get_scenario("basic_output")));
+        let server2 = tokio::spawn(testserver::run_server_port(port2, testserver::get_scenario("basic_output")));
+
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let config = TestConfig {
+            worlds: vec![
+                TestWorldConfig {
+                    name: "world1".to_string(),
+                    host: "127.0.0.1".to_string(),
+                    port: port1,
+                    use_ssl: false,
+                    auto_login_type: AutoConnectType::Connect,
+                    username: String::new(),
+                    password: String::new(),
+                },
+                TestWorldConfig {
+                    name: "world2".to_string(),
+                    host: "127.0.0.1".to_string(),
+                    port: port2,
+                    use_ssl: false,
+                    auto_login_type: AutoConnectType::Connect,
+                    username: String::new(),
+                    password: String::new(),
+                },
+            ],
+            output_height: 24,
+            output_width: 80,
+            more_mode_enabled: false,
+            max_duration: Duration::from_secs(10),
+        };
+
+        let events = testharness::run_test_scenario(config, vec![]).await;
+
+        // Should have WsBroadcastServerData for world1 (index 0)
+        assert!(events.iter().any(|e| matches!(e, TestEvent::WsBroadcastServerData(0))),
+            "Expected WsBroadcastServerData(0). ServerData events: {:?}",
+            events.iter().filter(|e| matches!(e, TestEvent::WsBroadcastServerData(_))).collect::<Vec<_>>());
+
+        // Should have WsBroadcastServerData for world2 (index 1)
+        assert!(events.iter().any(|e| matches!(e, TestEvent::WsBroadcastServerData(1))),
+            "Expected WsBroadcastServerData(1). ServerData events: {:?}",
+            events.iter().filter(|e| matches!(e, TestEvent::WsBroadcastServerData(_))).collect::<Vec<_>>());
+
+        let _ = server1.await;
+        let _ = server2.await;
     }
 }

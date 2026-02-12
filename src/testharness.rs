@@ -11,6 +11,7 @@ use crate::{
     telnet,
     find_safe_split_point,
 };
+use crate::websocket::WsMessage;
 
 /// Events captured during test execution
 #[derive(Debug, Clone, PartialEq)]
@@ -35,6 +36,18 @@ pub enum TestEvent {
     AutoLoginSent(String, String),
     /// Prompt received on a world
     PromptReceived(String, String),
+    /// WS broadcast: ActivityUpdate { count }
+    WsBroadcastActivity(usize),
+    /// WS broadcast: UnseenUpdate { world_index, count }
+    WsBroadcastUnseen(usize, usize),
+    /// WS broadcast: PendingLinesUpdate { world_index, count }
+    WsBroadcastPending(usize, usize),
+    /// WS broadcast: PendingReleased { world_index, count }
+    WsBroadcastReleased(usize, usize),
+    /// WS broadcast: UnseenCleared { world_index }
+    WsBroadcastUnseenCleared(usize),
+    /// WS broadcast: ServerData { world_index, ... }
+    WsBroadcastServerData(usize),
 }
 
 /// Configuration for a test world
@@ -72,6 +85,12 @@ pub enum TestAction {
     Sleep(Duration),
     /// Send a command as if the user typed it
     SendCommand(String),
+    /// Simulate WS client releasing pending lines for a world
+    WsReleasePending { world_name: String, count: usize },
+    /// Simulate WS client marking a world as seen
+    WsMarkWorldSeen(String),
+    /// Simulate WS client sending a command to a world
+    WsSendCommand { world_name: String, command: String },
 }
 
 /// Conditions to wait for
@@ -329,6 +348,48 @@ pub async fn run_test_scenario(
                     }
                     // Fall through to process more reader events
                 }
+                TestAction::WsReleasePending { world_name, count } => {
+                    let world_name = world_name.clone();
+                    let count = *count;
+                    action_iter.next();
+                    if let Some(idx) = app.find_world_index(&world_name) {
+                        let output_width = app.output_width as usize;
+                        // Use the App method that also broadcasts WS messages
+                        let old_current = app.current_world_index;
+                        app.current_world_index = idx;
+                        app.release_pending_screenful();
+                        app.current_world_index = old_current;
+                        let _ = count; // count parameter available for future use
+                    }
+                    check_state_changes(&mut app, &mut events, &mut prev_activity, &mut prev_unseen, &mut prev_paused);
+                    continue;
+                }
+                TestAction::WsMarkWorldSeen(name) => {
+                    let name = name.clone();
+                    action_iter.next();
+                    if let Some(idx) = app.find_world_index(&name) {
+                        app.worlds[idx].mark_seen();
+                        // Broadcast UnseenCleared like the real WS handler does
+                        app.ws_broadcast(WsMessage::UnseenCleared { world_index: idx });
+                        app.broadcast_activity();
+                    }
+                    check_state_changes(&mut app, &mut events, &mut prev_activity, &mut prev_unseen, &mut prev_paused);
+                    continue;
+                }
+                TestAction::WsSendCommand { world_name, command } => {
+                    let world_name = world_name.clone();
+                    let command = command.clone();
+                    action_iter.next();
+                    if let Some(idx) = app.find_world_index(&world_name) {
+                        // Reset lines_since_pause (like the real WS command handler)
+                        app.worlds[idx].lines_since_pause = 0;
+                        if let Some(conn) = &connections[idx] {
+                            let _ = conn.cmd_tx.try_send(WriteCommand::Text(command));
+                        }
+                    }
+                    check_state_changes(&mut app, &mut events, &mut prev_activity, &mut prev_unseen, &mut prev_paused);
+                    continue;
+                }
             }
         } else {
             // No more actions - check if all connections are done
@@ -493,6 +554,35 @@ fn check_state_changes(
                 events.push(TestEvent::MoreReleased(world.name.clone()));
             }
             prev_paused[idx] = current_paused;
+        }
+    }
+
+    // Drain ws_broadcast_log and convert to TestEvent variants
+    if let Ok(mut log) = app.ws_broadcast_log.lock() {
+        for msg in log.drain(..) {
+            match msg {
+                WsMessage::ActivityUpdate { count } => {
+                    events.push(TestEvent::WsBroadcastActivity(count));
+                }
+                WsMessage::UnseenUpdate { world_index, count } => {
+                    events.push(TestEvent::WsBroadcastUnseen(world_index, count));
+                }
+                WsMessage::PendingLinesUpdate { world_index, count } => {
+                    events.push(TestEvent::WsBroadcastPending(world_index, count));
+                }
+                WsMessage::PendingReleased { world_index, count } => {
+                    events.push(TestEvent::WsBroadcastReleased(world_index, count));
+                }
+                WsMessage::UnseenCleared { world_index } => {
+                    events.push(TestEvent::WsBroadcastUnseenCleared(world_index));
+                }
+                WsMessage::ServerData { world_index, .. } => {
+                    events.push(TestEvent::WsBroadcastServerData(world_index));
+                }
+                _ => {
+                    // Other WsMessage variants are not tracked
+                }
+            }
         }
     }
 }

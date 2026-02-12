@@ -45,6 +45,7 @@ pub fn get_scenario(name: &str) -> PortScenario {
         "basic_output" => scenario_basic_output(),
         "disconnect_after" => scenario_disconnect_after(),
         "idle" => scenario_idle(),
+        "timed_output" => scenario_timed_output(),
         _ => scenario_basic_output(),
     }
 }
@@ -147,6 +148,22 @@ fn scenario_idle() -> PortScenario {
     PortScenario {
         actions: vec![
             ServerAction::Sleep(Duration::from_secs(30)),
+            ServerAction::Disconnect,
+        ],
+        telnet_negotiate: false,
+    }
+}
+
+/// Sends 5 lines, pauses 500ms, sends 5 more, then disconnects
+fn scenario_timed_output() -> PortScenario {
+    let batch1: Vec<String> = (1..=5).map(|i| format!("Batch1 line {}", i)).collect();
+    let batch2: Vec<String> = (1..=5).map(|i| format!("Batch2 line {}", i)).collect();
+    PortScenario {
+        actions: vec![
+            ServerAction::SendLines(batch1),
+            ServerAction::Sleep(Duration::from_millis(500)),
+            ServerAction::SendLines(batch2),
+            ServerAction::Sleep(Duration::from_millis(500)),
             ServerAction::Disconnect,
         ],
         telnet_negotiate: false,
