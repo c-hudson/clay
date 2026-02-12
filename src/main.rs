@@ -17,6 +17,7 @@ pub mod theme;
 pub mod remote_gui;
 #[cfg(all(feature = "remote-gui", not(target_os = "android")))]
 pub mod remote_gui2;
+#[cfg(test)]
 pub mod testserver;
 #[cfg(test)]
 pub mod testharness;
