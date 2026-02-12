@@ -12,6 +12,7 @@ const TELNET_GA: u8 = 249;
 const TELNET_OPT_SGA: u8 = 3;
 
 #[derive(Clone, Debug)]
+#[allow(dead_code)]
 enum ServerAction {
     SendLine(String),
     SendRaw(Vec<u8>),
