@@ -94,42 +94,42 @@ pub struct ThemeColors {
 }
 
 impl ThemeColors {
-    /// Default dark theme - matches current GUI2 dark values
+    /// Default dark theme - imported from ~/clay.theme.dat
     pub fn dark_default() -> Self {
         Self {
             // Background hierarchy
-            bg: ThemeColor::new(19, 25, 38),          // #131926
-            bg_deep: ThemeColor::new(21, 17, 25),     // #151119
-            bg_surface: ThemeColor::new(28, 23, 34),   // #1c1722
-            bg_elevated: ThemeColor::new(35, 29, 42),  // #231d2a
-            bg_hover: ThemeColor::new(44, 37, 53),     // #2c2535
+            bg: ThemeColor::new(0x12, 0x12, 0x12),      // #121212
+            bg_deep: ThemeColor::new(0x15, 0x11, 0x19),  // #151119
+            bg_surface: ThemeColor::new(0x1c, 0x17, 0x22), // #1c1722
+            bg_elevated: ThemeColor::new(0x1f, 0x1f, 0x1f), // #1f1f1f
+            bg_hover: ThemeColor::new(0x2c, 0x25, 0x35),  // #2c2535
 
             // Foreground hierarchy
-            fg: ThemeColor::new(232, 228, 236),        // #e8e4ec
-            fg_secondary: ThemeColor::new(168, 159, 180), // #a89fb4
-            fg_muted: ThemeColor::new(110, 100, 121),  // #6e6479
-            fg_dim: ThemeColor::new(74, 66, 85),       // #4a4255
+            fg: ThemeColor::new(0xe8, 0xe4, 0xec),        // #e8e4ec
+            fg_secondary: ThemeColor::new(0xa8, 0x9f, 0xb4), // #a89fb4
+            fg_muted: ThemeColor::new(0x6e, 0x64, 0x79),  // #6e6479
+            fg_dim: ThemeColor::new(0x4a, 0x42, 0x55),    // #4a4255
 
             // Semantic colors
-            accent: ThemeColor::new(212, 132, 90),     // #d4845a
-            accent_dim: ThemeColor::new(194, 122, 82), // #c27a52
-            highlight: ThemeColor::new(232, 196, 106),  // #e8c46a
-            success: ThemeColor::new(126, 207, 139),    // #7ecf8b
-            error: ThemeColor::new(232, 112, 112),      // #e87070
-            error_dim: ThemeColor::new(95, 0, 0),       // #5f0000
+            accent: ThemeColor::new(0x26, 0x57, 0xba),    // #2657ba
+            accent_dim: ThemeColor::new(0x00, 0x40, 0x80), // #004080
+            highlight: ThemeColor::new(0xe8, 0xc4, 0x6a),  // #e8c46a
+            success: ThemeColor::new(0x7e, 0xcf, 0x8b),    // #7ecf8b
+            error: ThemeColor::new(0xb1, 0x0a, 0x0a),      // #b10a0a
+            error_dim: ThemeColor::new(0x5f, 0x00, 0x00),   // #5f0000
 
             // UI elements
-            status_bar_bg: ThemeColor::new(40, 75, 99), // #284b63
-            menu_bar_bg: ThemeColor::new(17, 17, 17),    // #111111
-            selection_bg: ThemeColor::new(0, 64, 128),   // #004080
-            link: ThemeColor::new(140, 180, 224),        // #8cb4e0
-            prompt: ThemeColor::new(212, 132, 90),       // #d4845a (same as accent)
-            border_subtle: ThemeColor::new(34, 28, 43),  // #221c2b
-            border_medium: ThemeColor::new(46, 39, 56),  // #2e2738
-            button_selected_bg: ThemeColor::new(232, 228, 236), // #e8e4ec (same as fg)
-            button_selected_fg: ThemeColor::new(19, 25, 38),    // #131926 (same as bg)
-            more_indicator_bg: ThemeColor::new(95, 0, 0),       // #5f0000
-            activity_bg: ThemeColor::new(245, 240, 216),        // #f5f0d8
+            status_bar_bg: ThemeColor::new(0x28, 0x4b, 0x63), // #284b63
+            menu_bar_bg: ThemeColor::new(0x15, 0x2b, 0x3a),    // #152b3a
+            selection_bg: ThemeColor::new(0x00, 0x40, 0x80),   // #004080
+            link: ThemeColor::new(0x8c, 0xb4, 0xe0),        // #8cb4e0
+            prompt: ThemeColor::new(0xd4, 0x84, 0x5a),       // #d4845a
+            border_subtle: ThemeColor::new(0x22, 0x1c, 0x2b),  // #221c2b
+            border_medium: ThemeColor::new(0x2e, 0x27, 0x38),  // #2e2738
+            button_selected_bg: ThemeColor::new(0xe8, 0xe4, 0xec), // #e8e4ec
+            button_selected_fg: ThemeColor::new(0x13, 0x19, 0x26), // #131926
+            more_indicator_bg: ThemeColor::new(0x5f, 0x00, 0x00),  // #5f0000
+            activity_bg: ThemeColor::new(0xf5, 0xf0, 0xd8),       // #f5f0d8
 
             // ANSI palette - Xubuntu Dark
             ansi: [
@@ -583,9 +583,9 @@ mod tests {
     #[test]
     fn test_dark_defaults_exist() {
         let dark = ThemeColors::dark_default();
-        assert_eq!(dark.bg, ThemeColor::new(19, 25, 38));
-        assert_eq!(dark.fg, ThemeColor::new(232, 228, 236));
-        assert_eq!(dark.accent, ThemeColor::new(212, 132, 90));
+        assert_eq!(dark.bg, ThemeColor::new(0x12, 0x12, 0x12));
+        assert_eq!(dark.fg, ThemeColor::new(0xe8, 0xe4, 0xec));
+        assert_eq!(dark.accent, ThemeColor::new(0x26, 0x57, 0xba));
         assert_eq!(dark.ansi[0], ThemeColor::new(0, 0, 0));
         assert_eq!(dark.ansi[15], ThemeColor::new(255, 255, 255));
     }
@@ -623,7 +623,7 @@ ansi.15 = #eeeeee
         assert_eq!(dark.bg, ThemeColor::new(255, 0, 0));
         assert_eq!(dark.fg, ThemeColor::new(0, 255, 0));
         // accent should still be default since not overridden
-        assert_eq!(dark.accent, ThemeColor::new(212, 132, 90));
+        assert_eq!(dark.accent, ThemeColor::new(0x26, 0x57, 0xba));
 
         // Light theme should have overridden bg
         let light = file.get("light");
@@ -654,7 +654,7 @@ ansi.15 = #eeeeee
         let file = ThemeFile::parse("");
         // Should still have defaults
         let dark = file.get("dark");
-        assert_eq!(dark.bg, ThemeColor::new(19, 25, 38));
+        assert_eq!(dark.bg, ThemeColor::new(0x12, 0x12, 0x12));
     }
 
     #[test]
@@ -663,7 +663,7 @@ ansi.15 = #eeeeee
         let file = ThemeFile::parse(content);
         let dark = file.get("dark");
         // bg should be default (invalid color ignored)
-        assert_eq!(dark.bg, ThemeColor::new(19, 25, 38));
+        assert_eq!(dark.bg, ThemeColor::new(0x12, 0x12, 0x12));
         // fg should be overridden
         assert_eq!(dark.fg, ThemeColor::new(0, 255, 0));
     }
@@ -673,7 +673,7 @@ ansi.15 = #eeeeee
         let file = ThemeFile::with_defaults();
         let theme = file.get("nonexistent");
         // Should fall back to dark
-        assert_eq!(theme.bg, ThemeColor::new(19, 25, 38));
+        assert_eq!(theme.bg, ThemeColor::new(0x12, 0x12, 0x12));
     }
 
     #[test]
@@ -697,19 +697,19 @@ ansi.15 = #eeeeee
         let content = ThemeFile::generate_default_file();
         assert!(content.contains("[theme:dark]"));
         assert!(content.contains("[theme:light]"));
-        assert!(content.contains("bg = #131926"));
+        assert!(content.contains("bg = #121212"));
         assert!(content.contains("ansi.0 = #000000"));
         // Should be re-parseable
         let file = ThemeFile::parse(&content);
         let dark = file.get("dark");
-        assert_eq!(dark.bg, ThemeColor::new(19, 25, 38));
+        assert_eq!(dark.bg, ThemeColor::new(0x12, 0x12, 0x12));
     }
 
     #[test]
     fn test_to_css_vars() {
         let theme = ThemeColors::dark_default();
         let css = theme.to_css_vars();
-        assert!(css.contains("--theme-bg: #131926;"));
+        assert!(css.contains("--theme-bg: #121212;"));
         assert!(css.contains("--theme-fg: #e8e4ec;"));
         assert!(css.contains("--theme-ansi-0: #000000;"));
         assert!(css.contains("--theme-ansi-15: #ffffff;"));
