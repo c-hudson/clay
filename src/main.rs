@@ -1993,18 +1993,12 @@ impl World {
     ) {
 
         // Handle splash mode transitions
-        if self.showing_splash {
-            if clear_splash {
-                // MUD server data: clear splash mode AND clear buffer
-                self.showing_splash = false;
-                self.needs_redraw = true; // Signal terminal needs full redraw
-                self.output_lines.clear();
-                self.scroll_offset = 0;
-            } else {
-                // Client message: just disable centering, keep splash content
-                self.showing_splash = false;
-                self.needs_redraw = true;
-            }
+        if self.showing_splash && clear_splash {
+            // MUD server data: clear splash mode AND clear buffer
+            self.showing_splash = false;
+            self.needs_redraw = true; // Signal terminal needs full redraw
+            self.output_lines.clear();
+            self.scroll_offset = 0;
         }
         let max_lines = (output_height as usize).saturating_sub(2);
 
@@ -6578,6 +6572,15 @@ fn handle_remote_client_key(
             }
             // Reset lines_since_pause for more-mode
             app.current_world_mut().lines_since_pause = 0;
+            // Clear splash on first user input (same as server data)
+            if app.current_world().showing_splash {
+                let world = app.current_world_mut();
+                world.showing_splash = false;
+                world.needs_redraw = true;
+                world.output_lines.clear();
+                world.scroll_offset = 0;
+                app.needs_output_redraw = true;
+            }
         }
         (_, KeyCode::F(1)) => {
             // Toggle help popup (using new unified popup system)
@@ -10367,6 +10370,16 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                             }
                         }
                         KeyAction::SendCommand(cmd) => {
+                            // Clear splash on first user input (same as server data)
+                            if app.current_world().showing_splash {
+                                let world = app.current_world_mut();
+                                world.showing_splash = false;
+                                world.needs_redraw = true;
+                                world.output_lines.clear();
+                                world.scroll_offset = 0;
+                                terminal.clear()?;
+                                terminal.resize(terminal.size()?)?;
+                            }
                             // Clear crash count after first successful user input
                             // This indicates the client is stable and running normally
                             if !crash_count_cleared {
@@ -19457,7 +19470,7 @@ fn render_splash_centered<'a>(world: &World, visible_height: usize, area_width: 
         lines.push(Line::from(""));
     }
 
-    // Process and center each line
+    // Center all lines while splash is showing
     for line in &world.output_lines {
         let line_width = visible_width(&line.text);
         let padding = if area_width > line_width {
@@ -19467,7 +19480,11 @@ fn render_splash_centered<'a>(world: &World, visible_height: usize, area_width: 
         };
 
         // Create padded line
-        let padded = format!("{:width$}{}", "", line.text, width = padding);
+        let padded = if padding > 0 {
+            format!("{:width$}{}", "", line.text, width = padding)
+        } else {
+            line.text.clone()
+        };
 
         // Parse ANSI codes and convert to ratatui spans
         match ansi_to_tui::IntoText::into_text(&padded) {
