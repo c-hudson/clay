@@ -3937,6 +3937,38 @@ impl eframe::App for RemoteGuiApp {
 
                     let response = scroll_output.inner;
 
+                    // Right-click context menu for input area
+                    let input_id_for_menu = input_id;
+                    let response = response.context_menu(|ui| {
+                        if ui.button("Paste").clicked() {
+                            if let Ok(mut clipboard) = arboard::Clipboard::new() {
+                                if let Ok(text) = clipboard.get_text() {
+                                    // Insert clipboard text at cursor position
+                                    if let Some(state) = egui::TextEdit::load_state(ui.ctx(), input_id_for_menu) {
+                                        if let Some(cursor_range) = state.ccursor_range() {
+                                            let cursor_pos = cursor_range.primary.index;
+                                            let byte_pos: usize = self.input_buffer.char_indices()
+                                                .nth(cursor_pos)
+                                                .map(|(i, _)| i)
+                                                .unwrap_or(self.input_buffer.len());
+                                            self.input_buffer.insert_str(byte_pos, &text);
+                                            // Move cursor after pasted text
+                                            let new_cursor = cursor_pos + text.chars().count();
+                                            let mut new_state = state;
+                                            let ccursor = egui::text::CCursor::new(new_cursor);
+                                            new_state.set_ccursor_range(Some(egui::text::CCursorRange::one(ccursor)));
+                                            new_state.store(ui.ctx(), input_id_for_menu);
+                                        }
+                                    } else {
+                                        // No cursor state - append to end
+                                        self.input_buffer.push_str(&text);
+                                    }
+                                }
+                            }
+                            ui.close_menu();
+                        }
+                    });
+
                     // Check for temperature conversion when input changes
                     if response.changed() && self.check_temp_conversion() {
                         // Conversion happened - move cursor to end of buffer
@@ -5589,15 +5621,29 @@ impl eframe::App for RemoteGuiApp {
                                 .stroke(egui::Stroke::new(1.0, theme.border_subtle()))
                                 .inner_margin(egui::Margin { left: 16.0, right: 1.0, top: 10.0, bottom: 10.0 }))
                             .show(ctx, |ui| {
+                                // Override widget visuals for buttons to match ConnectedWorlds popup
+                                {
+                                    let style = ui.style_mut();
+                                    let widget_rounding = egui::Rounding::same(4.0);
+                                    style.visuals.widgets.inactive.bg_fill = theme.bg_hover();
+                                    style.visuals.widgets.inactive.weak_bg_fill = theme.bg_hover();
+                                    style.visuals.widgets.inactive.rounding = widget_rounding;
+                                    style.visuals.widgets.hovered.bg_fill = theme.bg_hover();
+                                    style.visuals.widgets.hovered.weak_bg_fill = theme.bg_hover();
+                                    style.visuals.widgets.hovered.rounding = widget_rounding;
+                                    style.visuals.widgets.active.bg_fill = theme.accent_dim();
+                                    style.visuals.widgets.active.weak_bg_fill = theme.accent_dim();
+                                    style.visuals.widgets.active.rounding = widget_rounding;
+                                }
                                 ui.horizontal(|ui| {
                                     ui.spacing_mut().item_spacing = egui::vec2(8.0, 0.0);
 
-                                    // Delete button (left side)
+                                    // Delete button (left side, danger style)
                                     if can_delete
                                         && ui.add(egui::Button::new(
-                                            egui::RichText::new("Delete").size(11.0).color(theme.fg_secondary()))
-                                            .fill(theme.bg_hover())
-                                            .stroke(egui::Stroke::new(1.0, theme.border_medium()))
+                                            egui::RichText::new("DELETE").size(11.0).color(theme.bg_deep()).strong().family(egui::FontFamily::Monospace))
+                                            .fill(theme.error())
+                                            .stroke(egui::Stroke::NONE)
                                             .rounding(egui::Rounding::same(4.0))
                                             .min_size(egui::vec2(70.0, 28.0))
                                         ).clicked() {
@@ -7779,8 +7825,8 @@ impl eframe::App for RemoteGuiApp {
 
                                     // Delete button (danger) - left aligned
                                     if ui.add(egui::Button::new(
-                                        egui::RichText::new("DELETE").size(11.0).color(Color32::WHITE).family(egui::FontFamily::Monospace))
-                                        .fill(Color32::from_rgb(255, 25, 25))  // Red #ff1919
+                                        egui::RichText::new("DELETE").size(11.0).color(theme.bg_deep()).strong().family(egui::FontFamily::Monospace))
+                                        .fill(theme.error())
                                         .stroke(egui::Stroke::NONE)
                                         .rounding(egui::Rounding::same(4.0))
                                         .min_size(egui::vec2(70.0, 28.0))

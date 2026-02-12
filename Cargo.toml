@@ -58,6 +58,7 @@ eframe = { version = "0.24", optional = true, default-features = false, features
 egui = { version = "0.24", optional = true }
 egui_extras = { version = "0.24", optional = true, default-features = false, features = ["image", "svg"] }
 image = { version = "0.24", optional = true, default-features = false, features = ["png", "gif"] }
+arboard = { version = "3", optional = true }
 # Audio playback for ANSI music (optional, requires ALSA dev libraries on Linux)
 rodio = { version = "0.17", optional = true, default-features = false, features = ["wav"] }
 
@@ -67,6 +68,7 @@ eframe = { version = "0.24", optional = true, default-features = false, features
 egui = { version = "0.24", optional = true }
 egui_extras = { version = "0.24", optional = true, default-features = false, features = ["image", "svg"] }
 image = { version = "0.24", optional = true, default-features = false, features = ["png", "gif"] }
+arboard = { version = "3", optional = true }
 # Audio playback for ANSI music (uses CoreAudio on macOS automatically)
 rodio = { version = "0.17", optional = true, default-features = false, features = ["wav"] }
 
@@ -76,6 +78,7 @@ eframe = { version = "0.24", optional = true, default-features = false, features
 egui = { version = "0.24", optional = true }
 egui_extras = { version = "0.24", optional = true, default-features = false, features = ["image", "svg"] }
 image = { version = "0.24", optional = true, default-features = false, features = ["png", "gif"] }
+arboard = { version = "3", optional = true }
 # Audio playback for ANSI music (uses WASAPI on Windows automatically)
 rodio = { version = "0.17", optional = true, default-features = false, features = ["wav"] }
 
@@ -86,7 +89,7 @@ winres = "0.1"
 default = ["rustls-backend", "remote-gui-audio"]
 native-tls-backend = ["tokio-native-tls", "native-tls", "tokio-tungstenite/native-tls"]
 rustls-backend = ["tokio-rustls", "rustls", "rustls-pemfile", "webpki-roots", "tokio-tungstenite/rustls-tls-webpki-roots"]
-remote-gui = ["eframe", "egui", "egui_extras", "image"]
+remote-gui = ["eframe", "egui", "egui_extras", "image", "arboard"]
 remote-gui-audio = ["remote-gui", "rodio"]
 
 [[bin]]
