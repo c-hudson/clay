@@ -353,7 +353,6 @@ pub async fn run_test_scenario(
                     let count = *count;
                     action_iter.next();
                     if let Some(idx) = app.find_world_index(&world_name) {
-                        let output_width = app.output_width as usize;
                         // Use the App method that also broadcasts WS messages
                         let old_current = app.current_world_index;
                         app.current_world_index = idx;

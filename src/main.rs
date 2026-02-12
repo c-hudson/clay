@@ -2440,6 +2440,7 @@ pub struct App {
 }
 
 impl App {
+    #[allow(clippy::new_without_default)]
     pub fn new() -> Self {
         Self {
             worlds: Vec::new(),
@@ -3748,6 +3749,7 @@ impl App {
                             }
 
                             // Only spawn audio processes when play_audio is true and a player is available
+                            #[allow(clippy::collapsible_if)]
                             if play_audio {
                                 if let Some(ref player_cmd) = self.media_player_cmd {
                                     // For music type: stop previous music (unless continue)
@@ -3985,7 +3987,7 @@ impl App {
             return;
         }
         let default_url = self.worlds[world_idx].mcmp_default_url.clone();
-        for (_key, json_data) in &self.worlds[world_idx].active_media {
+        for json_data in self.worlds[world_idx].active_media.values() {
             self.ws_send_to_client(client_id, WsMessage::McmpMedia {
                 world_index: world_idx,
                 action: "Play".to_string(),
@@ -8192,10 +8194,8 @@ async fn main() -> io::Result<()> {
         .and_then(|a| {
             if a == "--gui" {
                 Some(None)
-            } else if let Some(addr) = a.strip_prefix("--gui=") {
-                Some(Some(addr.to_string()))
             } else {
-                None
+                a.strip_prefix("--gui=").map(|addr| Some(addr.to_string()))
             }
         });
 
@@ -8205,10 +8205,8 @@ async fn main() -> io::Result<()> {
         .and_then(|a| {
             if a == "--console" {
                 Some(None)
-            } else if let Some(addr) = a.strip_prefix("--console=") {
-                Some(Some(addr.to_string()))
             } else {
-                None
+                a.strip_prefix("--console=").map(|addr| Some(addr.to_string()))
             }
         });
 

@@ -142,6 +142,7 @@ pub struct LocalTime {
 
 /// Convert epoch seconds to local time (Unix implementation)
 #[cfg(unix)]
+#[allow(deprecated)]
 pub fn local_time_from_epoch(epoch_secs: i64) -> LocalTime {
     let time_t = epoch_secs as libc::time_t;
     let mut tm: libc::tm = unsafe { std::mem::zeroed() };

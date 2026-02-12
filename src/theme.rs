@@ -349,8 +349,8 @@ impl ThemeColors {
             "bright black", "bright red", "bright green", "bright yellow",
             "bright blue", "bright magenta", "bright cyan", "bright white",
         ];
-        for i in 0..16 {
-            s.push_str(&format!("ansi.{} = {}  # {}\n", i, self.ansi[i].to_css(), ansi_names[i]));
+        for (i, name) in ansi_names.iter().enumerate() {
+            s.push_str(&format!("ansi.{} = {}  # {}\n", i, self.ansi[i].to_css(), name));
         }
         s
     }
@@ -468,9 +468,9 @@ impl ThemeFile {
                     let key = key.trim();
                     let value = value.trim();
                     // Strip inline comments: find second # (first # is hex prefix)
-                    let value = if value.starts_with('#') {
+                    let value = if let Some(rest) = value.strip_prefix('#') {
                         // Skip the leading #, find next # for comment
-                        if let Some(pos) = value[1..].find('#') {
+                        if let Some(pos) = rest.find('#') {
                             value[..1 + pos].trim()
                         } else {
                             value
