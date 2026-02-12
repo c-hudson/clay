@@ -2,6 +2,8 @@
 
 A terminal-based MUD (Multi-User Dungeon) client built with Rust featuring multi-world support, ANSI color rendering, and a web interface.
 
+![Clay screenshot showing one instance with remote terminal, Firefox web client, native GUI, and theme editor](screenshot.png)
+
 ## Features
 
 - **Multi-World Support** - Connect to multiple MUD servers simultaneously
