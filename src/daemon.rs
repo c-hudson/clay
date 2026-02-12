@@ -325,6 +325,18 @@ pub async fn run_daemon_server() -> io::Result<()> {
                         // Print system messages (including connection rejections) to console
                         println!("{}", msg);
                     }
+                    AppEvent::ApiLookupResult(client_id, world_index, result) => {
+                        match result {
+                            Ok(text) => app.ws_send_to_client(client_id, WsMessage::SetInputBuffer { text }),
+                            Err(e) => app.ws_send_to_client(client_id, WsMessage::ServerData {
+                                world_index,
+                                data: e,
+                                is_viewed: false,
+                                ts: current_timestamp_secs(),
+                                from_server: false,
+                            }),
+                        }
+                    }
                     _ => {}
                 }
             }
@@ -559,20 +571,11 @@ pub async fn handle_daemon_ws_message(
                     // Broadcast to all clients
                     app.ws_broadcast(WsMessage::ShowTagsChanged { show_tags: app.show_tags });
                 }
-                Command::Dict { prefix, word } => {
-                    // /dict requires async HTTP - send back to client for local execution
-                    app.ws_send_to_client(client_id, WsMessage::ExecuteLocalCommand {
-                        command: format!("/dict {} {}", prefix, word),
-                    });
-                }
-                Command::Urban { prefix, word } => {
-                    // /urban requires async HTTP - send back to client for local execution
-                    app.ws_send_to_client(client_id, WsMessage::ExecuteLocalCommand {
-                        command: format!("/urban {} {}", prefix, word),
-                    });
+                Command::Dict { .. } | Command::Urban { .. } | Command::Translate { .. } => {
+                    spawn_api_lookup(event_tx.clone(), client_id, world_index, parsed);
                 }
                 Command::DictUsage => {
-                    app.ws_broadcast(WsMessage::ServerData {
+                    app.ws_send_to_client(client_id, WsMessage::ServerData {
                         world_index,
                         data: "Usage: /dict <prefix> <word>".to_string(),
                         is_viewed: false,
@@ -581,7 +584,7 @@ pub async fn handle_daemon_ws_message(
                     });
                 }
                 Command::UrbanUsage => {
-                    app.ws_broadcast(WsMessage::ServerData {
+                    app.ws_send_to_client(client_id, WsMessage::ServerData {
                         world_index,
                         data: "Usage: /urban <prefix> <word>".to_string(),
                         is_viewed: false,
@@ -589,14 +592,8 @@ pub async fn handle_daemon_ws_message(
                         from_server: false,
                     });
                 }
-                Command::Translate { lang, prefix, text } => {
-                    // /translate requires async HTTP - send back to client for local execution
-                    app.ws_send_to_client(client_id, WsMessage::ExecuteLocalCommand {
-                        command: format!("/translate {} {} {}", lang, prefix, text),
-                    });
-                }
                 Command::TranslateUsage => {
-                    app.ws_broadcast(WsMessage::ServerData {
+                    app.ws_send_to_client(client_id, WsMessage::ServerData {
                         world_index,
                         data: "Usage: /translate <lang> <prefix> <text>".to_string(),
                         is_viewed: false,

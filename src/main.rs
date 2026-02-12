@@ -3146,6 +3146,11 @@ impl App {
                     self.needs_output_redraw = true;
                 }
             }
+            WsMessage::SetInputBuffer { text } => {
+                self.input.buffer = text;
+                self.input.cursor_position = self.input.buffer.chars().count();
+                self.needs_output_redraw = true;
+            }
             WsMessage::ConnectionsListResponse { lines } => {
                 // Display the connections list from server
                 let was_at_bottom = self.current_world().is_at_bottom();
@@ -5002,6 +5007,8 @@ pub enum AppEvent {
     MsdpReceived(String, String, String),     // world_name, variable, value_json
     // Media process ready from background download/spawn thread
     MediaProcessReady(usize, String, std::process::Child, bool),  // world_idx, key, child, is_music
+    // API lookup result (dict/urban/translate) from spawned task
+    ApiLookupResult(u64, usize, Result<String, String>),  // client_id, world_index, Ok(input_text) or Err(error)
 }
 
 /// Per-user connection state for multiuser mode
@@ -9173,6 +9180,18 @@ pub async fn run_app_headless(
                         }
                         app.media_processes.insert(key, (world_idx, child));
                     }
+                    AppEvent::ApiLookupResult(client_id, world_index, result) => {
+                        match result {
+                            Ok(text) => app.ws_send_to_client(client_id, WsMessage::SetInputBuffer { text }),
+                            Err(e) => app.ws_send_to_client(client_id, WsMessage::ServerData {
+                                world_index,
+                                data: e,
+                                is_viewed: false,
+                                ts: current_timestamp_secs(),
+                                from_server: false,
+                            }),
+                        }
+                    }
                     _ => {}
                 }
             }
@@ -11743,17 +11762,8 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                             });
                                         }
                                     }
-                                    Command::Dict { prefix, word } => {
-                                        // /dict requires async HTTP - send back to client for local execution
-                                        app.ws_send_to_client(client_id, WsMessage::ExecuteLocalCommand {
-                                            command: format!("/dict {} {}", prefix, word),
-                                        });
-                                    }
-                                    Command::Urban { prefix, word } => {
-                                        // /urban requires async HTTP - send back to client for local execution
-                                        app.ws_send_to_client(client_id, WsMessage::ExecuteLocalCommand {
-                                            command: format!("/urban {} {}", prefix, word),
-                                        });
+                                    Command::Dict { .. } | Command::Urban { .. } | Command::Translate { .. } => {
+                                        spawn_api_lookup(event_tx.clone(), client_id, world_index, parsed);
                                     }
                                     Command::DictUsage => {
                                         app.ws_send_to_client(client_id, WsMessage::ServerData {
@@ -11771,12 +11781,6 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                             is_viewed: false,
                                             ts: current_timestamp_secs(),
                                             from_server: false,
-                                        });
-                                    }
-                                    Command::Translate { lang, prefix, text } => {
-                                        // /translate requires async HTTP - send back to client for local execution
-                                        app.ws_send_to_client(client_id, WsMessage::ExecuteLocalCommand {
-                                            command: format!("/translate {} {} {}", lang, prefix, text),
                                         });
                                     }
                                     Command::TranslateUsage => {
@@ -12659,6 +12663,18 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                             app.media_music_key = Some((world_idx, key.clone()));
                         }
                         app.media_processes.insert(key, (world_idx, child));
+                    }
+                    AppEvent::ApiLookupResult(client_id, world_index, result) => {
+                        match result {
+                            Ok(text) => app.ws_send_to_client(client_id, WsMessage::SetInputBuffer { text }),
+                            Err(e) => app.ws_send_to_client(client_id, WsMessage::ServerData {
+                                world_index,
+                                data: e,
+                                is_viewed: false,
+                                ts: current_timestamp_secs(),
+                                from_server: false,
+                            }),
+                        }
                     }
                 }
             }
@@ -14281,17 +14297,8 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                         });
                                     }
                                 }
-                                Command::Dict { prefix, word } => {
-                                    // /dict requires async HTTP - send back to client for local execution
-                                    app.ws_send_to_client(client_id, WsMessage::ExecuteLocalCommand {
-                                        command: format!("/dict {} {}", prefix, word),
-                                    });
-                                }
-                                Command::Urban { prefix, word } => {
-                                    // /urban requires async HTTP - send back to client for local execution
-                                    app.ws_send_to_client(client_id, WsMessage::ExecuteLocalCommand {
-                                        command: format!("/urban {} {}", prefix, word),
-                                    });
+                                Command::Dict { .. } | Command::Urban { .. } | Command::Translate { .. } => {
+                                    spawn_api_lookup(event_tx.clone(), client_id, world_index, parsed);
                                 }
                                 Command::DictUsage => {
                                     app.ws_send_to_client(client_id, WsMessage::ServerData {
@@ -14309,12 +14316,6 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                         is_viewed: false,
                                         ts: current_timestamp_secs(),
                                         from_server: false,
-                                    });
-                                }
-                                Command::Translate { lang, prefix, text } => {
-                                    // /translate requires async HTTP - send back to client for local execution
-                                    app.ws_send_to_client(client_id, WsMessage::ExecuteLocalCommand {
-                                        command: format!("/translate {} {} {}", lang, prefix, text),
                                     });
                                 }
                                 Command::TranslateUsage => {
@@ -14974,6 +14975,18 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                         app.media_music_key = Some((world_idx, key.clone()));
                     }
                     app.media_processes.insert(key, (world_idx, child));
+                }
+                AppEvent::ApiLookupResult(client_id, world_index, result) => {
+                    match result {
+                        Ok(text) => app.ws_send_to_client(client_id, WsMessage::SetInputBuffer { text }),
+                        Err(e) => app.ws_send_to_client(client_id, WsMessage::ServerData {
+                            world_index,
+                            data: e,
+                            is_viewed: false,
+                            ts: current_timestamp_secs(),
+                            from_server: false,
+                        }),
+                    }
                 }
             }
         }
@@ -16647,7 +16660,7 @@ async fn connect_discord(app: &mut App, event_tx: mpsc::Sender<AppEvent>) -> boo
 
 /// Convert UTF-8 characters with diacritics to ASCII equivalents
 /// for better compatibility with non-UTF-8 MUD worlds
-fn transliterate_to_ascii(s: &str) -> String {
+pub fn transliterate_to_ascii(s: &str) -> String {
     let mut result = String::with_capacity(s.len());
     for c in s.chars() {
         match c {
@@ -16832,7 +16845,7 @@ fn transliterate_to_ascii(s: &str) -> String {
 /// Look up a word definition from the Free Dictionary API
 /// Returns the first definition, with multiple definitions joined by spaces
 /// Result is a single line with newlines replaced by spaces
-async fn lookup_definition(word: &str) -> Result<String, String> {
+pub async fn lookup_definition(word: &str) -> Result<String, String> {
     let url = format!("https://api.dictionaryapi.dev/api/v2/entries/en/{}", word);
 
     let client = reqwest::Client::builder()
@@ -16899,7 +16912,7 @@ async fn lookup_definition(word: &str) -> Result<String, String> {
 
 /// Look up a word definition from Urban Dictionary API
 /// Returns the first definition only, as a single line
-async fn lookup_urban_definition(word: &str) -> Result<String, String> {
+pub async fn lookup_urban_definition(word: &str) -> Result<String, String> {
     let encoded: String = url::form_urlencoded::Serializer::new(String::new())
         .append_pair("term", word)
         .finish();
@@ -16952,7 +16965,7 @@ async fn lookup_urban_definition(word: &str) -> Result<String, String> {
 }
 
 /// Convert language name or code to ISO 639-1 code (case-insensitive)
-fn normalize_language_code(lang: &str) -> String {
+pub fn normalize_language_code(lang: &str) -> String {
     let lower = lang.to_lowercase();
     match lower.as_str() {
         // Already a 2-letter code - return as-is
@@ -17007,7 +17020,7 @@ fn normalize_language_code(lang: &str) -> String {
 }
 
 /// Translate text using MyMemory API (free, no API key required for up to 1000 words/day)
-async fn lookup_translation(text: &str, target_lang: &str) -> Result<String, String> {
+pub async fn lookup_translation(text: &str, target_lang: &str) -> Result<String, String> {
     // Normalize language input (accepts both codes and names)
     let lang_code = normalize_language_code(target_lang);
 
@@ -17064,6 +17077,68 @@ async fn lookup_translation(text: &str, target_lang: &str) -> Result<String, Str
         .join(" ");
 
     Ok(result)
+}
+
+/// Cap a string to max_len bytes at a valid char boundary.
+fn cap_text(s: String, max_len: usize) -> String {
+    if s.len() <= max_len {
+        s
+    } else {
+        let mut end = max_len;
+        while end > 0 && !s.is_char_boundary(end) {
+            end -= 1;
+        }
+        s[..end].to_string()
+    }
+}
+
+/// Spawn an async API lookup task for /dict, /urban, or /translate commands.
+/// Results are sent back via event_tx as ApiLookupResult for the main loop to route to the client.
+pub fn spawn_api_lookup(
+    event_tx: mpsc::Sender<AppEvent>,
+    client_id: u64,
+    world_index: usize,
+    command: Command,
+) {
+    match command {
+        Command::Dict { prefix, word } => {
+            tokio::spawn(async move {
+                let result = match lookup_definition(&word).await {
+                    Ok(def) => {
+                        let ascii = transliterate_to_ascii(&def);
+                        Ok(cap_text(format!("{} {}: {}", prefix, word, ascii), 1024))
+                    }
+                    Err(e) => Err(format!("Definition lookup failed: {}", e)),
+                };
+                let _ = event_tx.send(AppEvent::ApiLookupResult(client_id, world_index, result)).await;
+            });
+        }
+        Command::Urban { prefix, word } => {
+            tokio::spawn(async move {
+                let result = match lookup_urban_definition(&word).await {
+                    Ok(def) => {
+                        let ascii = transliterate_to_ascii(&def);
+                        Ok(cap_text(format!("{} Urban Dict: {}: {}", prefix, word, ascii), 1024))
+                    }
+                    Err(e) => Err(format!("Urban Dictionary lookup failed: {}", e)),
+                };
+                let _ = event_tx.send(AppEvent::ApiLookupResult(client_id, world_index, result)).await;
+            });
+        }
+        Command::Translate { lang, prefix, text } => {
+            tokio::spawn(async move {
+                let result = match lookup_translation(&text, &lang).await {
+                    Ok(trans) => {
+                        let ascii = transliterate_to_ascii(&trans);
+                        Ok(cap_text(format!("{} {}", prefix, ascii), 1024))
+                    }
+                    Err(e) => Err(format!("Translation failed: {}", e)),
+                };
+                let _ = event_tx.send(AppEvent::ApiLookupResult(client_id, world_index, result)).await;
+            });
+        }
+        _ => {}
+    }
 }
 
 #[async_recursion(?Send)]

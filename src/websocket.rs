@@ -110,6 +110,8 @@ pub enum WsMessage {
     WorldFlushed { world_index: usize },
     /// Tell client to execute a command locally (for action commands like /worlds)
     ExecuteLocalCommand { command: String },
+    /// Set client's input buffer (server -> client, for API lookup results like /dict, /urban, /translate)
+    SetInputBuffer { text: String },
 
     /// Notification for mobile clients (server -> client)
     Notification { title: String, message: String },

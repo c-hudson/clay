@@ -1882,6 +1882,13 @@
                 }
                 break;
 
+            case 'SetInputBuffer':
+                if (msg.text != null) {
+                    elements.input.value = msg.text;
+                    elements.input.selectionStart = elements.input.selectionEnd = msg.text.length;
+                }
+                break;
+
             case 'ThemeCssVarsUpdated':
                 // Live theme update from theme editor
                 if (msg.css_vars) {

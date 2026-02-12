@@ -1262,6 +1262,9 @@ impl RemoteGuiApp {
                         self.dictionary_path = settings.dictionary_path.clone();
                         self.output_dirty = true;
                     }
+                    WsMessage::SetInputBuffer { text } => {
+                        self.input_buffer = text;
+                    }
                     WsMessage::PendingLinesUpdate { world_index, count } => {
                         // Update pending count for world
                         if world_index < self.worlds.len() {
