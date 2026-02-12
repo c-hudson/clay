@@ -3456,13 +3456,8 @@ impl eframe::App for RemoteGuiApp {
                                 && self.worlds[self.current_world].pending_count > 0
                             {
                                 // Send ReleasePending to server with this client's visible line count
-                                // Server will release lines and broadcast to all clients
+                                // Server will release lines and broadcast PendingLinesUpdate to sync all clients
                                 let release_count = self.output_visible_lines.saturating_sub(2).max(1);
-                                // Optimistic UI update: immediately reduce pending_count so rapid Tab
-                                // presses don't send redundant requests. Server will correct with PendingLinesUpdate.
-                                let to_release = release_count.min(self.worlds[self.current_world].pending_count);
-                                self.worlds[self.current_world].pending_count =
-                                    self.worlds[self.current_world].pending_count.saturating_sub(to_release);
                                 if let Some(ref tx) = self.ws_tx {
                                     let _ = tx.send(WsMessage::ReleasePending {
                                         world_index: self.current_world,
@@ -4184,7 +4179,11 @@ impl eframe::App for RemoteGuiApp {
                         let was_connected = self.worlds.get(self.current_world)
                             .map(|w| w.was_connected)
                             .unwrap_or(false);
-                        let activity_count = self.server_activity_count;
+                        // Compute activity locally excluding this client's current world
+                        // (server_activity_count excludes the server's current world, which may differ)
+                        let activity_count = self.worlds.iter().enumerate()
+                            .filter(|(i, w)| *i != self.current_world && (w.unseen_lines > 0 || w.pending_count > 0))
+                            .count();
                         let server_pending_count = self.worlds.get(self.current_world)
                             .map(|w| w.pending_count)
                             .unwrap_or(0);
