@@ -39,30 +39,52 @@ fn main() {
     embed_windows_icon();
 }
 
-/// Embed clay_icon.png as a Windows application icon using winres.
-/// Creates an ICO file from the PNG and uses winres to compile and link it.
+/// Embed Windows PE metadata (version info, description) and optionally an icon.
+/// PE metadata helps AV heuristics trust the binary and reduces false positives.
 #[cfg(target_os = "windows")]
 fn embed_windows_icon() {
+    let mut res = winres::WindowsResource::new();
+
+    // PE version info — reduces AV heuristic false positives
+    res.set("FileDescription", "Clay - A MUD Client");
+    res.set("ProductName", "Clay");
+    res.set("ProductVersion", env!("CARGO_PKG_VERSION"));
+    res.set("FileVersion", env!("CARGO_PKG_VERSION"));
+    res.set("CompanyName", "Clay MUD Client");
+    res.set("LegalCopyright", "Copyright (c) 2024-2026 Clay contributors");
+    res.set("OriginalFilename", "clay.exe");
+    res.set("InternalName", "clay");
+
+    // Optionally embed application icon from clay_icon.png
     let png_path = Path::new("clay_icon.png");
-    if !png_path.exists() {
-        return;
+    if png_path.exists() {
+        if let Some(ico_path) = build_ico_from_png(png_path) {
+            res.set_icon(ico_path.to_str().unwrap());
+        }
+        println!("cargo:rerun-if-changed=clay_icon.png");
     }
 
-    let out_dir = std::env::var("OUT_DIR").unwrap();
+    if let Err(e) = res.compile() {
+        eprintln!("cargo:warning=Failed to compile Windows resource: {}", e);
+    }
+}
+
+/// Convert a PNG file to ICO format (Vista+ PNG-in-ICO).
+/// Returns the path to the generated ICO file, or None on failure.
+#[cfg(target_os = "windows")]
+fn build_ico_from_png(png_path: &Path) -> Option<std::path::PathBuf> {
+    let out_dir = std::env::var("OUT_DIR").ok()?;
     let out_path = Path::new(&out_dir);
 
     // Read the PNG file
     let mut png_data = Vec::new();
-    if fs::File::open(png_path)
+    fs::File::open(png_path)
         .and_then(|mut f| f.read_to_end(&mut png_data))
-        .is_err()
-    {
-        return;
-    }
+        .ok()?;
 
     // Parse PNG dimensions from IHDR chunk (bytes 16-23)
     if png_data.len() < 24 {
-        return;
+        return None;
     }
     let width = u32::from_be_bytes([png_data[16], png_data[17], png_data[18], png_data[19]]);
     let height = u32::from_be_bytes([png_data[20], png_data[21], png_data[22], png_data[23]]);
@@ -93,19 +115,8 @@ fn embed_windows_icon() {
     ico.extend_from_slice(&png_data);
 
     let ico_path = out_path.join("clay_icon.ico");
-    if fs::write(&ico_path, &ico).is_err() {
-        return;
-    }
-
-    // Use winres to compile and link the icon resource
-    if let Err(e) = winres::WindowsResource::new()
-        .set_icon(ico_path.to_str().unwrap())
-        .compile()
-    {
-        eprintln!("cargo:warning=Failed to compile Windows icon resource: {}", e);
-    }
-
-    println!("cargo:rerun-if-changed=clay_icon.png");
+    fs::write(&ico_path, &ico).ok()?;
+    Some(ico_path)
 }
 
 fn collect_source_files(dir: &Path, files: &mut BTreeSet<String>) {
