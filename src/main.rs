@@ -10517,7 +10517,20 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                         app.tf_engine.processes.push(process);
                                         app.add_tf_output(&format!("% Process {} started: {} every {} ({} times)", id, cmd, interval, count_str));
                                     }
-                                    tf::TfCommandResult::Quote { lines, disposition, world, delay_secs } => {
+                                    tf::TfCommandResult::Quote { mut lines, disposition, world, delay_secs, recall_opts } => {
+                                        // If this is a /quote with backtick /recall, execute the recall now
+                                        if let Some((opts, recall_prefix)) = recall_opts {
+                                            let output_lines = app.current_world().output_lines.clone();
+                                            let (matches, _header) = execute_recall(&opts, &output_lines);
+                                            lines = matches.iter()
+                                                .map(|line| format!("{}{}", recall_prefix, line))
+                                                .collect();
+                                            if lines.is_empty() {
+                                                let pattern_str = opts.pattern.as_deref().unwrap_or("*");
+                                                app.add_tf_output(&format!("(no recall matches for '{}')", pattern_str));
+                                            }
+                                        }
+
                                         // Determine target world
                                         let target_world = if let Some(ref world_name) = world {
                                             Some(world_name.clone())

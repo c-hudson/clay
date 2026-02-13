@@ -282,6 +282,7 @@ pub fn cmd_quote(engine: &mut super::TfEngine, args: &str) -> TfCommandResult {
                 disposition,
                 world,
                 delay_secs,
+                recall_opts: None,
             };
         }
     };
@@ -320,8 +321,11 @@ pub fn cmd_quote(engine: &mut super::TfEngine, args: &str) -> TfCommandResult {
         let suffix = after_source_char[byte_end..].trim();
 
         (source_content, suffix)
+    } else if source_char == '`' || source_char == '!' {
+        // Unquoted command source: rest of line is the command (commands contain spaces)
+        (after_source_char.trim().to_string(), "")
     } else {
-        // Unquoted source: read until whitespace
+        // Unquoted file source: read until whitespace, rest is suffix
         if let Some(space_pos) = after_source_char.find(char::is_whitespace) {
             let source = after_source_char[..space_pos].to_string();
             let suffix = after_source_char[space_pos..].trim();
@@ -373,6 +377,16 @@ pub fn cmd_quote(engine: &mut super::TfEngine, args: &str) -> TfCommandResult {
                 }
                 TfCommandResult::Error(e) => {
                     return TfCommandResult::Error(format!("Command '{}' failed: {}", source_value, e));
+                }
+                TfCommandResult::Recall(opts) => {
+                    // Recall needs output_lines from the world - pass to caller
+                    return TfCommandResult::Quote {
+                        lines: vec![],
+                        disposition,
+                        world,
+                        delay_secs,
+                        recall_opts: Some((opts, prefix.to_string())),
+                    };
                 }
                 _ => {
                     // Other result types (SendToMud, ClayCommand, etc.) don't produce capturable output
@@ -431,6 +445,7 @@ pub fn cmd_quote(engine: &mut super::TfEngine, args: &str) -> TfCommandResult {
         disposition,
         world,
         delay_secs,
+        recall_opts: None,
     }
 }
 

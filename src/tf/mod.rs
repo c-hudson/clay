@@ -196,6 +196,8 @@ pub enum TfCommandResult {
         disposition: QuoteDisposition,
         world: Option<String>,
         delay_secs: f64,  // Delay between lines (0 = immediate)
+        /// When backtick source is /recall, pass opts to caller for execution
+        recall_opts: Option<(RecallOptions, String)>,  // (opts, prefix)
     },
     /// Abort file loading early (#exit during load)
     ExitLoad,

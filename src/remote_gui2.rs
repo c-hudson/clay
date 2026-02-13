@@ -6,6 +6,7 @@ use tokio_tungstenite::{connect_async, tungstenite::Message as WsRawMessage};
 #[cfg(target_os = "windows")]
 mod windows_titlebar {
     use std::ffi::c_void;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     #[link(name = "dwmapi")]
     extern "system" {
@@ -20,50 +21,105 @@ mod windows_titlebar {
     #[link(name = "user32")]
     extern "system" {
         fn GetActiveWindow() -> *mut c_void;
+        fn GetCurrentThreadId() -> u32;
+        fn EnumThreadWindows(
+            dw_thread_id: u32,
+            lp_fn: unsafe extern "system" fn(*mut c_void, isize) -> i32,
+            l_param: isize,
+        ) -> i32;
+        fn IsWindowVisible(hwnd: *mut c_void) -> i32;
     }
 
     const DWMWA_USE_IMMERSIVE_DARK_MODE: u32 = 20;
     const DWMWA_CAPTION_COLOR: u32 = 35;
     const DWMWA_TEXT_COLOR: u32 = 36;
 
-    /// Set the title bar to dark or light mode on Windows 11+
-    pub fn set_dark_mode(dark: bool) {
+    // Cache the HWND once found (stored as usize for atomicity)
+    static CACHED_HWND: AtomicUsize = AtomicUsize::new(0);
+
+    unsafe extern "system" fn enum_callback(hwnd: *mut c_void, lparam: isize) -> i32 {
+        if IsWindowVisible(hwnd) != 0 {
+            let out = &*(lparam as *const AtomicUsize);
+            out.store(hwnd as usize, Ordering::Relaxed);
+            return 0; // Stop enumerating
+        }
+        1 // Continue
+    }
+
+    /// Get our window handle reliably. Tries cached value first, then
+    /// GetActiveWindow, then enumerates thread windows as fallback.
+    fn get_hwnd() -> *mut c_void {
+        // Try cached HWND first
+        let cached = CACHED_HWND.load(Ordering::Relaxed);
+        if cached != 0 {
+            return cached as *mut c_void;
+        }
+
         unsafe {
+            // Try GetActiveWindow (works when our window is focused)
             let hwnd = GetActiveWindow();
             if !hwnd.is_null() {
-                let value: u32 = if dark { 1 } else { 0 };
-                DwmSetWindowAttribute(
-                    hwnd,
-                    DWMWA_USE_IMMERSIVE_DARK_MODE,
-                    &value as *const u32 as *const c_void,
-                    std::mem::size_of::<u32>() as u32,
-                );
+                CACHED_HWND.store(hwnd as usize, Ordering::Relaxed);
+                return hwnd;
             }
+
+            // Fallback: enumerate visible windows on our thread
+            let found = AtomicUsize::new(0);
+            EnumThreadWindows(
+                GetCurrentThreadId(),
+                enum_callback,
+                &found as *const AtomicUsize as isize,
+            );
+            let hwnd = found.load(Ordering::Relaxed) as *mut c_void;
+            if !hwnd.is_null() {
+                CACHED_HWND.store(hwnd as usize, Ordering::Relaxed);
+            }
+            hwnd
         }
     }
 
-    /// Set title bar caption background and text colors on Windows 11+
-    /// Falls back gracefully on older Windows (DWM returns error, no crash).
-    pub fn set_title_colors(bg_r: u8, bg_g: u8, bg_b: u8, fg_r: u8, fg_g: u8, fg_b: u8) {
+    /// Apply all title bar theme attributes in one call. Returns true if
+    /// the DWM calls succeeded (HWND was found and DWM returned S_OK).
+    pub fn apply_titlebar_theme(
+        dark: bool,
+        bg_r: u8, bg_g: u8, bg_b: u8,
+        fg_r: u8, fg_g: u8, fg_b: u8,
+    ) -> bool {
+        let hwnd = get_hwnd();
+        if hwnd.is_null() {
+            return false;
+        }
+
         unsafe {
-            let hwnd = GetActiveWindow();
-            if !hwnd.is_null() {
-                // COLORREF is 0x00BBGGRR (BGR, not RGB)
-                let caption: u32 = (bg_b as u32) << 16 | (bg_g as u32) << 8 | bg_r as u32;
-                DwmSetWindowAttribute(
-                    hwnd,
-                    DWMWA_CAPTION_COLOR,
-                    &caption as *const u32 as *const c_void,
-                    std::mem::size_of::<u32>() as u32,
-                );
-                let text: u32 = (fg_b as u32) << 16 | (fg_g as u32) << 8 | fg_r as u32;
-                DwmSetWindowAttribute(
-                    hwnd,
-                    DWMWA_TEXT_COLOR,
-                    &text as *const u32 as *const c_void,
-                    std::mem::size_of::<u32>() as u32,
-                );
-            }
+            // Set dark/light mode
+            let value: u32 = if dark { 1 } else { 0 };
+            let hr = DwmSetWindowAttribute(
+                hwnd,
+                DWMWA_USE_IMMERSIVE_DARK_MODE,
+                &value as *const u32 as *const c_void,
+                std::mem::size_of::<u32>() as u32,
+            );
+            if hr != 0 { return false; }
+
+            // Set caption color (COLORREF is 0x00BBGGRR)
+            let caption: u32 = (bg_b as u32) << 16 | (bg_g as u32) << 8 | bg_r as u32;
+            let hr = DwmSetWindowAttribute(
+                hwnd,
+                DWMWA_CAPTION_COLOR,
+                &caption as *const u32 as *const c_void,
+                std::mem::size_of::<u32>() as u32,
+            );
+            if hr != 0 { return false; }
+
+            // Set text color
+            let text: u32 = (fg_b as u32) << 16 | (fg_g as u32) << 8 | fg_r as u32;
+            let hr = DwmSetWindowAttribute(
+                hwnd,
+                DWMWA_TEXT_COLOR,
+                &text as *const u32 as *const c_void,
+                std::mem::size_of::<u32>() as u32,
+            );
+            hr == 0
         }
     }
 }
@@ -3174,11 +3230,15 @@ impl eframe::App for RemoteGuiApp {
                 Some(prev) => prev.colors != theme.colors,
             };
             if need_update {
-                self.titlebar_theme = Some(theme.clone());
-                windows_titlebar::set_dark_mode(theme.is_dark());
                 let bg = &theme.colors.bg_deep;
                 let fg = &theme.colors.fg;
-                windows_titlebar::set_title_colors(bg.r, bg.g, bg.b, fg.r, fg.g, fg.b);
+                if windows_titlebar::apply_titlebar_theme(
+                    theme.is_dark(),
+                    bg.r, bg.g, bg.b,
+                    fg.r, fg.g, fg.b,
+                ) {
+                    self.titlebar_theme = Some(theme.clone());
+                }
             }
         }
 
