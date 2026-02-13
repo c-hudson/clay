@@ -9026,6 +9026,7 @@ pub async fn run_app_headless(
                         #[cfg(all(unix, not(target_os = "android")))]
                         {
                             debug_log(true, "HEADLESS: Received SIGUSR1, triggering reload");
+                            app.ws_broadcast(WsMessage::ServerReloading);
                             exec_reload(&app)?;
                             return Ok(());
                         }
@@ -11343,13 +11344,69 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                             }
                                             }
                                         } else {
-                                            app.ws_broadcast(WsMessage::ServerData {
-                                                world_index,
-                                                data: format!("Unknown action: /{}", name),
-                                                is_viewed: false,
-                                                ts: current_timestamp_secs(),
-                                                from_server: false,
-                                            });
+                                            // No matching action - try TF engine (handles /recall, /set, /echo, etc.)
+                                            app.sync_tf_world_info();
+                                            match app.tf_engine.execute(command) {
+                                                tf::TfCommandResult::Success(Some(msg)) => {
+                                                    app.ws_broadcast(WsMessage::ServerData {
+                                                        world_index, data: msg, is_viewed: false,
+                                                        ts: current_timestamp_secs(), from_server: false,
+                                                    });
+                                                }
+                                                tf::TfCommandResult::Success(None) => {}
+                                                tf::TfCommandResult::Error(err) => {
+                                                    app.ws_broadcast(WsMessage::ServerData {
+                                                        world_index, data: format!("Error: {}", err), is_viewed: false,
+                                                        ts: current_timestamp_secs(), from_server: false,
+                                                    });
+                                                }
+                                                tf::TfCommandResult::SendToMud(text) => {
+                                                    if world_index < app.worlds.len() {
+                                                        if let Some(tx) = &app.worlds[world_index].command_tx {
+                                                            let _ = tx.try_send(WriteCommand::Text(text));
+                                                            app.worlds[world_index].last_send_time = Some(std::time::Instant::now());
+                                                        }
+                                                    }
+                                                }
+                                                tf::TfCommandResult::ClayCommand(clay_cmd) => {
+                                                    app.ws_send_to_client(client_id, WsMessage::ExecuteLocalCommand { command: clay_cmd });
+                                                }
+                                                tf::TfCommandResult::Recall(opts) => {
+                                                    if world_index < app.worlds.len() {
+                                                        let output_lines = app.worlds[world_index].output_lines.clone();
+                                                        let (matches, header) = execute_recall(&opts, &output_lines);
+                                                        let pattern_str = opts.pattern.as_deref().unwrap_or("*");
+                                                        let ts = current_timestamp_secs();
+                                                        if !opts.quiet {
+                                                            if let Some(h) = header {
+                                                                app.ws_broadcast(WsMessage::ServerData { world_index, data: h, is_viewed: false, ts, from_server: false });
+                                                            }
+                                                        }
+                                                        if matches.is_empty() {
+                                                            app.ws_broadcast(WsMessage::ServerData { world_index, data: format!("✨ No matches for '{}'", pattern_str), is_viewed: false, ts, from_server: false });
+                                                        } else {
+                                                            for m in matches {
+                                                                app.ws_broadcast(WsMessage::ServerData { world_index, data: m, is_viewed: false, ts, from_server: false });
+                                                            }
+                                                        }
+                                                        if !opts.quiet {
+                                                            app.ws_broadcast(WsMessage::ServerData { world_index, data: "================= Recall end =================".to_string(), is_viewed: false, ts, from_server: false });
+                                                        }
+                                                    }
+                                                }
+                                                tf::TfCommandResult::RepeatProcess(process) => {
+                                                    app.tf_engine.processes.push(process);
+                                                }
+                                                _ => {
+                                                    app.ws_broadcast(WsMessage::ServerData {
+                                                        world_index,
+                                                        data: format!("Unknown command: /{}", name),
+                                                        is_viewed: false,
+                                                        ts: current_timestamp_secs(),
+                                                        from_server: false,
+                                                    });
+                                                }
+                                            }
                                         }
                                     }
                                     Command::NotACommand { text } => {
@@ -13912,13 +13969,69 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                         }
                                         }
                                     } else {
-                                        app.ws_broadcast(WsMessage::ServerData {
-                                            world_index,
-                                            data: format!("Unknown action: /{}", name),
-                                            is_viewed: false,
-                                            ts: current_timestamp_secs(),
-                                            from_server: false,
-                                        });
+                                        // No matching action - try TF engine (handles /recall, /set, /echo, etc.)
+                                        app.sync_tf_world_info();
+                                        match app.tf_engine.execute(command) {
+                                            tf::TfCommandResult::Success(Some(msg)) => {
+                                                app.ws_broadcast(WsMessage::ServerData {
+                                                    world_index, data: msg, is_viewed: false,
+                                                    ts: current_timestamp_secs(), from_server: false,
+                                                });
+                                            }
+                                            tf::TfCommandResult::Success(None) => {}
+                                            tf::TfCommandResult::Error(err) => {
+                                                app.ws_broadcast(WsMessage::ServerData {
+                                                    world_index, data: format!("Error: {}", err), is_viewed: false,
+                                                    ts: current_timestamp_secs(), from_server: false,
+                                                });
+                                            }
+                                            tf::TfCommandResult::SendToMud(text) => {
+                                                if world_index < app.worlds.len() {
+                                                    if let Some(tx) = &app.worlds[world_index].command_tx {
+                                                        let _ = tx.try_send(WriteCommand::Text(text));
+                                                        app.worlds[world_index].last_send_time = Some(std::time::Instant::now());
+                                                    }
+                                                }
+                                            }
+                                            tf::TfCommandResult::ClayCommand(clay_cmd) => {
+                                                app.ws_send_to_client(client_id, WsMessage::ExecuteLocalCommand { command: clay_cmd });
+                                            }
+                                            tf::TfCommandResult::Recall(opts) => {
+                                                if world_index < app.worlds.len() {
+                                                    let output_lines = app.worlds[world_index].output_lines.clone();
+                                                    let (matches, header) = execute_recall(&opts, &output_lines);
+                                                    let pattern_str = opts.pattern.as_deref().unwrap_or("*");
+                                                    let ts = current_timestamp_secs();
+                                                    if !opts.quiet {
+                                                        if let Some(h) = header {
+                                                            app.ws_broadcast(WsMessage::ServerData { world_index, data: h, is_viewed: false, ts, from_server: false });
+                                                        }
+                                                    }
+                                                    if matches.is_empty() {
+                                                        app.ws_broadcast(WsMessage::ServerData { world_index, data: format!("✨ No matches for '{}'", pattern_str), is_viewed: false, ts, from_server: false });
+                                                    } else {
+                                                        for m in matches {
+                                                            app.ws_broadcast(WsMessage::ServerData { world_index, data: m, is_viewed: false, ts, from_server: false });
+                                                        }
+                                                    }
+                                                    if !opts.quiet {
+                                                        app.ws_broadcast(WsMessage::ServerData { world_index, data: "================= Recall end =================".to_string(), is_viewed: false, ts, from_server: false });
+                                                    }
+                                                }
+                                            }
+                                            tf::TfCommandResult::RepeatProcess(process) => {
+                                                app.tf_engine.processes.push(process);
+                                            }
+                                            _ => {
+                                                app.ws_broadcast(WsMessage::ServerData {
+                                                    world_index,
+                                                    data: format!("Unknown command: /{}", name),
+                                                    is_viewed: false,
+                                                    ts: current_timestamp_secs(),
+                                                    from_server: false,
+                                                });
+                                            }
+                                        }
                                     }
                                 }
                                 Command::NotACommand { text } => {
@@ -17996,6 +18109,9 @@ async fn handle_command(cmd: &str, app: &mut App, event_tx: mpsc::Sender<AppEven
 
                 // Binary path is only shown on failure (see error handler below)
 
+                // Notify connected web/GUI clients to reconnect after reload
+                app.ws_broadcast(WsMessage::ServerReloading);
+
                 // Disable raw mode before exec (the new process will re-enable it)
                 let _ = crossterm::terminal::disable_raw_mode();
                 let _ = crossterm::execute!(
@@ -18425,7 +18541,53 @@ async fn handle_command(cmd: &str, app: &mut App, event_tx: mpsc::Sender<AppEven
                 }
                 }
             } else {
-                app.add_output(&format!("Unknown action: /{}", name));
+                // No matching action - try TF engine (handles /recall, /set, /echo, etc.)
+                app.sync_tf_world_info();
+                match app.tf_engine.execute(cmd) {
+                    tf::TfCommandResult::Success(Some(msg)) => {
+                        app.add_tf_output(&msg);
+                    }
+                    tf::TfCommandResult::Success(None) => {}
+                    tf::TfCommandResult::Error(err) => {
+                        app.add_tf_output(&format!("Error: {}", err));
+                    }
+                    tf::TfCommandResult::SendToMud(text) => {
+                        if let Some(tx) = &app.current_world().command_tx {
+                            let _ = tx.try_send(WriteCommand::Text(text));
+                            app.current_world_mut().last_send_time = Some(std::time::Instant::now());
+                        }
+                    }
+                    tf::TfCommandResult::ClayCommand(_) => {
+                        // Avoid recursion - just show unknown
+                        app.add_output(&format!("Unknown command: /{}", name));
+                    }
+                    tf::TfCommandResult::Recall(opts) => {
+                        let output_lines = app.current_world().output_lines.clone();
+                        let (matches, header) = execute_recall(&opts, &output_lines);
+                        let pattern_str = opts.pattern.as_deref().unwrap_or("*");
+                        if !opts.quiet {
+                            if let Some(h) = header {
+                                app.add_output(&h);
+                            }
+                        }
+                        if matches.is_empty() {
+                            app.add_output(&format!("No matches for '{}'", pattern_str));
+                        } else {
+                            for m in &matches {
+                                app.add_output(m);
+                            }
+                        }
+                        if !opts.quiet {
+                            app.add_output("================= Recall end =================");
+                        }
+                    }
+                    tf::TfCommandResult::RepeatProcess(process) => {
+                        app.tf_engine.processes.push(process);
+                    }
+                    _ => {
+                        app.add_output(&format!("Unknown command: /{}", name));
+                    }
+                }
             }
         }
         Command::NotACommand { text } => {

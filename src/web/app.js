@@ -204,6 +204,8 @@
     let commandHistory = [];
     let historyIndex = -1;
     let connectionFailures = 0;
+    let reloadReconnect = false;
+    let reloadReconnectAttempts = 0;
     let inputHeight = 1;
     let splashLines = [];  // Splash screen lines for multiuser mode
 
@@ -1177,6 +1179,19 @@
                 }
                 authenticated = false;
                 hasReceivedInitialState = false;  // Reset so we use server's world on reconnect
+
+                // Server reload - auto-reconnect with retry
+                if (reloadReconnect) {
+                    reloadReconnectAttempts++;
+                    if (reloadReconnectAttempts <= 5) {
+                        var delay = reloadReconnectAttempts === 1 ? 2000 : 1000;
+                        setTimeout(connect, delay);
+                    } else {
+                        reloadReconnect = false;
+                    }
+                    return;
+                }
+
                 showConnecting(false);
                 connectionFailures++;
                 // Stop Android foreground service when disconnected
@@ -1273,6 +1288,9 @@
                 if (msg.success) {
                     authenticated = true;
                     authKeyPending = false;  // Clear key-based auth flag
+                    reloadReconnect = false;
+                    reloadReconnectAttempts = 0;
+                    connectionFailures = 0;
                     multiuserMode = msg.multiuser_mode || false;
                     showAuthModal(false);
                     elements.authError.textContent = '';
@@ -2003,6 +2021,11 @@
             case 'ScrollbackLines':
                 // Response to RequestScrollback (for console clients, web clients don't use this)
                 // Web clients have full history so this is typically not needed
+                break;
+
+            case 'ServerReloading':
+                reloadReconnect = true;
+                reloadReconnectAttempts = 0;
                 break;
 
             default:

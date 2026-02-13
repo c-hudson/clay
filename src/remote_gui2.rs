@@ -330,6 +330,10 @@ pub struct RemoteGuiApp {
     /// Last theme applied to title bar (to detect changes)
     #[cfg(target_os = "windows")]
     titlebar_theme: Option<GuiTheme>,
+    /// When to attempt reload reconnect (None = not reconnecting)
+    reload_reconnect_at: Option<std::time::Instant>,
+    /// Number of reload reconnect attempts made
+    reload_reconnect_attempts: u8,
     /// Font name (empty for system default)
     font_name: String,
     /// Font size in points
@@ -603,6 +607,8 @@ impl RemoteGuiApp {
             theme: GuiTheme::from_name("dark"),
             #[cfg(target_os = "windows")]
             titlebar_theme: None,
+            reload_reconnect_at: None,
+            reload_reconnect_attempts: 0,
             font_name: String::new(),
             font_size: 14.0,
             web_font_size_phone: 10.0,
@@ -1135,6 +1141,8 @@ impl RemoteGuiApp {
                         if success {
                             self.authenticated = true;
                             self.error_message = None;
+                            self.reload_reconnect_at = None;
+                            self.reload_reconnect_attempts = 0;
                             // Declare client type to server (RemoteGUI for egui clients)
                             if let Some(ref tx) = self.ws_tx {
                                 let _ = tx.send(WsMessage::ClientTypeDeclaration {
@@ -1617,6 +1625,10 @@ impl RemoteGuiApp {
                     WsMessage::ScrollbackLines { world_index: _, lines: _ } => {
                         // Response to RequestScrollback (for console clients)
                         // GUI clients have full history so this is typically not needed
+                    }
+                    WsMessage::ServerReloading => {
+                        self.reload_reconnect_at = Some(std::time::Instant::now() + std::time::Duration::from_secs(2));
+                        self.reload_reconnect_attempts = 0;
                     }
                     _ => {}
                 }
@@ -3108,6 +3120,20 @@ impl eframe::App for RemoteGuiApp {
             ctx.request_repaint(); // Immediate repaint when new data arrives
         }
 
+        // Handle reload reconnect with retry
+        if let Some(reconnect_at) = self.reload_reconnect_at {
+            if std::time::Instant::now() >= reconnect_at {
+                self.reload_reconnect_attempts += 1;
+                if self.reload_reconnect_attempts <= 5 {
+                    self.connect_websocket();
+                    self.reload_reconnect_at = Some(std::time::Instant::now() + std::time::Duration::from_secs(1));
+                } else {
+                    self.reload_reconnect_at = None;
+                }
+            }
+            ctx.request_repaint_after(std::time::Duration::from_millis(100));
+        }
+
         // Apply theme to egui visuals (clone to avoid borrowing self)
         let theme = self.theme.clone();
         let mut visuals = if theme.is_dark() {
@@ -3474,6 +3500,19 @@ impl eframe::App for RemoteGuiApp {
                             resize_input = -1;
                         } else if i.consume_key(egui::Modifiers::ALT, egui::Key::ArrowDown) {
                             resize_input = 1;
+                        } else if i.consume_key(egui::Modifiers::ALT, egui::Key::J) {
+                            // Alt+J (Escape+j) - Jump to end, release all pending
+                            if self.current_world < self.worlds.len()
+                                && self.worlds[self.current_world].pending_count > 0
+                            {
+                                if let Some(ref tx) = self.ws_tx {
+                                    let _ = tx.send(WsMessage::ReleasePending {
+                                        world_index: self.current_world,
+                                        count: 0, // 0 = release all
+                                    });
+                                }
+                            }
+                            self.scroll_offset = None; // Scroll to bottom
                         }
                         // Note: Ctrl+Up/Down are handled by first ctrl block, letting egui TextEdit
                         // handle cursor movement in multi-line input if not consumed

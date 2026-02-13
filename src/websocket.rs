@@ -106,6 +106,8 @@ pub enum WsMessage {
     ActivityUpdate { count: usize },
     /// Broadcast when show_tags setting changes (F2 or /tag command)
     ShowTagsChanged { show_tags: bool },
+    /// Server is about to reload - clients should auto-reconnect
+    ServerReloading,
     /// Clear all output for a world (from /flush command)
     WorldFlushed { world_index: usize },
     /// Tell client to execute a command locally (for action commands like /worlds)
