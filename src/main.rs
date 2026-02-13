@@ -11686,11 +11686,19 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                             from_server: false,
                                         });
                                     }
-                                    // UI popup commands - handled client-side, no-op on server
-                                    Command::Help | Command::Version | Command::Menu | Command::Setup | Command::Web | Command::Actions { .. } |
+                                    // UI popup commands - send back to client for local handling
+                                    Command::Help | Command::Menu | Command::Setup | Command::Web | Command::Actions { .. } |
                                     Command::WorldsList | Command::WorldSelector | Command::WorldEdit { .. } => {
-                                        // These are handled by the GUI/web interface locally
-                                        // No server action needed
+                                        app.ws_send_to_client(client_id, WsMessage::ExecuteLocalCommand { command: command.clone() });
+                                    }
+                                    Command::Version => {
+                                        app.ws_send_to_client(client_id, WsMessage::ServerData {
+                                            world_index,
+                                            data: get_version_string(),
+                                            is_viewed: false,
+                                            ts: current_timestamp_secs(),
+                                            from_server: false,
+                                        });
                                     }
                                     // AddWorld - add or update world definition
                                     Command::AddWorld { name, host, port, user, password, use_ssl } => {
@@ -11768,6 +11776,8 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                             app.ws_client_worlds.insert(client_id, ClientViewState { world_index: idx, visible_lines, dimensions });
                                             app.ws_set_client_world(client_id, Some(idx));
                                             app.ws_send_to_client(client_id, WsMessage::WorldSwitched { new_index: idx });
+                                            // Also send ExecuteLocalCommand so web clients can switch their local view
+                                            app.ws_send_to_client(client_id, WsMessage::ExecuteLocalCommand { command: command.clone() });
                                             // Connect if not connected and has settings
                                             if !app.worlds[idx].connected
                                                 && app.worlds[idx].settings.has_connection_settings()
@@ -14245,11 +14255,19 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                         from_server: false,
                                     });
                                 }
-                                // UI popup commands - handled client-side, no-op on server
-                                Command::Help | Command::Version | Command::Menu | Command::Setup | Command::Web | Command::Actions { .. } |
+                                // UI popup commands - send back to client for local handling
+                                Command::Help | Command::Menu | Command::Setup | Command::Web | Command::Actions { .. } |
                                 Command::WorldsList | Command::WorldSelector | Command::WorldEdit { .. } => {
-                                    // These are handled by the GUI/web interface locally
-                                    // No server action needed
+                                    app.ws_send_to_client(client_id, WsMessage::ExecuteLocalCommand { command: command.clone() });
+                                }
+                                Command::Version => {
+                                    app.ws_send_to_client(client_id, WsMessage::ServerData {
+                                        world_index,
+                                        data: get_version_string(),
+                                        is_viewed: false,
+                                        ts: current_timestamp_secs(),
+                                        from_server: false,
+                                    });
                                 }
                                 // AddWorld - add or update world definition
                                 Command::AddWorld { name, host, port, user, password, use_ssl } => {
@@ -14315,6 +14333,8 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                         app.ws_client_worlds.insert(client_id, ClientViewState { world_index: idx, visible_lines, dimensions });
                                         app.ws_set_client_world(client_id, Some(idx));
                                         app.ws_send_to_client(client_id, WsMessage::WorldSwitched { new_index: idx });
+                                        // Also send ExecuteLocalCommand so web clients can switch their local view
+                                        app.ws_send_to_client(client_id, WsMessage::ExecuteLocalCommand { command: command.clone() });
                                         // Note: Connection requires async, use ConnectWorld message
                                     } else {
                                         app.ws_send_to_client(client_id, WsMessage::ServerData {
@@ -22830,5 +22850,63 @@ mod tests {
 
         let _ = server1.await;
         let _ = server2.await;
+    }
+
+    /// Structural comparison test: verify that the JS INTERNAL_COMMANDS list in app.js
+    /// matches the command strings handled by Rust's parse_command().
+    /// This catches drift when commands are added to Rust but not to JS (or vice versa).
+    #[test]
+    fn test_command_parity_js_vs_rust() {
+        // --- Extract JS INTERNAL_COMMANDS from app.js ---
+        let app_js = std::fs::read_to_string("src/web/app.js")
+            .expect("Failed to read src/web/app.js");
+
+        // Find the INTERNAL_COMMANDS array
+        let start_marker = "const INTERNAL_COMMANDS = [";
+        let start_pos = app_js.find(start_marker)
+            .expect("Could not find INTERNAL_COMMANDS in app.js");
+        let after_start = &app_js[start_pos + start_marker.len()..];
+        let end_pos = after_start.find(']')
+            .expect("Could not find closing ] for INTERNAL_COMMANDS");
+        let array_content = &after_start[..end_pos];
+
+        // Parse the comma-separated quoted strings
+        let mut js_commands: Vec<String> = Vec::new();
+        for part in array_content.split(',') {
+            let trimmed = part.trim().trim_matches('\'').trim_matches('"');
+            if !trimmed.is_empty() {
+                js_commands.push(trimmed.to_lowercase());
+            }
+        }
+        js_commands.sort();
+        js_commands.dedup();
+
+        // --- Build expected command list from Rust parse_command() ---
+        // These are the command strings (without /) that parse_command() matches on.
+        // When adding a new command to parse_command(), add it here too.
+        let mut rust_commands: Vec<String> = vec![
+            "help", "version", "quit", "reload", "setup", "web", "actions",
+            "connections", "l", "worlds", "world", "connect", "disconnect", "dc",
+            "flush", "menu", "send", "keepalive", "gag", "ban", "unban",
+            "testmusic", "dump", "notify", "addworld", "edit", "tag", "tags",
+            "dict", "urban", "translate", "tr",
+        ].into_iter().map(|s| s.to_string()).collect();
+        rust_commands.sort();
+        rust_commands.dedup();
+
+        // --- Compare ---
+        let js_set: std::collections::HashSet<&str> = js_commands.iter().map(|s| s.as_str()).collect();
+        let rust_set: std::collections::HashSet<&str> = rust_commands.iter().map(|s| s.as_str()).collect();
+
+        let missing_from_js: Vec<&&str> = rust_set.difference(&js_set).collect();
+        let extra_in_js: Vec<&&str> = js_set.difference(&rust_set).collect();
+
+        assert!(missing_from_js.is_empty() && extra_in_js.is_empty(),
+            "Command parity mismatch between Rust parse_command() and JS INTERNAL_COMMANDS!\n\
+             Missing from JS (present in Rust): {:?}\n\
+             Extra in JS (not in Rust): {:?}\n\
+             \n\
+             To fix: update INTERNAL_COMMANDS in src/web/app.js and rust_commands in this test.",
+            missing_from_js, extra_in_js);
     }
 }

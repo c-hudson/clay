@@ -929,10 +929,19 @@ pub async fn handle_daemon_ws_message(
                         from_server: false,
                     });
                 }
-                // UI popup commands - handled client-side, no-op on server
-                Command::Help | Command::Version | Command::Menu | Command::Setup | Command::Web | Command::Actions { .. } |
+                // UI popup commands - send back to client for local handling
+                Command::Help | Command::Menu | Command::Setup | Command::Web | Command::Actions { .. } |
                 Command::WorldsList | Command::WorldSelector | Command::WorldEdit { .. } => {
-                    // These are handled by the GUI/web interface locally
+                    app.ws_send_to_client(client_id, WsMessage::ExecuteLocalCommand { command: command.clone() });
+                }
+                Command::Version => {
+                    app.ws_send_to_client(client_id, WsMessage::ServerData {
+                        world_index,
+                        data: get_version_string(),
+                        is_viewed: false,
+                        ts: current_timestamp_secs(),
+                        from_server: false,
+                    });
                 }
                 // AddWorld - add or update world definition
                 Command::AddWorld { name, host, port, user, password, use_ssl } => {
@@ -1034,6 +1043,8 @@ pub async fn handle_daemon_ws_message(
                     if let Some(idx) = app.worlds.iter().position(|w| w.name.eq_ignore_ascii_case(name)) {
                         app.switch_world(idx);
                         app.ws_broadcast(WsMessage::WorldSwitched { new_index: idx });
+                        // Also send ExecuteLocalCommand so web clients can switch their local view
+                        app.ws_send_to_client(client_id, WsMessage::ExecuteLocalCommand { command: command.clone() });
                         // Connect if not connected and has settings
                         if !app.worlds[idx].connected
                             && app.worlds[idx].settings.has_connection_settings()

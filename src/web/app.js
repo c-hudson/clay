@@ -18,11 +18,11 @@
     const elements = {
         output: document.getElementById('output'),
         outputContainer: document.getElementById('output-container'),
-        statusIndicator: document.getElementById('status-indicator'),
-        connectionStatus: document.getElementById('connection-status'),
+        statusDot: document.getElementById('status-dot'),
         worldName: document.getElementById('world-name'),
+        statusMore: document.getElementById('status-more'),
         activityIndicator: document.getElementById('activity-indicator'),
-        separatorFill: document.getElementById('separator-fill'),
+        activityCount: document.getElementById('activity-count'),
         statusTime: document.getElementById('status-time'),
         statusBar: document.getElementById('status-bar'),
         inputContainer: document.getElementById('input-container'),
@@ -58,22 +58,21 @@
         passwordSaveBtn: document.getElementById('password-save-btn'),
         passwordCancelBtn: document.getElementById('password-cancel-btn'),
         connectingOverlay: document.getElementById('connecting-overlay'),
-        // Toolbar (desktop)
-        toolbar: document.getElementById('toolbar'),
+        // Menu
         menuBtn: document.getElementById('menu-btn'),
         menuDropdown: document.getElementById('menu-dropdown'),
-        fontSlider: document.getElementById('font-slider'),
-        fontSliderHandle: document.querySelector('#font-slider .slider-handle'),
-        // Mobile toolbar
-        mobileToolbar: document.getElementById('mobile-toolbar'),
-        mobileMenuBtn: document.getElementById('mobile-menu-btn'),
-        mobileMenuDropdown: document.getElementById('mobile-menu-dropdown'),
-        mobilePgUpBtn: document.getElementById('mobile-pgup-btn'),
-        mobileUpBtn: document.getElementById('mobile-up-btn'),
-        mobileDownBtn: document.getElementById('mobile-down-btn'),
-        mobilePgDnBtn: document.getElementById('mobile-pgdn-btn'),
-        mobileFontSlider: document.getElementById('mobile-font-slider'),
-        mobileFontSliderHandle: document.querySelector('#mobile-font-slider .slider-handle'),
+        // Font slider (status bar)
+        fontSliderInput: document.getElementById('font-slider'),
+        fontSliderVal: document.getElementById('font-slider-val'),
+        // Nav bar (tablet/phone)
+        navBar: document.getElementById('nav-bar'),
+        navMenuBtn: document.getElementById('nav-menu-btn'),
+        navPgUpBtn: document.getElementById('nav-pgup-btn'),
+        navPgDnBtn: document.getElementById('nav-pgdn-btn'),
+        navUpBtn: document.getElementById('nav-up-btn'),
+        navDownBtn: document.getElementById('nav-down-btn'),
+        navFontSlider: document.getElementById('nav-font-slider'),
+        navFontSliderVal: document.getElementById('nav-font-slider-val'),
         // Actions List popup
         actionsListModal: document.getElementById('actions-list-modal'),
         actionFilter: document.getElementById('action-filter'),
@@ -307,11 +306,9 @@
 
     // Menu state
     let menuOpen = false;
-    let mobileMenuOpen = false;
 
-    // Font size state: position 0-3 mapping to [8.5, 12, 14, 18] pixels
-    let currentFontPos = 2;  // Default to position 2 (14px)
-    const fontSizes = [8.5, 12, 14, 18];
+    // Font size state: pixel value (9-20 range)
+    let currentFontSize = 14;  // Default to 14px
 
     // Per-device font size tracking (saved separately for phone/tablet/desktop)
     let deviceType = 'desktop';  // 'phone', 'tablet', or 'desktop'
@@ -320,21 +317,12 @@
     let webFontSizeTablet = 14.0;
     let webFontSizeDesktop = 18.0;
 
-    // Convert pixel size to closest font position
-    function fontPosFromPixels(px) {
-        let closest = 0;
-        let minDiff = Math.abs(fontSizes[0] - px);
-        for (let i = 1; i < fontSizes.length; i++) {
-            const diff = Math.abs(fontSizes[i] - px);
-            if (diff < minDiff) {
-                minDiff = diff;
-                closest = i;
-            }
-        }
-        return closest;
+    // Clamp font size to valid range
+    function clampFontSize(px) {
+        return Math.max(9, Math.min(20, Math.round(px)));
     }
 
-    // Device mode: 'desktop' or 'mobile'
+    // Device mode: 'desktop', 'tablet', or 'phone'
     let deviceMode = 'desktop';
 
     // ANSI Music audio context (lazily initialized)
@@ -366,37 +354,17 @@
     }
 
     // ============================================================================
-    // Command Parsing (mirrors Rust parse_command)
+    // Command Definitions (single source of truth is Rust's parse_command)
     // ============================================================================
 
-    // Command types enum (as object)
-    const CommandType = {
-        HELP: 'Help',
-        MENU: 'Menu',
-        QUIT: 'Quit',
-        RELOAD: 'Reload',
-        SETUP: 'Settings',
-        WEB: 'Web',
-        ACTIONS: 'Actions',
-        WORLDS_LIST: 'WorldsList',
-        WORLD_SELECTOR: 'WorldSelector',
-        WORLD_EDIT: 'WorldEdit',
-        WORLD_CONNECT_NO_LOGIN: 'WorldConnectNoLogin',
-        WORLD_SWITCH: 'WorldSwitch',
-        CONNECT: 'Connect',
-        DISCONNECT: 'Disconnect',
-        SEND: 'Send',
-        KEEPALIVE: 'Keepalive',
-        GAG: 'Gag',
-        ACTION_COMMAND: 'ActionCommand',
-        NOT_A_COMMAND: 'NotACommand',
-        UNKNOWN: 'Unknown'
-    };
-
-    // Internal commands that are handled by the server (not action names)
+    // Internal commands for tab completion (must match Rust parse_command match arms)
+    // This list is verified by test_command_parity_js_vs_rust in main.rs
     const INTERNAL_COMMANDS = [
-        'help', 'menu', 'quit', 'reload', 'setup', 'web', 'actions', 'worlds', 'connections',
-        'l', 'disconnect', 'dc', 'send', 'keepalive', 'gag'
+        'help', 'version', 'quit', 'reload', 'setup', 'web', 'actions',
+        'worlds', 'world', 'connections', 'l', 'connect', 'disconnect', 'dc',
+        'flush', 'menu', 'send', 'keepalive', 'gag', 'ban', 'unban',
+        'testmusic', 'dump', 'notify', 'addworld', 'edit', 'tag', 'tags',
+        'dict', 'urban', 'translate', 'tr',
     ];
 
     function isInternalCommand(name) {
@@ -548,131 +516,9 @@
         elements.input.selectionStart = elements.input.selectionEnd = elements.input.value.length;
     }
 
-    // Parse a command string and return command object
-    function parseCommand(input) {
-        const trimmed = input.trim();
-
-        // Not a command if doesn't start with /
-        if (!trimmed.startsWith('/')) {
-            return { type: CommandType.NOT_A_COMMAND, text: trimmed };
-        }
-
-        const parts = trimmed.split(/\s+/);
-        if (parts.length === 0) {
-            return { type: CommandType.NOT_A_COMMAND, text: trimmed };
-        }
-
-        const cmd = parts[0].toLowerCase();
-        const args = parts.slice(1);
-
-        switch (cmd) {
-            case '/help':
-                return { type: CommandType.HELP };
-            case '/menu':
-                return { type: CommandType.MENU };
-            case '/quit':
-                return { type: CommandType.QUIT };
-            case '/reload':
-                return { type: CommandType.RELOAD };
-            case '/setup':
-                return { type: CommandType.SETUP };
-            case '/web':
-                return { type: CommandType.WEB };
-            case '/actions':
-                return { type: CommandType.ACTIONS, world: args.join(' ') || null };
-            case '/connections':
-            case '/l':
-                return { type: CommandType.WORLDS_LIST };
-            case '/worlds':
-            case '/world':
-                return parseWorldCommand(args);
-            case '/connect':
-                return parseConnectCommand(args);
-            case '/disconnect':
-            case '/dc':
-                return { type: CommandType.DISCONNECT };
-            case '/send':
-                return parseSendCommand(args, trimmed);
-            case '/keepalive':
-                return { type: CommandType.KEEPALIVE };
-            case '/gag':
-                if (args.length === 0) {
-                    return { type: CommandType.UNKNOWN, cmd: trimmed };
-                }
-                return { type: CommandType.GAG, pattern: args.join(' ') };
-            default:
-                // Check if it's an action command (starts with / but not a known command)
-                const actionName = cmd.slice(1);
-                if (actionName && !isInternalCommand(actionName)) {
-                    return { type: CommandType.ACTION_COMMAND, name: actionName, args: args.join(' ') };
-                }
-                return { type: CommandType.UNKNOWN, cmd: trimmed };
-        }
-    }
-
-    // Parse /worlds command variants
-    function parseWorldCommand(args) {
-        if (args.length === 0) {
-            return { type: CommandType.WORLD_SELECTOR };
-        }
-
-        if (args[0] === '-e') {
-            // /worlds -e [name]
-            const name = args.length > 1 ? args.slice(1).join(' ') : null;
-            return { type: CommandType.WORLD_EDIT, name: name };
-        }
-
-        if (args[0] === '-l') {
-            // /worlds -l <name>
-            if (args.length > 1) {
-                return { type: CommandType.WORLD_CONNECT_NO_LOGIN, name: args.slice(1).join(' ') };
-            }
-            return { type: CommandType.UNKNOWN, cmd: '/worlds -l' };
-        }
-
-        // /worlds <name>
-        return { type: CommandType.WORLD_SWITCH, name: args.join(' ') };
-    }
-
-    // Parse /connect command
-    function parseConnectCommand(args) {
-        if (args.length === 0) {
-            return { type: CommandType.CONNECT, host: null, port: null, ssl: false };
-        }
-
-        const host = args[0];
-        const port = args.length > 1 ? args[1] : null;
-        const ssl = args.length > 2 && args[2].toLowerCase() === 'ssl';
-
-        return { type: CommandType.CONNECT, host: host, port: port, ssl: ssl };
-    }
-
-    // Parse /send command with flags
-    function parseSendCommand(args, fullCmd) {
-        let allWorlds = false;
-        let targetWorld = null;
-        let noNewline = false;
-        let textStart = 0;
-
-        for (let i = 0; i < args.length; i++) {
-            const arg = args[i];
-            if (arg === '-W') {
-                allWorlds = true;
-                textStart = i + 1;
-            } else if (arg.startsWith('-w')) {
-                targetWorld = arg.slice(2) || (args[i + 1] || '');
-                textStart = arg.length > 2 ? i + 1 : i + 2;
-            } else if (arg === '-n') {
-                noNewline = true;
-                textStart = i + 1;
-            } else {
-                break;
-            }
-        }
-
-        const text = args.slice(textStart).join(' ');
-        return { type: CommandType.SEND, text: text, allWorlds: allWorlds, targetWorld: targetWorld, noNewline: noNewline };
-    }
+    // Command parsing is handled server-side by Rust's parse_command().
+    // Web client sends all commands to the server via SendCommand message.
+    // Server responds with ExecuteLocalCommand for UI/popup commands.
 
     // ============================================================================
     // Device Detection
@@ -685,11 +531,11 @@
         if (deviceModeOverride) {
             deviceType = deviceModeOverride;
             if (deviceModeOverride === 'phone') {
-                return { fontPos: fontPosFromPixels(webFontSizePhone), mode: 'mobile', device: 'phone' };
+                return { fontSize: clampFontSize(webFontSizePhone), mode: 'phone', device: 'phone' };
             } else if (deviceModeOverride === 'tablet') {
-                return { fontPos: fontPosFromPixels(webFontSizeTablet), mode: 'mobile', device: 'tablet' };
+                return { fontSize: clampFontSize(webFontSizeTablet), mode: 'tablet', device: 'tablet' };
             } else {
-                return { fontPos: fontPosFromPixels(webFontSizeDesktop), mode: 'desktop', device: 'desktop' };
+                return { fontSize: clampFontSize(webFontSizeDesktop), mode: 'desktop', device: 'desktop' };
             }
         }
 
@@ -699,23 +545,23 @@
         // Phone: narrow screen (< 768px)
         if (width < 768) {
             deviceType = 'phone';
-            return { fontPos: fontPosFromPixels(webFontSizePhone), mode: 'mobile', device: 'phone' };
+            return { fontSize: clampFontSize(webFontSizePhone), mode: 'phone', device: 'phone' };
         }
         // Tablet: medium screen with touch (768-1024px)
         if (width <= 1024 && hasTouch) {
             deviceType = 'tablet';
-            return { fontPos: fontPosFromPixels(webFontSizeTablet), mode: 'mobile', device: 'tablet' };
+            return { fontSize: clampFontSize(webFontSizeTablet), mode: 'tablet', device: 'tablet' };
         }
         // Desktop: wide screen or no touch
         deviceType = 'desktop';
-        return { fontPos: fontPosFromPixels(webFontSizeDesktop), mode: 'desktop', device: 'desktop' };
+        return { fontSize: clampFontSize(webFontSizeDesktop), mode: 'desktop', device: 'desktop' };
     }
 
     // Helper to focus input and ensure keyboard shows on mobile
     function focusInputWithKeyboard() {
         elements.input.focus();
         // On Android, sometimes need to set selection to trigger keyboard
-        if (deviceMode === 'mobile') {
+        if (deviceMode === 'phone' || deviceMode === 'tablet') {
             const len = elements.input.value.length;
             elements.input.setSelectionRange(len, len);
         }
@@ -847,20 +693,16 @@
         // Set override (null for auto)
         deviceModeOverride = mode === 'auto' ? null : mode;
 
-        // Remove mobile class first
-        document.body.classList.remove('is-mobile');
-
         // Destroy existing custom dropdowns
         destroyCustomDropdowns();
 
         // Re-detect device type with new override
         const device = detectDeviceType();
-        setFontPos(device.fontPos);
+        setFontSize(device.fontSize);
         setupToolbars(device.mode);
 
         // Re-init custom dropdowns if mobile mode
-        if (device.mode === 'mobile') {
-            document.body.classList.add('is-mobile');
+        if (device.mode === 'phone' || device.mode === 'tablet') {
             initCustomDropdowns();
         }
 
@@ -868,23 +710,16 @@
         appendClientLine('Device mode set to: ' + (mode === 'auto' ? 'Auto (' + device.device + ')' : mode));
     }
 
-    // Setup toolbars based on device mode
+    // Setup layout based on device mode
     function setupToolbars(mode) {
         deviceMode = mode;
-        if (mode === 'mobile') {
-            // Hide desktop toolbar, show mobile toolbar
-            elements.toolbar.style.display = 'none';
-            elements.mobileToolbar.style.display = '';  // Clear inline style
-            elements.mobileToolbar.classList.add('visible');
-            // Remove top padding since no fixed toolbar
-            elements.outputContainer.style.paddingTop = '2px';
-        } else {
-            // Show desktop toolbar, hide mobile toolbar
-            elements.toolbar.style.display = 'flex';
-            elements.mobileToolbar.style.display = '';  // Clear inline style
-            elements.mobileToolbar.classList.remove('visible');
-            // Add padding for fixed toolbar
-            elements.outputContainer.style.paddingTop = '40px';
+        // Remove all device classes
+        document.body.classList.remove('device-desktop', 'device-tablet', 'device-phone', 'is-mobile');
+        // Add the appropriate device class
+        document.body.classList.add('device-' + mode);
+        // Add is-mobile class for mobile-specific behaviors
+        if (mode === 'phone' || mode === 'tablet') {
+            document.body.classList.add('is-mobile');
         }
     }
 
@@ -916,13 +751,11 @@
 
         // Detect device type and configure UI
         const device = detectDeviceType();
-        setFontPos(device.fontPos);
+        setFontSize(device.fontSize);
         setupToolbars(device.mode);
 
-        // Add mobile class for CSS targeting
-        if (device.mode === 'mobile') {
-            document.body.classList.add('is-mobile');
-            // Create custom dropdowns to replace native selects on mobile
+        // Create custom dropdowns on mobile
+        if (device.mode === 'phone' || device.mode === 'tablet') {
             initCustomDropdowns();
         }
 
@@ -968,7 +801,7 @@
 
     // Get visible line count in output area
     function getVisibleLineCount() {
-        const fontSize = fontSizes[currentFontPos] || 14;
+        const fontSize = currentFontSize || 14;
         const lineHeight = fontSize * 1.2; // font-size * line-height
         return Math.floor(elements.outputContainer.clientHeight / lineHeight);
     }
@@ -1644,8 +1477,7 @@
                     // Pick the right font size based on current device type
                     const fontPx = deviceType === 'phone' ? webFontSizePhone :
                                    deviceType === 'tablet' ? webFontSizeTablet : webFontSizeDesktop;
-                    const pos = fontPosFromPixels(fontPx);
-                    setFontPos(pos, false);  // Don't send back to server
+                    setFontSize(clampFontSize(fontPx), false);  // Don't send back to server
                 }
                 renderOutput();
                 updateStatusBar();
@@ -2034,6 +1866,9 @@
 
             case 'PendingReleased':
                 // Server/another client released pending lines - sync our state
+                // Reset linesSincePause because released lines are broadcast as ServerData
+                // and would otherwise inflate the counter, causing premature more-mode trigger
+                linesSincePause = 0;
                 if (msg.world_index === currentWorldIndex && msg.count > 0) {
                     doReleasePending(msg.count);
                 }
@@ -2450,70 +2285,14 @@
         return H.map(h => h.toString(16).padStart(8, '0')).join('');
     }
 
-    // Send command
+    // Send command - all commands are sent to the server for parsing via Rust's
+    // parse_command(). Server handles data commands directly and responds with
+    // ExecuteLocalCommand for UI/popup commands.
     function sendCommand() {
         const cmd = elements.input.value;
         // Don't send empty commands, or any commands if not authenticated
         if (cmd.length === 0) return;
         if (!authenticated) return;
-
-        // Use shared command parsing
-        const parsed = parseCommand(cmd);
-
-        // Handle local popup commands
-        switch (parsed.type) {
-            case CommandType.ACTIONS:
-                elements.input.value = '';
-                openActionsListPopup(parsed.world);
-                return;
-
-            case CommandType.WEB:
-                elements.input.value = '';
-                openWebPopup();
-                return;
-
-            case CommandType.SETUP:
-                elements.input.value = '';
-                openSetupPopup();
-                return;
-
-            case CommandType.WORLDS_LIST:
-                elements.input.value = '';
-                outputWorldsList();
-                return;
-
-            case CommandType.WORLD_SELECTOR:
-                elements.input.value = '';
-                openWorldSelectorPopup();
-                return;
-
-            case CommandType.WORLD_SWITCH:
-                elements.input.value = '';
-                handleWorldCommand(parsed.name);
-                return;
-
-            case CommandType.WORLD_EDIT:
-                elements.input.value = '';
-                // Find the world to edit
-                if (parsed.name) {
-                    const idx = worlds.findIndex(w => w.name.toLowerCase() === parsed.name.toLowerCase());
-                    if (idx >= 0) {
-                        openWorldEditorPopup(idx);
-                    }
-                } else {
-                    // Edit current world
-                    openWorldEditorPopup(currentWorldIndex);
-                }
-                return;
-
-            case CommandType.WORLD_CONNECT_NO_LOGIN:
-                // Connect without auto-login - send to server
-                break;
-
-            default:
-                // All other commands - continue to send to server
-                break;
-        }
 
         // Release all pending lines when sending a command
         if (paused) {
@@ -2548,59 +2327,76 @@
         elements.prompt.textContent = '';
     }
 
-    // Execute a command locally (called from server via ExecuteLocalCommand message)
-    // Used when action commands contain /commands that should open popups
+    // Execute a command locally (called from server via ExecuteLocalCommand message).
+    // The server's parse_command() is the single source of truth for command parsing.
+    // This function only handles the UI/popup side of commands.
     function executeLocalCommand(cmd) {
-        const parsed = parseCommand(cmd);
+        const trimmed = cmd.trim();
+        const parts = trimmed.split(/\s+/);
+        const firstWord = parts[0].toLowerCase();
+        const args = parts.slice(1);
 
-        switch (parsed.type) {
-            case CommandType.ACTIONS:
-                openActionsListPopup(parsed.world);
+        switch (firstWord) {
+            case '/actions':
+                openActionsListPopup(args.join(' ') || null);
                 break;
 
-            case CommandType.WEB:
+            case '/web':
                 openWebPopup();
                 break;
 
-            case CommandType.SETUP:
+            case '/setup':
                 openSetupPopup();
                 break;
 
-            case CommandType.WORLDS_LIST:
+            case '/connections':
+            case '/l':
                 outputWorldsList();
                 break;
 
-            case CommandType.WORLD_SELECTOR:
-                openWorldSelectorPopup();
-                break;
-
-            case CommandType.WORLD_SWITCH:
-                handleWorldCommand(parsed.name);
-                break;
-
-            case CommandType.WORLD_EDIT:
-                // Open world editor
-                if (parsed.name) {
-                    const idx = worlds.findIndex(w => w.name.toLowerCase() === parsed.name.toLowerCase());
-                    if (idx >= 0) {
-                        openWorldEditorPopup(idx);
+            case '/worlds':
+            case '/world':
+                if (args.length === 0) {
+                    openWorldSelectorPopup();
+                } else if (args[0] === '-e') {
+                    // /worlds -e [name] - open world editor
+                    const name = args.length > 1 ? args.slice(1).join(' ') : null;
+                    if (name) {
+                        const idx = worlds.findIndex(w => w.name.toLowerCase() === name.toLowerCase());
+                        if (idx >= 0) openWorldEditorPopup(idx);
+                    } else {
+                        openWorldEditorPopup(currentWorldIndex);
+                    }
+                } else if (args[0] === '-l') {
+                    // /worlds -l <name> - server already connected, just switch local view
+                    if (args.length > 1) {
+                        const name = args.slice(1).join(' ');
+                        const idx = worlds.findIndex(w => w.name.toLowerCase() === name.toLowerCase());
+                        if (idx >= 0) switchWorldLocal(idx);
                     }
                 } else {
-                    openWorldEditorPopup(currentWorldIndex);
+                    // /worlds <name> - server already connected if needed, switch local view
+                    const name = args.join(' ');
+                    const idx = worlds.findIndex(w => w.name.toLowerCase() === name.toLowerCase());
+                    if (idx >= 0) switchWorldLocal(idx);
                 }
                 break;
 
-            case CommandType.HELP:
+            case '/help':
                 // Help popup not implemented in web, just ignore
                 break;
 
-            case CommandType.MENU:
+            case '/menu':
                 openMenuPopup();
+                break;
+
+            case '/edit':
+                // Open split-screen editor locally
+                // (handled by specific client-side logic if implemented)
                 break;
 
             default:
                 // For commands not handled locally, send to server
-                // (e.g., /send, /disconnect)
                 send({
                     type: 'SendCommand',
                     world_index: currentWorldIndex,
@@ -3857,51 +3653,48 @@
         return n.toString().padStart(4, ' ');
     }
 
-    // Update status bar (console-style with underscores)
+    // Update status bar
     function updateStatusBar() {
         const world = worlds[currentWorldIndex];
 
-        // Status indicator: shows Hist/More when active, underscores when idle (9 chars)
-        // Priority: Hist (scrolled back) > More (pending lines) > underscores
+        // Connection dot and world name
+        if (world && world.name && world.was_connected) {
+            elements.statusDot.className = 'status-dot' + (world.connected ? '' : ' off');
+            const gmcpInd = (world && world.gmcp_user_enabled) ? ' [g]' : '';
+            elements.worldName.textContent = world.name + gmcpInd;
+            elements.statusDot.style.display = '';
+            elements.worldName.style.display = '';
+        } else {
+            elements.statusDot.style.display = 'none';
+            elements.worldName.style.display = 'none';
+        }
+
+        // More/Hist badge
         const serverPending = world ? (world.pending_count || 0) : 0;
         const totalPending = pendingLines.length + serverPending;
         if (!isAtBottom()) {
-            // Show Hist indicator when scrolled back (takes precedence over More)
             const container = elements.outputContainer;
-            const fontSize = fontSizes[currentFontPos] || 14;
+            const fontSize = currentFontSize || 14;
             const lineHeight = fontSize * 1.2;
             const linesFromBottom = Math.floor((container.scrollHeight - container.scrollTop - container.clientHeight) / lineHeight);
-            elements.statusIndicator.textContent = 'Hist ' + formatCount(linesFromBottom);
-            elements.statusIndicator.className = 'scrolled';
+            elements.statusMore.textContent = 'Hist ' + formatCount(linesFromBottom);
+            elements.statusMore.className = 'status-more scrolled';
+            elements.statusMore.style.display = '';
         } else if ((paused && pendingLines.length > 0) || serverPending > 0) {
-            // Show More indicator when paused with pending lines
-            elements.statusIndicator.textContent = 'More ' + formatCount(totalPending);
-            elements.statusIndicator.className = 'paused';
+            elements.statusMore.textContent = 'More ' + formatCount(totalPending);
+            elements.statusMore.className = 'status-more paused';
+            elements.statusMore.style.display = '';
         } else {
-            elements.statusIndicator.textContent = '__________';
-            elements.statusIndicator.className = '';
+            elements.statusMore.style.display = 'none';
         }
 
-        // Only show connection ball and world name if world has ever connected
-        if (world && world.name && world.was_connected) {
-            elements.connectionStatus.textContent = world.connected ? '🟢' : '🔴';
-            const gmcpInd = (world && world.gmcp_user_enabled) ? ' [g]' : '';
-            elements.worldName.textContent = ' ' + world.name + gmcpInd;
+        // Activity badge
+        if (serverActivityCount > 0) {
+            elements.activityCount.textContent = serverActivityCount;
+            elements.activityIndicator.style.display = '';
         } else {
-            elements.connectionStatus.textContent = '';
-            elements.worldName.textContent = '';
+            elements.activityIndicator.style.display = 'none';
         }
-
-        // Activity indicator - use server's count directly (console broadcasts this value)
-        elements.activityIndicator.textContent = serverActivityCount > 0 ? ` (Activity: ${serverActivityCount})` : '';
-
-        // Fill remaining space with underscores
-        // Calculate how many underscores fit based on container width and font size
-        const fillWidth = elements.separatorFill.offsetWidth || window.innerWidth;
-        const fontSize = fontSizes[currentFontPos] || 14;
-        const charWidth = fontSize * 0.6; // Approximate width ratio for monospace
-        const numUnderscores = Math.ceil(fillWidth / charWidth) + 20; // Add buffer
-        elements.separatorFill.textContent = '_'.repeat(Math.max(200, numUnderscores));
     }
 
     // Update time (12-hour format, no leading zeros)
@@ -3917,7 +3710,7 @@
     // Set input area height (number of lines)
     function setInputHeight(lines) {
         inputHeight = Math.max(1, Math.min(15, lines));
-        const fontSize = fontSizes[currentFontPos] || 14;
+        const fontSize = currentFontSize || 14;
         const lineHeight = 1.2 * fontSize; // line-height * font-size
         elements.input.style.height = (inputHeight * lineHeight) + 'px';
         elements.input.rows = inputHeight;
@@ -3965,14 +3758,12 @@
         if (show) {
             // Hide all UI elements when showing auth modal
             elements.output.innerHTML = '';
-            if (elements.toolbar) elements.toolbar.style.display = 'none';
-            if (elements.mobileToolbar) elements.mobileToolbar.style.display = 'none';
             if (elements.statusBar) elements.statusBar.style.display = 'none';
+            if (elements.navBar) elements.navBar.style.display = 'none';
             if (elements.inputContainer) elements.inputContainer.style.display = 'none';
             if (elements.outputContainer) elements.outputContainer.style.display = 'none';
             // Close any open menus
             closeMenu();
-            closeMobileMenu();
             elements.authPassword.value = '';
             elements.authError.textContent = '';
             if (elements.authUsername) {
@@ -3980,9 +3771,9 @@
             }
         } else {
             // Restore UI elements when hiding auth modal
-            // Re-apply toolbar visibility based on device mode
             setupToolbars(deviceMode);
             if (elements.statusBar) elements.statusBar.style.display = '';
+            if (elements.navBar) elements.navBar.style.display = '';
             if (elements.inputContainer) elements.inputContainer.style.display = '';
             if (elements.outputContainer) elements.outputContainer.style.display = '';
         }
@@ -4119,12 +3910,12 @@
         // Each item is approximately 26px (padding + content + border)
         const itemHeight = 26;
         const minHeight = 80;  // At least show a few items
-        // Calculate available height: window height minus toolbar, separator, input, and popup chrome
-        const separatorHeight = elements.separator ? elements.separator.offsetHeight : 20;
-        const inputHeight = elements.inputContainer ? elements.inputContainer.offsetHeight : 80;
-        const toolbarHeight = elements.toolbar ? elements.toolbar.offsetHeight : 40;
+        // Calculate available height: window height minus status bar, nav bar, input, and popup chrome
+        const statusBarHeight = elements.statusBar ? elements.statusBar.offsetHeight : 26;
+        const navBarHeight = elements.navBar ? elements.navBar.offsetHeight : 0;
+        const inputContainerHeight = elements.inputContainer ? elements.inputContainer.offsetHeight : 80;
         const popupChrome = 180; // Approximate space for popup header, filter, buttons, margins
-        const maxAvailable = window.innerHeight - separatorHeight - inputHeight - toolbarHeight - popupChrome;
+        const maxAvailable = window.innerHeight - statusBarHeight - navBarHeight - inputContainerHeight - popupChrome;
         // Height needed to show all filtered items
         const neededHeight = filteredIndices.length * itemHeight;
         // Use the smaller of needed or available, but at least minHeight
@@ -5278,34 +5069,27 @@
         }
     }
 
-    // Toggle hamburger menu (desktop)
-    function toggleMenu() {
+    // Toggle menu dropdown (unified - opens upward from button)
+    function toggleMenu(anchorBtn) {
         menuOpen = !menuOpen;
-        elements.menuDropdown.className = 'dropdown' + (menuOpen ? ' visible' : '');
+        if (menuOpen && anchorBtn) {
+            // Position dropdown above the anchor button
+            const rect = anchorBtn.getBoundingClientRect();
+            elements.menuDropdown.style.bottom = (window.innerHeight - rect.top + 4) + 'px';
+            elements.menuDropdown.style.left = rect.left + 'px';
+        }
+        elements.menuDropdown.classList.toggle('visible', menuOpen);
     }
 
-    // Close hamburger menu (desktop)
+    // Close menu dropdown
     function closeMenu() {
         menuOpen = false;
-        elements.menuDropdown.className = 'dropdown';
-    }
-
-    // Toggle mobile menu
-    function toggleMobileMenu() {
-        mobileMenuOpen = !mobileMenuOpen;
-        elements.mobileMenuDropdown.className = 'dropdown' + (mobileMenuOpen ? ' visible' : '');
-    }
-
-    // Close mobile menu
-    function closeMobileMenu() {
-        mobileMenuOpen = false;
-        elements.mobileMenuDropdown.className = 'dropdown';
+        elements.menuDropdown.classList.remove('visible');
     }
 
     // Handle menu item click
     function handleMenuItem(action) {
         closeMenu();
-        closeMobileMenu();
         switch (action) {
             case 'worlds':
                 outputWorldsList();
@@ -5328,10 +5112,8 @@
                 renderOutput();
                 focusInputWithKeyboard();
                 break;
-            case 'toggle-highlight':
-                highlightActions = !highlightActions;
-                renderOutput();
-                focusInputWithKeyboard();
+            case 'filter':
+                openFilterPopup();
                 break;
             case 'resync':
                 // On Android, call native reload method if available
@@ -5390,69 +5172,15 @@
         }
     }
 
-    // Setup slider event handlers
-    function setupSlider(slider, handle) {
-        if (!slider || !handle) return;
-
-        const sliderWidth = 80;  // Match CSS width
-        const handleRadius = 6;  // Half of handle width
-
-        function posFromX(clientX) {
-            const rect = slider.getBoundingClientRect();
-            const x = clientX - rect.left;
-            // Positions are at: 6px, 28px, 50px, 72px (for positions 0-3)
-            const stepWidth = (sliderWidth - 2 * handleRadius) / 3;
-            const pos = Math.round((x - handleRadius) / stepWidth);
-            return Math.max(0, Math.min(3, pos));
-        }
-
-        slider.addEventListener('click', function(e) {
-            e.stopPropagation();
-            const newPos = posFromX(e.clientX);
-            if (newPos !== currentFontPos) {
-                setFontPos(newPos);
-            }
-            elements.input.focus();
-        });
-
-        // Touch support
-        slider.addEventListener('touchstart', function(e) {
-            e.preventDefault();
-            e.stopPropagation();
-            const touch = e.touches[0];
-            const newPos = posFromX(touch.clientX);
-            if (newPos !== currentFontPos) {
-                setFontPos(newPos);
-            }
-        }, { passive: false });
-
-        slider.addEventListener('touchmove', function(e) {
-            e.preventDefault();
-            e.stopPropagation();
-            const touch = e.touches[0];
-            const newPos = posFromX(touch.clientX);
-            if (newPos !== currentFontPos) {
-                setFontPos(newPos);
-            }
-        }, { passive: false });
-
-        slider.addEventListener('touchend', function(e) {
-            e.preventDefault();
-            e.stopPropagation();
-            focusInputWithKeyboard();
-        }, { passive: false });
-    }
-
-    // Set font size by position (0-3)
+    // Set font size by pixel value (9-20)
     // If sendToServer is true (default), save the font size to the server
-    function setFontPos(pos, sendToServer = true) {
-        pos = Math.max(0, Math.min(3, pos));
+    function setFontSize(px, sendToServer = true) {
+        px = clampFontSize(px);
 
         // Check if we were at the bottom before changing size
         const wasAtBottom = isAtBottom();
 
-        currentFontPos = pos;
-        const px = fontSizes[pos];
+        currentFontSize = px;
 
         // Update the per-device font size variable
         if (deviceType === 'phone') {
@@ -5466,12 +5194,18 @@
         // Update body font size
         document.body.style.fontSize = px + 'px';
 
-        // Update slider handles
-        if (elements.fontSliderHandle) {
-            elements.fontSliderHandle.setAttribute('data-pos', pos);
+        // Sync both range sliders
+        if (elements.fontSliderInput) {
+            elements.fontSliderInput.value = px;
         }
-        if (elements.mobileFontSliderHandle) {
-            elements.mobileFontSliderHandle.setAttribute('data-pos', pos);
+        if (elements.fontSliderVal) {
+            elements.fontSliderVal.textContent = px;
+        }
+        if (elements.navFontSlider) {
+            elements.navFontSlider.value = px;
+        }
+        if (elements.navFontSliderVal) {
+            elements.navFontSliderVal.textContent = px;
         }
 
         // If we were at the bottom, stay at the bottom after font size change
@@ -5540,7 +5274,7 @@
             }
             if (!menuLongPressed) {
                 e.stopPropagation();
-                toggleMenu();
+                toggleMenu(elements.menuBtn);
             }
             menuLongPressed = false;
         });
@@ -5568,113 +5302,109 @@
             }
             if (!menuLongPressed) {
                 e.preventDefault();
-                toggleMenu();
+                toggleMenu(elements.menuBtn);
             }
             menuLongPressed = false;
         }, { passive: false });
 
-        // Menu items
+        // Menu items (unified dropdown)
         elements.menuDropdown.onclick = function(e) {
             e.stopPropagation();
-            const item = e.target.closest('.dropdown-item');
+            const item = e.target.closest('.menu-item');
             if (item) {
                 handleMenuItem(item.dataset.action);
             }
         };
 
-        // Font size slider handler (desktop)
-        setupSlider(elements.fontSlider, elements.fontSliderHandle);
-        // Font size slider handler (mobile)
-        setupSlider(elements.mobileFontSlider, elements.mobileFontSliderHandle);
-
-        // Mobile toolbar buttons with long-press for device mode
-        let mobileLongPressTimer = null;
-        let mobileLongPressed = false;
-
-        // Mouse events for desktop browsers simulating mobile mode
-        elements.mobileMenuBtn.addEventListener('mousedown', function(e) {
-            mobileLongPressed = false;
-            mobileLongPressTimer = setTimeout(function() {
-                mobileLongPressed = true;
-                showDeviceModeModal();
-            }, 2000);
-        });
-
-        elements.mobileMenuBtn.addEventListener('click', function(e) {
-            if (mobileLongPressTimer) {
-                clearTimeout(mobileLongPressTimer);
-                mobileLongPressTimer = null;
-            }
-            if (!mobileLongPressed) {
+        // Font size range slider (status bar)
+        if (elements.fontSliderInput) {
+            elements.fontSliderInput.addEventListener('input', function(e) {
                 e.stopPropagation();
-                toggleMobileMenu();
-            }
-            mobileLongPressed = false;
-        });
+                setFontSize(parseInt(this.value));
+            });
+            elements.fontSliderInput.addEventListener('click', function(e) {
+                e.stopPropagation();
+            });
+        }
 
-        elements.mobileMenuBtn.addEventListener('mouseleave', function(e) {
-            if (mobileLongPressTimer) {
-                clearTimeout(mobileLongPressTimer);
-                mobileLongPressTimer = null;
-            }
-        });
+        // Font size range slider (nav bar)
+        if (elements.navFontSlider) {
+            elements.navFontSlider.addEventListener('input', function(e) {
+                e.stopPropagation();
+                setFontSize(parseInt(this.value));
+            });
+            elements.navFontSlider.addEventListener('click', function(e) {
+                e.stopPropagation();
+            });
+        }
 
-        // Touch events for actual mobile devices
-        elements.mobileMenuBtn.addEventListener('touchstart', function(e) {
-            elements.input.focus();
-            mobileLongPressed = false;
-            mobileLongPressTimer = setTimeout(function() {
-                mobileLongPressed = true;
-                showDeviceModeModal();
-            }, 2000);
-        }, { passive: true });
+        // Nav bar menu button (with long-press for device mode)
+        let navMenuLongPressTimer = null;
+        let navMenuLongPressed = false;
 
-        elements.mobileMenuBtn.addEventListener('touchend', function(e) {
-            if (mobileLongPressTimer) {
-                clearTimeout(mobileLongPressTimer);
-                mobileLongPressTimer = null;
-            }
-            if (!mobileLongPressed) {
-                e.preventDefault();
-                toggleMobileMenu();
-            }
-            mobileLongPressed = false;
-        }, { passive: false });
+        if (elements.navMenuBtn) {
+            elements.navMenuBtn.addEventListener('mousedown', function(e) {
+                navMenuLongPressed = false;
+                navMenuLongPressTimer = setTimeout(function() {
+                    navMenuLongPressed = true;
+                    showDeviceModeModal();
+                }, 2000);
+            });
 
-        elements.mobileMenuDropdown.addEventListener('touchstart', function(e) {
-            elements.input.focus();
-        }, { passive: true });
-        elements.mobileMenuDropdown.addEventListener('touchend', function(e) {
-            e.preventDefault();
-            const item = e.target.closest('.dropdown-item');
-            if (item) {
-                handleMenuItem(item.dataset.action);
-            }
-        }, { passive: false });
+            elements.navMenuBtn.addEventListener('click', function(e) {
+                if (navMenuLongPressTimer) {
+                    clearTimeout(navMenuLongPressTimer);
+                    navMenuLongPressTimer = null;
+                }
+                if (!navMenuLongPressed) {
+                    e.stopPropagation();
+                    toggleMenu(elements.navMenuBtn);
+                }
+                navMenuLongPressed = false;
+            });
 
-        // Mouse handler for mobile dropdown when simulating mobile on desktop
-        elements.mobileMenuDropdown.onclick = function(e) {
-            e.stopPropagation();
-            const item = e.target.closest('.dropdown-item');
-            if (item) {
-                handleMenuItem(item.dataset.action);
-            }
-        };
+            elements.navMenuBtn.addEventListener('mouseleave', function(e) {
+                if (navMenuLongPressTimer) {
+                    clearTimeout(navMenuLongPressTimer);
+                    navMenuLongPressTimer = null;
+                }
+            });
 
-        // Track button press timing for long-press detection
+            elements.navMenuBtn.addEventListener('touchstart', function(e) {
+                elements.input.focus();
+                navMenuLongPressed = false;
+                navMenuLongPressTimer = setTimeout(function() {
+                    navMenuLongPressed = true;
+                    showDeviceModeModal();
+                }, 2000);
+            }, { passive: true });
+
+            elements.navMenuBtn.addEventListener('touchend', function(e) {
+                if (navMenuLongPressTimer) {
+                    clearTimeout(navMenuLongPressTimer);
+                    navMenuLongPressTimer = null;
+                }
+                if (!navMenuLongPressed) {
+                    e.preventDefault();
+                    toggleMenu(elements.navMenuBtn);
+                }
+                navMenuLongPressed = false;
+            }, { passive: false });
+        }
+
+        // Track button press timing for long-press detection on nav bar world arrows
         let upBtnTimer = null;
         let upBtnLongPressed = false;
         let downBtnTimer = null;
         let downBtnLongPressed = false;
 
-        // Up button - short press: prev world, long press (1s): prev history (triggers immediately at 1s)
+        // Up button - short press: prev world, long press (1s): prev history
         function upBtnStart(e) {
             e.preventDefault();
-            elements.input.focus(); // Keep keyboard visible
+            elements.input.focus();
             upBtnLongPressed = false;
             upBtnTimer = setTimeout(function() {
                 upBtnLongPressed = true;
-                // Long press: cycle to previous command in history
                 if (commandHistory.length > 0) {
                     if (historyIndex === -1) {
                         historyIndex = commandHistory.length - 1;
@@ -5694,24 +5424,24 @@
                 upBtnTimer = null;
             }
             if (!upBtnLongPressed) {
-                // Short press: cycle to previous active world
                 requestPrevWorld();
             }
             elements.input.focus();
         }
-        elements.mobileUpBtn.addEventListener('mousedown', upBtnStart);
-        elements.mobileUpBtn.addEventListener('mouseup', upBtnEnd);
-        elements.mobileUpBtn.addEventListener('touchstart', upBtnStart, { passive: false });
-        elements.mobileUpBtn.addEventListener('touchend', upBtnEnd, { passive: false });
+        if (elements.navUpBtn) {
+            elements.navUpBtn.addEventListener('mousedown', upBtnStart);
+            elements.navUpBtn.addEventListener('mouseup', upBtnEnd);
+            elements.navUpBtn.addEventListener('touchstart', upBtnStart, { passive: false });
+            elements.navUpBtn.addEventListener('touchend', upBtnEnd, { passive: false });
+        }
 
-        // Down button - short press: next world, long press (1s): next history (triggers immediately at 1s)
+        // Down button - short press: next world, long press (1s): next history
         function downBtnStart(e) {
             e.preventDefault();
-            elements.input.focus(); // Keep keyboard visible
+            elements.input.focus();
             downBtnLongPressed = false;
             downBtnTimer = setTimeout(function() {
                 downBtnLongPressed = true;
-                // Long press: cycle to next command in history
                 if (historyIndex !== -1) {
                     if (historyIndex < commandHistory.length - 1) {
                         historyIndex++;
@@ -5732,17 +5462,18 @@
                 downBtnTimer = null;
             }
             if (!downBtnLongPressed) {
-                // Short press: cycle to next active world
                 requestNextWorld();
             }
             elements.input.focus();
         }
-        elements.mobileDownBtn.addEventListener('mousedown', downBtnStart);
-        elements.mobileDownBtn.addEventListener('mouseup', downBtnEnd);
-        elements.mobileDownBtn.addEventListener('touchstart', downBtnStart, { passive: false });
-        elements.mobileDownBtn.addEventListener('touchend', downBtnEnd, { passive: false });
+        if (elements.navDownBtn) {
+            elements.navDownBtn.addEventListener('mousedown', downBtnStart);
+            elements.navDownBtn.addEventListener('mouseup', downBtnEnd);
+            elements.navDownBtn.addEventListener('touchstart', downBtnStart, { passive: false });
+            elements.navDownBtn.addEventListener('touchend', downBtnEnd, { passive: false });
+        }
 
-        // Page up/down buttons
+        // Page up/down buttons (nav bar)
         function handlePgUp() {
             const container = elements.outputContainer;
             const pageHeight = container.clientHeight * 0.9;
@@ -5754,13 +5485,11 @@
             const world = worlds[currentWorldIndex];
             const serverPending = world ? (world.pending_count || 0) : 0;
             if (pendingLines.length > 0 || serverPending > 0) {
-                // Release pending lines like Tab does when more mode is active
                 releaseScreenful();
             } else {
                 const pageHeight = container.clientHeight * 0.9;
                 container.scrollTop += pageHeight;
             }
-            // If at bottom now and no pending (local or server), unpause
             if (isAtBottom()) {
                 if (pendingLines.length === 0 && serverPending === 0) {
                     paused = false;
@@ -5770,21 +5499,31 @@
             updateStatusBar();
         }
 
-        elements.mobilePgUpBtn.addEventListener('touchstart', function(e) {
-            elements.input.focus();
-        }, { passive: true });
-        elements.mobilePgUpBtn.addEventListener('touchend', function(e) {
-            e.preventDefault();
-            handlePgUp();
-        }, { passive: false });
+        if (elements.navPgUpBtn) {
+            elements.navPgUpBtn.addEventListener('touchstart', function(e) {
+                elements.input.focus();
+            }, { passive: true });
+            elements.navPgUpBtn.addEventListener('touchend', function(e) {
+                e.preventDefault();
+                handlePgUp();
+            }, { passive: false });
+            elements.navPgUpBtn.addEventListener('click', function(e) {
+                handlePgUp();
+            });
+        }
 
-        elements.mobilePgDnBtn.addEventListener('touchstart', function(e) {
-            elements.input.focus();
-        }, { passive: true });
-        elements.mobilePgDnBtn.addEventListener('touchend', function(e) {
-            e.preventDefault();
-            handlePgDn();
-        }, { passive: false });
+        if (elements.navPgDnBtn) {
+            elements.navPgDnBtn.addEventListener('touchstart', function(e) {
+                elements.input.focus();
+            }, { passive: true });
+            elements.navPgDnBtn.addEventListener('touchend', function(e) {
+                e.preventDefault();
+                handlePgDn();
+            }, { passive: false });
+            elements.navPgDnBtn.addEventListener('click', function(e) {
+                handlePgDn();
+            });
+        }
 
         // Track whether we're at the bottom (for resize handling)
         let wasAtBottomBeforeResize = true;
@@ -5805,32 +5544,22 @@
             sendViewStateIfChanged();
         });
 
-        // Handle mobile keyboard visibility - keep toolbar at visual viewport top
+        // Handle mobile keyboard visibility
         if (window.visualViewport) {
-            const toolbar = document.getElementById('toolbar');
             window.visualViewport.addEventListener('resize', function() {
-                // When keyboard appears, visualViewport height shrinks
-                // Keep toolbar at the top of the visual viewport
-                toolbar.style.top = window.visualViewport.offsetTop + 'px';
                 // If we were at bottom before keyboard appeared, stay at bottom
                 if (wasAtBottomBeforeResize) {
                     scrollToBottom();
                 }
                 updateStatusBar();
             });
-            window.visualViewport.addEventListener('scroll', function() {
-                toolbar.style.top = window.visualViewport.offsetTop + 'px';
-            });
         }
 
         // Click anywhere to focus input and close menu
         document.body.onclick = function(e) {
-            // Close menus if open
+            // Close menu if open
             if (menuOpen) {
                 closeMenu();
-            }
-            if (mobileMenuOpen) {
-                closeMobileMenu();
             }
 
             // Don't steal focus if user has selected text (for copy)
@@ -5838,7 +5567,7 @@
             if (selection && selection.toString().length > 0) {
                 return;
             }
-            // Don't steal focus from modals, toolbars, or form elements (like select dropdowns)
+            // Don't steal focus from modals, status/nav bars, or form elements
             if (!elements.authModal.classList.contains('visible') &&
                 !elements.actionsListModal.classList.contains('visible') &&
                 !elements.actionsEditorModal.classList.contains('visible') &&
@@ -5848,15 +5577,16 @@
                 !elements.setupModal?.classList.contains('visible') &&
                 !elements.worldEditorModal?.classList.contains('visible') &&
                 !elements.webModal?.classList.contains('visible') &&
-                !e.target.closest('#toolbar') &&
-                !e.target.closest('#mobile-toolbar') &&
+                !e.target.closest('#status-bar') &&
+                !e.target.closest('#nav-bar') &&
+                !e.target.closest('.menu-dropdown') &&
                 !e.target.closest('select')) {
                 elements.input.focus();
             }
         };
 
         // On mobile, keep keyboard visible by refocusing input when it loses focus
-        if (deviceMode === 'mobile') {
+        if (deviceMode === 'phone' || deviceMode === 'tablet') {
             // Helper to check if any modal or menu is open
             function isAnyModalOpen() {
                 return elements.authModal.classList.contains('visible') ||
@@ -5871,14 +5601,13 @@
                     elements.passwordModal?.classList.contains('visible') ||
                     filterPopupOpen ||
                     activeCustomDropdown !== null ||
-                    menuOpen ||
-                    mobileMenuOpen;
+                    menuOpen;
             }
 
             // Global touchend handler - refocus input after any touch interaction
             document.addEventListener('touchend', function(e) {
                 // Skip if touching interactive elements
-                if (e.target.closest('input, textarea, button, a, select, .custom-dropdown, .dropdown-item, .modal')) {
+                if (e.target.closest('input, textarea, button, a, select, .custom-dropdown, .menu-item, .modal')) {
                     return;
                 }
                 // Skip if modal is open
