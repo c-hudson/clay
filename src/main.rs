@@ -824,6 +824,46 @@ fn generate_wav_from_notes(notes: &[crate::ansi_music::MusicNote]) -> Vec<u8> {
     wav
 }
 
+/// Generate the Super Mario Bros theme (~10 seconds) for /testmusic
+fn generate_test_music_notes() -> Vec<crate::ansi_music::MusicNote> {
+    use crate::ansi_music::MusicNote;
+    // Note frequencies (A4=440Hz standard tuning)
+    const E5: f32 = 659.25; const D5: f32 = 587.33; const C5: f32 = 523.25;
+    const B4: f32 = 493.88; const BB4: f32 = 466.16; const A4: f32 = 440.00;
+    const G4: f32 = 392.00; const FS4: f32 = 369.99; const F4: f32 = 349.23;
+    const E4: f32 = 329.63;
+    const F5: f32 = 698.46; const G5: f32 = 783.99; const A5: f32 = 880.00;
+    const REST: f32 = 0.0;
+    // Tempo ~200 BPM: eighth=150ms, quarter=300ms, dotted-quarter=450ms
+    let n = |freq: f32, ms: u32| MusicNote { frequency: freq, duration_ms: ms };
+    vec![
+        // Bar 1
+        n(E5,150), n(E5,150), n(REST,150), n(E5,150), n(REST,150), n(C5,150), n(E5,300),
+        // Bar 2
+        n(G5,300), n(REST,300), n(G4,300), n(REST,300),
+        // Bar 3
+        n(C5,450), n(G4,150), n(REST,300), n(E4,300),
+        // Bar 4
+        n(REST,150), n(A4,300), n(B4,300), n(BB4,150), n(A4,300),
+        // Bar 5 (triplet feel on first 3 notes)
+        n(G4,200), n(E5,200), n(G5,200), n(A5,300), n(F5,150), n(G5,150),
+        // Bar 6
+        n(REST,150), n(E5,300), n(C5,150), n(D5,150), n(B4,300),
+        // Bar 7 (second phrase)
+        n(C5,450), n(G4,150), n(REST,300), n(E4,300),
+        // Bar 8
+        n(REST,150), n(A4,300), n(B4,300), n(BB4,150), n(A4,300),
+        // Bar 9
+        n(G4,200), n(E5,200), n(G5,200), n(A5,300), n(F5,150), n(G5,150),
+        // Bar 10
+        n(REST,150), n(E5,300), n(C5,150), n(D5,150), n(B4,300),
+        // Bar 11 (descending run ending)
+        n(REST,300), n(G5,150), n(FS4,150), n(F4,150), n(D5,300), n(E5,300),
+        // Bar 12
+        n(REST,150), n(G4,150), n(A4,150), n(C5,300), n(REST,150), n(A4,150), n(C5,150), n(D5,150),
+    ]
+}
+
 /// Detect available system media player for console audio playback
 fn detect_media_player() -> Option<String> {
     for cmd in &["mpv", "ffplay"] {
@@ -11647,14 +11687,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                         }
                                     }
                                     Command::TestMusic => {
-                                        // Broadcast a test ANSI music sequence (C-D-E-F-G melody)
-                                        let test_notes = vec![
-                                            ansi_music::MusicNote { frequency: 261.63, duration_ms: 250 }, // C4
-                                            ansi_music::MusicNote { frequency: 293.66, duration_ms: 250 }, // D4
-                                            ansi_music::MusicNote { frequency: 329.63, duration_ms: 250 }, // E4
-                                            ansi_music::MusicNote { frequency: 349.23, duration_ms: 250 }, // F4
-                                            ansi_music::MusicNote { frequency: 392.00, duration_ms: 250 }, // G4
-                                        ];
+                                        let test_notes = generate_test_music_notes();
                                         // Play locally on console via mpv/ffplay
                                         if let Some(ref player_cmd) = app.media_player_cmd {
                                             let wav_data = generate_wav_from_notes(&test_notes);
@@ -11682,7 +11715,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                         });
                                         app.ws_broadcast(WsMessage::ServerData {
                                             world_index,
-                                            data: "Playing test music (C-D-E-F-G)...".to_string(),
+                                            data: "Playing test music (Super Mario Bros)...".to_string(),
                                             is_viewed: false,
                                             ts: current_timestamp_secs(),
                                             from_server: false,
@@ -14240,14 +14273,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                     }
                                 }
                                 Command::TestMusic => {
-                                    // Broadcast a test ANSI music sequence (C-D-E-F-G melody)
-                                    let test_notes = vec![
-                                        ansi_music::MusicNote { frequency: 261.63, duration_ms: 250 }, // C4
-                                        ansi_music::MusicNote { frequency: 293.66, duration_ms: 250 }, // D4
-                                        ansi_music::MusicNote { frequency: 329.63, duration_ms: 250 }, // E4
-                                        ansi_music::MusicNote { frequency: 349.23, duration_ms: 250 }, // F4
-                                        ansi_music::MusicNote { frequency: 392.00, duration_ms: 250 }, // G4
-                                    ];
+                                    let test_notes = generate_test_music_notes();
                                     // Play locally on console via mpv/ffplay
                                     if let Some(ref player_cmd) = app.media_player_cmd {
                                         let wav_data = generate_wav_from_notes(&test_notes);
@@ -14264,8 +14290,14 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                                     _ => { cmd.arg(&wav_path_str); }
                                                 }
                                                 cmd.stdout(std::process::Stdio::null());
-                                                cmd.stderr(std::process::Stdio::null());
-                                                let _ = cmd.status();
+                                                cmd.stderr(std::process::Stdio::piped());
+                                                if let Ok(output) = cmd.output() {
+                                                    if !output.status.success() {
+                                                        let stderr = String::from_utf8_lossy(&output.stderr);
+                                                        let _ = std::fs::write("/tmp/clay-testmusic.log",
+                                                            format!("Player: {}\nStatus: {}\nStderr: {}", player, output.status, stderr));
+                                                    }
+                                                }
                                             });
                                         }
                                     }
@@ -14274,7 +14306,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                         notes: test_notes,
                                     });
                                     if app.media_player_cmd.is_some() {
-                                        app.add_output("Playing test music (C-D-E-F-G)...");
+                                        app.add_output("Playing test music (Super Mario Bros)...");
                                     } else {
                                         app.add_output("No audio player found (install mpv or ffplay for console audio)");
                                     }
@@ -18222,19 +18254,12 @@ async fn handle_command(cmd: &str, app: &mut App, event_tx: mpsc::Sender<AppEven
             }
         }
         Command::TestMusic => {
-            // Broadcast a test ANSI music sequence (C-D-E-F-G melody)
-            let test_notes = vec![
-                ansi_music::MusicNote { frequency: 261.63, duration_ms: 250 }, // C4
-                ansi_music::MusicNote { frequency: 293.66, duration_ms: 250 }, // D4
-                ansi_music::MusicNote { frequency: 329.63, duration_ms: 250 }, // E4
-                ansi_music::MusicNote { frequency: 349.23, duration_ms: 250 }, // F4
-                ansi_music::MusicNote { frequency: 392.00, duration_ms: 250 }, // G4
-            ];
+            let test_notes = generate_test_music_notes();
             app.ws_broadcast(WsMessage::AnsiMusic {
                 world_index: app.current_world_index,
                 notes: test_notes,
             });
-            app.add_output("Playing test music (C-D-E-F-G)...");
+            app.add_output("Playing test music (Super Mario Bros)...");
         }
         Command::Notify { message } => {
             // Send notification to mobile clients

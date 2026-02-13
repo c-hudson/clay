@@ -28,20 +28,36 @@ mod windows_titlebar {
             l_param: isize,
         ) -> i32;
         fn IsWindowVisible(hwnd: *mut c_void) -> i32;
+        fn SetWindowPos(
+            hwnd: *mut c_void,
+            hwnd_insert_after: *mut c_void,
+            x: i32, y: i32, cx: i32, cy: i32,
+            flags: u32,
+        ) -> i32;
+        fn GetWindowTextW(hwnd: *mut c_void, lpstring: *mut u16, max_count: i32) -> i32;
     }
 
     const DWMWA_USE_IMMERSIVE_DARK_MODE: u32 = 20;
     const DWMWA_CAPTION_COLOR: u32 = 35;
     const DWMWA_TEXT_COLOR: u32 = 36;
+    const SWP_NOMOVE: u32 = 0x0002;
+    const SWP_NOSIZE: u32 = 0x0001;
+    const SWP_NOZORDER: u32 = 0x0004;
+    const SWP_FRAMECHANGED: u32 = 0x0020;
 
     // Cache the HWND once found (stored as usize for atomicity)
     static CACHED_HWND: AtomicUsize = AtomicUsize::new(0);
 
     unsafe extern "system" fn enum_callback(hwnd: *mut c_void, lparam: isize) -> i32 {
         if IsWindowVisible(hwnd) != 0 {
-            let out = &*(lparam as *const AtomicUsize);
-            out.store(hwnd as usize, Ordering::Relaxed);
-            return 0; // Stop enumerating
+            // Skip helper windows with empty titles - we want the main window
+            let mut title_buf = [0u16; 4];
+            let len = GetWindowTextW(hwnd, title_buf.as_mut_ptr(), 4);
+            if len > 0 {
+                let out = &*(lparam as *const AtomicUsize);
+                out.store(hwnd as usize, Ordering::Relaxed);
+                return 0; // Stop enumerating
+            }
         }
         1 // Continue
     }
@@ -89,7 +105,6 @@ mod windows_titlebar {
         if hwnd.is_null() {
             return false;
         }
-
         unsafe {
             // Set dark/light mode
             let value: u32 = if dark { 1 } else { 0 };
@@ -119,7 +134,16 @@ mod windows_titlebar {
                 &text as *const u32 as *const c_void,
                 std::mem::size_of::<u32>() as u32,
             );
-            hr == 0
+            if hr != 0 { return false; }
+
+            // Force Windows to redraw the window frame so DWM changes take effect
+            SetWindowPos(
+                hwnd,
+                std::ptr::null_mut(),
+                0, 0, 0, 0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_FRAMECHANGED,
+            );
+            true
         }
     }
 }
