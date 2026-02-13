@@ -319,6 +319,29 @@ pub fn execute_recall(opts: &tf::RecallOptions, output_lines: &[OutputLine]) -> 
             continue;
         }
 
+        // Filter by source: -w (default) = server only, -l = local only, -g = all
+        match &opts.source {
+            tf::RecallSource::CurrentWorld | tf::RecallSource::World(_) => {
+                // Default: only MUD server output (not client-generated)
+                if !line.from_server {
+                    continue;
+                }
+            }
+            tf::RecallSource::Local => {
+                // -l: only client-generated output (TF output, system messages)
+                if line.from_server {
+                    continue;
+                }
+            }
+            tf::RecallSource::Global => {
+                // -g: all lines (server + local)
+            }
+            tf::RecallSource::Input => {
+                // -i: input history - handled separately, skip all output lines
+                continue;
+            }
+        }
+
         let plain = strip_ansi_codes(&line.text);
         let is_match = match &regex {
             Some(Ok(re)) => {
