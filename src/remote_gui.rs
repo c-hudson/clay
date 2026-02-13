@@ -38,8 +38,6 @@ mod windows_titlebar {
     }
 
     const DWMWA_USE_IMMERSIVE_DARK_MODE: u32 = 20;
-    const DWMWA_CAPTION_COLOR: u32 = 35;
-    const DWMWA_TEXT_COLOR: u32 = 36;
     const SWP_NOMOVE: u32 = 0x0002;
     const SWP_NOSIZE: u32 = 0x0001;
     const SWP_NOZORDER: u32 = 0x0004;
@@ -94,45 +92,19 @@ mod windows_titlebar {
         }
     }
 
-    /// Apply all title bar theme attributes in one call. Returns true if
-    /// the DWM calls succeeded (HWND was found and DWM returned S_OK).
-    pub fn apply_titlebar_theme(
-        dark: bool,
-        bg_r: u8, bg_g: u8, bg_b: u8,
-        fg_r: u8, fg_g: u8, fg_b: u8,
-    ) -> bool {
+    /// Set the title bar to dark or light mode, using the native Windows 11
+    /// title bar colors. Returns true if the DWM call succeeded.
+    pub fn apply_titlebar_theme(dark: bool) -> bool {
         let hwnd = get_hwnd();
         if hwnd.is_null() {
             return false;
         }
-
         unsafe {
-            // Set dark/light mode
             let value: u32 = if dark { 1 } else { 0 };
             let hr = DwmSetWindowAttribute(
                 hwnd,
                 DWMWA_USE_IMMERSIVE_DARK_MODE,
                 &value as *const u32 as *const c_void,
-                std::mem::size_of::<u32>() as u32,
-            );
-            if hr != 0 { return false; }
-
-            // Set caption color (COLORREF is 0x00BBGGRR)
-            let caption: u32 = (bg_b as u32) << 16 | (bg_g as u32) << 8 | bg_r as u32;
-            let hr = DwmSetWindowAttribute(
-                hwnd,
-                DWMWA_CAPTION_COLOR,
-                &caption as *const u32 as *const c_void,
-                std::mem::size_of::<u32>() as u32,
-            );
-            if hr != 0 { return false; }
-
-            // Set text color
-            let text: u32 = (fg_b as u32) << 16 | (fg_g as u32) << 8 | fg_r as u32;
-            let hr = DwmSetWindowAttribute(
-                hwnd,
-                DWMWA_TEXT_COLOR,
-                &text as *const u32 as *const c_void,
                 std::mem::size_of::<u32>() as u32,
             );
             if hr != 0 { return false; }
@@ -3148,13 +3120,7 @@ impl eframe::App for RemoteGuiApp {
                 Some(prev) => prev.colors != theme.colors,
             };
             if need_update {
-                let bg = &theme.colors.bg_deep;
-                let fg = &theme.colors.fg;
-                if windows_titlebar::apply_titlebar_theme(
-                    theme.is_dark(),
-                    bg.r, bg.g, bg.b,
-                    fg.r, fg.g, fg.b,
-                ) {
+                if windows_titlebar::apply_titlebar_theme(theme.is_dark()) {
                     self.titlebar_theme = Some(theme.clone());
                 }
             }
