@@ -53,7 +53,7 @@ impl ThemeColor {
 }
 
 /// All theme color variables for a single theme
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct ThemeColors {
     // Background hierarchy
     pub bg: ThemeColor,

@@ -23,6 +23,8 @@ mod windows_titlebar {
     }
 
     const DWMWA_USE_IMMERSIVE_DARK_MODE: u32 = 20;
+    const DWMWA_CAPTION_COLOR: u32 = 35;
+    const DWMWA_TEXT_COLOR: u32 = 36;
 
     /// Set the title bar to dark or light mode on Windows 11+
     pub fn set_dark_mode(dark: bool) {
@@ -34,6 +36,31 @@ mod windows_titlebar {
                     hwnd,
                     DWMWA_USE_IMMERSIVE_DARK_MODE,
                     &value as *const u32 as *const c_void,
+                    std::mem::size_of::<u32>() as u32,
+                );
+            }
+        }
+    }
+
+    /// Set title bar caption background and text colors on Windows 11+
+    /// Falls back gracefully on older Windows (DWM returns error, no crash).
+    pub fn set_title_colors(bg_r: u8, bg_g: u8, bg_b: u8, fg_r: u8, fg_g: u8, fg_b: u8) {
+        unsafe {
+            let hwnd = GetActiveWindow();
+            if !hwnd.is_null() {
+                // COLORREF is 0x00BBGGRR (BGR, not RGB)
+                let caption: u32 = (bg_b as u32) << 16 | (bg_g as u32) << 8 | bg_r as u32;
+                DwmSetWindowAttribute(
+                    hwnd,
+                    DWMWA_CAPTION_COLOR,
+                    &caption as *const u32 as *const c_void,
+                    std::mem::size_of::<u32>() as u32,
+                );
+                let text: u32 = (fg_b as u32) << 16 | (fg_g as u32) << 8 | fg_r as u32;
+                DwmSetWindowAttribute(
+                    hwnd,
+                    DWMWA_TEXT_COLOR,
+                    &text as *const u32 as *const c_void,
                     std::mem::size_of::<u32>() as u32,
                 );
             }
@@ -1049,8 +1076,10 @@ impl RemoteGuiApp {
                         // On resync, preserve current world (bounded by new world count)
                         if !is_resync {
                             self.current_world = current_world_index;
+                            self.selection_start = None; self.selection_end = None;
                         } else if self.current_world >= self.worlds.len() {
                             self.current_world = self.worlds.len().saturating_sub(1);
+                            self.selection_start = None; self.selection_end = None;
                         }
                         self.console_theme = GuiTheme::from_name(&settings.console_theme);
                         self.theme = GuiTheme::from_name(&settings.gui_theme);
@@ -1190,8 +1219,10 @@ impl RemoteGuiApp {
                             // Adjust current_world if needed
                             if self.current_world >= self.worlds.len() {
                                 self.current_world = self.worlds.len().saturating_sub(1);
+                                self.selection_start = None; self.selection_end = None;
                             } else if self.current_world > world_index {
                                 self.current_world -= 1;
+                                self.selection_start = None; self.selection_end = None;
                             }
                             // Adjust world_list_selected if needed
                             if self.world_list_selected >= self.worlds.len() {
@@ -1204,6 +1235,7 @@ impl RemoteGuiApp {
                     }
                     WsMessage::WorldSwitched { new_index } => {
                         self.current_world = new_index;
+                        self.selection_start = None; self.selection_end = None;
                         // Mark seen when switching to a world
                         if new_index < self.worlds.len() {
                             self.worlds[new_index].unseen_lines = 0;
@@ -1321,6 +1353,7 @@ impl RemoteGuiApp {
                         // Server calculated the next/prev world for us
                         if idx < self.worlds.len() && idx != self.current_world {
                             self.current_world = idx;
+                            self.selection_start = None; self.selection_end = None;
                             self.worlds[idx].unseen_lines = 0;
                             self.scroll_offset = None; // Reset scroll
                             self.output_dirty = true;
@@ -1380,6 +1413,7 @@ impl RemoteGuiApp {
                                 // Switch to world locally, connect if needed
                                 if let Some(idx) = self.worlds.iter().position(|w| w.name.eq_ignore_ascii_case(name)) {
                                     self.current_world = idx;
+                                    self.selection_start = None; self.selection_end = None;
                                     self.output_dirty = true;
                                     deferred_switch = Some(idx);
                                     if !self.worlds[idx].connected {
@@ -1455,6 +1489,7 @@ impl RemoteGuiApp {
                         // Response to CycleWorld - update local world index and state
                         if world_index < self.worlds.len() {
                             self.current_world = world_index;
+                            self.selection_start = None; self.selection_end = None;
                             self.worlds[world_index].pending_count = pending_count;
                             self.worlds[world_index].unseen_lines = 0;
                             self.scroll_offset = None; // Reset scroll on world switch
@@ -3000,9 +3035,18 @@ impl eframe::App for RemoteGuiApp {
 
         // Update Windows title bar color to match theme
         #[cfg(target_os = "windows")]
-        if self.titlebar_theme.as_ref().map(|t| t.is_dark()) != Some(theme.is_dark()) {
-            self.titlebar_theme = Some(theme.clone());
-            windows_titlebar::set_dark_mode(theme.is_dark());
+        {
+            let need_update = match &self.titlebar_theme {
+                None => true,
+                Some(prev) => prev.colors != theme.colors,
+            };
+            if need_update {
+                self.titlebar_theme = Some(theme.clone());
+                windows_titlebar::set_dark_mode(theme.is_dark());
+                let bg = &theme.colors.bg_deep;
+                let fg = &theme.colors.fg;
+                windows_titlebar::set_title_colors(bg.r, bg.g, bg.b, fg.r, fg.g, fg.b);
+            }
         }
 
         // Make scrollbars always visible and solid (not floating)
@@ -3251,6 +3295,7 @@ impl eframe::App for RemoteGuiApp {
                 let switch_world: Option<usize> = None;
                 let mut history_action: Option<i32> = None; // -1 = prev, 1 = next
                 let mut scroll_action: Option<i32> = None; // -1 = up, 1 = down
+                let mut copy_selection = false;
                 let mut clear_input = false;
                 let mut delete_word = false;
                 let mut resize_input: i32 = 0;
@@ -3288,6 +3333,9 @@ impl eframe::App for RemoteGuiApp {
                         } else if i.consume_key(egui::Modifiers::CTRL, egui::Key::A) {
                             // Ctrl+A - move cursor to beginning of line
                             cursor_home = true;
+                        } else if i.consume_key(egui::Modifiers::CTRL, egui::Key::C) {
+                            // Ctrl+C - copy selected text
+                            copy_selection = true;
                         }
                     } else if i.modifiers.alt {
                         // Alt+Up/Down - resize input area
@@ -3381,6 +3429,16 @@ impl eframe::App for RemoteGuiApp {
                 if clear_input {
                     self.input_buffer.clear();
                     self.history_index = 0;
+                }
+
+                // Apply copy selection (Ctrl+C)
+                if copy_selection
+                    && self.selection_start.is_some() && self.selection_end.is_some() {
+                    let sel_id = egui::Id::new(format!("output_selection_{}", self.current_world));
+                    let stored: Option<String> = ctx.data(|d| d.get_temp(sel_id));
+                    if let Some(text) = stored {
+                        ctx.copy_text(text);
+                    }
                 }
 
                 // Apply delete word
@@ -3524,6 +3582,7 @@ impl eframe::App for RemoteGuiApp {
                 if let Some(new_world) = switch_world {
                     if new_world != self.current_world && new_world < self.worlds.len() {
                         self.current_world = new_world;
+                        self.selection_start = None; self.selection_end = None;
                         self.worlds[new_world].unseen_lines = 0;
                         self.scroll_offset = None; // Reset scroll
                         self.output_dirty = true;
@@ -4161,6 +4220,7 @@ impl eframe::App for RemoteGuiApp {
                                     if let Some(idx) = self.worlds.iter().position(|w| w.name.eq_ignore_ascii_case(name)) {
                                         // Switch locally
                                         self.current_world = idx;
+                                        self.selection_start = None; self.selection_end = None;
                                         self.output_dirty = true;
                                         // If not connected, send connect command to server
                                         if !self.worlds[idx].connected {
@@ -4181,6 +4241,7 @@ impl eframe::App for RemoteGuiApp {
                                     // /worlds -l <name> - switch to world, connect without auto-login
                                     if let Some(idx) = self.worlds.iter().position(|w| w.name.eq_ignore_ascii_case(name)) {
                                         self.current_world = idx;
+                                        self.selection_start = None; self.selection_end = None;
                                         self.output_dirty = true;
                                         if !self.worlds[idx].connected {
                                             // Send the command to server (it handles -l flag)
@@ -4728,11 +4789,56 @@ impl eframe::App for RemoteGuiApp {
                                 if let Some(pos) = press_origin {
                                     let relative_pos = pos - text_pos;
                                     let cursor = galley.cursor_from_pos(relative_pos);
-                                    // Subtract 1 so clicking on a character includes it in selection
-                                    let idx = cursor.ccursor.index.saturating_sub(1);
-                                    self.selection_start = Some(idx);
+                                    self.selection_start = Some(cursor.ccursor.index);
                                     self.selection_end = Some(cursor.ccursor.index);
                                     self.selection_dragging = true;
+                                }
+                            }
+
+                            // Double-click to select word
+                            if alloc_response.double_clicked() {
+                                if let Some(pos) = press_origin {
+                                    let relative_pos = pos - text_pos;
+                                    let cursor = galley.cursor_from_pos(relative_pos);
+                                    let idx = cursor.ccursor.index;
+                                    let text = galley.text();
+                                    let chars: Vec<char> = text.chars().collect();
+                                    // Walk backward to find word start
+                                    let mut word_start = idx;
+                                    while word_start > 0 && chars.get(word_start - 1).is_some_and(|c| !c.is_whitespace() && !c.is_ascii_punctuation()) {
+                                        word_start -= 1;
+                                    }
+                                    // Walk forward to find word end
+                                    let mut word_end = idx;
+                                    while word_end < chars.len() && chars.get(word_end).is_some_and(|c| !c.is_whitespace() && !c.is_ascii_punctuation()) {
+                                        word_end += 1;
+                                    }
+                                    if word_start != word_end {
+                                        self.selection_start = Some(word_start);
+                                        self.selection_end = Some(word_end);
+                                        self.selection_dragging = false;
+                                    }
+                                }
+                            }
+
+                            // Triple-click to select line
+                            if alloc_response.triple_clicked() {
+                                if let Some(pos) = press_origin {
+                                    let relative_pos = pos - text_pos;
+                                    let cursor = galley.cursor_from_pos(relative_pos);
+                                    let row_idx = cursor.rcursor.row;
+                                    let rows = &galley.rows;
+                                    if row_idx < rows.len() {
+                                        // Find character offset at start of this row
+                                        let row_start = galley.from_rcursor(egui::epaint::text::cursor::RCursor { row: row_idx, column: 0 });
+                                        // Find character offset at end of this row
+                                        let row = &rows[row_idx];
+                                        let row_end_col = row.glyphs.len();
+                                        let row_end = galley.from_rcursor(egui::epaint::text::cursor::RCursor { row: row_idx, column: row_end_col });
+                                        self.selection_start = Some(row_start.ccursor.index);
+                                        self.selection_end = Some(row_end.ccursor.index);
+                                        self.selection_dragging = false;
+                                    }
                                 }
                             }
 
@@ -4754,6 +4860,20 @@ impl eframe::App for RemoteGuiApp {
                             // Handle selection end on release
                             if alloc_response.drag_released() {
                                 self.selection_dragging = false;
+                            }
+
+                            // Clear selection when clicking outside the output area
+                            if alloc_response.clicked_elsewhere() {
+                                self.selection_start = None;
+                                self.selection_end = None;
+                                let sel_id = egui::Id::new(format!("output_selection_{}", self.current_world));
+                                let sel_range_id = egui::Id::new(format!("output_selection_range_{}", self.current_world));
+                                let sel_raw_id = egui::Id::new(format!("output_selection_raw_{}", self.current_world));
+                                ui.ctx().data_mut(|d| {
+                                    d.remove::<String>(sel_id);
+                                    d.remove::<(usize, usize)>(sel_range_id);
+                                    d.remove::<String>(sel_raw_id);
+                                });
                             }
 
                             // Cache URLs from galley text (only recompute when output changed)
@@ -4781,7 +4901,7 @@ impl eframe::App for RemoteGuiApp {
                                 }
                             }
 
-                            // Show pointer cursor when hovering over URLs
+                            // Show pointer cursor when hovering over URLs, I-beam over output text
                             let hover_pos = ui.input(|i| i.pointer.hover_pos());
                             if let Some(pos) = hover_pos {
                                 if alloc_response.rect.contains(pos) {
@@ -4789,11 +4909,16 @@ impl eframe::App for RemoteGuiApp {
                                     let cursor = galley.cursor_from_pos(relative_pos);
                                     let hover_char = cursor.ccursor.index;
 
+                                    let mut over_url = false;
                                     for (start, end, _) in url_ranges {
                                         if hover_char >= *start && hover_char < *end {
                                             ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                                            over_url = true;
                                             break;
                                         }
+                                    }
+                                    if !over_url {
+                                        ui.ctx().set_cursor_icon(egui::CursorIcon::Text);
                                     }
                                 }
                             }
@@ -8847,6 +8972,7 @@ impl eframe::App for RemoteGuiApp {
                     "edit" => self.open_world_editor(idx),
                     "switch" => {
                         self.current_world = idx;
+                        self.selection_start = None; self.selection_end = None;
                         self.output_dirty = true;
                         self.switch_world(idx);
                     }
