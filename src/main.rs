@@ -11655,6 +11655,27 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                             ansi_music::MusicNote { frequency: 349.23, duration_ms: 250 }, // F4
                                             ansi_music::MusicNote { frequency: 392.00, duration_ms: 250 }, // G4
                                         ];
+                                        // Play locally on console via mpv/ffplay
+                                        if let Some(ref player_cmd) = app.media_player_cmd {
+                                            let wav_data = generate_wav_from_notes(&test_notes);
+                                            let _ = std::fs::create_dir_all(&app.media_cache_dir);
+                                            let wav_path = app.media_cache_dir.join("ansi_music.wav");
+                                            if std::fs::write(&wav_path, &wav_data).is_ok() {
+                                                let wav_path_str = wav_path.to_string_lossy().to_string();
+                                                let player = player_cmd.clone();
+                                                std::thread::spawn(move || {
+                                                    let mut cmd = std::process::Command::new(&player);
+                                                    match player.as_str() {
+                                                        "mpv" => { cmd.args(["--no-video", "--no-terminal", &wav_path_str]); }
+                                                        "ffplay" => { cmd.args(["-nodisp", "-autoexit", &wav_path_str]); }
+                                                        _ => { cmd.arg(&wav_path_str); }
+                                                    }
+                                                    cmd.stdout(std::process::Stdio::null());
+                                                    cmd.stderr(std::process::Stdio::null());
+                                                    let _ = cmd.status();
+                                                });
+                                            }
+                                        }
                                         app.ws_broadcast(WsMessage::AnsiMusic {
                                             world_index,
                                             notes: test_notes,
@@ -13059,63 +13080,10 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
             }
         }
 
-        // Check if any popup is now visible
-        let any_popup_visible = app.confirm_dialog.visible
-            || app.filter_popup.visible
-            || app.has_new_popup();
-
-        // If transitioning from no popup to popup, clear terminal to sync ratatui with terminal state
-        if any_popup_visible && !app.popup_was_visible {
-            terminal.clear()?;
-        }
-        // Detect popup visibility change before updating
-        let popup_visibility_changed = any_popup_visible != app.popup_was_visible;
-        app.popup_was_visible = any_popup_visible;
-
-        // Handle terminal clear request (e.g., after closing editor)
-        if app.needs_terminal_clear {
-            execute!(
-                std::io::stdout(),
-                crossterm::terminal::Clear(crossterm::terminal::ClearType::All)
-            )?;
-            terminal.clear()?;
-            app.needs_terminal_clear = false;
-        }
-
-        // Use ratatui for everything, but render output area with raw crossterm
-        // after the ratatui draw (ratatui's Paragraph has rendering bugs)
-        terminal.draw(|f| ui(f, &mut app))?;
-
-        // Render output area with crossterm only when needed (optimization)
-        // Also redraw when popup visibility changes
-        if app.needs_output_redraw || popup_visibility_changed {
-            render_output_crossterm(&app);
-            app.needs_output_redraw = false;
-            // Mark current world as seen since its output was just displayed
-            let has_unseen = app.current_world().unseen_lines > 0;
-            let has_pending = !app.current_world().pending_lines.is_empty();
-            if has_unseen {
-                app.current_world_mut().mark_seen();
-                // Broadcast to WebSocket clients
-                app.ws_broadcast(WsMessage::UnseenCleared { world_index: app.current_world_index });
-                // Broadcast activity count since a world was just marked as seen
-                app.broadcast_activity();
-            }
-            // If more mode is disabled but world has orphaned pending_lines, release them
-            if has_pending && !app.settings.more_mode_enabled {
-                let world = app.current_world_mut();
-                world.output_lines.append(&mut world.pending_lines);
-                world.pending_since = None;
-                world.paused = false;
-                world.scroll_to_bottom();
-            }
-        }
-
-        // Process any additional queued server events before next select
-        // Track if we processed any events to know if we need to redraw
-        let mut processed_events = false;
+        // Process any additional queued server events BEFORE drawing
+        // This ensures the render always shows the most current state
+        // (the select! above processes only one event; drain remaining here)
         while let Ok(event) = event_rx.try_recv() {
-            processed_events = true;
             match event {
                 AppEvent::ServerData(ref world_name, bytes) => {
                     if let Some(world_idx) = app.find_world_index(world_name) {
@@ -14280,17 +14248,36 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                         ansi_music::MusicNote { frequency: 349.23, duration_ms: 250 }, // F4
                                         ansi_music::MusicNote { frequency: 392.00, duration_ms: 250 }, // G4
                                     ];
+                                    // Play locally on console via mpv/ffplay
+                                    if let Some(ref player_cmd) = app.media_player_cmd {
+                                        let wav_data = generate_wav_from_notes(&test_notes);
+                                        let _ = std::fs::create_dir_all(&app.media_cache_dir);
+                                        let wav_path = app.media_cache_dir.join("ansi_music.wav");
+                                        if std::fs::write(&wav_path, &wav_data).is_ok() {
+                                            let wav_path_str = wav_path.to_string_lossy().to_string();
+                                            let player = player_cmd.clone();
+                                            std::thread::spawn(move || {
+                                                let mut cmd = std::process::Command::new(&player);
+                                                match player.as_str() {
+                                                    "mpv" => { cmd.args(["--no-video", "--no-terminal", &wav_path_str]); }
+                                                    "ffplay" => { cmd.args(["-nodisp", "-autoexit", &wav_path_str]); }
+                                                    _ => { cmd.arg(&wav_path_str); }
+                                                }
+                                                cmd.stdout(std::process::Stdio::null());
+                                                cmd.stderr(std::process::Stdio::null());
+                                                let _ = cmd.status();
+                                            });
+                                        }
+                                    }
                                     app.ws_broadcast(WsMessage::AnsiMusic {
                                         world_index,
                                         notes: test_notes,
                                     });
-                                    app.ws_broadcast(WsMessage::ServerData {
-                                        world_index,
-                                        data: "Playing test music (C-D-E-F-G)...".to_string(),
-                                        is_viewed: false,
-                                        ts: current_timestamp_secs(),
-                                        from_server: false,
-                                    });
+                                    if app.media_player_cmd.is_some() {
+                                        app.add_output("Playing test music (C-D-E-F-G)...");
+                                    } else {
+                                        app.add_output("No audio player found (install mpv or ffplay for console audio)");
+                                    }
                                 }
                                 Command::Notify { message } => {
                                     // Send notification to mobile clients
@@ -14303,13 +14290,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                         title,
                                         message: message.clone(),
                                     });
-                                    app.ws_broadcast(WsMessage::ServerData {
-                                        world_index,
-                                        data: format!("Notification sent: {}", message),
-                                        is_viewed: false,
-                                        ts: current_timestamp_secs(),
-                                        from_server: false,
-                                    });
+                                    app.add_output(&format!("Notification sent: {}", message));
                                 }
                                 Command::Dump => {
                                     // Dump all scrollback buffers to ~/.clay.dmp.log
@@ -15166,12 +15147,56 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
             }
         }
 
-        // If we processed events in try_recv, redraw before waiting in select
-        if processed_events {
-            terminal.draw(|f| ui(f, &mut app))?;
-            if app.needs_output_redraw {
-                render_output_crossterm(&app);
-                app.needs_output_redraw = false;
+        // Now draw with the most up-to-date state (after all events processed)
+        // Check if any popup is now visible
+        let any_popup_visible = app.confirm_dialog.visible
+            || app.filter_popup.visible
+            || app.has_new_popup();
+
+        // If transitioning from no popup to popup, clear terminal to sync ratatui with terminal state
+        if any_popup_visible && !app.popup_was_visible {
+            terminal.clear()?;
+        }
+        // Detect popup visibility change before updating
+        let popup_visibility_changed = any_popup_visible != app.popup_was_visible;
+        app.popup_was_visible = any_popup_visible;
+
+        // Handle terminal clear request (e.g., after closing editor)
+        if app.needs_terminal_clear {
+            execute!(
+                std::io::stdout(),
+                crossterm::terminal::Clear(crossterm::terminal::ClearType::All)
+            )?;
+            terminal.clear()?;
+            app.needs_terminal_clear = false;
+        }
+
+        // Use ratatui for everything, but render output area with raw crossterm
+        // after the ratatui draw (ratatui's Paragraph has rendering bugs)
+        terminal.draw(|f| ui(f, &mut app))?;
+
+        // Render output area with crossterm only when needed (optimization)
+        // Also redraw when popup visibility changes
+        if app.needs_output_redraw || popup_visibility_changed {
+            render_output_crossterm(&app);
+            app.needs_output_redraw = false;
+            // Mark current world as seen since its output was just displayed
+            let has_unseen = app.current_world().unseen_lines > 0;
+            let has_pending = !app.current_world().pending_lines.is_empty();
+            if has_unseen {
+                app.current_world_mut().mark_seen();
+                // Broadcast to WebSocket clients
+                app.ws_broadcast(WsMessage::UnseenCleared { world_index: app.current_world_index });
+                // Broadcast activity count since a world was just marked as seen
+                app.broadcast_activity();
+            }
+            // If more mode is disabled but world has orphaned pending_lines, release them
+            if has_pending && !app.settings.more_mode_enabled {
+                let world = app.current_world_mut();
+                world.output_lines.append(&mut world.pending_lines);
+                world.pending_since = None;
+                world.paused = false;
+                world.scroll_to_bottom();
             }
         }
     }
