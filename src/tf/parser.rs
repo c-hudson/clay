@@ -273,12 +273,12 @@ fn execute_command_impl(engine: &mut TfEngine, input: &str, skip_substitution: b
 
         // Control flow commands
         "if" => cmd_if(engine, args),
-        "elseif" => TfCommandResult::Error("#elseif outside of #if block".to_string()),
-        "else" => TfCommandResult::Error("#else outside of #if block".to_string()),
-        "endif" => TfCommandResult::Error("#endif without matching #if".to_string()),
+        "elseif" => TfCommandResult::Error("/elseif outside of /if block".to_string()),
+        "else" => TfCommandResult::Error("/else outside of /if block".to_string()),
+        "endif" => TfCommandResult::Error("/endif without matching /if".to_string()),
         "while" => cmd_while(engine, args),
         "for" => cmd_for(engine, args),
-        "done" => TfCommandResult::Error("#done without matching #while or #for".to_string()),
+        "done" => TfCommandResult::Error("/done without matching /while or /for".to_string()),
         "break" => TfCommandResult::Error("__break__".to_string()), // Special marker
 
         // Macro commands
@@ -500,7 +500,7 @@ fn cmd_unset(engine: &mut TfEngine, args: &str) -> TfCommandResult {
     let name = args.trim();
 
     if name.is_empty() {
-        return TfCommandResult::Error("Usage: #unset varname".to_string());
+        return TfCommandResult::Error("Usage: /unset varname".to_string());
     }
 
     if engine.unset_global(name) {
@@ -516,7 +516,7 @@ fn cmd_let(engine: &mut TfEngine, args: &str) -> TfCommandResult {
     let args = args.trim();
 
     if args.is_empty() {
-        return TfCommandResult::Error("Usage: #let varname=value".to_string());
+        return TfCommandResult::Error("Usage: /let varname=value".to_string());
     }
 
     // Parse name=value or name = value
@@ -550,7 +550,7 @@ fn cmd_setenv(engine: &mut TfEngine, args: &str) -> TfCommandResult {
     let parts: Vec<&str> = args.splitn(2, char::is_whitespace).collect();
 
     if parts.is_empty() || parts[0].is_empty() {
-        return TfCommandResult::Error("Usage: #setenv varname value".to_string());
+        return TfCommandResult::Error("Usage: /setenv varname value".to_string());
     }
 
     let name = parts[0];
@@ -792,7 +792,7 @@ fn cmd_send(_engine: &TfEngine, args: &str) -> TfCommandResult {
     let args = args.trim();
 
     if args.is_empty() {
-        return TfCommandResult::Error("Usage: #send [-w world] text".to_string());
+        return TfCommandResult::Error("Usage: /send [-w world] text".to_string());
     }
 
     // Check for -w flag
@@ -805,7 +805,7 @@ fn cmd_send(_engine: &TfEngine, args: &str) -> TfCommandResult {
             // Map to Clay /send command
             return TfCommandResult::ClayCommand(format!("/send -w{} {}", world, text));
         } else {
-            return TfCommandResult::Error("Usage: #send -w world text".to_string());
+            return TfCommandResult::Error("Usage: /send -w world text".to_string());
         }
     }
 
@@ -857,7 +857,7 @@ fn cmd_connect(args: &str) -> TfCommandResult {
 fn cmd_addworld(args: &str) -> TfCommandResult {
     // Pass through to Clay's /addworld command which handles the actual creation
     if args.trim().is_empty() {
-        return TfCommandResult::Error("Usage: #addworld [-xe] [-Ttype] name [char pass] host port".to_string());
+        return TfCommandResult::Error("Usage: /addworld [-xe] [-Ttype] name [char pass] host port".to_string());
     }
     TfCommandResult::ClayCommand(format!("/addworld {}", args))
 }
@@ -1235,7 +1235,7 @@ File I/O:
   tfeof(handle)            - Check for end of file
   fwrite(file, text)       - Append text to file (simple)
 
-Usage: $[function(args)] or in #expr/#test"#.to_string()
+Usage: $[function(args)] or in /expr//test"#.to_string()
             )),
             _ => TfCommandResult::Success(Some(format!("No help available for '{}'\nTry: set, echo, send, def, if, while, for, expr, bind, hooks, repeat, ps, kill, load, require, loaded, exit, addworld, functions", topic))),
         }
@@ -1250,7 +1250,7 @@ fn cmd_version() -> TfCommandResult {
 /// #expr expression - Evaluate expression and display result
 fn cmd_expr(engine: &mut TfEngine, args: &str) -> TfCommandResult {
     if args.is_empty() {
-        return TfCommandResult::Error("Usage: #expr expression".to_string());
+        return TfCommandResult::Error("Usage: /expr expression".to_string());
     }
 
     match super::expressions::evaluate(engine, args) {
@@ -1262,7 +1262,7 @@ fn cmd_expr(engine: &mut TfEngine, args: &str) -> TfCommandResult {
 /// #eval expression - Evaluate expression and execute result as command
 fn cmd_eval(engine: &mut TfEngine, args: &str) -> TfCommandResult {
     if args.is_empty() {
-        return TfCommandResult::Error("Usage: #eval expression".to_string());
+        return TfCommandResult::Error("Usage: /eval expression".to_string());
     }
 
     match super::expressions::evaluate(engine, args) {
@@ -1297,7 +1297,7 @@ fn cmd_eval(engine: &mut TfEngine, args: &str) -> TfCommandResult {
 ///   #test regmatch("foo(.*)", "foobar") -> sets %P1 to "bar"
 fn cmd_test(engine: &mut TfEngine, args: &str) -> TfCommandResult {
     if args.is_empty() {
-        return TfCommandResult::Error("Usage: #test expression".to_string());
+        return TfCommandResult::Error("Usage: /test expression".to_string());
     }
 
     match super::expressions::evaluate(engine, args) {
@@ -1464,7 +1464,7 @@ fn cmd_undef(engine: &mut TfEngine, args: &str) -> TfCommandResult {
     let name = args.trim();
 
     if name.is_empty() {
-        return TfCommandResult::Error("Usage: #undef name".to_string());
+        return TfCommandResult::Error("Usage: /undef name".to_string());
     }
 
     if macros::undef_macro(engine, name) {
@@ -1479,7 +1479,7 @@ fn cmd_undefn(engine: &mut TfEngine, args: &str) -> TfCommandResult {
     let pattern = args.trim();
 
     if pattern.is_empty() {
-        return TfCommandResult::Error("Usage: #undefn pattern".to_string());
+        return TfCommandResult::Error("Usage: /undefn pattern".to_string());
     }
 
     let count = macros::undef_by_name_pattern(engine, pattern);
@@ -1491,7 +1491,7 @@ fn cmd_undeft(engine: &mut TfEngine, args: &str) -> TfCommandResult {
     let pattern = args.trim();
 
     if pattern.is_empty() {
-        return TfCommandResult::Error("Usage: #undeft pattern".to_string());
+        return TfCommandResult::Error("Usage: /undeft pattern".to_string());
     }
 
     let count = macros::undef_by_trigger_pattern(engine, pattern);
@@ -1559,7 +1559,7 @@ fn cmd_unhook(engine: &mut TfEngine, args: &str) -> TfCommandResult {
     let event_str = args.trim();
 
     if event_str.is_empty() {
-        return TfCommandResult::Error("Usage: #unhook event".to_string());
+        return TfCommandResult::Error("Usage: /unhook event".to_string());
     }
 
     match TfHookEvent::parse(event_str) {
@@ -1603,7 +1603,7 @@ fn cmd_unbind(engine: &mut TfEngine, args: &str) -> TfCommandResult {
     let key = args.trim();
 
     if key.is_empty() {
-        return TfCommandResult::Error("Usage: #unbind key".to_string());
+        return TfCommandResult::Error("Usage: /unbind key".to_string());
     }
 
     match hooks::unbind_key(engine, key) {
@@ -1671,7 +1671,7 @@ fn cmd_trigger(engine: &mut TfEngine, args: &str) -> TfCommandResult {
     let pattern = args.trim();
 
     if pattern.is_empty() {
-        return TfCommandResult::Error("Usage: #trigger pattern".to_string());
+        return TfCommandResult::Error("Usage: /trigger pattern".to_string());
     }
 
     // Find macros with triggers that match the pattern
@@ -1706,7 +1706,7 @@ fn cmd_trigger(engine: &mut TfEngine, args: &str) -> TfCommandResult {
 /// Insert text into input buffer
 fn cmd_input(engine: &mut TfEngine, args: &str) -> TfCommandResult {
     if args.is_empty() {
-        return TfCommandResult::Error("Usage: #input text".to_string());
+        return TfCommandResult::Error("Usage: /input text".to_string());
     }
 
     // Substitute variables in the text

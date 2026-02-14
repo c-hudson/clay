@@ -301,7 +301,7 @@ pub fn parse_for_args(args: &str) -> Result<(String, i64, i64, i64), String> {
     let parts: Vec<&str> = args.split_whitespace().collect();
 
     if parts.len() < 3 {
-        return Err("#for requires: var start end [step]".to_string());
+        return Err("/for requires: var start end [step]".to_string());
     }
 
     let var_name = parts[0].to_string();
@@ -362,7 +362,7 @@ pub fn process_control_line(state: &mut ControlState, line: &str) -> ControlResu
             if if_state.depth == 1 {
                 if lower.starts_with("#elseif ") || lower.starts_with("/elseif ") {
                     if if_state.has_else {
-                        return ControlResult::Error("#elseif after #else".to_string());
+                        return ControlResult::Error("/elseif after /else".to_string());
                     }
                     let prefix_len = 8; // "#elseif " or "/elseif " are both 8 chars
                     let args = &trimmed[prefix_len..];
@@ -379,7 +379,7 @@ pub fn process_control_line(state: &mut ControlState, line: &str) -> ControlResu
 
                 if lower == "#else" || lower == "/else" {
                     if if_state.has_else {
-                        return ControlResult::Error("Duplicate #else".to_string());
+                        return ControlResult::Error("Duplicate /else".to_string());
                     }
                     if_state.has_else = true;
                     if_state.bodies.push(vec![]);
@@ -621,7 +621,7 @@ pub fn execute_inline_if_block(engine: &mut TfEngine, block: &str) -> Vec<TfComm
                 || lower.starts_with("/elseif ") || lower == "/elseif")
             {
                 if state.has_else {
-                    return vec![TfCommandResult::Error("#elseif after #else".to_string())];
+                    return vec![TfCommandResult::Error("/elseif after /else".to_string())];
                 }
                 // Parse elseif condition and optional body
                 let prefix_len = if lower.starts_with("#elseif") { 7 } else { 7 }; // both are 7 chars
@@ -641,7 +641,7 @@ pub fn execute_inline_if_block(engine: &mut TfEngine, block: &str) -> Vec<TfComm
                 || lower == "/else" || lower.starts_with("/else "))
             {
                 if state.has_else {
-                    return vec![TfCommandResult::Error("Duplicate #else".to_string())];
+                    return vec![TfCommandResult::Error("Duplicate /else".to_string())];
                 }
                 state.has_else = true;
                 state.bodies.push(vec![]);
@@ -661,7 +661,7 @@ pub fn execute_inline_if_block(engine: &mut TfEngine, block: &str) -> Vec<TfComm
             if !lower.starts_with("#if ") && lower != "#if"
                 && !lower.starts_with("/if ") && lower != "/if"
             {
-                return vec![TfCommandResult::Error("Expected #if at start of block".to_string())];
+                return vec![TfCommandResult::Error("Expected /if at start of block".to_string())];
             }
 
             // Parse the #if / /if line
@@ -689,7 +689,7 @@ pub fn execute_inline_if_block(engine: &mut TfEngine, block: &str) -> Vec<TfComm
     }
 
     // If we get here, the block wasn't properly closed
-    vec![TfCommandResult::Error("#if block not closed with #endif".to_string())]
+    vec![TfCommandResult::Error("/if block not closed with /endif".to_string())]
 }
 
 /// Execute a complete inline while block (from macro execution).
@@ -715,7 +715,7 @@ pub fn execute_inline_while_block(engine: &mut TfEngine, block: &str) -> Vec<TfC
             if !lower.starts_with("#while ") && lower != "#while"
                 && !lower.starts_with("/while ") && lower != "/while"
             {
-                return vec![TfCommandResult::Error("Expected #while at start of block".to_string())];
+                return vec![TfCommandResult::Error("Expected /while at start of block".to_string())];
             }
 
             // Parse the #while / /while line
@@ -755,7 +755,7 @@ pub fn execute_inline_while_block(engine: &mut TfEngine, block: &str) -> Vec<TfC
         }
     }
 
-    vec![TfCommandResult::Error("#while block not closed with #done".to_string())]
+    vec![TfCommandResult::Error("/while block not closed with /done".to_string())]
 }
 
 /// Execute a while loop with given condition and body
@@ -858,7 +858,7 @@ pub fn execute_inline_for_block(engine: &mut TfEngine, block: &str) -> Vec<TfCom
             if !lower.starts_with("#for ") && lower != "#for"
                 && !lower.starts_with("/for ") && lower != "/for"
             {
-                return vec![TfCommandResult::Error("Expected #for at start of block".to_string())];
+                return vec![TfCommandResult::Error("Expected /for at start of block".to_string())];
             }
 
             // Parse the #for / /for line
@@ -867,7 +867,7 @@ pub fn execute_inline_for_block(engine: &mut TfEngine, block: &str) -> Vec<TfCom
             // Parse for args: var start end [step] [body_content]
             let parts: Vec<&str> = args.split_whitespace().collect();
             if parts.len() < 3 {
-                return vec![TfCommandResult::Error("#for requires: var start end [step]".to_string())];
+                return vec![TfCommandResult::Error("/for requires: var start end [step]".to_string())];
             }
 
             var_name = parts[0].to_string();
@@ -929,7 +929,7 @@ pub fn execute_inline_for_block(engine: &mut TfEngine, block: &str) -> Vec<TfCom
         }
     }
 
-    vec![TfCommandResult::Error("#for block not closed with #done".to_string())]
+    vec![TfCommandResult::Error("/for block not closed with /done".to_string())]
 }
 
 /// Execute a for loop
