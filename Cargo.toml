@@ -45,7 +45,6 @@ indexmap = ">=2.2.0, <2.5.0"
 url = "=2.5.0"
 hashbrown = "0.14"
 home = "=0.5.5"
-arboard = ">=3, <3.4"    # 3.4+ pulls image 0.25+ which needs moxcms (Rust 2024 edition)
 
 # HTTP client for Slack/Discord APIs
 reqwest = { version = "0.11", default-features = false, features = ["json", "rustls-tls"] }
@@ -59,7 +58,7 @@ eframe = { version = "0.24", optional = true, default-features = false, features
 egui = { version = "0.24", optional = true }
 egui_extras = { version = "0.24", optional = true, default-features = false, features = ["image", "svg"] }
 image = { version = "0.24", optional = true, default-features = false, features = ["png", "gif"] }
-arboard = { version = "3", optional = true }
+arboard = { version = ">=3, <3.4", optional = true }  # 3.4+ pulls moxcms (Rust 2024 edition)
 # Audio playback for ANSI music (optional, requires ALSA dev libraries on Linux)
 rodio = { version = "0.17", optional = true, default-features = false, features = ["wav"] }
 
@@ -69,7 +68,7 @@ eframe = { version = "0.24", optional = true, default-features = false, features
 egui = { version = "0.24", optional = true }
 egui_extras = { version = "0.24", optional = true, default-features = false, features = ["image", "svg"] }
 image = { version = "0.24", optional = true, default-features = false, features = ["png", "gif"] }
-arboard = { version = "3", optional = true }
+arboard = { version = ">=3, <3.4", optional = true }  # 3.4+ pulls moxcms (Rust 2024 edition)
 # Audio playback for ANSI music (uses CoreAudio on macOS automatically)
 rodio = { version = "0.17", optional = true, default-features = false, features = ["wav"] }
 
@@ -79,7 +78,7 @@ eframe = { version = "0.24", optional = true, default-features = false, features
 egui = { version = "0.24", optional = true }
 egui_extras = { version = "0.24", optional = true, default-features = false, features = ["image", "svg"] }
 image = { version = "0.24", optional = true, default-features = false, features = ["png", "gif"] }
-arboard = { version = "3", optional = true }
+arboard = { version = ">=3, <3.4", optional = true }  # 3.4+ pulls moxcms (Rust 2024 edition)
 # Audio playback for ANSI music (uses WASAPI on Windows automatically)
 rodio = { version = "0.17", optional = true, default-features = false, features = ["wav"] }
 
