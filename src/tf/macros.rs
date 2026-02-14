@@ -77,22 +77,27 @@ pub fn parse_def(args: &str) -> Result<TfMacro, String> {
         }
     }
 
-    // Parse name = body
-    // Find the = separator
-    let eq_pos = remaining.find('=')
-        .ok_or_else(|| "Missing '=' in #def (syntax: #def [options] name = body)".to_string())?;
+    // Parse name [= body]
+    // The = and body are optional - a macro with just options (e.g., -ag -t"pattern" name)
+    // applies attributes when triggered without executing any commands
+    if let Some(eq_pos) = remaining.find('=') {
+        let name = remaining[..eq_pos].trim();
+        let body = remaining[eq_pos + 1..].trim();
 
-    let name = remaining[..eq_pos].trim();
-    let body = remaining[eq_pos + 1..].trim();
+        if name.is_empty() {
+            return Err("Macro name cannot be empty".to_string());
+        }
 
-    if name.is_empty() {
-        return Err("Macro name cannot be empty".to_string());
+        macro_def.name = name.to_string();
+        macro_def.body = body.to_string();
+    } else {
+        // No = sign: entire remaining text is the macro name (no body)
+        let name = remaining.trim();
+        if name.is_empty() {
+            return Err("Macro name cannot be empty".to_string());
+        }
+        macro_def.name = name.to_string();
     }
-
-    macro_def.name = name.to_string();
-    // Store the body as-is; escape processing happens during execution
-    // The expression parser handles \\ in strings, and substitute_commands handles \\ -> \
-    macro_def.body = body.to_string();
 
     // Compile trigger pattern if present
     if let Some(ref mut trigger) = macro_def.trigger {
