@@ -464,12 +464,16 @@ fn count_control_flow_depth_change(text: &str) -> i32 {
     let words: Vec<&str> = lower.split_whitespace().collect();
     for word in &words {
         // Check if this is a control flow keyword (possibly with something attached)
-        if *word == "#if" || word.starts_with("#if(")
-            || *word == "#while" || word.starts_with("#while(")
-            || *word == "#for"
+        if *word == "#if" || *word == "/if"
+            || word.starts_with("#if(") || word.starts_with("/if(")
+            || *word == "#while" || *word == "/while"
+            || word.starts_with("#while(") || word.starts_with("/while(")
+            || *word == "#for" || *word == "/for"
         {
             depth += 1;
-        } else if *word == "#endif" || *word == "#done" {
+        } else if *word == "#endif" || *word == "/endif"
+            || *word == "#done" || *word == "/done"
+        {
             depth -= 1;
         }
     }
@@ -531,6 +535,14 @@ pub fn execute_macro(
     if let Some(tm) = trigger_match {
         let capture_refs: Vec<&str> = tm.captures.to_vec();
         body = variables::substitute_captures(&body, tm.full_match, &capture_refs, tm.left, tm.right);
+
+        // Set capture groups as local variables for expression access ({P0}, {P1}, etc.)
+        engine.set_local("P0", TfValue::String(tm.full_match.to_string()));
+        for (i, cap) in tm.captures.iter().enumerate() {
+            engine.set_local(&format!("P{}", i + 1), TfValue::String(cap.to_string()));
+        }
+        engine.set_local("PL", TfValue::String(tm.left.to_string()));
+        engine.set_local("PR", TfValue::String(tm.right.to_string()));
     }
 
     // Split body into execution units, preserving control flow blocks as units
@@ -546,9 +558,12 @@ pub fn execute_macro(
         // The control flow executor will handle per-iteration substitution
         let lower = cmd.to_lowercase();
         let is_control_flow = lower.starts_with("#while ") || lower.starts_with("#while\n")
+            || lower.starts_with("/while ") || lower.starts_with("/while\n")
             || lower.starts_with("#for ") || lower.starts_with("#for\n")
+            || lower.starts_with("/for ") || lower.starts_with("/for\n")
             || lower.starts_with("#if ") || lower.starts_with("#if\n")
-            || lower.starts_with("#if(");
+            || lower.starts_with("/if ") || lower.starts_with("/if\n")
+            || lower.starts_with("#if(") || lower.starts_with("/if(");
 
         let cmd = if is_control_flow {
             // Pass control flow blocks directly without substitution
@@ -564,10 +579,11 @@ pub fn execute_macro(
         let cmd = cmd.trim();
 
         // Execute the command (already substituted above)
-        let result = if cmd.starts_with('#') {
+        // Both # and / prefixed commands are routed through the TF engine,
+        // which handles /command → #command conversion for known TF commands
+        // and returns ClayCommand for Clay-specific commands like /notify
+        let result = if cmd.starts_with('#') || cmd.starts_with('/') {
             super::parser::execute_command_substituted(engine, cmd)
-        } else if cmd.starts_with('/') {
-            TfCommandResult::ClayCommand(cmd.to_string())
         } else {
             TfCommandResult::SendToMud(cmd.to_string())
         };

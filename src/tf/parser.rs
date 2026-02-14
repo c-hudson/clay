@@ -1329,8 +1329,9 @@ fn is_valid_var_name(name: &str) -> bool {
 /// #if (condition) [command] - Conditional execution
 fn cmd_if(engine: &mut TfEngine, args: &str) -> TfCommandResult {
     // Check if this is a complete inline block (from macro execution)
-    // These contain newlines and the full #if...#endif structure
-    if args.contains('\n') && args.to_lowercase().contains("#endif") {
+    // These contain newlines and the full #if...#endif or /if.../endif structure
+    let if_args_lower = args.to_lowercase();
+    if args.contains('\n') && (if_args_lower.contains("#endif") || if_args_lower.contains("/endif")) {
         // Reconstruct the full block by prepending "#if "
         let full_block = format!("#if {}", args);
         let results = control_flow::execute_inline_if_block(engine, &full_block);
@@ -1380,8 +1381,9 @@ fn aggregate_inline_results(results: Vec<TfCommandResult>) -> TfCommandResult {
 /// #while (condition) - Start a while loop
 fn cmd_while(engine: &mut TfEngine, args: &str) -> TfCommandResult {
     // Check if this is a complete inline block (from macro execution)
-    // These contain newlines and the full #while...#done structure
-    if args.contains('\n') && args.to_lowercase().contains("#done") {
+    // These contain newlines and the full #while...#done or /while.../done structure
+    let args_lower = args.to_lowercase();
+    if args.contains('\n') && (args_lower.contains("#done") || args_lower.contains("/done")) {
         // Reconstruct the full block by prepending "#while "
         let full_block = format!("#while {}", args);
         let results = control_flow::execute_inline_while_block(engine, &full_block);
@@ -1400,7 +1402,8 @@ fn cmd_while(engine: &mut TfEngine, args: &str) -> TfCommandResult {
 /// #for var start end [step] - Start a for loop
 fn cmd_for(engine: &mut TfEngine, args: &str) -> TfCommandResult {
     // Check if this is a complete inline block (from macro execution)
-    if args.contains('\n') && args.to_lowercase().contains("#done") {
+    let for_args_lower = args.to_lowercase();
+    if args.contains('\n') && (for_args_lower.contains("#done") || for_args_lower.contains("/done")) {
         let full_block = format!("#for {}", args);
         let results = control_flow::execute_inline_for_block(engine, &full_block);
         return aggregate_inline_results(results);

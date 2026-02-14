@@ -1750,5 +1750,111 @@ mod tests {
         assert!(listen_macro.trigger.is_some(), "listen_mush should have a trigger");
         assert_eq!(listen_macro.priority, 5000, "listen_mush should have priority 5000");
 
+        // Verify crypt_pwd was set by /passwd Fredrik (line 99 of crypt.tf)
+        // The passwd macro uses /while, /if, /let, /def with / prefix - these must work in macro bodies
+        let crypt_pwd_macro = engine.macros.iter().find(|m| m.name == "crypt_pwd");
+        assert!(crypt_pwd_macro.is_some(), "crypt_pwd macro should be defined after /passwd Fredrik");
+        assert_eq!(crypt_pwd_macro.unwrap().body, "Fredrik",
+            "crypt_pwd should be 'Fredrik', got: '{}'", crypt_pwd_macro.unwrap().body);
+
+    }
+
+    #[test]
+    fn test_capture_groups_in_expressions() {
+        // Test that {P1} works in expression context within trigger macros
+        let mut engine = TfEngine::new();
+
+        // Define a simple trigger that uses {P1} in expression context
+        let result = engine.execute(r#"#def -mregexp -t"^Hello (.+)$" test_capture = /let first=$[substr({P1},0,1)]%;/echo %{first}"#);
+        assert!(matches!(result, TfCommandResult::Success(_)),
+            "Failed to define trigger: {:?}", result);
+
+        // Verify trigger was stored
+        let mac = engine.macros.iter().find(|m| m.name == "test_capture");
+        assert!(mac.is_some(), "test_capture macro not found");
+        let mac = mac.unwrap();
+        assert!(mac.trigger.is_some(), "trigger should be set");
+        let trigger = mac.trigger.as_ref().unwrap();
+        assert_eq!(trigger.pattern, "^Hello (.+)$",
+            "trigger pattern wrong: {}", trigger.pattern);
+
+        // Fire the trigger
+        let results = crate::tf::macros::process_triggers(&mut engine, "Hello World", None);
+
+        // The trigger should have fired and set P1 = "World"
+        // Then {P1} in the expression should resolve, substr gets "W"
+        let has_output = results.iter().any(|r| {
+            if let TfCommandResult::Success(Some(msg)) = r {
+                msg.contains("W")
+            } else {
+                false
+            }
+        });
+        assert!(has_output, "Expected output containing 'W' from substr({{P1}},0,1), got: {:?}", results);
+    }
+
+    #[test]
+    fn test_encrypt_decrypt_roundtrip() {
+        // Test encrypt→decrypt round trip with crypt.tf
+        let mut engine = TfEngine::new();
+
+        // Load crypt.tf
+        let _ = cmd_load(&mut engine, "crypt.tf");
+
+        // Verify crypt_pwd is set
+        let pwd = engine.macros.iter().find(|m| m.name == "crypt_pwd");
+        assert!(pwd.is_some(), "crypt_pwd should be set");
+        assert_eq!(pwd.unwrap().body, "Fredrik");
+
+        // Encrypt a test string
+        let result = engine.execute("/encrypt Hello World3.14");
+        let encrypted = match &result {
+            TfCommandResult::Success(Some(msg)) => msg.trim().to_string(),
+            other => panic!("Expected output from /encrypt, got: {:?}", other),
+        };
+        assert!(!encrypted.is_empty(), "Encrypted output should not be empty");
+
+        // The encrypted text may contain backslash-escaped characters
+        // Decrypt in mode 0 (no backslash handling - for worlds that evaluate escapes)
+        // First, strip backslashes to simulate world evaluation
+        let unescaped: String = {
+            let chars: Vec<char> = encrypted.chars().collect();
+            let mut result = String::new();
+            let mut i = 0;
+            while i < chars.len() {
+                if chars[i] == '\\' && i + 1 < chars.len() {
+                    // Skip backslash, keep next char
+                    result.push(chars[i + 1]);
+                    i += 2;
+                } else {
+                    result.push(chars[i]);
+                    i += 1;
+                }
+            }
+            result
+        };
+
+        // Also handle %b → space
+        let unescaped = unescaped.replace("%b", " ");
+
+        // Decrypt in mode 0 (no backslash escapes in text)
+        let decrypt_cmd = format!("/decrypt 0 x{}x", unescaped);
+        let result = engine.execute(&decrypt_cmd);
+        let decrypted = match &result {
+            TfCommandResult::Success(Some(msg)) => msg.trim().to_string(),
+            other => panic!("Expected output from mode-0 /decrypt, got: {:?}", other),
+        };
+        assert_eq!(decrypted, "Hello World3.14",
+            "Mode 0 decrypt should recover original text, got: '{}'", decrypted);
+
+        // Decrypt in mode 1 (backslash escapes preserved - verbatim case)
+        let decrypt_cmd = format!("/decrypt 1 x{}x", encrypted);
+        let result = engine.execute(&decrypt_cmd);
+        let decrypted = match &result {
+            TfCommandResult::Success(Some(msg)) => msg.trim().to_string(),
+            other => panic!("Expected output from mode-1 /decrypt, got: {:?}", other),
+        };
+        assert_eq!(decrypted, "Hello World3.14",
+            "Mode 1 decrypt should recover original text, got: '{}'", decrypted);
     }
 }
