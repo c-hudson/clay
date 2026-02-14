@@ -13,6 +13,79 @@ const SYSTEM_DICT_PATHS: &[&str] = &[
     "/data/data/com.termux/files/usr/share/dict/british-english",
 ];
 
+// Parse a dictionary line, handling Hunspell .dic format (word/FLAGS)
+// Returns the word portion lowercased, or None if invalid
+fn parse_dict_word(line: &str) -> Option<String> {
+    let trimmed = line.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    // Skip Hunspell .dic header (first line is a number = word count)
+    if trimmed.chars().all(|c| c.is_ascii_digit()) {
+        return None;
+    }
+    // Strip Hunspell affix flags after '/' (e.g., "word/MS" -> "word")
+    let word = if let Some(slash_pos) = trimmed.find('/') {
+        &trimmed[..slash_pos]
+    } else {
+        trimmed
+    };
+    let lower = word.to_lowercase();
+    if !lower.is_empty() && lower.chars().all(|c| c.is_alphabetic()) {
+        Some(lower)
+    } else {
+        None
+    }
+}
+
+// Find LibreOffice Hunspell dictionaries on Windows
+#[cfg(target_os = "windows")]
+fn find_hunspell_dict_paths() -> Vec<std::path::PathBuf> {
+    let mut paths = Vec::new();
+    // Program Files locations
+    for base in &[
+        r"C:\Program Files\LibreOffice\share\extensions",
+        r"C:\Program Files (x86)\LibreOffice\share\extensions",
+    ] {
+        let base_path = std::path::Path::new(base);
+        if base_path.is_dir() {
+            if let Ok(entries) = std::fs::read_dir(base_path) {
+                for entry in entries.flatten() {
+                    let dir = entry.path();
+                    if dir.is_dir() {
+                        // Look for en_US.dic or en_GB.dic in subdirectories
+                        for name in &["en_US.dic", "en_GB.dic"] {
+                            let dic = dir.join(name);
+                            if dic.exists() {
+                                paths.push(dic);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    // Also check next to the executable
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(exe_dir) = exe.parent() {
+            let words = exe_dir.join("words");
+            if words.exists() {
+                paths.push(words);
+            }
+            let dic = exe_dir.join("en_US.dic");
+            if dic.exists() {
+                paths.push(dic);
+            }
+        }
+    }
+    paths
+}
+
+#[cfg(not(target_os = "windows"))]
+fn find_hunspell_dict_paths() -> Vec<std::path::PathBuf> {
+    Vec::new()
+}
+
 // Common contraction suffixes (after apostrophe)
 // If a word ends with 'suffix, check if the base word is valid
 // Note: "n't" must come before "'t" so we match the longer suffix first
@@ -38,11 +111,7 @@ impl SpellChecker {
         // Try custom dictionary path first
         if !custom_path.is_empty() {
             if let Ok(content) = std::fs::read_to_string(custom_path) {
-                words = content
-                    .lines()
-                    .map(|s| s.trim().to_lowercase())
-                    .filter(|s| !s.is_empty() && s.chars().all(|c| c.is_alphabetic()))
-                    .collect();
+                words = content.lines().filter_map(parse_dict_word).collect();
             }
         }
 
@@ -50,12 +119,20 @@ impl SpellChecker {
         if words.is_empty() {
             for path in SYSTEM_DICT_PATHS {
                 if let Ok(content) = std::fs::read_to_string(path) {
-                    words = content
-                        .lines()
-                        .map(|s| s.trim().to_lowercase())
-                        .filter(|s| !s.is_empty() && s.chars().all(|c| c.is_alphabetic()))
-                        .collect();
+                    words = content.lines().filter_map(parse_dict_word).collect();
                     break;
+                }
+            }
+        }
+
+        // Try Hunspell dictionaries (LibreOffice on Windows)
+        if words.is_empty() {
+            for path in find_hunspell_dict_paths() {
+                if let Ok(content) = std::fs::read_to_string(&path) {
+                    words = content.lines().filter_map(parse_dict_word).collect();
+                    if !words.is_empty() {
+                        break;
+                    }
                 }
             }
         }
@@ -68,11 +145,7 @@ impl SpellChecker {
             {
                 if output.status.success() {
                     if let Ok(content) = String::from_utf8(output.stdout) {
-                        words = content
-                            .lines()
-                            .map(|s| s.trim().to_lowercase())
-                            .filter(|s| !s.is_empty() && s.chars().all(|c| c.is_alphabetic()))
-                            .collect();
+                        words = content.lines().filter_map(parse_dict_word).collect();
                     }
                 }
             }
