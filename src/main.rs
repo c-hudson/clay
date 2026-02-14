@@ -9072,7 +9072,8 @@ pub async fn run_app_headless(
                         }
                     }
                     // Background connection completed successfully
-                    AppEvent::ConnectionSuccess(world_name, cmd_tx, _socket_fd, is_tls) => {
+                    AppEvent::ConnectionSuccess(world_name, cmd_tx, socket_fd, is_tls) => {
+                        let _ = &socket_fd; // used on unix only
                         if let Some(world_idx) = app.find_world_index(&world_name) {
                             app.worlds[world_idx].connected = true;
                             app.worlds[world_idx].was_connected = true;
@@ -12764,7 +12765,8 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                         }
                     }
                     // Background connection completed successfully
-                    AppEvent::ConnectionSuccess(world_name, cmd_tx, _socket_fd, is_tls) => {
+                    AppEvent::ConnectionSuccess(world_name, cmd_tx, socket_fd, is_tls) => {
+                        let _ = &socket_fd; // used on unix only
                         if let Some(world_idx) = app.find_world_index(&world_name) {
                             app.worlds[world_idx].connected = true;
                             app.worlds[world_idx].was_connected = true;
@@ -15100,7 +15102,8 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                     }
                 }
                 // Background connection completed successfully
-                AppEvent::ConnectionSuccess(world_name, cmd_tx, _socket_fd, is_tls) => {
+                AppEvent::ConnectionSuccess(world_name, cmd_tx, socket_fd, is_tls) => {
+                        let _ = &socket_fd; // used on unix only
                     if let Some(world_idx) = app.find_world_index(&world_name) {
                         app.worlds[world_idx].connected = true;
                         app.worlds[world_idx].was_connected = true;
