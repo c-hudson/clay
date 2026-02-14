@@ -8348,7 +8348,7 @@ async fn main() -> io::Result<()> {
 
             std::process::exit(136);  // 128 + 8 (SIGFPE)
         }
-        libc::signal(libc::SIGFPE, sigfpe_handler as libc::sighandler_t);
+        libc::signal(libc::SIGFPE, sigfpe_handler as *const () as libc::sighandler_t);
 
         extern "C" fn sigsegv_handler(_: libc::c_int) {
             let _ = disable_raw_mode();
@@ -8361,7 +8361,7 @@ async fn main() -> io::Result<()> {
             eprintln!("{}", bt);
             std::process::exit(139);  // 128 + 11 (SIGSEGV)
         }
-        libc::signal(libc::SIGSEGV, sigsegv_handler as libc::sighandler_t);
+        libc::signal(libc::SIGSEGV, sigsegv_handler as *const () as libc::sighandler_t);
 
         extern "C" fn sigbus_handler(_: libc::c_int) {
             let _ = disable_raw_mode();
@@ -8374,7 +8374,7 @@ async fn main() -> io::Result<()> {
             eprintln!("{}", bt);
             std::process::exit(135);  // 128 + 7 (SIGBUS)
         }
-        libc::signal(libc::SIGBUS, sigbus_handler as libc::sighandler_t);
+        libc::signal(libc::SIGBUS, sigbus_handler as *const () as libc::sighandler_t);
 
         extern "C" fn sigabrt_handler(_: libc::c_int) {
             let _ = disable_raw_mode();
@@ -8387,7 +8387,7 @@ async fn main() -> io::Result<()> {
             eprintln!("{}", bt);
             std::process::exit(134);  // 128 + 6 (SIGABRT)
         }
-        libc::signal(libc::SIGABRT, sigabrt_handler as libc::sighandler_t);
+        libc::signal(libc::SIGABRT, sigabrt_handler as *const () as libc::sighandler_t);
     }
 
     // Set up crash handler for automatic recovery (not available on Android or Windows)
