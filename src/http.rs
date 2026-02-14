@@ -186,7 +186,6 @@ async fn handle_https_client(
 
         if stream.write_all(&response).await.is_ok() {
             // Ensure the response is fully sent before closing
-            use tokio::io::AsyncWriteExt;
             let _ = stream.shutdown().await;
         }
     }
@@ -402,7 +401,6 @@ async fn handle_https_client(
 
         if stream.write_all(&response).await.is_ok() {
             // Ensure the response is fully sent before closing
-            use tokio::io::AsyncWriteExt;
             let _ = stream.shutdown().await;
         }
     }

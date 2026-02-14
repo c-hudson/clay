@@ -939,7 +939,6 @@ impl RemoteGuiApp {
             let connect_result = {
                 if url.starts_with("wss://") {
                     // Configure rustls to accept self-signed/invalid certificates
-                    use std::sync::Arc;
                     let tls_config = rustls::ClientConfig::builder()
                         .dangerous()
                         .with_custom_certificate_verifier(Arc::new(crate::danger::NoCertificateVerification::new()))
@@ -2768,7 +2767,6 @@ impl RemoteGuiApp {
     /// Parse text into segments of plain text, Discord emojis, and colored squares
     fn parse_discord_segments(text: &str) -> Vec<DiscordSegment> {
         use regex::Regex;
-        use std::sync::OnceLock;
 
         static RE: OnceLock<Regex> = OnceLock::new();
         let re = RE.get_or_init(|| {
@@ -9148,8 +9146,6 @@ pub fn run_remote_gui(addr: &str) -> std::io::Result<()> {
 
 /// Run the master GUI mode: App runs in-process on tokio, GUI on the main thread.
 pub fn run_master_gui() -> std::io::Result<()> {
-    use tokio::sync::mpsc;
-
     // Check for display server availability (Linux only - Windows/macOS always have a display)
     #[cfg(all(unix, not(target_os = "macos")))]
     {

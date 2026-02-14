@@ -148,7 +148,6 @@ pub fn cmd_sh(args: &str) -> TfCommandResult {
 ///   #quote -decho '"config.txt"  - Display file contents locally
 pub fn cmd_quote(engine: &mut super::TfEngine, args: &str) -> TfCommandResult {
     use super::QuoteDisposition;
-    use std::io::{BufRead, BufReader};
     use std::process::{Command, Stdio};
 
     if args.is_empty() {

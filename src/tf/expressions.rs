@@ -1903,7 +1903,6 @@ impl<'a> Evaluator<'a> {
                     filename
                 };
 
-                use std::io::Write;
                 match std::fs::OpenOptions::new().create(true).append(true).open(&expanded) {
                     Ok(mut file) => {
                         match file.write_all(text.as_bytes()) {
