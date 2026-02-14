@@ -268,23 +268,63 @@ fn parse_attributes(attrs: &str) -> Result<TfAttributes, String> {
     let mut result = TfAttributes::default();
 
     for attr in attrs.split(',') {
-        let attr = attr.trim().to_lowercase();
+        let attr = attr.trim();
 
-        if let Some(color) = attr.strip_prefix("hilite:") {
+        if attr.is_empty() {
+            continue;
+        }
+
+        // Check for long-form names first (case-insensitive)
+        let lower = attr.to_lowercase();
+        if let Some(color) = lower.strip_prefix("hilite:") {
             result.hilite = Some(color.to_string());
-        } else {
-            match attr.as_str() {
-                "gag" => result.gag = true,
-                "norecord" => result.norecord = true,
-                "bold" => result.bold = true,
-                "underline" => result.underline = true,
-                "reverse" => result.reverse = true,
-                "flash" => result.flash = true,
-                "dim" => result.dim = true,
-                "bell" => result.bell = true,
-                "" => {} // Ignore empty
+            continue;
+        }
+        match lower.as_str() {
+            "gag" => { result.gag = true; continue; }
+            "norecord" | "nohistory" => { result.norecord = true; continue; }
+            "nolog" => { continue; } // Accepted but not tracked
+            "noactivity" => { continue; } // Accepted but not tracked
+            "bold" => { result.bold = true; continue; }
+            "underline" => { result.underline = true; continue; }
+            "reverse" => { result.reverse = true; continue; }
+            "flash" => { result.flash = true; continue; }
+            "dim" => { result.dim = true; continue; }
+            "bell" => { result.bell = true; continue; }
+            _ => {}
+        }
+
+        // Parse TF single-letter attribute codes: g, G, L, A, u, r, B, b, h, n, x, C, E, W, d, f
+        // Multiple codes can be concatenated (e.g., "gB" = gag + bold)
+        let chars: Vec<char> = attr.chars().collect();
+        let mut i = 0;
+        while i < chars.len() {
+            match chars[i] {
+                'n' => {} // normal/none - reset (we just don't set anything)
+                'x' => {} // exclusive - accepted but not tracked separately
+                'g' => result.gag = true,
+                'G' => result.norecord = true, // nohistory
+                'L' => {} // nolog - accepted but not tracked
+                'A' => {} // noactivity - accepted but not tracked
+                'u' => result.underline = true,
+                'r' => result.reverse = true,
+                'B' => result.bold = true,
+                'b' => result.bell = true,
+                'h' => result.hilite = Some("hilite".to_string()),
+                'd' | 'f' => {} // dim/flash - accepted for compat
+                'E' | 'W' => {} // error/warning attrs - accepted but not tracked
+                'C' => {
+                    // Color: "Cname" or "Cbgname" - consume rest as color
+                    let color: String = chars[i+1..].iter().collect();
+                    if !color.is_empty() {
+                        result.hilite = Some(color);
+                    }
+                    i = chars.len(); // consumed all remaining
+                    continue;
+                }
                 _ => return Err(format!("Unknown attribute: {}", attr)),
             }
+            i += 1;
         }
     }
 
@@ -856,11 +896,33 @@ mod tests {
 
     #[test]
     fn test_parse_attributes() {
+        // Long-form names
         let attrs = parse_attributes("gag,bold,hilite:red").unwrap();
         assert!(attrs.gag);
         assert!(attrs.bold);
         assert_eq!(attrs.hilite, Some("red".to_string()));
         assert!(!attrs.underline);
+
+        // TF single-letter codes
+        let attrs = parse_attributes("g").unwrap();
+        assert!(attrs.gag);
+        let attrs = parse_attributes("gB").unwrap();
+        assert!(attrs.gag);
+        assert!(attrs.bold);
+
+        // Combined single-letter codes
+        let attrs = parse_attributes("ur").unwrap();
+        assert!(attrs.underline);
+        assert!(attrs.reverse);
+
+        // Color attribute
+        let attrs = parse_attributes("Cred").unwrap();
+        assert_eq!(attrs.hilite, Some("red".to_string()));
+
+        // Mixed: single-letter with comma-separated long-form
+        let attrs = parse_attributes("B,gag").unwrap();
+        assert!(attrs.bold);
+        assert!(attrs.gag);
     }
 
     #[test]
