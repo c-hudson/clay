@@ -624,7 +624,7 @@ pub fn execute_inline_if_block(engine: &mut TfEngine, block: &str) -> Vec<TfComm
                     return vec![TfCommandResult::Error("/elseif after /else".to_string())];
                 }
                 // Parse elseif condition and optional body
-                let prefix_len = if lower.starts_with("#elseif") { 7 } else { 7 }; // both are 7 chars
+                let prefix_len = 7; // #elseif and /elseif are both 7 chars
                 let args = &trimmed[prefix_len..].trim_start();
                 match parse_condition_with_body(args) {
                     Ok((condition, body_start)) => {
@@ -647,7 +647,7 @@ pub fn execute_inline_if_block(engine: &mut TfEngine, block: &str) -> Vec<TfComm
                 state.bodies.push(vec![]);
                 state.current_branch += 1;
                 // Check for content after #else / /else
-                let prefix_len = if lower.starts_with("#else") { 5 } else { 5 }; // both are 5 chars
+                let prefix_len = 5; // #else and /else are both 5 chars
                 let rest = if lower == "#else" || lower == "/else" { "" } else { trimmed[prefix_len..].trim_start() };
                 if !rest.is_empty() {
                     state.bodies[state.current_branch].push(rest.to_string());
@@ -665,7 +665,7 @@ pub fn execute_inline_if_block(engine: &mut TfEngine, block: &str) -> Vec<TfComm
             }
 
             // Parse the #if / /if line
-            let prefix_len = if lower.starts_with("#if") { 3 } else { 3 }; // both are 3 chars
+            let prefix_len = 3; // #if and /if are both 3 chars
             let args = &trimmed[prefix_len..].trim_start();
 
             // Find the condition
@@ -719,7 +719,7 @@ pub fn execute_inline_while_block(engine: &mut TfEngine, block: &str) -> Vec<TfC
             }
 
             // Parse the #while / /while line
-            let prefix_len = if lower.starts_with("#while") { 6 } else { 6 }; // both 6 chars
+            let prefix_len = 6; // #while and /while are both 6 chars
             let args = &trimmed[prefix_len..].trim_start();
             match parse_condition_with_body(args) {
                 Ok((cond, body_start)) => {
@@ -862,7 +862,7 @@ pub fn execute_inline_for_block(engine: &mut TfEngine, block: &str) -> Vec<TfCom
             }
 
             // Parse the #for / /for line
-            let prefix_len = if lower.starts_with("#for") { 4 } else { 4 }; // both 4 chars
+            let prefix_len = 4; // #for and /for are both 4 chars
             let args = &trimmed[prefix_len..].trim_start();
             // Parse for args: var start end [step] [body_content]
             let parts: Vec<&str> = args.split_whitespace().collect();

@@ -376,13 +376,58 @@ Prompts that are auto-answered are immediately cleared and not displayed in the 
 
 ### Files
 
-- `src/main.rs` - Main application
+**Core:**
+- `src/main.rs` - Main application (TUI, event loop, world management, connections)
 - `src/encoding.rs` - Character encoding (UTF-8, Latin1, Fansi), colored emoji handling, and console `Theme` enum (Dark/Light with hardcoded ratatui colors)
+- `src/input.rs` - Input area with viewport scrolling, cursor positioning, display width helpers
+- `src/actions.rs` - Action/trigger system (pattern matching, command execution, capture groups)
+- `src/telnet.rs` - Telnet protocol negotiation and option handling
+- `src/spell.rs` - Spell checking with Levenshtein distance suggestions
+- `src/persistence.rs` - Settings save/load (`~/.clay.dat` INI format)
+- `src/util.rs` - Shared utility functions
+- `src/daemon.rs` - Daemon/background process management
+- `src/ansi_music.rs` - ANSI music sequence parsing and playback
+
+**Networking:**
+- `src/websocket.rs` - WebSocket server, message types, client management
+- `src/http.rs` - HTTP/HTTPS web server (3 handler implementations: native-tls, rustls, plain)
+
+**Theme:**
 - `src/theme.rs` - `ThemeColors` struct (42 customizable color vars), `ThemeFile` for loading `~/clay.theme.dat` (INI format). Used by GUI/web only; console uses `Theme` from encoding.rs
+
+**Popup System:**
+- `src/popup/mod.rs` - Unified popup system (PopupManager, field types, layout)
+- `src/popup/console_renderer.rs` - Console/TUI popup rendering (ratatui)
+- `src/popup/gui_renderer.rs` - GUI popup rendering (egui)
+- `src/popup/definitions/` - Individual popup definitions (actions, confirm, connections, filter, help, menu, setup, web, world_editor, world_selector)
+
+**TF (TinyFugue) Engine:**
+- `src/tf/mod.rs` - TF engine state, variable storage, macro registry
+- `src/tf/parser.rs` - Command parsing, routing (`#`/`/` prefix), inline block detection
+- `src/tf/macros.rs` - Macro definition, trigger matching, execution, attribute parsing
+- `src/tf/builtins.rs` - Built-in TF commands (`/echo`, `/set`, `/load`, `/save`, `/quote`, etc.)
+- `src/tf/control_flow.rs` - `/if`/`/while`/`/for` block execution
+- `src/tf/expressions.rs` - Expression evaluator (arithmetic, string, regex, function calls)
+- `src/tf/variables.rs` - Variable substitution (`%{var}`, `%Pn`, positional params)
+- `src/tf/hooks.rs` - Hook event system (CONNECT, DISCONNECT, LOAD, etc.)
+- `src/tf/bridge.rs` - Bridge between TF engine and App (command results → app actions)
+
+**Remote GUI:**
+- `src/remote_gui.rs` - Remote GUI client v1 (egui, WebSocket connection)
+- `src/remote_gui2.rs` - Remote GUI client v2 (egui, alternative implementation)
+
+**Web Interface:**
 - `src/web/index.html` - Web interface HTML template
 - `src/web/style.css` - Web interface CSS styles (uses `var(--theme-*)` CSS variables)
 - `src/web/app.js` - Web interface JavaScript client
 - `src/web/theme-editor.html` - Standalone browser-based theme color editor with live preview
+
+**Testing:**
+- `src/testharness.rs` - Test harness for integration tests
+- `src/testserver.rs` - Mock MUD server for testing
+- `src/bin/clay-test-server.rs` - Standalone test server binary
+
+**Data Files:**
 - `clay2.png` - Logo image used in remote GUI login screen and Android app icon
 - `android/app/src/main/res/mipmap-*/` - Android launcher icons (generated from clay2.png)
 - `websockets.readme` - WebSocket protocol documentation
@@ -527,13 +572,14 @@ Clay includes a TinyFugue compatibility layer. TF commands work with both `/` an
 - `/break` - Exit loop early
 
 **Macros (Triggers):**
-- `/def [options] name = body` - Define macro
+- `/def [options] name [= body]` - Define macro (body is optional for attribute-only macros)
   - `-t"pattern"` - Trigger pattern (fires when MUD output matches)
   - `-mtype` - Match type: `simple`, `glob` (default), `regexp`
   - `-p priority` - Execution priority (higher = first)
   - `-F` - Fall-through (continue checking other triggers)
   - `-1` - One-shot (delete after firing once)
   - `-n count` - Fire only N times
+  - `-a` - Attributes: supports both single-letter TF codes (`g`=gag, `h`=hilite, `B`=bold, `u`=underline, `r`=reverse, `b`=bell) and long-form names (`"gag"`, `"bold"`, etc.)
   - `-ag` - Gag (suppress) matched line
   - `-ah` - Highlight matched line
   - `-ab` - Bold
@@ -590,9 +636,14 @@ Clay includes a TinyFugue compatibility layer. TF commands work with both `/` an
 - `%*` - All positional parameters
 - `%L` - Text left of match
 - `%R` - Text right of match
-- `%P0` - `%P9` - Regex capture groups from `regmatch()` (%P0 = full match)
+- `%P0` - `%P9` - Regex capture groups from `regmatch()` or trigger match (%P0 = full match)
 - `%%` - Literal percent sign
 - `\%` - Literal percent sign (backslash escape)
+
+**Capture Groups in Expressions:**
+- Trigger capture groups are available in both text substitution (`%P1`) and expression context (`{P1}`)
+- `{P0}` - Full match, `{P1}`-`{P9}` - Capture groups, `{PL}` - Left of match, `{PR}` - Right of match
+- These are set as local variables in macro scope so the expression evaluator can resolve them
 
 **Special Variables:**
 - `%{world_name}` - Current world name
