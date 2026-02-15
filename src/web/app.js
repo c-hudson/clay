@@ -3720,14 +3720,12 @@
         }
     }
 
-    // Update time (12-hour format, no leading zeros)
+    // Update time (24-hour format HH:MM)
     function updateTime() {
         const now = new Date();
-        let hours = now.getHours();
-        const ampm = hours >= 12 ? 'pm' : 'am';
-        hours = hours % 12 || 12; // Convert 0 to 12 for midnight
+        const hours = now.getHours().toString().padStart(2, '0');
         const minutes = now.getMinutes().toString().padStart(2, '0');
-        elements.statusTime.textContent = `${hours}:${minutes}${ampm}`;
+        elements.statusTime.textContent = `${hours}:${minutes}`;
     }
 
     // Set input area height (number of lines)
