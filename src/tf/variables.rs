@@ -540,7 +540,7 @@ fn execute_for_substitution(engine: &mut TfEngine, cmd: &str) -> String {
     }
 
     // Execute the command
-    let result = if cmd.starts_with('#') || cmd.starts_with('/') {
+    let result = if cmd.starts_with('/') {
         super::parser::execute_command(engine, cmd)
     } else {
         // Non-command text - just return it as-is

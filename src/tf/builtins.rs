@@ -946,7 +946,7 @@ fn load_file_internal(engine: &mut TfEngine, filename: &str, quiet: bool) -> TfC
         }
 
         // Execute the line
-        let result = if trimmed.starts_with('#') || trimmed.starts_with('/') {
+        let result = if trimmed.starts_with('/') {
             super::parser::execute_command(engine, trimmed)
         } else {
             // Non-command lines are sent to the MUD in TF, but we ignore them in Clay
@@ -997,15 +997,15 @@ fn load_file_internal(engine: &mut TfEngine, filename: &str, quiet: bool) -> TfC
     }
 }
 
-/// #load [-q] filename - Load and execute a TF script file
+/// /load [-q] filename - Load and execute a TF script file
 ///
 /// Options:
 ///   -q  Quiet mode - don't echo "Loading commands from..." message
 ///
-/// The file may contain TF commands starting with # or /.
+/// The file may contain TF commands starting with /.
 /// Blank lines and lines beginning with ';' or single '#' are ignored.
 /// Lines ending in '\' continue on the next line (use %\ for literal backslash).
-/// Use #exit to abort loading early.
+/// Use /exit to abort loading early.
 pub fn cmd_load(engine: &mut TfEngine, args: &str) -> TfCommandResult {
     let args = args.trim();
 
@@ -1028,9 +1028,9 @@ pub fn cmd_load(engine: &mut TfEngine, args: &str) -> TfCommandResult {
     load_file_internal(engine, filename, quiet)
 }
 
-/// #require [-q] filename - Load file only if not already loaded via #loaded
+/// /require [-q] filename - Load file only if not already loaded via /loaded
 ///
-/// Same as #load, but if the file has already registered a token via #loaded,
+/// Same as /load, but if the file has already registered a token via /loaded,
 /// the file will not be read again (but the LOAD hook is still called).
 pub fn cmd_require(engine: &mut TfEngine, args: &str) -> TfCommandResult {
     let args = args.trim();
@@ -1051,15 +1051,15 @@ pub fn cmd_require(engine: &mut TfEngine, args: &str) -> TfCommandResult {
         }
     }
 
-    // Note: We don't check loaded_tokens here - that's done by #loaded inside the file.
-    // #require just calls #load; the difference is that files designed for #require
-    // will have #loaded as their first command, which will abort if already loaded.
+    // Note: We don't check loaded_tokens here - that's done by /loaded inside the file.
+    // /require just calls /load; the difference is that files designed for /require
+    // will have /loaded as their first command, which will abort if already loaded.
     load_file_internal(engine, filename, quiet)
 }
 
-/// #loaded token - Mark this file as loaded (for use with #require)
+/// /loaded token - Mark this file as loaded (for use with /require)
 ///
-/// Should be the first command in a file designed for #require.
+/// Should be the first command in a file designed for /require.
 /// If the token has already been registered, aborts the file load and returns success.
 /// Token should be unique (file's full path is recommended).
 pub fn cmd_loaded(engine: &mut TfEngine, args: &str) -> TfCommandResult {
@@ -1651,8 +1651,8 @@ mod tests {
         let mut engine = TfEngine::new();
 
         // Test reading from internal command (using ` prefix)
-        // #version returns a success message
-        let result = cmd_quote(&mut engine, "`\"#version\"");
+        // /version returns a success message
+        let result = cmd_quote(&mut engine, "`\"/version\"");
         match result {
             TfCommandResult::Quote { lines, disposition, .. } => {
                 assert!(!lines.is_empty());
@@ -1663,7 +1663,7 @@ mod tests {
         }
 
         // Test with prefix
-        let result = cmd_quote(&mut engine, "think `\"#version\"");
+        let result = cmd_quote(&mut engine, "think `\"/version\"");
         match result {
             TfCommandResult::Quote { lines, .. } => {
                 assert!(!lines.is_empty());
@@ -1764,7 +1764,7 @@ mod tests {
         let mut engine = TfEngine::new();
 
         // Define a simple trigger that uses {P1} in expression context
-        let result = engine.execute(r#"#def -mregexp -t"^Hello (.+)$" test_capture = /let first=$[substr({P1},0,1)]%;/echo %{first}"#);
+        let result = engine.execute(r#"/def -mregexp -t"^Hello (.+)$" test_capture = /let first=$[substr({P1},0,1)]%;/echo %{first}"#);
         assert!(matches!(result, TfCommandResult::Success(_)),
             "Failed to define trigger: {:?}", result);
 

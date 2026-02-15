@@ -1,6 +1,6 @@
 //! TinyFugue command parser.
 //!
-//! Parses commands starting with `#` and routes them to appropriate handlers.
+//! Parses commands starting with `/` and routes them to appropriate handlers.
 
 use super::{TfCommandResult, TfEngine, TfValue, TfHookEvent};
 use super::control_flow::{self, ControlState, ControlResult, IfState, WhileState, ForState};
@@ -139,44 +139,32 @@ fn execute_command_impl(engine: &mut TfEngine, input: &str, skip_substitution: b
         };
     }
 
-    // Handle commands starting with / (unified command system)
+    // Handle commands starting with /
     if input.starts_with('/') {
-        // Check for /tf prefix (TF-specific commands that conflict with Clay)
-        // e.g., /tfhelp, /tfgag
-        let lower_input = input.to_lowercase();
-        if lower_input.starts_with("/tfhelp") || lower_input.starts_with("/tfgag") {
-            // Route to TF-specific handlers
-            // Extract command name after /tf prefix
-            let cmd_part = input.split_whitespace().next().unwrap_or("");
-            let cmd_name = cmd_part[3..].to_lowercase(); // Skip "/tf"
-            let args = if input.len() > cmd_part.len() {
-                input[cmd_part.len()..].trim_start()
-            } else {
-                ""
-            };
-            let tf_cmd = format!("#{} {}", cmd_name, args);
-            return execute_tf_specific_command(engine, tf_cmd.trim(), skip_substitution);
-        }
-
         // Parse command name from /command format
         let cmd_part = input.split_whitespace().next().unwrap_or("");
         let cmd_name = cmd_part.trim_start_matches('/').to_lowercase();
-        let args = if input.len() > cmd_part.len() {
+        let args_str = if input.len() > cmd_part.len() {
             input[cmd_part.len()..].trim_start()
         } else {
             ""
         };
 
+        // Check for /tf prefix (TF-specific commands that conflict with Clay)
+        // e.g., /tfhelp, /tfgag
+        if cmd_name.starts_with("tf") && (cmd_name == "tfhelp" || cmd_name == "tfgag") {
+            let tf_cmd_name = &cmd_name[2..]; // Strip "tf" prefix
+            return execute_tf_command(engine, tf_cmd_name, args_str, skip_substitution);
+        }
+
         // Check if it's a TF command that should be handled here
         if is_tf_command_name(&cmd_name) {
-            // Convert / to # for internal processing
-            let tf_cmd = format!("#{} {}", cmd_name, args);
-            return execute_command_impl(engine, tf_cmd.trim(), skip_substitution);
+            return execute_tf_command(engine, &cmd_name, args_str, skip_substitution);
         }
 
         // Check if it's a user-defined macro
         if let Some(macro_def) = engine.macros.iter().find(|m| m.name.eq_ignore_ascii_case(&cmd_name)).cloned() {
-            let macro_args: Vec<&str> = parse_macro_args(args);
+            let macro_args: Vec<&str> = parse_macro_args(args_str);
             let results = super::macros::execute_macro(engine, &macro_def, &macro_args, None);
             return aggregate_results_with_engine(engine, results);
         }
@@ -185,67 +173,63 @@ fn execute_command_impl(engine: &mut TfEngine, input: &str, skip_substitution: b
         return TfCommandResult::ClayCommand(input.to_string());
     }
 
-    if !input.starts_with('#') {
-        return TfCommandResult::NotTfCommand;
-    }
+    TfCommandResult::NotTfCommand
+}
 
-    // Check if this is an inline control flow block (multi-line #while/#for/#if)
+/// Execute a TF command by name with the given arguments.
+/// Handles variable substitution, control flow detection, and dispatch.
+fn execute_tf_command(engine: &mut TfEngine, cmd_name: &str, args: &str, skip_substitution: bool) -> TfCommandResult {
+    // Reconstruct as /command for substitution and inline control flow detection
+    let full_input = if args.is_empty() {
+        format!("/{}", cmd_name)
+    } else {
+        format!("/{} {}", cmd_name, args)
+    };
+    let input = &full_input;
+
+    let rest_check = args.trim();
+    let lower_cmd = cmd_name.to_lowercase();
+
+    // Check if this is an inline control flow block (multi-line /while//for//if)
     // These should not have variables substituted here - the control flow executor handles it
-    let rest_check = input[1..].trim_start();
-    let lower_rest = rest_check.to_lowercase();
-    let is_inline_control_flow = input.contains('\n') && (
-        lower_rest.starts_with("while ") || lower_rest.starts_with("while\n")
-        || lower_rest.starts_with("for ") || lower_rest.starts_with("for\n")
-        || lower_rest.starts_with("if ") || lower_rest.starts_with("if\n") || lower_rest.starts_with("if(")
-    );
+    let is_inline_control_flow = input.contains('\n') && matches!(lower_cmd.as_str(), "while" | "for" | "if");
 
-    // Check if this is a #def command - if so, don't substitute variables in the body
+    // Check if this is a /def command - if so, don't substitute variables in the body
     // The body should be stored literally and only substituted when executed
-    let is_def_command = lower_rest.starts_with("def ")
-        || lower_rest.starts_with("def\t")
-        || lower_rest == "def";
+    let is_def_command = lower_cmd == "def";
 
-    // Perform variable and command substitution before parsing (except for #def bodies, inline control flow,
+    // Perform variable and command substitution before parsing (except for /def bodies, inline control flow,
     // or when called with pre-substituted input from control_flow)
-    let input = if skip_substitution {
+    let substituted;
+    let args = if skip_substitution {
         // Already substituted by caller (control_flow)
-        input.to_string()
+        rest_check
     } else if is_inline_control_flow {
         // Don't substitute - control flow executor will handle per-iteration substitution
-        input.to_string()
+        rest_check
     } else if is_def_command {
-        // For #def, only substitute variables in options, not in the body
+        // For /def, only substitute variables in options, not in the body
         // Find the = separator and only substitute before it
-        if let Some(eq_pos) = input.find('=') {
-            let before_eq = &input[..eq_pos];
-            let after_eq = &input[eq_pos..];
+        if let Some(eq_pos) = rest_check.find('=') {
+            let before_eq = &rest_check[..eq_pos];
+            let after_eq = &rest_check[eq_pos..];
             let substituted_before = engine.substitute_vars(before_eq);
             let substituted_before = super::variables::substitute_commands(engine, &substituted_before);
-            format!("{}{}", substituted_before, after_eq)
+            substituted = format!("{}{}", substituted_before, after_eq);
+            substituted.trim()
         } else {
-            // No body (just #def or #def with options but no =), substitute normally
-            let input = engine.substitute_vars(input);
-            super::variables::substitute_commands(engine, &input)
+            // No body (just /def or /def with options but no =), substitute normally
+            let s = engine.substitute_vars(rest_check);
+            substituted = super::variables::substitute_commands(engine, &s);
+            substituted.trim()
         }
     } else {
-        let input = engine.substitute_vars(input);
-        super::variables::substitute_commands(engine, &input)
+        let s = engine.substitute_vars(rest_check);
+        substituted = super::variables::substitute_commands(engine, &s);
+        substituted.trim()
     };
-    let input = input.trim();
 
-    // Skip the # and parse the command
-    let rest = &input[1..];
-
-    // Handle empty command
-    if rest.is_empty() {
-        return TfCommandResult::Error("Empty command".to_string());
-    }
-
-    // Split into command and arguments
-    let (cmd, args) = split_command(rest);
-    let cmd_lower = cmd.to_lowercase();
-
-    match cmd_lower.as_str() {
+    match lower_cmd.as_str() {
         // Variable commands
         "set" => cmd_set(engine, args),
         "unset" => cmd_unset(engine, args),
@@ -334,13 +318,13 @@ fn execute_command_impl(engine: &mut TfEngine, input: &str, skip_substitution: b
         // Check for user-defined macro with this name
         _ => {
             // Look for a macro with this name (case-insensitive)
-            if let Some(macro_def) = engine.macros.iter().find(|m| m.name.eq_ignore_ascii_case(cmd)).cloned() {
+            if let Some(macro_def) = engine.macros.iter().find(|m| m.name.eq_ignore_ascii_case(&lower_cmd)).cloned() {
                 // Parse arguments for the macro with delimiter-aware splitting
                 let macro_args: Vec<&str> = parse_macro_args(args);
                 let results = macros::execute_macro(engine, &macro_def, &macro_args, None);
                 aggregate_results_with_engine(engine, results)
             } else {
-                TfCommandResult::UnknownCommand(cmd.to_string())
+                TfCommandResult::UnknownCommand(lower_cmd.to_string())
             }
         }
     }
@@ -422,30 +406,6 @@ fn aggregate_results(results: Vec<TfCommandResult>) -> TfCommandResult {
     }
 }
 
-/// Execute TF-specific commands that conflict with Clay (/tfhelp, /tfgag)
-/// Input is expected to be in #command format (already converted from /tf prefix)
-fn execute_tf_specific_command(engine: &mut TfEngine, input: &str, _skip_substitution: bool) -> TfCommandResult {
-    let rest = input.trim_start_matches('#');
-    let (cmd, args) = split_command(rest);
-    let cmd_lower = cmd.to_lowercase();
-
-    match cmd_lower.as_str() {
-        "help" => cmd_help(args),  // TF text-based help (vs Clay /help popup)
-        "gag" => builtins::cmd_gag(engine, args),  // TF gag pattern (vs Clay /gag action command)
-        _ => TfCommandResult::UnknownCommand(format!("/tf{}", cmd)),
-    }
-}
-
-/// Split command into name and arguments
-fn split_command(input: &str) -> (&str, &str) {
-    if let Some(space_idx) = input.find(char::is_whitespace) {
-        let cmd = &input[..space_idx];
-        let args = input[space_idx..].trim_start();
-        (cmd, args)
-    } else {
-        (input, "")
-    }
-}
 
 // =============================================================================
 // Command Implementations
@@ -864,10 +824,10 @@ fn cmd_addworld(args: &str) -> TfCommandResult {
 
 /// /help [topic] or /tfhelp [topic] - Display TF help
 fn cmd_help(args: &str) -> TfCommandResult {
-    let topic = args.trim().trim_start_matches('/').trim_start_matches('#').to_lowercase();
+    let topic = args.trim().trim_start_matches('/').to_lowercase();
 
     if topic.is_empty() {
-        let help_text = r#"TinyFugue Commands (use / or # prefix)
+        let help_text = r#"TinyFugue Commands (use / prefix)
 
 Variables:
   /set [name [value]]  - Set/list global variables
@@ -933,8 +893,7 @@ Misc:
   /version             - Show version info
   /quit                - Exit Clay
 
-Note: Use # prefix for backward compatibility (e.g., #set, #echo).
-      Use /tfhelp and /tfgag for TF versions of conflicting commands.
+Use /tfhelp and /tfgag for TF versions of conflicting commands.
 
 Variable Substitution:
   %{varname}           - Variable value
@@ -948,17 +907,16 @@ Use /tfhelp functions for list of expression functions."#;
     } else {
         match topic.as_str() {
             "set" => TfCommandResult::Success(Some(
-                "/set [name [value]]  (or #set)\n\nSet a global variable. Without arguments, lists all variables.\nExamples:\n  /set foo bar    - Set foo to \"bar\"\n  /set count 42   - Set count to 42\n  /set            - List all variables".to_string()
+                "/set [name [value]]\n\nSet a global variable. Without arguments, lists all variables.\nExamples:\n  /set foo bar    - Set foo to \"bar\"\n  /set count 42   - Set count to 42\n  /set            - List all variables".to_string()
             )),
             "echo" => TfCommandResult::Success(Some(
-                "/echo message  (or #echo)\n\nDisplay a message locally (not sent to MUD).\nVariable substitution is performed on the message.\nExample: /echo Hello %{name}!".to_string()
+                "/echo message\n\nDisplay a message locally (not sent to MUD).\nVariable substitution is performed on the message.\nExample: /echo Hello %{name}!".to_string()
             )),
             "send" => TfCommandResult::Success(Some(
-                "/send [-w world] text  (or #send)\n\nSend text to the MUD server.\n-w world: Send to specific world\nExample: /send say Hello everyone!".to_string()
+                "/send [-w world] text\n\nSend text to the MUD server.\n-w world: Send to specific world\nExample: /send say Hello everyone!".to_string()
             )),
             "def" => TfCommandResult::Success(Some(
-                r#"/def [options] name = body  (or #def)
-
+                r#"/def [options] name = body
 Define a macro. Options:
   -t"pattern"   Trigger pattern (fires on matching MUD output)
   -mtype        Match type: simple, glob (default), regexp
@@ -982,19 +940,19 @@ Examples:
   /def -hCONNECT greet = look"#.to_string()
             )),
             "if" => TfCommandResult::Success(Some(
-                "/if (expression) command  (or #if)\n/if (expr) ... /elseif (expr) ... /else ... /endif\n\nConditional execution.\nExamples:\n  /if (hp < 50) cast heal\n  /if (%1 == \"yes\") /echo Confirmed /else /echo Cancelled /endif".to_string()
+                "/if (expression) command\n/if (expr) ... /elseif (expr) ... /else ... /endif\n\nConditional execution.\nExamples:\n  /if (hp < 50) cast heal\n  /if (%1 == \"yes\") /echo Confirmed /else /echo Cancelled /endif".to_string()
             )),
             "while" => TfCommandResult::Success(Some(
-                "/while (expression) ... /done  (or #while)\n\nRepeat commands while expression is true.\nExample:\n  /while (count < 10) /echo %count%; /set count $[count+1] /done".to_string()
+                "/while (expression) ... /done\n\nRepeat commands while expression is true.\nExample:\n  /while (count < 10) /echo %count%; /set count $[count+1] /done".to_string()
             )),
             "for" => TfCommandResult::Success(Some(
-                "/for variable start end [step] ... /done  (or #for)\n\nLoop from start to end.\nExample:\n  /for i 1 5 /echo Number %i /done".to_string()
+                "/for variable start end [step] ... /done\n\nLoop from start to end.\nExample:\n  /for i 1 5 /echo Number %i /done".to_string()
             )),
             "expr" => TfCommandResult::Success(Some(
-                "/expr expression  (or #expr)\n\nEvaluate expression and display result.\nOperators: + - * / % == != < > <= >= & | ! =~ !~ ?:\nFunctions: strlen() substr() strcat() tolower() toupper() rand() time() abs() min() max()\nExample: /expr 2 + 2 * 3".to_string()
+                "/expr expression\n\nEvaluate expression and display result.\nOperators: + - * / % == != < > <= >= & | ! =~ !~ ?:\nFunctions: strlen() substr() strcat() tolower() toupper() rand() time() abs() min() max()\nExample: /expr 2 + 2 * 3".to_string()
             )),
             "test" => TfCommandResult::Success(Some(
-                r#"#test expression
+                r#"/test expression
 
 Evaluate expression and return its value, setting %?.
 
@@ -1003,21 +961,21 @@ Also sets the special variable %? to the result.
 Useful for evaluating expressions for side effects.
 
 Examples:
-  #test 2 + 2           - Returns 4, sets %? to 4
-  #test strlen("hello") - Returns 5, sets %? to 5
-  #test hp < 50         - Returns 1 or 0, sets %?
+  /test 2 + 2           - Returns 4, sets %? to 4
+  /test strlen("hello") - Returns 5, sets %? to 5
+  /test hp < 50         - Returns 1 or 0, sets %?
 
-Unlike #expr, #test does not display the result automatically.
+Unlike /expr, /test does not display the result automatically.
 The result is stored in %? for later use."#.to_string()
             )),
             "bind" => TfCommandResult::Success(Some(
-                "#bind key = command\n\nBind a key to execute a command.\nKey names: F1-F12, ^A-^Z (Ctrl), @a-@z (Alt), PgUp, PgDn, Home, End, Insert, Delete\nExample: #bind F5 = cast heal".to_string()
+                "/bind key = command\n\nBind a key to execute a command.\nKey names: F1-F12, ^A-^Z (Ctrl), @a-@z (Alt), PgUp, PgDn, Home, End, Insert, Delete\nExample: /bind F5 = cast heal".to_string()
             )),
             "hook" | "hooks" => TfCommandResult::Success(Some(
-                "Hooks fire macros on events. Use #def -h<event> to register.\n\nEvents:\n  CONNECT     - When connected to MUD\n  DISCONNECT  - When disconnected\n  LOGIN       - After login\n  PROMPT      - On prompt received\n  SEND        - Before sending command\n\nExample: #def -hCONNECT auto_look = look".to_string()
+                "Hooks fire macros on events. Use /def -h<event> to register.\n\nEvents:\n  CONNECT     - When connected to MUD\n  DISCONNECT  - When disconnected\n  LOGIN       - After login\n  PROMPT      - On prompt received\n  SEND        - Before sending command\n\nExample: /def -hCONNECT auto_look = look".to_string()
             )),
             "repeat" => TfCommandResult::Success(Some(
-                r#"#repeat [-w[world]] {[-time]|-S|-P} count command
+                r#"/repeat [-w[world]] {[-time]|-S|-P} count command
 
 Repeat a command on a timer. First iteration runs immediately,
 then waits the interval before each subsequent iteration.
@@ -1031,19 +989,19 @@ Options:
 Count: integer or "i" for infinite
 
 Examples:
-  #repeat -30 5 #echo hi        - Now, then every 30s, 5 times total
-  #repeat -0:30 i #echo hi      - Now, then every 30s, infinite
-  #repeat -1:0:0 1 #echo hourly - Once now (1 hour interval unused)
-  #repeat -S 3 #echo sync       - 3 times immediately"#.to_string()
+  /repeat -30 5 /echo hi        - Now, then every 30s, 5 times total
+  /repeat -0:30 i /echo hi      - Now, then every 30s, infinite
+  /repeat -1:0:0 1 /echo hourly - Once now (1 hour interval unused)
+  /repeat -S 3 /echo sync       - 3 times immediately"#.to_string()
             )),
             "ps" => TfCommandResult::Success(Some(
-                "#ps\n\nList all background processes (from #repeat).\nShows PID, interval, remaining count, and command.".to_string()
+                "/ps\n\nList all background processes (from /repeat).\nShows PID, interval, remaining count, and command.".to_string()
             )),
             "kill" => TfCommandResult::Success(Some(
-                "#kill pid\n\nKill a background process by its PID.\nUse #ps to see running processes.".to_string()
+                "/kill pid\n\nKill a background process by its PID.\nUse /ps to see running processes.".to_string()
             )),
             "load" => TfCommandResult::Success(Some(
-                r#"#load [-q] filename
+                r#"/load [-q] filename
 
 Load and execute commands from a TF script file.
 
@@ -1051,8 +1009,7 @@ Options:
   -q  Quiet mode - don't echo "% Loading commands from..." message
 
 The file may contain:
-  - TF commands starting with # (e.g., #def, #set)
-  - Clay commands starting with / (e.g., /connect)
+  - TF commands starting with / (e.g., /def, /set)
   - Comments: lines starting with ; or single # followed by space
   - Blank lines (ignored)
 
@@ -1060,71 +1017,71 @@ Line continuation: End a line with \ to continue on next line.
 Use %\ for a literal backslash at end of line.
 
 File search order (for relative paths):
-  1. Current directory (from #lcd or actual cwd)
+  1. Current directory (from /lcd or actual cwd)
   2. Directories in $TFPATH (colon-separated)
   3. $TFLIBDIR
 
-Use #exit to abort loading early.
+Use /exit to abort loading early.
 
 Example:
-  #load ~/.tf/init.tf
-  #load -q mylib.tf"#.to_string()
+  /load ~/.tf/init.tf
+  /load -q mylib.tf"#.to_string()
             )),
             "require" => TfCommandResult::Success(Some(
-                r#"#require [-q] filename
+                r#"/require [-q] filename
 
-Load a file only if not already loaded via #loaded.
+Load a file only if not already loaded via /loaded.
 
-Same as #load, but if the file has already registered a token
-via #loaded, the file will not be read again.
+Same as /load, but if the file has already registered a token
+via /loaded, the file will not be read again.
 
-Files designed for #require should have #loaded as their first
+Files designed for /require should have /loaded as their first
 command with a unique token (usually the file's full path).
 
 Example file (mylib.tf):
-  #loaded mylib.tf
-  #def myfunc = #echo Hello from mylib
+  /loaded mylib.tf
+  /def myfunc = /echo Hello from mylib
 
 Usage:
-  #require mylib.tf   - Loads the file
-  #require mylib.tf   - Does nothing (already loaded)"#.to_string()
+  /require mylib.tf   - Loads the file
+  /require mylib.tf   - Does nothing (already loaded)"#.to_string()
             )),
             "loaded" => TfCommandResult::Success(Some(
-                r#"#loaded token
+                r#"/loaded token
 
-Mark a file as loaded (for use with #require).
+Mark a file as loaded (for use with /require).
 
-Should be the first command in a file designed for #require.
-If the token has already been registered by a previous #loaded
+Should be the first command in a file designed for /require.
+If the token has already been registered by a previous /loaded
 call, the current file load is aborted (returns success).
 
 Token should be unique - the file's full path is recommended.
 
 Example (in mylib.tf):
-  #loaded mylib.tf
+  /loaded mylib.tf
   ; Rest of file only executed once"#.to_string()
             )),
             "exit" => TfCommandResult::Success(Some(
-                r#"#exit
+                r#"/exit
 
 Abort loading the current file early.
 
-When called during #load or #require, stops reading the
+When called during /load or /require, stops reading the
 current file immediately. Commands already executed are
 not undone.
 
-When called outside of file loading, #exit is equivalent
-to #quit (exits Clay)."#.to_string()
+When called outside of file loading, /exit is equivalent
+to /quit (exits Clay)."#.to_string()
             )),
             "addworld" => TfCommandResult::Success(Some(
-                r#"#addworld [-xe] [-Ttype] name [char pass] host port
+                r#"/addworld [-xe] [-Ttype] name [char pass] host port
 
 Define a new world or update an existing world.
 
 Command form:
-  #addworld MyMUD mud.example.com 4000
-  #addworld -x SecureMUD secure.example.com 4443
-  #addworld MyMUD player password mud.example.com 4000
+  /addworld MyMUD mud.example.com 4000
+  /addworld -x SecureMUD secure.example.com 4443
+  /addworld MyMUD player password mud.example.com 4000
 
 Function form:
   addworld(name, type, host, port, char, pass, file, flags)
@@ -1139,10 +1096,10 @@ Function flags string:
   "x" = use SSL
 
 Examples:
-  #addworld Cave cave.tcp.com 2283
-  #addworld -x Secure secure.tcp.com 4443
-  #test addworld("Cave", "", "cave.tcp.com", "2283")
-  #test addworld("Secure", "", "ssl.tcp.com", "4443", "", "", "", "x")"#.to_string()
+  /addworld Cave cave.tcp.com 2283
+  /addworld -x Secure secure.tcp.com 4443
+  /test addworld("Cave", "", "cave.tcp.com", "2283")
+  /test addworld("Secure", "", "ssl.tcp.com", "4443", "", "", "", "x")"#.to_string()
             )),
             "functions" | "func" | "funcs" => TfCommandResult::Success(Some(
                 r#"Expression Functions
@@ -1270,9 +1227,6 @@ fn cmd_eval(engine: &mut TfEngine, args: &str) -> TfCommandResult {
             let cmd = value.to_string_value();
             if cmd.is_empty() {
                 TfCommandResult::Success(None)
-            } else if cmd.starts_with('#') {
-                // Execute as TF command (recursive)
-                execute_command(engine, &cmd)
             } else if cmd.starts_with('/') {
                 // Execute as Clay command
                 TfCommandResult::ClayCommand(cmd)
@@ -1332,8 +1286,8 @@ fn cmd_if(engine: &mut TfEngine, args: &str) -> TfCommandResult {
     // These contain newlines and the full #if...#endif or /if.../endif structure
     let if_args_lower = args.to_lowercase();
     if args.contains('\n') && (if_args_lower.contains("#endif") || if_args_lower.contains("/endif")) {
-        // Reconstruct the full block by prepending "#if "
-        let full_block = format!("#if {}", args);
+        // Reconstruct the full block by prepending "/if "
+        let full_block = format!("/if {}", args);
         let results = control_flow::execute_inline_if_block(engine, &full_block);
         return aggregate_inline_results(results);
     }
@@ -1384,8 +1338,8 @@ fn cmd_while(engine: &mut TfEngine, args: &str) -> TfCommandResult {
     // These contain newlines and the full #while...#done or /while.../done structure
     let args_lower = args.to_lowercase();
     if args.contains('\n') && (args_lower.contains("#done") || args_lower.contains("/done")) {
-        // Reconstruct the full block by prepending "#while "
-        let full_block = format!("#while {}", args);
+        // Reconstruct the full block by prepending "/while "
+        let full_block = format!("/while {}", args);
         let results = control_flow::execute_inline_while_block(engine, &full_block);
         return aggregate_inline_results(results);
     }
@@ -1404,7 +1358,7 @@ fn cmd_for(engine: &mut TfEngine, args: &str) -> TfCommandResult {
     // Check if this is a complete inline block (from macro execution)
     let for_args_lower = args.to_lowercase();
     if args.contains('\n') && (for_args_lower.contains("#done") || for_args_lower.contains("/done")) {
-        let full_block = format!("#for {}", args);
+        let full_block = format!("/for {}", args);
         let results = control_flow::execute_inline_for_block(engine, &full_block);
         return aggregate_inline_results(results);
     }
@@ -1721,7 +1675,7 @@ fn cmd_input(engine: &mut TfEngine, args: &str) -> TfCommandResult {
 fn cmd_grab(_args: &str) -> TfCommandResult {
     // In TF, #grab grabs the current line from output. We don't have that context here.
     // Return success but note that grab is limited.
-    TfCommandResult::Success(Some("Note: #grab is not fully supported in this implementation".to_string()))
+    TfCommandResult::Success(Some("Note: /grab is not fully supported in this implementation".to_string()))
 }
 
 #[cfg(test)]
@@ -1730,20 +1684,12 @@ mod tests {
 
     #[test]
     fn test_is_tf_command() {
-        // Only / prefix is recognized as TF command from user input
-        // (# prefix is only used internally in macro bodies and scripts)
+        // Only / prefix is recognized as TF command
         assert!(is_tf_command("/quit"));
         assert!(is_tf_command("/set foo"));
         assert!(is_tf_command("  /echo hello"));
-        assert!(!is_tf_command("#set foo bar"));  // # no longer recognized from user input
+        assert!(!is_tf_command("#set foo bar"));  // # is not a command prefix
         assert!(!is_tf_command("say hello"));  // Plain text, not a command
-    }
-
-    #[test]
-    fn test_split_command() {
-        assert_eq!(split_command("set foo bar"), ("set", "foo bar"));
-        assert_eq!(split_command("echo"), ("echo", ""));
-        assert_eq!(split_command("send   -w world text"), ("send", "-w world text"));
     }
 
     #[test]
@@ -1822,7 +1768,7 @@ mod tests {
         let mut engine = TfEngine::new();
         engine.set_global("target", TfValue::String("orc".to_string()));
 
-        let result = execute_command(&mut engine, "#echo Attack the %{target}!");
+        let result = execute_command(&mut engine, "/echo Attack the %{target}!");
         match result {
             TfCommandResult::Success(Some(msg)) => assert_eq!(msg, "Attack the orc!"),
             _ => panic!("Expected success with substituted message"),
@@ -1838,12 +1784,12 @@ mod tests {
         // Define a simple macro
         engine.macros.push(TfMacro {
             name: "greet".to_string(),
-            body: "#echo Hello there!".to_string(),
+            body: "/echo Hello there!".to_string(),
             ..Default::default()
         });
 
         // Invoke it by name
-        let result = execute_command(&mut engine, "#greet");
+        let result = execute_command(&mut engine, "/greet");
         match result {
             TfCommandResult::Success(Some(msg)) => assert_eq!(msg, "Hello there!"),
             _ => panic!("Expected success with message, got {:?}", result),
@@ -1858,15 +1804,15 @@ mod tests {
 
         engine.macros.push(TfMacro {
             name: "MyMacro".to_string(),
-            body: "#echo Works!".to_string(),
+            body: "/echo Works!".to_string(),
             ..Default::default()
         });
 
         // Should work with different cases
-        let result = execute_command(&mut engine, "#mymacro");
+        let result = execute_command(&mut engine, "/mymacro");
         assert!(matches!(result, TfCommandResult::Success(Some(_))));
 
-        let result = execute_command(&mut engine, "#MYMACRO");
+        let result = execute_command(&mut engine, "/MYMACRO");
         assert!(matches!(result, TfCommandResult::Success(Some(_))));
     }
 
@@ -1874,16 +1820,17 @@ mod tests {
     fn test_unknown_command_when_no_macro() {
         let mut engine = TfEngine::new();
 
-        let result = execute_command(&mut engine, "#nonexistent");
-        assert!(matches!(result, TfCommandResult::UnknownCommand(_)));
+        // /nonexistent is not a TF command or macro, so it goes to Clay
+        let result = execute_command(&mut engine, "/nonexistent");
+        assert!(matches!(result, TfCommandResult::ClayCommand(_)));
     }
 
     #[test]
     fn test_def_command_body_parsing() {
         let mut engine = TfEngine::new();
 
-        // Define a macro using #def command
-        let result = execute_command(&mut engine, "#def foo = bar");
+        // Define a macro using /def command
+        let result = execute_command(&mut engine, "/def foo = bar");
         assert!(matches!(result, TfCommandResult::Success(_)));
 
         // Check the macro was defined correctly
@@ -1897,15 +1844,15 @@ mod tests {
         let mut engine = TfEngine::new();
 
         // Define a macro that echoes
-        let result = execute_command(&mut engine, "#def greet = #echo Hello World");
+        let result = execute_command(&mut engine, "/def greet = /echo Hello World");
         assert!(matches!(result, TfCommandResult::Success(_)));
 
         // Verify the body doesn't include the =
         let macro_def = engine.macros.iter().find(|m| m.name == "greet").unwrap();
-        assert_eq!(macro_def.body, "#echo Hello World");
+        assert_eq!(macro_def.body, "/echo Hello World");
 
         // Invoke the macro
-        let result = execute_command(&mut engine, "#greet");
+        let result = execute_command(&mut engine, "/greet");
         match result {
             TfCommandResult::Success(Some(msg)) => assert_eq!(msg, "Hello World"),
             _ => panic!("Expected success with 'Hello World', got {:?}", result),
@@ -1917,20 +1864,20 @@ mod tests {
         let mut engine = TfEngine::new();
 
         // Define a macro that uses %* (all arguments)
-        execute_command(&mut engine, "#def say_all = #echo You said: %*");
+        execute_command(&mut engine, "/def say_all = /echo You said: %*");
 
         // Invoke the macro with arguments
-        let result = execute_command(&mut engine, "#say_all hello world");
+        let result = execute_command(&mut engine, "/say_all hello world");
         match result {
             TfCommandResult::Success(Some(msg)) => assert_eq!(msg, "You said: hello world"),
             _ => panic!("Expected success with 'You said: hello world', got {:?}", result),
         }
 
         // Define a macro that uses positional parameters
-        execute_command(&mut engine, "#def greet_person = #echo Hello %1, you are %2");
+        execute_command(&mut engine, "/def greet_person = /echo Hello %1, you are %2");
 
         // Invoke with arguments
-        let result = execute_command(&mut engine, "#greet_person Alice great");
+        let result = execute_command(&mut engine, "/greet_person Alice great");
         match result {
             TfCommandResult::Success(Some(msg)) => assert_eq!(msg, "Hello Alice, you are great"),
             _ => panic!("Expected success, got {:?}", result),
@@ -1942,9 +1889,9 @@ mod tests {
         let mut engine = TfEngine::new();
 
         // Define several macros
-        execute_command(&mut engine, "#def first = one");
-        execute_command(&mut engine, "#def second = two");
-        execute_command(&mut engine, "#def third = three");
+        execute_command(&mut engine, "/def first = one");
+        execute_command(&mut engine, "/def second = two");
+        execute_command(&mut engine, "/def third = three");
 
         // Check sequence numbers
         let first = engine.macros.iter().find(|m| m.name == "first").unwrap();
@@ -1956,16 +1903,16 @@ mod tests {
         assert_eq!(third.sequence_number, 2);
 
         // Redefine a macro - should keep its original sequence number
-        execute_command(&mut engine, "#def second = two_updated");
+        execute_command(&mut engine, "/def second = two_updated");
         let second = engine.macros.iter().find(|m| m.name == "second").unwrap();
         assert_eq!(second.sequence_number, 1, "Redefining a macro should preserve its sequence number");
         assert_eq!(second.body, "two_updated");
 
-        // Check #list output contains sequence numbers
+        // Check /list output contains sequence numbers
         let list_output = super::super::macros::list_macros(&engine, None);
-        assert!(list_output.contains("0: #def"), "List should contain sequence number 0");
-        assert!(list_output.contains("1: #def"), "List should contain sequence number 1");
-        assert!(list_output.contains("2: #def"), "List should contain sequence number 2");
+        assert!(list_output.contains("0: /def"), "List should contain sequence number 0");
+        assert!(list_output.contains("1: /def"), "List should contain sequence number 1");
+        assert!(list_output.contains("2: /def"), "List should contain sequence number 2");
     }
 
     #[test]
@@ -1974,16 +1921,16 @@ mod tests {
 
         // Define a macro with %R and other variables in the body
         // The body should be preserved literally for later substitution when executed
-        execute_command(&mut engine, "#def random = #echo -- %R");
-        execute_command(&mut engine, "#def test = #echo %1 %* %L %myvar");
+        execute_command(&mut engine, "/def random = /echo -- %R");
+        execute_command(&mut engine, "/def test = /echo %1 %* %L %myvar");
 
         let random = engine.macros.iter().find(|m| m.name == "random").unwrap();
-        assert_eq!(random.body, "#echo -- %R", "Body should preserve %R literally");
+        assert_eq!(random.body, "/echo -- %R", "Body should preserve %R literally");
 
         let test = engine.macros.iter().find(|m| m.name == "test").unwrap();
-        assert_eq!(test.body, "#echo %1 %* %L %myvar", "Body should preserve all variables");
+        assert_eq!(test.body, "/echo %1 %* %L %myvar", "Body should preserve all variables");
 
         // When a macro is EXECUTED (not defined), variables are substituted
-        // This is handled by execute_macro, not by #def parsing
+        // This is handled by execute_macro, not by /def parsing
     }
 }

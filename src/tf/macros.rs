@@ -509,16 +509,12 @@ fn count_control_flow_depth_change(text: &str) -> i32 {
     let words: Vec<&str> = lower.split_whitespace().collect();
     for word in &words {
         // Check if this is a control flow keyword (possibly with something attached)
-        if *word == "#if" || *word == "/if"
-            || word.starts_with("#if(") || word.starts_with("/if(")
-            || *word == "#while" || *word == "/while"
-            || word.starts_with("#while(") || word.starts_with("/while(")
-            || *word == "#for" || *word == "/for"
+        if *word == "/if" || word.starts_with("/if(")
+            || *word == "/while" || word.starts_with("/while(")
+            || *word == "/for"
         {
             depth += 1;
-        } else if *word == "#endif" || *word == "/endif"
-            || *word == "#done" || *word == "/done"
-        {
+        } else if *word == "/endif" || *word == "/done" {
             depth -= 1;
         }
     }
@@ -602,13 +598,10 @@ pub fn execute_macro(
         // Check if this is a control flow block - if so, don't substitute here
         // The control flow executor will handle per-iteration substitution
         let lower = cmd.to_lowercase();
-        let is_control_flow = lower.starts_with("#while ") || lower.starts_with("#while\n")
-            || lower.starts_with("/while ") || lower.starts_with("/while\n")
-            || lower.starts_with("#for ") || lower.starts_with("#for\n")
+        let is_control_flow = lower.starts_with("/while ") || lower.starts_with("/while\n")
             || lower.starts_with("/for ") || lower.starts_with("/for\n")
-            || lower.starts_with("#if ") || lower.starts_with("#if\n")
             || lower.starts_with("/if ") || lower.starts_with("/if\n")
-            || lower.starts_with("#if(") || lower.starts_with("/if(");
+            || lower.starts_with("/if(");
 
         let cmd = if is_control_flow {
             // Pass control flow blocks directly without substitution
@@ -624,10 +617,9 @@ pub fn execute_macro(
         let cmd = cmd.trim();
 
         // Execute the command (already substituted above)
-        // Both # and / prefixed commands are routed through the TF engine,
-        // which handles /command → #command conversion for known TF commands
-        // and returns ClayCommand for Clay-specific commands like /notify
-        let result = if cmd.starts_with('#') || cmd.starts_with('/') {
+        // / prefixed commands are routed through the TF engine,
+        // which returns ClayCommand for Clay-specific commands like /notify
+        let result = if cmd.starts_with('/') {
             super::parser::execute_command_substituted(engine, cmd)
         } else {
             TfCommandResult::SendToMud(cmd.to_string())
@@ -745,8 +737,8 @@ pub fn list_macros(engine: &TfEngine, pattern: Option<&str>) -> String {
             }
         }
 
-        // Format: N: #def [opts] name = body (sparkle added by output system)
-        output.push_str(&format!("{}: #def ", macro_def.sequence_number));
+        // Format: N: /def [opts] name = body (sparkle added by output system)
+        output.push_str(&format!("{}: /def ", macro_def.sequence_number));
 
         // Show trigger if present (before name, like TF)
         if let Some(ref trigger) = macro_def.trigger {
@@ -964,9 +956,9 @@ mod tests {
         });
 
         let output = list_macros(&engine, None);
-        // Format: N: #def [opts] name = body
-        assert!(output.contains("0: #def greet = say Hello!"));
-        assert!(output.contains("1: #def -t\"^You hit\" attack = kick"));
+        // Format: N: /def [opts] name = body
+        assert!(output.contains("0: /def greet = say Hello!"));
+        assert!(output.contains("1: /def -t\"^You hit\" attack = kick"));
     }
 }
 
@@ -976,32 +968,32 @@ mod split_tests {
 
     #[test]
     fn test_split_body_preserving_control_flow() {
-        // Simulating crypt.tf pattern: #if...%;#else...%;#endif
-        let body = "#if (cond)    cmd1%;#else    cmd2%;#endif";
+        // Simulating crypt.tf pattern: /if...%;/else...%;/endif
+        let body = "/if (cond)    cmd1%;/else    cmd2%;/endif";
         let parts = split_body_preserving_control_flow(body);
 
         // Should be ONE part - the entire control flow block
         assert_eq!(parts.len(), 1, "Parts: {:?}", parts);
-        assert!(parts[0].contains("#if") && parts[0].contains("#endif"));
+        assert!(parts[0].contains("/if") && parts[0].contains("/endif"));
     }
 
     #[test]
     fn test_split_mixed_commands() {
         // Mix of regular commands and control flow
-        let body = "cmd1%;#if (x)    inside%;#endif%;cmd2";
+        let body = "cmd1%;/if (x)    inside%;/endif%;cmd2";
         let parts = split_body_preserving_control_flow(body);
 
         // Should be 3 parts: cmd1, the if block, cmd2
         assert_eq!(parts.len(), 3, "Parts: {:?}", parts);
         assert_eq!(parts[0], "cmd1");
-        assert!(parts[1].contains("#if") && parts[1].contains("#endif"));
+        assert!(parts[1].contains("/if") && parts[1].contains("/endif"));
         assert_eq!(parts[2], "cmd2");
     }
 
     #[test]
     fn test_split_nested_control_flow() {
-        // Nested #if blocks (like in crypt.tf)
-        let body = "#if (a)    #if (b)    inner%;#endif%;outer%;#endif";
+        // Nested /if blocks (like in crypt.tf)
+        let body = "/if (a)    /if (b)    inner%;/endif%;outer%;/endif";
         let parts = split_body_preserving_control_flow(body);
 
         // Should be ONE part - the entire outer control flow block
@@ -1010,26 +1002,26 @@ mod split_tests {
 
     #[test]
     fn test_split_crypt_tf_pattern() {
-        // Pattern from crypt.tf: two sequential #if blocks
-        let body = "#if (a)    cmd1%;#else    cmd2%;#endif%;#if (b)    #if (c)    inner%;#else    other%;#endif%;outer%;#endif";
+        // Pattern from crypt.tf: two sequential /if blocks
+        let body = "/if (a)    cmd1%;/else    cmd2%;/endif%;/if (b)    /if (c)    inner%;/else    other%;/endif%;outer%;/endif";
         let parts = split_body_preserving_control_flow(body);
 
         // Should be TWO parts - two separate control flow blocks
         assert_eq!(parts.len(), 2, "Parts: {:?}", parts);
-        assert!(parts[0].contains("#if (a)") && parts[0].contains("#endif"));
-        assert!(parts[1].contains("#if (b)") && parts[1].contains("#endif"));
+        assert!(parts[0].contains("/if (a)") && parts[0].contains("/endif"));
+        assert!(parts[1].contains("/if (b)") && parts[1].contains("/endif"));
     }
 
     #[test]
     fn test_split_listen_mush() {
         // Simulated listen_mush body from crypt.tf
-        let body = r#"#if (substr({P2},0,1) =~ "\") #let dcrypt=$(#decrypt 1 x%P2x)%;#else #let dcrypt=$(#decrypt 0 x%P2x)%;#endif%;#if (dcrypt =/ "*3.14") #if (dcrypt =/ "\:*") #echo -w${world_name} -ag -- %*%;#substitute -aCred -- %% * %PL $[substr(dcrypt,strstr(dcrypt,":")+1,strlen(dcrypt)-5)]%;#else #echo -w${world_name} -ag -- %*%;#substitute -aCred -- %% %PL %P1 "$[substr(dcrypt,0,strlen(dcrypt)-4)]"%;#endif%;#endif"#;
+        let body = r#"/if (substr({P2},0,1) =~ "\") /let dcrypt=$(/decrypt 1 x%P2x)%;/else /let dcrypt=$(/decrypt 0 x%P2x)%;/endif%;/if (dcrypt =/ "*3.14") /if (dcrypt =/ "\:*") /echo -w${world_name} -ag -- %*%;/substitute -aCred -- %% * %PL $[substr(dcrypt,strstr(dcrypt,":")+1,strlen(dcrypt)-5)]%;/else /echo -w${world_name} -ag -- %*%;/substitute -aCred -- %% %PL %P1 "$[substr(dcrypt,0,strlen(dcrypt)-4)]"%;/endif%;/endif"#;
         let parts = split_body_preserving_control_flow(body);
 
-        // Should be TWO parts - two separate #if...#endif blocks
+        // Should be TWO parts - two separate /if.../endif blocks
         assert_eq!(parts.len(), 2, "Expected 2 parts, got {}: {:?}", parts.len(), parts);
-        assert!(parts[0].contains("#if (substr") && parts[0].contains("#endif"), "First block should contain first if..endif");
-        assert!(parts[1].contains("#if (dcrypt =/ \"*3.14\")") && parts[1].contains("#endif"), "Second block should contain second if..endif");
+        assert!(parts[0].contains("/if (substr") && parts[0].contains("/endif"), "First block should contain first if..endif");
+        assert!(parts[1].contains("/if (dcrypt =/ \"*3.14\")") && parts[1].contains("/endif"), "Second block should contain second if..endif");
     }
 
     #[test]
@@ -1042,7 +1034,7 @@ mod split_tests {
         engine.set_global("dcrypt", super::TfValue::String("foobar3.14".to_string()));
 
         // Simulated second part of listen_mush: nested if block
-        let block = r#"#if (dcrypt =/ "*3.14") #if (dcrypt =/ "\:*") #echo COLON PATH%;#else #echo ELSE PATH: $[substr(dcrypt,0,strlen(dcrypt)-4)]%;#endif%;#endif"#;
+        let block = r#"/if (dcrypt =/ "*3.14") /if (dcrypt =/ "\:*") /echo COLON PATH%;/else /echo ELSE PATH: $[substr(dcrypt,0,strlen(dcrypt)-4)]%;/endif%;/endif"#;
 
         // Create a minimal macro to execute
         let macro_def = TfMacro {

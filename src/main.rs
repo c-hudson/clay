@@ -11032,12 +11032,12 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                         }
                                     }
                                     tf::TfCommandResult::NotTfCommand => {
-                                        // Shouldn't happen since we checked for / or #
+                                        // Shouldn't happen since we checked for /
                                         app.add_output("Internal error: not a command");
                                     }
                                     tf::TfCommandResult::UnknownCommand(cmd_name) => {
                                         // Show the command with its original prefix
-                                        let prefix = if cmd_name.starts_with("//") { "" } else if cmd.starts_with('/') { "/" } else { "#" };
+                                        let prefix = if cmd_name.starts_with("//") { "" } else { "/" };
                                         app.add_output(&format!("Unknown command: {}{}", prefix, cmd_name));
                                     }
                                     tf::TfCommandResult::ExitLoad => {

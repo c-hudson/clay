@@ -1,10 +1,10 @@
 //! Control flow structures for TinyFugue compatibility.
 //!
 //! Implements:
-//! - Single-line: #if (expr) command
-//! - Multi-line: #if (expr) ... #elseif (expr) ... #else ... #endif
-//! - Loops: #while (expr) ... #done, #for var start end [step] ... #done
-//! - Loop control: #break
+//! - Single-line: /if (expr) command
+//! - Multi-line: /if (expr) ... /elseif (expr) ... /else ... /endif
+//! - Loops: /while (expr) ... /done, /for var start end [step] ... /done
+//! - Loop control: /break
 
 use super::expressions;
 use super::{TfEngine, TfCommandResult};
@@ -127,18 +127,16 @@ fn count_control_keywords(text: &str) -> (i32, i32, i32, i32) {
 
     let words: Vec<&str> = lower.split_whitespace().collect();
     for word in &words {
-        if *word == "#if" || *word == "/if"
-            || word.starts_with("#if(") || word.starts_with("/if(")
-        {
+        if *word == "/if" || word.starts_with("/if(") {
             if_opens += 1;
-        } else if *word == "#while" || *word == "/while"
-            || word.starts_with("#while(") || word.starts_with("/while(")
-            || *word == "#for" || *word == "/for"
+        } else if *word == "/while"
+            || word.starts_with("/while(")
+            || *word == "/for"
         {
             loop_opens += 1;
-        } else if *word == "#endif" || *word == "/endif" {
+        } else if *word == "/endif" {
             if_closes += 1;
-        } else if *word == "#done" || *word == "/done" {
+        } else if *word == "/done" {
             loop_closes += 1;
         }
     }
@@ -243,7 +241,7 @@ pub fn parse_single_line_if(args: &str) -> Option<(String, String)> {
 fn contains_control_flow_keyword(text: &str) -> bool {
     // Check for #else, #elseif, #endif as commands (not inside strings)
     // Look for patterns like ";#else", "%;#else", or just "#else" at start
-    let keywords = ["#else", "#elseif", "#endif", "/else", "/elseif", "/endif"];
+    let keywords = ["/else", "/elseif", "/endif"];
     for keyword in &keywords {
         // Check at start
         if let Some(after) = text.strip_prefix(keyword) {
@@ -334,17 +332,15 @@ pub fn process_control_line(state: &mut ControlState, line: &str) -> ControlResu
         ControlState::None => ControlResult::NotControlFlow,
 
         ControlState::If(if_state) => {
-            // Check for nested #if / /if
-            if lower.starts_with("#if ") || lower == "#if"
-                || lower.starts_with("/if ") || lower == "/if"
-            {
+            // Check for nested /if
+            if lower.starts_with("/if ") || lower == "/if" {
                 if_state.depth += 1;
                 if_state.bodies[if_state.current_branch].push(line.to_string());
                 return ControlResult::Consumed;
             }
 
-            // Check for #endif / /endif
-            if lower == "#endif" || lower == "/endif" {
+            // Check for /endif
+            if lower == "/endif" {
                 if_state.depth -= 1;
                 if if_state.depth == 0 {
                     // End of our if block - return the collected structure
@@ -360,7 +356,7 @@ pub fn process_control_line(state: &mut ControlState, line: &str) -> ControlResu
 
             // Only process elseif/else at our depth level
             if if_state.depth == 1 {
-                if lower.starts_with("#elseif ") || lower.starts_with("/elseif ") {
+                if lower.starts_with("/elseif ") {
                     if if_state.has_else {
                         return ControlResult::Error("/elseif after /else".to_string());
                     }
@@ -377,7 +373,7 @@ pub fn process_control_line(state: &mut ControlState, line: &str) -> ControlResu
                     }
                 }
 
-                if lower == "#else" || lower == "/else" {
+                if lower == "/else" {
                     if if_state.has_else {
                         return ControlResult::Error("Duplicate /else".to_string());
                     }
@@ -395,9 +391,7 @@ pub fn process_control_line(state: &mut ControlState, line: &str) -> ControlResu
 
         ControlState::While(while_state) => {
             // Check for nested while/for
-            if lower.starts_with("#while ") || lower == "#while"
-                || lower.starts_with("/while ") || lower == "/while"
-                || lower.starts_with("#for ") || lower == "#for"
+            if lower.starts_with("/while ") || lower == "/while"
                 || lower.starts_with("/for ") || lower == "/for"
             {
                 while_state.depth += 1;
@@ -405,8 +399,8 @@ pub fn process_control_line(state: &mut ControlState, line: &str) -> ControlResu
                 return ControlResult::Consumed;
             }
 
-            // Check for #done / /done
-            if lower == "#done" || lower == "/done" {
+            // Check for /done
+            if lower == "/done" {
                 while_state.depth -= 1;
                 if while_state.depth == 0 {
                     let result = ControlResult::Execute(
@@ -427,9 +421,7 @@ pub fn process_control_line(state: &mut ControlState, line: &str) -> ControlResu
 
         ControlState::For(for_state) => {
             // Check for nested while/for
-            if lower.starts_with("#while ") || lower == "#while"
-                || lower.starts_with("/while ") || lower == "/while"
-                || lower.starts_with("#for ") || lower == "#for"
+            if lower.starts_with("/while ") || lower == "/while"
                 || lower.starts_with("/for ") || lower == "/for"
             {
                 for_state.depth += 1;
@@ -437,8 +429,8 @@ pub fn process_control_line(state: &mut ControlState, line: &str) -> ControlResu
                 return ControlResult::Consumed;
             }
 
-            // Check for #done / /done
-            if lower == "#done" || lower == "/done" {
+            // Check for /done
+            if lower == "/done" {
                 for_state.depth -= 1;
                 if for_state.depth == 0 {
                     let result = ControlResult::Execute(
@@ -578,8 +570,8 @@ pub fn execute_inline_if_block(engine: &mut TfEngine, block: &str) -> Vec<TfComm
         let lower = trimmed.to_lowercase();
 
         if let Some(state) = if_state.as_mut() {
-            // Check for #endif or /endif
-            if lower == "#endif" || lower == "/endif" {
+            // Check for /endif
+            if lower == "/endif" {
                 state.depth -= 1;
                 if state.depth == 0 {
                     // Block complete, execute it
@@ -611,14 +603,11 @@ pub fn execute_inline_if_block(engine: &mut TfEngine, block: &str) -> Vec<TfComm
                 } else {
                     state.bodies[state.current_branch].push(trimmed.to_string());
                 }
-            } else if lower.starts_with("#if ") || lower == "#if"
-                || lower.starts_with("/if ") || lower == "/if"
-            {
-                // Nested #if / /if
+            } else if lower.starts_with("/if ") || lower == "/if" {
+                // Nested /if
                 state.depth += 1;
                 state.bodies[state.current_branch].push(trimmed.to_string());
-            } else if state.depth == 1 && (lower.starts_with("#elseif ") || lower == "#elseif"
-                || lower.starts_with("/elseif ") || lower == "/elseif")
+            } else if state.depth == 1 && (lower.starts_with("/elseif ") || lower == "/elseif")
             {
                 if state.has_else {
                     return vec![TfCommandResult::Error("/elseif after /else".to_string())];
@@ -637,8 +626,7 @@ pub fn execute_inline_if_block(engine: &mut TfEngine, block: &str) -> Vec<TfComm
                     }
                     Err(e) => return vec![TfCommandResult::Error(e)],
                 }
-            } else if state.depth == 1 && (lower == "#else" || lower.starts_with("#else ")
-                || lower == "/else" || lower.starts_with("/else "))
+            } else if state.depth == 1 && (lower == "/else" || lower.starts_with("/else "))
             {
                 if state.has_else {
                     return vec![TfCommandResult::Error("Duplicate /else".to_string())];
@@ -646,9 +634,9 @@ pub fn execute_inline_if_block(engine: &mut TfEngine, block: &str) -> Vec<TfComm
                 state.has_else = true;
                 state.bodies.push(vec![]);
                 state.current_branch += 1;
-                // Check for content after #else / /else
-                let prefix_len = 5; // #else and /else are both 5 chars
-                let rest = if lower == "#else" || lower == "/else" { "" } else { trimmed[prefix_len..].trim_start() };
+                // Check for content after /else
+                let prefix_len = 5; // /else is 5 chars
+                let rest = if lower == "/else" { "" } else { trimmed[prefix_len..].trim_start() };
                 if !rest.is_empty() {
                     state.bodies[state.current_branch].push(rest.to_string());
                 }
@@ -657,15 +645,13 @@ pub fn execute_inline_if_block(engine: &mut TfEngine, block: &str) -> Vec<TfComm
                 state.bodies[state.current_branch].push(trimmed.to_string());
             }
         } else {
-            // First line should be #if or /if
-            if !lower.starts_with("#if ") && lower != "#if"
-                && !lower.starts_with("/if ") && lower != "/if"
-            {
+            // First line should be /if
+            if !lower.starts_with("/if ") && lower != "/if" {
                 return vec![TfCommandResult::Error("Expected /if at start of block".to_string())];
             }
 
-            // Parse the #if / /if line
-            let prefix_len = 3; // #if and /if are both 3 chars
+            // Parse the /if line
+            let prefix_len = 3; // /if is 3 chars
             let args = &trimmed[prefix_len..].trim_start();
 
             // Find the condition
@@ -711,15 +697,13 @@ pub fn execute_inline_while_block(engine: &mut TfEngine, block: &str) -> Vec<TfC
         let lower = trimmed.to_lowercase();
 
         if !in_body {
-            // First line should be #while or /while
-            if !lower.starts_with("#while ") && lower != "#while"
-                && !lower.starts_with("/while ") && lower != "/while"
-            {
+            // First line should be /while
+            if !lower.starts_with("/while ") && lower != "/while" {
                 return vec![TfCommandResult::Error("Expected /while at start of block".to_string())];
             }
 
-            // Parse the #while / /while line
-            let prefix_len = 6; // #while and /while are both 6 chars
+            // Parse the /while line
+            let prefix_len = 6; // /while is 6 chars
             let args = &trimmed[prefix_len..].trim_start();
             match parse_condition_with_body(args) {
                 Ok((cond, body_start)) => {
@@ -734,14 +718,12 @@ pub fn execute_inline_while_block(engine: &mut TfEngine, block: &str) -> Vec<TfC
             }
         } else {
             // Track nested while/for/if blocks
-            if lower.starts_with("#while ") || lower == "#while"
-                || lower.starts_with("/while ") || lower == "/while"
-                || lower.starts_with("#for ") || lower == "#for"
+            if lower.starts_with("/while ") || lower == "/while"
                 || lower.starts_with("/for ") || lower == "/for"
             {
                 depth += 1;
                 body.push(trimmed.to_string());
-            } else if lower == "#done" || lower == "/done" {
+            } else if lower == "/done" {
                 depth -= 1;
                 if depth == 0 {
                     // Execute the while loop
@@ -791,17 +773,16 @@ fn execute_while_loop(engine: &mut TfEngine, condition: &str, body: &[String]) -
         let mut should_break = false;
         for line in &grouped_body {
             let line_lower = line.trim().to_lowercase();
-            if line_lower == "#break" || line_lower == "/break" {
+            if line_lower == "/break" {
                 should_break = true;
                 break;
             }
 
             // Check if this is a control flow block - if so, don't substitute here
             // The control flow executor will handle per-branch substitution
-            let is_control_flow = line_lower.starts_with("#if ") || line_lower.starts_with("#if(")
-                || line_lower.starts_with("/if ") || line_lower.starts_with("/if(")
-                || line_lower.starts_with("#while ") || line_lower.starts_with("/while ")
-                || line_lower.starts_with("#for ") || line_lower.starts_with("/for ");
+            let is_control_flow = line_lower.starts_with("/if ") || line_lower.starts_with("/if(")
+                || line_lower.starts_with("/while ")
+                || line_lower.starts_with("/for ");
 
             let line = if is_control_flow {
                 // Pass control flow blocks directly without substitution
@@ -854,15 +835,13 @@ pub fn execute_inline_for_block(engine: &mut TfEngine, block: &str) -> Vec<TfCom
         let lower = trimmed.to_lowercase();
 
         if !in_body {
-            // First line should be #for or /for
-            if !lower.starts_with("#for ") && lower != "#for"
-                && !lower.starts_with("/for ") && lower != "/for"
-            {
+            // First line should be /for
+            if !lower.starts_with("/for ") && lower != "/for" {
                 return vec![TfCommandResult::Error("Expected /for at start of block".to_string())];
             }
 
-            // Parse the #for / /for line
-            let prefix_len = 4; // #for and /for are both 4 chars
+            // Parse the /for line
+            let prefix_len = 4; // /for is 4 chars
             let args = &trimmed[prefix_len..].trim_start();
             // Parse for args: var start end [step] [body_content]
             let parts: Vec<&str> = args.split_whitespace().collect();
@@ -908,14 +887,12 @@ pub fn execute_inline_for_block(engine: &mut TfEngine, block: &str) -> Vec<TfCom
             }
         } else {
             // Track nested while/for blocks
-            if lower.starts_with("#while ") || lower == "#while"
-                || lower.starts_with("/while ") || lower == "/while"
-                || lower.starts_with("#for ") || lower == "#for"
+            if lower.starts_with("/while ") || lower == "/while"
                 || lower.starts_with("/for ") || lower == "/for"
             {
                 depth += 1;
                 body.push(trimmed.to_string());
-            } else if lower == "#done" || lower == "/done" {
+            } else if lower == "/done" {
                 depth -= 1;
                 if depth == 0 {
                     // Execute the for loop
@@ -972,17 +949,16 @@ fn execute_for_loop(
         let mut should_break = false;
         for line in &grouped_body {
             let line_lower = line.trim().to_lowercase();
-            if line_lower == "#break" || line_lower == "/break" {
+            if line_lower == "/break" {
                 should_break = true;
                 break;
             }
 
             // Check if this is a control flow block - if so, don't substitute here
             // The control flow executor will handle per-branch substitution
-            let is_control_flow = line_lower.starts_with("#if ") || line_lower.starts_with("#if(")
-                || line_lower.starts_with("/if ") || line_lower.starts_with("/if(")
-                || line_lower.starts_with("#while ") || line_lower.starts_with("/while ")
-                || line_lower.starts_with("#for ") || line_lower.starts_with("/for ");
+            let is_control_flow = line_lower.starts_with("/if ") || line_lower.starts_with("/if(")
+                || line_lower.starts_with("/while ")
+                || line_lower.starts_with("/for ");
 
             let line = if is_control_flow {
                 // Pass control flow blocks directly without substitution
@@ -1021,19 +997,15 @@ fn count_control_flow_in_line(text: &str) -> i32 {
     let lower = text.to_lowercase();
     let mut depth = 0;
 
-    // Simple word-based scanning for control flow keywords (both # and / prefixes)
+    // Simple word-based scanning for control flow keywords
     let words: Vec<&str> = lower.split_whitespace().collect();
     for word in &words {
-        if *word == "#if" || *word == "/if"
-            || word.starts_with("#if(") || word.starts_with("/if(")
-            || *word == "#while" || *word == "/while"
-            || word.starts_with("#while(") || word.starts_with("/while(")
-            || *word == "#for" || *word == "/for"
+        if *word == "/if" || word.starts_with("/if(")
+            || *word == "/while" || word.starts_with("/while(")
+            || *word == "/for"
         {
             depth += 1;
-        } else if *word == "#endif" || *word == "/endif"
-            || *word == "#done" || *word == "/done"
-        {
+        } else if *word == "/endif" || *word == "/done" {
             depth -= 1;
         }
     }
@@ -1198,10 +1170,9 @@ pub fn execute_if_encoded(engine: &mut TfEngine, encoded: &str) -> Vec<TfCommand
 
                             // Check if this is a nested control flow block
                             let lower = line.to_lowercase();
-                            let is_control_flow = lower.starts_with("#if ") || lower.starts_with("#if(")
-                                || lower.starts_with("/if ") || lower.starts_with("/if(")
-                                || lower.starts_with("#while ") || lower.starts_with("/while ")
-                                || lower.starts_with("#for ") || lower.starts_with("/for ");
+                            let is_control_flow = lower.starts_with("/if ") || lower.starts_with("/if(")
+                                || lower.starts_with("/while ")
+                                || lower.starts_with("/for ");
 
                             let line = if is_control_flow {
                                 line.to_string()
@@ -1235,10 +1206,9 @@ pub fn execute_if_encoded(engine: &mut TfEngine, encoded: &str) -> Vec<TfCommand
 
             // Check if this is a nested control flow block
             let lower = line.to_lowercase();
-            let is_control_flow = lower.starts_with("#if ") || lower.starts_with("#if(")
-                || lower.starts_with("/if ") || lower.starts_with("/if(")
-                || lower.starts_with("#while ") || lower.starts_with("/while ")
-                || lower.starts_with("#for ") || lower.starts_with("/for ");
+            let is_control_flow = lower.starts_with("/if ") || lower.starts_with("/if(")
+                || lower.starts_with("/while ")
+                || lower.starts_with("/for ");
 
             let line = if is_control_flow {
                 line.to_string()
@@ -1322,7 +1292,7 @@ pub fn execute_while_encoded(engine: &mut TfEngine, encoded: &str) -> Vec<TfComm
         let mut should_break = false;
         for line in &grouped_body {
             let line_lower = line.trim().to_lowercase();
-            if line_lower == "#break" || line_lower == "/break" {
+            if line_lower == "/break" {
                 should_break = true;
                 break;
             }
@@ -1442,7 +1412,7 @@ pub fn execute_for_encoded(engine: &mut TfEngine, encoded: &str) -> Vec<TfComman
         let mut should_break = false;
         for line in &grouped_body {
             let line_lower = line.trim().to_lowercase();
-            if line_lower == "#break" || line_lower == "/break" {
+            if line_lower == "/break" {
                 should_break = true;
                 break;
             }
@@ -1478,8 +1448,8 @@ mod tests {
     #[test]
     fn test_parse_single_line_if() {
         assert_eq!(
-            parse_single_line_if("(1 == 1) #echo yes"),
-            Some(("1 == 1".to_string(), "#echo yes".to_string()))
+            parse_single_line_if("(1 == 1) /echo yes"),
+            Some(("1 == 1".to_string(), "/echo yes".to_string()))
         );
 
         assert_eq!(
@@ -1492,8 +1462,8 @@ mod tests {
 
         // Nested parens in condition
         assert_eq!(
-            parse_single_line_if("((1 + 2) > 2) #echo yes"),
-            Some(("(1 + 2) > 2".to_string(), "#echo yes".to_string()))
+            parse_single_line_if("((1 + 2) > 2) /echo yes"),
+            Some(("(1 + 2) > 2".to_string(), "/echo yes".to_string()))
         );
     }
 
@@ -1532,7 +1502,7 @@ mod tests {
         let mut engine = TfEngine::new();
 
         // True condition
-        let result = execute_single_if(&mut engine, "1 == 1", "#set result yes");
+        let result = execute_single_if(&mut engine, "1 == 1", "/set result yes");
         assert!(matches!(result, TfCommandResult::Success(_)));
         assert_eq!(
             engine.get_var("result").map(|v| v.to_string_value()),
@@ -1540,7 +1510,7 @@ mod tests {
         );
 
         // False condition
-        let result = execute_single_if(&mut engine, "1 == 2", "#set result no");
+        let result = execute_single_if(&mut engine, "1 == 2", "/set result no");
         assert!(matches!(result, TfCommandResult::Success(None)));
         // result should still be "yes"
         assert_eq!(
@@ -1554,11 +1524,11 @@ mod tests {
         let mut state = ControlState::If(IfState::new("x > 5".to_string()));
 
         // Add some lines
-        assert!(matches!(process_control_line(&mut state, "#echo inside if"), ControlResult::Consumed));
-        assert!(matches!(process_control_line(&mut state, "#set y 10"), ControlResult::Consumed));
+        assert!(matches!(process_control_line(&mut state, "/echo inside if"), ControlResult::Consumed));
+        assert!(matches!(process_control_line(&mut state, "/set y 10"), ControlResult::Consumed));
 
         // End the if
-        let result = process_control_line(&mut state, "#endif");
+        let result = process_control_line(&mut state, "/endif");
         assert!(matches!(result, ControlResult::Execute(_)));
         assert!(matches!(state, ControlState::None));
     }
@@ -1567,10 +1537,10 @@ mod tests {
     fn test_while_state_collection() {
         let mut state = ControlState::While(WhileState::new("x < 10".to_string()));
 
-        assert!(matches!(process_control_line(&mut state, "#set x (x + 1)"), ControlResult::Consumed));
-        assert!(matches!(process_control_line(&mut state, "#echo %x"), ControlResult::Consumed));
+        assert!(matches!(process_control_line(&mut state, "/set x (x + 1)"), ControlResult::Consumed));
+        assert!(matches!(process_control_line(&mut state, "/echo %x"), ControlResult::Consumed));
 
-        let result = process_control_line(&mut state, "#done");
+        let result = process_control_line(&mut state, "/done");
         assert!(matches!(result, ControlResult::Execute(_)));
     }
 
@@ -1582,7 +1552,7 @@ mod tests {
         // Create and execute a simple for loop using the new \x1F separator format
         const SEP: char = '\x1F';
         let encoded = format!(
-            "__tf_for_eval__{sep}VAR{sep}i{sep}START{sep}1{sep}END{sep}3{sep}STEP{sep}1{sep}LINE{sep}#set sum (${{sum}} + %i){sep}ENDFOR{sep}",
+            "__tf_for_eval__{sep}VAR{sep}i{sep}START{sep}1{sep}END{sep}3{sep}STEP{sep}1{sep}LINE{sep}/set sum (${{sum}} + %i){sep}ENDFOR{sep}",
             sep = SEP
         );
 
@@ -1602,7 +1572,7 @@ mod inline_tests {
         let mut engine = TfEngine::new();
 
         // Test true condition
-        let block = "#if (1 == 1)    #set x yes\n#else    #set x no\n#endif";
+        let block = "/if (1 == 1)    /set x yes\n/else    /set x no\n/endif";
         let results = execute_inline_if_block(&mut engine, block);
         assert!(!results.iter().any(|r| matches!(r, TfCommandResult::Error(_))), "Results: {:?}", results);
         assert_eq!(
@@ -1611,7 +1581,7 @@ mod inline_tests {
         );
 
         // Test false condition
-        let block2 = "#if (1 == 2)    #set y wrong\n#else    #set y correct\n#endif";
+        let block2 = "/if (1 == 2)    /set y wrong\n/else    /set y correct\n/endif";
         let results2 = execute_inline_if_block(&mut engine, block2);
         assert!(!results2.iter().any(|r| matches!(r, TfCommandResult::Error(_))), "Results2: {:?}", results2);
         assert_eq!(
@@ -1624,7 +1594,7 @@ mod inline_tests {
     fn test_nested_inline_if() {
         let mut engine = TfEngine::new();
 
-        let block = "#if (1 == 1)    #if (2 == 2)    #set z inner\n#endif\n#endif";
+        let block = "/if (1 == 1)    /if (2 == 2)    /set z inner\n/endif\n/endif";
         let results = execute_inline_if_block(&mut engine, block);
         assert!(!results.iter().any(|r| matches!(r, TfCommandResult::Error(_))), "Results: {:?}", results);
         assert_eq!(

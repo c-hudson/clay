@@ -1,6 +1,6 @@
 //! TinyFugue compatibility layer for Clay MUD client.
 //!
-//! This module provides TF-style commands using `#` prefix instead of `/`.
+//! This module provides TF-style commands using `/` prefix.
 //! Commands work alongside existing Clay commands for full coexistence.
 
 pub mod parser;
