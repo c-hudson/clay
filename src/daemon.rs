@@ -616,7 +616,7 @@ pub async fn handle_daemon_ws_message(
                         }
                     }
                 }
-                Command::Edit { .. } => {
+                Command::Edit { .. } | Command::EditList => {
                     // Edit command is handled locally on the client, not on daemon
                     // Send back to client for local execution
                     app.ws_send_to_client(client_id, WsMessage::ExecuteLocalCommand { command: command.clone() });

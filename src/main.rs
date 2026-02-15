@@ -510,48 +510,98 @@ impl EditorState {
         visual_line
     }
 
-    /// Move cursor up one line
-    pub fn cursor_up(&mut self) {
-        if self.cursor_line == 0 {
+    /// Move cursor up one visual (wrapped) line
+    pub fn cursor_up(&mut self, width: usize) {
+        if width == 0 {
+            // Fallback to logical line movement
+            if self.cursor_line == 0 { return; }
+            let lines = self.lines();
+            let target_line = self.cursor_line - 1;
+            let target_col = self.cursor_col.min(lines[target_line].chars().count());
+            let mut pos = 0;
+            for (i, line) in lines.iter().enumerate() {
+                if i == target_line { pos += target_col; break; }
+                pos += line.chars().count() + 1;
+            }
+            self.cursor_position = pos;
+            self.update_cursor_position();
             return;
         }
-        let lines = self.lines();
-        let target_line = self.cursor_line - 1;
-        let target_col = self.cursor_col.min(lines[target_line].chars().count());
 
-        // Calculate new cursor position
-        let mut pos = 0;
-        for (i, line) in lines.iter().enumerate() {
-            if i == target_line {
-                pos += target_col;
-                break;
+        let visual_col_in_visual_row = self.cursor_col % width;
+        let visual_row_in_line = self.cursor_col / width;
+
+        if visual_row_in_line > 0 {
+            // Move up within the same logical line
+            let new_col = self.cursor_col - width;
+            // cursor_position moves back by width characters
+            self.cursor_position -= width;
+            self.cursor_col = new_col;
+        } else {
+            // Move to previous logical line's last visual row
+            if self.cursor_line == 0 { return; }
+            let lines = self.lines();
+            let prev_line = self.cursor_line - 1;
+            let prev_len = lines[prev_line].chars().count();
+            let prev_last_visual_row = if prev_len == 0 { 0 } else { (prev_len - 1) / width };
+            let target_col_in_prev = (prev_last_visual_row * width) + visual_col_in_visual_row;
+            let target_col = target_col_in_prev.min(prev_len);
+
+            let mut pos = 0;
+            for (i, line) in lines.iter().enumerate() {
+                if i == prev_line { pos += target_col; break; }
+                pos += line.chars().count() + 1;
             }
-            pos += line.chars().count() + 1; // +1 for newline
+            self.cursor_position = pos;
+            self.update_cursor_position();
         }
-        self.cursor_position = pos;
-        self.update_cursor_position();
     }
 
-    /// Move cursor down one line
-    pub fn cursor_down(&mut self) {
-        let lines = self.lines();
-        if self.cursor_line >= lines.len() - 1 {
+    /// Move cursor down one visual (wrapped) line
+    pub fn cursor_down(&mut self, width: usize) {
+        if width == 0 {
+            // Fallback to logical line movement
+            let lines = self.lines();
+            if self.cursor_line >= lines.len() - 1 { return; }
+            let target_line = self.cursor_line + 1;
+            let target_col = self.cursor_col.min(lines[target_line].chars().count());
+            let mut pos = 0;
+            for (i, line) in lines.iter().enumerate() {
+                if i == target_line { pos += target_col; break; }
+                pos += line.chars().count() + 1;
+            }
+            self.cursor_position = pos;
+            self.update_cursor_position();
             return;
         }
-        let target_line = self.cursor_line + 1;
-        let target_col = self.cursor_col.min(lines[target_line].chars().count());
 
-        // Calculate new cursor position
-        let mut pos = 0;
-        for (i, line) in lines.iter().enumerate() {
-            if i == target_line {
-                pos += target_col;
-                break;
+        let lines = self.lines();
+        let cur_len = lines[self.cursor_line].chars().count();
+        let visual_col_in_visual_row = self.cursor_col % width;
+        let visual_row_in_line = self.cursor_col / width;
+        let last_visual_row = if cur_len == 0 { 0 } else { (cur_len - 1) / width };
+
+        if visual_row_in_line < last_visual_row {
+            // Move down within the same logical line
+            let new_col = (self.cursor_col + width).min(cur_len);
+            let advance = new_col - self.cursor_col;
+            self.cursor_position += advance;
+            self.cursor_col = new_col;
+        } else {
+            // Move to next logical line's first visual row
+            if self.cursor_line >= lines.len() - 1 { return; }
+            let next_line = self.cursor_line + 1;
+            let next_len = lines[next_line].chars().count();
+            let target_col = visual_col_in_visual_row.min(next_len);
+
+            let mut pos = 0;
+            for (i, line) in lines.iter().enumerate() {
+                if i == next_line { pos += target_col; break; }
+                pos += line.chars().count() + 1;
             }
-            pos += line.chars().count() + 1; // +1 for newline
+            self.cursor_position = pos;
+            self.update_cursor_position();
         }
-        self.cursor_position = pos;
-        self.update_cursor_position();
     }
 
     /// Move cursor left one character
@@ -1167,6 +1217,8 @@ pub enum Command {
     },
     /// /edit [filename] - open split-screen editor for world notes or file
     Edit { filename: Option<String> },
+    /// /edit -l - open notes list popup
+    EditList,
     /// /tag - toggle MUD tag display (same as F2)
     Tag,
     /// /dict <prefix> <word> - look up word definition and send with prefix
@@ -1262,7 +1314,9 @@ pub fn parse_command(input: &str) -> Command {
         }
         "/addworld" => parse_addworld_command(args),
         "/edit" => {
-            if args.is_empty() {
+            if args.first() == Some(&"-l") {
+                Command::EditList
+            } else if args.is_empty() {
                 Command::Edit { filename: None }
             } else {
                 Command::Edit { filename: Some(args.join(" ")) }
@@ -2786,6 +2840,49 @@ impl App {
             if let Some(field) = state.field_mut(SELECTOR_FIELD_LIST) {
                 if let popup::FieldKind::List { selected_index, .. } = &mut field.kind {
                     *selected_index = self.current_world_index;
+                }
+            }
+        }
+    }
+
+    /// Open the notes list popup showing worlds with notes
+    fn open_notes_list_popup(&mut self) {
+        use popup::definitions::notes_list::{create_notes_list_popup, NoteInfo, NOTES_FIELD_LIST};
+
+        let notes: Vec<NoteInfo> = self.worlds.iter().enumerate()
+            .filter(|(_, w)| !w.settings.notes.trim().is_empty())
+            .map(|(i, w)| {
+                let first_line = w.settings.notes.lines().next().unwrap_or("");
+                let preview = if first_line.len() > 50 {
+                    format!("{}...", &first_line[..47])
+                } else {
+                    first_line.to_string()
+                };
+                NoteInfo {
+                    world_name: w.name.clone(),
+                    preview,
+                    is_current: i == self.current_world_index,
+                }
+            })
+            .collect();
+
+        if notes.is_empty() {
+            self.add_output("No worlds have notes. Use /edit to create notes for the current world.");
+            return;
+        }
+
+        let visible_height = 10.min(notes.len().max(3));
+        let def = create_notes_list_popup(&notes, visible_height);
+        self.popup_manager.open(def);
+
+        // Select current world in the list if it has notes
+        if let Some(state) = self.popup_manager.current_mut() {
+            state.select_field(NOTES_FIELD_LIST);
+            if let Some(current_idx) = notes.iter().position(|n| n.is_current) {
+                if let Some(field) = state.field_mut(NOTES_FIELD_LIST) {
+                    if let popup::FieldKind::List { selected_index, .. } = &mut field.kind {
+                        *selected_index = current_idx;
+                    }
                 }
             }
         }
@@ -6544,6 +6641,9 @@ fn handle_remote_client_key(
                 // Send connect request to daemon
                 let _ = ws_tx.send(WsMessage::ConnectWorld { world_index: idx });
             }
+            NewPopupAction::NotesList(_action) => {
+                // Notes list not used in remote client
+            }
             NewPopupAction::None => {}
         }
         return false;
@@ -6894,6 +6994,8 @@ enum NewPopupAction {
     WorldEditorDelete(usize),
     /// World editor connect requested
     WorldEditorConnect(usize),
+    /// Notes list action
+    NotesList(NotesListAction),
 }
 
 /// Settings from the setup popup
@@ -6967,6 +7069,11 @@ enum ActionsListAction {
     Toggle(usize),        // Toggle enable/disable action at index
 }
 
+/// Actions from the notes list popup
+enum NotesListAction {
+    Open(String),         // Open notes for world by name
+}
+
 /// Handle input for new unified popup system
 fn handle_new_popup_key(app: &mut App, key: KeyEvent) -> NewPopupAction {
     use crossterm::event::KeyCode::*;
@@ -7018,6 +7125,7 @@ fn handle_new_popup_key(app: &mut App, key: KeyEvent) -> NewPopupAction {
     let is_actions_list = popup_id == Some(popup::PopupId("actions_list"));
     let is_action_editor = popup_id == Some(popup::PopupId("action_editor"));
     let is_world_editor = popup_id == Some(popup::PopupId("world_editor"));
+    let is_notes_list = popup_id == Some(popup::PopupId("notes_list"));
 
     if let Some(state) = app.popup_manager.current_mut() {
         // World selector has special handling
@@ -7586,6 +7694,53 @@ fn handle_new_popup_key(app: &mut App, key: KeyEvent) -> NewPopupAction {
                         state.start_edit();
                         state.insert_char(c);
                     }
+                }
+                _ => {}
+            }
+            return NewPopupAction::None;
+        }
+
+        // Notes list popup handling
+        if is_notes_list {
+            use popup::definitions::notes_list::{NOTES_BTN_CANCEL};
+
+            let get_selected_name = || state.get_selected_list_item().map(|item| item.id.clone());
+
+            match key.code {
+                Esc => {
+                    app.popup_manager.close();
+                    return NewPopupAction::None;
+                }
+                Enter => {
+                    // If on a button, check which one
+                    if state.is_button_focused(NOTES_BTN_CANCEL) {
+                        app.popup_manager.close();
+                        return NewPopupAction::None;
+                    }
+                    // Open button or list item - open notes
+                    if let Some(name) = get_selected_name() {
+                        app.popup_manager.close();
+                        return NewPopupAction::NotesList(NotesListAction::Open(name));
+                    }
+                }
+                Up => {
+                    state.list_select_up();
+                }
+                Down => {
+                    state.list_select_down();
+                }
+                Tab | BackTab => {
+                    state.cycle_field_buttons();
+                }
+                Char('o') | Char('O') => {
+                    if let Some(name) = get_selected_name() {
+                        app.popup_manager.close();
+                        return NewPopupAction::NotesList(NotesListAction::Open(name));
+                    }
+                }
+                Char('c') | Char('C') => {
+                    app.popup_manager.close();
+                    return NewPopupAction::None;
                 }
                 _ => {}
             }
@@ -11690,7 +11845,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                             }
                                         }
                                     }
-                                    Command::Edit { .. } => {
+                                    Command::Edit { .. } | Command::EditList => {
                                         // Edit command is handled locally on the client, not on server
                                         // Send back to client for local execution
                                         app.ws_send_to_client(client_id, WsMessage::ExecuteLocalCommand { command: command.clone() });
@@ -14388,7 +14543,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                         }
                                     }
                                 }
-                                Command::Edit { .. } => {
+                                Command::Edit { .. } | Command::EditList => {
                                     // Edit command is handled locally on the client, not on server
                                     // Send back to client for local execution
                                     app.ws_send_to_client(client_id, WsMessage::ExecuteLocalCommand { command: command.clone() });
@@ -15730,16 +15885,16 @@ fn handle_key_event(key: KeyEvent, app: &mut App) -> KeyAction {
                     return KeyAction::None;
                 }
                 KeyCode::Up => {
-                    app.editor.cursor_up();
-                    let visible_lines = app.output_height.saturating_sub(2) as usize; // Account for border and buttons
-                    let editor_width = (app.output_width / 2).saturating_sub(2) as usize; // Half width minus borders
+                    let editor_width = (app.output_width / 2).saturating_sub(2) as usize;
+                    app.editor.cursor_up(editor_width);
+                    let visible_lines = app.output_height.saturating_sub(2) as usize;
                     app.editor.ensure_cursor_visible(visible_lines, editor_width);
                     return KeyAction::None;
                 }
                 KeyCode::Down => {
-                    app.editor.cursor_down();
-                    let visible_lines = app.output_height.saturating_sub(2) as usize;
                     let editor_width = (app.output_width / 2).saturating_sub(2) as usize;
+                    app.editor.cursor_down(editor_width);
+                    let visible_lines = app.output_height.saturating_sub(2) as usize;
                     app.editor.ensure_cursor_visible(visible_lines, editor_width);
                     return KeyAction::None;
                 }
@@ -16258,6 +16413,17 @@ fn handle_key_event(key: KeyEvent, app: &mut App) -> KeyAction {
                     app.switch_world(idx);
                     if !app.current_world().connected {
                         return KeyAction::Connect;
+                    }
+                }
+            }
+            NewPopupAction::NotesList(action) => {
+                match action {
+                    NotesListAction::Open(name) => {
+                        if let Some(idx) = app.find_world(&name) {
+                            let notes = app.worlds[idx].settings.notes.clone();
+                            app.editor.open_notes(idx, &notes);
+                            app.needs_terminal_clear = true;
+                        }
                     }
                 }
             }
@@ -18893,6 +19059,9 @@ async fn handle_command(cmd: &str, app: &mut App, event_tx: mpsc::Sender<AppEven
             };
             app.add_output(&format!("{} world '{}'{}.", action, name, host_info));
         }
+        Command::EditList => {
+            app.open_notes_list_popup();
+        }
         Command::Edit { filename } => {
             // Open split-screen editor
             if app.editor.visible {
@@ -20096,8 +20265,8 @@ fn render_editor_panel(f: &mut Frame, app: &App, area: Rect) {
         Span::raw(" "),
         Span::styled("[S]", save_style),
         Span::raw("ave "),
-        Span::styled("[C]", cancel_style),
-        Span::raw("ancel"),
+        Span::styled("[Esc]", cancel_style),
+        Span::raw(" Cancel"),
     ]);
     let button_paragraph = Paragraph::new(button_text)
         .style(Style::default().bg(theme.bg()).fg(theme.fg()));

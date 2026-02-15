@@ -11,6 +11,7 @@ pub mod help;
 pub mod menu;
 pub mod setup;
 pub mod web;
+pub mod notes_list;
 pub mod world_editor;
 pub mod world_selector;
 
@@ -20,6 +21,7 @@ pub use connections::*;
 pub use filter::*;
 pub use help::*;
 pub use menu::*;
+pub use notes_list::*;
 pub use setup::*;
 pub use web::*;
 pub use world_editor::*;
