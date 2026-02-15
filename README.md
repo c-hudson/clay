@@ -9,25 +9,30 @@ A terminal-based MUD (Multi-User Dungeon) client built with Rust featuring multi
 
 - **Multi-World Support** - Connect to multiple MUD servers simultaneously
 - **SSL/TLS** - Secure connections with full TLS support
-- **ANSI Colors** - Full ANSI color and formatting support
+- **ANSI Colors** - Full ANSI color and formatting support (256-color, true color)
 - **Web Interface** - Browser-based client via WebSocket
 - **Remote GUI** - Optional graphical client using egui
 - **Remote Console** - Connect to a running Clay instance from another terminal
 - **More-Mode** - Pagination for fast-scrolling output
 - **Scrollback** - Unlimited history with PageUp/PageDown navigation
 - **Command History** - Navigate previous commands with Ctrl+P/N
-- **Telnet Protocol** - Full telnet negotiation with keepalive support
+- **Telnet Protocol** - Full telnet negotiation with keepalive support (SGA, TTYPE, EOR, NAWS)
 - **Auto-Login** - Configurable automatic login (Connect, Prompt, MOO modes)
 - **Hot Reload** - Update the binary without losing connections (`/reload`)
+- **Self-Update** - Download and install latest release from GitHub (`/update`)
 - **TLS Proxy** - Optional proxy to preserve TLS connections across hot reload
 - **Spell Check** - Built-in spell checking with suggestions
 - **Output Filtering** - Search/filter output with F4
 - **File Logging** - Per-world output logging
 - **ANSI Music** - BBS-style music playback (web/GUI interfaces)
+- **GMCP Media** - Server-driven sound effects and music via Client.Media protocol
 - **Actions/Triggers** - Pattern matching with regex or wildcard, auto-commands
-- **TinyFugue Compatibility** - `#` commands for TF users (`#def`, `#set`, `#if`, etc.)
+- **TinyFugue Compatibility** - Both `/` and `#` prefixes for TF commands (`/def`, `#set`, `/if`, etc.)
+- **Themes** - Customizable color themes for GUI/web via `~/clay.theme.dat` with browser-based theme editor
+- **Notes Editor** - Per-world split-screen notes editor (`/edit`)
 - **Termux Support** - Runs on Android via Termux
-- **Android Notifications** - Push notifications via companion app
+- **Android App** - WebSocket client with push notifications via `/notify`
+- **Daemon Mode** - Run headless as a background process
 
 ## Installation
 
@@ -37,7 +42,6 @@ Download pre-built binaries from the [Releases](https://github.com/c-hudson/clay
 
 | Platform | Binary | Notes |
 |----------|--------|-------|
-| Linux x86_64 | `clay-linux-x86_64` | GUI + audio, requires glibc |
 | Linux x86_64 (static) | `clay-linux-x86_64-musl` | TUI only, works on any Linux |
 | Linux ARM64 (Termux) | `clay-termux-aarch64` | TUI only, for Android/Termux |
 | Android | `clay-android.apk` | WebSocket client app |
@@ -46,7 +50,7 @@ Download pre-built binaries from the [Releases](https://github.com/c-hudson/clay
 
 ```bash
 # Example: Download and install on Linux
-curl -L https://github.com/c-hudson/clay/releases/latest/download/clay-linux-x86_64 -o clay
+curl -L https://github.com/c-hudson/clay/releases/latest/download/clay-linux-x86_64-musl -o clay
 chmod +x clay
 ./clay
 ```
@@ -59,10 +63,7 @@ chmod +x clay
 # Install dependencies (Debian/Ubuntu)
 sudo apt install libasound2-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev libxcb1-dev pkg-config
 
-# Easy build with included script (GUI + audio)
-./build.sh
-
-# Or manual build with GUI + audio
+# Build with GUI + audio
 cargo build --release --features remote-gui-audio
 
 # Static binary for any Linux (TUI only, no GUI)
@@ -99,20 +100,6 @@ pkg install rust
 cargo build --release --no-default-features --features rustls-backend
 ```
 
-### Docker
-
-```bash
-# Build with GUI + audio (glibc)
-docker build -t clay-builder .
-docker run --rm -v $(pwd)/output:/output clay-builder
-
-# Build static binary (musl, TUI only)
-docker build -f Dockerfile.static -t clay-static-builder .
-docker run --rm -v $(pwd)/output:/output clay-static-builder
-
-# Binary will be in ./output/clay
-```
-
 ## Usage
 
 ```bash
@@ -135,38 +122,43 @@ docker run --rm -v $(pwd)/output:/output clay-static-builder
 | `/worlds -e [name]` | Edit world settings |
 | `/connections` or `/l` | List connected worlds |
 | `/disconnect` or `/dc` | Disconnect current world |
+| `/send [-w world] text` | Send text to a world |
 | `/setup` | Open global settings |
 | `/web` | Open web/WebSocket settings |
 | `/actions` | Open actions/triggers editor |
+| `/edit` | Open split-screen notes editor |
+| `/menu` | Open menu popup |
 | `/reload` | Hot reload the binary |
+| `/update` | Download and install latest release |
+| `/notify <msg>` | Send notification to Android app |
 | `/testmusic` | Play test ANSI music sequence |
 | `/quit` | Exit the client |
 | `/help` | Show help |
 
 ## TinyFugue Commands
 
-Clay includes TinyFugue compatibility using `#` prefix:
+Clay includes a TinyFugue compatibility layer. All TF commands work with both `/` and `#` prefixes:
 
 | Command | Description |
 |---------|-------------|
-| `#set name value` | Set a variable |
-| `#echo message` | Display local message |
-| `#def name = body` | Define a macro/trigger |
-| `#if (expr) cmd` | Conditional execution |
-| `#while (expr) ... #done` | While loop |
-| `#for var start end ... #done` | For loop |
-| `#bind key = cmd` | Bind key to command |
-| `#load filename` | Load a TF script file |
-| `#help [topic]` | Show TF help |
+| `/set name value` | Set a variable |
+| `/echo message` | Display local message |
+| `/def name = body` | Define a macro/trigger |
+| `/if (expr) cmd` | Conditional execution |
+| `/while (expr) ... /done` | While loop |
+| `/for var start end ... /done` | For loop |
+| `/bind key = cmd` | Bind key to command |
+| `/load filename` | Load a TF script file |
+| `/tfhelp [topic]` | Show TF help |
 
-See `#help` for full command list.
+The `#` prefix still works for backward compatibility (`#set`, `#echo`, `#def`, etc.). See `/tfhelp` for full command list.
 
 ### Importing TinyFugue Worlds
 
-If you have an existing TinyFugue configuration, you can import your worlds using `#load`:
+If you have an existing TinyFugue configuration, you can import your worlds using `/load`:
 
 ```bash
-#load ~/.tfrc
+/load ~/.tfrc
 ```
 
 Clay will parse `/addworld` commands from your TF config file and create corresponding worlds. This makes migrating from TinyFugue seamless - your existing world definitions are automatically imported.
@@ -190,6 +182,7 @@ Clay will parse `/addworld` commands from your TF config file and create corresp
 | `F2` | Toggle MUD tag display |
 | `F4` | Filter output |
 | `F8` | Toggle action highlighting |
+| `F9` | Toggle GMCP media audio |
 | `Ctrl+C` (x2) | Quit |
 
 ## Android App
@@ -227,7 +220,16 @@ Actions match incoming MUD output against patterns and execute commands:
 3. Set command(s) to execute when matched
 4. Use `$1`-`$9` for captured groups, `$0` for full match
 
-Example: Pattern `* tells you: *` with command `#echo Got tell from $1`
+Example: Pattern `* tells you: *` with command `/echo Got tell from $1`
+
+## Themes
+
+Clay supports customizable color themes for the GUI and web interfaces:
+
+- Theme file: `~/clay.theme.dat` (INI format with `[theme:name]` sections)
+- Browser-based theme editor included for live color preview
+- Select themes in `/setup` (GUI Theme setting)
+- Console uses separate dark/light theme toggle
 
 ## Configuration
 
