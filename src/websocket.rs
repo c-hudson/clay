@@ -94,6 +94,8 @@ pub enum WsMessage {
     WorldConnected { world_index: usize, name: String },
     WorldDisconnected { world_index: usize },
     WorldAdded { world: Box<WorldStateMsg> },
+    /// Response to CreateWorld - tells the requesting client the index of the new world
+    WorldCreated { world_index: usize },
     WorldRemoved { world_index: usize },
     WorldSwitched { new_index: usize },
     PromptUpdate { world_index: usize, prompt: String },

@@ -1273,6 +1273,61 @@ impl RemoteGuiApp {
                         // Defer playing music to avoid borrow issues
                         deferred_music.extend(notes);
                     }
+                    WsMessage::WorldAdded { world } => {
+                        // Skip if we already have this world locally (from our own Add)
+                        let already_exists = world.index < self.worlds.len()
+                            && self.worlds[world.index].name == world.name;
+                        if !already_exists {
+                            let pending_count = if !world.pending_lines_ts.is_empty() {
+                                world.pending_lines_ts.len()
+                            } else {
+                                world.pending_lines.len()
+                            };
+                            let new_world = RemoteWorld {
+                                name: world.name.clone(),
+                                connected: world.connected,
+                                was_connected: world.was_connected,
+                                is_proxy: world.is_proxy,
+                                output_lines: if !world.output_lines_ts.is_empty() {
+                                    world.output_lines_ts.clone()
+                                } else {
+                                    let now = current_timestamp_secs();
+                                    world.output_lines.iter().enumerate().map(|(i, text)| TimestampedLine {
+                                        text: text.clone(), ts: now, gagged: false, from_server: true, seq: i as u64, highlight_color: None,
+                                    }).collect()
+                                },
+                                prompt: world.prompt.clone(),
+                                settings: RemoteWorldSettings {
+                                    hostname: world.settings.hostname.clone(),
+                                    port: world.settings.port.clone(),
+                                    user: world.settings.user.clone(),
+                                    password: decrypt_password(&world.settings.password),
+                                    use_ssl: world.settings.use_ssl,
+                                    log_enabled: world.settings.log_enabled,
+                                    encoding: world.settings.encoding.clone(),
+                                    auto_login: world.settings.auto_connect_type.clone(),
+                                    keep_alive_type: world.keep_alive_type.clone(),
+                                    keep_alive_cmd: world.settings.keep_alive_cmd.clone(),
+                                    gmcp_packages: world.settings.gmcp_packages.clone(),
+                                },
+                                unseen_lines: world.unseen_lines,
+                                pending_count,
+                                last_send_secs: world.last_send_secs,
+                                last_recv_secs: world.last_recv_secs,
+                                last_nop_secs: world.last_nop_secs,
+                                partial_line: String::new(),
+                                showing_splash: world.showing_splash,
+                                gmcp_user_enabled: world.gmcp_user_enabled,
+                            };
+                            let insert_index = world.index.min(self.worlds.len());
+                            self.worlds.insert(insert_index, new_world);
+                            // Adjust current_world if needed
+                            if self.current_world >= insert_index && self.worlds.len() > 1 {
+                                self.current_world += 1;
+                            }
+                            self.output_dirty = true;
+                        }
+                    }
                     WsMessage::WorldRemoved { world_index } => {
                         if world_index < self.worlds.len() {
                             self.worlds.remove(world_index);
@@ -9068,6 +9123,34 @@ impl eframe::App for RemoteGuiApp {
                         if self.worlds.len() > 1 && idx < self.worlds.len() {
                             self.popup_state = PopupState::WorldConfirmDelete(idx);
                         }
+                    }
+                    "add" => {
+                        // Create world locally and open editor immediately
+                        let new_name = format!("World {}", self.worlds.len() + 1);
+                        let new_world = RemoteWorld {
+                            name: new_name.clone(),
+                            connected: false,
+                            was_connected: false,
+                            is_proxy: false,
+                            output_lines: Vec::new(),
+                            prompt: String::new(),
+                            settings: RemoteWorldSettings::default(),
+                            unseen_lines: 0,
+                            pending_count: 0,
+                            last_send_secs: None,
+                            last_recv_secs: None,
+                            last_nop_secs: None,
+                            partial_line: String::new(),
+                            showing_splash: true,
+                            gmcp_user_enabled: false,
+                        };
+                        self.worlds.push(new_world);
+                        let new_idx = self.worlds.len() - 1;
+                        // Tell server to create the world too
+                        if let Some(ref tx) = self.ws_tx {
+                            let _ = tx.send(WsMessage::CreateWorld { name: new_name });
+                        }
+                        self.open_world_editor(new_idx);
                     }
                     _ => {}
                 }

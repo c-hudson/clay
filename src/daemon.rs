@@ -462,13 +462,69 @@ pub async fn handle_daemon_ws_message(
                             }
                         }
                     } else {
-                        app.ws_broadcast(WsMessage::ServerData {
-                            world_index,
-                            data: format!("Unknown action: /{}", name),
-                            is_viewed: false,
-                            ts: current_timestamp_secs(),
-                            from_server: false,
-                        });
+                        // No matching action - try TF engine (handles /recall, /set, /echo, etc.)
+                        app.sync_tf_world_info();
+                        match app.tf_engine.execute(&command) {
+                            tf::TfCommandResult::Success(Some(msg)) => {
+                                app.ws_broadcast(WsMessage::ServerData {
+                                    world_index, data: msg, is_viewed: false,
+                                    ts: current_timestamp_secs(), from_server: false,
+                                });
+                            }
+                            tf::TfCommandResult::Success(None) => {}
+                            tf::TfCommandResult::Error(err) => {
+                                app.ws_broadcast(WsMessage::ServerData {
+                                    world_index, data: format!("Error: {}", err), is_viewed: false,
+                                    ts: current_timestamp_secs(), from_server: false,
+                                });
+                            }
+                            tf::TfCommandResult::SendToMud(text) => {
+                                if world_index < app.worlds.len() {
+                                    if let Some(tx) = &app.worlds[world_index].command_tx {
+                                        let _ = tx.try_send(WriteCommand::Text(text));
+                                        app.worlds[world_index].last_send_time = Some(std::time::Instant::now());
+                                    }
+                                }
+                            }
+                            tf::TfCommandResult::ClayCommand(clay_cmd) => {
+                                app.ws_send_to_client(client_id, WsMessage::ExecuteLocalCommand { command: clay_cmd });
+                            }
+                            tf::TfCommandResult::Recall(opts) => {
+                                if world_index < app.worlds.len() {
+                                    let output_lines = app.worlds[world_index].output_lines.clone();
+                                    let (matches, header) = execute_recall(&opts, &output_lines);
+                                    let pattern_str = opts.pattern.as_deref().unwrap_or("*");
+                                    let ts = current_timestamp_secs();
+                                    if !opts.quiet {
+                                        if let Some(h) = header {
+                                            app.ws_broadcast(WsMessage::ServerData { world_index, data: h, is_viewed: false, ts, from_server: false });
+                                        }
+                                    }
+                                    if matches.is_empty() {
+                                        app.ws_broadcast(WsMessage::ServerData { world_index, data: format!("\u{2728} No matches for '{}'", pattern_str), is_viewed: false, ts, from_server: false });
+                                    } else {
+                                        for m in matches {
+                                            app.ws_broadcast(WsMessage::ServerData { world_index, data: m, is_viewed: false, ts, from_server: false });
+                                        }
+                                    }
+                                    if !opts.quiet {
+                                        app.ws_broadcast(WsMessage::ServerData { world_index, data: "================= Recall end =================".to_string(), is_viewed: false, ts, from_server: false });
+                                    }
+                                }
+                            }
+                            tf::TfCommandResult::RepeatProcess(process) => {
+                                app.tf_engine.processes.push(process);
+                            }
+                            _ => {
+                                app.ws_broadcast(WsMessage::ServerData {
+                                    world_index,
+                                    data: format!("Unknown command: /{}", name),
+                                    is_viewed: false,
+                                    ts: current_timestamp_secs(),
+                                    from_server: false,
+                                });
+                            }
+                        }
                     }
                 }
                 Command::NotACommand { text } => {
@@ -1519,6 +1575,97 @@ pub async fn handle_daemon_ws_message(
                     world_index,
                     lines,
                 });
+            }
+        }
+        WsMessage::CreateWorld { name } => {
+            let new_world = World::new(&name);
+            app.worlds.push(new_world);
+            let idx = app.worlds.len() - 1;
+            let world = &app.worlds[idx];
+            let world_state = WorldStateMsg {
+                index: idx,
+                name: world.name.clone(),
+                connected: false,
+                output_lines: Vec::new(),
+                pending_lines: Vec::new(),
+                output_lines_ts: Vec::new(),
+                pending_lines_ts: Vec::new(),
+                prompt: String::new(),
+                scroll_offset: 0,
+                paused: false,
+                unseen_lines: 0,
+                settings: WorldSettingsMsg {
+                    hostname: world.settings.hostname.clone(),
+                    port: world.settings.port.clone(),
+                    user: world.settings.user.clone(),
+                    password: world.settings.password.clone(),
+                    use_ssl: world.settings.use_ssl,
+                    log_enabled: world.settings.log_enabled,
+                    encoding: world.settings.encoding.name().to_string(),
+                    auto_connect_type: world.settings.auto_connect_type.name().to_string(),
+                    keep_alive_type: world.settings.keep_alive_type.name().to_string(),
+                    keep_alive_cmd: world.settings.keep_alive_cmd.clone(),
+                    gmcp_packages: world.settings.gmcp_packages.clone(),
+                },
+                last_send_secs: None,
+                last_recv_secs: None,
+                last_nop_secs: None,
+                keep_alive_type: world.settings.keep_alive_type.name().to_string(),
+                showing_splash: world.showing_splash,
+                was_connected: false,
+                is_proxy: false,
+                gmcp_user_enabled: world.gmcp_user_enabled,
+            };
+            app.ws_broadcast(WsMessage::WorldAdded { world: Box::new(world_state) });
+            let _ = persistence::save_settings(&app);
+            app.ws_send_to_client(client_id, WsMessage::WorldCreated { world_index: idx });
+        }
+        WsMessage::DeleteWorld { world_index } => {
+            if app.worlds.len() > 1 && world_index < app.worlds.len() {
+                app.worlds.remove(world_index);
+                if app.current_world_index >= app.worlds.len() {
+                    app.current_world_index = app.worlds.len().saturating_sub(1);
+                } else if app.current_world_index > world_index {
+                    app.current_world_index -= 1;
+                }
+                if let Some(prev) = app.previous_world_index {
+                    if prev >= app.worlds.len() {
+                        app.previous_world_index = Some(app.worlds.len().saturating_sub(1));
+                    } else if prev > world_index {
+                        app.previous_world_index = Some(prev - 1);
+                    }
+                }
+                app.ws_broadcast(WsMessage::WorldRemoved { world_index });
+                let _ = persistence::save_settings(&app);
+            }
+        }
+        WsMessage::UpdateWorldSettings { world_index, name, hostname, port, user, password, use_ssl, log_enabled, encoding, auto_login, keep_alive_type, keep_alive_cmd, gmcp_packages } => {
+            if world_index < app.worlds.len() {
+                app.worlds[world_index].name = name.clone();
+                app.worlds[world_index].settings.hostname = hostname.clone();
+                app.worlds[world_index].settings.port = port.clone();
+                app.worlds[world_index].settings.user = user.clone();
+                app.worlds[world_index].settings.password = password.clone();
+                app.worlds[world_index].settings.use_ssl = use_ssl;
+                app.worlds[world_index].settings.log_enabled = log_enabled;
+                app.worlds[world_index].settings.encoding = match encoding.as_str() {
+                    "latin1" => Encoding::Latin1,
+                    "fansi" => Encoding::Fansi,
+                    _ => Encoding::Utf8,
+                };
+                app.worlds[world_index].settings.auto_connect_type = AutoConnectType::from_name(&auto_login);
+                app.worlds[world_index].settings.keep_alive_type = KeepAliveType::from_name(&keep_alive_type);
+                app.worlds[world_index].settings.keep_alive_cmd = keep_alive_cmd.clone();
+                app.worlds[world_index].settings.gmcp_packages = gmcp_packages.clone();
+                let _ = persistence::save_settings(&app);
+                let settings_msg = WorldSettingsMsg {
+                    hostname, port, user,
+                    password: encrypt_password(&password),
+                    use_ssl, log_enabled, encoding,
+                    auto_connect_type: auto_login,
+                    keep_alive_type, keep_alive_cmd, gmcp_packages,
+                };
+                app.ws_broadcast(WsMessage::WorldSettingsUpdated { world_index, settings: settings_msg, name });
             }
         }
         _ => {}

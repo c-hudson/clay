@@ -12039,6 +12039,51 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                     // WorldDisconnected broadcast happens via AppEvent::Disconnected
                                 }
                             }
+                            WsMessage::CreateWorld { name } => {
+                                // Create new world and broadcast to all clients
+                                let new_world = World::new(&name);
+                                app.worlds.push(new_world);
+                                let idx = app.worlds.len() - 1;
+                                let world = &app.worlds[idx];
+                                let world_state = WorldStateMsg {
+                                    index: idx,
+                                    name: world.name.clone(),
+                                    connected: false,
+                                    output_lines: Vec::new(),
+                                    pending_lines: Vec::new(),
+                                    output_lines_ts: Vec::new(),
+                                    pending_lines_ts: Vec::new(),
+                                    prompt: String::new(),
+                                    scroll_offset: 0,
+                                    paused: false,
+                                    unseen_lines: 0,
+                                    settings: WorldSettingsMsg {
+                                        hostname: world.settings.hostname.clone(),
+                                        port: world.settings.port.clone(),
+                                        user: world.settings.user.clone(),
+                                        password: world.settings.password.clone(),
+                                        use_ssl: world.settings.use_ssl,
+                                        log_enabled: world.settings.log_enabled,
+                                        encoding: world.settings.encoding.name().to_string(),
+                                        auto_connect_type: world.settings.auto_connect_type.name().to_string(),
+                                        keep_alive_type: world.settings.keep_alive_type.name().to_string(),
+                                        keep_alive_cmd: world.settings.keep_alive_cmd.clone(),
+                                        gmcp_packages: world.settings.gmcp_packages.clone(),
+                                    },
+                                    last_send_secs: None,
+                                    last_recv_secs: None,
+                                    last_nop_secs: None,
+                                    keep_alive_type: world.settings.keep_alive_type.name().to_string(),
+                                    showing_splash: world.showing_splash,
+                                    was_connected: false,
+                                    is_proxy: false,
+                                    gmcp_user_enabled: world.gmcp_user_enabled,
+                                };
+                                app.ws_broadcast(WsMessage::WorldAdded { world: Box::new(world_state) });
+                                let _ = persistence::save_settings(&app);
+                                // Send the new world's index back to the requesting client
+                                app.ws_send_to_client(client_id, WsMessage::WorldCreated { world_index: idx });
+                            }
                             WsMessage::DeleteWorld { world_index } => {
                                 // Delete specified world (if not the last one)
                                 if app.worlds.len() > 1 && world_index < app.worlds.len() {
@@ -15096,6 +15141,68 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                     world_index,
                                     lines,
                                 });
+                            }
+                        }
+                        WsMessage::CreateWorld { name } => {
+                            let new_world = World::new(&name);
+                            app.worlds.push(new_world);
+                            let idx = app.worlds.len() - 1;
+                            let world = &app.worlds[idx];
+                            let world_state = WorldStateMsg {
+                                index: idx,
+                                name: world.name.clone(),
+                                connected: false,
+                                output_lines: Vec::new(),
+                                pending_lines: Vec::new(),
+                                output_lines_ts: Vec::new(),
+                                pending_lines_ts: Vec::new(),
+                                prompt: String::new(),
+                                scroll_offset: 0,
+                                paused: false,
+                                unseen_lines: 0,
+                                settings: WorldSettingsMsg {
+                                    hostname: world.settings.hostname.clone(),
+                                    port: world.settings.port.clone(),
+                                    user: world.settings.user.clone(),
+                                    password: world.settings.password.clone(),
+                                    use_ssl: world.settings.use_ssl,
+                                    log_enabled: world.settings.log_enabled,
+                                    encoding: world.settings.encoding.name().to_string(),
+                                    auto_connect_type: world.settings.auto_connect_type.name().to_string(),
+                                    keep_alive_type: world.settings.keep_alive_type.name().to_string(),
+                                    keep_alive_cmd: world.settings.keep_alive_cmd.clone(),
+                                    gmcp_packages: world.settings.gmcp_packages.clone(),
+                                },
+                                last_send_secs: None,
+                                last_recv_secs: None,
+                                last_nop_secs: None,
+                                keep_alive_type: world.settings.keep_alive_type.name().to_string(),
+                                showing_splash: world.showing_splash,
+                                was_connected: false,
+                                is_proxy: false,
+                                gmcp_user_enabled: world.gmcp_user_enabled,
+                            };
+                            app.ws_broadcast(WsMessage::WorldAdded { world: Box::new(world_state) });
+                            let _ = persistence::save_settings(&app);
+                            app.ws_send_to_client(client_id, WsMessage::WorldCreated { world_index: idx });
+                        }
+                        WsMessage::DeleteWorld { world_index } => {
+                            if app.worlds.len() > 1 && world_index < app.worlds.len() {
+                                app.worlds.remove(world_index);
+                                if app.current_world_index >= app.worlds.len() {
+                                    app.current_world_index = app.worlds.len().saturating_sub(1);
+                                } else if app.current_world_index > world_index {
+                                    app.current_world_index -= 1;
+                                }
+                                if let Some(prev) = app.previous_world_index {
+                                    if prev >= app.worlds.len() {
+                                        app.previous_world_index = Some(app.worlds.len().saturating_sub(1));
+                                    } else if prev > world_index {
+                                        app.previous_world_index = Some(prev - 1);
+                                    }
+                                }
+                                app.ws_broadcast(WsMessage::WorldRemoved { world_index });
+                                let _ = persistence::save_settings(&app);
                             }
                         }
                         _ => {}
