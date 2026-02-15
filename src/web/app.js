@@ -362,7 +362,7 @@
     // Internal commands for tab completion (must match Rust parse_command match arms)
     // This list is verified by test_command_parity_js_vs_rust in main.rs
     const INTERNAL_COMMANDS = [
-        'help', 'version', 'quit', 'reload', 'setup', 'web', 'actions',
+        'help', 'version', 'quit', 'reload', 'update', 'setup', 'web', 'actions',
         'worlds', 'world', 'connections', 'l', 'connect', 'disconnect', 'dc',
         'flush', 'menu', 'send', 'keepalive', 'gag', 'ban', 'unban',
         'testmusic', 'dump', 'notify', 'addworld', 'edit', 'tag', 'tags',

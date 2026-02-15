@@ -976,7 +976,7 @@ pub async fn handle_daemon_ws_message(
                     }
                 }
                 // Commands that should be blocked from remote
-                Command::Quit | Command::Reload => {
+                Command::Quit | Command::Reload | Command::Update => {
                     app.ws_broadcast(WsMessage::ServerData {
                         world_index,
                         data: "This command is not available from remote interfaces.".to_string(),

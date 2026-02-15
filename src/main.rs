@@ -1114,6 +1114,8 @@ pub enum Command {
     Quit,
     /// /reload - hot reload binary
     Reload,
+    /// /update - check for and install updates from GitHub
+    Update,
     /// /setup - show global settings popup
     Setup,
     /// /web - show web settings popup
@@ -1215,6 +1217,7 @@ pub fn parse_command(input: &str) -> Command {
         "/version" => Command::Version,
         "/quit" => Command::Quit,
         "/reload" => Command::Reload,
+        "/update" => Command::Update,
         "/setup" => Command::Setup,
         "/web" => Command::Web,
         "/actions" => {
@@ -5063,6 +5066,14 @@ pub enum AppEvent {
     MediaProcessReady(usize, String, std::process::Child, bool),  // world_idx, key, child, is_music
     // API lookup result (dict/urban/translate) from spawned task
     ApiLookupResult(u64, usize, Result<String, String>),  // client_id, world_index, Ok(input_text) or Err(error)
+    // Result from background update check/download
+    UpdateResult(Result<UpdateSuccess, String>),
+}
+
+/// Successful update download ready to install
+pub struct UpdateSuccess {
+    pub version: String,
+    pub temp_path: std::path::PathBuf,
 }
 
 /// Per-user connection state for multiuser mode
@@ -5562,6 +5573,166 @@ fn get_executable_path() -> io::Result<(PathBuf, String)> {
         PathBuf::from(&clean_path).exists()
     );
     Ok((PathBuf::from(clean_path), debug_info))
+}
+
+/// Get the correct GitHub release asset name for this platform
+fn get_platform_asset_name() -> &'static str {
+    #[cfg(all(target_os = "linux", target_env = "musl"))]
+    { return "clay-linux-x86_64-musl"; }
+
+    #[cfg(all(target_os = "linux", not(target_env = "musl")))]
+    { return "clay-linux-x86_64"; }
+
+    #[cfg(target_os = "macos")]
+    { return "clay-macos-universal"; }
+
+    #[cfg(target_os = "windows")]
+    { return "clay-windows-x86_64.exe"; }
+
+    #[cfg(target_os = "android")]
+    { return "clay-termux-aarch64"; }
+
+    #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows", target_os = "android")))]
+    { return "unknown"; }
+}
+
+/// Compare two semver-style version strings, returns true if remote is newer than current.
+/// Handles: "1.0.0" vs "1.0.1", pre-release suffixes like "-alpha", "-beta", "-rc1"
+fn is_newer_version(remote: &str, current: &str) -> bool {
+    // Split off pre-release suffix (e.g. "1.0.0-alpha" → "1.0.0", "alpha")
+    fn split_version(v: &str) -> (Vec<u64>, Option<&str>) {
+        let (base, pre) = if let Some(idx) = v.find('-') {
+            (&v[..idx], Some(&v[idx + 1..]))
+        } else {
+            (v, None)
+        };
+        let parts: Vec<u64> = base.split('.').filter_map(|p| p.parse().ok()).collect();
+        (parts, pre)
+    }
+
+    let (remote_parts, remote_pre) = split_version(remote);
+    let (current_parts, current_pre) = split_version(current);
+
+    // Compare numeric parts
+    let max_len = remote_parts.len().max(current_parts.len());
+    for i in 0..max_len {
+        let r = remote_parts.get(i).copied().unwrap_or(0);
+        let c = current_parts.get(i).copied().unwrap_or(0);
+        if r > c { return true; }
+        if r < c { return false; }
+    }
+
+    // Same base version: pre-release is older than release
+    // remote has no pre-release, current does → remote is newer (release > pre-release)
+    if remote_pre.is_none() && current_pre.is_some() {
+        return true;
+    }
+
+    false
+}
+
+/// Check GitHub for latest release and download the binary if newer
+#[cfg(all(unix, not(target_os = "android")))]
+async fn check_and_download_update() -> Result<UpdateSuccess, String> {
+    let client = reqwest::Client::builder()
+        .user_agent("clay-mud-client")
+        .build()
+        .map_err(|e| format!("HTTP client error: {}", e))?;
+
+    let release: serde_json::Value = client
+        .get("https://api.github.com/repos/c-hudson/clay/releases/latest")
+        .send()
+        .await
+        .map_err(|e| format!("Failed to check for updates: {}", e))?
+        .json()
+        .await
+        .map_err(|e| format!("Invalid response: {}", e))?;
+
+    // Extract version from tag_name (strip leading 'v')
+    let tag = release["tag_name"]
+        .as_str()
+        .ok_or("No version tag in release")?;
+    let remote_version = tag.trim_start_matches('v');
+
+    // Compare versions
+    if !is_newer_version(remote_version, VERSION) {
+        return Err(format!(
+            "Already up to date (current: v{}, latest: v{})",
+            VERSION, remote_version
+        ));
+    }
+
+    // Find correct asset for this platform
+    let asset_name = get_platform_asset_name();
+    let assets = release["assets"]
+        .as_array()
+        .ok_or("No assets in release")?;
+    let asset = assets
+        .iter()
+        .find(|a| a["name"].as_str() == Some(asset_name))
+        .ok_or_else(|| format!("No binary for this platform ({}) in release", asset_name))?;
+
+    let download_url = asset["browser_download_url"]
+        .as_str()
+        .ok_or("No download URL for asset")?;
+    let expected_size = asset["size"].as_u64().unwrap_or(0);
+
+    // Download to temp file
+    let temp_path = std::env::temp_dir().join(format!("clay-update-{}", remote_version));
+    let response = client
+        .get(download_url)
+        .send()
+        .await
+        .map_err(|e| format!("Download failed: {}", e))?;
+
+    if !response.status().is_success() {
+        return Err(format!("Download failed: HTTP {}", response.status()));
+    }
+
+    let bytes = response
+        .bytes()
+        .await
+        .map_err(|e| format!("Download incomplete: {}", e))?;
+
+    // Validate download size
+    if expected_size > 0 && bytes.len() as u64 != expected_size {
+        return Err(format!(
+            "Download size mismatch (got {} bytes, expected {})",
+            bytes.len(),
+            expected_size
+        ));
+    }
+
+    // Minimum size sanity check (Clay binary should be at least 1MB)
+    if bytes.len() < 1_000_000 {
+        return Err(format!(
+            "Downloaded file too small ({} bytes) - likely not a valid binary",
+            bytes.len()
+        ));
+    }
+
+    // Check ELF header (Linux) or Mach-O header (macOS) to verify it's an executable
+    #[cfg(target_os = "linux")]
+    if bytes.len() >= 4 && &bytes[0..4] != b"\x7fELF" {
+        return Err("Downloaded file is not a valid ELF binary".to_string());
+    }
+    #[cfg(target_os = "macos")]
+    if bytes.len() >= 4 {
+        let magic = u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+        // Mach-O magic numbers: MH_MAGIC_64, MH_CIGAM_64, FAT_MAGIC, FAT_CIGAM
+        if !matches!(magic, 0xFEEDFACF | 0xCFFAEDFE | 0xBEBAFECA | 0xCAFEBABE) {
+            return Err("Downloaded file is not a valid Mach-O binary".to_string());
+        }
+    }
+
+    // Write to temp file
+    std::fs::write(&temp_path, &bytes)
+        .map_err(|e| format!("Failed to write update: {}", e))?;
+
+    Ok(UpdateSuccess {
+        version: remote_version.to_string(),
+        temp_path,
+    })
 }
 
 #[cfg(all(unix, not(target_os = "android")))]
@@ -9253,6 +9424,51 @@ pub async fn run_app_headless(
                             }),
                         }
                     }
+                    AppEvent::UpdateResult(result) => {
+                        match result {
+                            Ok(success) => {
+                                match get_executable_path() {
+                                    Ok((exe_path, _)) => {
+                                        use std::os::unix::fs::PermissionsExt;
+                                        if let Err(e) = std::fs::set_permissions(
+                                            &success.temp_path,
+                                            std::fs::Permissions::from_mode(0o755),
+                                        ) {
+                                            app.add_output(&format!("Failed to set permissions: {}", e));
+                                            let _ = std::fs::remove_file(&success.temp_path);
+                                        } else if let Err(e) = std::fs::rename(&success.temp_path, &exe_path) {
+                                            // rename may fail cross-device; fallback to copy
+                                            match std::fs::copy(&success.temp_path, &exe_path) {
+                                                Ok(_) => {
+                                                    let _ = std::fs::remove_file(&success.temp_path);
+                                                    app.add_output(&format!("Updated to Clay v{} — reloading...", success.version));
+                                                    app.ws_broadcast(WsMessage::ServerReloading);
+                                                    exec_reload(&app)?;
+                                                    return Ok(());
+                                                }
+                                                Err(e2) => {
+                                                    app.add_output(&format!("Failed to install update: {} (rename: {})", e2, e));
+                                                    let _ = std::fs::remove_file(&success.temp_path);
+                                                }
+                                            }
+                                        } else {
+                                            app.add_output(&format!("Updated to Clay v{} — reloading...", success.version));
+                                            app.ws_broadcast(WsMessage::ServerReloading);
+                                            exec_reload(&app)?;
+                                            return Ok(());
+                                        }
+                                    }
+                                    Err(e) => {
+                                        app.add_output(&format!("Cannot find current binary: {}", e));
+                                        let _ = std::fs::remove_file(&success.temp_path);
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                app.add_output(&e);
+                            }
+                        }
+                    }
                     _ => {}
                 }
             }
@@ -11802,7 +12018,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                         }
                                     }
                                     // Commands that should be blocked from remote
-                                    Command::Quit | Command::Reload => {
+                                    Command::Quit | Command::Reload | Command::Update => {
                                         app.ws_broadcast(WsMessage::ServerData {
                                             world_index,
                                             data: "This command is not available from remote interfaces.".to_string(),
@@ -12886,6 +13102,60 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                             }),
                         }
                     }
+                    AppEvent::UpdateResult(result) => {
+                        match result {
+                            Ok(success) => {
+                                match get_executable_path() {
+                                    Ok((exe_path, _)) => {
+                                        use std::os::unix::fs::PermissionsExt;
+                                        if let Err(e) = std::fs::set_permissions(
+                                            &success.temp_path,
+                                            std::fs::Permissions::from_mode(0o755),
+                                        ) {
+                                            app.add_output(&format!("Failed to set permissions: {}", e));
+                                            let _ = std::fs::remove_file(&success.temp_path);
+                                        } else if let Err(e) = std::fs::rename(&success.temp_path, &exe_path) {
+                                            match std::fs::copy(&success.temp_path, &exe_path) {
+                                                Ok(_) => {
+                                                    let _ = std::fs::remove_file(&success.temp_path);
+                                                    app.add_output(&format!("Updated to Clay v{} — reloading...", success.version));
+                                                    app.ws_broadcast(WsMessage::ServerReloading);
+                                                    let _ = crossterm::terminal::disable_raw_mode();
+                                                    let _ = crossterm::execute!(
+                                                        std::io::stdout(),
+                                                        crossterm::terminal::LeaveAlternateScreen
+                                                    );
+                                                    exec_reload(&app)?;
+                                                    return Ok(());
+                                                }
+                                                Err(e2) => {
+                                                    app.add_output(&format!("Failed to install update: {} (rename: {})", e2, e));
+                                                    let _ = std::fs::remove_file(&success.temp_path);
+                                                }
+                                            }
+                                        } else {
+                                            app.add_output(&format!("Updated to Clay v{} — reloading...", success.version));
+                                            app.ws_broadcast(WsMessage::ServerReloading);
+                                            let _ = crossterm::terminal::disable_raw_mode();
+                                            let _ = crossterm::execute!(
+                                                std::io::stdout(),
+                                                crossterm::terminal::LeaveAlternateScreen
+                                            );
+                                            exec_reload(&app)?;
+                                            return Ok(());
+                                        }
+                                    }
+                                    Err(e) => {
+                                        app.add_output(&format!("Cannot find current binary: {}", e));
+                                        let _ = std::fs::remove_file(&success.temp_path);
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                app.add_output(&e);
+                            }
+                        }
+                    }
                 }
             }
 
@@ -13601,6 +13871,18 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                 AppEvent::MultiuserPrompt(_, _, _) => {}
                 // SIGUSR1 - only relevant in main console mode, ignore in daemon mode
                 AppEvent::Sigusr1Received => {}
+                AppEvent::UpdateResult(result) => {
+                    // In daemon mode, just show the result message (no reload)
+                    match result {
+                        Ok(_success) => {
+                            app.add_output("Update downloaded but reload is not supported in daemon mode.");
+                            let _ = std::fs::remove_file(&_success.temp_path);
+                        }
+                        Err(e) => {
+                            app.add_output(&e);
+                        }
+                    }
+                }
                 AppEvent::GmcpNegotiated(ref world_name) => {
                     if let Some(world_idx) = app.find_world_index(world_name) {
                         app.worlds[world_idx].gmcp_enabled = true;
@@ -14432,7 +14714,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                     }
                                 }
                                 // Commands that should be blocked from remote
-                                Command::Quit | Command::Reload => {
+                                Command::Quit | Command::Reload | Command::Update => {
                                     app.ws_broadcast(WsMessage::ServerData {
                                         world_index,
                                         data: "This command is not available from remote interfaces.".to_string(),
@@ -16150,7 +16432,7 @@ fn handle_key_event(key: KeyEvent, app: &mut App) -> KeyAction {
                 let internal_commands = vec![
                     // Clay-specific commands
                     "/help", "/disconnect", "/dc", "/worlds", "/world", "/connections",
-                    "/setup", "/web", "/actions", "/keepalive", "/reload", "/quit", "/gag",
+                    "/setup", "/web", "/actions", "/keepalive", "/reload", "/update", "/quit", "/gag",
                     "/testmusic", "/dump", "/edit", "/tag", "/menu", "/notify",
                     // TF commands (now available with / prefix)
                     "/set", "/unset", "/let", "/echo", "/send", "/beep", "/quote",
@@ -18317,6 +18599,22 @@ async fn handle_command(cmd: &str, app: &mut App, event_tx: mpsc::Sender<AppEven
                         app.add_output(&format!("Executable path: {}", exe_path.display()));
                     }
                 }
+            }
+        }
+        Command::Update => {
+            #[cfg(any(target_os = "android", not(unix)))]
+            {
+                app.add_output("Update is not available on this platform.");
+            }
+
+            #[cfg(all(unix, not(target_os = "android")))]
+            {
+                app.add_output("Checking for updates...");
+                let event_tx_clone = event_tx.clone();
+                tokio::spawn(async move {
+                    let result = check_and_download_update().await;
+                    let _ = event_tx_clone.send(AppEvent::UpdateResult(result)).await;
+                });
             }
         }
         Command::Gag { pattern } => {
@@ -23220,7 +23518,7 @@ mod tests {
         // These are the command strings (without /) that parse_command() matches on.
         // When adding a new command to parse_command(), add it here too.
         let mut rust_commands: Vec<String> = vec![
-            "help", "version", "quit", "reload", "setup", "web", "actions",
+            "help", "version", "quit", "reload", "update", "setup", "web", "actions",
             "connections", "l", "worlds", "world", "connect", "disconnect", "dc",
             "flush", "menu", "send", "keepalive", "gag", "ban", "unban",
             "testmusic", "dump", "notify", "addworld", "edit", "tag", "tags",
@@ -23243,5 +23541,26 @@ mod tests {
              \n\
              To fix: update INTERNAL_COMMANDS in src/web/app.js and rust_commands in this test.",
             missing_from_js, extra_in_js);
+    }
+
+    #[test]
+    fn test_is_newer_version() {
+        // Basic version comparison
+        assert!(is_newer_version("1.0.1", "1.0.0"));
+        assert!(is_newer_version("1.1.0", "1.0.0"));
+        assert!(is_newer_version("2.0.0", "1.0.0"));
+        assert!(!is_newer_version("1.0.0", "1.0.0"));
+        assert!(!is_newer_version("1.0.0", "1.0.1"));
+        assert!(!is_newer_version("0.9.0", "1.0.0"));
+
+        // Pre-release handling
+        assert!(is_newer_version("1.0.0", "1.0.0-alpha"));
+        assert!(!is_newer_version("1.0.0-alpha", "1.0.0"));
+        assert!(!is_newer_version("1.0.0-alpha", "1.0.0-alpha"));
+
+        // Different length versions
+        assert!(is_newer_version("1.0.1", "1.0"));
+        assert!(!is_newer_version("1.0", "1.0.1"));
+        assert!(!is_newer_version("1.0", "1.0.0"));
     }
 }
