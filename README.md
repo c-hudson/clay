@@ -27,7 +27,7 @@ A terminal-based MUD (Multi-User Dungeon) client built with Rust featuring multi
 - **ANSI Music** - BBS-style music playback (web/GUI interfaces)
 - **GMCP Media** - Server-driven sound effects and music via Client.Media protocol
 - **Actions/Triggers** - Pattern matching with regex or wildcard, auto-commands
-- **TinyFugue Compatibility** - Both `/` and `#` prefixes for TF commands (`/def`, `#set`, `/if`, etc.)
+- **TinyFugue Compatibility** - Full TF command support (`/def`, `/set`, `/if`, `/load`, etc.)
 - **Themes** - Customizable color themes for GUI/web via `~/clay.theme.dat` with browser-based theme editor
 - **Notes Editor** - Per-world split-screen notes editor (`/edit`)
 - **Termux Support** - Runs on Android via Termux
@@ -151,7 +151,7 @@ Clay includes a TinyFugue compatibility layer. All TF commands work with both `/
 | `/load filename` | Load a TF script file |
 | `/tfhelp [topic]` | Show TF help |
 
-The `#` prefix still works for backward compatibility (`#set`, `#echo`, `#def`, etc.). See `/tfhelp` for full command list.
+The `#` prefix also works for backward compatibility. See `/tfhelp` for full command list.
 
 ### Importing TinyFugue Worlds
 
