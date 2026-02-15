@@ -1393,3 +1393,11 @@ Tab completion for commands when input starts with `/`:
 - Completion is case-insensitive
 - Pressing `Tab` multiple times cycles through all matches alphabetically
 - Arguments after the command are preserved when cycling
+
+### /release Skill
+
+Automated multi-platform build and GitHub release. Invoke with `/release [version]`.
+
+Builds Clay on all target platforms (local Linux musl, Windows cross-compile, Android APK, remote macOS universal, remote Termux aarch64), verifies compilation on a test machine, and uploads release binaries to GitHub.
+
+Skill files: `.claude/skills/release/SKILL.md` (instructions), `.claude/skills/release/machines.md` (machine details).
