@@ -3706,7 +3706,7 @@
             elements.moreCount.textContent = formatCount(linesFromBottom);
             elements.statusMore.style.display = '';
         } else if ((paused && pendingLines.length > 0) || serverPending > 0) {
-            elements.moreLabel.textContent = '\u23F8 More';
+            elements.moreLabel.textContent = 'More';
             elements.moreCount.textContent = formatCount(totalPending);
             elements.statusMore.style.display = '';
         } else {

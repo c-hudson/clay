@@ -4477,7 +4477,7 @@ impl eframe::App for RemoteGuiApp {
                             } else {
                                 format!("{}", lines_back)
                             };
-                            let hist_bg = egui::Color32::from_rgb(0xf5, 0x21, 0x11);
+                            let hist_bg = egui::Color32::from_rgb(0xcc, 0x1a, 0x0e);
                             let hist_num_bg = egui::Color32::from_rgb(0xa1, 0x0b, 0x00);
                             let hist_text_color = egui::Color32::WHITE;
                             let badge_height = fs_badge * 1.6;
@@ -4512,14 +4512,14 @@ impl eframe::App for RemoteGuiApp {
                             } else {
                                 format!("{}", server_pending_count)
                             };
-                            let more_bg = egui::Color32::from_rgb(0xf5, 0x21, 0x11);
+                            let more_bg = egui::Color32::from_rgb(0xcc, 0x1a, 0x0e);
                             let more_num_bg = egui::Color32::from_rgb(0xa1, 0x0b, 0x00);
                             let more_text_color = egui::Color32::WHITE;
                             let badge_height = fs_badge * 1.6;
                             ui.horizontal_centered(|ui| {
                                 ui.spacing_mut().item_spacing.x = 0.0;
                                 ui.add(egui::Button::new(
-                                    egui::RichText::new(" ⏸ More ").monospace().size(fs_badge).strong()
+                                    egui::RichText::new(" More ").monospace().size(fs_badge).strong()
                                         .color(more_text_color))
                                     .fill(more_bg)
                                     .stroke(egui::Stroke::NONE)
