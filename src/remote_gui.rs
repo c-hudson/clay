@@ -4966,6 +4966,8 @@ impl eframe::App for RemoteGuiApp {
                             } else {
                                 Self::strip_mud_tags_ansi(&line.text)
                             };
+                            // Replace ✨ emoji with yellow ++ (egui monospace font can't render sparkles emoji)
+                            let base_line = base_line.replace("✨", "\x1b[33m++\x1b[0m");
                             // Apply /highlight color from action command (takes priority)
                             if let Some(ref hl_color) = line.highlight_color {
                                 let bg_code = Self::color_name_to_ansi_bg(hl_color);
