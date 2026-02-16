@@ -191,9 +191,12 @@ enum PopupState {
 /// Remote GUI client application state
 /// GUI Theme - mirrors the TUI Theme but with egui colors
 /// GUI theme wrapper that delegates to ThemeColors from the theme file.
+/// Provides Color32-returning methods for egui rendering.
 #[derive(Clone)]
 struct GuiTheme {
+    /// The underlying theme colors from ~/clay.theme.dat
     colors: theme::ThemeColors,
+    /// Whether this is a dark theme (for is_dark() checks and ANSI adjustments)
     dark: bool,
 }
 
@@ -207,11 +210,17 @@ impl GuiTheme {
         }
     }
 
+    fn from_theme_colors(colors: theme::ThemeColors, dark: bool) -> Self {
+        Self { colors, dark }
+    }
+
     fn name(&self) -> &'static str {
         if self.dark { "Dark" } else { "Light" }
     }
 
     fn next(&self) -> Self {
+        // Toggle: return the opposite theme with defaults
+        // (full theme colors will be received from server via settings update)
         Self::from_name(if self.dark { "light" } else { "dark" })
     }
 
@@ -223,26 +232,31 @@ impl GuiTheme {
         if self.dark { "dark".to_string() } else { "light".to_string() }
     }
 
+    /// Update colors from JSON received via WebSocket
     fn update_from_json(&mut self, json: &str) {
         let base = if self.dark { theme::ThemeColors::dark_default() } else { theme::ThemeColors::light_default() };
         self.colors = theme::ThemeColors::from_json(json, &base);
     }
 
+    // Helper to convert ThemeColor to egui Color32
     fn c(tc: &theme::ThemeColor) -> Color32 {
         Color32::from_rgb(tc.r, tc.g, tc.b)
     }
 
+    // Background hierarchy
     fn bg_deep(&self) -> Color32 { Self::c(&self.colors.bg_deep) }
     fn bg(&self) -> Color32 { Self::c(&self.colors.bg) }
     fn bg_surface(&self) -> Color32 { Self::c(&self.colors.bg_surface) }
     fn bg_elevated(&self) -> Color32 { Self::c(&self.colors.bg_elevated) }
     fn bg_hover(&self) -> Color32 { Self::c(&self.colors.bg_hover) }
 
+    // Text hierarchy
     fn fg(&self) -> Color32 { Self::c(&self.colors.fg) }
     fn fg_secondary(&self) -> Color32 { Self::c(&self.colors.fg_secondary) }
     fn fg_muted(&self) -> Color32 { Self::c(&self.colors.fg_muted) }
     fn fg_dim(&self) -> Color32 { Self::c(&self.colors.fg_dim) }
 
+    // Accent colors
     fn accent(&self) -> Color32 { Self::c(&self.colors.accent) }
     fn accent_dim(&self) -> Color32 { Self::c(&self.colors.accent_dim) }
     fn highlight(&self) -> Color32 { Self::c(&self.colors.highlight) }
@@ -250,11 +264,11 @@ impl GuiTheme {
     fn error(&self) -> Color32 { Self::c(&self.colors.error) }
     fn error_dim(&self) -> Color32 { Self::c(&self.colors.error_dim) }
 
+    // Borders
     fn border_subtle(&self) -> Color32 { Self::c(&self.colors.border_subtle) }
     fn border_medium(&self) -> Color32 { Self::c(&self.colors.border_medium) }
 
-    fn panel_bg(&self) -> Color32 { self.bg_surface() }
-    fn menu_bar_bg(&self) -> Color32 { Self::c(&self.colors.menu_bar_bg) }
+    fn panel_bg(&self) -> Color32 { self.bg() }
     fn button_bg(&self) -> Color32 { self.bg_hover() }
     fn selection_bg(&self) -> Color32 { Self::c(&self.colors.selection_bg) }
     fn prompt(&self) -> Color32 { Self::c(&self.colors.prompt) }
@@ -262,6 +276,21 @@ impl GuiTheme {
     fn list_selection_bg(&self) -> Color32 {
         let a = self.accent();
         Color32::from_rgba_unmultiplied(a.r(), a.g(), a.b(), 38)
+    }
+
+    // Status bar and indicators
+    fn status_bar_bg(&self) -> Color32 { Self::c(&self.colors.status_bar_bg) }
+    fn menu_bar_bg(&self) -> Color32 { Self::c(&self.colors.menu_bar_bg) }
+    fn more_indicator_bg(&self) -> Color32 { Self::c(&self.colors.more_indicator_bg) }
+    fn activity_label_bg(&self) -> Color32 { Self::c(&self.colors.activity_bg) }
+
+    fn activity_count_bg(&self) -> Color32 {
+        // Slightly different shade for count vs label
+        if self.dark {
+            Color32::from_rgb(212, 192, 106) // #d4c06a
+        } else {
+            Self::c(&self.colors.activity_bg)
+        }
     }
 }
 
@@ -320,12 +349,12 @@ pub struct RemoteGuiApp {
     popup_state: PopupState,
     /// When true, scroll the selected item to center when rendering a popup list
     popup_scroll_to_selected: bool,
+    /// Hamburger menu open state (gui2)
+    hamburger_menu_open: bool,
+    /// Time when hamburger menu was opened (to avoid immediate close)
+    hamburger_opened_time: std::time::Instant,
     /// Selected item in menu popup
     menu_selected: usize,
-    /// When to attempt reload reconnect (None = not reconnecting)
-    reload_reconnect_at: Option<std::time::Instant>,
-    /// Number of reload reconnect attempts made
-    reload_reconnect_attempts: u8,
     /// Selected world in world list popup
     world_list_selected: usize,
     /// Filter text for worlds popup
@@ -354,6 +383,10 @@ pub struct RemoteGuiApp {
     /// Last theme applied to title bar (to detect changes)
     #[cfg(target_os = "windows")]
     titlebar_theme: Option<GuiTheme>,
+    /// When to attempt reload reconnect (None = not reconnecting)
+    reload_reconnect_at: Option<std::time::Instant>,
+    /// Number of reload reconnect attempts made
+    reload_reconnect_attempts: u8,
     /// Font name (empty for system default)
     font_name: String,
     /// Font size in points
@@ -436,6 +469,10 @@ pub struct RemoteGuiApp {
     action_error: Option<String>,
     /// Debug text for showing raw ANSI codes
     debug_text: String,
+    /// Whether initial settings have been received from the server
+    settings_received: bool,
+    /// Frame counter for waiting screen diagnostic
+    frame_count: u32,
     /// Window transparency (0.0 = fully transparent, 1.0 = fully opaque)
     transparency: f32,
     /// Original transparency when setup popup opened (for cancel/revert)
@@ -468,6 +505,10 @@ pub struct RemoteGuiApp {
     server_activity_count: usize,
     /// Unified popup state for new popup system
     unified_popup: Option<crate::popup::PopupState>,
+    /// Cached URL positions from galley text (computed once per frame)
+    cached_urls: Vec<(usize, usize, String)>,
+    /// Whether cached URLs need recomputation
+    urls_dirty: bool,
     /// Whether output needs rebuilding (dirty flag for caching)
     output_dirty: bool,
     /// Cached LayoutJob for output area
@@ -480,14 +521,20 @@ pub struct RemoteGuiApp {
     cached_has_emojis: bool,
     /// Last available width used for output layout
     cached_output_width: f32,
-    /// Cached URL positions from galley text (computed once on dirty)
-    cached_urls: Vec<(usize, usize, String)>,
-    /// Whether cached URLs need recomputation
-    urls_dirty: bool,
-    /// Cached spell check results
-    cached_misspelled: Vec<(usize, usize)>,
-    /// Last input buffer for spell check invalidation
-    cached_spell_input: String,
+    /// Last output line count (to detect changes without explicit dirty flag)
+    cached_output_len: usize,
+    /// Last world index rendered (to detect world switches)
+    cached_world_index: usize,
+    /// Last show_tags state
+    cached_show_tags: bool,
+    /// Last highlight_actions state
+    cached_highlight_actions: bool,
+    /// Last filter text
+    cached_filter_text: String,
+    /// Last font size
+    cached_font_size: f32,
+    /// Last color_offset_percent
+    cached_color_offset: u8,
 }
 
 /// Square wave audio source for ANSI music playback
@@ -566,7 +613,7 @@ enum DiscordSegment {
 
 impl RemoteGuiApp {
     pub fn new(ws_url: String, runtime: tokio::runtime::Handle) -> Self {
-        Self {
+        let mut app = Self {
             is_master: false,
             ws_url,
             username: String::new(),
@@ -590,8 +637,8 @@ impl RemoteGuiApp {
             connect_time: None,
             popup_state: PopupState::None,
             popup_scroll_to_selected: false,
-            reload_reconnect_at: None,
-            reload_reconnect_attempts: 0,
+            hamburger_menu_open: false,
+            hamburger_opened_time: std::time::Instant::now(),
             menu_selected: 0,
             world_list_selected: 0,
             connected_worlds_filter: String::new(),
@@ -613,6 +660,8 @@ impl RemoteGuiApp {
             theme: GuiTheme::from_name("dark"),
             #[cfg(target_os = "windows")]
             titlebar_theme: None,
+            reload_reconnect_at: None,
+            reload_reconnect_attempts: 0,
             font_name: String::new(),
             font_size: 14.0,
             web_font_size_phone: 10.0,
@@ -658,6 +707,8 @@ impl RemoteGuiApp {
             edit_action_startup: false,
             action_error: None,
             debug_text: String::new(),
+            settings_received: false,
+            frame_count: 0,
             transparency: 1.0,
             original_transparency: None,
             color_offset_percent: 0,
@@ -675,17 +726,24 @@ impl RemoteGuiApp {
             last_sent_view_state: None,
             server_activity_count: 0,
             unified_popup: None,
+            cached_urls: Vec::new(),
+            urls_dirty: true,
             output_dirty: true,
             cached_output_job: None,
             cached_plain_text: String::new(),
             cached_display_lines: Vec::new(),
             cached_has_emojis: false,
             cached_output_width: 0.0,
-            cached_urls: Vec::new(),
-            urls_dirty: true,
-            cached_misspelled: Vec::new(),
-            cached_spell_input: String::new(),
-        }
+            cached_output_len: 0,
+            cached_world_index: usize::MAX,
+            cached_show_tags: false,
+            cached_highlight_actions: false,
+            cached_filter_text: String::new(),
+            cached_font_size: 0.0,
+            cached_color_offset: 0,
+        };
+        app.load_remote_settings();
+        app
     }
 
     /// Create a new RemoteGuiApp in master mode (in-process App, no WebSocket).
@@ -703,6 +761,70 @@ impl RemoteGuiApp {
         app.ws_tx = Some(ws_tx);
         app.auto_connect_attempted = true; // Skip WebSocket auto-connect
         app
+    }
+
+    /// Get the path for the local remote settings cache file
+    fn get_remote_settings_path() -> Option<std::path::PathBuf> {
+        home::home_dir().map(|p| p.join(".clay.remote.dat"))
+    }
+
+    /// Load cached settings from ~/.clay.remote.dat
+    /// These are temporary settings used before the server sends the real ones.
+    fn load_remote_settings(&mut self) {
+        let path = match Self::get_remote_settings_path() {
+            Some(p) => p,
+            None => return,
+        };
+        let contents = match std::fs::read_to_string(&path) {
+            Ok(c) => c,
+            Err(_) => return,
+        };
+        for line in contents.lines() {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            if let Some((key, value)) = line.split_once('=') {
+                let key = key.trim();
+                let value = value.trim();
+                match key {
+                    "gui_theme" => self.theme = GuiTheme::from_name(value),
+                    "font_size" => if let Ok(v) = value.parse::<f32>() { self.font_size = v; },
+                    "font_name" => self.font_name = value.to_string(),
+                    "input_height" => if let Ok(v) = value.parse::<u16>() { self.input_height = v; },
+                    "transparency" => if let Ok(v) = value.parse::<f32>() { self.transparency = v; },
+                    "color_offset_percent" => if let Ok(v) = value.parse::<u8>() { self.color_offset_percent = v; },
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    /// Save current settings to ~/.clay.remote.dat
+    /// Only saves settings that affect initial appearance before server auth.
+    fn save_remote_settings(&self) {
+        let path = match Self::get_remote_settings_path() {
+            Some(p) => p,
+            None => return,
+        };
+        let contents = format!(
+            "# Clay remote client cached settings\n\
+             # These are temporary defaults used before authenticating with the server.\n\
+             # Server settings will override these once connected and authenticated.\n\
+             gui_theme = {}\n\
+             font_size = {}\n\
+             font_name = {}\n\
+             input_height = {}\n\
+             transparency = {}\n\
+             color_offset_percent = {}\n",
+            self.theme.to_string_value(),
+            self.font_size,
+            self.font_name,
+            self.input_height,
+            self.transparency,
+            self.color_offset_percent,
+        );
+        let _ = std::fs::write(&path, contents);
     }
 
     /// Initialize audio output for ANSI music playback
@@ -1050,6 +1172,7 @@ impl RemoteGuiApp {
     }
 
     fn process_messages(&mut self) -> bool {
+        let mut had_messages = false;
         // Collect deferred actions to avoid borrow issues
         let mut deferred_switch: Option<usize> = None;
         let mut deferred_connect: Option<usize> = None;
@@ -1057,7 +1180,7 @@ impl RemoteGuiApp {
         let mut deferred_music: Vec<crate::ansi_music::MusicNote> = Vec::new();
         let mut deferred_open_actions = false;
         let deferred_open_connections = false;
-        let mut had_messages = false;
+        let mut deferred_save_remote = false;
 
         if let Some(ref mut rx) = self.ws_rx {
             while let Ok(msg) = rx.try_recv() {
@@ -1146,6 +1269,7 @@ impl RemoteGuiApp {
                         if !settings.theme_colors_json.is_empty() {
                             self.theme.update_from_json(&settings.theme_colors_json);
                         }
+                        self.settings_received = true;
                         self.font_name = settings.font_name;
                         self.font_size = settings.font_size;
                         self.web_font_size_phone = settings.web_font_size_phone;
@@ -1171,7 +1295,6 @@ impl RemoteGuiApp {
                         self.tls_proxy_enabled = settings.tls_proxy_enabled;
                         self.dictionary_path = settings.dictionary_path.clone();
                         self.actions = actions;
-                        self.output_dirty = true;
                         // Send initial view state for synchronized more-mode
                         if let Some(ref tx) = self.ws_tx {
                             let _ = tx.send(WsMessage::UpdateViewState {
@@ -1180,6 +1303,7 @@ impl RemoteGuiApp {
                             });
                             self.last_sent_view_state = Some((self.current_world, self.output_visible_lines));
                         }
+                        deferred_save_remote = true;
                     }
                     WsMessage::ServerData { world_index, data, is_viewed: _, ts, from_server } => {
                         if world_index < self.worlds.len() {
@@ -1239,9 +1363,6 @@ impl RemoteGuiApp {
 
                             // Note: Don't track unseen_lines locally - server handles centralized tracking
                             // and will broadcast UnseenUpdate/UnseenCleared when counts change
-                            if world_index == self.current_world {
-                                self.output_dirty = true;
-                            }
                         }
                     }
                     WsMessage::WorldConnected { world_index, name } => {
@@ -1249,9 +1370,6 @@ impl RemoteGuiApp {
                             self.worlds[world_index].connected = true;
                             self.worlds[world_index].was_connected = true;
                             self.worlds[world_index].name = name;
-                            if world_index == self.current_world {
-                                self.output_dirty = true;
-                            }
                         }
                     }
                     WsMessage::WorldDisconnected { world_index } => {
@@ -1264,9 +1382,6 @@ impl RemoteGuiApp {
                             self.worlds[world_index].output_lines.clear();
                             self.worlds[world_index].pending_count = 0;
                             self.worlds[world_index].partial_line.clear();
-                            if world_index == self.current_world {
-                                self.output_dirty = true;
-                            }
                         }
                     }
                     WsMessage::AnsiMusic { world_index: _, notes } => {
@@ -1321,11 +1436,14 @@ impl RemoteGuiApp {
                             };
                             let insert_index = world.index.min(self.worlds.len());
                             self.worlds.insert(insert_index, new_world);
-                            // Adjust current_world if needed
                             if self.current_world >= insert_index && self.worlds.len() > 1 {
                                 self.current_world += 1;
                             }
-                            self.output_dirty = true;
+                        }
+                    }
+                    WsMessage::WorldCreated { world_index } => {
+                        if world_index < self.worlds.len() {
+                            deferred_edit = Some(world_index);
                         }
                     }
                     WsMessage::WorldRemoved { world_index } => {
@@ -1345,7 +1463,6 @@ impl RemoteGuiApp {
                             } else if self.world_list_selected > world_index {
                                 self.world_list_selected -= 1;
                             }
-                            self.output_dirty = true;
                         }
                     }
                     WsMessage::WorldSwitched { new_index } => {
@@ -1355,7 +1472,6 @@ impl RemoteGuiApp {
                         if new_index < self.worlds.len() {
                             self.worlds[new_index].unseen_lines = 0;
                         }
-                        self.output_dirty = true;
                     }
                     WsMessage::PromptUpdate { world_index, prompt } => {
                         if world_index < self.worlds.len() {
@@ -1407,7 +1523,7 @@ impl RemoteGuiApp {
                         self.ansi_music_enabled = settings.ansi_music_enabled;
                         self.tls_proxy_enabled = settings.tls_proxy_enabled;
                         self.dictionary_path = settings.dictionary_path.clone();
-                        self.output_dirty = true;
+                        deferred_save_remote = true;
                     }
                     WsMessage::SetInputBuffer { text } => {
                         self.input_buffer = text;
@@ -1434,9 +1550,6 @@ impl RemoteGuiApp {
                     WsMessage::ActionsUpdated { actions } => {
                         // Update local actions from server
                         self.actions = actions;
-                        if self.highlight_actions {
-                            self.output_dirty = true;
-                        }
                     }
                     WsMessage::UnseenCleared { world_index } => {
                         // Another client (console or web) has viewed this world
@@ -1457,7 +1570,6 @@ impl RemoteGuiApp {
                     WsMessage::ShowTagsChanged { show_tags } => {
                         // Server toggled show_tags (F2 or /tag command)
                         self.show_tags = show_tags;
-                        self.output_dirty = true;
                     }
                     WsMessage::GmcpUserToggled { world_index, enabled } => {
                         if world_index < self.worlds.len() {
@@ -1471,7 +1583,6 @@ impl RemoteGuiApp {
                             self.selection_start = None; self.selection_end = None;
                             self.worlds[idx].unseen_lines = 0;
                             self.scroll_offset = None; // Reset scroll
-                            self.output_dirty = true;
                             // Notify server and request current state
                             if let Some(ref tx) = self.ws_tx {
                                 let _ = tx.send(WsMessage::MarkWorldSeen { world_index: idx });
@@ -1521,7 +1632,6 @@ impl RemoteGuiApp {
                                             highlight_color: None,
                                         });
                                     }
-                                    self.output_dirty = true;
                                 }
                             }
                             Command::WorldSwitch { ref name } | Command::WorldConnectNoLogin { ref name } => {
@@ -1529,7 +1639,6 @@ impl RemoteGuiApp {
                                 if let Some(idx) = self.worlds.iter().position(|w| w.name.eq_ignore_ascii_case(name)) {
                                     self.current_world = idx;
                                     self.selection_start = None; self.selection_end = None;
-                                    self.output_dirty = true;
                                     deferred_switch = Some(idx);
                                     if !self.worlds[idx].connected {
                                         deferred_connect = Some(idx);
@@ -1558,7 +1667,6 @@ impl RemoteGuiApp {
                                     self.worlds[self.current_world].output_lines.push(
                                         TimestampedLine { text: super::get_version_string(), ts, gagged: false, from_server: false, seq, highlight_color: None }
                                     );
-                                    self.output_dirty = true;
                                 }
                             }
                             Command::Menu => {
@@ -1608,7 +1716,6 @@ impl RemoteGuiApp {
                             self.worlds[world_index].pending_count = pending_count;
                             self.worlds[world_index].unseen_lines = 0;
                             self.scroll_offset = None; // Reset scroll on world switch
-                            self.output_dirty = true;
                         }
                     }
                     WsMessage::OutputLines { world_index, lines, is_initial: _ } => {
@@ -1616,9 +1723,6 @@ impl RemoteGuiApp {
                         if world_index < self.worlds.len() {
                             for line in lines {
                                 self.worlds[world_index].output_lines.push(line);
-                            }
-                            if world_index == self.current_world {
-                                self.output_dirty = true;
                             }
                         }
                     }
@@ -1659,6 +1763,9 @@ impl RemoteGuiApp {
         }
         if deferred_open_connections {
             self.open_connections_unified();
+        }
+        if deferred_save_remote {
+            self.save_remote_settings();
         }
         had_messages
     }
@@ -3119,7 +3226,7 @@ impl eframe::App for RemoteGuiApp {
         // Process incoming WebSocket messages
         let had_messages = self.process_messages();
         if had_messages {
-            ctx.request_repaint(); // Immediate repaint when data arrives
+            ctx.request_repaint(); // Immediate repaint when new data arrives
         }
 
         // Handle reload reconnect with retry
@@ -3157,6 +3264,9 @@ impl eframe::App for RemoteGuiApp {
         visuals.widgets.hovered.bg_fill = theme.selection_bg();
         visuals.widgets.active.bg_fill = theme.selection_bg();
         visuals.selection.bg_fill = theme.selection_bg();
+        visuals.extreme_bg_color = theme.bg();
+        visuals.faint_bg_color = theme.bg();
+        visuals.widgets.noninteractive.bg_stroke = egui::Stroke::NONE;
         // Set proper foreground strokes for buttons/widgets to be visible
         let fg_stroke = egui::Stroke::new(1.0, theme.fg());
         visuals.widgets.noninteractive.fg_stroke = fg_stroke;
@@ -3267,9 +3377,33 @@ impl eframe::App for RemoteGuiApp {
         }
         ctx.set_style(style);
 
-        // Poll for messages at 100ms intervals when idle;
-        // immediate repaint is triggered when messages arrive or on user input
-        ctx.request_repaint_after(std::time::Duration::from_millis(100));
+        // Request repaint after a short delay to keep polling messages
+        // Using request_repaint_after instead of request_repaint allows egui to
+        // prioritize immediate keyboard/mouse events over background polling
+        ctx.request_repaint_after(std::time::Duration::from_millis(50));
+
+        // Wait for settings before rendering UI (prevents theme flash)
+        // Visuals are already applied above so the background color is correct
+        if self.authenticated && !self.settings_received {
+            egui::CentralPanel::default()
+                .frame(egui::Frame::none().fill(theme.bg()))
+                .show(ctx, |ui| {
+                    // Show waiting indicator after a brief delay
+                    if self.connect_time.is_some_and(|t| t.elapsed().as_millis() > 500)
+                        || (self.is_master && self.frame_count > 30)
+                    {
+                        ui.vertical_centered(|ui| {
+                            ui.add_space(ui.available_height() / 3.0);
+                            ui.label(egui::RichText::new("Waiting for server state...")
+                                .color(theme.fg_muted())
+                                .size(14.0));
+                        });
+                    }
+                });
+            self.frame_count += 1;
+            ctx.request_repaint();
+            return;
+        }
 
         if !self.connected || !self.authenticated {
             // Show login dialog with dog and Clay branding
@@ -3498,23 +3632,20 @@ impl eframe::App for RemoteGuiApp {
                         } else if i.consume_key(egui::Modifiers::NONE, egui::Key::F2) {
                             // F2 - toggle MUD tag display
                             self.show_tags = !self.show_tags;
-                            self.output_dirty = true;
                         } else if i.consume_key(egui::Modifiers::NONE, egui::Key::F4) {
                             // F4 - toggle filter popup
                             self.filter_active = true;
                             self.filter_text.clear();
-                            self.output_dirty = true;
                         } else if i.consume_key(egui::Modifiers::NONE, egui::Key::F8) {
                             // F8 - toggle action pattern highlighting
                             self.highlight_actions = !self.highlight_actions;
-                            self.output_dirty = true;
                         } else if i.consume_key(egui::Modifiers::NONE, egui::Key::F9) {
                             // F9 - toggle GMCP user processing for current world
                             if let Some(ref tx) = self.ws_tx {
                                 let _ = tx.send(WsMessage::ToggleWorldGmcp { world_index: self.current_world });
                             }
                         } else if i.consume_key(egui::Modifiers::NONE, egui::Key::Tab) {
-                            // Tab - command completion if input starts with /
+                            // Tab - command completion if input starts with / or #
                             // Otherwise release pending lines or scroll down if viewing history
                             if self.input_buffer.starts_with('/') {
                                 tab_complete = true;
@@ -3710,7 +3841,6 @@ impl eframe::App for RemoteGuiApp {
                         self.selection_start = None; self.selection_end = None;
                         self.worlds[new_world].unseen_lines = 0;
                         self.scroll_offset = None; // Reset scroll
-                        self.output_dirty = true;
                         // Notify server and request current state
                         if let Some(ref tx) = self.ws_tx {
                             let _ = tx.send(WsMessage::MarkWorldSeen { world_index: new_world });
@@ -3756,171 +3886,11 @@ impl eframe::App for RemoteGuiApp {
                     if i.key_pressed(egui::Key::Escape) || i.key_pressed(egui::Key::F4) {
                         self.filter_active = false;
                         self.filter_text.clear();
-                        self.output_dirty = true;
                     }
                 });
             }
 
-            let alpha = (self.transparency * 255.0) as u8;
-            let menu_bg = theme.menu_bar_bg();
-            let menu_bg_transparent = egui::Color32::from_rgba_unmultiplied(menu_bg.r(), menu_bg.g(), menu_bg.b(), alpha);
-            egui::TopBottomPanel::top("menu_bar")
-                .frame(egui::Frame::none()
-                    .fill(menu_bg_transparent)
-                    .inner_margin(egui::Margin::symmetric(4.0, 5.0))  // 3px extra padding top/bottom
-                    .stroke(egui::Stroke::NONE))
-                .show(ctx, |ui| {
-                ui.horizontal_centered(|ui| {
-                    // Paw menu icon - SVG matching web interface
-                    const PAW_SVG: &[u8] = br##"<svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 48.839 48.839"><path fill="#c0c0c0" d="M39.041,36.843c2.054,3.234,3.022,4.951,3.022,6.742c0,3.537-2.627,5.252-6.166,5.252c-1.56,0-2.567-0.002-5.112-1.326c0,0-1.649-1.509-5.508-1.354c-3.895-0.154-5.545,1.373-5.545,1.373c-2.545,1.323-3.516,1.309-5.074,1.309c-3.539,0-6.168-1.713-6.168-5.252c0-1.791,0.971-3.506,3.024-6.742c0,0,3.881-6.445,7.244-9.477c2.43-2.188,5.973-2.18,5.973-2.18h1.093v-0.001c0,0,3.698-0.009,5.976,2.181C35.059,30.51,39.041,36.844,39.041,36.843z M16.631,20.878c3.7,0,6.699-4.674,6.699-10.439S20.331,0,16.631,0S9.932,4.674,9.932,10.439S12.931,20.878,16.631,20.878z M10.211,30.988c2.727-1.259,3.349-5.723,1.388-9.971s-5.761-6.672-8.488-5.414s-3.348,5.723-1.388,9.971C3.684,29.822,7.484,32.245,10.211,30.988z M32.206,20.878c3.7,0,6.7-4.674,6.7-10.439S35.906,0,32.206,0s-6.699,4.674-6.699,10.439C25.507,16.204,28.506,20.878,32.206,20.878z M45.727,15.602c-2.728-1.259-6.527,1.165-8.488,5.414s-1.339,8.713,1.389,9.972c2.728,1.258,6.527-1.166,8.488-5.414S48.455,16.861,45.727,15.602z"/></svg>"##;
-                    let paw_size = 24.0;  // 20% bigger than 20.0
-                    let paw_image = egui::Image::from_bytes("bytes://paw_icon.svg", PAW_SVG)
-                        .fit_to_exact_size(egui::vec2(paw_size, paw_size));
-                    ui.menu_image_button(paw_image, |ui| {
-                        // First segment - alphabetical
-                        if ui.button("Actions").clicked() {
-                            action = Some("actions");
-                            ui.close_menu();
-                        }
-                        if ui.button("Font").clicked() {
-                            action = Some("font");
-                            ui.close_menu();
-                        }
-                        if ui.button("Settings").clicked() {
-                            action = Some("setup");
-                            ui.close_menu();
-                        }
-                        if ui.button("Web").clicked() {
-                            action = Some("web");
-                            ui.close_menu();
-                        }
-                        if ui.button("Worlds").clicked() {
-                            action = Some("world_selector");
-                            ui.close_menu();
-                        }
-                        ui.separator();
-                        if ui.button("Toggle Tags").clicked() {
-                            action = Some("toggle_tags");
-                            ui.close_menu();
-                        }
-                        ui.separator();
-                        // Third segment
-                        if ui.button("Resync").clicked() {
-                            action = Some("resync");
-                            ui.close_menu();
-                        }
-                    });
-
-                    // Font size slider on the right side of menu bar
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        // Define the 4 font size positions
-                        const FONT_SIZES: [f32; 4] = [8.5, 12.0, 14.0, 18.0];
-
-                        // Find current position (0-3)
-                        let current_pos = FONT_SIZES.iter()
-                            .position(|&s| (s - self.font_size).abs() < 0.5)
-                            .unwrap_or(2) as i32;
-
-                        let label_color = egui::Color32::from_gray(128);
-
-                        // Slider dimensions
-                        let slider_width = 80.0;
-                        let slider_height = 20.0;
-                        let label_spacing = 4.0;
-
-                        // Allocate space for: large A + slider + small A
-                        let total_width = 14.0 + label_spacing + slider_width + label_spacing + 8.0;
-                        let (total_rect, response) = ui.allocate_exact_size(
-                            egui::vec2(total_width, slider_height),
-                            egui::Sense::click_and_drag()
-                        );
-
-                        // Calculate positions (RTL: large A on right, small A on left)
-                        let small_a_x = total_rect.left() + 4.0;
-                        let slider_left = total_rect.left() + 8.0 + label_spacing;
-                        let slider_right = slider_left + slider_width;
-                        let large_a_x = slider_right + label_spacing;
-                        let rect = egui::Rect::from_min_max(
-                            egui::pos2(slider_left, total_rect.top()),
-                            egui::pos2(slider_right, total_rect.bottom())
-                        );
-
-                        if ui.is_rect_visible(total_rect) {
-                            let painter = ui.painter();
-
-                            // Draw triangle background (point on left, tall on right)
-                            let triangle_color = if theme.is_dark() {
-                                egui::Color32::from_gray(60)
-                            } else {
-                                egui::Color32::from_gray(180)
-                            };
-
-                            let triangle_points = vec![
-                                egui::pos2(rect.left() + 2.0, rect.bottom() - 2.0),  // Bottom left
-                                egui::pos2(rect.right() - 2.0, rect.bottom() - 2.0), // Bottom right
-                                egui::pos2(rect.right() - 2.0, rect.top() + 2.0),    // Top right
-                            ];
-                            painter.add(egui::Shape::convex_polygon(
-                                triangle_points,
-                                triangle_color,
-                                egui::Stroke::NONE,
-                            ));
-
-                            // Draw slider handle
-                            let handle_x = rect.left() + 6.0 + (current_pos as f32) * ((slider_width - 12.0) / 3.0);
-                            let handle_color = if theme.is_dark() {
-                                egui::Color32::from_rgb(100, 180, 255)
-                            } else {
-                                egui::Color32::from_rgb(50, 120, 200)
-                            };
-
-                            painter.circle_filled(
-                                egui::pos2(handle_x, rect.center().y),
-                                6.0,
-                                handle_color
-                            );
-
-                            // Draw A labels aligned with bottom of slider
-                            let label_y = rect.bottom() - 2.0;
-
-                            // Small A on left
-                            painter.text(
-                                egui::pos2(small_a_x, label_y),
-                                egui::Align2::LEFT_BOTTOM,
-                                "A",
-                                egui::FontId::proportional(8.0),
-                                label_color,
-                            );
-
-                            // Large A on right
-                            painter.text(
-                                egui::pos2(large_a_x, label_y),
-                                egui::Align2::LEFT_BOTTOM,
-                                "A",
-                                egui::FontId::proportional(14.0),
-                                label_color,
-                            );
-                        }
-
-                        // Handle clicks and drags on the slider area
-                        if response.clicked() || response.dragged() {
-                            if let Some(pos) = response.interact_pointer_pos() {
-                                if pos.x >= rect.left() && pos.x <= rect.right() {
-                                    let rel_x = pos.x - rect.left() - 6.0;
-                                    let step_width = (slider_width - 12.0) / 3.0;
-                                    let new_pos = ((rel_x / step_width).round() as i32).clamp(0, 3);
-                                    let new_size = FONT_SIZES[new_pos as usize];
-                                    if (new_size - self.font_size).abs() > 0.5 {
-                                        self.font_size = new_size;
-                                        self.output_dirty = true;
-                                        action = Some("font_changed");
-                                    }
-                                }
-                            }
-                        }
-                    });
-                });
-            });
+            // No top menu bar in gui2 - hamburger menu is in the status bar
 
             // Handle menu actions
             match action {
@@ -3957,20 +3927,10 @@ impl eframe::App for RemoteGuiApp {
                 }
                 Some("connect") => self.connect_world(self.current_world),
                 Some("disconnect") => self.disconnect_world(self.current_world),
-                Some("toggle_tags") => { self.show_tags = !self.show_tags; self.output_dirty = true; }
-                Some("toggle_highlight") => { self.highlight_actions = !self.highlight_actions; self.output_dirty = true; }
+                Some("toggle_tags") => self.show_tags = !self.show_tags,
+                Some("toggle_highlight") => self.highlight_actions = !self.highlight_actions,
                 Some("resync") => {
                     // Request full state resync from server
-                    if let Some(ref ws_tx) = self.ws_tx {
-                        let _ = ws_tx.send(WsMessage::RequestState);
-                    }
-                }
-                Some("redraw") => {
-                    // Filter output to only server data (remove client-generated lines)
-                    if let Some(world) = self.worlds.get_mut(self.current_world) {
-                        world.output_lines.retain(|line| line.from_server);
-                    }
-                    // Also request a full resync from server
                     if let Some(ref ws_tx) = self.ws_tx {
                         let _ = ws_tx.send(WsMessage::RequestState);
                     }
@@ -3995,19 +3955,17 @@ impl eframe::App for RemoteGuiApp {
                 _ => {}
             }
 
-            // Input area at bottom (full width)
-            let input_height = self.input_height as f32 * 16.0 + 8.0;
-            let prompt_text = self.worlds.get(self.current_world)
-                .map(|w| crate::util::strip_ansi_codes(&w.prompt))
-                .unwrap_or_default();
+            // Input area at bottom (full width, minimum 3 lines in gui2)
+            let effective_input_height = self.input_height.max(3);
+            let input_height = effective_input_height as f32 * (self.font_size * 1.3) + 8.0;
+            let prompt_text = String::new(); // gui2: no prompt display
 
             let input_bg = theme.bg();
-            let input_bg_transparent = egui::Color32::from_rgba_unmultiplied(input_bg.r(), input_bg.g(), input_bg.b(), alpha);
             egui::TopBottomPanel::bottom("input_panel")
                 .exact_height(input_height)
                 .frame(egui::Frame::none()
-                    .fill(input_bg_transparent)
-                    .inner_margin(egui::Margin::same(2.0))
+                    .fill(input_bg)
+                    .inner_margin(egui::Margin::symmetric(8.0, 2.0))
                     .stroke(egui::Stroke::NONE))
                 .show(ctx, |ui| {
                     ui.spacing_mut().item_spacing.x = 0.0; // Remove horizontal spacing
@@ -4015,11 +3973,7 @@ impl eframe::App for RemoteGuiApp {
                     // Text input takes full area
                     // Build layout job with spell check coloring (misspelled words in red)
                     let input_id = egui::Id::new("main_input");
-                    if self.input_buffer != self.cached_spell_input {
-                        self.cached_misspelled = self.find_misspelled_words();
-                        self.cached_spell_input = self.input_buffer.clone();
-                    }
-                    let misspelled = self.cached_misspelled.clone();
+                    let misspelled = self.find_misspelled_words();
                     let font_id = egui::FontId::monospace(self.font_size);
                     let default_color = theme.fg();
                     let line_height = 16.0_f32; // Approximate line height for scrolling calc
@@ -4346,7 +4300,6 @@ impl eframe::App for RemoteGuiApp {
                                         // Switch locally
                                         self.current_world = idx;
                                         self.selection_start = None; self.selection_end = None;
-                                        self.output_dirty = true;
                                         // If not connected, send connect command to server
                                         if !self.worlds[idx].connected {
                                             self.connect_world(idx);
@@ -4367,7 +4320,6 @@ impl eframe::App for RemoteGuiApp {
                                     if let Some(idx) = self.worlds.iter().position(|w| w.name.eq_ignore_ascii_case(name)) {
                                         self.current_world = idx;
                                         self.selection_start = None; self.selection_end = None;
-                                        self.output_dirty = true;
                                         if !self.worlds[idx].connected {
                                             // Send the command to server (it handles -l flag)
                                             self.send_command(idx, cmd);
@@ -4405,21 +4357,28 @@ impl eframe::App for RemoteGuiApp {
                     }
                 });
 
-            // Separator bar (matches TUI style)
-            let separator_bg = if theme.is_dark() {
-                egui::Color32::from_rgb(40, 40, 40)
-            } else {
-                egui::Color32::from_rgb(200, 200, 200)  // Darker for light theme
-            };
+            // Separator bar (gui2 redesign)
+            let separator_bg = theme.status_bar_bg();
             let separator_bg_transparent = egui::Color32::from_rgba_unmultiplied(separator_bg.r(), separator_bg.g(), separator_bg.b(), alpha);
             egui::TopBottomPanel::bottom("separator_bar")
-                .exact_height(20.0)
+                .exact_height(34.0)
                 .frame(egui::Frame::none()
                     .fill(separator_bg_transparent)
-                    .inner_margin(egui::Margin::same(0.0))
-                    .stroke(egui::Stroke::NONE))
+                    .inner_margin(egui::Margin::symmetric(10.0, 0.0))
+                    .stroke(egui::Stroke::new(0.25, theme.border_medium())))
                 .show(ctx, |ui| {
-                    ui.horizontal(|ui| {
+                    ui.horizontal_centered(|ui| {
+                        ui.spacing_mut().item_spacing.x = 10.0;
+
+                        // Scale separator bar font sizes relative to self.font_size (30% bigger)
+                        let fs = self.font_size;
+                        let fs_icon = fs * 1.3;         // hamburger icon
+                        let fs_name = fs * 0.86 * 1.3;  // world name
+                        let fs_tag = fs * 0.75 * 1.3;   // [tag] indicator
+                        let fs_badge = fs * 0.79 * 1.3;  // MORE/HIST/ACT badges
+                        let fs_time = fs * 0.79 * 1.3;   // time display
+                        let fs_slider_label = fs * 0.57 * 1.3; // font slider labels
+
                         // Get current world info
                         let world_name = self.worlds.get(self.current_world)
                             .map(|w| w.name.as_str())
@@ -4430,92 +4389,186 @@ impl eframe::App for RemoteGuiApp {
                         let was_connected = self.worlds.get(self.current_world)
                             .map(|w| w.was_connected)
                             .unwrap_or(false);
-
-                        // Use server's activity count (console broadcasts this value)
                         // Compute activity locally excluding this client's current world
                         // (server_activity_count excludes the server's current world, which may differ)
                         let activity_count = self.worlds.iter().enumerate()
                             .filter(|(i, w)| *i != self.current_world && (w.unseen_lines > 0 || w.pending_count > 0))
                             .count();
-
-                        // Status indicator (Hist/More or spaces)
-                        // Priority: Hist (when scrolled back) > More (when paused) > spaces
                         let server_pending_count = self.worlds.get(self.current_world)
                             .map(|w| w.pending_count)
                             .unwrap_or(0);
-
-                        // Check if scrolled back (scroll_offset is Some when not at bottom)
                         let is_scrolled_back = self.scroll_offset.is_some();
 
+                        // Hamburger menu button (shift right 8px)
+                        ui.add_space(4.0);
+                        let is_menu_open = self.hamburger_menu_open;
+                        let btn_text_color = if is_menu_open { theme.accent() } else { theme.fg_muted() };
+                        // 40% darker than separator bar bg for highlight
+                        let hamburger_highlight = if theme.is_dark() {
+                            let c = theme.status_bar_bg();
+                            egui::Color32::from_rgb(
+                                (c.r() as f32 * 0.6) as u8,
+                                (c.g() as f32 * 0.6) as u8,
+                                (c.b() as f32 * 0.6) as u8,
+                            )
+                        } else {
+                            theme.bg_hover()
+                        };
+                        // Override hover/active styles for this button
+                        ui.visuals_mut().widgets.hovered.bg_fill = hamburger_highlight;
+                        ui.visuals_mut().widgets.hovered.bg_stroke = egui::Stroke::NONE;
+                        ui.visuals_mut().widgets.active.bg_fill = hamburger_highlight;
+                        ui.visuals_mut().widgets.active.bg_stroke = egui::Stroke::NONE;
+                        let menu_btn = ui.add(egui::Button::new(
+                            egui::RichText::new("☰").size(fs_icon).color(btn_text_color)
+                        ).min_size(egui::vec2(30.0, 30.0))
+                         .rounding(egui::Rounding::same(4.0))
+                         .fill(if is_menu_open { hamburger_highlight } else { egui::Color32::TRANSPARENT })
+                         .stroke(egui::Stroke::NONE));
+                        // Restore default widget styles
+                        ui.visuals_mut().widgets.hovered.bg_fill = theme.selection_bg();
+                        ui.visuals_mut().widgets.active.bg_fill = theme.selection_bg();
+
+                        if menu_btn.clicked() {
+                            self.hamburger_menu_open = !self.hamburger_menu_open;
+                            if self.hamburger_menu_open {
+                                self.hamburger_opened_time = std::time::Instant::now();
+                            }
+                            ctx.request_repaint();
+                        }
+
+                        // Connection dot + world name
+                        if was_connected {
+                            let ball_color = if connected { theme.success() } else { theme.error() };
+                            let (dot_rect, _) = ui.allocate_exact_size(
+                                egui::vec2(9.0, 9.0), egui::Sense::hover());
+                            ui.painter().circle_filled(dot_rect.center(), 4.5, ball_color);
+
+                            ui.label(egui::RichText::new(world_name)
+                                .strong().color(theme.fg()).size(fs_name));
+
+                            if self.show_tags {
+                                ui.label(egui::RichText::new("[tag]")
+                                    .color(theme.accent()).size(fs_tag));
+                            }
+                            if self.worlds.get(self.current_world).map_or(false, |w| w.gmcp_user_enabled) {
+                                ui.label(egui::RichText::new("[g]")
+                                    .color(theme.accent()).size(fs_tag));
+                            }
+                        }
+
+                        // More/Hist indicator badge at fixed position
+                        // Reserve space for: hamburger(30+4px) + dot(9px) + spacing + 15 chars + 20px gap
+                        let char_width = fs_name * 0.6; // approximate monospace char width
+                        let target_x = 4.0 + 30.0 + ui.spacing().item_spacing.x + 9.0 + ui.spacing().item_spacing.x + (15.0 * char_width) + 20.0;
+                        let current_x = ui.cursor().left() - ui.min_rect().left();
+                        if target_x > current_x {
+                            ui.add_space(target_x - current_x);
+                        } else {
+                            ui.add_space(20.0);
+                        }
+
                         if is_scrolled_back {
-                            // Show Hist indicator when scrolled back (takes precedence)
-                            // Calculate approximate lines from bottom based on scroll offset
                             let lines_back = self.scroll_offset
-                                .map(|offset| (offset / 20.0).max(1.0) as usize) // Rough estimate
+                                .map(|offset| (offset / 20.0).max(1.0) as usize)
                                 .unwrap_or(0);
                             let count_str = if lines_back >= 10000 {
-                                format!("{:>3}K", (lines_back / 1000).min(999))
+                                format!("{}K", (lines_back / 1000).min(999))
                             } else {
-                                format!("{:>4}", lines_back)
+                                format!("{}", lines_back)
                             };
-                            let status_text = format!("Hist {}", count_str);
-                            ui.label(egui::RichText::new(status_text)
-                                .monospace()
-                                .color(egui::Color32::BLACK)
-                                .background_color(egui::Color32::from_rgb(0xf8, 0x53, 0x49))); // Red background
+                            let hist_bg = egui::Color32::from_rgb(0xf5, 0x21, 0x11);
+                            let hist_num_bg = egui::Color32::from_rgb(0xa1, 0x0b, 0x00);
+                            let hist_text_color = egui::Color32::WHITE;
+                            let badge_height = fs_badge * 1.6;
+                            ui.horizontal_centered(|ui| {
+                                ui.spacing_mut().item_spacing.x = 0.0;
+                                ui.add(egui::Button::new(
+                                    egui::RichText::new(" History ").monospace().size(fs_badge).strong()
+                                        .color(hist_text_color))
+                                    .fill(hist_bg)
+                                    .stroke(egui::Stroke::NONE)
+                                    .rounding(egui::Rounding {
+                                        nw: 4.0, sw: 4.0, ne: 0.0, se: 0.0,
+                                    })
+                                    .min_size(egui::vec2(0.0, badge_height))
+                                    .sense(egui::Sense::hover()));
+                                ui.add(egui::Button::new(
+                                    egui::RichText::new(format!(" {} ", count_str)).monospace().size(fs_badge).strong()
+                                        .color(hist_text_color))
+                                    .fill(hist_num_bg)
+                                    .stroke(egui::Stroke::NONE)
+                                    .rounding(egui::Rounding {
+                                        nw: 0.0, sw: 0.0, ne: 4.0, se: 4.0,
+                                    })
+                                    .min_size(egui::vec2(0.0, badge_height))
+                                    .sense(egui::Sense::hover()));
+                            });
                         } else if server_pending_count > 0 {
-                            // Show More indicator when paused with pending lines
-                            let count_str = if server_pending_count >= 10000 {
-                                format!("{:>3}K", (server_pending_count / 1000).min(999))
+                            let count_str = if server_pending_count >= 1_000_000 {
+                                "Alot".to_string()
+                            } else if server_pending_count >= 10000 {
+                                format!("{}K", (server_pending_count / 1000).min(999))
                             } else {
-                                format!("{:>4}", server_pending_count)
+                                format!("{}", server_pending_count)
                             };
-                            let status_text = format!("More {}", count_str);
-                            ui.label(egui::RichText::new(status_text)
-                                .monospace()
-                                .color(egui::Color32::BLACK)
-                                .background_color(egui::Color32::from_rgb(0xf8, 0x53, 0x49))); // Red background
-                        } else {
-                            // Status area - spaces when no indicator
-                            let status_text = "          ";
-                            ui.label(egui::RichText::new(status_text).monospace());
+                            let more_bg = egui::Color32::from_rgb(0xf5, 0x21, 0x11);
+                            let more_num_bg = egui::Color32::from_rgb(0xa1, 0x0b, 0x00);
+                            let more_text_color = egui::Color32::WHITE;
+                            let badge_height = fs_badge * 1.6;
+                            ui.horizontal_centered(|ui| {
+                                ui.spacing_mut().item_spacing.x = 0.0;
+                                ui.add(egui::Button::new(
+                                    egui::RichText::new(" ⏸ More ").monospace().size(fs_badge).strong()
+                                        .color(more_text_color))
+                                    .fill(more_bg)
+                                    .stroke(egui::Stroke::NONE)
+                                    .rounding(egui::Rounding {
+                                        nw: 4.0, sw: 4.0, ne: 0.0, se: 0.0,
+                                    })
+                                    .min_size(egui::vec2(0.0, badge_height))
+                                    .sense(egui::Sense::hover()));
+                                ui.add(egui::Button::new(
+                                    egui::RichText::new(format!(" {} ", count_str)).monospace().size(fs_badge).strong()
+                                        .color(more_text_color))
+                                    .fill(more_num_bg)
+                                    .stroke(egui::Stroke::NONE)
+                                    .rounding(egui::Rounding {
+                                        nw: 0.0, sw: 0.0, ne: 4.0, se: 4.0,
+                                    })
+                                    .min_size(egui::vec2(0.0, badge_height))
+                                    .sense(egui::Sense::hover()));
+                            });
                         }
 
-                        // Only show connection ball, world name, and tag indicator if world has ever connected
-                        if was_connected {
-                            // Connection status ball (green when connected, red when disconnected)
-                            let circle_size = ui.text_style_height(&egui::TextStyle::Monospace);
-                            let (rect, _) = ui.allocate_exact_size(
-                                egui::vec2(circle_size, circle_size),
-                                egui::Sense::hover(),
-                            );
-                            let ball_color = if connected {
-                                egui::Color32::from_rgb(0x3f, 0xb9, 0x50) // Green
-                            } else {
-                                egui::Color32::from_rgb(0xf8, 0x51, 0x49) // Red
-                            };
-                            ui.painter().circle_filled(rect.center(), circle_size * 0.3, ball_color);
-
-                            // World name (bold)
-                            ui.label(egui::RichText::new(world_name).monospace().strong().color(theme.fg()));
-
-                            // Tag indicator (only shown when F2 toggled to show tags)
-                            if self.show_tags {
-                                ui.label(egui::RichText::new(" [tag]").monospace().color(theme.prompt()));
-                            }
-                            // GMCP indicator (only shown when F9 toggled to enable GMCP processing)
-                            if self.worlds.get(self.current_world).map_or(false, |w| w.gmcp_user_enabled) {
-                                ui.label(egui::RichText::new(" [g]").monospace().color(theme.prompt()));
-                            }
-                        }
-
-                        // Activity indicator with hover tooltip
+                        // Activity indicator badge (right after More/Hist)
                         if activity_count > 0 {
-                            ui.label(egui::RichText::new(" ").monospace().color(theme.fg_dim()));
-                            let activity_label = ui.label(egui::RichText::new(format!("(Activity: {})", activity_count))
-                                .monospace().color(theme.highlight()));
-                            // Show hover popup with list of worlds that have activity
-                            activity_label.on_hover_ui(|ui| {
+                            ui.add_space(8.0);
+                            let badge_height = fs_badge * 1.6;
+                            let act_response = ui.horizontal_centered(|ui| {
+                                ui.spacing_mut().item_spacing.x = 0.0;
+                                ui.add(egui::Button::new(
+                                    egui::RichText::new(" Activity ").monospace().size(fs_badge).strong()
+                                        .color(egui::Color32::BLACK))
+                                    .fill(theme.activity_label_bg())
+                                    .stroke(egui::Stroke::NONE)
+                                    .rounding(egui::Rounding {
+                                        nw: 4.0, sw: 4.0, ne: 0.0, se: 0.0,
+                                    })
+                                    .min_size(egui::vec2(0.0, badge_height))
+                                    .sense(egui::Sense::hover()));
+                                ui.add(egui::Button::new(
+                                    egui::RichText::new(format!(" {} ", activity_count)).monospace().size(fs_badge).strong()
+                                        .color(egui::Color32::BLACK))
+                                    .fill(theme.activity_count_bg())
+                                    .stroke(egui::Stroke::NONE)
+                                    .rounding(egui::Rounding {
+                                        nw: 0.0, sw: 0.0, ne: 4.0, se: 4.0,
+                                    })
+                                    .min_size(egui::vec2(0.0, badge_height))
+                                    .sense(egui::Sense::hover()));
+                            }).response;
+                            act_response.on_hover_ui(|ui| {
                                 ui.label(egui::RichText::new("Worlds with activity:").strong());
                                 for (i, w) in self.worlds.iter().enumerate() {
                                     if i != self.current_world && (w.unseen_lines > 0 || w.pending_count > 0) {
@@ -4531,74 +4584,229 @@ impl eframe::App for RemoteGuiApp {
                             });
                         }
 
-                        // Spacer with underscore-style fill
+                        // Right side: time, font slider (RTL order)
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            // Current time (H:MM) in 12-hour format
+                            // Time (rightmost)
                             let lt = local_time_now();
                             let hours_24 = lt.hour as u32;
                             let mins = lt.minute as u32;
-                            // Convert to 12-hour format
-                            let hours = if hours_24 == 0 {
-                                12
-                            } else if hours_24 <= 12 {
-                                hours_24
-                            } else {
-                                hours_24 - 12
-                            };
+                            let hours = if hours_24 == 0 { 12 }
+                                else if hours_24 <= 12 { hours_24 }
+                                else { hours_24 - 12 };
+                            let time_color = theme.fg();
                             ui.label(egui::RichText::new(format!("{}:{:02}", hours, mins))
-                                .monospace().color(theme.accent()));
+                                .monospace().size(fs_time).color(time_color));
+
+                            ui.add_space(15.0);
+
+                            // Custom-painted font size slider (matches mockup: 60px track, 4px tall, 12px circle thumb)
+                            let label_color = if theme.is_dark() { theme.fg_muted() } else { theme.fg() };
+                            ui.label(egui::RichText::new(format!("{:.0}", self.font_size))
+                                .monospace().size(fs_slider_label).color(label_color));
+
+                            // Custom slider widget
+                            let slider_width = 60.0_f32;
+                            let slider_total_height = 14.0_f32; // enough room for 12px thumb
+                            let track_height = 4.0_f32;
+                            let thumb_radius = 6.0_f32;
+                            let (slider_rect, slider_resp) = ui.allocate_exact_size(
+                                egui::vec2(slider_width, slider_total_height),
+                                egui::Sense::click_and_drag(),
+                            );
+
+                            // Handle interaction
+                            if slider_resp.dragged() || slider_resp.clicked() {
+                                if let Some(pos) = slider_resp.interact_pointer_pos() {
+                                    let t = ((pos.x - slider_rect.left() - thumb_radius) / (slider_width - thumb_radius * 2.0)).clamp(0.0, 1.0);
+                                    let new_val = 9.0 + t * 11.0; // range 9..=20
+                                    self.font_size = new_val.round();
+                                    action = Some("font_changed");
+                                }
+                            }
+
+                            // Paint track
+                            let track_color = if theme.is_dark() { theme.border_medium() } else { egui::Color32::from_rgb(0x88, 0x88, 0x88) };
+                            let track_y = slider_rect.center().y;
+                            let track_rect = egui::Rect::from_min_max(
+                                egui::pos2(slider_rect.left() + thumb_radius, track_y - track_height / 2.0),
+                                egui::pos2(slider_rect.right() - thumb_radius, track_y + track_height / 2.0),
+                            );
+                            ui.painter().rect_filled(track_rect, egui::Rounding::same(2.0), track_color);
+
+                            // Paint thumb
+                            let t = ((self.font_size - 9.0) / 11.0).clamp(0.0, 1.0);
+                            let thumb_x = track_rect.left() + t * track_rect.width();
+                            let thumb_color = if slider_resp.hovered() || slider_resp.dragged() {
+                                theme.accent()
+                            } else {
+                                theme.fg_muted()
+                            };
+                            let thumb_border = if theme.is_dark() { theme.border_medium() } else { egui::Color32::from_rgb(0x77, 0x77, 0x77) };
+                            ui.painter().circle_filled(egui::pos2(thumb_x, track_y), thumb_radius, thumb_color);
+                            ui.painter().circle_stroke(egui::pos2(thumb_x, track_y), thumb_radius, egui::Stroke::new(1.5, thumb_border));
+
+                            ui.label(egui::RichText::new("A")
+                                .size(fs_slider_label).color(label_color));
                         });
                     });
                 });
 
-            // Filter popup (F4) - separate OS window
-            if self.filter_active {
-                let mut should_close = false;
-                let mut filter_text = self.filter_text.clone();
+            // Hamburger menu popup (gui2)
+            if self.hamburger_menu_open {
+                let menu_bg = theme.menu_bar_bg();
+                // Position menu: bottom edge at separator bar top, left edge at hamburger button
+                let bar_top = ctx.screen_rect().height() - 34.0 - input_height;
+                let menu_width = 195.0;
+                // 8 items × 24px + 3 separators × 6px + 12px inner margin padding
+                let menu_height = 8.0 * 24.0 + 3.0 * 6.0 + 12.0;
+                let menu_pos = egui::pos2(8.0, (bar_top - menu_height + 2.0).max(2.0));
 
-                ctx.show_viewport_immediate(
-                    egui::ViewportId::from_hash_of("filter_window"),
-                    egui::ViewportBuilder::default()
-                        .with_title("Filter - Clay MUD Client")
-                        .with_inner_size([300.0, 60.0]),
-                    |ctx, _class| {
-                        egui::CentralPanel::default().show(ctx, |ui| {
-                            if ui.input(|i| i.key_pressed(egui::Key::Escape)) ||
-                               ui.input(|i| i.key_pressed(egui::Key::F4)) ||
-                               ui.input(|i| i.viewport().close_requested()) {
-                                should_close = true;
+                let mut close_menu = false;
+                egui::Window::new("##hamburger_menu")
+                    .fixed_pos(menu_pos)
+                    .fixed_size(egui::vec2(menu_width, menu_height))
+                    .title_bar(false)
+                    .resizable(false)
+                    .collapsible(false)
+                    .frame(egui::Frame::none()
+                        .fill(menu_bg)
+                        .stroke(egui::Stroke::new(1.0, theme.border_medium()))
+                        .rounding(egui::Rounding::same(6.0))
+                        .inner_margin(egui::Margin::same(6.0)))
+                    .show(ctx, |ui| {
+                        ui.spacing_mut().item_spacing.y = 0.0;
+
+                        let row_width = menu_width - 12.0;
+                        let clicked = |ui: &mut egui::Ui, label: &str, shortcut: &str| -> bool {
+                            let (rect, response) = ui.allocate_exact_size(
+                                egui::vec2(row_width, 24.0),
+                                egui::Sense::click(),
+                            );
+                            if ui.is_rect_visible(rect) {
+                                // Hover highlight
+                                if response.hovered() {
+                                    ui.painter().rect_filled(rect, 3.0, theme.bg_hover());
+                                }
+                                // Label left-aligned
+                                ui.painter().text(
+                                    egui::pos2(rect.left() + 8.0, rect.center().y),
+                                    egui::Align2::LEFT_CENTER,
+                                    label,
+                                    egui::FontId::proportional(12.0),
+                                    theme.fg(),
+                                );
+                                // Shortcut right-aligned
+                                if !shortcut.is_empty() {
+                                    ui.painter().text(
+                                        egui::pos2(rect.right() - 8.0, rect.center().y),
+                                        egui::Align2::RIGHT_CENTER,
+                                        shortcut,
+                                        egui::FontId::monospace(10.0),
+                                        theme.fg_muted(),
+                                    );
+                                }
                             }
+                            response.clicked()
+                        };
 
-                            ui.horizontal(|ui| {
-                                ui.label("Filter:");
-                                let response = ui.text_edit_singleline(&mut filter_text);
-                                response.request_focus();
-                            });
-                        });
-                    },
-                );
+                        if clicked(ui, "Worlds", "") { action = Some("world_selector"); close_menu = true; }
+                        if clicked(ui, "World Editor", "Ctrl+E") { action = Some("edit_current"); close_menu = true; }
+                        if clicked(ui, "Actions", "") { action = Some("actions"); close_menu = true; }
+                        ui.separator();
+                        if clicked(ui, "Settings", "Ctrl+S") { action = Some("setup"); close_menu = true; }
+                        if clicked(ui, "Web Settings", "") { action = Some("web"); close_menu = true; }
+                        ui.separator();
+                        if clicked(ui, "Toggle Tags", "F2") { action = Some("toggle_tags"); close_menu = true; }
+                        if clicked(ui, "Search", "F4") { self.filter_active = !self.filter_active; close_menu = true; }
+                        ui.separator();
+                        if clicked(ui, "Resync", "") { action = Some("resync"); close_menu = true; }
+                    });
 
-                if filter_text != self.filter_text {
-                    self.output_dirty = true;
+                if close_menu {
+                    self.hamburger_menu_open = false;
+                    ctx.request_repaint();
                 }
-                self.filter_text = filter_text;
-                if should_close {
-                    self.filter_active = false;
-                    self.filter_text.clear();
-                    self.output_dirty = true;
+
+                // Close on Escape
+                if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+                    self.hamburger_menu_open = false;
+                    ctx.request_repaint();
                 }
+
+                // Close on click outside (skip first 200ms to avoid fighting with open click)
+                let elapsed = self.hamburger_opened_time.elapsed();
+                if elapsed.as_millis() > 100 && ctx.input(|i| i.pointer.any_pressed()) {
+                    if let Some(pos) = ctx.input(|i| i.pointer.interact_pos()) {
+                        let menu_rect = egui::Rect::from_min_size(menu_pos, egui::vec2(menu_width + 10.0, menu_height));
+                        let btn_rect = egui::Rect::from_min_size(
+                            egui::pos2(0.0, bar_top), egui::vec2(40.0, 34.0));
+                        if !menu_rect.contains(pos) && !btn_rect.contains(pos) {
+                            self.hamburger_menu_open = false;
+                            ctx.request_repaint();
+                        }
+                    }
+                }
+            }
+
+            // Handle menu actions set by hamburger menu or separator bar
+            match action {
+                Some("world_list") => {
+                    self.popup_state = PopupState::ConnectedWorlds;
+                    self.world_list_selected = self.current_world;
+                    self.only_connected_worlds = false;
+                    self.popup_scroll_to_selected = true;
+                }
+                Some("connected_worlds") => {
+                    self.open_connections_unified();
+                }
+                Some("world_selector") => {
+                    self.popup_state = PopupState::ConnectedWorlds;
+                    self.world_list_selected = self.current_world;
+                    self.only_connected_worlds = false;
+                    self.popup_scroll_to_selected = true;
+                }
+                Some("actions") => {
+                    self.open_actions_list_unified();
+                }
+                Some("edit_current") => self.open_world_editor(self.current_world),
+                Some("setup") => self.popup_state = PopupState::Setup,
+                Some("web") => self.popup_state = PopupState::Web,
+                Some("font_changed") => {
+                    self.update_global_settings();
+                }
+                Some("connect") => self.connect_world(self.current_world),
+                Some("disconnect") => self.disconnect_world(self.current_world),
+                Some("toggle_tags") => self.show_tags = !self.show_tags,
+                Some("toggle_highlight") => self.highlight_actions = !self.highlight_actions,
+                Some("resync") => {
+                    if let Some(ref ws_tx) = self.ws_tx {
+                        let _ = ws_tx.send(WsMessage::RequestState);
+                    }
+                }
+                Some("redraw") => {
+                    // Filter output to only server data (remove client-generated lines)
+                    if let Some(world) = self.worlds.get_mut(self.current_world) {
+                        world.output_lines.retain(|line| line.from_server);
+                    }
+                    // Also request a full resync from server
+                    if let Some(ref ws_tx) = self.ws_tx {
+                        let _ = ws_tx.send(WsMessage::RequestState);
+                    }
+                }
+                Some("help") => self.popup_state = PopupState::Help,
+                _ => {}
             }
 
             // Main output area with scrollbar (no frame/border/margin)
             let bg = theme.bg();
-            let alpha = (self.transparency * 255.0) as u8;
-            let transparent_bg = egui::Color32::from_rgba_unmultiplied(bg.r(), bg.g(), bg.b(), alpha);
             egui::CentralPanel::default()
                 .frame(egui::Frame::none()
-                    .fill(transparent_bg)
-                    .inner_margin(egui::Margin::same(0.0))
+                    .fill(bg)
+                    .inner_margin(egui::Margin { left: 0.0, right: 0.0, top: 7.0, bottom: 0.0 })
                     .stroke(egui::Stroke::NONE))
                 .show(ctx, |ui| {
+                // Clip output area so scrollbar doesn't bleed into separator bar
+                ui.set_clip_rect(ui.max_rect());
                 if let Some(world) = self.worlds.get(self.current_world) {
                     // Check if showing splash screen - render centered image instead of output
                     if world.showing_splash {
@@ -4626,43 +4834,67 @@ impl eframe::App for RemoteGuiApp {
                         return;  // Skip regular output rendering
                     }
 
-                    // Check if available width changed (invalidates layout)
+                    // Check if output needs rebuilding by detecting any state change
                     let available_width = ui.available_width();
-                    if (available_width - self.cached_output_width).abs() > 1.0 {
+                    let current_line_count = world.output_lines.len();
+                    if current_line_count != self.cached_output_len
+                        || self.current_world != self.cached_world_index
+                        || self.show_tags != self.cached_show_tags
+                        || self.highlight_actions != self.cached_highlight_actions
+                        || self.filter_text != self.cached_filter_text
+                        || self.font_size != self.cached_font_size
+                        || self.color_offset_percent != self.cached_color_offset
+                        || (available_width - self.cached_output_width).abs() > 1.0 {
                         self.output_dirty = true;
                     }
 
                     let default_color = theme.fg();
                     let font_id = egui::FontId::monospace(self.font_size);
-
-                    let (combined_job, plain_text, display_lines, has_any_discord_emojis): (egui::text::LayoutJob, String, Vec<String>, bool);
+                    let is_light_theme = !theme.is_dark();
 
                     if self.output_dirty {
                         // Cache "now" for timestamp formatting - compute once per frame
                         let cached_now = GuiCachedNow::new();
 
+                        const MAX_RENDER_LINES: usize = 2000;
+
                         // Keep original lines with ANSI for coloring
-                        let colored_lines: Vec<&TimestampedLine> = world.output_lines.iter()
+                        let filtering = self.filter_active && !self.filter_text.is_empty();
+
+                        // Pre-truncate to avoid iterating thousands of lines when not filtering
+                        let lines_slice: &[TimestampedLine] = if !filtering && world.output_lines.len() > MAX_RENDER_LINES + 100 {
+                            &world.output_lines[world.output_lines.len() - MAX_RENDER_LINES - 100..]
+                        } else {
+                            &world.output_lines
+                        };
+
+                        // Pre-compile filter regex once (not per-line)
+                        let filter_regex = if filtering {
+                            let has_wildcards = self.filter_text.contains('*') || self.filter_text.contains('?');
+                            if has_wildcards {
+                                filter_wildcard_to_regex(&self.filter_text)
+                            } else {
+                                None
+                            }
+                        } else {
+                            None
+                        };
+                        let filter_lower = if filtering { self.filter_text.to_lowercase() } else { String::new() };
+
+                        let colored_lines: Vec<&TimestampedLine> = lines_slice.iter()
                             .filter(|line| {
                                 // Skip gagged lines unless show_tags is enabled (F2)
                                 if line.gagged && !self.show_tags {
                                     return false;
                                 }
                                 // Apply filter if active (filter on stripped text)
-                                if self.filter_active && !self.filter_text.is_empty() {
+                                if filtering {
                                     let stripped = crate::util::strip_ansi_codes(&line.text);
-                                    // Check if pattern has wildcards
-                                    let has_wildcards = self.filter_text.contains('*') || self.filter_text.contains('?');
-                                    if has_wildcards {
-                                        // Use wildcard matching
-                                        if let Some(regex) = filter_wildcard_to_regex(&self.filter_text) {
-                                            regex.is_match(&stripped)
-                                        } else {
-                                            false // Invalid regex
-                                        }
+                                    if let Some(ref regex) = filter_regex {
+                                        regex.is_match(&stripped)
                                     } else {
                                         // Simple substring match
-                                        stripped.to_lowercase().contains(&self.filter_text.to_lowercase())
+                                        stripped.to_lowercase().contains(&filter_lower)
                                     }
                                 } else {
                                     true
@@ -4670,11 +4902,8 @@ impl eframe::App for RemoteGuiApp {
                             })
                             .collect();
 
-                        // Cap rendered lines to avoid slow layout on large buffers.
-                        // When not filtering, only render the last N lines (scrollback still works
-                        // within this range). Filtering needs all matching lines.
-                        const MAX_RENDER_LINES: usize = 2000;
-                        let colored_lines = if !self.filter_active && colored_lines.len() > MAX_RENDER_LINES {
+                        // Cap rendered lines
+                        let colored_lines = if !filtering && colored_lines.len() > MAX_RENDER_LINES {
                             colored_lines[colored_lines.len() - MAX_RENDER_LINES..].to_vec()
                         } else {
                             colored_lines
@@ -4700,10 +4929,10 @@ impl eframe::App for RemoteGuiApp {
                                 }
                             })
                             .collect();
-                        plain_text = lines.join("\n");
+                        let plain_text: String = lines.join("\n");
 
                         // Build combined LayoutJob with ANSI colors
-                        let mut job = egui::text::LayoutJob {
+                        let mut combined_job = egui::text::LayoutJob {
                             wrap: egui::text::TextWrapping {
                                 max_width: available_width,
                                 ..Default::default()
@@ -4712,7 +4941,7 @@ impl eframe::App for RemoteGuiApp {
                         };
 
                         // Check if any line has Discord emojis (skip when show_tags enabled to show original text)
-                        has_any_discord_emojis = !self.show_tags && colored_lines.iter()
+                        let has_any_discord_emojis = !self.show_tags && colored_lines.iter()
                             .any(|line| Self::has_discord_emojis(&line.text));
 
                         // Build display lines for both paths
@@ -4724,7 +4953,7 @@ impl eframe::App for RemoteGuiApp {
                         } else {
                             Vec::new()
                         };
-                        display_lines = colored_lines.iter().map(|line| {
+                        let display_lines: Vec<String> = colored_lines.iter().map(|line| {
                             let base_line = if self.show_tags {
                                 let ts_prefix = Self::format_timestamp_gui_cached(line.ts, &cached_now);
                                 // Convert temperatures only if enabled
@@ -4756,8 +4985,6 @@ impl eframe::App for RemoteGuiApp {
                             }
                         }).collect();
 
-                        let is_light_theme = !theme.is_dark();
-
                         // Build combined LayoutJob from display_lines
                         if !has_any_discord_emojis {
                             for (i, display_line) in display_lines.iter().enumerate() {
@@ -4769,10 +4996,10 @@ impl eframe::App for RemoteGuiApp {
                                 };
                                 // Apply word breaks for long words
                                 let line_text = Self::insert_word_breaks(&line_text);
-                                Self::append_ansi_to_job(&line_text, default_color, font_id.clone(), &mut job, is_light_theme, self.color_offset_percent);
+                                Self::append_ansi_to_job(&line_text, default_color, font_id.clone(), &mut combined_job, is_light_theme, self.color_offset_percent);
 
                                 if i < display_lines.len() - 1 {
-                                    job.append("\n", 0.0, egui::TextFormat {
+                                    combined_job.append("\n", 0.0, egui::TextFormat {
                                         font_id: font_id.clone(),
                                         color: default_color,
                                         ..Default::default()
@@ -4780,22 +5007,22 @@ impl eframe::App for RemoteGuiApp {
                                 }
                             }
                         }
-                        combined_job = job;
 
                         // Cache the results
-                        self.cached_output_job = Some(combined_job.clone());
-                        self.cached_plain_text = plain_text.clone();
-                        self.cached_display_lines = display_lines.clone();
+                        self.cached_output_job = Some(combined_job);
+                        self.cached_plain_text = plain_text;
+                        self.cached_display_lines = display_lines;
                         self.cached_has_emojis = has_any_discord_emojis;
                         self.cached_output_width = available_width;
+                        self.cached_output_len = current_line_count;
+                        self.cached_world_index = self.current_world;
+                        self.cached_show_tags = self.show_tags;
+                        self.cached_highlight_actions = self.highlight_actions;
+                        self.cached_filter_text = self.filter_text.clone();
+                        self.cached_font_size = self.font_size;
+                        self.cached_color_offset = self.color_offset_percent;
                         self.urls_dirty = true;
                         self.output_dirty = false;
-                    } else {
-                        // Reuse cached values
-                        combined_job = self.cached_output_job.clone().unwrap_or_default();
-                        plain_text = self.cached_plain_text.clone();
-                        display_lines = self.cached_display_lines.clone();
-                        has_any_discord_emojis = self.cached_has_emojis;
                     }
 
                     // Calculate approximate visible lines based on available height and font size
@@ -4835,17 +5062,16 @@ impl eframe::App for RemoteGuiApp {
                         scroll_area = scroll_area.vertical_scroll_offset(delta);
                     }
 
-                    // Clone the job for the custom rendering
-                    let layout_job = combined_job.clone();
+                    // Use cached values for rendering
+                    let layout_job = self.cached_output_job.clone().unwrap_or_default();
 
-                    // Clone values needed in the closure
-                    let has_emojis = has_any_discord_emojis;
-                    let emoji_lines = display_lines.clone();
+                    let has_emojis = self.cached_has_emojis;
+                    let emoji_lines = self.cached_display_lines.clone();
                     let emoji_font_id = font_id.clone();
                     let emoji_default_color = default_color;
-                    let emoji_is_light = !theme.is_dark();
+                    let emoji_is_light = is_light_theme;
                     let emoji_link_color = theme.link();
-                    let emoji_plain_text = plain_text.clone();
+                    let emoji_plain_text = self.cached_plain_text.clone();
                     let emoji_color_offset = self.color_offset_percent;
 
                     let scroll_output = scroll_area.show(ui, |ui| {
@@ -5212,7 +5438,7 @@ impl eframe::App for RemoteGuiApp {
                                         result
                                     }
 
-                                    // Build selection from raw lines (use cached display_lines which contain ANSI codes)
+                                    // Build selection from raw lines
                                     let mut raw_selected_parts = Vec::new();
                                     let mut char_pos = 0;
                                     for (i, galley_line) in galley_text.lines().enumerate() {
@@ -5221,7 +5447,7 @@ impl eframe::App for RemoteGuiApp {
 
                                         // Check if this line overlaps with selection
                                         if line_end > start_char && line_start < end_char {
-                                            if let Some(raw_line) = display_lines.get(i) {
+                                            if let Some(raw_line) = self.cached_display_lines.get(i) {
                                                 // Calculate visible char range within this line
                                                 let sel_start_in_line = start_char.saturating_sub(line_start);
                                                 let sel_end_in_line = (end_char - line_start).min(galley_line.chars().count());
@@ -5377,7 +5603,7 @@ impl eframe::App for RemoteGuiApp {
                             }
 
                             // Right-click context menu
-                            let plain_text_for_menu = plain_text.clone();
+                            let plain_text_for_menu = self.cached_plain_text.clone();
                             let debug_request_id = egui::Id::new("debug_text_request");
 
                             response.response.context_menu(|ui| {
@@ -5434,6 +5660,57 @@ impl eframe::App for RemoteGuiApp {
                         // Clamp our tracked offset to valid range
                         self.scroll_offset = Some(current_offset.clamp(0.0, max_offset));
                     }
+                }
+
+                // Inline search box overlay (upper-right corner, like console F4)
+                if self.filter_active {
+                    let panel_rect = ui.max_rect();
+                    let search_width = 220.0;
+                    let search_height = 26.0;
+                    let margin = 8.0;
+                    let search_rect = egui::Rect::from_min_size(
+                        egui::pos2(panel_rect.right() - search_width - margin - 14.0, panel_rect.top() + margin),
+                        egui::vec2(search_width, search_height),
+                    );
+
+                    let painter = ui.painter();
+                    // Background
+                    painter.rect_filled(
+                        search_rect,
+                        egui::Rounding::same(4.0),
+                        theme.bg_surface(),
+                    );
+                    // Border
+                    painter.rect_stroke(
+                        search_rect,
+                        egui::Rounding::same(4.0),
+                        egui::Stroke::new(0.5, theme.border_medium()),
+                    );
+
+                    // Label
+                    let label_pos = egui::pos2(search_rect.left() + 6.0, search_rect.center().y);
+                    painter.text(
+                        label_pos,
+                        egui::Align2::LEFT_CENTER,
+                        "Search:",
+                        egui::FontId::proportional(11.0),
+                        theme.fg_muted(),
+                    );
+
+                    // Text input area
+                    let input_rect = egui::Rect::from_min_max(
+                        egui::pos2(search_rect.left() + 54.0, search_rect.top() + 2.0),
+                        egui::pos2(search_rect.right() - 4.0, search_rect.bottom() - 2.0),
+                    );
+                    let mut child_ui = ui.child_ui(input_rect, egui::Layout::left_to_right(egui::Align::Center));
+                    let response = child_ui.add(
+                        egui::TextEdit::singleline(&mut self.filter_text)
+                            .desired_width(input_rect.width())
+                            .frame(false)
+                            .font(egui::FontId::monospace(11.0))
+                            .text_color(theme.fg())
+                    );
+                    response.request_focus();
                 }
             });
 
@@ -5556,22 +5833,22 @@ impl eframe::App for RemoteGuiApp {
                                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                                         ui.spacing_mut().item_spacing = egui::vec2(8.0, 0.0);
 
-                                        // Close button
+                                        // Ok button (primary)
                                         if ui.add(egui::Button::new(
-                                            egui::RichText::new("CLOSE").size(11.0).color(theme.fg_secondary()).family(egui::FontFamily::Monospace))
-                                            .fill(theme.bg_hover())
-                                            .stroke(egui::Stroke::new(1.0, theme.border_medium()))
+                                            egui::RichText::new("OK").size(11.0).color(theme.bg_deep()).strong().family(egui::FontFamily::Monospace))
+                                            .fill(theme.accent_dim())
+                                            .stroke(egui::Stroke::NONE)
                                             .rounding(egui::Rounding::same(4.0))
                                             .min_size(egui::vec2(70.0, 28.0))
                                         ).clicked() {
                                             should_close = true;
                                         }
 
-                                        // Connect button (primary)
+                                        // Connect button
                                         if ui.add(egui::Button::new(
-                                            egui::RichText::new("CONNECT").size(11.0).color(theme.bg_deep()).strong().family(egui::FontFamily::Monospace))
-                                            .fill(theme.accent_dim())
-                                            .stroke(egui::Stroke::NONE)
+                                            egui::RichText::new("CONNECT").size(11.0).color(theme.fg_secondary()).family(egui::FontFamily::Monospace))
+                                            .fill(theme.bg_hover())
+                                            .stroke(egui::Stroke::new(1.0, theme.border_medium()))
                                             .rounding(egui::Rounding::same(4.0))
                                             .min_size(egui::vec2(80.0, 28.0))
                                         ).clicked() {
@@ -5690,13 +5967,12 @@ impl eframe::App for RemoteGuiApp {
 
                                             // Full row as a clickable area
                                             let row_rect = ui.allocate_space(egui::vec2(ui.available_width(), row_height)).1;
+                                            let response = ui.interact(row_rect, ui.id().with(idx), egui::Sense::click());
 
                                             // Scroll selected item to center when popup first opens
                                             if is_selected && scroll_to {
                                                 ui.scroll_to_rect(row_rect, Some(egui::Align::Center));
                                             }
-
-                                            let response = ui.interact(row_rect, ui.id().with(idx), egui::Sense::click());
 
                                             // Draw selection/hover background for full row
                                             if is_selected {
@@ -6942,12 +7218,6 @@ impl eframe::App for RemoteGuiApp {
                 }
 
                 // Apply changes back (live preview for transparency)
-                if temp_convert != self.temp_convert_enabled
-                    || color_offset != self.color_offset_percent
-                    || gui_theme.name() != self.theme.name()
-                {
-                    self.output_dirty = true;
-                }
                 self.more_mode = more_mode;
                 self.spell_check_enabled = spell_check;
                 self.temp_convert_enabled = temp_convert;
@@ -7485,7 +7755,6 @@ impl eframe::App for RemoteGuiApp {
                     if let Ok(size) = self.edit_font_size.parse::<f32>() {
                         self.font_size = size.clamp(8.0, 48.0);
                     }
-                    self.output_dirty = true;
                     // Send updated settings to server
                     self.update_global_settings();
                     close_popup = true;
@@ -8011,11 +8280,11 @@ impl eframe::App for RemoteGuiApp {
                 let mut actions_selected = self.actions_selected;
                 let mut actions_list_filter = self.actions_list_filter.clone();
                 let actions_clone = self.actions.clone();
+                let scroll_to_selected = self.popup_scroll_to_selected;
 
                 // State for opening editor
                 let mut open_editor_idx: Option<usize> = None;
                 let mut add_new_action = false;
-                let scroll_to_selected = self.popup_scroll_to_selected;
 
                 ctx.show_viewport_immediate(
                     egui::ViewportId::from_hash_of("actions_list_window"),
@@ -8212,13 +8481,12 @@ impl eframe::App for RemoteGuiApp {
 
                                             // Full row as a clickable area
                                             let row_rect = ui.allocate_space(egui::vec2(ui.available_width(), row_height)).1;
+                                            let response = ui.interact(row_rect, ui.id().with(idx), egui::Sense::click());
 
                                             // Scroll selected item to center when popup first opens
                                             if is_selected && scroll_to {
                                                 ui.scroll_to_rect(row_rect, Some(egui::Align::Center));
                                             }
-
-                                            let response = ui.interact(row_rect, ui.id().with(idx), egui::Sense::click());
 
                                             // Draw selection/hover background for full row
                                             if is_selected {
@@ -9098,7 +9366,6 @@ impl eframe::App for RemoteGuiApp {
                     "switch" => {
                         self.current_world = idx;
                         self.selection_start = None; self.selection_end = None;
-                        self.output_dirty = true;
                         self.switch_world(idx);
                     }
                     "delete" => {
@@ -9128,7 +9395,6 @@ impl eframe::App for RemoteGuiApp {
                         };
                         self.worlds.push(new_world);
                         let new_idx = self.worlds.len() - 1;
-                        // Tell server to create the world too
                         if let Some(ref tx) = self.ws_tx {
                             let _ = tx.send(WsMessage::CreateWorld { name: new_name });
                         }

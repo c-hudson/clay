@@ -15,8 +15,6 @@ pub mod daemon;
 pub mod theme;
 #[cfg(all(feature = "remote-gui", not(target_os = "android")))]
 pub mod remote_gui;
-#[cfg(all(feature = "remote-gui", not(target_os = "android")))]
-pub mod remote_gui2;
 #[cfg(test)]
 pub mod testserver;
 #[cfg(test)]
@@ -8626,7 +8624,7 @@ async fn main() -> io::Result<()> {
         (true, Some(ref addr)) => {
             #[cfg(all(feature = "remote-gui", not(target_os = "android")))]
             {
-                return remote_gui2::run_remote_gui(addr);
+                return remote_gui::run_remote_gui(addr);
             }
             #[cfg(not(all(feature = "remote-gui", not(target_os = "android"))))]
             {
@@ -8638,7 +8636,7 @@ async fn main() -> io::Result<()> {
         (true, None) => {
             #[cfg(all(feature = "remote-gui", not(target_os = "android")))]
             {
-                return remote_gui2::run_master_gui();
+                return remote_gui::run_master_gui();
             }
             #[cfg(not(all(feature = "remote-gui", not(target_os = "android"))))]
             {

@@ -95,8 +95,12 @@ pub fn save_settings(app: &App) -> io::Result<()> {
     if !app.is_master {
         return Ok(());
     }
-    let path = get_settings_path();
-    let mut file = std::fs::File::create(&path)?;
+    save_settings_to_path(app, &get_settings_path())
+}
+
+/// Save settings to a specific path (used by tests)
+pub fn save_settings_to_path(app: &App, path: &std::path::Path) -> io::Result<()> {
+    let mut file = std::fs::File::create(path)?;
 
     // Save global settings
     writeln!(file, "[global]")?;
@@ -270,11 +274,16 @@ pub fn save_settings(app: &App) -> io::Result<()> {
 
 pub fn load_settings(app: &mut App) -> io::Result<()> {
     let path = get_settings_path();
+    load_settings_from_path(app, &path)
+}
+
+/// Load settings from a specific path (used by tests)
+pub fn load_settings_from_path(app: &mut App, path: &std::path::Path) -> io::Result<()> {
     if !path.exists() {
         return Ok(());
     }
 
-    let file = std::fs::File::open(&path)?;
+    let file = std::fs::File::open(path)?;
     let reader = std::io::BufReader::new(file);
 
     let mut current_world: Option<String> = None;
@@ -1104,6 +1113,7 @@ pub fn save_reload_state(app: &App) -> io::Result<()> {
     if !app.settings.dictionary_path.is_empty() {
         writeln!(file, "dictionary_path={}", app.settings.dictionary_path)?;
     }
+    writeln!(file, "editor_side={}", app.settings.editor_side.name())?;
 
     // Save input history (base64 encode each line to handle special chars)
     writeln!(file, "history_count={}", app.input.history.len())?;
@@ -1708,6 +1718,9 @@ pub fn load_reload_state(app: &mut App) -> io::Result<bool> {
                     "dictionary_path" => {
                         app.settings.dictionary_path = value.to_string();
                     }
+                    "editor_side" => {
+                        app.settings.editor_side = EditorSide::from_name(value);
+                    }
                     "history_count" | "world_count" => {
                         // These are informational, not needed for parsing
                     }
@@ -1867,4 +1880,261 @@ pub fn load_reload_state(app: &mut App) -> io::Result<bool> {
     let _ = std::fs::remove_file(&path);
 
     Ok(true)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Helper: set ALL Settings fields to non-default values.
+    /// Uses explicit struct construction — if a new field is added to Settings,
+    /// this function will fail to compile until updated here AND in the assertions.
+    fn make_non_default_settings() -> Settings {
+        Settings {
+            more_mode_enabled: false,          // default: true
+            spell_check_enabled: false,        // default: true
+            temp_convert_enabled: true,        // default: false
+            world_switch_mode: WorldSwitchMode::Alphabetical, // default: UnseenFirst
+            debug_enabled: true,               // default: false
+            ansi_music_enabled: false,         // default: true
+            theme: Theme::Light,               // default: Dark
+            gui_theme: Theme::Light,           // default: Dark
+            gui_transparency: 0.7,             // default: 1.0
+            color_offset_percent: 42,          // default: 0
+            font_name: "TestFont".to_string(), // default: ""
+            font_size: 18.0,                   // default: 14.0
+            web_font_size_phone: 12.0,         // default: 10.0
+            web_font_size_tablet: 16.0,        // default: 14.0
+            web_font_size_desktop: 20.0,       // default: 18.0
+            web_secure: true,                  // default: false
+            http_enabled: true,                // default: false
+            http_port: 8080,                   // default: 9000
+            ws_enabled: true,                  // default: false
+            ws_port: 8081,                     // default: 9001
+            websocket_password: "testpass".to_string(),     // default: ""
+            websocket_allow_list: "192.168.1.1".to_string(), // default: ""
+            websocket_whitelisted_host: Some("10.0.0.1".to_string()), // default: None (not persisted to .clay.dat)
+            websocket_cert_file: "/tmp/cert.pem".to_string(), // default: ""
+            websocket_key_file: "/tmp/key.pem".to_string(),   // default: ""
+            websocket_auth_keys: vec!["key1".to_string(), "key2".to_string()], // default: []
+            actions: vec![
+                {
+                    let mut a = Action::new();
+                    a.name = "test_action".to_string();
+                    a.pattern = "^test.*pattern$".to_string();
+                    a.command = "/echo matched".to_string();
+                    a.world = "testworld".to_string();
+                    a.match_type = crate::actions::MatchType::Wildcard;
+                    a.enabled = false;
+                    a.startup = true;
+                    a
+                },
+            ],
+            tls_proxy_enabled: true,           // default: false
+            dictionary_path: "/custom/dict".to_string(), // default: ""
+            editor_side: EditorSide::Right,    // default: Left
+        }
+    }
+
+    /// Helper: set ALL WorldSettings fields to non-default values.
+    fn make_non_default_world_settings() -> WorldSettings {
+        WorldSettings {
+            world_type: WorldType::Mud,
+            hostname: "mud.example.com".to_string(),
+            port: "4000".to_string(),
+            user: "testuser".to_string(),
+            password: "testpassword".to_string(),
+            use_ssl: true,                             // default: false
+            log_enabled: true,                         // default: false
+            encoding: Encoding::Latin1,                // default: Utf8
+            auto_connect_type: AutoConnectType::Prompt, // default: Connect
+            keep_alive_type: KeepAliveType::Custom,    // default: Nop
+            keep_alive_cmd: "keepalive_cmd".to_string(), // default: ""
+            slack_token: "slack_tok".to_string(),
+            slack_channel: "slack_chan".to_string(),
+            slack_workspace: "slack_ws".to_string(),
+            discord_token: "disc_tok".to_string(),
+            discord_guild: "disc_guild".to_string(),
+            discord_channel: "disc_chan".to_string(),
+            discord_dm_user: "disc_dm".to_string(),
+            notes: "test notes\nline two".to_string(),
+            gmcp_packages: "Custom.Package 1".to_string(), // default: "Client.Media 1"
+        }
+    }
+
+    /// Assert all Settings fields match between two instances.
+    /// Explicitly checks every field — if a new field is added, this must be updated.
+    fn assert_settings_match(a: &Settings, b: &Settings, context: &str) {
+        assert_eq!(a.more_mode_enabled, b.more_mode_enabled, "{context}: more_mode_enabled");
+        assert_eq!(a.spell_check_enabled, b.spell_check_enabled, "{context}: spell_check_enabled");
+        assert_eq!(a.temp_convert_enabled, b.temp_convert_enabled, "{context}: temp_convert_enabled");
+        assert_eq!(a.world_switch_mode.name(), b.world_switch_mode.name(), "{context}: world_switch_mode");
+        assert_eq!(a.debug_enabled, b.debug_enabled, "{context}: debug_enabled");
+        assert_eq!(a.ansi_music_enabled, b.ansi_music_enabled, "{context}: ansi_music_enabled");
+        assert_eq!(a.theme.name(), b.theme.name(), "{context}: theme");
+        assert_eq!(a.gui_theme.name(), b.gui_theme.name(), "{context}: gui_theme");
+        assert_eq!(a.gui_transparency, b.gui_transparency, "{context}: gui_transparency");
+        assert_eq!(a.color_offset_percent, b.color_offset_percent, "{context}: color_offset_percent");
+        assert_eq!(a.font_name, b.font_name, "{context}: font_name");
+        assert_eq!(a.font_size, b.font_size, "{context}: font_size");
+        assert_eq!(a.web_font_size_phone, b.web_font_size_phone, "{context}: web_font_size_phone");
+        assert_eq!(a.web_font_size_tablet, b.web_font_size_tablet, "{context}: web_font_size_tablet");
+        assert_eq!(a.web_font_size_desktop, b.web_font_size_desktop, "{context}: web_font_size_desktop");
+        assert_eq!(a.web_secure, b.web_secure, "{context}: web_secure");
+        assert_eq!(a.http_enabled, b.http_enabled, "{context}: http_enabled");
+        assert_eq!(a.http_port, b.http_port, "{context}: http_port");
+        assert_eq!(a.ws_enabled, b.ws_enabled, "{context}: ws_enabled");
+        assert_eq!(a.ws_port, b.ws_port, "{context}: ws_port");
+        assert_eq!(a.websocket_password, b.websocket_password, "{context}: websocket_password");
+        assert_eq!(a.websocket_allow_list, b.websocket_allow_list, "{context}: websocket_allow_list");
+        // websocket_whitelisted_host is not persisted to .clay.dat (runtime state)
+        assert_eq!(a.websocket_cert_file, b.websocket_cert_file, "{context}: websocket_cert_file");
+        assert_eq!(a.websocket_key_file, b.websocket_key_file, "{context}: websocket_key_file");
+        assert_eq!(a.websocket_auth_keys, b.websocket_auth_keys, "{context}: websocket_auth_keys");
+        assert_eq!(a.actions.len(), b.actions.len(), "{context}: actions.len()");
+        for (i, (aa, bb)) in a.actions.iter().zip(b.actions.iter()).enumerate() {
+            assert_eq!(aa.name, bb.name, "{context}: action[{i}].name");
+            assert_eq!(aa.pattern, bb.pattern, "{context}: action[{i}].pattern");
+            assert_eq!(aa.command, bb.command, "{context}: action[{i}].command");
+            assert_eq!(aa.world, bb.world, "{context}: action[{i}].world");
+            assert_eq!(aa.match_type, bb.match_type, "{context}: action[{i}].match_type");
+            assert_eq!(aa.enabled, bb.enabled, "{context}: action[{i}].enabled");
+            assert_eq!(aa.startup, bb.startup, "{context}: action[{i}].startup");
+        }
+        assert_eq!(a.tls_proxy_enabled, b.tls_proxy_enabled, "{context}: tls_proxy_enabled");
+        assert_eq!(a.dictionary_path, b.dictionary_path, "{context}: dictionary_path");
+        assert_eq!(a.editor_side.name(), b.editor_side.name(), "{context}: editor_side");
+    }
+
+    /// Assert all WorldSettings fields match between two instances.
+    fn assert_world_settings_match(a: &WorldSettings, b: &WorldSettings, context: &str) {
+        assert_eq!(a.world_type.name(), b.world_type.name(), "{context}: world_type");
+        assert_eq!(a.hostname, b.hostname, "{context}: hostname");
+        assert_eq!(a.port, b.port, "{context}: port");
+        assert_eq!(a.user, b.user, "{context}: user");
+        assert_eq!(a.password, b.password, "{context}: password");
+        assert_eq!(a.use_ssl, b.use_ssl, "{context}: use_ssl");
+        assert_eq!(a.log_enabled, b.log_enabled, "{context}: log_enabled");
+        assert_eq!(a.encoding.name(), b.encoding.name(), "{context}: encoding");
+        assert_eq!(a.auto_connect_type.name(), b.auto_connect_type.name(), "{context}: auto_connect_type");
+        assert_eq!(a.keep_alive_type.name(), b.keep_alive_type.name(), "{context}: keep_alive_type");
+        assert_eq!(a.keep_alive_cmd, b.keep_alive_cmd, "{context}: keep_alive_cmd");
+        assert_eq!(a.slack_token, b.slack_token, "{context}: slack_token");
+        assert_eq!(a.slack_channel, b.slack_channel, "{context}: slack_channel");
+        assert_eq!(a.slack_workspace, b.slack_workspace, "{context}: slack_workspace");
+        assert_eq!(a.discord_token, b.discord_token, "{context}: discord_token");
+        assert_eq!(a.discord_guild, b.discord_guild, "{context}: discord_guild");
+        assert_eq!(a.discord_channel, b.discord_channel, "{context}: discord_channel");
+        assert_eq!(a.discord_dm_user, b.discord_dm_user, "{context}: discord_dm_user");
+        assert_eq!(a.notes, b.notes, "{context}: notes");
+        assert_eq!(a.gmcp_packages, b.gmcp_packages, "{context}: gmcp_packages");
+    }
+
+    #[test]
+    fn test_settings_save_load_roundtrip() {
+        let tmp = std::env::temp_dir().join("clay_test_settings_roundtrip.dat");
+        // Ensure clean state
+        let _ = std::fs::remove_file(&tmp);
+
+        // Create app with non-default settings and a world
+        let mut app = App::new();
+        app.settings = make_non_default_settings();
+        app.input_height = 7; // non-default (default: 3)
+
+        // Add a world with non-default settings
+        let mut world = World::new("testworld");
+        world.settings = make_non_default_world_settings();
+        app.worlds.push(world);
+
+        // Save
+        save_settings_to_path(&app, &tmp).expect("save_settings_to_path failed");
+
+        // Load into fresh app
+        let mut loaded_app = App::new();
+        loaded_app.worlds.clear(); // load will create worlds
+        load_settings_from_path(&mut loaded_app, &tmp).expect("load_settings_from_path failed");
+
+        // Verify all global settings survived roundtrip
+        assert_settings_match(&app.settings, &loaded_app.settings, "save/load roundtrip");
+
+        // Verify input_height survived
+        assert_eq!(loaded_app.input_height, 7, "input_height");
+
+        // Verify world settings survived roundtrip
+        assert_eq!(loaded_app.worlds.len(), 1, "world count");
+        assert_eq!(loaded_app.worlds[0].name, "testworld", "world name");
+        assert_world_settings_match(
+            &app.worlds[0].settings,
+            &loaded_app.worlds[0].settings,
+            "world settings roundtrip",
+        );
+
+        // Cleanup
+        let _ = std::fs::remove_file(&tmp);
+    }
+
+    #[test]
+    fn test_settings_non_default_detection() {
+        // Verify that make_non_default_settings actually differs from defaults
+        // for every field that is persisted. This catches the case where
+        // make_non_default_settings uses a value that happens to equal the default.
+        let non_default = make_non_default_settings();
+        let default = Settings::default();
+
+        assert_ne!(non_default.more_mode_enabled, default.more_mode_enabled, "more_mode_enabled should differ");
+        assert_ne!(non_default.spell_check_enabled, default.spell_check_enabled, "spell_check_enabled should differ");
+        assert_ne!(non_default.temp_convert_enabled, default.temp_convert_enabled, "temp_convert_enabled should differ");
+        assert_ne!(non_default.world_switch_mode.name(), default.world_switch_mode.name(), "world_switch_mode should differ");
+        assert_ne!(non_default.debug_enabled, default.debug_enabled, "debug_enabled should differ");
+        assert_ne!(non_default.ansi_music_enabled, default.ansi_music_enabled, "ansi_music_enabled should differ");
+        assert_ne!(non_default.theme.name(), default.theme.name(), "theme should differ");
+        assert_ne!(non_default.gui_theme.name(), default.gui_theme.name(), "gui_theme should differ");
+        assert_ne!(non_default.gui_transparency, default.gui_transparency, "gui_transparency should differ");
+        assert_ne!(non_default.color_offset_percent, default.color_offset_percent, "color_offset_percent should differ");
+        assert_ne!(non_default.font_name, default.font_name, "font_name should differ");
+        assert_ne!(non_default.font_size, default.font_size, "font_size should differ");
+        assert_ne!(non_default.web_font_size_phone, default.web_font_size_phone, "web_font_size_phone should differ");
+        assert_ne!(non_default.web_font_size_tablet, default.web_font_size_tablet, "web_font_size_tablet should differ");
+        assert_ne!(non_default.web_font_size_desktop, default.web_font_size_desktop, "web_font_size_desktop should differ");
+        assert_ne!(non_default.web_secure, default.web_secure, "web_secure should differ");
+        assert_ne!(non_default.http_enabled, default.http_enabled, "http_enabled should differ");
+        assert_ne!(non_default.http_port, default.http_port, "http_port should differ");
+        assert_ne!(non_default.ws_enabled, default.ws_enabled, "ws_enabled should differ");
+        assert_ne!(non_default.ws_port, default.ws_port, "ws_port should differ");
+        assert_ne!(non_default.websocket_password, default.websocket_password, "websocket_password should differ");
+        assert_ne!(non_default.websocket_allow_list, default.websocket_allow_list, "websocket_allow_list should differ");
+        assert_ne!(non_default.websocket_cert_file, default.websocket_cert_file, "websocket_cert_file should differ");
+        assert_ne!(non_default.websocket_key_file, default.websocket_key_file, "websocket_key_file should differ");
+        assert!(!non_default.websocket_auth_keys.is_empty(), "websocket_auth_keys should be non-empty");
+        assert!(!non_default.actions.is_empty(), "actions should be non-empty");
+        assert_ne!(non_default.tls_proxy_enabled, default.tls_proxy_enabled, "tls_proxy_enabled should differ");
+        assert_ne!(non_default.dictionary_path, default.dictionary_path, "dictionary_path should differ");
+        assert_ne!(non_default.editor_side.name(), default.editor_side.name(), "editor_side should differ");
+    }
+
+    #[test]
+    fn test_world_settings_non_default_detection() {
+        let non_default = make_non_default_world_settings();
+        let default = WorldSettings::default();
+
+        assert_ne!(non_default.hostname, default.hostname, "hostname should differ");
+        assert_ne!(non_default.port, default.port, "port should differ");
+        assert_ne!(non_default.user, default.user, "user should differ");
+        assert_ne!(non_default.password, default.password, "password should differ");
+        assert_ne!(non_default.use_ssl, default.use_ssl, "use_ssl should differ");
+        assert_ne!(non_default.log_enabled, default.log_enabled, "log_enabled should differ");
+        assert_ne!(non_default.encoding.name(), default.encoding.name(), "encoding should differ");
+        assert_ne!(non_default.auto_connect_type.name(), default.auto_connect_type.name(), "auto_connect_type should differ");
+        assert_ne!(non_default.keep_alive_type.name(), default.keep_alive_type.name(), "keep_alive_type should differ");
+        assert_ne!(non_default.keep_alive_cmd, default.keep_alive_cmd, "keep_alive_cmd should differ");
+        assert_ne!(non_default.slack_token, default.slack_token, "slack_token should differ");
+        assert_ne!(non_default.slack_channel, default.slack_channel, "slack_channel should differ");
+        assert_ne!(non_default.slack_workspace, default.slack_workspace, "slack_workspace should differ");
+        assert_ne!(non_default.discord_token, default.discord_token, "discord_token should differ");
+        assert_ne!(non_default.discord_guild, default.discord_guild, "discord_guild should differ");
+        assert_ne!(non_default.discord_channel, default.discord_channel, "discord_channel should differ");
+        assert_ne!(non_default.discord_dm_user, default.discord_dm_user, "discord_dm_user should differ");
+        assert_ne!(non_default.notes, default.notes, "notes should differ");
+        assert_ne!(non_default.gmcp_packages, default.gmcp_packages, "gmcp_packages should differ");
+    }
 }

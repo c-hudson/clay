@@ -21,6 +21,8 @@
         statusDot: document.getElementById('status-dot'),
         worldName: document.getElementById('world-name'),
         statusMore: document.getElementById('status-more'),
+        moreLabel: document.getElementById('more-label'),
+        moreCount: document.getElementById('more-count'),
         activityIndicator: document.getElementById('activity-indicator'),
         activityCount: document.getElementById('activity-count'),
         statusTime: document.getElementById('status-time'),
@@ -3700,12 +3702,12 @@
             const fontSize = currentFontSize || 14;
             const lineHeight = fontSize * 1.2;
             const linesFromBottom = Math.floor((container.scrollHeight - container.scrollTop - container.clientHeight) / lineHeight);
-            elements.statusMore.textContent = 'Hist ' + formatCount(linesFromBottom);
-            elements.statusMore.className = 'status-more scrolled';
+            elements.moreLabel.textContent = 'History';
+            elements.moreCount.textContent = formatCount(linesFromBottom);
             elements.statusMore.style.display = '';
         } else if ((paused && pendingLines.length > 0) || serverPending > 0) {
-            elements.statusMore.textContent = 'More ' + formatCount(totalPending);
-            elements.statusMore.className = 'status-more paused';
+            elements.moreLabel.textContent = '\u23F8 More';
+            elements.moreCount.textContent = formatCount(totalPending);
             elements.statusMore.style.display = '';
         } else {
             elements.statusMore.style.display = 'none';

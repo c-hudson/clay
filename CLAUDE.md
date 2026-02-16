@@ -413,8 +413,7 @@ Prompts that are auto-answered are immediately cleared and not displayed in the 
 - `src/tf/bridge.rs` - Bridge between TF engine and App (command results → app actions)
 
 **Remote GUI:**
-- `src/remote_gui.rs` - Remote GUI client v1 (egui, WebSocket connection)
-- `src/remote_gui2.rs` - Remote GUI client v2 (egui, alternative implementation)
+- `src/remote_gui.rs` - Remote GUI client (egui, WebSocket connection)
 
 **Web Interface:**
 - `src/web/index.html` - Web interface HTML template
