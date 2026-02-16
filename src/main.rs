@@ -3728,19 +3728,41 @@ impl App {
         crate::util::calculate_prev_world(&world_info, from_index, self.settings.world_switch_mode)
     }
 
-    pub fn activity_count(&self) -> usize {
+    /// Activity count excluding a specific world (for per-client counts)
+    fn activity_count_excluding(&self, exclude_world: Option<usize>) -> usize {
         self.worlds
             .iter()
             .enumerate()
-            .filter(|(i, w)| *i != self.current_world_index && w.has_activity())
+            .filter(|(i, w)| Some(*i) != exclude_world && w.has_activity())
             .count()
     }
 
-    /// Broadcast current activity count to all WebSocket clients
+    pub fn activity_count(&self) -> usize {
+        self.activity_count_excluding(Some(self.current_world_index))
+    }
+
+    /// Send per-client activity counts to all WebSocket clients
+    /// Each client may be viewing a different world, so each gets a personalized count
     pub(crate) fn broadcast_activity(&self) {
-        self.ws_broadcast(WsMessage::ActivityUpdate {
-            count: self.activity_count(),
-        });
+        #[cfg(test)]
+        {
+            // Log console's activity count for test assertions
+            if let Ok(mut log) = self.ws_broadcast_log.lock() {
+                log.push(WsMessage::ActivityUpdate {
+                    count: self.activity_count(),
+                });
+            }
+        }
+        if let Some(ref server) = self.ws_server {
+            if let Ok(clients_guard) = server.clients.try_read() {
+                for client in clients_guard.values() {
+                    if client.authenticated {
+                        let count = self.activity_count_excluding(client.current_world);
+                        let _ = client.tx.send(WsMessage::ActivityUpdate { count });
+                    }
+                }
+            }
+        }
     }
 
     /// Discard the initial "fake" world if it exists and is not connected.
