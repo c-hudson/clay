@@ -130,6 +130,20 @@ impl GuiCachedNow {
     }
 }
 
+/// ANSI text style attributes tracked during SGR parsing
+#[derive(Clone, Default)]
+struct AnsiStyle {
+    bold: bool,
+    dim: bool,
+    italics: bool,
+    underline: bool,
+    blink: bool,
+    reverse: bool,
+    strikethrough: bool,
+    /// Whether blink text is currently visible (toggled by animation timer)
+    blink_visible: bool,
+}
+
 /// World settings for remote GUI
 #[derive(Clone, Default)]
 pub struct RemoteWorldSettings {
@@ -493,6 +507,10 @@ pub struct RemoteGuiApp {
     original_transparency: Option<f32>,
     /// Color offset percentage (0 = disabled, 1-100 = adjustment percentage)
     color_offset_percent: u8,
+    /// Blink animation phase (true = visible, toggles every ~500ms)
+    blink_visible: bool,
+    /// Last time blink state was toggled
+    blink_last_toggle: std::time::Instant,
     /// ANSI music enabled
     ansi_music_enabled: bool,
     /// TLS proxy enabled (for connection preservation over hot reload)
@@ -735,6 +753,8 @@ impl RemoteGuiApp {
             transparency: 1.0,
             original_transparency: None,
             color_offset_percent: 0,
+            blink_visible: true,
+            blink_last_toggle: std::time::Instant::now(),
             ansi_music_enabled: true,
             tls_proxy_enabled: false,
             dictionary_path: String::new(),
@@ -2514,6 +2534,64 @@ impl RemoteGuiApp {
         }
     }
 
+    /// Build an egui::TextFormat with the current ANSI style flags applied
+    fn make_text_format(
+        font_id: &egui::FontId,
+        fg_color: egui::Color32,
+        bg_color: egui::Color32,
+        theme_bg: egui::Color32,
+        style: &AnsiStyle,
+    ) -> egui::TextFormat {
+        // Apply dim: reduce brightness by 50%
+        let fg_color = if style.dim {
+            let [r, g, b, a] = fg_color.to_array();
+            egui::Color32::from_rgba_premultiplied(r / 2, g / 2, b / 2, a)
+        } else {
+            fg_color
+        };
+
+        // Apply reverse: swap fg and bg
+        let (fg_color, bg_color) = if style.reverse {
+            let effective_bg = if bg_color == egui::Color32::TRANSPARENT {
+                theme_bg
+            } else {
+                bg_color
+            };
+            (effective_bg, fg_color)
+        } else {
+            (fg_color, bg_color)
+        };
+
+        // Apply blink: hide text during off phase
+        let fg_color = if style.blink && !style.blink_visible {
+            bg_color // text becomes invisible (same as background)
+        } else {
+            fg_color
+        };
+
+        let underline = if style.underline {
+            egui::Stroke::new(1.0, fg_color)
+        } else {
+            egui::Stroke::NONE
+        };
+
+        let strikethrough = if style.strikethrough {
+            egui::Stroke::new(1.0, fg_color)
+        } else {
+            egui::Stroke::NONE
+        };
+
+        egui::TextFormat {
+            font_id: font_id.clone(),
+            color: fg_color,
+            background: bg_color,
+            italics: style.italics,
+            underline,
+            strikethrough,
+            ..Default::default()
+        }
+    }
+
     /// Append a segment to job, processing shade characters for proper color blending
     fn append_segment_with_shades(
         segment: &str,
@@ -2522,6 +2600,7 @@ impl RemoteGuiApp {
         bg_color: egui::Color32,
         theme_bg: egui::Color32,
         color_offset_percent: u8,
+        style: &AnsiStyle,
         job: &mut egui::text::LayoutJob,
     ) {
         // Apply color contrast adjustment if enabled
@@ -2529,12 +2608,7 @@ impl RemoteGuiApp {
 
         // If no shade characters, just append normally
         if !segment.chars().any(|c| c == '░' || c == '▒' || c == '▓') {
-            job.append(segment, 0.0, egui::TextFormat {
-                font_id: font_id.clone(),
-                color: fg_color,
-                background: bg_color,
-                ..Default::default()
-            });
+            job.append(segment, 0.0, Self::make_text_format(font_id, fg_color, bg_color, theme_bg, style));
             return;
         }
 
@@ -2558,15 +2632,12 @@ impl RemoteGuiApp {
             if shade_type != current_is_shade && !current_run.is_empty() {
                 // Flush current run
                 if let Some(shade_char) = current_is_shade {
-                    // Shade run - use blended color for background
-                    // The background rectangles will provide the visual color
                     let blended_color = match shade_char {
                         '░' => Self::blend_colors(fg_color, blend_bg, 0.25),
                         '▒' => Self::blend_colors(fg_color, blend_bg, 0.50),
                         '▓' => Self::blend_colors(fg_color, blend_bg, 0.75),
                         _ => fg_color,
                     };
-                    // Use spaces - the background rectangle painting will provide the color
                     let spaces: String = current_run.chars().map(|_| ' ').collect();
                     job.append(&spaces, 0.0, egui::TextFormat {
                         font_id: font_id.clone(),
@@ -2575,13 +2646,7 @@ impl RemoteGuiApp {
                         ..Default::default()
                     });
                 } else {
-                    // Regular run
-                    job.append(&current_run, 0.0, egui::TextFormat {
-                        font_id: font_id.clone(),
-                        color: fg_color,
-                        background: bg_color,
-                        ..Default::default()
-                    });
+                    job.append(&current_run, 0.0, Self::make_text_format(font_id, fg_color, bg_color, theme_bg, style));
                 }
                 current_run.clear();
             }
@@ -2599,7 +2664,6 @@ impl RemoteGuiApp {
                     '▓' => Self::blend_colors(fg_color, blend_bg, 0.75),
                     _ => fg_color,
                 };
-                // Use spaces - the background rectangle painting will provide the color
                 let spaces: String = current_run.chars().map(|_| ' ').collect();
                 job.append(&spaces, 0.0, egui::TextFormat {
                     font_id: font_id.clone(),
@@ -2608,18 +2672,13 @@ impl RemoteGuiApp {
                     ..Default::default()
                 });
             } else {
-                job.append(&current_run, 0.0, egui::TextFormat {
-                    font_id: font_id.clone(),
-                    color: fg_color,
-                    background: bg_color,
-                    ..Default::default()
-                });
+                job.append(&current_run, 0.0, Self::make_text_format(font_id, fg_color, bg_color, theme_bg, style));
             }
         }
     }
 
     /// Append ANSI-colored text to an existing LayoutJob
-    fn append_ansi_to_job(text: &str, default_color: egui::Color32, font_id: egui::FontId, job: &mut egui::text::LayoutJob, is_light_theme: bool, color_offset_percent: u8) {
+    fn append_ansi_to_job(text: &str, default_color: egui::Color32, font_id: egui::FontId, job: &mut egui::text::LayoutJob, is_light_theme: bool, color_offset_percent: u8, blink_visible: bool) {
         // Theme background for shade character blending
         let theme_bg = if is_light_theme {
             egui::Color32::from_rgb(255, 255, 255)
@@ -2629,7 +2688,7 @@ impl RemoteGuiApp {
 
         let mut current_color = default_color;
         let mut current_bg = egui::Color32::TRANSPARENT;
-        let mut bold = false;
+        let mut style = AnsiStyle { blink_visible, ..Default::default() };
         let mut chars = text.chars().peekable();
         let mut segment = String::new();
 
@@ -2637,7 +2696,7 @@ impl RemoteGuiApp {
             if c == '\x1b' && chars.peek() == Some(&'[') {
                 // Flush current segment
                 if !segment.is_empty() {
-                    Self::append_segment_with_shades(&segment, &font_id, current_color, current_bg, theme_bg, color_offset_percent, job);
+                    Self::append_segment_with_shades(&segment, &font_id, current_color, current_bg, theme_bg, color_offset_percent, &style, job);
                     segment.clear();
                 }
 
@@ -2666,27 +2725,38 @@ impl RemoteGuiApp {
                 let mut i = 0;
                 while i < parts.len() {
                     match parts[i].parse::<u8>().unwrap_or(0) {
-                        0 => { current_color = default_color; current_bg = egui::Color32::TRANSPARENT; bold = false; }
-                        1 => bold = true,
-                        22 => bold = false,
+                        0 => { current_color = default_color; current_bg = egui::Color32::TRANSPARENT; style.bold = false; style.dim = false; style.italics = false; style.underline = false; style.blink = false; style.reverse = false; style.strikethrough = false; }
+                        1 => style.bold = true,
+                        2 => style.dim = true,
+                        3 => style.italics = true,
+                        4 => style.underline = true,
+                        5 | 6 => style.blink = true,
+                        7 => style.reverse = true,
+                        9 => style.strikethrough = true,
+                        22 => { style.bold = false; style.dim = false; }
+                        23 => style.italics = false,
+                        24 => style.underline = false,
+                        25 => style.blink = false,
+                        27 => style.reverse = false,
+                        29 => style.strikethrough = false,
                         // Standard foreground colors (30-37) - Xubuntu Dark palette
                         // When bold is active, upgrade to bright variants (90-97)
-                        30 => current_color = if bold {
+                        30 => current_color = if style.bold {
                             egui::Color32::from_rgb(119, 119, 119)  // Bright Black #777777
                         } else {
                             egui::Color32::from_rgb(0, 0, 0)        // Black #000000
                         },
-                        31 => current_color = if bold {
+                        31 => current_color = if style.bold {
                             egui::Color32::from_rgb(255, 135, 135)  // Bright Red #ff8787
                         } else {
                             egui::Color32::from_rgb(170, 0, 0)      // Red #aa0000
                         },
-                        32 => current_color = if bold {
+                        32 => current_color = if style.bold {
                             egui::Color32::from_rgb(76, 230, 76)    // Bright Green #4ce64c
                         } else {
                             egui::Color32::from_rgb(68, 170, 68)    // Green #44aa44
                         },
-                        33 => current_color = if bold {
+                        33 => current_color = if style.bold {
                             if is_light_theme {
                                 egui::Color32::from_rgb(167, 163, 33)  // Bright Yellow (light)
                             } else {
@@ -2697,24 +2767,24 @@ impl RemoteGuiApp {
                         } else {
                             egui::Color32::from_rgb(170, 85, 0)  // Yellow #aa5500
                         },
-                        34 => current_color = if bold {
+                        34 => current_color = if style.bold {
                             egui::Color32::from_rgb(41, 95, 204)    // Bright Blue #295fcc
                         } else if is_light_theme {
                             egui::Color32::from_rgb(0, 43, 128)     // Darker blue for light theme
                         } else {
                             egui::Color32::from_rgb(0, 57, 170)     // Blue #0039aa
                         },
-                        35 => current_color = if bold {
+                        35 => current_color = if style.bold {
                             egui::Color32::from_rgb(204, 88, 204)   // Bright Magenta #cc58cc
                         } else {
                             egui::Color32::from_rgb(170, 34, 170)   // Magenta #aa22aa
                         },
-                        36 => current_color = if bold {
+                        36 => current_color = if style.bold {
                             egui::Color32::from_rgb(76, 204, 230)   // Bright Cyan #4ccce6
                         } else {
                             egui::Color32::from_rgb(26, 146, 170)   // Cyan #1a92aa
                         },
-                        37 => current_color = if bold {
+                        37 => current_color = if style.bold {
                             if is_light_theme {
                                 egui::Color32::from_rgb(40, 40, 40)     // Bright White (light)
                             } else {
@@ -2829,7 +2899,7 @@ impl RemoteGuiApp {
                 if let Some((r, g, b)) = Self::colored_square_rgb(c) {
                     // Flush current segment first
                     if !segment.is_empty() {
-                        Self::append_segment_with_shades(&segment, &font_id, current_color, current_bg, theme_bg, color_offset_percent, job);
+                        Self::append_segment_with_shades(&segment, &font_id, current_color, current_bg, theme_bg, color_offset_percent, &style, job);
                         segment.clear();
                     }
                     // Add two block characters with the emoji's color
@@ -2852,7 +2922,7 @@ impl RemoteGuiApp {
 
         // Flush remaining segment
         if !segment.is_empty() {
-            Self::append_segment_with_shades(&segment, &font_id, current_color, current_bg, theme_bg, color_offset_percent, job);
+            Self::append_segment_with_shades(&segment, &font_id, current_color, current_bg, theme_bg, color_offset_percent, &style, job);
         }
     }
 
@@ -3087,6 +3157,7 @@ impl RemoteGuiApp {
         is_light_theme: bool,
         link_color: egui::Color32,
         color_offset_percent: u8,
+        blink_visible: bool,
     ) {
         let segments = Self::parse_discord_segments(text);
         let available_width = ui.available_width();
@@ -3110,7 +3181,7 @@ impl RemoteGuiApp {
                                 },
                                 ..Default::default()
                             };
-                            Self::append_ansi_to_job(&txt_with_breaks, default_color, font_id.clone(), &mut job, is_light_theme, color_offset_percent);
+                            Self::append_ansi_to_job(&txt_with_breaks, default_color, font_id.clone(), &mut job, is_light_theme, color_offset_percent, blink_visible);
                             let galley = ui.fonts(|f| f.layout_job(job));
                             ui.label(galley);
                         }
@@ -3152,7 +3223,7 @@ impl RemoteGuiApp {
                     let urls = Self::find_urls(txt);
                     if urls.is_empty() {
                         let txt_with_breaks = Self::insert_word_breaks(txt);
-                        Self::append_ansi_to_job(&txt_with_breaks, default_color, font_id.clone(), &mut job, is_light_theme, color_offset_percent);
+                        Self::append_ansi_to_job(&txt_with_breaks, default_color, font_id.clone(), &mut job, is_light_theme, color_offset_percent, blink_visible);
                     } else {
                         let char_to_byte: Vec<usize> = txt.char_indices().map(|(i, _)| i).collect();
                         let txt_char_count = char_to_byte.len();
@@ -3163,7 +3234,7 @@ impl RemoteGuiApp {
                                 let start_byte = char_to_byte.get(last_end_char).copied().unwrap_or(0);
                                 let end_byte = char_to_byte.get(start_char).copied().unwrap_or(txt.len());
                                 let before = Self::insert_word_breaks(&txt[start_byte..end_byte]);
-                                Self::append_ansi_to_job(&before, default_color, font_id.clone(), &mut job, is_light_theme, color_offset_percent);
+                                Self::append_ansi_to_job(&before, default_color, font_id.clone(), &mut job, is_light_theme, color_offset_percent, blink_visible);
                             }
 
                             let clean_url = crate::util::strip_ansi_codes(&url);
@@ -3185,7 +3256,7 @@ impl RemoteGuiApp {
                         if last_end_char < txt_char_count {
                             let start_byte = char_to_byte.get(last_end_char).copied().unwrap_or(txt.len());
                             let after = Self::insert_word_breaks(&txt[start_byte..]);
-                            Self::append_ansi_to_job(&after, default_color, font_id.clone(), &mut job, is_light_theme, color_offset_percent);
+                            Self::append_ansi_to_job(&after, default_color, font_id.clone(), &mut job, is_light_theme, color_offset_percent, blink_visible);
                         }
                     }
                 }
@@ -3274,6 +3345,18 @@ impl eframe::App for RemoteGuiApp {
             }
             ctx.request_repaint_after(std::time::Duration::from_millis(100));
         }
+
+        // Blink animation: toggle every 500ms
+        if self.blink_last_toggle.elapsed() >= std::time::Duration::from_millis(500) {
+            self.blink_visible = !self.blink_visible;
+            self.blink_last_toggle = std::time::Instant::now();
+            self.output_dirty = true;
+            ctx.request_repaint();
+        }
+        // Schedule repaint for next blink toggle
+        let time_since_toggle = self.blink_last_toggle.elapsed();
+        let next_toggle = std::time::Duration::from_millis(500).saturating_sub(time_since_toggle);
+        ctx.request_repaint_after(next_toggle);
 
         // Apply theme to egui visuals (clone to avoid borrowing self)
         let theme = self.theme.clone();
@@ -5087,7 +5170,7 @@ impl eframe::App for RemoteGuiApp {
                                 };
                                 // Apply word breaks for long words
                                 let line_text = Self::insert_word_breaks(&line_text);
-                                Self::append_ansi_to_job(&line_text, default_color, font_id.clone(), &mut combined_job, is_light_theme, self.color_offset_percent);
+                                Self::append_ansi_to_job(&line_text, default_color, font_id.clone(), &mut combined_job, is_light_theme, self.color_offset_percent, self.blink_visible);
 
                                 if i < display_lines.len() - 1 {
                                     combined_job.append("\n", 0.0, egui::TextFormat {
@@ -5164,6 +5247,7 @@ impl eframe::App for RemoteGuiApp {
                     let emoji_link_color = theme.link();
                     let emoji_plain_text = self.cached_plain_text.clone();
                     let emoji_color_offset = self.color_offset_percent;
+                    let emoji_blink_visible = self.blink_visible;
 
                     let scroll_output = scroll_area.show(ui, |ui| {
                             ui.set_width(ui.available_width());
@@ -5182,6 +5266,7 @@ impl eframe::App for RemoteGuiApp {
                                         emoji_is_light,
                                         emoji_link_color,
                                         emoji_color_offset,
+                                        emoji_blink_visible,
                                     );
                                 }
 
