@@ -391,6 +391,12 @@ pub struct RemoteGuiApp {
     font_name: String,
     /// Font size in points
     font_size: f32,
+    /// Font tweak: scale factor (default 1.05)
+    font_scale: f32,
+    /// Font tweak: vertical offset factor (default -0.02)
+    font_y_offset: f32,
+    /// Font tweak: baseline offset factor (default 0.0)
+    font_baseline_offset: f32,
     /// Web interface font sizes (passed through to web clients)
     web_font_size_phone: f32,
     web_font_size_tablet: f32,
@@ -399,8 +405,16 @@ pub struct RemoteGuiApp {
     edit_font_name: String,
     /// Temp field for font size editor
     edit_font_size: String,
+    /// Temp fields for font tweak editor
+    edit_font_scale: String,
+    edit_font_y_offset: String,
+    edit_font_baseline_offset: String,
     /// Last loaded font name (to avoid reloading)
     loaded_font_name: String,
+    /// Last loaded font tweak values (to detect changes)
+    loaded_font_scale: f32,
+    loaded_font_y_offset: f32,
+    loaded_font_baseline_offset: f32,
     /// Command history
     command_history: Vec<String>,
     /// Current position in command history (0 = current input, 1+ = history)
@@ -664,12 +678,21 @@ impl RemoteGuiApp {
             reload_reconnect_attempts: 0,
             font_name: String::new(),
             font_size: 14.0,
+            font_scale: 1.05,
+            font_y_offset: -0.02,
+            font_baseline_offset: 0.0,
             web_font_size_phone: 10.0,
             web_font_size_tablet: 14.0,
             web_font_size_desktop: 18.0,
             edit_font_name: String::new(),
             edit_font_size: String::from("14.0"),
+            edit_font_scale: String::from("1.05"),
+            edit_font_y_offset: String::from("-0.02"),
+            edit_font_baseline_offset: String::from("0.00"),
             loaded_font_name: String::from("__uninitialized__"),
+            loaded_font_scale: 0.0,
+            loaded_font_y_offset: 0.0,
+            loaded_font_baseline_offset: 0.0,
             command_history: Vec::new(),
             history_index: 0,
             saved_input: String::new(),
@@ -791,6 +814,9 @@ impl RemoteGuiApp {
                     "gui_theme" => self.theme = GuiTheme::from_name(value),
                     "font_size" => if let Ok(v) = value.parse::<f32>() { self.font_size = v; },
                     "font_name" => self.font_name = value.to_string(),
+                    "font_scale" => if let Ok(v) = value.parse::<f32>() { self.font_scale = v; },
+                    "font_y_offset" => if let Ok(v) = value.parse::<f32>() { self.font_y_offset = v; },
+                    "font_baseline_offset" => if let Ok(v) = value.parse::<f32>() { self.font_baseline_offset = v; },
                     "input_height" => if let Ok(v) = value.parse::<u16>() { self.input_height = v; },
                     "transparency" => if let Ok(v) = value.parse::<f32>() { self.transparency = v; },
                     "color_offset_percent" => if let Ok(v) = value.parse::<u8>() { self.color_offset_percent = v; },
@@ -814,12 +840,18 @@ impl RemoteGuiApp {
              gui_theme = {}\n\
              font_size = {}\n\
              font_name = {}\n\
+             font_scale = {}\n\
+             font_y_offset = {}\n\
+             font_baseline_offset = {}\n\
              input_height = {}\n\
              transparency = {}\n\
              color_offset_percent = {}\n",
             self.theme.to_string_value(),
             self.font_size,
             self.font_name,
+            self.font_scale,
+            self.font_y_offset,
+            self.font_baseline_offset,
             self.input_height,
             self.transparency,
             self.color_offset_percent,
@@ -3303,22 +3335,28 @@ impl eframe::App for RemoteGuiApp {
         style.spacing.item_spacing.y = 0.0;
         ctx.set_style(style);
 
-        // Load custom font if font name changed
-        if self.loaded_font_name != self.font_name {
+        // Load custom font if font name or tweaks changed
+        let tweaks_changed = self.loaded_font_scale != self.font_scale
+            || self.loaded_font_y_offset != self.font_y_offset
+            || self.loaded_font_baseline_offset != self.font_baseline_offset;
+        if self.loaded_font_name != self.font_name || tweaks_changed {
             self.loaded_font_name = self.font_name.clone();
+            self.loaded_font_scale = self.font_scale;
+            self.loaded_font_y_offset = self.font_y_offset;
+            self.loaded_font_baseline_offset = self.font_baseline_offset;
 
             let mut fonts = egui::FontDefinitions::default();
 
             if !self.font_name.is_empty() {
                 // Try to load the system font
                 if let Some(font_data) = Self::find_system_font(&self.font_name) {
-                    // Add the custom font with tweaks for tighter line spacing (ASCII art)
+                    // Add the custom font with user-configurable tweaks
                     let font_data = egui::FontData::from_owned(font_data).tweak(
                         egui::FontTweak {
-                            scale: 1.05,              // Slightly larger to fill row height
-                            y_offset_factor: -0.02,   // Move up slightly to reduce gaps
+                            scale: self.font_scale,
+                            y_offset_factor: self.font_y_offset,
                             y_offset: 0.0,
-                            baseline_offset_factor: 0.0,
+                            baseline_offset_factor: self.font_baseline_offset,
                         }
                     );
                     fonts.font_data.insert(
@@ -3339,8 +3377,23 @@ impl eframe::App for RemoteGuiApp {
                         .insert(0, "custom_mono".to_owned());
                 }
             }
-            // Load symbol fonts for Unicode/emoji coverage
-            // NotoSansSymbols2 has geometric shapes including colored square emoji
+            // Load FreeMono before NotoEmoji-Regular in the fallback chain.
+            // FreeMono has a proper sparkles glyph for ✨; NotoEmoji-Regular renders it as a diamond.
+            // Default monospace chain is [Hack, Ubuntu-Light, NotoEmoji-Regular, emoji-icon-font].
+            // We insert FreeMono before NotoEmoji-Regular so it gets priority for ✨.
+            if let Ok(font_data) = std::fs::read("/usr/share/fonts/truetype/freefont/FreeMono.ttf") {
+                fonts.font_data.insert("freemono".to_owned(), egui::FontData::from_owned(font_data));
+                // Insert before NotoEmoji-Regular in monospace chain
+                let mono_family = fonts.families.entry(egui::FontFamily::Monospace).or_default();
+                if let Some(pos) = mono_family.iter().position(|n| n == "NotoEmoji-Regular") {
+                    mono_family.insert(pos, "freemono".to_owned());
+                } else {
+                    mono_family.push("freemono".to_owned());
+                }
+                fonts.families.entry(egui::FontFamily::Proportional).or_default().push("freemono".to_owned());
+            }
+
+            // Load additional symbol fonts for Unicode/emoji coverage
             let symbol_fonts: &[(&str, &str)] = &[
                 ("symbols2", "/usr/share/fonts/truetype/noto/NotoSansSymbols2-Regular.ttf"),
                 ("symbols", "/usr/share/fonts/truetype/noto/NotoSansSymbols-Regular.ttf"),
@@ -3917,7 +3970,10 @@ impl eframe::App for RemoteGuiApp {
                 Some("web") => self.popup_state = PopupState::Web,
                 Some("font") => {
                     self.edit_font_name = self.font_name.clone();
-                    self.edit_font_size = self.font_size.to_string();
+                    self.edit_font_size = format!("{:.1}", self.font_size);
+                    self.edit_font_scale = format!("{:.2}", self.font_scale);
+                    self.edit_font_y_offset = format!("{:.2}", self.font_y_offset);
+                    self.edit_font_baseline_offset = format!("{:.2}", self.font_baseline_offset);
                     self.popup_state = PopupState::Font;
                     self.popup_scroll_to_selected = true;
                 }
@@ -4340,6 +4396,9 @@ impl eframe::App for RemoteGuiApp {
                                     if cmd.trim().eq_ignore_ascii_case("/font") {
                                         self.edit_font_name = self.font_name.clone();
                                         self.edit_font_size = format!("{:.1}", self.font_size);
+                                        self.edit_font_scale = format!("{:.2}", self.font_scale);
+                                        self.edit_font_y_offset = format!("{:.2}", self.font_y_offset);
+                                        self.edit_font_baseline_offset = format!("{:.2}", self.font_baseline_offset);
                                         self.popup_state = PopupState::Font;
                                         self.popup_scroll_to_selected = true;
                                     } else {
@@ -4657,8 +4716,8 @@ impl eframe::App for RemoteGuiApp {
                 // Position menu: bottom edge at separator bar top, left edge at hamburger button
                 let bar_top = ctx.screen_rect().height() - 34.0 - input_height;
                 let menu_width = 195.0;
-                // 8 items × 24px + 3 separators × 6px + 12px inner margin padding
-                let menu_height = 8.0 * 24.0 + 3.0 * 6.0 + 12.0;
+                // 9 items × 24px + 3 separators × 6px + 12px inner margin padding
+                let menu_height = 9.0 * 24.0 + 3.0 * 6.0 + 12.0;
                 let menu_pos = egui::pos2(8.0, (bar_top - menu_height + 2.0).max(2.0));
 
                 let mut close_menu = false;
@@ -4715,6 +4774,7 @@ impl eframe::App for RemoteGuiApp {
                         ui.separator();
                         if clicked(ui, "Settings", "Ctrl+S") { action = Some("setup"); close_menu = true; }
                         if clicked(ui, "Web Settings", "") { action = Some("web"); close_menu = true; }
+                        if clicked(ui, "Font", "") { action = Some("font"); close_menu = true; }
                         ui.separator();
                         if clicked(ui, "Toggle Tags", "F2") { action = Some("toggle_tags"); close_menu = true; }
                         if clicked(ui, "Search", "F4") { self.filter_active = !self.filter_active; close_menu = true; }
@@ -4771,6 +4831,15 @@ impl eframe::App for RemoteGuiApp {
                 Some("edit_current") => self.open_world_editor(self.current_world),
                 Some("setup") => self.popup_state = PopupState::Setup,
                 Some("web") => self.popup_state = PopupState::Web,
+                Some("font") => {
+                    self.edit_font_name = self.font_name.clone();
+                    self.edit_font_size = format!("{:.1}", self.font_size);
+                    self.edit_font_scale = format!("{:.2}", self.font_scale);
+                    self.edit_font_y_offset = format!("{:.2}", self.font_y_offset);
+                    self.edit_font_baseline_offset = format!("{:.2}", self.font_baseline_offset);
+                    self.popup_state = PopupState::Font;
+                    self.popup_scroll_to_selected = true;
+                }
                 Some("font_changed") => {
                     self.update_global_settings();
                 }
@@ -4966,8 +5035,8 @@ impl eframe::App for RemoteGuiApp {
                             } else {
                                 Self::strip_mud_tags_ansi(&line.text)
                             };
-                            // Replace ✨ emoji with yellow ** (egui monospace font can't render sparkles emoji)
-                            let base_line = base_line.replace("✨", "\x1b[33m**\x1b[0m");
+                            // Colorize ✨ emoji yellow (matches console terminal appearance)
+                            let base_line = base_line.replace("✨", "\x1b[33m✨\x1b[0m");
                             // Apply /highlight color from action command (takes priority)
                             if let Some(ref hl_color) = line.highlight_color {
                                 let bg_code = Self::color_name_to_ansi_bg(hl_color);
@@ -7569,13 +7638,16 @@ impl eframe::App for RemoteGuiApp {
                 // Copy mutable state for viewport
                 let mut edit_font_name = self.edit_font_name.clone();
                 let mut edit_font_size = self.edit_font_size.clone();
+                let mut edit_font_scale = self.edit_font_scale.clone();
+                let mut edit_font_y_offset = self.edit_font_y_offset.clone();
+                let mut edit_font_baseline_offset = self.edit_font_baseline_offset.clone();
                 let scroll_to_selected = self.popup_scroll_to_selected;
 
                 ctx.show_viewport_immediate(
                     egui::ViewportId::from_hash_of("font_settings_window"),
                     egui::ViewportBuilder::default()
                         .with_title("Font Settings")
-                        .with_inner_size([380.0, 400.0]),
+                        .with_inner_size([380.0, 480.0]),
                     |ctx, _class| {
                         // Apply popup styling
                         ctx.style_mut(|style| {
@@ -7742,6 +7814,52 @@ impl eframe::App for RemoteGuiApp {
                                         }
                                     }
                                 });
+
+                                ui.add_space(16.0);
+
+                                // Font tweaks section
+                                ui.label(egui::RichText::new("Font tweaks").size(12.0).color(theme.fg_secondary()));
+                                ui.add_space(4.0);
+
+                                // Helper for tweak rows with -/+ buttons
+                                let tweak_row = |ui: &mut egui::Ui, label: &str, value: &mut String, step: f32, min: f32, max: f32| {
+                                    ui.horizontal(|ui| {
+                                        ui.label(egui::RichText::new(label).size(11.0).color(theme.fg_muted())
+                                            .family(egui::FontFamily::Monospace));
+                                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                            ui.spacing_mut().item_spacing = egui::vec2(4.0, 0.0);
+                                            if ui.add(egui::Button::new(
+                                                egui::RichText::new("+").size(11.0).color(theme.fg_secondary()))
+                                                .fill(theme.bg_hover())
+                                                .stroke(egui::Stroke::new(1.0, theme.border_medium()))
+                                                .rounding(egui::Rounding::same(4.0))
+                                                .min_size(egui::vec2(24.0, 22.0))
+                                            ).clicked() {
+                                                if let Ok(v) = value.parse::<f32>() {
+                                                    *value = format!("{:.2}", (v + step).min(max));
+                                                }
+                                            }
+                                            ui.add(egui::TextEdit::singleline(value)
+                                                .desired_width(50.0)
+                                                .margin(egui::vec2(6.0, 4.0)));
+                                            if ui.add(egui::Button::new(
+                                                egui::RichText::new("-").size(11.0).color(theme.fg_secondary()))
+                                                .fill(theme.bg_hover())
+                                                .stroke(egui::Stroke::new(1.0, theme.border_medium()))
+                                                .rounding(egui::Rounding::same(4.0))
+                                                .min_size(egui::vec2(24.0, 22.0))
+                                            ).clicked() {
+                                                if let Ok(v) = value.parse::<f32>() {
+                                                    *value = format!("{:.2}", (v - step).max(min));
+                                                }
+                                            }
+                                        });
+                                    });
+                                };
+
+                                tweak_row(ui, "Scale",    &mut edit_font_scale,           0.05, 0.50, 2.00);
+                                tweak_row(ui, "Y Offset", &mut edit_font_y_offset,         0.01, -0.50, 0.50);
+                                tweak_row(ui, "Baseline", &mut edit_font_baseline_offset,   0.01, -0.50, 0.50);
                         });
                     },
                 );
@@ -7749,6 +7867,9 @@ impl eframe::App for RemoteGuiApp {
                 // Apply changes back to self
                 self.edit_font_name = edit_font_name;
                 self.edit_font_size = edit_font_size;
+                self.edit_font_scale = edit_font_scale;
+                self.edit_font_y_offset = edit_font_y_offset;
+                self.edit_font_baseline_offset = edit_font_baseline_offset;
                 self.popup_scroll_to_selected = false;
 
                 if should_save {
@@ -7757,8 +7878,18 @@ impl eframe::App for RemoteGuiApp {
                     if let Ok(size) = self.edit_font_size.parse::<f32>() {
                         self.font_size = size.clamp(8.0, 48.0);
                     }
-                    // Send updated settings to server
+                    if let Ok(v) = self.edit_font_scale.parse::<f32>() {
+                        self.font_scale = v.clamp(0.50, 2.00);
+                    }
+                    if let Ok(v) = self.edit_font_y_offset.parse::<f32>() {
+                        self.font_y_offset = v.clamp(-0.50, 0.50);
+                    }
+                    if let Ok(v) = self.edit_font_baseline_offset.parse::<f32>() {
+                        self.font_baseline_offset = v.clamp(-0.50, 0.50);
+                    }
+                    // Send updated settings to server and save locally
                     self.update_global_settings();
+                    self.save_remote_settings();
                     close_popup = true;
                 } else if should_close {
                     close_popup = true;
