@@ -437,6 +437,8 @@ pub struct RemoteGuiApp {
     saved_input: String,
     /// Manual scroll offset for output (None = auto-scroll to bottom)
     scroll_offset: Option<f32>,
+    /// One-time scroll jump target (consumed after one frame of rendering)
+    scroll_jump_to: Option<f32>,
     /// Maximum scroll offset (content height - viewport height)
     scroll_max_offset: f32,
     /// Show MUD tags
@@ -715,6 +717,7 @@ impl RemoteGuiApp {
             history_index: 0,
             saved_input: String::new(),
             scroll_offset: None,
+            scroll_jump_to: None,
             scroll_max_offset: 0.0,
             show_tags: false,
             highlight_actions: false,
@@ -3756,6 +3759,7 @@ impl eframe::App for RemoteGuiApp {
                                 }
                             }
                             self.scroll_offset = None; // Scroll to bottom
+                            self.scroll_jump_to = Some(self.scroll_max_offset);
                         }
                         // Note: Ctrl+Up/Down are handled by first ctrl block, letting egui TextEdit
                         // handle cursor movement in multi-line input if not consumed
@@ -3799,14 +3803,17 @@ impl eframe::App for RemoteGuiApp {
                                 }
                                 // Scroll to bottom
                                 self.scroll_offset = None;
+                                self.scroll_jump_to = Some(self.scroll_max_offset);
                             } else if self.scroll_offset.is_some() {
                                 // Viewing history - scroll down like PgDn
                                 if let Some(offset) = self.scroll_offset {
                                     let new_offset = offset + 300.0;
                                     if new_offset >= self.scroll_max_offset - 10.0 {
                                         self.scroll_offset = None; // Snap to bottom
+                                        self.scroll_jump_to = Some(self.scroll_max_offset);
                                     } else {
                                         self.scroll_offset = Some(new_offset);
+                                        self.scroll_jump_to = Some(new_offset);
                                     }
                                 }
                             }
@@ -3995,10 +4002,12 @@ impl eframe::App for RemoteGuiApp {
                         if let Some(offset) = self.scroll_offset {
                             let new_offset = (offset - 300.0).max(0.0);
                             self.scroll_offset = Some(new_offset);
+                            self.scroll_jump_to = Some(new_offset);
                         } else {
                             // Currently at bottom, start scrolling up from max offset
                             let new_offset = (self.scroll_max_offset - 300.0).max(0.0);
                             self.scroll_offset = Some(new_offset);
+                            self.scroll_jump_to = Some(new_offset);
                         }
                     } else {
                         // Scroll down (PageDown) - increase offset to show newer content
@@ -4007,8 +4016,10 @@ impl eframe::App for RemoteGuiApp {
                             // If we're within one page of the bottom, snap to bottom
                             if new_offset >= self.scroll_max_offset - 10.0 {
                                 self.scroll_offset = None;
+                                self.scroll_jump_to = Some(self.scroll_max_offset);
                             } else {
                                 self.scroll_offset = Some(new_offset);
+                                self.scroll_jump_to = Some(new_offset);
                             }
                         }
                         // If scroll_offset is None, we're already at bottom, nothing to do
@@ -4612,7 +4623,7 @@ impl eframe::App for RemoteGuiApp {
 
                         if is_scrolled_back {
                             let lines_back = self.scroll_offset
-                                .map(|offset| (offset / 20.0).max(1.0) as usize)
+                                .map(|offset| ((self.scroll_max_offset - offset).max(0.0) / 20.0).max(1.0) as usize)
                                 .unwrap_or(0);
                             let count_str = if lines_back >= 10000 {
                                 format!("{}K", (lines_back / 1000).min(999))
@@ -4648,6 +4659,7 @@ impl eframe::App for RemoteGuiApp {
                                 if r1.clicked() || r2.clicked() {
                                     // Scroll to bottom (same as PageDown when viewing history)
                                     self.scroll_offset = None;
+                                    self.scroll_jump_to = Some(self.scroll_max_offset);
                                 }
                             });
                         } else if server_pending_count > 0 {
@@ -5222,8 +5234,8 @@ impl eframe::App for RemoteGuiApp {
                     let scroll_id = egui::Id::new(format!("output_scroll_{}", self.current_world));
                     let stick_to_bottom = self.scroll_offset.is_none() && !self.filter_active;
 
-                    // Apply scroll offset if set (from PageUp/PageDown)
-                    let scroll_delta = self.scroll_offset.take();
+                    // Apply scroll jump if set (one-time from PageUp/PageDown)
+                    let scroll_delta = self.scroll_jump_to.take();
 
                     let mut scroll_area = ScrollArea::vertical()
                         .id_source(scroll_id)
@@ -5833,7 +5845,7 @@ impl eframe::App for RemoteGuiApp {
                         // At or near bottom
                         self.scroll_offset = None;
                     } else if self.scroll_offset.is_some() {
-                        // Clamp our tracked offset to valid range
+                        // Track actual scroll position (may differ from jump target due to mouse wheel)
                         self.scroll_offset = Some(current_offset.clamp(0.0, max_offset));
                     }
                 }
