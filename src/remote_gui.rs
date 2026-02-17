@@ -513,6 +513,8 @@ pub struct RemoteGuiApp {
     blink_visible: bool,
     /// Last time blink state was toggled
     blink_last_toggle: std::time::Instant,
+    /// Whether the current output contains any blink text (avoids unnecessary rebuilds)
+    has_blink_text: bool,
     /// ANSI music enabled
     ansi_music_enabled: bool,
     /// TLS proxy enabled (for connection preservation over hot reload)
@@ -758,6 +760,7 @@ impl RemoteGuiApp {
             color_offset_percent: 0,
             blink_visible: true,
             blink_last_toggle: std::time::Instant::now(),
+            has_blink_text: false,
             ansi_music_enabled: true,
             tls_proxy_enabled: false,
             dictionary_path: String::new(),
@@ -3349,17 +3352,18 @@ impl eframe::App for RemoteGuiApp {
             ctx.request_repaint_after(std::time::Duration::from_millis(100));
         }
 
-        // Blink animation: toggle every 500ms
-        if self.blink_last_toggle.elapsed() >= std::time::Duration::from_millis(500) {
-            self.blink_visible = !self.blink_visible;
-            self.blink_last_toggle = std::time::Instant::now();
-            self.output_dirty = true;
-            ctx.request_repaint();
+        // Blink animation: toggle every 500ms (only when blink text exists)
+        if self.has_blink_text {
+            if self.blink_last_toggle.elapsed() >= std::time::Duration::from_millis(500) {
+                self.blink_visible = !self.blink_visible;
+                self.blink_last_toggle = std::time::Instant::now();
+                self.output_dirty = true;
+                ctx.request_repaint();
+            }
+            let time_since_toggle = self.blink_last_toggle.elapsed();
+            let next_toggle = std::time::Duration::from_millis(500).saturating_sub(time_since_toggle);
+            ctx.request_repaint_after(next_toggle);
         }
-        // Schedule repaint for next blink toggle
-        let time_since_toggle = self.blink_last_toggle.elapsed();
-        let next_toggle = std::time::Duration::from_millis(500).saturating_sub(time_since_toggle);
-        ctx.request_repaint_after(next_toggle);
 
         // Apply theme to egui visuals (clone to avoid borrowing self)
         let theme = self.theme.clone();
@@ -5197,6 +5201,11 @@ impl eframe::App for RemoteGuiApp {
                         // Cache the results
                         self.cached_output_job = Some(combined_job);
                         self.cached_plain_text = plain_text;
+                        self.has_blink_text = display_lines.iter().any(|line| {
+                            line.contains("\x1b[5m") || line.contains("\x1b[6m")
+                                || line.contains(";5m") || line.contains(";6m")
+                                || line.contains(";5;") || line.contains(";6;")
+                        });
                         self.cached_display_lines = display_lines;
                         self.cached_has_emojis = has_any_discord_emojis;
                         self.cached_output_width = available_width;
