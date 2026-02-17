@@ -3321,6 +3321,14 @@ impl RemoteGuiApp {
 }
 
 impl eframe::App for RemoteGuiApp {
+    fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
+        // Use transparent clear color so window transparency works
+        let theme = self.theme.clone();
+        let bg = theme.bg();
+        let a = self.transparency;
+        [bg.r() as f32 / 255.0, bg.g() as f32 / 255.0, bg.b() as f32 / 255.0, a]
+    }
+
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         // Skip rendering until screen has valid dimensions
         // This prevents NaN panics from egui layout calculations on startup
@@ -4118,7 +4126,10 @@ impl eframe::App for RemoteGuiApp {
                 String::new()
             };
 
-            let input_bg = theme.bg();
+            let input_bg = {
+                let c = theme.bg();
+                egui::Color32::from_rgba_unmultiplied(c.r(), c.g(), c.b(), alpha)
+            };
             egui::TopBottomPanel::bottom("input_panel")
                 .exact_height(input_height)
                 .frame(egui::Frame::none()
@@ -4522,7 +4533,7 @@ impl eframe::App for RemoteGuiApp {
             let separator_bg = theme.status_bar_bg();
             let separator_bg_transparent = egui::Color32::from_rgba_unmultiplied(separator_bg.r(), separator_bg.g(), separator_bg.b(), alpha);
             egui::TopBottomPanel::bottom("separator_bar")
-                .exact_height(34.0)
+                .exact_height(27.0)
                 .frame(egui::Frame::none()
                     .fill(separator_bg_transparent)
                     .inner_margin(egui::Margin::symmetric(10.0, 0.0))
@@ -4990,7 +5001,10 @@ impl eframe::App for RemoteGuiApp {
             }
 
             // Main output area with scrollbar (no frame/border/margin)
-            let bg = theme.bg();
+            let bg = {
+                let c = theme.bg();
+                egui::Color32::from_rgba_unmultiplied(c.r(), c.g(), c.b(), alpha)
+            };
             egui::CentralPanel::default()
                 .frame(egui::Frame::none()
                     .fill(bg)
@@ -9740,7 +9754,8 @@ pub fn run(addr: &str, runtime: tokio::runtime::Handle) -> io::Result<()> {
 
     let mut viewport = egui::ViewportBuilder::default()
         .with_inner_size([800.0, 600.0])
-        .with_title("Clay Mud Client");
+        .with_title("Clay Mud Client")
+        .with_transparent(true);
 
     // Set window icon from embedded PNG
     if let Some(icon) = load_app_icon() {
@@ -9803,7 +9818,8 @@ pub fn run_master_gui() -> std::io::Result<()> {
     // Run the GUI on the main thread (required by eframe/windowing systems)
     let mut viewport = egui::ViewportBuilder::default()
         .with_inner_size([800.0, 600.0])
-        .with_title("Clay Mud Client");
+        .with_title("Clay Mud Client")
+        .with_transparent(true);
 
     // Set window icon from embedded PNG
     if let Some(icon) = load_app_icon() {
