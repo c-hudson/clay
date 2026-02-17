@@ -4542,7 +4542,7 @@ impl eframe::App for RemoteGuiApp {
                             let badge_height = fs_badge * 1.6;
                             ui.horizontal_centered(|ui| {
                                 ui.spacing_mut().item_spacing.x = 0.0;
-                                ui.add(egui::Button::new(
+                                let r1 = ui.add(egui::Button::new(
                                     egui::RichText::new(" History ").monospace().size(fs_badge).strong()
                                         .color(hist_text_color))
                                     .fill(hist_bg)
@@ -4551,8 +4551,8 @@ impl eframe::App for RemoteGuiApp {
                                         nw: 4.0, sw: 4.0, ne: 0.0, se: 0.0,
                                     })
                                     .min_size(egui::vec2(0.0, badge_height))
-                                    .sense(egui::Sense::hover()));
-                                ui.add(egui::Button::new(
+                                    .sense(egui::Sense::click()));
+                                let r2 = ui.add(egui::Button::new(
                                     egui::RichText::new(format!(" {} ", count_str)).monospace().size(fs_badge).strong()
                                         .color(hist_text_color))
                                     .fill(hist_num_bg)
@@ -4561,7 +4561,11 @@ impl eframe::App for RemoteGuiApp {
                                         nw: 0.0, sw: 0.0, ne: 4.0, se: 4.0,
                                     })
                                     .min_size(egui::vec2(0.0, badge_height))
-                                    .sense(egui::Sense::hover()));
+                                    .sense(egui::Sense::click()));
+                                if r1.clicked() || r2.clicked() {
+                                    // Scroll to bottom (same as PageDown when viewing history)
+                                    self.scroll_offset = None;
+                                }
                             });
                         } else if server_pending_count > 0 {
                             let count_str = if server_pending_count >= 1_000_000 {
@@ -4577,7 +4581,7 @@ impl eframe::App for RemoteGuiApp {
                             let badge_height = fs_badge * 1.6;
                             ui.horizontal_centered(|ui| {
                                 ui.spacing_mut().item_spacing.x = 0.0;
-                                ui.add(egui::Button::new(
+                                let r1 = ui.add(egui::Button::new(
                                     egui::RichText::new(" More ").monospace().size(fs_badge).strong()
                                         .color(more_text_color))
                                     .fill(more_bg)
@@ -4586,8 +4590,8 @@ impl eframe::App for RemoteGuiApp {
                                         nw: 4.0, sw: 4.0, ne: 0.0, se: 0.0,
                                     })
                                     .min_size(egui::vec2(0.0, badge_height))
-                                    .sense(egui::Sense::hover()));
-                                ui.add(egui::Button::new(
+                                    .sense(egui::Sense::click()));
+                                let r2 = ui.add(egui::Button::new(
                                     egui::RichText::new(format!(" {} ", count_str)).monospace().size(fs_badge).strong()
                                         .color(more_text_color))
                                     .fill(more_num_bg)
@@ -4596,7 +4600,17 @@ impl eframe::App for RemoteGuiApp {
                                         nw: 0.0, sw: 0.0, ne: 4.0, se: 4.0,
                                     })
                                     .min_size(egui::vec2(0.0, badge_height))
-                                    .sense(egui::Sense::hover()));
+                                    .sense(egui::Sense::click()));
+                                if r1.clicked() || r2.clicked() {
+                                    // Release one screenful of pending lines (same as Tab)
+                                    let release_count = self.output_visible_lines.saturating_sub(2).max(1);
+                                    if let Some(ref tx) = self.ws_tx {
+                                        let _ = tx.send(WsMessage::ReleasePending {
+                                            world_index: self.current_world,
+                                            count: release_count,
+                                        });
+                                    }
+                                }
                             });
                         }
 
@@ -4606,7 +4620,7 @@ impl eframe::App for RemoteGuiApp {
                             let badge_height = fs_badge * 1.6;
                             let act_response = ui.horizontal_centered(|ui| {
                                 ui.spacing_mut().item_spacing.x = 0.0;
-                                ui.add(egui::Button::new(
+                                let r1 = ui.add(egui::Button::new(
                                     egui::RichText::new(" Activity ").monospace().size(fs_badge).strong()
                                         .color(egui::Color32::BLACK))
                                     .fill(theme.activity_label_bg())
@@ -4615,8 +4629,8 @@ impl eframe::App for RemoteGuiApp {
                                         nw: 4.0, sw: 4.0, ne: 0.0, se: 0.0,
                                     })
                                     .min_size(egui::vec2(0.0, badge_height))
-                                    .sense(egui::Sense::hover()));
-                                ui.add(egui::Button::new(
+                                    .sense(egui::Sense::click()));
+                                let r2 = ui.add(egui::Button::new(
                                     egui::RichText::new(format!(" {} ", activity_count)).monospace().size(fs_badge).strong()
                                         .color(egui::Color32::BLACK))
                                     .fill(theme.activity_count_bg())
@@ -4625,7 +4639,13 @@ impl eframe::App for RemoteGuiApp {
                                         nw: 0.0, sw: 0.0, ne: 4.0, se: 4.0,
                                     })
                                     .min_size(egui::vec2(0.0, badge_height))
-                                    .sense(egui::Sense::hover()));
+                                    .sense(egui::Sense::click()));
+                                if r1.clicked() || r2.clicked() {
+                                    // Switch to world with activity (same as Down arrow)
+                                    if let Some(ref tx) = self.ws_tx {
+                                        let _ = tx.send(WsMessage::CalculateNextWorld { current_index: self.current_world });
+                                    }
+                                }
                             }).response;
                             act_response.on_hover_ui(|ui| {
                                 ui.label(egui::RichText::new("Worlds with activity:").strong());

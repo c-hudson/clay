@@ -5548,6 +5548,16 @@
             });
         }
 
+        // Click on More/History indicator to release pending lines
+        elements.statusMore.addEventListener('click', function() {
+            releaseScreenful();
+        });
+
+        // Click on Activity indicator to switch to world with activity
+        elements.activityIndicator.addEventListener('click', function() {
+            requestNextWorld();
+        });
+
         // Track whether we're at the bottom (for resize handling)
         let wasAtBottomBeforeResize = true;
 
