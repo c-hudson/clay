@@ -9353,11 +9353,37 @@ impl eframe::App for RemoteGuiApp {
                 let label_width = popup_state.definition.layout.label_width as f32;
                 let scroll_to_selected = self.popup_scroll_to_selected;
 
+                // Calculate height from content
+                let row_height = 28.0_f32;
+                let row_spacing = 8.0_f32;
+                let mut content_height = 0.0_f32;
+                for field in &popup_state.definition.fields {
+                    if !field.visible { continue; }
+                    let h = match &field.kind {
+                        crate::popup::FieldKind::MultilineText { visible_lines, .. } => {
+                            *visible_lines as f32 * 18.0 + 8.0
+                        }
+                        crate::popup::FieldKind::List { visible_height, headers, .. } => {
+                            let header = if headers.is_some() { row_height + row_spacing } else { 0.0 };
+                            header + *visible_height as f32 * (row_height + 2.0)
+                        }
+                        crate::popup::FieldKind::ScrollableContent { visible_height, .. } => {
+                            *visible_height as f32 * 18.0
+                        }
+                        _ => row_height,
+                    };
+                    content_height += h + row_spacing;
+                }
+                // Add space for buttons and margins
+                let buttons_height = if popup_state.definition.buttons.is_empty() { 0.0 } else { 48.0 };
+                let margins = 16.0 + 15.0; // top + bottom inner margin
+                let popup_height = (content_height + buttons_height + margins + 15.0).max(200.0);
+
                 ctx.show_viewport_immediate(
                     egui::ViewportId::from_hash_of(format!("unified_popup_{}", popup_id_str)),
                     egui::ViewportBuilder::default()
                         .with_title(format!("{} - Clay MUD Client", popup_title))
-                        .with_inner_size([min_width.max(400.0), 420.0])
+                        .with_inner_size([min_width.max(400.0), popup_height])
                         .with_resizable(true),
                     |ctx, _class| {
                         // Apply popup styling
@@ -9507,6 +9533,13 @@ impl eframe::App for RemoteGuiApp {
                             if btn_id == EDITOR_BTN_CANCEL {
                                 // Return to actions list
                                 self.open_actions_list_unified();
+                            } else if btn_id == EDITOR_BTN_DELETE {
+                                // Delete action - open confirm dialog
+                                if self.actions_selected < self.actions.len() {
+                                    let name = self.actions[self.actions_selected].name.clone();
+                                    let def = crate::popup::definitions::confirm::create_delete_action_dialog(&name);
+                                    self.unified_popup = Some(crate::popup::PopupState::new(def));
+                                }
                             } else if btn_id == EDITOR_BTN_SAVE {
                                 // Save action and return to list
                                 if let Some(ps) = &self.unified_popup {

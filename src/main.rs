@@ -6618,6 +6618,12 @@ fn handle_remote_client_key(
                     actions: app.settings.actions.clone()
                 });
             }
+            NewPopupAction::ActionEditorDelete { editing_index } => {
+                if editing_index < app.settings.actions.len() {
+                    let name = app.settings.actions[editing_index].name.clone();
+                    app.open_delete_action_confirm(&name, editing_index);
+                }
+            }
             NewPopupAction::WorldEditorSaved(settings) => {
                 // Update local world settings
                 let idx = settings.world_index;
@@ -7008,6 +7014,8 @@ enum NewPopupAction {
     ActionsListFilter,
     /// Action editor saved
     ActionEditorSave { action: Action, editing_index: Option<usize> },
+    /// Action editor delete requested
+    ActionEditorDelete { editing_index: usize },
     /// World editor saved
     WorldEditorSaved(Box<WorldEditorSettings>),
     /// World editor delete requested
@@ -7122,7 +7130,7 @@ fn handle_new_popup_key(app: &mut App, key: KeyEvent) -> NewPopupAction {
         ACTIONS_BTN_ADD, ACTIONS_BTN_EDIT, ACTIONS_BTN_DELETE, ACTIONS_BTN_CANCEL,
         EDITOR_FIELD_NAME, EDITOR_FIELD_WORLD, EDITOR_FIELD_MATCH_TYPE,
         EDITOR_FIELD_PATTERN, EDITOR_FIELD_COMMAND, EDITOR_FIELD_ENABLED, EDITOR_FIELD_STARTUP,
-        EDITOR_BTN_SAVE, EDITOR_BTN_CANCEL,
+        EDITOR_BTN_SAVE, EDITOR_BTN_CANCEL, EDITOR_BTN_DELETE,
     };
     use popup::definitions::world_editor::{
         WORLD_FIELD_NAME, WORLD_FIELD_TYPE, WORLD_FIELD_HOSTNAME, WORLD_FIELD_PORT,
@@ -8004,6 +8012,12 @@ fn handle_new_popup_key(app: &mut App, key: KeyEvent) -> NewPopupAction {
                             return NewPopupAction::ActionEditorSave { action, editing_index };
                         } else if state.is_button_focused(EDITOR_BTN_CANCEL) {
                             app.popup_manager.close();
+                        } else if state.is_button_focused(EDITOR_BTN_DELETE) {
+                            let editing_index = state.get_custom("editing_index").and_then(|s| s.parse::<usize>().ok());
+                            if let Some(idx) = editing_index {
+                                app.popup_manager.close();
+                                return NewPopupAction::ActionEditorDelete { editing_index: idx };
+                            }
                         }
                     } else if is_toggle || is_select {
                         state.toggle_current();
@@ -8111,6 +8125,10 @@ fn handle_new_popup_key(app: &mut App, key: KeyEvent) -> NewPopupAction {
                 }
                 Char('c') | Char('C') if !state.editing && !is_text_field => {
                     app.popup_manager.close();
+                }
+                Char('d') | Char('D') if !state.editing && !is_text_field => {
+                    // Delete shortcut
+                    state.select_button(EDITOR_BTN_DELETE);
                 }
                 Char(' ') if !state.editing && (is_toggle || is_select) => {
                     // Space toggles current toggle/select field
@@ -16377,6 +16395,12 @@ fn handle_key_event(key: KeyEvent, app: &mut App) -> KeyAction {
                         // Reopen actions list to show updated list
                         app.open_actions_list_popup();
                     }
+                }
+            }
+            NewPopupAction::ActionEditorDelete { editing_index } => {
+                if editing_index < app.settings.actions.len() {
+                    let name = app.settings.actions[editing_index].name.clone();
+                    app.open_delete_action_confirm(&name, editing_index);
                 }
             }
             NewPopupAction::WorldEditorSaved(settings) => {

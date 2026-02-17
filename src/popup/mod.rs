@@ -626,6 +626,10 @@ impl PopupDefinition {
         self
     }
 
+    pub fn with_button_if(self, condition: bool, button: Button) -> Self {
+        if condition { self.with_button(button) } else { self }
+    }
+
     pub fn with_layout(mut self, layout: PopupLayout) -> Self {
         self.layout = layout;
         self

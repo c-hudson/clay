@@ -97,6 +97,7 @@
         actionStartup: document.getElementById('action-startup'),
         actionError: document.getElementById('action-error'),
         actionSaveBtn: document.getElementById('action-save-btn'),
+        actionEditorDeleteBtn: document.getElementById('action-editor-delete-btn'),
         actionEditorCancelBtn: document.getElementById('action-editor-cancel-btn'),
         actionsEditorCloseBtn: document.getElementById('actions-editor-close-btn'),
         // Actions Confirm Delete popup
@@ -4049,6 +4050,7 @@
             elements.actionStartup.value = 'no';  // Default to disabled
         }
         elements.actionError.textContent = '';
+        elements.actionEditorDeleteBtn.style.display = (editIndex >= 0) ? '' : 'none';
         elements.actionName.focus();
     }
 
@@ -4091,6 +4093,10 @@
             renderActionsList();
         }
         closeActionsConfirmPopup();
+        // If editor was open (delete from editor), close it and return to list
+        if (actionsEditorPopupOpen) {
+            closeActionsEditorPopup();
+        }
     }
 
     function validateAction(name, editIndex) {
@@ -6243,6 +6249,12 @@
 
         // Actions Editor popup
         elements.actionSaveBtn.onclick = saveAction;
+        elements.actionEditorDeleteBtn.onclick = function() {
+            if (editingActionIndex >= 0 && editingActionIndex < actions.length) {
+                selectedActionIndex = editingActionIndex;
+                openActionsConfirmPopup();
+            }
+        };
         elements.actionEditorCancelBtn.onclick = closeActionsEditorPopup;
         elements.actionsEditorCloseBtn.onclick = closeActionsEditorPopup;
         elements.actionMatchType.onchange = function() {
