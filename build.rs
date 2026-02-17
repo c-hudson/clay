@@ -12,13 +12,24 @@ fn main() {
     files.insert("build.rs".to_string());
     files.insert("Cargo.toml".to_string());
 
-    // Compute hash of all file contents
+    // Compute hash of all file contents and find most recent modification time
     let mut hasher = Sha256::new();
+    let mut newest_mtime: u64 = 0;
     for file_path in &files {
         if let Ok(mut file) = fs::File::open(file_path) {
             let mut contents = Vec::new();
             if file.read_to_end(&mut contents).is_ok() {
                 hasher.update(&contents);
+            }
+        }
+        if let Ok(metadata) = fs::metadata(file_path) {
+            if let Ok(modified) = metadata.modified() {
+                if let Ok(duration) = modified.duration_since(std::time::UNIX_EPOCH) {
+                    let secs = duration.as_secs();
+                    if secs > newest_mtime {
+                        newest_mtime = secs;
+                    }
+                }
             }
         }
     }
@@ -27,7 +38,11 @@ fn main() {
     let hash_hex: String = hash.iter().map(|b| format!("{:02x}", b)).collect();
     let short_hash = &hash_hex[..8];
 
+    // Format the newest modification time as YY/MM/DD HH:MM in local time
+    let build_date = format_unix_timestamp(newest_mtime);
+
     println!("cargo:rustc-env=BUILD_HASH={}", short_hash);
+    println!("cargo:rustc-env=BUILD_DATE={}", build_date);
 
     // Rerun if any source file changes
     println!("cargo:rerun-if-changed=src");
@@ -117,6 +132,159 @@ fn build_ico_from_png(png_path: &Path) -> Option<std::path::PathBuf> {
     let ico_path = out_path.join("clay_icon.ico");
     fs::write(&ico_path, &ico).ok()?;
     Some(ico_path)
+}
+
+/// Format a Unix timestamp as "YY/MM/DD HH:MM" in local time.
+/// No external dependencies — computes local time from /etc/localtime or TZ env.
+fn format_unix_timestamp(timestamp: u64) -> String {
+    // Try to get UTC offset from TZ environment or /etc/localtime
+    let offset_secs = get_local_utc_offset();
+    let local_ts = timestamp as i64 + offset_secs;
+
+    // Convert to calendar date/time (civil time from Unix epoch)
+    let secs_per_day: i64 = 86400;
+    let mut days = local_ts / secs_per_day;
+    let mut time_of_day = local_ts % secs_per_day;
+    if time_of_day < 0 {
+        days -= 1;
+        time_of_day += secs_per_day;
+    }
+
+    let hours = time_of_day / 3600;
+    let minutes = (time_of_day % 3600) / 60;
+
+    // Days since Unix epoch (Jan 1, 1970) to (year, month, day)
+    // Algorithm from Howard Hinnant's chrono-compatible date library
+    let z = days + 719468;
+    let era = (if z >= 0 { z } else { z - 146096 }) / 146097;
+    let doe = z - era * 146097; // day of era [0, 146096]
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if m <= 2 { y + 1 } else { y };
+
+    format!("{:02}/{:02}/{:02} {:02}:{:02}", y % 100, m, d, hours, minutes)
+}
+
+/// Get the local UTC offset in seconds by reading /etc/localtime TZif file.
+fn get_local_utc_offset() -> i64 {
+    // Try TZ environment variable for simple offset formats
+    if let Ok(tz) = std::env::var("TZ") {
+        if let Some(offset) = parse_simple_tz_offset(&tz) {
+            return offset;
+        }
+    }
+
+    // Try reading /etc/localtime (TZif binary format)
+    if let Ok(data) = fs::read("/etc/localtime") {
+        if let Some(offset) = parse_tzif_offset(&data) {
+            return offset;
+        }
+    }
+
+    0 // Fall back to UTC
+}
+
+/// Parse simple TZ offset like "EST5EDT" or "UTC-5" — returns offset in seconds
+fn parse_simple_tz_offset(tz: &str) -> Option<i64> {
+    // Look for a digit or minus sign after alphabetic chars
+    let bytes = tz.as_bytes();
+    let mut i = 0;
+    // Skip alphabetic prefix
+    while i < bytes.len() && bytes[i].is_ascii_alphabetic() {
+        i += 1;
+    }
+    if i >= bytes.len() {
+        return None;
+    }
+    // Parse number (POSIX TZ offset is WEST-positive, so negate for UTC offset)
+    let remaining = &tz[i..];
+    // Find end of number part
+    let mut end = 0;
+    if end < remaining.len() && (remaining.as_bytes()[end] == b'-' || remaining.as_bytes()[end] == b'+') {
+        end += 1;
+    }
+    while end < remaining.len() && remaining.as_bytes()[end].is_ascii_digit() {
+        end += 1;
+    }
+    let num_str = &remaining[..end];
+    let hours: i64 = num_str.parse().ok()?;
+    Some(-hours * 3600) // POSIX TZ is west-positive
+}
+
+/// Parse a TZif (timezone info) binary file and return the last transition's UTC offset.
+fn parse_tzif_offset(data: &[u8]) -> Option<i64> {
+    // TZif format: "TZif" magic, then header with counts
+    if data.len() < 44 || &data[0..4] != b"TZif" {
+        return None;
+    }
+    let version = data[4];
+
+    // For TZif2/3 (version '2' or '3'), skip v1 data and parse v2 header
+    if version == b'2' || version == b'3' {
+        // v1 header counts (at offset 20)
+        let tzh_timecnt = u32::from_be_bytes(data[32..36].try_into().ok()?) as usize;
+        let tzh_typecnt = u32::from_be_bytes(data[36..40].try_into().ok()?) as usize;
+        let tzh_charcnt = u32::from_be_bytes(data[40..44].try_into().ok()?) as usize;
+        // v1 data size: timecnt*4 (times) + timecnt*1 (type indices) + typecnt*6 (ttinfos) + charcnt
+        let v1_data_size = tzh_timecnt * 5 + tzh_typecnt * 6 + tzh_charcnt;
+        // Also account for leap seconds, std/wall, ut/local indicators
+        let tzh_leapcnt = u32::from_be_bytes(data[28..32].try_into().ok()?) as usize;
+        let tzh_ttisstdcnt = u32::from_be_bytes(data[24..28].try_into().ok()?) as usize;
+        let tzh_ttisutcnt = u32::from_be_bytes(data[20..24].try_into().ok()?) as usize;
+        let v1_total = 44 + v1_data_size + tzh_leapcnt * 8 + tzh_ttisstdcnt + tzh_ttisutcnt;
+
+        if data.len() > v1_total + 44 && &data[v1_total..v1_total + 4] == b"TZif" {
+            // Parse v2 header (uses 8-byte timestamps)
+            let v2 = &data[v1_total..];
+            return parse_tzif_block(v2, 8);
+        }
+    }
+
+    parse_tzif_block(data, 4)
+}
+
+/// Parse a TZif data block and return the last ttinfo UTC offset.
+/// `time_size` is 4 for v1 (32-bit timestamps) or 8 for v2/v3 (64-bit timestamps).
+fn parse_tzif_block(data: &[u8], time_size: usize) -> Option<i64> {
+    if data.len() < 44 {
+        return None;
+    }
+    let tzh_timecnt = u32::from_be_bytes(data[32..36].try_into().ok()?) as usize;
+    let tzh_typecnt = u32::from_be_bytes(data[36..40].try_into().ok()?) as usize;
+    if tzh_typecnt == 0 {
+        return None;
+    }
+
+    // Time values start at offset 44 (each is `time_size` bytes)
+    let times_start = 44;
+    // Type indices follow times
+    let types_start = times_start + tzh_timecnt * time_size;
+    // TTInfo structs follow type indices (each is 6 bytes: i32 utoff, u8 dst, u8 idx)
+    let ttinfos_start = types_start + tzh_timecnt;
+
+    if data.len() < ttinfos_start + tzh_typecnt * 6 {
+        return None;
+    }
+
+    // Get the type index of the last transition (or type 0 if no transitions)
+    let type_idx = if tzh_timecnt > 0 {
+        data[types_start + tzh_timecnt - 1] as usize
+    } else {
+        0
+    };
+
+    if type_idx >= tzh_typecnt {
+        return None;
+    }
+
+    // Read UTC offset from ttinfo
+    let ttinfo_offset = ttinfos_start + type_idx * 6;
+    let utoff = i32::from_be_bytes(data[ttinfo_offset..ttinfo_offset + 4].try_into().ok()?);
+    Some(utoff as i64)
 }
 
 fn collect_source_files(dir: &Path, files: &mut BTreeSet<String>) {

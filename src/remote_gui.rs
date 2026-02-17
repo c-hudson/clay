@@ -4112,14 +4112,18 @@ impl eframe::App for RemoteGuiApp {
             // Input area at bottom (full width, minimum 3 lines in gui2)
             let effective_input_height = self.input_height.max(3);
             let input_height = effective_input_height as f32 * (self.font_size * 1.3) + 8.0;
-            let prompt_text = String::new(); // gui2: no prompt display
+            let prompt_text = if self.current_world < self.worlds.len() {
+                crate::util::strip_ansi_codes(&self.worlds[self.current_world].prompt)
+            } else {
+                String::new()
+            };
 
             let input_bg = theme.bg();
             egui::TopBottomPanel::bottom("input_panel")
                 .exact_height(input_height)
                 .frame(egui::Frame::none()
                     .fill(input_bg)
-                    .inner_margin(egui::Margin::symmetric(8.0, 2.0))
+                    .inner_margin(egui::Margin { left: 3.0, right: 8.0, top: 2.0, bottom: 2.0 })
                     .stroke(egui::Stroke::NONE))
                 .show(ctx, |ui| {
                     ui.spacing_mut().item_spacing.x = 0.0; // Remove horizontal spacing

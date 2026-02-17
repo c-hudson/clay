@@ -187,8 +187,8 @@ pub fn create_action_editor_popup(settings: &ActionSettings, is_new: bool) -> Po
             FieldKind::toggle(settings.startup),
         ))
         .with_button_if(!is_new, Button::new(EDITOR_BTN_DELETE, "Delete").danger().with_shortcut('D').left_align())
-        .with_button(Button::new(EDITOR_BTN_SAVE, "Save").primary().with_shortcut('S'))
         .with_button(Button::new(EDITOR_BTN_CANCEL, "Cancel").with_shortcut('C'))
+        .with_button(Button::new(EDITOR_BTN_SAVE, "Save").primary().with_shortcut('S'))
         .with_layout(PopupLayout {
             label_width: 12,
             min_width: 60,

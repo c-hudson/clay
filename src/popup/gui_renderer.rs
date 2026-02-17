@@ -499,8 +499,10 @@ pub fn render_popup_content_with_scroll(
             // Spacer to push other buttons to the right
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 // Render in reverse order for right-to-left layout
-                for button in right_buttons.iter().rev() {
-                    ui.add_space(8.0);
+                for (i, button) in right_buttons.iter().rev().enumerate() {
+                    if i > 0 {
+                        ui.add_space(8.0);
+                    }
                     render_single_button(ui, button, state, theme, &mut actions.clicked_button);
                 }
             });

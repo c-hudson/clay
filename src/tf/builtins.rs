@@ -1677,7 +1677,7 @@ mod tests {
         match result {
             TfCommandResult::Quote { lines, .. } => {
                 assert!(!lines.is_empty());
-                assert!(lines[0].starts_with("think Clay v"));
+                assert!(lines[0].contains("Clay v"));
             }
             _ => panic!("Expected Quote result, got {:?}", result),
         }

@@ -23,6 +23,7 @@ pub mod testharness;
 // Version information
 const VERSION: &str = "1.0.0-alpha";
 const BUILD_HASH: &str = env!("BUILD_HASH");
+const BUILD_DATE: &str = env!("BUILD_DATE");
 
 // Custom config file path (set via --conf=<path> argument)
 use std::sync::OnceLock;
@@ -40,7 +41,7 @@ pub fn get_custom_config_path() -> Option<&'static PathBuf> {
 
 /// Get the full version string including build hash
 pub fn get_version_string() -> String {
-    format!("Clay v{} (build {})", VERSION, BUILD_HASH)
+    format!("\u{2728} Clay v{} (build {}-{})", VERSION, BUILD_DATE, BUILD_HASH)
 }
 
 // Re-export commonly used types from modules
