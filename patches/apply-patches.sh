@@ -3,7 +3,7 @@
 # These patches enable the remote GUI (egui) to run on Termux with Termux:X11
 #
 # Usage: ./patches/apply-patches.sh
-#   Run from the clay project root directory BEFORE cargo fetch/build.
+#   Run from the clay project root directory BEFORE cargo build.
 #   The script handles bootstrapping: creates stub dirs so cargo fetch works,
 #   then replaces them with patched sources.
 
@@ -13,17 +13,14 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
 cd "$PROJECT_DIR"
 
-# Crate name -> patched dir name -> package name (for stub Cargo.toml)
 CRATE_NAMES=("winit-0.28.7" "glutin-0.30.10" "glutin-winit-0.3.0")
 PATCHED_DIRS=("winit-0.28.7-patched" "glutin-0.30.10-patched" "glutin-winit-0.3.0-patched")
-PKG_NAMES=("winit" "glutin" "glutin-winit")
-PKG_VERSIONS=("0.28.7" "0.30.10" "0.3.0")
 
 # Check if all patched dirs already have real content (not stubs)
 all_done=true
 for i in "${!CRATE_NAMES[@]}"; do
     dst="${PATCHED_DIRS[$i]}"
-    if [ ! -d "$dst/src" ]; then
+    if [ ! -d "$dst/src" ] || [ "$(find "$dst/src" -name '*.rs' | wc -l)" -le 1 ]; then
         all_done=false
         break
     fi
@@ -35,24 +32,101 @@ if $all_done; then
 fi
 
 # Step 1: Create stub Cargo.toml files so cargo fetch can resolve [patch.crates-io]
+# Stubs must declare all features that downstream crates reference.
 echo "Creating stub directories for cargo fetch..."
-for i in "${!CRATE_NAMES[@]}"; do
-    dst="${PATCHED_DIRS[$i]}"
-    if [ -d "$dst/src" ]; then
-        continue  # Already has real content
-    fi
+
+needs_fetch=false
+
+# winit stub
+dst="${PATCHED_DIRS[0]}"
+if [ ! -d "$dst/src" ] || [ "$(find "$dst/src" -name '*.rs' | wc -l)" -le 1 ]; then
+    needs_fetch=true
+    rm -rf "$dst"
     mkdir -p "$dst/src"
-    # Minimal stub so cargo can parse it
-    cat > "$dst/Cargo.toml" << STUBEOF
+    cat > "$dst/Cargo.toml" << 'EOF'
 [package]
-name = "${PKG_NAMES[$i]}"
-version = "${PKG_VERSIONS[$i]}"
+name = "winit"
+version = "0.28.7"
 edition = "2021"
-STUBEOF
-    # Stub lib.rs so it compiles (never actually built - replaced before build)
+
+[features]
+default = ["x11", "wayland", "wayland-dlopen", "wayland-csd-adwaita"]
+x11 = []
+wayland = []
+wayland-dlopen = []
+wayland-csd-adwaita = []
+wayland-csd-adwaita-crossfont = []
+wayland-csd-adwaita-notitle = []
+android-game-activity = []
+android-native-activity = []
+serde = []
+mint = []
+
+[dependencies]
+raw-window-handle = { version = "0.5", package = "raw-window-handle" }
+EOF
     echo "" > "$dst/src/lib.rs"
-    echo "  ${CRATE_NAMES[$i]}: stub created"
-done
+    echo "  winit-0.28.7: stub created"
+fi
+
+# glutin stub
+dst="${PATCHED_DIRS[1]}"
+if [ ! -d "$dst/src" ] || [ "$(find "$dst/src" -name '*.rs' | wc -l)" -le 1 ]; then
+    needs_fetch=true
+    rm -rf "$dst"
+    mkdir -p "$dst/src"
+    cat > "$dst/Cargo.toml" << 'EOF'
+[package]
+name = "glutin"
+version = "0.30.10"
+edition = "2021"
+
+[features]
+default = ["egl", "glx", "x11", "wayland", "wgl"]
+egl = []
+glx = ["x11"]
+x11 = []
+wayland = []
+wgl = []
+
+[dependencies]
+raw-window-handle = "0.5"
+EOF
+    echo "" > "$dst/src/lib.rs"
+    echo "  glutin-0.30.10: stub created"
+fi
+
+# glutin-winit stub
+dst="${PATCHED_DIRS[2]}"
+if [ ! -d "$dst/src" ] || [ "$(find "$dst/src" -name '*.rs' | wc -l)" -le 1 ]; then
+    needs_fetch=true
+    rm -rf "$dst"
+    mkdir -p "$dst/src"
+    cat > "$dst/Cargo.toml" << 'EOF'
+[package]
+name = "glutin-winit"
+version = "0.3.0"
+edition = "2021"
+
+[features]
+default = ["egl", "glx", "x11", "wayland", "wgl"]
+egl = []
+glx = ["x11"]
+x11 = []
+wayland = []
+wgl = []
+
+[dependencies]
+raw-window-handle = "0.5"
+EOF
+    echo "" > "$dst/src/lib.rs"
+    echo "  glutin-winit-0.3.0: stub created"
+fi
+
+if ! $needs_fetch; then
+    echo "All patches already applied."
+    exit 0
+fi
 
 # Step 2: Run cargo fetch to download real crate sources
 echo "Running cargo fetch..."
@@ -72,12 +146,6 @@ for i in "${!CRATE_NAMES[@]}"; do
     dst="${PATCHED_DIRS[$i]}"
     patch="$SCRIPT_DIR/$crate.patch"
     src="$REGISTRY_DIR/$crate"
-
-    # Skip if already has real content (has more than just src/lib.rs)
-    if [ -d "$dst/src" ] && [ "$(find "$dst/src" -name '*.rs' | wc -l)" -gt 1 ]; then
-        echo "  $crate: already patched"
-        continue
-    fi
 
     if [ ! -d "$src" ]; then
         echo "Error: Source crate not found at $src"
