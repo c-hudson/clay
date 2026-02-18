@@ -31,6 +31,11 @@ fn main() {
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-changed=wayland_protocols");
 
+    // Debug: print cfg state during build
+    println!("cargo:warning=winit build.rs: target_os=android? {}", cfg!(target_os = "android"));
+    println!("cargo:warning=winit build.rs: unix? {}", cfg!(unix));
+    println!("cargo:warning=winit build.rs: feature x11? {}", cfg!(feature = "x11"));
+
     // Setup cfg aliases
     // Patched for Termux/Android X11 support:
     // When "x11" feature is enabled on Android, use the Linux/X11 backend instead of android-activity.

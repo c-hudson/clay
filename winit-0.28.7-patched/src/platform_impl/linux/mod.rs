@@ -1,4 +1,5 @@
-#![cfg(free_unix)]
+// Patched: removed #![cfg(free_unix)] to allow X11 on Android/Termux
+// Module inclusion is already gated by x11_platform/wayland_platform in platform_impl/mod.rs
 
 #[cfg(all(not(x11_platform), not(wayland_platform)))]
 compile_error!("Please select a feature to build for unix: `x11`, `wayland`");
