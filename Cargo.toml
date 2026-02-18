@@ -52,8 +52,8 @@ reqwest = { version = "0.11", default-features = false, features = ["json", "rus
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
-[target.'cfg(all(unix, not(any(target_os = "android", target_os = "macos"))))'.dependencies]
-# GUI client (optional, not available on Android/Termux - winit uses android-activity instead of X11)
+[target.'cfg(all(unix, not(target_os = "macos")))'.dependencies]
+# GUI client for Linux and Android/Termux (X11)
 eframe = { version = "0.24", optional = true, default-features = false, features = ["default_fonts", "glow", "x11"] }
 egui = { version = "0.24", optional = true }
 egui_extras = { version = "0.24", optional = true, default-features = false, features = ["image", "svg"] }
@@ -91,6 +91,9 @@ native-tls-backend = ["tokio-native-tls", "native-tls", "tokio-tungstenite/nativ
 rustls-backend = ["tokio-rustls", "rustls", "rustls-pemfile", "webpki-roots", "tokio-tungstenite/rustls-tls-webpki-roots"]
 remote-gui = ["eframe", "egui", "egui_extras", "image", "arboard"]
 remote-gui-audio = ["remote-gui", "rodio"]
+
+[patch.crates-io]
+winit = { path = "winit-0.28.7-patched" }
 
 [[bin]]
 name = "clay-test-server"
