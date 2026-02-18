@@ -95,6 +95,8 @@ remote-gui-audio = ["remote-gui", "rodio"]
 
 [patch.crates-io]
 winit = { path = "winit-0.28.7-patched" }
+glutin = { path = "glutin-0.30.10-patched" }
+glutin-winit = { path = "glutin-winit-0.3.0-patched" }
 
 [[bin]]
 name = "clay-test-server"
