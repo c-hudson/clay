@@ -13,7 +13,7 @@ pub mod http;
 pub mod persistence;
 pub mod daemon;
 pub mod theme;
-#[cfg(all(feature = "remote-gui", not(target_os = "android")))]
+#[cfg(feature = "remote-gui")]
 pub mod remote_gui;
 #[cfg(test)]
 pub mod testserver;
@@ -8628,25 +8628,17 @@ async fn main() -> io::Result<()> {
     } else {
         // Default: Mac/Windows -> GUI (if feature available), others -> Console
         let default_gui = (cfg!(target_os = "macos") || cfg!(windows))
-            && cfg!(feature = "remote-gui")
-            && !cfg!(target_os = "android");
+            && cfg!(feature = "remote-gui");
         (default_gui, None)
     };
 
     // Fall back to console if GUI not available
-    let use_gui = use_gui && cfg!(feature = "remote-gui") && !cfg!(target_os = "android");
+    let use_gui = use_gui && cfg!(feature = "remote-gui");
     if has_gui_flag && !use_gui {
-        #[cfg(target_os = "android")]
+        #[cfg(not(feature = "remote-gui"))]
         {
-            eprintln!("Warning: --gui is not available on Android/Termux. Falling back to console.");
-        }
-        #[cfg(not(target_os = "android"))]
-        {
-            #[cfg(not(feature = "remote-gui"))]
-            {
-                eprintln!("Warning: --gui requires the 'remote-gui' feature. Falling back to console.");
-                eprintln!("Rebuild with: cargo build --features remote-gui");
-            }
+            eprintln!("Warning: --gui requires the 'remote-gui' feature. Falling back to console.");
+            eprintln!("Rebuild with: cargo build --features remote-gui");
         }
     }
 
@@ -8663,11 +8655,11 @@ async fn main() -> io::Result<()> {
     match (use_gui, remote_addr) {
         // Remote GUI: connect to a running Clay instance via WebSocket
         (true, Some(ref addr)) => {
-            #[cfg(all(feature = "remote-gui", not(target_os = "android")))]
+            #[cfg(feature = "remote-gui")]
             {
                 return remote_gui::run_remote_gui(addr);
             }
-            #[cfg(not(all(feature = "remote-gui", not(target_os = "android"))))]
+            #[cfg(not(feature = "remote-gui"))]
             {
                 let _ = addr;
                 unreachable!("use_gui should be false when remote-gui feature is not available");
@@ -8675,11 +8667,11 @@ async fn main() -> io::Result<()> {
         }
         // Master GUI: run App in-process with egui GUI
         (true, None) => {
-            #[cfg(all(feature = "remote-gui", not(target_os = "android")))]
+            #[cfg(feature = "remote-gui")]
             {
                 return remote_gui::run_master_gui();
             }
-            #[cfg(not(all(feature = "remote-gui", not(target_os = "android"))))]
+            #[cfg(not(feature = "remote-gui"))]
             {
                 unreachable!("use_gui should be false when remote-gui feature is not available");
             }

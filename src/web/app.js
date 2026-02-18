@@ -3723,10 +3723,11 @@
         }
     }
 
-    // Update time (24-hour format HH:MM)
+    // Update time (12-hour format H:MM, no AM/PM)
     function updateTime() {
         const now = new Date();
-        const hours = now.getHours().toString().padStart(2, '0');
+        let hours = now.getHours() % 12;
+        if (hours === 0) hours = 12;
         const minutes = now.getMinutes().toString().padStart(2, '0');
         elements.statusTime.textContent = `${hours}:${minutes}`;
     }
