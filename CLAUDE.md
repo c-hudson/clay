@@ -59,18 +59,38 @@ Clay compiles and runs on Termux (Android terminal emulator):
 # On Termux, install rust first
 pkg install rust
 
-# Build without GUI features
+# Build without GUI features (console-only)
 cargo build --no-default-features --features rustls-backend
 ```
+
+**Building with Remote GUI on Termux (requires Termux:X11):**
+
+```bash
+# Install X11 dependencies
+pkg install x11-repo
+pkg install libx11 libxcursor libxrandr libxi libxfixes
+
+# Apply patches to winit/glutin for Android X11 support (one-time setup)
+cargo fetch
+./patches/apply-patches.sh
+
+# Build with GUI
+cargo build --no-default-features --features rustls-backend,remote-gui
+
+# Run GUI client (from within Termux:X11 desktop)
+./target/debug/clay --gui=hostname:port
+```
+
+The patches modify winit, glutin, and glutin-winit to use the X11/EGL backend on Android instead of the Android-native windowing backend. They are applied from `patches/` directory to crate sources downloaded by `cargo fetch`. The patched directories (`*-patched/`) are gitignored and must be regenerated on each fresh clone.
 
 **Limitations on Termux:**
 - Hot reload (`/reload`, `Ctrl+R`, `SIGUSR1`) is not available - exec() and signals are limited on Android
 - TLS proxy is not available - TLS connections cannot be preserved across restarts
 - Process suspension (`Ctrl+Z`) is not available
-- Remote GUI client is not available
 
 **What works on Termux:**
 - Core MUD client (connect, send, receive)
+- Remote GUI client (with Termux:X11 and patches applied)
 - Multiple worlds
 - TLS connections (direct, not via proxy)
 - More-mode pausing
