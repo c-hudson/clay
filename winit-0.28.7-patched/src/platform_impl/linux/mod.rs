@@ -886,7 +886,7 @@ fn sticky_exit_callback<T, F>(
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "android"))]
 fn is_main_thread() -> bool {
     use libc::{c_long, getpid, syscall, SYS_gettid};
 
