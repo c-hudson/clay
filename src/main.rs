@@ -5694,6 +5694,7 @@ fn get_executable_path() -> io::Result<(PathBuf, String)> {
 }
 
 /// Get the correct GitHub release asset name for this platform
+#[cfg(all(unix, not(target_os = "android")))]
 fn get_platform_asset_name() -> &'static str {
     #[cfg(all(target_os = "linux", target_env = "musl"))]
     { "clay-linux-x86_64-musl" }
@@ -5716,6 +5717,7 @@ fn get_platform_asset_name() -> &'static str {
 
 /// Compare two semver-style version strings, returns true if remote is newer than current.
 /// Handles: "1.0.0" vs "1.0.1", pre-release suffixes like "-alpha", "-beta", "-rc1"
+#[cfg(any(not(target_os = "android"), test))]
 fn is_newer_version(remote: &str, current: &str) -> bool {
     // Split off pre-release suffix (e.g. "1.0.0-alpha" → "1.0.0", "alpha")
     fn split_version(v: &str) -> (Vec<u64>, Option<&str>) {
