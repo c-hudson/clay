@@ -5696,22 +5696,22 @@ fn get_executable_path() -> io::Result<(PathBuf, String)> {
 /// Get the correct GitHub release asset name for this platform
 fn get_platform_asset_name() -> &'static str {
     #[cfg(all(target_os = "linux", target_env = "musl"))]
-    { return "clay-linux-x86_64-musl"; }
+    { "clay-linux-x86_64-musl" }
 
     #[cfg(all(target_os = "linux", not(target_env = "musl")))]
-    { return "clay-linux-x86_64"; }
+    { "clay-linux-x86_64" }
 
     #[cfg(target_os = "macos")]
-    { return "clay-macos-universal"; }
+    { "clay-macos-universal" }
 
     #[cfg(target_os = "windows")]
-    { return "clay-windows-x86_64.exe"; }
+    { "clay-windows-x86_64.exe" }
 
     #[cfg(target_os = "android")]
-    { return "clay-termux-aarch64"; }
+    { "clay-termux-aarch64" }
 
     #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows", target_os = "android")))]
-    { return "unknown"; }
+    { "unknown" }
 }
 
 /// Compare two semver-style version strings, returns true if remote is newer than current.

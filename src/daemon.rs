@@ -1539,7 +1539,7 @@ pub async fn handle_daemon_ws_message(
                 gmcp_user_enabled: world.gmcp_user_enabled,
             };
             app.ws_broadcast(WsMessage::WorldAdded { world: Box::new(world_state) });
-            let _ = persistence::save_settings(&app);
+            let _ = persistence::save_settings(app);
             app.ws_send_to_client(client_id, WsMessage::WorldCreated { world_index: idx });
         }
         WsMessage::DeleteWorld { world_index } => {
@@ -1558,7 +1558,7 @@ pub async fn handle_daemon_ws_message(
                     }
                 }
                 app.ws_broadcast(WsMessage::WorldRemoved { world_index });
-                let _ = persistence::save_settings(&app);
+                let _ = persistence::save_settings(app);
             }
         }
         WsMessage::UpdateWorldSettings { world_index, name, hostname, port, user, password, use_ssl, log_enabled, encoding, auto_login, keep_alive_type, keep_alive_cmd, gmcp_packages } => {
@@ -1579,7 +1579,7 @@ pub async fn handle_daemon_ws_message(
                 app.worlds[world_index].settings.keep_alive_type = KeepAliveType::from_name(&keep_alive_type);
                 app.worlds[world_index].settings.keep_alive_cmd = keep_alive_cmd.clone();
                 app.worlds[world_index].settings.gmcp_packages = gmcp_packages.clone();
-                let _ = persistence::save_settings(&app);
+                let _ = persistence::save_settings(app);
                 let settings_msg = WorldSettingsMsg {
                     hostname, port, user,
                     password: encrypt_password(&password),
