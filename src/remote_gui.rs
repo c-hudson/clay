@@ -4252,14 +4252,15 @@ impl eframe::App for RemoteGuiApp {
                     let response = scroll_output.inner;
 
                     // Right-click context menu for input area
+                    #[cfg(feature = "arboard")]
                     let input_id_for_menu = input_id;
-                    let response = response.context_menu(|ui| {
+                    let response = response.context_menu(|_ui| {
                         #[cfg(feature = "arboard")]
-                        if ui.button("Paste").clicked() {
+                        if _ui.button("Paste").clicked() {
                             if let Ok(mut clipboard) = arboard::Clipboard::new() {
                                 if let Ok(text) = clipboard.get_text() {
                                     // Insert clipboard text at cursor position
-                                    if let Some(state) = egui::TextEdit::load_state(ui.ctx(), input_id_for_menu) {
+                                    if let Some(state) = egui::TextEdit::load_state(_ui.ctx(), input_id_for_menu) {
                                         if let Some(cursor_range) = state.ccursor_range() {
                                             let cursor_pos = cursor_range.primary.index;
                                             let byte_pos: usize = self.input_buffer.char_indices()
@@ -4272,7 +4273,7 @@ impl eframe::App for RemoteGuiApp {
                                             let mut new_state = state;
                                             let ccursor = egui::text::CCursor::new(new_cursor);
                                             new_state.set_ccursor_range(Some(egui::text::CCursorRange::one(ccursor)));
-                                            new_state.store(ui.ctx(), input_id_for_menu);
+                                            new_state.store(_ui.ctx(), input_id_for_menu);
                                         }
                                     } else {
                                         // No cursor state - append to end
@@ -4280,7 +4281,7 @@ impl eframe::App for RemoteGuiApp {
                                     }
                                 }
                             }
-                            ui.close_menu();
+                            _ui.close_menu();
                         }
                     });
 
