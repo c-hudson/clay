@@ -71,7 +71,7 @@ pkg install x11-repo
 pkg install libx11 libxcursor libxrandr libxi libxfixes
 
 # Apply patches to winit/glutin for Android X11 support (one-time setup)
-cargo fetch
+# This creates stubs, runs cargo fetch, then applies patches automatically
 ./patches/apply-patches.sh
 
 # Build with GUI
