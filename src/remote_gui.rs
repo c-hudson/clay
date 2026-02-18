@@ -4254,6 +4254,7 @@ impl eframe::App for RemoteGuiApp {
                     // Right-click context menu for input area
                     let input_id_for_menu = input_id;
                     let response = response.context_menu(|ui| {
+                        #[cfg(feature = "arboard")]
                         if ui.button("Paste").clicked() {
                             if let Ok(mut clipboard) = arboard::Clipboard::new() {
                                 if let Ok(text) = clipboard.get_text() {

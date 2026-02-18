@@ -89,7 +89,8 @@ winres = "0.1"
 default = ["rustls-backend", "remote-gui-audio"]
 native-tls-backend = ["tokio-native-tls", "native-tls", "tokio-tungstenite/native-tls"]
 rustls-backend = ["tokio-rustls", "rustls", "rustls-pemfile", "webpki-roots", "tokio-tungstenite/rustls-tls-webpki-roots"]
-remote-gui = ["eframe", "egui", "egui_extras", "image", "arboard"]
+remote-gui = ["eframe", "egui", "egui_extras", "image"]
+remote-gui-clipboard = ["remote-gui", "arboard"]
 remote-gui-audio = ["remote-gui", "rodio"]
 
 [patch.crates-io]
