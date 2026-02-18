@@ -17,11 +17,13 @@ fn main() {
 
         // Native displays.
         x11_platform: { all(feature = "x11", unix, not(apple), not(wasm)) },
-        wayland_platform: { all(feature = "wayland", free_unix, not(wasm)) },
+        // Wayland not available on Android
+        wayland_platform: { all(feature = "wayland", free_unix, not(target_os = "android"), not(wasm)) },
 
         // Backends.
         egl_backend: { all(feature = "egl", any(windows, unix), not(apple), not(wasm)) },
-        glx_backend: { all(feature = "glx", feature = "x11", unix, not(apple), not(wasm)) },
+        // GLX not available on Android; use EGL+X11 instead
+        glx_backend: { all(feature = "glx", feature = "x11", unix, not(apple), not(target_os = "android"), not(wasm)) },
         wgl_backend: { all(feature = "wgl", windows, not(wasm)) },
         cgl_backend: { all(macos, not(wasm)) },
     }
