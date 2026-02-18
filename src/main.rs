@@ -1805,13 +1805,6 @@ impl OutputLine {
         Self { text: Self::truncate_if_needed(text), timestamp, from_server: true, gagged: false, seq, highlight_color: None }
     }
 
-    /// Format timestamp for display based on whether it's from today
-    /// Same day: HH:MM>
-    /// Previous days: DD/MM HH:MM>
-    fn format_timestamp(&self) -> String {
-        self.format_timestamp_with_now(&CachedNow::new())
-    }
-
     /// Format timestamp using a pre-computed "now" value for batch rendering
     fn format_timestamp_with_now(&self, _now: &CachedNow) -> String {
         let ts_secs = self.timestamp.duration_since(UNIX_EPOCH).unwrap_or_default().as_secs() as i64;
@@ -20118,45 +20111,73 @@ fn render_output_area(f: &mut Frame, app: &App, area: Rect) {
     let background = ratatui::widgets::Block::default().style(Style::default().bg(theme.bg()));
     f.render_widget(background, area);
 
-    // Get lines to display
-    let end = world.scroll_offset.saturating_add(1).min(world.output_lines.len());
-    let start = end.saturating_sub(visible_height);
+    // Build visual lines by working backwards from scroll_offset, wrapping each line
+    let mut lines: Vec<Line<'_>> = Vec::new();
 
-    // Build Text with proper ANSI color parsing
-    let mut lines: Vec<Line<'_>> = Vec::with_capacity(end - start);
+    if !world.output_lines.is_empty() {
+        let end_line = world.scroll_offset.min(world.output_lines.len().saturating_sub(1));
 
-    for line in world.output_lines.iter().skip(start).take(end - start) {
-        // Skip lines that are only ANSI codes (cursor control garbage)
-        if is_ansi_only_line(&line.text) {
-            continue;
-        }
-        // For legitimate blank lines (empty or whitespace without background colors), render as blank line
-        // Lines with background colors (like ANSI art) should preserve their ANSI codes
-        if is_visually_empty(&line.text) && !has_background_color(&line.text) {
-            lines.push(Line::from(""));
-            continue;
-        }
+        // Cache "now" for timestamp formatting
+        let cached_now = CachedNow::new();
 
-        // Strip MUD tags if show_tags is disabled, add timestamp if enabled
-        // Also colorize square emoji (🟩🟨 etc.) with ANSI codes
-        let display_line = if app.show_tags {
-            // Show timestamp + original text when tags are shown
-            colorize_square_emojis(&format!("\x1b[36m{}\x1b[0m {}", line.format_timestamp(), line.text))
-        } else {
-            colorize_square_emojis(&strip_mud_tag(&line.text))
-        };
+        for line_idx in (0..=end_line).rev() {
+            let line = &world.output_lines[line_idx];
 
-        // Parse ANSI codes and convert to ratatui spans
-        match ansi_to_tui::IntoText::into_text(&display_line) {
-            Ok(text) => {
-                for l in text.lines {
-                    lines.push(l);
+            // Skip gagged lines unless show_tags (F2) is enabled
+            if line.gagged && !app.show_tags {
+                continue;
+            }
+            // Skip lines that are only ANSI codes (cursor control garbage)
+            if is_ansi_only_line(&line.text) {
+                continue;
+            }
+            // For legitimate blank lines (empty or whitespace without background colors), render as blank line
+            if is_visually_empty(&line.text) && !has_background_color(&line.text) {
+                lines.insert(0, Line::from(""));
+                if lines.len() >= visible_height {
+                    break;
                 }
+                continue;
             }
-            Err(_) => {
-                lines.push(Line::raw(display_line));
+
+            // Process line: colorize emojis, add client-generated prefix, timestamps/tag stripping, tabs
+            let text = colorize_square_emojis(&line.text);
+            let text = if !line.from_server {
+                format!("✨ {}", text)
+            } else {
+                text
+            };
+            let display_line = if app.show_tags {
+                format!("\x1b[36m{}\x1b[0m {}", line.format_timestamp_with_now(&cached_now), text)
+            } else {
+                strip_mud_tag(&text)
+            };
+            let expanded = display_line.replace('\t', "        ");
+
+            // Wrap the line to fit the output area width
+            let wrapped = wrap_ansi_line(&expanded, area_width);
+
+            // Convert each wrapped visual line to ratatui Line and insert at front
+            for w in wrapped.into_iter().rev() {
+                let rline = match ansi_to_tui::IntoText::into_text(&w) {
+                    Ok(text) => {
+                        text.lines.into_iter().next().unwrap_or_else(|| Line::from(""))
+                    }
+                    Err(_) => Line::raw(w),
+                };
+                lines.insert(0, rline);
+            }
+
+            if lines.len() >= visible_height {
+                break;
             }
         }
+    }
+
+    // Trim to visible_height from the bottom (keep the most recent lines)
+    if lines.len() > visible_height {
+        let excess = lines.len() - visible_height;
+        lines.drain(0..excess);
     }
 
     let output_text = Text::from(lines);
