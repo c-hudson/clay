@@ -1,0 +1,49 @@
+--- a/build.rs	2006-07-23 20:21:28.000000000 -0500
++++ b/build.rs	2026-02-18 09:08:43.465184145 -0600
+@@ -4,7 +4,9 @@
+     // Setup alias to reduce `cfg` boilerplate.
+     cfg_aliases! {
+         // Systems.
+-        android_platform: { target_os = "android" },
++        // Patched for Termux/Android X11: when "x11" feature is enabled on Android,
++        // treat it as a free_unix platform so X11/GLX backends are available.
++        android_platform: { all(target_os = "android", not(feature = "x11")) },
+         wasm_platform: { target_family = "wasm" },
+         macos_platform: { target_os = "macos" },
+         ios_platform: { target_os = "ios" },
+@@ -12,12 +14,14 @@
+         free_unix: { all(unix, not(apple), not(android_platform)) },
+ 
+         // Native displays.
+-        x11_platform: { all(feature = "x11", free_unix, not(wasm_platform)) },
+-        wayland_platform: { all(feature = "wayland", free_unix, not(wasm_platform)) },
++        x11_platform: { all(feature = "x11", unix, not(apple), not(wasm_platform)) },
++        // Wayland not available on Android (no wayland-sys)
++        wayland_platform: { all(feature = "wayland", free_unix, not(target_os = "android"), not(wasm_platform)) },
+ 
+         // Backends.
+         egl_backend: { all(feature = "egl", any(windows, unix), not(apple), not(wasm_platform)) },
+-        glx_backend: { all(feature = "glx", x11_platform, not(wasm_platform)) },
++        // GLX not available on Android (glutin_glx_sys doesn't generate bindings); use EGL+X11 instead
++        glx_backend: { all(feature = "glx", feature = "x11", unix, not(apple), not(target_os = "android"), not(wasm_platform)) },
+         wgl_backend: { all(feature = "wgl", windows, not(wasm_platform)) },
+         cgl_backend: { all(macos_platform, not(wasm_platform)) },
+     }
+--- a/Cargo.toml	1969-12-31 18:00:01.000000000 -0600
++++ b/Cargo.toml	2026-02-18 08:54:05.914406691 -0600
+@@ -120,6 +120,15 @@
+ [target."cfg(target_os = \"android\")".dependencies.glutin_egl_sys]
+ version = "0.5.1"
+ 
++# Android/Termux X11 support: include X11/GLX deps when x11 feature is enabled
++[target."cfg(target_os = \"android\")".dependencies.glutin_glx_sys]
++version = "0.4.0"
++optional = true
++
++[target."cfg(target_os = \"android\")".dependencies.x11-dl]
++version = "2.20.0"
++optional = true
++
+ [target."cfg(windows)".dependencies.glutin_egl_sys]
+ version = "0.5.1"
+ optional = true
