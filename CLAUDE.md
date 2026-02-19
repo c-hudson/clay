@@ -81,7 +81,7 @@ cargo build --no-default-features --features rustls-backend,remote-gui
 ./target/debug/clay --gui=hostname:port
 ```
 
-The patches modify winit, glutin, and glutin-winit to use the X11/EGL backend on Android instead of the Android-native windowing backend. They are applied from `patches/` directory to crate sources downloaded by `cargo fetch`. The patched directories (`*-patched/`) are gitignored and must be regenerated on each fresh clone.
+The patches modify winit, glutin, and glutin-winit to use the X11/EGL backend on Android instead of the Android-native windowing backend. Stub `Cargo.toml` and `src/lib.rs` files are checked into git so that `[patch.crates-io]` resolves on fresh clones without running `apply-patches.sh`. Only Termux needs to run the script to replace stubs with real patched sources for `--features remote-gui` builds.
 
 **Limitations on Termux:**
 - Hot reload (`/reload`, `Ctrl+R`, `SIGUSR1`) is not available - exec() and signals are limited on Android
