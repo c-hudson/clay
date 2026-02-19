@@ -2033,6 +2033,11 @@ impl World {
         self.reader_name = None;
         // Reset skip_auto_login so next fresh connection triggers auto-login
         self.skip_auto_login = false;
+        // Clear timing fields so /connections doesn't show stale times
+        self.last_send_time = None;
+        self.last_receive_time = None;
+        self.last_nop_time = None;
+        self.last_user_command_time = None;
         // Clear active media tracking (processes already killed by stop_world_media)
         self.active_media.clear();
         if clear_prompt {
@@ -9433,6 +9438,8 @@ pub async fn run_app_headless(
                             let now = std::time::Instant::now();
                             app.worlds[world_idx].last_send_time = Some(now);
                             app.worlds[world_idx].last_receive_time = Some(now);
+                            app.worlds[world_idx].last_user_command_time = Some(now);
+                            app.worlds[world_idx].last_nop_time = None;
                             app.worlds[world_idx].is_initial_world = false;
                             app.worlds[world_idx].command_tx = Some(cmd_tx.clone());
                             #[cfg(unix)]
@@ -10481,11 +10488,12 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                 if let Some(tx) = &world.command_tx {
                     let now = std::time::Instant::now();
 
+                    // Initialize timing fields for /connections display after reload
+                    world.last_receive_time = Some(now);
+                    world.last_user_command_time = Some(now);
                     match world.settings.keep_alive_type {
                         KeepAliveType::None => {
-                            // Keepalive disabled - still initialize timing fields for /connections display
                             world.last_send_time = Some(now);
-                            world.last_receive_time = Some(now);
                         }
                         KeepAliveType::Nop => {
                             let nop = vec![TELNET_IAC, TELNET_NOP];
@@ -12992,8 +13000,20 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                             WsMessage::RequestConnectionsList => {
                                 // Generate connections list using same format as master console
                                 let current_idx = app.current_world_index;
+                                const KEEPALIVE_SECS: u64 = 5 * 60;
                                 let worlds_info: Vec<util::WorldListInfo> = app.worlds.iter().enumerate().map(|(idx, world)| {
                                     let now = std::time::Instant::now();
+                                    let last_activity_elapsed = match (world.last_send_time, world.last_receive_time) {
+                                        (Some(s), Some(r)) => Some(s.max(r).elapsed().as_secs()),
+                                        (Some(s), None) => Some(s.elapsed().as_secs()),
+                                        (None, Some(r)) => Some(r.elapsed().as_secs()),
+                                        (None, None) => None,
+                                    };
+                                    let next_nop = if world.connected {
+                                        last_activity_elapsed.map(|elapsed| KEEPALIVE_SECS.saturating_sub(elapsed))
+                                    } else {
+                                        None
+                                    };
                                     util::WorldListInfo {
                                         name: world.name.clone(),
                                         connected: world.connected,
@@ -13004,7 +13024,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                         last_send_secs: world.last_user_command_time.map(|t| now.duration_since(t).as_secs()),
                                         last_recv_secs: world.last_receive_time.map(|t| now.duration_since(t).as_secs()),
                                         last_nop_secs: world.last_nop_time.map(|t| now.duration_since(t).as_secs()),
-                                        next_nop_secs: None,
+                                        next_nop_secs: next_nop,
                                         buffer_size: world.output_lines.len() + world.pending_lines.len(),
                                     }
                                 }).collect();
@@ -13223,6 +13243,8 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                             let now = std::time::Instant::now();
                             app.worlds[world_idx].last_send_time = Some(now);
                             app.worlds[world_idx].last_receive_time = Some(now);
+                            app.worlds[world_idx].last_user_command_time = Some(now);
+                            app.worlds[world_idx].last_nop_time = None;
                             app.worlds[world_idx].is_initial_world = false;
                             app.worlds[world_idx].command_tx = Some(cmd_tx.clone());
                             #[cfg(unix)]
@@ -15390,8 +15412,20 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                         WsMessage::RequestConnectionsList => {
                             // Generate connections list for remote console client
                             let current_idx = app.current_world_index;
-                            let now = std::time::Instant::now();
+                            const KEEPALIVE_SECS: u64 = 5 * 60;
                             let worlds_info: Vec<util::WorldListInfo> = app.worlds.iter().enumerate().map(|(idx, world)| {
+                                let now = std::time::Instant::now();
+                                let last_activity_elapsed = match (world.last_send_time, world.last_receive_time) {
+                                    (Some(s), Some(r)) => Some(s.max(r).elapsed().as_secs()),
+                                    (Some(s), None) => Some(s.elapsed().as_secs()),
+                                    (None, Some(r)) => Some(r.elapsed().as_secs()),
+                                    (None, None) => None,
+                                };
+                                let next_nop = if world.connected {
+                                    last_activity_elapsed.map(|elapsed| KEEPALIVE_SECS.saturating_sub(elapsed))
+                                } else {
+                                    None
+                                };
                                 util::WorldListInfo {
                                     name: world.name.clone(),
                                     connected: world.connected,
@@ -15402,7 +15436,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                     last_send_secs: world.last_user_command_time.map(|t| now.duration_since(t).as_secs()),
                                     last_recv_secs: world.last_receive_time.map(|t| now.duration_since(t).as_secs()),
                                     last_nop_secs: world.last_nop_time.map(|t| now.duration_since(t).as_secs()),
-                                    next_nop_secs: None,
+                                    next_nop_secs: next_nop,
                                     buffer_size: world.output_lines.len() + world.pending_lines.len(),
                                 }
                             }).collect();
@@ -15695,6 +15729,8 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                         let now = std::time::Instant::now();
                         app.worlds[world_idx].last_send_time = Some(now);
                         app.worlds[world_idx].last_receive_time = Some(now);
+                        app.worlds[world_idx].last_user_command_time = Some(now);
+                        app.worlds[world_idx].last_nop_time = None;
                         app.worlds[world_idx].is_initial_world = false;
                         app.worlds[world_idx].command_tx = Some(cmd_tx.clone());
                         #[cfg(unix)]
@@ -18076,8 +18112,22 @@ async fn handle_command(cmd: &str, app: &mut App, event_tx: mpsc::Sender<AppEven
         Command::WorldsList => {
             // Output connected worlds list as text
             let current_idx = app.current_world_index;
+            const KEEPALIVE_SECS: u64 = 5 * 60;
             let worlds_info: Vec<util::WorldListInfo> = app.worlds.iter().enumerate().map(|(idx, world)| {
                 let now = std::time::Instant::now();
+                // Compute next NOP using same logic as the actual keepalive timer:
+                // max(last_send_time, last_receive_time) determines when activity last happened
+                let last_activity_elapsed = match (world.last_send_time, world.last_receive_time) {
+                    (Some(s), Some(r)) => Some(s.max(r).elapsed().as_secs()),
+                    (Some(s), None) => Some(s.elapsed().as_secs()),
+                    (None, Some(r)) => Some(r.elapsed().as_secs()),
+                    (None, None) => None,
+                };
+                let next_nop = if world.connected {
+                    last_activity_elapsed.map(|elapsed| KEEPALIVE_SECS.saturating_sub(elapsed))
+                } else {
+                    None
+                };
                 util::WorldListInfo {
                     name: world.name.clone(),
                     connected: world.connected,
@@ -18088,7 +18138,7 @@ async fn handle_command(cmd: &str, app: &mut App, event_tx: mpsc::Sender<AppEven
                     last_send_secs: world.last_user_command_time.map(|t| now.duration_since(t).as_secs()),
                     last_recv_secs: world.last_receive_time.map(|t| now.duration_since(t).as_secs()),
                     last_nop_secs: world.last_nop_time.map(|t| now.duration_since(t).as_secs()),
-                    next_nop_secs: None,
+                    next_nop_secs: next_nop,
                     buffer_size: world.output_lines.len() + world.pending_lines.len(),
                 }
             }).collect();

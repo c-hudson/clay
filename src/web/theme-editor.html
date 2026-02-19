@@ -887,6 +887,17 @@ select:focus, button:focus { outline: 1px solid var(--editor-accent); outline-of
     <div class="preview-section">
       <div class="preview-label">Live Preview</div>
       <div class="preview-container" id="previewContainer">
+        <div class="preview-output" id="previewOutput"></div>
+        <div class="preview-separator" id="previewSeparator">
+          <span class="preview-status-left" id="previewStatus"></span>
+          <span class="preview-world-name" id="previewWorldName"></span>
+          <span class="preview-separator-fill" id="previewFill"></span>
+          <span class="preview-time" id="previewTime"></span>
+        </div>
+        <div class="preview-input" id="previewInput">
+          <span class="preview-prompt-text" id="previewPrompt"></span>
+          <span class="preview-cursor" id="previewCursor"></span>
+        </div>
         <div class="preview-toolbar" id="previewToolbar">
           <div class="preview-toolbar-btn" id="previewHamburger">
             <svg width="13" height="13" viewBox="0 0 16 16" fill="none"><rect y="2" width="16" height="1.5" rx="0.75" fill="currentColor"/><rect y="7.25" width="16" height="1.5" rx="0.75" fill="currentColor"/><rect y="12.5" width="16" height="1.5" rx="0.75" fill="currentColor"/></svg>
@@ -898,17 +909,6 @@ select:focus, button:focus { outline: 1px solid var(--editor-accent); outline-of
           </div>
           <span class="preview-toolbar-title" id="previewToolbarTitle">Clay</span>
           <div class="preview-toolbar-spacer"></div>
-        </div>
-        <div class="preview-output" id="previewOutput"></div>
-        <div class="preview-separator" id="previewSeparator">
-          <span class="preview-status-left" id="previewStatus"></span>
-          <span class="preview-world-name" id="previewWorldName"></span>
-          <span class="preview-separator-fill" id="previewFill"></span>
-          <span class="preview-time" id="previewTime"></span>
-        </div>
-        <div class="preview-input" id="previewInput">
-          <span class="preview-prompt-text" id="previewPrompt"></span>
-          <span class="preview-cursor" id="previewCursor"></span>
         </div>
         <div class="preview-popup-overlay">
           <div class="preview-popup" id="previewPopup"></div>
@@ -1675,7 +1675,7 @@ function updatePreview() {
   // Toolbar (hamburger, font slider, Clay title)
   var toolbar = document.getElementById('previewToolbar');
   toolbar.style.background = t['menu_bar.bg'] || t.bg_surface;
-  toolbar.style.borderBottom = '1px solid ' + t.border_subtle;
+  toolbar.style.borderTop = '1px solid ' + t.border_subtle;
 
   var hamburger = document.getElementById('previewHamburger');
   hamburger.style.color = t.fg_muted;
@@ -1878,7 +1878,7 @@ function updatePreview() {
   menu.style.top = '';
   menu.style.right = '';
   menu.style.left = '0px';
-  menu.style.bottom = '45px';
+  menu.style.bottom = '69px';
 
   var menuItems = ['Help', 'Settings', 'Web Settings', 'Actions', 'World Selector', 'Connected Worlds'];
   var selectedMenu = 1; // "Settings" selected

@@ -575,7 +575,9 @@ pub fn format_duration_short(secs: u64) -> String {
     let hours = secs as f64 / 3600.0;
     let days = secs as f64 / 86400.0;
 
-    if minutes < 60 {
+    if secs < 60 {
+        format!("{}s", secs)
+    } else if minutes < 60 {
         format!("{}m", minutes)
     } else if hours < 24.0 {
         format!("{:.1}h", hours)
@@ -603,8 +605,6 @@ pub struct WorldListInfo {
 /// Returns a string with ANSI color codes for terminal display
 /// Only shows connected worlds
 pub fn format_worlds_list(worlds: &[WorldListInfo]) -> String {
-    const KEEPALIVE_SECS: u64 = 5 * 60;
-
     // ANSI color codes
     const GRAY: &str = "\x1b[90m";
     const YELLOW: &str = "\x1b[33m";
@@ -663,17 +663,8 @@ pub fn format_worlds_list(worlds: &[WorldListInfo]) -> String {
         let last_ak = world.last_nop_secs
             .map(format_duration_short)
             .unwrap_or_else(|| "—".to_string());
-        let last_activity = match (world.last_send_secs, world.last_recv_secs) {
-            (Some(s), Some(r)) => Some(s.min(r)),
-            (Some(s), None) => Some(s),
-            (None, Some(r)) => Some(r),
-            (None, None) => None,
-        };
-        let next_ak = match last_activity {
-            Some(elapsed) => {
-                let remaining = KEEPALIVE_SECS.saturating_sub(elapsed);
-                format_duration_short(remaining)
-            }
+        let next_ak = match world.next_nop_secs {
+            Some(remaining) => format_duration_short(remaining),
             None => "—".to_string(),
         };
         let ka = format!("{}/{}", last_ak, next_ak);
