@@ -446,6 +446,87 @@ select:focus, button:focus { outline: 1px solid var(--editor-accent); outline-of
   position: relative;
 }
 
+.preview-toolbar {
+  display: flex;
+  align-items: center;
+  height: 24px;
+  padding: 0 8px;
+  gap: 8px;
+  flex-shrink: 0;
+  font-size: 11px;
+}
+
+.preview-toolbar-btn {
+  display: flex;
+  align-items: center;
+  padding: 2px 4px;
+  border-radius: 3px;
+  cursor: default;
+  flex-shrink: 0;
+}
+
+.preview-toolbar-btn svg {
+  width: 13px;
+  height: 13px;
+}
+
+.preview-font-slider-group {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  flex-shrink: 0;
+}
+
+.preview-font-slider-label {
+  font-size: 9px;
+  font-weight: 600;
+  letter-spacing: 0.3px;
+  text-transform: uppercase;
+}
+
+.preview-font-slider {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 50px;
+  height: 3px;
+  border-radius: 2px;
+  outline: none;
+  pointer-events: none;
+}
+
+.preview-font-slider::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  pointer-events: none;
+}
+
+.preview-font-slider::-moz-range-thumb {
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  pointer-events: none;
+  border: none;
+}
+
+.preview-font-slider-val {
+  font-size: 9px;
+  font-weight: 500;
+  min-width: 14px;
+  text-align: center;
+  font-variant-numeric: tabular-nums;
+}
+
+.preview-toolbar-title {
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.3px;
+}
+
+.preview-toolbar-spacer { flex: 1; }
+
 .preview-output {
   flex: 1;
   padding: 8px 10px;
@@ -806,6 +887,18 @@ select:focus, button:focus { outline: 1px solid var(--editor-accent); outline-of
     <div class="preview-section">
       <div class="preview-label">Live Preview</div>
       <div class="preview-container" id="previewContainer">
+        <div class="preview-toolbar" id="previewToolbar">
+          <div class="preview-toolbar-btn" id="previewHamburger">
+            <svg width="13" height="13" viewBox="0 0 16 16" fill="none"><rect y="2" width="16" height="1.5" rx="0.75" fill="currentColor"/><rect y="7.25" width="16" height="1.5" rx="0.75" fill="currentColor"/><rect y="12.5" width="16" height="1.5" rx="0.75" fill="currentColor"/></svg>
+          </div>
+          <div class="preview-font-slider-group" id="previewFontSliderGroup">
+            <span class="preview-font-slider-label" id="previewFontLabel">A</span>
+            <input type="range" class="preview-font-slider" id="previewFontSlider" min="9" max="20" value="14" tabindex="-1">
+            <span class="preview-font-slider-val" id="previewFontVal">14</span>
+          </div>
+          <span class="preview-toolbar-title" id="previewToolbarTitle">Clay</span>
+          <div class="preview-toolbar-spacer"></div>
+        </div>
         <div class="preview-output" id="previewOutput"></div>
         <div class="preview-separator" id="previewSeparator">
           <span class="preview-status-left" id="previewStatus"></span>
@@ -1578,6 +1671,36 @@ function updatePreview() {
   container.style.background = t.bg;
   output.style.background = t.bg;
   output.style.color = t.fg;
+
+  // Toolbar (hamburger, font slider, Clay title)
+  var toolbar = document.getElementById('previewToolbar');
+  toolbar.style.background = t['menu_bar.bg'] || t.bg_surface;
+  toolbar.style.borderBottom = '1px solid ' + t.border_subtle;
+
+  var hamburger = document.getElementById('previewHamburger');
+  hamburger.style.color = t.fg_muted;
+
+  var fontLabel = document.getElementById('previewFontLabel');
+  fontLabel.style.color = t.fg_muted;
+
+  var fontSlider = document.getElementById('previewFontSlider');
+  fontSlider.style.background = t.border_medium;
+
+  // Update slider thumb color via dynamic style
+  var thumbStyle = document.getElementById('previewSliderThumbStyle');
+  if (!thumbStyle) {
+    thumbStyle = document.createElement('style');
+    thumbStyle.id = 'previewSliderThumbStyle';
+    document.head.appendChild(thumbStyle);
+  }
+  thumbStyle.textContent = '.preview-font-slider::-webkit-slider-thumb{background:' + t.fg_muted + ';border:1.5px solid ' + t.border_medium + '}'
+    + '.preview-font-slider::-moz-range-thumb{background:' + t.fg_muted + ';border:1.5px solid ' + t.border_medium + '}';
+
+  var fontVal = document.getElementById('previewFontVal');
+  fontVal.style.color = t.fg_muted;
+
+  var toolbarTitle = document.getElementById('previewToolbarTitle');
+  toolbarTitle.style.color = t.fg_secondary;
 
   var lines = [
     { text: 'Welcome to the Realm of Shadows!', color: t['ansi.11'], bold: true },
