@@ -2418,11 +2418,20 @@ impl World {
         self.scroll_offset >= self.output_lines.len().saturating_sub(1)
     }
 
-    fn lines_from_bottom(&self) -> usize {
-        self.output_lines
-            .len()
-            .saturating_sub(1)
-            .saturating_sub(self.scroll_offset)
+    fn lines_from_bottom(&self, show_tags: bool) -> usize {
+        if self.scroll_offset >= self.output_lines.len().saturating_sub(1) {
+            return 0;
+        }
+        if show_tags {
+            // All lines visible when show_tags is on
+            self.output_lines.len().saturating_sub(1).saturating_sub(self.scroll_offset)
+        } else {
+            // Count only non-gagged lines after scroll_offset
+            self.output_lines[(self.scroll_offset + 1)..]
+                .iter()
+                .filter(|l| !l.gagged)
+                .count()
+        }
     }
 
     fn generate_splash_lines() -> Vec<OutputLine> {
@@ -4540,6 +4549,7 @@ impl App {
         }
 
         // Add gagged lines to output (they'll only show with F2)
+        let was_at_bottom = self.worlds[world_idx].is_at_bottom();
         for (line, highlight) in gagged_lines {
             let seq = self.worlds[world_idx].next_seq;
             self.worlds[world_idx].next_seq += 1;
@@ -4547,8 +4557,10 @@ impl App {
             output_line.highlight_color = highlight;
             self.worlds[world_idx].output_lines.push(output_line);
         }
-        // Keep scroll at bottom if we added gagged lines
-        if !self.worlds[world_idx].paused {
+        // Keep scroll at bottom if we were already there, even when paused.
+        // Without this, gagged lines shift output_lines.len() ahead of scroll_offset,
+        // causing is_at_bottom() to return false and Tab to scroll instead of releasing.
+        if was_at_bottom {
             self.worlds[world_idx].scroll_to_bottom();
         }
 
@@ -20488,7 +20500,7 @@ fn render_separator_bar(f: &mut Frame, app: &App, area: Rect) {
     const STATUS_INDICATOR_LEN: usize = 9;
     let (status_str, status_active) = if !world.is_at_bottom() {
         // Show History indicator when scrolled back (takes precedence over More)
-        let lines_back = world.lines_from_bottom();
+        let lines_back = world.lines_from_bottom(app.show_tags);
         (format!("Hist {}", format_more_count(lines_back)), true)
     } else if world.paused && (!world.pending_lines.is_empty() || world.pending_count > 0) {
         // Show More indicator when paused with pending lines
