@@ -358,6 +358,23 @@
         }
     }
 
+    // Apply theme colors from JSON (updates CSS custom properties in the DOM)
+    function applyThemeColors(jsonStr) {
+        try {
+            const colors = JSON.parse(jsonStr);
+            const el = document.getElementById('theme-vars');
+            if (!el) return;
+            let css = ':root { ';
+            for (const [key, val] of Object.entries(colors)) {
+                css += '--theme-' + key.replace(/[_.]/g, '-') + ': ' + val + '; ';
+            }
+            css += '}';
+            el.textContent = css;
+        } catch (e) {
+            // ignore parse errors
+        }
+    }
+
     // ============================================================================
     // Command Definitions (single source of truth is Rust's parse_command)
     // ============================================================================
@@ -1482,6 +1499,9 @@
                         guiTheme = msg.settings.gui_theme;
                         applyTheme(guiTheme);
                     }
+                    if (msg.settings.theme_colors_json) {
+                        applyThemeColors(msg.settings.theme_colors_json);
+                    }
                     if (msg.settings.color_offset_percent !== undefined) {
                         colorOffsetPercent = msg.settings.color_offset_percent;
                     }
@@ -1814,6 +1834,9 @@
                     if (msg.settings.gui_theme !== undefined) {
                         guiTheme = msg.settings.gui_theme;
                         applyTheme(guiTheme);
+                    }
+                    if (msg.settings.theme_colors_json) {
+                        applyThemeColors(msg.settings.theme_colors_json);
                     }
                     if (msg.settings.color_offset_percent !== undefined) {
                         const oldOffset = colorOffsetPercent;
