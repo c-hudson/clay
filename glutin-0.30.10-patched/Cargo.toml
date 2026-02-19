@@ -1,0 +1,15 @@
+[package]
+name = "glutin"
+version = "0.30.10"
+edition = "2021"
+
+[features]
+default = ["egl", "glx", "x11", "wayland", "wgl"]
+egl = []
+glx = ["x11"]
+x11 = []
+wayland = []
+wgl = []
+
+[dependencies]
+raw-window-handle = "0.5"

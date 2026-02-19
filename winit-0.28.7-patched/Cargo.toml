@@ -1,0 +1,20 @@
+[package]
+name = "winit"
+version = "0.28.7"
+edition = "2021"
+
+[features]
+default = ["x11", "wayland", "wayland-dlopen", "wayland-csd-adwaita"]
+x11 = []
+wayland = []
+wayland-dlopen = []
+wayland-csd-adwaita = []
+wayland-csd-adwaita-crossfont = []
+wayland-csd-adwaita-notitle = []
+android-game-activity = []
+android-native-activity = []
+serde = []
+mint = []
+
+[dependencies]
+raw-window-handle = { version = "0.5", package = "raw-window-handle" }
