@@ -2269,6 +2269,7 @@ impl World {
                 }
 
                 self.pending_lines.push(new_line);
+                if !is_current { self.unseen_lines += 1; }
                 if is_partial {
                     self.partial_line = line.to_string();
                     self.partial_in_pending = true;
@@ -2540,6 +2541,17 @@ pub struct App {
     /// Test-only: log of all messages passed to ws_broadcast() and ws_broadcast_to_world()
     #[cfg(test)]
     pub ws_broadcast_log: std::sync::Arc<std::sync::Mutex<Vec<WsMessage>>>,
+}
+
+/// Result of handling a WS client message that may require async follow-up.
+enum WsAsyncAction {
+    /// Message was fully handled synchronously.
+    Done,
+    /// Need to run /connect for world_index. prev_index is the world to restore after.
+    /// broadcast = true means broadcast WorldConnected on success.
+    Connect { world_index: usize, prev_index: usize, broadcast: bool },
+    /// Need to run /disconnect for world_index. prev_index is the world to restore after.
+    Disconnect { world_index: usize, prev_index: usize },
 }
 
 impl App {
@@ -4572,6 +4584,1942 @@ impl App {
         // Merge TF commands into commands_to_execute
         commands_to_execute.extend(tf_commands_to_execute);
         commands_to_execute
+    }
+
+    // ========================================================================
+    // Extracted event handlers (shared across headless, console, and batch drain loops)
+    // ========================================================================
+
+    /// Handle Disconnected event for a world.
+    fn handle_disconnected(&mut self, world_idx: usize) {
+        // Fire TF DISCONNECT hook before cleaning up
+        let hook_result = tf::bridge::fire_event(&mut self.tf_engine, tf::TfHookEvent::Disconnect);
+        for cmd in hook_result.clay_commands {
+            let _ = self.tf_engine.execute(&cmd);
+        }
+
+        // Push prompt to output before clearing
+        if !self.worlds[world_idx].prompt.is_empty() {
+            let prompt_text = self.worlds[world_idx].prompt.trim().to_string();
+            let seq = self.worlds[world_idx].next_seq;
+            self.worlds[world_idx].next_seq += 1;
+            self.worlds[world_idx].output_lines.push(OutputLine::new(prompt_text, seq));
+        }
+        self.worlds[world_idx].clear_connection_state(true, true);
+        // Show disconnection message
+        let seq = self.worlds[world_idx].next_seq;
+        self.worlds[world_idx].next_seq += 1;
+        let disconnect_msg = OutputLine::new_client("Disconnected.".to_string(), seq);
+        self.worlds[world_idx].output_lines.push(disconnect_msg.clone());
+
+        // If this is not the current world, increment unseen_lines for activity indicator
+        if world_idx != self.current_world_index {
+            if self.worlds[world_idx].unseen_lines == 0 {
+                self.worlds[world_idx].first_unseen_at = Some(std::time::Instant::now());
+            }
+            self.worlds[world_idx].unseen_lines += 1;
+        }
+
+        // Broadcast disconnect message to WebSocket clients viewing this world
+        self.ws_broadcast_to_world(world_idx, WsMessage::ServerData {
+            world_index: world_idx,
+            data: "Disconnected.\n".to_string(),
+            is_viewed: true,
+            ts: disconnect_msg.timestamp.duration_since(UNIX_EPOCH).unwrap_or_default().as_secs(),
+            from_server: false,
+        });
+        self.ws_broadcast(WsMessage::WorldDisconnected { world_index: world_idx });
+    }
+
+    /// Handle TelnetDetected event.
+    fn handle_telnet_detected(&mut self, world_idx: usize) {
+        if !self.worlds[world_idx].telnet_mode {
+            self.worlds[world_idx].telnet_mode = true;
+        }
+    }
+
+    /// Handle WontEchoSeen event.
+    fn handle_wont_echo_seen(&mut self, world_idx: usize) {
+        if !self.worlds[world_idx].uses_wont_echo_prompt {
+            self.worlds[world_idx].uses_wont_echo_prompt = true;
+        }
+    }
+
+    /// Handle NawsRequested event.
+    fn handle_naws_requested(&mut self, world_idx: usize) {
+        self.worlds[world_idx].naws_enabled = true;
+        self.send_naws_if_changed(world_idx);
+    }
+
+    /// Handle TtypeRequested event.
+    fn handle_ttype_requested(&mut self, world_idx: usize) {
+        let term_type = std::env::var("TERM").unwrap_or_else(|_| "ANSI".to_string());
+        if let Some(ref tx) = self.worlds[world_idx].command_tx {
+            let ttype_response = build_ttype_response(&term_type);
+            let _ = tx.try_send(WriteCommand::Raw(ttype_response));
+        }
+    }
+
+    /// Handle Prompt event.
+    fn handle_prompt(&mut self, world_idx: usize, prompt_bytes: &[u8]) {
+        self.worlds[world_idx].last_receive_time = Some(std::time::Instant::now());
+        let encoding = self.worlds[world_idx].settings.encoding;
+        let prompt_text = encoding.decode(prompt_bytes);
+        let prompt_normalized = crate::util::normalize_prompt(&prompt_text);
+
+        // If world is not connected, display prompt as output instead of input area
+        if !self.worlds[world_idx].connected {
+            let seq = self.worlds[world_idx].next_seq;
+            self.worlds[world_idx].next_seq += 1;
+            self.worlds[world_idx].output_lines.push(OutputLine::new(prompt_normalized.trim().to_string(), seq));
+            self.worlds[world_idx].prompt.clear();
+            return;
+        }
+
+        self.worlds[world_idx].prompt = prompt_normalized.clone();
+        self.ws_broadcast(WsMessage::PromptUpdate {
+            world_index: world_idx,
+            prompt: prompt_normalized,
+        });
+
+        let world = &mut self.worlds[world_idx];
+        world.prompt_count += 1;
+
+        // Skip auto-login if flag is set (from /worlds -l)
+        if world.skip_auto_login {
+            return;
+        }
+
+        let auto_type = world.settings.auto_connect_type;
+        let user = world.settings.user.clone();
+        let password = world.settings.password.clone();
+        let prompt_num = world.prompt_count;
+
+        if !user.is_empty() && !password.is_empty() {
+            let cmd_to_send = match auto_type {
+                AutoConnectType::Prompt => {
+                    match prompt_num {
+                        1 if !user.is_empty() => Some(user),
+                        2 if !password.is_empty() => Some(password),
+                        _ => None,
+                    }
+                }
+                AutoConnectType::MooPrompt => {
+                    match prompt_num {
+                        1 if !user.is_empty() => Some(user.clone()),
+                        2 if !password.is_empty() => Some(password),
+                        3 if !user.is_empty() => Some(user),
+                        _ => None,
+                    }
+                }
+                AutoConnectType::Connect | AutoConnectType::NoLogin => None,
+            };
+
+            if let Some(cmd) = cmd_to_send {
+                if let Some(tx) = &world.command_tx {
+                    let _ = tx.try_send(WriteCommand::Text(cmd));
+                    world.last_send_time = Some(std::time::Instant::now());
+                    // Clear prompt since we auto-answered it
+                    world.prompt.clear();
+                }
+            }
+        }
+    }
+
+    /// Handle GmcpNegotiated event.
+    fn handle_gmcp_negotiated(&mut self, world_idx: usize) {
+        self.worlds[world_idx].gmcp_enabled = true;
+        let packages_str = self.worlds[world_idx].settings.gmcp_packages.clone();
+        let packages: Vec<String> = packages_str
+            .split(',')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
+        self.worlds[world_idx].gmcp_supported_packages = packages.clone();
+        if let Some(ref tx) = self.worlds[world_idx].command_tx {
+            let hello = build_gmcp_message("Core.Hello", &format!(
+                "{{\"client\":\"Clay\",\"version\":\"{}\"}}",
+                VERSION
+            ));
+            let _ = tx.try_send(WriteCommand::Raw(hello));
+            let json_list: Vec<String> = packages.iter()
+                .map(|p| format!("\"{}\"", p))
+                .collect();
+            let supports = build_gmcp_message(
+                "Core.Supports.Set",
+                &format!("[{}]", json_list.join(",")),
+            );
+            let _ = tx.try_send(WriteCommand::Raw(supports));
+        }
+    }
+
+    /// Handle GmcpReceived event.
+    fn handle_gmcp_received(&mut self, world_idx: usize, package: &str, json_data: &str) {
+        // Always store GMCP data
+        self.worlds[world_idx].gmcp_data.insert(package.to_string(), json_data.to_string());
+        // Always store Client.Media.Default URL
+        if package == "Client.Media.Default" {
+            if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(json_data) {
+                if let Some(url) = parsed.get("url").and_then(|v| v.as_str()) {
+                    self.worlds[world_idx].mcmp_default_url = url.to_string();
+                }
+            }
+        }
+        // Always broadcast to remote clients
+        self.ws_broadcast(WsMessage::GmcpData {
+            world_index: world_idx,
+            package: package.to_string(),
+            data: json_data.to_string(),
+        });
+        if package.starts_with("Client.Media.") {
+            let action = package.rsplit('.').next().unwrap_or("Play").to_string();
+            let default_url = self.worlds[world_idx].mcmp_default_url.clone();
+            self.ws_broadcast(WsMessage::McmpMedia {
+                world_index: world_idx,
+                action,
+                data: json_data.to_string(),
+                default_url,
+            });
+        }
+        // Always track media state; only play audio when enabled + current world
+        if package.starts_with("Client.Media.") {
+            let play_audio = self.worlds[world_idx].gmcp_user_enabled
+                && world_idx == self.current_world_index;
+            self.handle_gmcp_media(world_idx, package, json_data, play_audio);
+        }
+        // Gate TF hooks on gmcp_user_enabled
+        if self.worlds[world_idx].gmcp_user_enabled {
+            self.tf_engine.set_global("gmcp_package", crate::tf::TfValue::String(package.to_string()));
+            self.tf_engine.set_global("gmcp_data", crate::tf::TfValue::String(json_data.to_string()));
+            let results = crate::tf::hooks::fire_hook(&mut self.tf_engine, crate::tf::TfHookEvent::Gmcp);
+            for r in results {
+                if let crate::tf::TfCommandResult::SendToMud(text) = r {
+                    if let Some(world) = self.worlds.get(world_idx) {
+                        if let Some(ref tx) = world.command_tx {
+                            let _ = tx.try_send(WriteCommand::Text(text));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Handle MsdpReceived event.
+    fn handle_msdp_received(&mut self, world_idx: usize, variable: &str, value_json: &str) {
+        self.worlds[world_idx].msdp_variables.insert(variable.to_string(), value_json.to_string());
+        // Fire TF MSDP hook
+        self.tf_engine.set_global("msdp_var", crate::tf::TfValue::String(variable.to_string()));
+        self.tf_engine.set_global("msdp_val", crate::tf::TfValue::String(value_json.to_string()));
+        let results = crate::tf::hooks::fire_hook(&mut self.tf_engine, crate::tf::TfHookEvent::Msdp);
+        for r in results {
+            if let crate::tf::TfCommandResult::SendToMud(text) = r {
+                if let Some(world) = self.worlds.get(world_idx) {
+                    if let Some(ref tx) = world.command_tx {
+                        let _ = tx.try_send(WriteCommand::Text(text));
+                    }
+                }
+            }
+        }
+        // Broadcast to WebSocket clients
+        self.ws_broadcast(WsMessage::MsdpData {
+            world_index: world_idx,
+            variable: variable.to_string(),
+            value: value_json.to_string(),
+        });
+    }
+
+    /// Handle WsClientDisconnected event.
+    fn handle_ws_client_disconnected(&mut self, client_id: u64) {
+        // Check if this client had NAWS dimensions, and recalculate if needed
+        if let Some(state) = self.ws_client_worlds.get(&client_id) {
+            if state.dimensions.is_some() {
+                // Client had dimensions - need to recalculate NAWS after removal
+                self.ws_client_worlds.remove(&client_id);
+                // Recalculate NAWS for all worlds that might be affected
+                for i in 0..self.worlds.len() {
+                    if self.worlds[i].naws_enabled && self.worlds[i].connected {
+                        self.send_naws_if_changed(i);
+                    }
+                }
+                return;
+            }
+        }
+        self.ws_client_worlds.remove(&client_id);
+    }
+
+    /// Handle WsAuthKeyValidation event.
+    fn handle_ws_auth_key_validation(&mut self, client_id: u64, msg: WsMessage, client_ip: &str) {
+        if let WsMessage::AuthRequest { auth_key: Some(key), current_world, .. } = msg {
+            let is_valid = self.settings.websocket_auth_keys.contains(&key);
+            if is_valid {
+                self.ws_set_client_authenticated(client_id, true);
+                self.ws_send_to_client(client_id, WsMessage::AuthResponse {
+                    success: true,
+                    error: None,
+                    username: None,
+                    multiuser_mode: false,
+                });
+                let initial_state = self.build_initial_state();
+                self.ws_send_to_client(client_id, initial_state);
+                self.ws_mark_initial_state_sent(client_id);
+                let world_idx = current_world
+                    .filter(|&w| w < self.worlds.len())
+                    .unwrap_or(self.current_world_index);
+                self.ws_set_client_world(client_id, Some(world_idx));
+                self.ws_client_worlds.insert(client_id, ClientViewState {
+                    world_index: world_idx,
+                    visible_lines: 0,
+                    dimensions: None,
+                });
+            } else {
+                self.ban_list.record_violation(client_ip, "WebSocket: failed auth key");
+                self.ws_send_to_client(client_id, WsMessage::AuthResponse {
+                    success: false,
+                    error: Some("Invalid auth key".to_string()),
+                    username: None,
+                    multiuser_mode: false,
+                });
+            }
+        }
+    }
+
+    /// Handle WsKeyRequest event.
+    fn handle_ws_key_request(&mut self, client_id: u64) {
+        use sha2::{Sha256, Digest};
+        let mut hasher = Sha256::new();
+        hasher.update(std::time::SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()
+            .to_le_bytes());
+        hasher.update(std::process::id().to_le_bytes());
+        hasher.update(client_id.to_le_bytes());
+        hasher.update(self.settings.websocket_auth_keys.len().to_le_bytes());
+        let key = hex::encode(hasher.finalize());
+        self.settings.websocket_auth_keys.push(key.clone());
+        let _ = persistence::save_settings(self);
+        self.ws_send_to_client(client_id, WsMessage::KeyGenerated { auth_key: key });
+    }
+
+    /// Handle WsKeyRevoke event.
+    fn handle_ws_key_revoke(&mut self, key: &str) {
+        self.settings.websocket_auth_keys.retain(|k| k != key);
+        let _ = persistence::save_settings(self);
+    }
+
+    /// Handle initial WsClientMessage (AuthRequest) after authentication.
+    fn handle_ws_auth_initial_state(&mut self, client_id: u64, current_world: Option<usize>) {
+        let initial_state = self.build_initial_state();
+        self.ws_send_to_client(client_id, initial_state);
+        self.ws_mark_initial_state_sent(client_id);
+        let world_idx = current_world
+            .filter(|&w| w < self.worlds.len())
+            .unwrap_or(self.current_world_index);
+        self.ws_set_client_world(client_id, Some(world_idx));
+        self.ws_client_worlds.insert(client_id, ClientViewState {
+            world_index: world_idx,
+            visible_lines: 0,
+            dimensions: None,
+        });
+        // Broadcast activity count to new client
+        self.broadcast_activity();
+    }
+
+    /// Handle ConnectionSuccess event (used in headless and console modes).
+    fn handle_connection_success(&mut self, world_name: &str, cmd_tx: mpsc::Sender<WriteCommand>, socket_fd: Option<i32>, is_tls: bool) {
+        let _ = &socket_fd; // used on unix only
+        if let Some(world_idx) = self.find_world_index(world_name) {
+            self.worlds[world_idx].connected = true;
+            self.worlds[world_idx].was_connected = true;
+            self.worlds[world_idx].prompt_count = 0;
+            let now = std::time::Instant::now();
+            self.worlds[world_idx].last_send_time = Some(now);
+            self.worlds[world_idx].last_receive_time = Some(now);
+            self.worlds[world_idx].last_user_command_time = Some(now);
+            self.worlds[world_idx].last_nop_time = None;
+            self.worlds[world_idx].is_initial_world = false;
+            self.worlds[world_idx].command_tx = Some(cmd_tx.clone());
+            #[cfg(unix)]
+            { self.worlds[world_idx].socket_fd = socket_fd; }
+            self.worlds[world_idx].is_tls = is_tls;
+
+            // Discard any unused initial world
+            self.discard_initial_world();
+
+            // Open log file if enabled
+            if self.worlds[world_idx].settings.log_enabled {
+                if self.worlds[world_idx].open_log_file() {
+                    let log_path = self.worlds[world_idx].get_log_path();
+                    self.add_output_to_world(world_idx, &format!("Logging to: {}", log_path.display()));
+                } else {
+                    self.add_output_to_world(world_idx, "Warning: Could not open log file");
+                }
+            }
+
+            // Fire TF CONNECT hook
+            let hook_result = tf::bridge::fire_event(&mut self.tf_engine, tf::TfHookEvent::Connect);
+            for cmd in hook_result.send_commands {
+                let _ = cmd_tx.try_send(WriteCommand::Text(cmd));
+            }
+            for cmd in hook_result.clay_commands {
+                let _ = self.tf_engine.execute(&cmd);
+            }
+
+            // Send auto-login if configured
+            let skip_login = self.worlds[world_idx].skip_auto_login;
+            self.worlds[world_idx].skip_auto_login = false;
+            let user = self.worlds[world_idx].settings.user.clone();
+            let password = self.worlds[world_idx].settings.password.clone();
+            let auto_connect_type = self.worlds[world_idx].settings.auto_connect_type;
+            if !skip_login && !user.is_empty() && !password.is_empty() && auto_connect_type == AutoConnectType::Connect {
+                let connect_cmd = format!("connect {} {}", user, password);
+                let _ = cmd_tx.try_send(WriteCommand::Text(connect_cmd));
+            }
+
+            // Broadcast connection status
+            self.ws_broadcast(WsMessage::WorldConnected { world_index: world_idx, name: self.worlds[world_idx].name.clone() });
+        }
+    }
+
+    /// Handle WsMessage::SendCommand - processes the command and returns a WsAsyncAction
+    /// if an async operation (connect/disconnect) is needed.
+    #[allow(clippy::too_many_lines)]
+    fn handle_ws_send_command(&mut self, client_id: u64, world_index: usize, command: &str, event_tx: &mpsc::Sender<AppEvent>) -> WsAsyncAction {
+        // Use shared command parsing
+        let parsed = parse_command(command);
+
+        match parsed {
+            // Commands handled locally on server
+            Command::ActionCommand { name, args } => {
+                // Execute action if it exists
+                if let Some(action) = self.settings.actions.iter().find(|a| a.name.eq_ignore_ascii_case(&name)) {
+                    // Skip disabled actions
+                    if !action.enabled {
+                        self.ws_broadcast(WsMessage::ServerData {
+                            world_index,
+                            data: format!("\u{2728} Action '{}' is disabled.", name),
+                            is_viewed: false,
+                            ts: current_timestamp_secs(),
+                            from_server: false,
+                        });
+                    } else {
+                        let commands = split_action_commands(&action.command);
+                        let mut sent_to_server = false;
+                        for cmd in commands {
+                            // Substitute $1-$9 and $* with arguments
+                            let cmd = substitute_action_args(&cmd, &args);
+
+                            if cmd.eq_ignore_ascii_case("/gag") || cmd.to_lowercase().starts_with("/gag ") {
+                                continue;
+                            }
+                            // Unified command system - route through TF parser
+                            if cmd.starts_with('/') {
+                                self.sync_tf_world_info();
+                                match self.tf_engine.execute(&cmd) {
+                                    tf::TfCommandResult::Success(Some(msg)) => {
+                                        self.ws_broadcast(WsMessage::ServerData {
+                                            world_index,
+                                            data: msg,
+                                            is_viewed: false,
+                                            ts: current_timestamp_secs(),
+                                            from_server: false,
+                                        });
+                                    }
+                                    tf::TfCommandResult::Success(None) => {}
+                                    tf::TfCommandResult::Error(err) => {
+                                        self.ws_broadcast(WsMessage::ServerData {
+                                            world_index,
+                                            data: format!("Error: {}", err),
+                                            is_viewed: false,
+                                            ts: current_timestamp_secs(),
+                                            from_server: false,
+                                        });
+                                    }
+                                    tf::TfCommandResult::SendToMud(text) => {
+                                        if world_index < self.worlds.len() {
+                                            if let Some(tx) = &self.worlds[world_index].command_tx {
+                                                let _ = tx.try_send(WriteCommand::Text(text));
+                                                sent_to_server = true;
+                                            }
+                                        }
+                                    }
+                                    tf::TfCommandResult::ClayCommand(clay_cmd) => {
+                                        self.ws_send_to_client(client_id, WsMessage::ExecuteLocalCommand { command: clay_cmd });
+                                    }
+                                    tf::TfCommandResult::Recall(opts) => {
+                                        if world_index < self.worlds.len() {
+                                            let output_lines = self.worlds[world_index].output_lines.clone();
+                                            let (matches, header) = execute_recall(&opts, &output_lines);
+                                            let pattern_str = opts.pattern.as_deref().unwrap_or("*");
+                                            let ts = current_timestamp_secs();
+
+                                            if !opts.quiet {
+                                                if let Some(h) = header {
+                                                    self.ws_broadcast(WsMessage::ServerData { world_index, data: h, is_viewed: false, ts , from_server: false });
+                                                }
+                                            }
+                                            if matches.is_empty() {
+                                                self.ws_broadcast(WsMessage::ServerData { world_index, data: format!("\u{2728} No matches for '{}'", pattern_str), is_viewed: false, ts, from_server: false });
+                                            } else {
+                                                for m in matches {
+                                                    self.ws_broadcast(WsMessage::ServerData { world_index, data: m, is_viewed: false, ts , from_server: false });
+                                                }
+                                            }
+                                            if !opts.quiet {
+                                                self.ws_broadcast(WsMessage::ServerData { world_index, data: "================= Recall end =================".to_string(), is_viewed: false, ts , from_server: false });
+                                            }
+                                        }
+                                    }
+                                    tf::TfCommandResult::RepeatProcess(process) => {
+                                        self.tf_engine.processes.push(process);
+                                    }
+                                    _ => {}
+                                }
+                            } else if world_index < self.worlds.len() {
+                                // Plain text - send to MUD server
+                                if let Some(tx) = &self.worlds[world_index].command_tx {
+                                    let _ = tx.try_send(WriteCommand::Text(cmd));
+                                    sent_to_server = true;
+                                }
+                            }
+                        }
+                        if sent_to_server {
+                            self.worlds[world_index].last_send_time = Some(std::time::Instant::now());
+                        }
+                    }
+                } else {
+                    // No matching action - try TF engine (handles /recall, /set, /echo, etc.)
+                    self.sync_tf_world_info();
+                    match self.tf_engine.execute(command) {
+                        tf::TfCommandResult::Success(Some(msg)) => {
+                            self.ws_broadcast(WsMessage::ServerData {
+                                world_index, data: msg, is_viewed: false,
+                                ts: current_timestamp_secs(), from_server: false,
+                            });
+                        }
+                        tf::TfCommandResult::Success(None) => {}
+                        tf::TfCommandResult::Error(err) => {
+                            self.ws_broadcast(WsMessage::ServerData {
+                                world_index, data: format!("Error: {}", err), is_viewed: false,
+                                ts: current_timestamp_secs(), from_server: false,
+                            });
+                        }
+                        tf::TfCommandResult::SendToMud(text) => {
+                            if world_index < self.worlds.len() {
+                                if let Some(tx) = &self.worlds[world_index].command_tx {
+                                    let _ = tx.try_send(WriteCommand::Text(text));
+                                    self.worlds[world_index].last_send_time = Some(std::time::Instant::now());
+                                }
+                            }
+                        }
+                        tf::TfCommandResult::ClayCommand(clay_cmd) => {
+                            self.ws_send_to_client(client_id, WsMessage::ExecuteLocalCommand { command: clay_cmd });
+                        }
+                        tf::TfCommandResult::Recall(opts) => {
+                            if world_index < self.worlds.len() {
+                                let output_lines = self.worlds[world_index].output_lines.clone();
+                                let (matches, header) = execute_recall(&opts, &output_lines);
+                                let pattern_str = opts.pattern.as_deref().unwrap_or("*");
+                                let ts = current_timestamp_secs();
+                                if !opts.quiet {
+                                    if let Some(h) = header {
+                                        self.ws_broadcast(WsMessage::ServerData { world_index, data: h, is_viewed: false, ts, from_server: false });
+                                    }
+                                }
+                                if matches.is_empty() {
+                                    self.ws_broadcast(WsMessage::ServerData { world_index, data: format!("\u{2728} No matches for '{}'", pattern_str), is_viewed: false, ts, from_server: false });
+                                } else {
+                                    for m in matches {
+                                        self.ws_broadcast(WsMessage::ServerData { world_index, data: m, is_viewed: false, ts, from_server: false });
+                                    }
+                                }
+                                if !opts.quiet {
+                                    self.ws_broadcast(WsMessage::ServerData { world_index, data: "================= Recall end =================".to_string(), is_viewed: false, ts, from_server: false });
+                                }
+                            }
+                        }
+                        tf::TfCommandResult::RepeatProcess(process) => {
+                            self.tf_engine.processes.push(process);
+                        }
+                        _ => {
+                            self.ws_broadcast(WsMessage::ServerData {
+                                world_index,
+                                data: format!("Unknown command: /{}", name),
+                                is_viewed: false,
+                                ts: current_timestamp_secs(),
+                                from_server: false,
+                            });
+                        }
+                    }
+                }
+            }
+            Command::NotACommand { text } => {
+                // Regular text - send to MUD
+                if world_index < self.worlds.len() {
+                    if let Some(tx) = &self.worlds[world_index].command_tx {
+                        if tx.try_send(WriteCommand::Text(text)).is_ok() {
+                            self.worlds[world_index].last_send_time = Some(std::time::Instant::now());
+                            self.worlds[world_index].prompt.clear();
+                        }
+                    }
+                }
+            }
+            Command::Edit { .. } | Command::EditList => {
+                // Edit command is handled locally on the client, not on server
+                // Send back to client for local execution
+                self.ws_send_to_client(client_id, WsMessage::ExecuteLocalCommand { command: command.to_string() });
+            }
+            Command::Tag => {
+                // Toggle show_tags setting (same as F2)
+                self.show_tags = !self.show_tags;
+                self.ws_broadcast(WsMessage::ShowTagsChanged { show_tags: self.show_tags });
+            }
+            Command::Unknown { cmd } => {
+                self.ws_broadcast(WsMessage::ServerData {
+                    world_index,
+                    data: format!("Unknown command: {}", cmd),
+                    is_viewed: false,
+                    ts: current_timestamp_secs(),
+                    from_server: false,
+                });
+            }
+            Command::Send { text, all_worlds, target_world, no_newline } => {
+                // Handle /send command
+                // Helper to create the write command
+                let make_write_cmd = |t: &str| -> WriteCommand {
+                    if no_newline {
+                        WriteCommand::Raw(t.as_bytes().to_vec())
+                    } else {
+                        WriteCommand::Text(t.to_string())
+                    }
+                };
+
+                if all_worlds {
+                    // Send to all connected worlds
+                    for world in self.worlds.iter_mut() {
+                        if world.connected {
+                            if let Some(tx) = &world.command_tx {
+                                let _ = tx.try_send(make_write_cmd(&text));
+                                world.last_send_time = Some(std::time::Instant::now());
+                            }
+                        }
+                    }
+                } else if let Some(ref target) = target_world {
+                    // Send to specific world by name
+                    if let Some(world) = self.worlds.iter_mut().find(|w| w.name.eq_ignore_ascii_case(target)) {
+                        if world.connected {
+                            if let Some(tx) = &world.command_tx {
+                                let _ = tx.try_send(make_write_cmd(&text));
+                                world.last_send_time = Some(std::time::Instant::now());
+                            }
+                        } else {
+                            self.ws_broadcast(WsMessage::ServerData {
+                                world_index,
+                                data: format!("World '{}' is not connected.", target),
+                                is_viewed: false,
+                                ts: current_timestamp_secs(),
+                                from_server: false,
+                            });
+                        }
+                    } else {
+                        self.ws_broadcast(WsMessage::ServerData {
+                            world_index,
+                            data: format!("Unknown world: {}", target),
+                            is_viewed: false,
+                            ts: current_timestamp_secs(),
+                            from_server: false,
+                        });
+                    }
+                } else {
+                    // Send to current world (the one this command came from)
+                    if world_index < self.worlds.len() {
+                        if let Some(tx) = &self.worlds[world_index].command_tx {
+                            let _ = tx.try_send(make_write_cmd(&text));
+                            self.worlds[world_index].last_send_time = Some(std::time::Instant::now());
+                        }
+                    }
+                }
+            }
+            Command::Disconnect => {
+                // Disconnect the specified world
+                if world_index < self.worlds.len() && self.worlds[world_index].connected {
+                    // Kill proxy process if one exists
+                    #[cfg(unix)]
+                    if let Some(proxy_pid) = self.worlds[world_index].proxy_pid {
+                        unsafe { libc::kill(proxy_pid as libc::pid_t, libc::SIGTERM); }
+                    }
+                    self.worlds[world_index].clear_connection_state(true, true);
+                    self.ws_broadcast(WsMessage::ServerData {
+                        world_index,
+                        data: "Disconnected.".to_string(),
+                        is_viewed: false,
+                        ts: current_timestamp_secs(),
+                        from_server: false,
+                    });
+                    self.ws_broadcast(WsMessage::WorldDisconnected { world_index });
+                } else {
+                    self.ws_broadcast(WsMessage::ServerData {
+                        world_index,
+                        data: "Not connected.".to_string(),
+                        is_viewed: false,
+                        ts: current_timestamp_secs(),
+                        from_server: false,
+                    });
+                }
+            }
+            Command::Flush => {
+                // Clear output buffer for this world
+                if world_index < self.worlds.len() {
+                    let line_count = self.worlds[world_index].output_lines.len();
+                    self.worlds[world_index].output_lines.clear();
+                    self.worlds[world_index].pending_lines.clear();
+                    self.worlds[world_index].scroll_offset = 0;
+                    self.worlds[world_index].lines_since_pause = 0;
+                    self.worlds[world_index].paused = false;
+                    self.ws_broadcast(WsMessage::WorldFlushed { world_index });
+                    self.ws_broadcast(WsMessage::ServerData {
+                        world_index,
+                        data: format!("Flushed {} lines from output buffer.", line_count),
+                        is_viewed: false,
+                        ts: current_timestamp_secs(),
+                        from_server: false,
+                    });
+                }
+            }
+            Command::Keepalive => {
+                // Show keepalive settings for this world
+                if world_index < self.worlds.len() {
+                    let world = &self.worlds[world_index];
+                    let info = format!(
+                        "Keepalive: {} ({})",
+                        world.settings.keep_alive_type.name(),
+                        if world.settings.keep_alive_type == KeepAliveType::Custom {
+                            world.settings.keep_alive_cmd.clone()
+                        } else {
+                            world.settings.keep_alive_type.name().to_string()
+                        }
+                    );
+                    self.ws_broadcast(WsMessage::ServerData {
+                        world_index,
+                        data: info,
+                        is_viewed: false,
+                        ts: current_timestamp_secs(),
+                        from_server: false,
+                    });
+                }
+            }
+            Command::Gag { pattern } => {
+                // TODO: Implement gag patterns storage
+                self.ws_broadcast(WsMessage::ServerData {
+                    world_index,
+                    data: format!("Gag pattern set: {}", pattern),
+                    is_viewed: false,
+                    ts: current_timestamp_secs(),
+                    from_server: false,
+                });
+            }
+            Command::BanList => {
+                // Send current ban list
+                let bans = self.ban_list.get_ban_info();
+                if bans.is_empty() {
+                    self.ws_broadcast(WsMessage::ServerData {
+                        world_index,
+                        data: "No hosts are currently banned.".to_string(),
+                        is_viewed: false,
+                        ts: current_timestamp_secs(),
+                        from_server: false,
+                    });
+                } else {
+                    let mut output = String::new();
+                    output.push_str("\nBanned Hosts:\n");
+                    output.push_str(&"\u{2500}".repeat(70));
+                    output.push_str(&format!("\n{:<20} {:<12} {}\n", "Host", "Type", "Last URL/Reason"));
+                    output.push_str(&"\u{2500}".repeat(70));
+                    output.push('\n');
+                    for (ip, ban_type, reason) in &bans {
+                        let reason_display = if reason.is_empty() { "(unknown)" } else { reason };
+                        output.push_str(&format!("{:<20} {:<12} {}\n", ip, ban_type, reason_display));
+                    }
+                    output.push_str(&"\u{2500}".repeat(70));
+                    output.push_str("\nUse /unban <host> to remove a ban.");
+                    self.ws_broadcast(WsMessage::ServerData {
+                        world_index,
+                        data: output,
+                        is_viewed: false,
+                        ts: current_timestamp_secs(),
+                        from_server: false,
+                    });
+                }
+                self.ws_send_to_client(client_id, WsMessage::BanListResponse { bans });
+            }
+            Command::Unban { host } => {
+                if self.ban_list.remove_ban(&host) {
+                    // Save settings to persist the change
+                    let _ = persistence::save_settings(self);
+                    self.ws_broadcast(WsMessage::ServerData {
+                        world_index,
+                        data: format!("Removed ban for: {}", host),
+                        is_viewed: false,
+                        ts: current_timestamp_secs(),
+                        from_server: false,
+                    });
+                    // Broadcast updated ban list
+                    self.ws_broadcast(WsMessage::BanListResponse { bans: self.ban_list.get_ban_info() });
+                    self.ws_send_to_client(client_id, WsMessage::UnbanResult { success: true, host, error: None });
+                } else {
+                    self.ws_broadcast(WsMessage::ServerData {
+                        world_index,
+                        data: format!("No ban found for: {}", host),
+                        is_viewed: false,
+                        ts: current_timestamp_secs(),
+                        from_server: false,
+                    });
+                    self.ws_send_to_client(client_id, WsMessage::UnbanResult { success: false, host, error: Some("No ban found".to_string()) });
+                }
+            }
+            Command::TestMusic => {
+                let test_notes = generate_test_music_notes();
+                // Play locally on console via mpv/ffplay
+                if let Some(ref player_cmd) = self.media_player_cmd {
+                    let wav_data = generate_wav_from_notes(&test_notes);
+                    let _ = std::fs::create_dir_all(&self.media_cache_dir);
+                    let wav_path = self.media_cache_dir.join("ansi_music.wav");
+                    if std::fs::write(&wav_path, &wav_data).is_ok() {
+                        let wav_path_str = wav_path.to_string_lossy().to_string();
+                        let player = player_cmd.clone();
+                        std::thread::spawn(move || {
+                            let mut cmd = std::process::Command::new(&player);
+                            match player.as_str() {
+                                "mpv" => { cmd.args(["--no-video", "--no-terminal", &wav_path_str]); }
+                                "ffplay" => { cmd.args(["-nodisp", "-autoexit", &wav_path_str]); }
+                                _ => { cmd.arg(&wav_path_str); }
+                            }
+                            cmd.stdout(std::process::Stdio::null());
+                            cmd.stderr(std::process::Stdio::null());
+                            let _ = cmd.status();
+                        });
+                    }
+                }
+                self.ws_broadcast(WsMessage::AnsiMusic {
+                    world_index,
+                    notes: test_notes,
+                });
+                self.ws_broadcast(WsMessage::ServerData {
+                    world_index,
+                    data: "Playing test music (Super Mario Bros)...".to_string(),
+                    is_viewed: false,
+                    ts: current_timestamp_secs(),
+                    from_server: false,
+                });
+            }
+            Command::Notify { message } => {
+                // Send notification to mobile clients
+                let title = if world_index < self.worlds.len() {
+                    self.worlds[world_index].name.clone()
+                } else {
+                    "Clay".to_string()
+                };
+                self.ws_broadcast(WsMessage::Notification {
+                    title,
+                    message: message.clone(),
+                });
+                self.ws_broadcast(WsMessage::ServerData {
+                    world_index,
+                    data: format!("Notification sent: {}", message),
+                    is_viewed: false,
+                    ts: current_timestamp_secs(),
+                    from_server: false,
+                });
+            }
+            Command::Dump => {
+                // Dump all scrollback buffers to ~/.clay.dmp.log
+                use std::io::Write;
+                let ts = current_timestamp_secs();
+
+                let home = get_home_dir();
+                let dump_path = format!("{}/{}", home, clay_filename("clay.dmp.log"));
+
+                match std::fs::File::create(&dump_path) {
+                    Ok(mut file) => {
+                        let mut total_lines = 0;
+                        for world in self.worlds.iter() {
+                            for line in &world.output_lines {
+                                let line_ts = line.timestamp
+                                    .duration_since(std::time::UNIX_EPOCH)
+                                    .map(|d| d.as_secs())
+                                    .unwrap_or(0) as i64;
+                                let lt = local_time_from_epoch(line_ts);
+                                let datetime = format!(
+                                    "{:04}-{:02}-{:02} {:02}:{:02}:{:02}",
+                                    lt.year, lt.month, lt.day,
+                                    lt.hour, lt.minute, lt.second
+                                );
+                                let _ = writeln!(file, "{},{},{}", world.name, datetime, line.text);
+                                total_lines += 1;
+                            }
+                            for line in &world.pending_lines {
+                                let line_ts = line.timestamp
+                                    .duration_since(std::time::UNIX_EPOCH)
+                                    .map(|d| d.as_secs())
+                                    .unwrap_or(0) as i64;
+                                let lt = local_time_from_epoch(line_ts);
+                                let datetime = format!(
+                                    "{:04}-{:02}-{:02} {:02}:{:02}:{:02}",
+                                    lt.year, lt.month, lt.day,
+                                    lt.hour, lt.minute, lt.second
+                                );
+                                let _ = writeln!(file, "{},{},{}", world.name, datetime, line.text);
+                                total_lines += 1;
+                            }
+                        }
+                        self.ws_broadcast(WsMessage::ServerData {
+                            world_index,
+                            data: format!("Dumped {} lines from {} worlds to {}", total_lines, self.worlds.len(), dump_path),
+                            is_viewed: false,
+                            ts,
+                            from_server: false,
+                        });
+                    }
+                    Err(e) => {
+                        self.ws_broadcast(WsMessage::ServerData {
+                            world_index,
+                            data: format!("Failed to create dump file: {}", e),
+                            is_viewed: false,
+                            ts,
+                            from_server: false,
+                        });
+                    }
+                }
+            }
+            // Commands that should be blocked from remote
+            Command::Quit | Command::Reload | Command::Update => {
+                self.ws_broadcast(WsMessage::ServerData {
+                    world_index,
+                    data: "This command is not available from remote interfaces.".to_string(),
+                    is_viewed: false,
+                    ts: current_timestamp_secs(),
+                    from_server: false,
+                });
+            }
+            // UI popup commands - send back to client for local handling
+            Command::Help | Command::Menu | Command::Setup | Command::Web | Command::Actions { .. } |
+            Command::WorldsList | Command::WorldSelector | Command::WorldEdit { .. } => {
+                self.ws_send_to_client(client_id, WsMessage::ExecuteLocalCommand { command: command.to_string() });
+            }
+            Command::Version => {
+                self.ws_send_to_client(client_id, WsMessage::ServerData {
+                    world_index,
+                    data: get_version_string(),
+                    is_viewed: false,
+                    ts: current_timestamp_secs(),
+                    from_server: false,
+                });
+            }
+            // AddWorld - add or update world definition
+            Command::AddWorld { name, host, port, user, password, use_ssl } => {
+                let existing_idx = self.worlds.iter().position(|w| w.name.eq_ignore_ascii_case(&name));
+
+                let world_idx = if let Some(idx) = existing_idx {
+                    idx
+                } else {
+                    let new_world = World::new(&name);
+                    self.worlds.push(new_world);
+                    self.worlds.len() - 1
+                };
+
+                if let Some(h) = host {
+                    self.worlds[world_idx].settings.hostname = h;
+                }
+                if let Some(p) = port {
+                    self.worlds[world_idx].settings.port = p;
+                }
+                if let Some(u) = user {
+                    self.worlds[world_idx].settings.user = u;
+                }
+                if let Some(p) = password {
+                    self.worlds[world_idx].settings.password = p;
+                }
+                self.worlds[world_idx].settings.use_ssl = use_ssl;
+
+                let _ = persistence::save_settings(self);
+
+                let action = if existing_idx.is_some() { "Updated" } else { "Added" };
+                let host_info = if !self.worlds[world_idx].settings.hostname.is_empty() {
+                    format!(" ({}:{}{})",
+                        self.worlds[world_idx].settings.hostname,
+                        self.worlds[world_idx].settings.port,
+                        if use_ssl { " SSL" } else { "" })
+                } else {
+                    " (connectionless)".to_string()
+                };
+                self.ws_broadcast(WsMessage::ServerData {
+                    world_index,
+                    data: format!("{} world '{}'{}.", action, name, host_info),
+                    is_viewed: false,
+                    ts: current_timestamp_secs(),
+                    from_server: false,
+                });
+            }
+            // Connect command - needs async follow-up
+            Command::Connect { .. } => {
+                if world_index < self.worlds.len() && !self.worlds[world_index].connected {
+                    if self.worlds[world_index].settings.has_connection_settings() {
+                        let prev_index = self.current_world_index;
+                        self.current_world_index = world_index;
+                        return WsAsyncAction::Connect { world_index, prev_index, broadcast: false };
+                    } else {
+                        self.ws_broadcast(WsMessage::ServerData {
+                            world_index,
+                            data: "No connection settings configured for this world.".to_string(),
+                            is_viewed: false,
+                            ts: current_timestamp_secs(),
+                            from_server: false,
+                        });
+                    }
+                }
+            }
+            // WorldSwitch and WorldConnectNoLogin need proper handling
+            Command::WorldSwitch { ref name } | Command::WorldConnectNoLogin { ref name } => {
+                if let Some(idx) = self.worlds.iter().position(|w| w.name.eq_ignore_ascii_case(name)) {
+                    // Switch only the requesting client's world, not the console
+                    let dimensions = self.ws_client_worlds.get(&client_id).and_then(|s| s.dimensions);
+                    let visible_lines = self.ws_client_worlds.get(&client_id).map(|v| v.visible_lines).unwrap_or(0);
+                    self.ws_client_worlds.insert(client_id, ClientViewState { world_index: idx, visible_lines, dimensions });
+                    self.ws_set_client_world(client_id, Some(idx));
+                    self.ws_send_to_client(client_id, WsMessage::WorldSwitched { new_index: idx });
+                    // Also send ExecuteLocalCommand so web clients can switch their local view
+                    self.ws_send_to_client(client_id, WsMessage::ExecuteLocalCommand { command: command.to_string() });
+                    // Connect if not connected and has settings
+                    if !self.worlds[idx].connected
+                        && self.worlds[idx].settings.has_connection_settings()
+                    {
+                        // For WorldConnectNoLogin, set skip flag
+                        if matches!(parsed, Command::WorldConnectNoLogin { .. }) {
+                            self.worlds[idx].skip_auto_login = true;
+                        }
+                        let prev_index = self.current_world_index;
+                        self.current_world_index = idx;
+                        return WsAsyncAction::Connect { world_index: idx, prev_index, broadcast: false };
+                    }
+                } else {
+                    self.ws_send_to_client(client_id, WsMessage::ServerData {
+                        world_index,
+                        data: format!("World '{}' not found.", name),
+                        is_viewed: false,
+                        ts: current_timestamp_secs(),
+                        from_server: false,
+                    });
+                }
+            }
+            Command::Dict { .. } | Command::Urban { .. } | Command::Translate { .. } => {
+                spawn_api_lookup(event_tx.clone(), client_id, world_index, parsed);
+            }
+            Command::DictUsage => {
+                self.ws_send_to_client(client_id, WsMessage::ServerData {
+                    world_index,
+                    data: "Usage: /dict <prefix> <word>".to_string(),
+                    is_viewed: false,
+                    ts: current_timestamp_secs(),
+                    from_server: false,
+                });
+            }
+            Command::UrbanUsage => {
+                self.ws_send_to_client(client_id, WsMessage::ServerData {
+                    world_index,
+                    data: "Usage: /urban <prefix> <word>".to_string(),
+                    is_viewed: false,
+                    ts: current_timestamp_secs(),
+                    from_server: false,
+                });
+            }
+            Command::TranslateUsage => {
+                self.ws_send_to_client(client_id, WsMessage::ServerData {
+                    world_index,
+                    data: "Usage: /translate <lang> <prefix> <text>".to_string(),
+                    is_viewed: false,
+                    ts: current_timestamp_secs(),
+                    from_server: false,
+                });
+            }
+            Command::HelpTf => {
+                // Execute TF help command and send the result
+                match self.tf_engine.execute("#help") {
+                    tf::TfCommandResult::Success(Some(msg)) => {
+                        for line in msg.lines() {
+                            self.ws_send_to_client(client_id, WsMessage::ServerData {
+                                world_index,
+                                data: line.to_string(),
+                                is_viewed: false,
+                                ts: current_timestamp_secs(),
+                                from_server: false,
+                            });
+                        }
+                    }
+                    _ => {
+                        self.ws_send_to_client(client_id, WsMessage::ServerData {
+                            world_index,
+                            data: "TF help not available.".to_string(),
+                            is_viewed: false,
+                            ts: current_timestamp_secs(),
+                            from_server: false,
+                        });
+                    }
+                }
+            }
+        }
+        WsAsyncAction::Done
+    }
+
+    /// Handle a full WsMessage from a client. Returns WsAsyncAction for operations
+    /// that require async follow-up (connect/disconnect).
+    #[allow(clippy::too_many_lines)]
+    fn handle_ws_client_msg(&mut self, client_id: u64, msg: WsMessage, event_tx: &mpsc::Sender<AppEvent>) -> WsAsyncAction {
+        let auth_current_world = if let WsMessage::AuthRequest { ref current_world, .. } = msg {
+            *current_world
+        } else {
+            None
+        };
+        match msg {
+            WsMessage::AuthRequest { .. } => {
+                self.handle_ws_auth_initial_state(client_id, auth_current_world);
+            }
+            WsMessage::SendCommand { world_index, command } => {
+                // Reset more-mode counter when ANY client sends a command
+                if world_index < self.worlds.len() {
+                    self.worlds[world_index].lines_since_pause = 0;
+                    self.worlds[world_index].last_user_command_time = Some(std::time::Instant::now());
+                    // Update client's viewing world to ensure they receive output
+                    // (fixes race condition where client sends command before UpdateViewState)
+                    let dimensions = self.ws_client_worlds.get(&client_id).and_then(|s| s.dimensions);
+                    let visible_lines = self.ws_client_worlds.get(&client_id).map(|v| v.visible_lines).unwrap_or(0);
+                    self.ws_client_worlds.insert(client_id, ClientViewState { world_index, visible_lines, dimensions });
+                    self.ws_set_client_world(client_id, Some(world_index));
+                }
+
+                return self.handle_ws_send_command(client_id, world_index, &command, event_tx);
+            }
+            WsMessage::SwitchWorld { world_index } => {
+                // Switch only the requesting client's world, not the console
+                if world_index < self.worlds.len() {
+                    let dimensions = self.ws_client_worlds.get(&client_id).and_then(|s| s.dimensions);
+                    let visible_lines = self.ws_client_worlds.get(&client_id).map(|v| v.visible_lines).unwrap_or(0);
+                    self.ws_client_worlds.insert(client_id, ClientViewState { world_index, visible_lines, dimensions });
+                    self.ws_set_client_world(client_id, Some(world_index));
+                    self.ws_send_to_client(client_id, WsMessage::WorldSwitched { new_index: world_index });
+                    // Send active media for the new world
+                    self.ws_send_active_media_to_client(client_id, world_index);
+                }
+            }
+            WsMessage::ConnectWorld { world_index } => {
+                // Trigger connection for specified world
+                if world_index < self.worlds.len() && !self.worlds[world_index].connected {
+                    // Check if world has connection settings
+                    if !self.worlds[world_index].settings.has_connection_settings() {
+                        self.ws_broadcast(WsMessage::ServerData {
+                            world_index,
+                            data: "No connection settings configured for this world.".to_string(),
+                            is_viewed: false,
+                            ts: current_timestamp_secs(),
+                            from_server: false,
+                        });
+                    } else {
+                        // Save current world index, switch to target, connect, then restore
+                        let prev_index = self.current_world_index;
+                        self.current_world_index = world_index;
+                        return WsAsyncAction::Connect { world_index, prev_index, broadcast: true };
+                    }
+                }
+            }
+            WsMessage::DisconnectWorld { world_index } => {
+                // Disconnect specified world
+                if world_index < self.worlds.len() && self.worlds[world_index].connected {
+                    let prev_index = self.current_world_index;
+                    self.current_world_index = world_index;
+                    return WsAsyncAction::Disconnect { world_index, prev_index };
+                }
+            }
+            WsMessage::CreateWorld { name } => {
+                // Create new world and broadcast to all clients
+                let new_world = World::new(&name);
+                self.worlds.push(new_world);
+                let idx = self.worlds.len() - 1;
+                let world = &self.worlds[idx];
+                let world_state = WorldStateMsg {
+                    index: idx,
+                    name: world.name.clone(),
+                    connected: false,
+                    output_lines: Vec::new(),
+                    pending_lines: Vec::new(),
+                    output_lines_ts: Vec::new(),
+                    pending_lines_ts: Vec::new(),
+                    prompt: String::new(),
+                    scroll_offset: 0,
+                    paused: false,
+                    unseen_lines: 0,
+                    settings: WorldSettingsMsg {
+                        hostname: world.settings.hostname.clone(),
+                        port: world.settings.port.clone(),
+                        user: world.settings.user.clone(),
+                        password: world.settings.password.clone(),
+                        use_ssl: world.settings.use_ssl,
+                        log_enabled: world.settings.log_enabled,
+                        encoding: world.settings.encoding.name().to_string(),
+                        auto_connect_type: world.settings.auto_connect_type.name().to_string(),
+                        keep_alive_type: world.settings.keep_alive_type.name().to_string(),
+                        keep_alive_cmd: world.settings.keep_alive_cmd.clone(),
+                        gmcp_packages: world.settings.gmcp_packages.clone(),
+                    },
+                    last_send_secs: None,
+                    last_recv_secs: None,
+                    last_nop_secs: None,
+                    keep_alive_type: world.settings.keep_alive_type.name().to_string(),
+                    showing_splash: world.showing_splash,
+                    was_connected: false,
+                    is_proxy: false,
+                    gmcp_user_enabled: world.gmcp_user_enabled,
+                };
+                self.ws_broadcast(WsMessage::WorldAdded { world: Box::new(world_state) });
+                let _ = persistence::save_settings(self);
+                // Send the new world's index back to the requesting client
+                self.ws_send_to_client(client_id, WsMessage::WorldCreated { world_index: idx });
+            }
+            WsMessage::DeleteWorld { world_index } => {
+                // Delete specified world (if not the last one)
+                if self.worlds.len() > 1 && world_index < self.worlds.len() {
+                    let deleted_name = self.worlds[world_index].name.clone();
+                    self.worlds.remove(world_index);
+                    // Adjust current_world_index if needed
+                    if self.current_world_index >= self.worlds.len() {
+                        self.current_world_index = self.worlds.len().saturating_sub(1);
+                    } else if self.current_world_index > world_index {
+                        self.current_world_index -= 1;
+                    }
+                    // Adjust previous_world_index if needed
+                    if let Some(prev) = self.previous_world_index {
+                        if prev >= self.worlds.len() {
+                            self.previous_world_index = Some(self.worlds.len().saturating_sub(1));
+                        } else if prev > world_index {
+                            self.previous_world_index = Some(prev - 1);
+                        }
+                    }
+                    self.add_output(&format!("World '{}' deleted.\n", deleted_name));
+                    // Broadcast WorldRemoved to all clients
+                    self.ws_broadcast(WsMessage::WorldRemoved { world_index });
+                    let _ = persistence::save_settings(self);
+                }
+            }
+            WsMessage::MarkWorldSeen { world_index } => {
+                // A remote client has viewed this world - update their current_world
+                if world_index < self.worlds.len() {
+                    // Check if client is switching to a different world
+                    let old_world_idx = self.ws_client_worlds.get(&client_id).map(|s| s.world_index);
+                    let switched = old_world_idx.map(|old| old != world_index).unwrap_or(true);
+                    // Reset lines_since_pause for the old world if switching away and more-mode hasn't triggered
+                    if let Some(old_idx) = old_world_idx {
+                        if old_idx != world_index && old_idx < self.worlds.len()
+                            && self.worlds[old_idx].pending_lines.is_empty()
+                        {
+                            self.worlds[old_idx].lines_since_pause = 0;
+                        }
+                    }
+                    // Track which world this client is viewing (sync cache)
+                    let visible_lines = self.ws_client_worlds
+                        .get(&client_id)
+                        .map(|v| v.visible_lines)
+                        .unwrap_or(0);
+                    let dimensions = self.ws_client_worlds.get(&client_id).and_then(|s| s.dimensions);
+                    self.ws_client_worlds.insert(client_id, ClientViewState { world_index, visible_lines, dimensions });
+                    // Update client's world in WebSocket server (async state)
+                    self.ws_set_client_world(client_id, Some(world_index));
+
+                    self.worlds[world_index].mark_seen();
+                    // Broadcast to all clients so they update their UI
+                    self.ws_broadcast(WsMessage::UnseenCleared { world_index });
+                    // Broadcast activity count since a world was just marked as seen
+                    self.broadcast_activity();
+                    // Trigger console redraw to update activity indicator
+                    self.needs_output_redraw = true;
+                    if switched {
+                        self.ws_send_active_media_to_client(client_id, world_index);
+                    }
+                }
+            }
+            WsMessage::UpdateViewState { world_index, visible_lines } => {
+                // A remote client is reporting its view state (for more-mode threshold calculation)
+                if world_index < self.worlds.len() {
+                    // Preserve existing dimensions when updating view state
+                    let dimensions = self.ws_client_worlds.get(&client_id).and_then(|s| s.dimensions);
+                    self.ws_client_worlds.insert(client_id, ClientViewState { world_index, visible_lines, dimensions });
+                    // Update client's world in WebSocket server so broadcast_to_world_viewers works
+                    self.ws_set_client_world(client_id, Some(world_index));
+                }
+            }
+            WsMessage::UpdateDimensions { width, height } => {
+                // A remote client is reporting its output dimensions (for NAWS)
+                if let Some(state) = self.ws_client_worlds.get_mut(&client_id) {
+                    let old_dims = state.dimensions;
+                    state.dimensions = Some((width, height));
+                    // If dimensions changed, send NAWS updates to all worlds
+                    if old_dims != Some((width, height)) {
+                        self.send_naws_to_all_worlds();
+                    }
+                }
+            }
+            WsMessage::ReleasePending { world_index, count } => {
+                // A remote client is releasing pending lines - sync across all interfaces
+                if world_index < self.worlds.len() {
+                    let pending_count = self.worlds[world_index].pending_lines.len();
+                    if pending_count > 0 {
+                        // Get client's output width for visual line calculation
+                        let client_width = self.ws_client_worlds.get(&client_id)
+                            .and_then(|s| s.dimensions)
+                            .map(|(w, _)| w as usize)
+                            .unwrap_or(self.output_width as usize);
+
+                        // count == 0 means release all; otherwise treat count as visual budget
+                        let visual_budget = if count == 0 { usize::MAX } else { count };
+
+                        // Pre-calculate logical lines to release (same logic as release_pending)
+                        let width = client_width.max(1);
+                        let mut visual_total = 0;
+                        let mut logical_count = 0;
+                        for line in &self.worlds[world_index].pending_lines {
+                            let vl = visual_line_count(&line.text, width);
+                            if visual_total > 0 && visual_total + vl > visual_budget {
+                                break;
+                            }
+                            visual_total += vl;
+                            logical_count += 1;
+                            if visual_total >= visual_budget {
+                                break;
+                            }
+                        }
+                        if logical_count == 0 && pending_count > 0 {
+                            logical_count = 1;
+                        }
+                        // For release-all, cap at pending_count
+                        let to_release = logical_count.min(pending_count);
+
+                        // Get the lines that will be released (for broadcasting as ServerData)
+                        let lines_to_broadcast: Vec<String> = self.worlds[world_index]
+                            .pending_lines
+                            .iter()
+                            .take(to_release)
+                            .map(|line| line.text.replace('\r', ""))
+                            .collect();
+
+                        // Release the lines on the server
+                        self.worlds[world_index].release_pending(visual_budget, client_width);
+
+                        // Broadcast the released lines to clients viewing this world
+                        if !lines_to_broadcast.is_empty() {
+                            let ws_data = lines_to_broadcast.join("\n") + "\n";
+                            self.ws_broadcast_to_world(world_index, WsMessage::ServerData {
+                                world_index,
+                                data: ws_data,
+                                is_viewed: true,
+                                ts: current_timestamp_secs(),
+                                from_server: true,
+                            });
+                        }
+
+                        // Broadcast to all clients so they know how many were released
+                        self.ws_broadcast(WsMessage::PendingReleased { world_index, count: to_release });
+                        let new_count = self.worlds[world_index].pending_lines.len();
+                        self.ws_broadcast(WsMessage::PendingLinesUpdate { world_index, count: new_count });
+
+                        // Broadcast activity count since pending lines changed
+                        self.broadcast_activity();
+
+                        // Update console display
+                        if world_index == self.current_world_index {
+                            self.needs_output_redraw = true;
+                        }
+                    } else {
+                        // Client has stale pending_count - sync them with the actual state
+                        self.ws_broadcast(WsMessage::PendingLinesUpdate { world_index, count: 0 });
+                        self.broadcast_activity();
+                    }
+                }
+            }
+            WsMessage::UpdateWorldSettings { world_index, name, hostname, port, user, password, use_ssl, log_enabled, encoding, auto_login, keep_alive_type, keep_alive_cmd, gmcp_packages } => {
+                // Update world settings from remote client
+                if world_index < self.worlds.len() {
+                    self.worlds[world_index].name = name.clone();
+                    self.worlds[world_index].settings.hostname = hostname.clone();
+                    self.worlds[world_index].settings.port = port.clone();
+                    self.worlds[world_index].settings.user = user.clone();
+                    self.worlds[world_index].settings.password = password.clone();
+                    self.worlds[world_index].settings.use_ssl = use_ssl;
+                    self.worlds[world_index].settings.log_enabled = log_enabled;
+                    self.worlds[world_index].settings.encoding = match encoding.as_str() {
+                        "latin1" => Encoding::Latin1,
+                        "fansi" => Encoding::Fansi,
+                        _ => Encoding::Utf8,
+                    };
+                    self.worlds[world_index].settings.auto_connect_type = AutoConnectType::from_name(&auto_login);
+                    self.worlds[world_index].settings.keep_alive_type = KeepAliveType::from_name(&keep_alive_type);
+                    self.worlds[world_index].settings.keep_alive_cmd = keep_alive_cmd.clone();
+                    self.worlds[world_index].settings.gmcp_packages = gmcp_packages.clone();
+                    // Save settings to persist changes
+                    let _ = persistence::save_settings(self);
+                    // Build settings message for broadcast (encrypt password)
+                    let settings_msg = WorldSettingsMsg {
+                        hostname,
+                        port,
+                        user,
+                        password: encrypt_password(&password),
+                        use_ssl,
+                        log_enabled,
+                        encoding,
+                        auto_connect_type: auto_login,
+                        keep_alive_type,
+                        keep_alive_cmd,
+                        gmcp_packages,
+                    };
+                    // Broadcast update to all clients
+                    self.ws_broadcast(WsMessage::WorldSettingsUpdated {
+                        world_index,
+                        settings: settings_msg,
+                        name,
+                    });
+                }
+            }
+            WsMessage::UpdateGlobalSettings { more_mode_enabled, spell_check_enabled, temp_convert_enabled, world_switch_mode, show_tags, debug_enabled, ansi_music_enabled, console_theme, gui_theme, gui_transparency, color_offset_percent, input_height, font_name, font_size, web_font_size_phone, web_font_size_tablet, web_font_size_desktop, ws_allow_list, web_secure, http_enabled, http_port, ws_enabled, ws_port, ws_cert_file, ws_key_file, tls_proxy_enabled, dictionary_path } => {
+                // Update global settings from remote client
+                self.settings.more_mode_enabled = more_mode_enabled;
+                self.settings.spell_check_enabled = spell_check_enabled;
+                self.settings.temp_convert_enabled = temp_convert_enabled;
+                self.settings.world_switch_mode = WorldSwitchMode::from_name(&world_switch_mode);
+                self.show_tags = show_tags;
+                self.settings.debug_enabled = debug_enabled;
+                self.settings.ansi_music_enabled = ansi_music_enabled;
+                // Console theme affects the TUI on the server
+                self.settings.theme = Theme::from_name(&console_theme);
+                // GUI theme is stored for sending back to GUI clients
+                self.settings.gui_theme = Theme::from_name(&gui_theme);
+                self.settings.gui_transparency = gui_transparency.clamp(0.3, 1.0);
+                self.settings.color_offset_percent = color_offset_percent.min(100);
+                self.input_height = input_height.clamp(1, 15);
+                self.input.visible_height = self.input_height;
+                self.settings.font_name = font_name;
+                self.settings.font_size = font_size.clamp(8.0, 48.0);
+                self.settings.web_font_size_phone = web_font_size_phone.clamp(8.0, 48.0);
+                self.settings.web_font_size_tablet = web_font_size_tablet.clamp(8.0, 48.0);
+                self.settings.web_font_size_desktop = web_font_size_desktop.clamp(8.0, 48.0);
+                self.settings.websocket_allow_list = ws_allow_list.clone();
+                // Update the running WebSocket server's allow list
+                if let Some(ref server) = self.ws_server {
+                    server.update_allow_list(&ws_allow_list);
+                }
+                // Update web settings
+                self.settings.web_secure = web_secure;
+                self.settings.http_enabled = http_enabled;
+                self.settings.http_port = http_port;
+                self.settings.ws_enabled = ws_enabled;
+                self.settings.ws_port = ws_port;
+                self.settings.websocket_cert_file = ws_cert_file;
+                self.settings.websocket_key_file = ws_key_file;
+                self.settings.tls_proxy_enabled = tls_proxy_enabled;
+                if self.settings.dictionary_path != dictionary_path {
+                    self.settings.dictionary_path = dictionary_path;
+                    self.spell_checker = SpellChecker::new(&self.settings.dictionary_path);
+                }
+                // Save settings to persist changes
+                let _ = persistence::save_settings(self);
+                // Build settings message for broadcast
+                let settings_msg = GlobalSettingsMsg {
+                    more_mode_enabled: self.settings.more_mode_enabled,
+                    spell_check_enabled: self.settings.spell_check_enabled,
+                    temp_convert_enabled: self.settings.temp_convert_enabled,
+                    world_switch_mode: self.settings.world_switch_mode.name().to_string(),
+                    debug_enabled: self.settings.debug_enabled,
+                    show_tags: self.show_tags,
+                    ansi_music_enabled: self.settings.ansi_music_enabled,
+                    console_theme: self.settings.theme.name().to_string(),
+                    gui_theme: self.settings.gui_theme.name().to_string(),
+                    gui_transparency: self.settings.gui_transparency,
+                    color_offset_percent: self.settings.color_offset_percent,
+                    input_height: self.input_height,
+                    font_name: self.settings.font_name.clone(),
+                    font_size: self.settings.font_size,
+                    web_font_size_phone: self.settings.web_font_size_phone,
+                    web_font_size_tablet: self.settings.web_font_size_tablet,
+                    web_font_size_desktop: self.settings.web_font_size_desktop,
+                    ws_allow_list: self.settings.websocket_allow_list.clone(),
+                    web_secure: self.settings.web_secure,
+                    http_enabled: self.settings.http_enabled,
+                    http_port: self.settings.http_port,
+                    ws_enabled: self.settings.ws_enabled,
+                    ws_port: self.settings.ws_port,
+                    ws_cert_file: self.settings.websocket_cert_file.clone(),
+                    ws_key_file: self.settings.websocket_key_file.clone(),
+                    tls_proxy_enabled: self.settings.tls_proxy_enabled,
+                    dictionary_path: self.settings.dictionary_path.clone(),
+                    theme_colors_json: self.gui_theme_colors().to_json(),
+                };
+                // Broadcast update to all clients
+                self.ws_broadcast(WsMessage::GlobalSettingsUpdated {
+                    settings: settings_msg,
+                    input_height: self.input_height,
+                });
+            }
+            WsMessage::UpdateActions { actions } => {
+                // Update actions from remote client
+                self.settings.actions = actions.clone();
+                // Save settings to persist changes
+                let _ = persistence::save_settings(self);
+                // Broadcast update to all clients
+                self.ws_broadcast(WsMessage::ActionsUpdated {
+                    actions,
+                });
+            }
+            WsMessage::CalculateNextWorld { current_index } => {
+                // Calculate next world using shared logic
+                let world_info: Vec<crate::util::WorldSwitchInfo> = self.worlds.iter()
+                    .map(|w| crate::util::WorldSwitchInfo {
+                        name: w.name.clone(),
+                        connected: w.connected,
+                        unseen_lines: w.unseen_lines,
+                        pending_lines: w.pending_lines.len(),
+                        first_unseen_at: w.first_unseen_at,
+                    })
+                    .collect();
+                let next_idx = crate::util::calculate_next_world(
+                    &world_info,
+                    current_index,
+                    self.settings.world_switch_mode,
+                );
+                self.ws_send_to_client(client_id, WsMessage::CalculatedWorld { index: next_idx });
+            }
+            WsMessage::CalculatePrevWorld { current_index } => {
+                // Calculate prev world using shared logic
+                let world_info: Vec<crate::util::WorldSwitchInfo> = self.worlds.iter()
+                    .map(|w| crate::util::WorldSwitchInfo {
+                        name: w.name.clone(),
+                        connected: w.connected,
+                        unseen_lines: w.unseen_lines,
+                        pending_lines: w.pending_lines.len(),
+                        first_unseen_at: w.first_unseen_at,
+                    })
+                    .collect();
+                let prev_idx = crate::util::calculate_prev_world(
+                    &world_info,
+                    current_index,
+                    self.settings.world_switch_mode,
+                );
+                self.ws_send_to_client(client_id, WsMessage::CalculatedWorld { index: prev_idx });
+            }
+            WsMessage::CalculateOldestPending { current_index } => {
+                // Find world with oldest pending output (for Escape+w)
+                // Priority: 1) oldest pending, 2) any unseen, 3) previous world
+                let mut oldest_idx: Option<usize> = None;
+                let mut oldest_time: Option<std::time::Instant> = None;
+
+                // Check for worlds with pending output
+                for (idx, world) in self.worlds.iter().enumerate() {
+                    if idx == current_index || world.pending_lines.is_empty() {
+                        continue;
+                    }
+                    if let Some(pending_time) = world.pending_since {
+                        if oldest_time.is_none() || pending_time < oldest_time.unwrap() {
+                            oldest_time = Some(pending_time);
+                            oldest_idx = Some(idx);
+                        }
+                    }
+                }
+
+                // If no pending, check for unseen output
+                if oldest_idx.is_none() {
+                    for (idx, world) in self.worlds.iter().enumerate() {
+                        if idx != current_index && world.unseen_lines > 0 {
+                            oldest_idx = Some(idx);
+                            break;
+                        }
+                    }
+                }
+
+                // If still none, use previous world
+                if oldest_idx.is_none() {
+                    if let Some(prev_idx) = self.previous_world_index {
+                        if prev_idx != current_index && prev_idx < self.worlds.len() {
+                            oldest_idx = Some(prev_idx);
+                        }
+                    }
+                }
+
+                self.ws_send_to_client(client_id, WsMessage::CalculatedWorld { index: oldest_idx });
+            }
+            WsMessage::RequestState => {
+                // Client requested full state resync - send initial state
+                let initial_state = self.build_initial_state();
+                self.ws_send_to_client(client_id, initial_state);
+                // Mark client as having received initial state so it receives broadcasts
+                self.ws_mark_initial_state_sent(client_id);
+                // Set client's initial world so broadcast_to_world_viewers works immediately
+                self.ws_set_client_world(client_id, Some(self.current_world_index));
+                // Also send current activity count
+                self.ws_send_to_client(client_id, WsMessage::ActivityUpdate {
+                    count: self.activity_count(),
+                });
+            }
+            WsMessage::RequestWorldState { world_index } => {
+                // Client switched to a world and needs current state
+                if world_index < self.worlds.len() {
+                    let world = &self.worlds[world_index];
+                    // Build recent lines from output_lines (last 100 lines for context)
+                    let recent_lines: Vec<TimestampedLine> = world.output_lines
+                        .iter()
+                        .rev()
+                        .take(100)
+                        .map(|line| TimestampedLine {
+                            text: line.text.clone(),
+                            ts: line.timestamp.duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs(),
+                            gagged: line.gagged,
+                            from_server: line.from_server,
+                            seq: line.seq,
+                            highlight_color: line.highlight_color.clone(),
+                        })
+                        .collect::<Vec<_>>()
+                        .into_iter()
+                        .rev()
+                        .collect();
+
+                    let pending_count = world.pending_lines.len();
+
+                    self.ws_send_to_client(client_id, WsMessage::WorldStateResponse {
+                        world_index,
+                        pending_count,
+                        prompt: world.prompt.clone(),
+                        scroll_offset: world.scroll_offset,
+                        recent_lines,
+                    });
+                }
+            }
+            WsMessage::BanListRequest => {
+                // Send current ban list to client
+                let bans = self.ban_list.get_ban_info();
+                self.ws_send_to_client(client_id, WsMessage::BanListResponse { bans });
+            }
+            WsMessage::UnbanRequest { host } => {
+                if self.ban_list.remove_ban(&host) {
+                    // Save settings to persist the change
+                    let _ = persistence::save_settings(self);
+                    // Broadcast updated ban list to all clients
+                    self.ws_broadcast(WsMessage::BanListResponse { bans: self.ban_list.get_ban_info() });
+                    self.ws_send_to_client(client_id, WsMessage::UnbanResult { success: true, host, error: None });
+                } else {
+                    self.ws_send_to_client(client_id, WsMessage::UnbanResult { success: false, host, error: Some("No ban found".to_string()) });
+                }
+            }
+            // Theme editor messages
+            WsMessage::RequestThemeEditorState => {
+                let themes_json = self.theme_file.to_json_all();
+                let theme_names: Vec<String> = self.theme_file.themes.keys().cloned().collect();
+                let active_theme = self.settings.gui_theme.name().to_string();
+                self.ws_send_to_client(client_id, WsMessage::ThemeEditorState {
+                    themes_json,
+                    theme_names,
+                    active_theme,
+                });
+            }
+            WsMessage::UpdateThemeColors { theme_name, colors_json } => {
+                let base = if theme_name == "light" {
+                    theme::ThemeColors::light_default()
+                } else {
+                    theme::ThemeColors::dark_default()
+                };
+                let colors = theme::ThemeColors::from_json(&colors_json, &base);
+                self.theme_file.set_theme(&theme_name, colors);
+                // If updated theme is the active GUI theme, broadcast CSS vars update
+                if theme_name == self.settings.gui_theme.name() {
+                    let css_vars = self.gui_theme_colors().to_css_vars();
+                    let colors_json = self.gui_theme_colors().to_json();
+                    self.ws_broadcast(WsMessage::ThemeCssVarsUpdated {
+                        css_vars,
+                        colors_json: colors_json.clone(),
+                    });
+                    // Also broadcast GlobalSettingsUpdated for GUI clients
+                    let settings_msg = self.build_global_settings_msg();
+                    self.ws_broadcast(WsMessage::GlobalSettingsUpdated {
+                        settings: settings_msg,
+                        input_height: self.input_height,
+                    });
+                }
+            }
+            WsMessage::AddTheme { name, copy_from } => {
+                let base_colors = self.theme_file.get(&copy_from).clone();
+                self.theme_file.set_theme(&name, base_colors);
+                // Send updated state back to editor
+                let themes_json = self.theme_file.to_json_all();
+                let theme_names: Vec<String> = self.theme_file.themes.keys().cloned().collect();
+                let active_theme = self.settings.gui_theme.name().to_string();
+                self.ws_send_to_client(client_id, WsMessage::ThemeEditorState {
+                    themes_json,
+                    theme_names,
+                    active_theme,
+                });
+            }
+            WsMessage::DeleteTheme { name } => {
+                self.theme_file.remove_theme(&name);
+                // Send updated state back to editor
+                let themes_json = self.theme_file.to_json_all();
+                let theme_names: Vec<String> = self.theme_file.themes.keys().cloned().collect();
+                let active_theme = self.settings.gui_theme.name().to_string();
+                self.ws_send_to_client(client_id, WsMessage::ThemeEditorState {
+                    themes_json,
+                    theme_names,
+                    active_theme,
+                });
+            }
+            WsMessage::SaveThemeFile => {
+                let content = self.theme_file.generate_file_content();
+                let path = std::path::Path::new(&get_home_dir()).join("clay.theme.dat");
+                match std::fs::write(&path, &content) {
+                    Ok(_) => {
+                        self.ws_send_to_client(client_id, WsMessage::ThemeFileSaved { success: true, error: None });
+                    }
+                    Err(e) => {
+                        self.ws_send_to_client(client_id, WsMessage::ThemeFileSaved { success: false, error: Some(e.to_string()) });
+                    }
+                }
+            }
+            WsMessage::RequestConnectionsList => {
+                // Generate connections list using same format as master console
+                let current_idx = self.current_world_index;
+                const KEEPALIVE_SECS: u64 = 5 * 60;
+                let worlds_info: Vec<util::WorldListInfo> = self.worlds.iter().enumerate().map(|(idx, world)| {
+                    let now = std::time::Instant::now();
+                    let last_activity_elapsed = match (world.last_send_time, world.last_receive_time) {
+                        (Some(s), Some(r)) => Some(s.max(r).elapsed().as_secs()),
+                        (Some(s), None) => Some(s.elapsed().as_secs()),
+                        (None, Some(r)) => Some(r.elapsed().as_secs()),
+                        (None, None) => None,
+                    };
+                    let next_nop = if world.connected {
+                        last_activity_elapsed.map(|elapsed| KEEPALIVE_SECS.saturating_sub(elapsed))
+                    } else {
+                        None
+                    };
+                    util::WorldListInfo {
+                        name: world.name.clone(),
+                        connected: world.connected,
+                        is_current: idx == current_idx,
+                        is_ssl: world.is_tls,
+                        is_proxy: world.proxy_pid.is_some(),
+                        unseen_lines: world.unseen_lines,
+                        last_send_secs: world.last_user_command_time.map(|t| now.duration_since(t).as_secs()),
+                        last_recv_secs: world.last_receive_time.map(|t| now.duration_since(t).as_secs()),
+                        last_nop_secs: world.last_nop_time.map(|t| now.duration_since(t).as_secs()),
+                        next_nop_secs: next_nop,
+                        buffer_size: world.output_lines.len() + world.pending_lines.len(),
+                    }
+                }).collect();
+                let output = util::format_worlds_list(&worlds_info);
+                let lines: Vec<String> = output.lines().map(|s| s.to_string()).collect();
+                self.ws_send_to_client(client_id, WsMessage::ConnectionsListResponse { lines });
+            }
+            WsMessage::ReportSeqMismatch { world_index, expected_seq_gt, actual_seq, line_text, source } => {
+                let world_name = self.worlds.get(world_index).map(|w| w.name.as_str()).unwrap_or("?");
+                use std::io::Write;
+                if let Ok(mut f) = std::fs::OpenOptions::new()
+                    .create(true).append(true)
+                    .open("clay.output.debug")
+                {
+                    let _ = writeln!(f, "SEQ MISMATCH [{}] in '{}': expected seq>{}, got seq={}, text={:?}",
+                        source, world_name, expected_seq_gt, actual_seq,
+                        line_text.chars().take(80).collect::<String>());
+                }
+            }
+            WsMessage::ClientTypeDeclaration { client_type } => {
+                // Update client type in WebSocket server
+                self.ws_set_client_type(client_id, client_type);
+            }
+            WsMessage::CycleWorld { direction } => {
+                // Client requests to cycle to next/previous world
+                let current = self.ws_client_worlds.get(&client_id)
+                    .map(|s| s.world_index)
+                    .unwrap_or(self.current_world_index);
+
+                let new_index = if direction == "up" {
+                    self.calculate_prev_world_from(current)
+                } else {
+                    self.calculate_next_world_from(current)
+                };
+
+                if let Some(idx) = new_index {
+                    // Update client's view state (sync state)
+                    let visible_lines = self.ws_client_worlds.get(&client_id)
+                        .map(|s| s.visible_lines)
+                        .unwrap_or(24);
+                    let dimensions = self.ws_client_worlds.get(&client_id)
+                        .and_then(|s| s.dimensions);
+                    self.ws_client_worlds.insert(client_id, ClientViewState {
+                        world_index: idx,
+                        visible_lines,
+                        dimensions,
+                    });
+                    // Update client's world in WebSocket server (async state)
+                    self.ws_set_client_world(client_id, Some(idx));
+
+                    // Send world switch result with state
+                    if idx < self.worlds.len() {
+                        let pending_count = self.worlds[idx].pending_lines.len();
+                        let paused = self.worlds[idx].paused;
+                        let world_name = self.worlds[idx].name.clone();
+
+                        self.ws_send_to_client(client_id, WsMessage::WorldSwitchResult {
+                            world_index: idx,
+                            world_name,
+                            pending_count,
+                            paused,
+                        });
+
+                        // Send initial output lines based on client type
+                        let client_type = self.ws_get_client_type(client_id);
+                        let world = &self.worlds[idx];
+                        let total_lines = world.output_lines.len();
+
+                        let lines_to_send = match client_type {
+                            Some(websocket::RemoteClientType::RemoteConsole) => {
+                                // Console: last screenful (viewport - 2)
+                                visible_lines.saturating_sub(2).min(total_lines)
+                            }
+                            _ => {
+                                // Web/GUI: full history
+                                total_lines
+                            }
+                        };
+
+                        if lines_to_send > 0 {
+                            let start = total_lines.saturating_sub(lines_to_send);
+                            let lines: Vec<TimestampedLine> = world.output_lines[start..].iter()
+                                .map(|line| {
+                                    let ts = line.timestamp
+                                        .duration_since(std::time::UNIX_EPOCH)
+                                        .map(|d| d.as_secs())
+                                        .unwrap_or(0);
+                                    TimestampedLine {
+                                        text: line.text.clone(),
+                                        ts,
+                                        gagged: line.gagged,
+                                        from_server: line.from_server,
+                                        seq: line.seq,
+                                        highlight_color: line.highlight_color.clone(),
+                                    }
+                                })
+                                .collect();
+
+                            self.ws_send_to_client(client_id, WsMessage::OutputLines {
+                                world_index: idx,
+                                lines,
+                                is_initial: true,
+                            });
+                        }
+
+                        // Also mark world as seen if it had unseen output
+                        if self.worlds[idx].unseen_lines > 0 {
+                            self.worlds[idx].unseen_lines = 0;
+                            self.worlds[idx].first_unseen_at = None;
+                            self.ws_broadcast(WsMessage::UnseenCleared { world_index: idx });
+                            self.broadcast_activity();
+                        }
+                    }
+                }
+            }
+            WsMessage::RequestScrollback { world_index, count, before_seq } => {
+                // Console client requests scrollback from master
+                if world_index < self.worlds.len() {
+                    let world = &self.worlds[world_index];
+
+                    // Find lines to send based on before_seq
+                    let lines: Vec<TimestampedLine> = if let Some(seq) = before_seq {
+                        // Send lines with seq < before_seq (older than what client has)
+                        let eligible: Vec<_> = world.output_lines.iter()
+                            .filter(|l| l.seq < seq)
+                            .collect();
+                        let start = eligible.len().saturating_sub(count);
+                        eligible[start..].iter()
+                            .map(|line| {
+                                let ts = line.timestamp
+                                    .duration_since(std::time::UNIX_EPOCH)
+                                    .map(|d| d.as_secs())
+                                    .unwrap_or(0);
+                                TimestampedLine {
+                                    text: line.text.clone(),
+                                    ts,
+                                    gagged: line.gagged,
+                                    from_server: line.from_server,
+                                    seq: line.seq,
+                                    highlight_color: line.highlight_color.clone(),
+                                }
+                            })
+                            .collect()
+                    } else {
+                        // No before_seq - send last N lines (backwards compatible)
+                        let total_lines = world.output_lines.len();
+                        let start = total_lines.saturating_sub(count);
+                        world.output_lines[start..].iter()
+                            .map(|line| {
+                                let ts = line.timestamp
+                                    .duration_since(std::time::UNIX_EPOCH)
+                                    .map(|d| d.as_secs())
+                                    .unwrap_or(0);
+                                TimestampedLine {
+                                    text: line.text.clone(),
+                                    ts,
+                                    gagged: line.gagged,
+                                    from_server: line.from_server,
+                                    seq: line.seq,
+                                    highlight_color: line.highlight_color.clone(),
+                                }
+                            })
+                            .collect()
+                    };
+
+                    self.ws_send_to_client(client_id, WsMessage::ScrollbackLines {
+                        world_index,
+                        lines,
+                    });
+                }
+            }
+            WsMessage::ToggleWorldGmcp { world_index } => {
+                if world_index < self.worlds.len() {
+                    self.worlds[world_index].gmcp_user_enabled = !self.worlds[world_index].gmcp_user_enabled;
+                    // Broadcast toggle state first so clients update before receiving media
+                    self.ws_broadcast(WsMessage::GmcpUserToggled {
+                        world_index,
+                        enabled: self.worlds[world_index].gmcp_user_enabled,
+                    });
+                    if self.worlds[world_index].gmcp_user_enabled {
+                        self.restart_world_media(world_index);
+                    } else {
+                        self.stop_world_media(world_index);
+                    }
+                    self.needs_output_redraw = true;
+                }
+            }
+            WsMessage::SendGmcp { world_index, package, data } => {
+                if world_index < self.worlds.len() {
+                    if let Some(ref tx) = self.worlds[world_index].command_tx {
+                        let msg = build_gmcp_message(&package, &data);
+                        let _ = tx.try_send(WriteCommand::Raw(msg));
+                    }
+                }
+            }
+            WsMessage::SendMsdp { world_index, variable, value } => {
+                if world_index < self.worlds.len() {
+                    if let Some(ref tx) = self.worlds[world_index].command_tx {
+                        let msg = build_msdp_set(&variable, &value);
+                        let _ = tx.try_send(WriteCommand::Raw(msg));
+                    }
+                }
+            }
+            _ => {
+                // Other message types handled elsewhere or ignored
+            }
+        }
+        WsAsyncAction::Done
     }
 
     /// Build initial state message for a newly authenticated client.
@@ -9287,135 +11235,29 @@ pub async fn run_app_headless(
                     }
                     AppEvent::Disconnected(ref world_name, conn_id) => {
                         if let Some(world_idx) = app.find_world_index(world_name) {
-                            // Ignore stale disconnect from a previous connection
-                            if conn_id != app.worlds[world_idx].connection_id {
-                                continue;
-                            }
-                            // Fire TF DISCONNECT hook
-                            let hook_result = tf::bridge::fire_event(&mut app.tf_engine, tf::TfHookEvent::Disconnect);
-                            for cmd in hook_result.clay_commands {
-                                let _ = app.tf_engine.execute(&cmd);
-                            }
-
-                            // Push prompt to output before clearing
-                            if !app.worlds[world_idx].prompt.is_empty() {
-                                let prompt_text = app.worlds[world_idx].prompt.trim().to_string();
-                                let seq = app.worlds[world_idx].next_seq;
-                                app.worlds[world_idx].next_seq += 1;
-                                app.worlds[world_idx].output_lines.push(OutputLine::new(prompt_text, seq));
-                            }
-                            app.worlds[world_idx].clear_connection_state(true, true);
-                            let seq = app.worlds[world_idx].next_seq;
-                            app.worlds[world_idx].next_seq += 1;
-                            let disconnect_msg = OutputLine::new_client("Disconnected.".to_string(), seq);
-                            app.worlds[world_idx].output_lines.push(disconnect_msg.clone());
-
-                            if world_idx != app.current_world_index {
-                                if app.worlds[world_idx].unseen_lines == 0 {
-                                    app.worlds[world_idx].first_unseen_at = Some(std::time::Instant::now());
-                                }
-                                app.worlds[world_idx].unseen_lines += 1;
-                            }
-
-                            app.ws_broadcast_to_world(world_idx, WsMessage::ServerData {
-                                world_index: world_idx,
-                                data: "Disconnected.\n".to_string(),
-                                is_viewed: true,
-                                ts: disconnect_msg.timestamp.duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs(),
-                                from_server: false,
-                            });
-                            app.ws_broadcast(WsMessage::WorldDisconnected { world_index: world_idx });
+                            if conn_id != app.worlds[world_idx].connection_id { continue; }
+                            app.handle_disconnected(world_idx);
                         }
                     }
                     AppEvent::WsClientMessage(client_id, msg) => {
                         if let WsMessage::AuthRequest { current_world, .. } = &*msg {
-                            let initial_state = app.build_initial_state();
-                            app.ws_send_to_client(client_id, initial_state);
-                            // Mark client as having received initial state so it receives broadcasts
-                            app.ws_mark_initial_state_sent(client_id);
-                            // Use client's world if provided, otherwise default to console's world
-                            let world_idx = current_world
-                                .filter(|&w| w < app.worlds.len())
-                                .unwrap_or(app.current_world_index);
-                            // Set client's initial world so broadcast_to_world_viewers works immediately
-                            app.ws_set_client_world(client_id, Some(world_idx));
-                            // Also update ws_client_worlds cache for ws_client_viewing()
-                            app.ws_client_worlds.insert(client_id, ClientViewState {
-                                world_index: world_idx,
-                                visible_lines: 0,
-                                dimensions: None,
-                            });
+                            app.handle_ws_auth_initial_state(client_id, *current_world);
                         } else {
                             daemon::handle_daemon_ws_message(&mut app, client_id, *msg, &event_tx).await;
                         }
                     }
                     AppEvent::WsClientConnected(_client_id) => {}
                     AppEvent::WsClientDisconnected(client_id) => {
-                        app.ws_client_worlds.remove(&client_id);
+                        app.handle_ws_client_disconnected(client_id);
                     }
                     AppEvent::WsAuthKeyValidation(client_id, msg, client_ip) => {
-                        // Validate auth key from AuthRequest
-                        if let WsMessage::AuthRequest { auth_key: Some(key), current_world, .. } = *msg {
-                            let is_valid = app.settings.websocket_auth_keys.contains(&key);
-                            if is_valid {
-                                // Key is valid - authenticate the client
-                                app.ws_set_client_authenticated(client_id, true);
-                                app.ws_send_to_client(client_id, WsMessage::AuthResponse {
-                                    success: true,
-                                    error: None,
-                                    username: None,
-                                    multiuser_mode: false,
-                                });
-                                // Send initial state
-                                let initial_state = app.build_initial_state();
-                                app.ws_send_to_client(client_id, initial_state);
-                                app.ws_mark_initial_state_sent(client_id);
-                                // Set client's world
-                                let world_idx = current_world
-                                    .filter(|&w| w < app.worlds.len())
-                                    .unwrap_or(app.current_world_index);
-                                app.ws_set_client_world(client_id, Some(world_idx));
-                                app.ws_client_worlds.insert(client_id, ClientViewState {
-                                    world_index: world_idx,
-                                    visible_lines: 0,
-                                    dimensions: None,
-                                });
-                            } else {
-                                // Invalid key - record ban violation
-                                app.ban_list.record_violation(&client_ip, "WebSocket: failed auth key");
-                                app.ws_send_to_client(client_id, WsMessage::AuthResponse {
-                                    success: false,
-                                    error: Some("Invalid auth key".to_string()),
-                                    username: None,
-                                    multiuser_mode: false,
-                                });
-                            }
-                        }
+                        app.handle_ws_auth_key_validation(client_id, *msg, &client_ip);
                     }
                     AppEvent::WsKeyRequest(client_id) => {
-                        // Generate a new auth key for the client using SHA256 hash
-                        use sha2::{Sha256, Digest};
-                        let mut hasher = Sha256::new();
-                        hasher.update(std::time::SystemTime::now()
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .unwrap_or_default()
-                            .as_nanos()
-                            .to_le_bytes());
-                        hasher.update(std::process::id().to_le_bytes());
-                        hasher.update(client_id.to_le_bytes());
-                        // Add number of existing keys for additional uniqueness
-                        hasher.update(app.settings.websocket_auth_keys.len().to_le_bytes());
-                        let key = hex::encode(hasher.finalize());
-                        // Store the key
-                        app.settings.websocket_auth_keys.push(key.clone());
-                        let _ = persistence::save_settings(&app);
-                        // Send to client
-                        app.ws_send_to_client(client_id, WsMessage::KeyGenerated { auth_key: key });
+                        app.handle_ws_key_request(client_id);
                     }
                     AppEvent::WsKeyRevoke(_client_id, key) => {
-                        // Remove the key from stored keys
-                        app.settings.websocket_auth_keys.retain(|k| k != &key);
-                        let _ = persistence::save_settings(&app);
+                        app.handle_ws_key_revoke(&key);
                     }
                     AppEvent::SystemMessage(msg) => {
                         // Add to current world's output and broadcast
@@ -9440,62 +11282,9 @@ pub async fn run_app_headless(
                             return Ok(());
                         }
                     }
-                    // Background connection completed successfully
                     AppEvent::ConnectionSuccess(world_name, cmd_tx, socket_fd, is_tls) => {
-                        let _ = &socket_fd; // used on unix only
-                        if let Some(world_idx) = app.find_world_index(&world_name) {
-                            app.worlds[world_idx].connected = true;
-                            app.worlds[world_idx].was_connected = true;
-                            app.worlds[world_idx].prompt_count = 0;
-                            let now = std::time::Instant::now();
-                            app.worlds[world_idx].last_send_time = Some(now);
-                            app.worlds[world_idx].last_receive_time = Some(now);
-                            app.worlds[world_idx].last_user_command_time = Some(now);
-                            app.worlds[world_idx].last_nop_time = None;
-                            app.worlds[world_idx].is_initial_world = false;
-                            app.worlds[world_idx].command_tx = Some(cmd_tx.clone());
-                            #[cfg(unix)]
-                            { app.worlds[world_idx].socket_fd = socket_fd; }
-                            app.worlds[world_idx].is_tls = is_tls;
-
-                            // Discard any unused initial world
-                            app.discard_initial_world();
-
-                            // Open log file if enabled
-                            if app.worlds[world_idx].settings.log_enabled {
-                                if app.worlds[world_idx].open_log_file() {
-                                    let log_path = app.worlds[world_idx].get_log_path();
-                                    app.add_output_to_world(world_idx, &format!("Logging to: {}", log_path.display()));
-                                } else {
-                                    app.add_output_to_world(world_idx, "Warning: Could not open log file");
-                                }
-                            }
-
-                            // Fire TF CONNECT hook
-                            let hook_result = tf::bridge::fire_event(&mut app.tf_engine, tf::TfHookEvent::Connect);
-                            for cmd in hook_result.send_commands {
-                                let _ = cmd_tx.try_send(WriteCommand::Text(cmd));
-                            }
-                            for cmd in hook_result.clay_commands {
-                                let _ = app.tf_engine.execute(&cmd);
-                            }
-
-                            // Send auto-login if configured
-                            let skip_login = app.worlds[world_idx].skip_auto_login;
-                            app.worlds[world_idx].skip_auto_login = false;
-                            let user = app.worlds[world_idx].settings.user.clone();
-                            let password = app.worlds[world_idx].settings.password.clone();
-                            let auto_connect_type = app.worlds[world_idx].settings.auto_connect_type;
-                            if !skip_login && !user.is_empty() && !password.is_empty() && auto_connect_type == AutoConnectType::Connect {
-                                let connect_cmd = format!("connect {} {}", user, password);
-                                let _ = cmd_tx.try_send(WriteCommand::Text(connect_cmd));
-                            }
-
-                            // Broadcast connection status
-                            app.ws_broadcast(WsMessage::WorldConnected { world_index: world_idx, name: app.worlds[world_idx].name.clone() });
-                        }
+                        app.handle_connection_success(&world_name, cmd_tx, socket_fd, is_tls);
                     }
-                    // Background connection failed
                     AppEvent::ConnectionFailed(world_name, error) => {
                         if let Some(world_idx) = app.find_world_index(&world_name) {
                             app.add_output_to_world(world_idx, &format!("Connection failed: {}", error));
@@ -9503,29 +11292,7 @@ pub async fn run_app_headless(
                     }
                     AppEvent::GmcpNegotiated(ref world_name) => {
                         if let Some(world_idx) = app.find_world_index(world_name) {
-                            app.worlds[world_idx].gmcp_enabled = true;
-                            let packages_str = app.worlds[world_idx].settings.gmcp_packages.clone();
-                            let packages: Vec<String> = packages_str
-                                .split(',')
-                                .map(|s| s.trim().to_string())
-                                .filter(|s| !s.is_empty())
-                                .collect();
-                            app.worlds[world_idx].gmcp_supported_packages = packages.clone();
-                            if let Some(ref tx) = app.worlds[world_idx].command_tx {
-                                let hello = build_gmcp_message("Core.Hello", &format!(
-                                    "{{\"client\":\"Clay\",\"version\":\"{}\"}}",
-                                    VERSION
-                                ));
-                                let _ = tx.try_send(WriteCommand::Raw(hello));
-                                let json_list: Vec<String> = packages.iter()
-                                    .map(|p| format!("\"{}\"", p))
-                                    .collect();
-                                let supports = build_gmcp_message(
-                                    "Core.Supports.Set",
-                                    &format!("[{}]", json_list.join(",")),
-                                );
-                                let _ = tx.try_send(WriteCommand::Raw(supports));
-                            }
+                            app.handle_gmcp_negotiated(world_idx);
                         }
                     }
                     AppEvent::MsdpNegotiated(ref world_name) => {
@@ -9535,75 +11302,12 @@ pub async fn run_app_headless(
                     }
                     AppEvent::GmcpReceived(ref world_name, ref package, ref json_data) => {
                         if let Some(world_idx) = app.find_world_index(world_name) {
-                            // Always store GMCP data
-                            app.worlds[world_idx].gmcp_data.insert(package.clone(), json_data.clone());
-                            // Always store Client.Media.Default URL (just URL storage, no playback)
-                            if package == "Client.Media.Default" {
-                                if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(json_data) {
-                                    if let Some(url) = parsed.get("url").and_then(|v| v.as_str()) {
-                                        app.worlds[world_idx].mcmp_default_url = url.to_string();
-                                    }
-                                }
-                            }
-                            // Always broadcast to remote clients (they decide locally)
-                            app.ws_broadcast(WsMessage::GmcpData {
-                                world_index: world_idx,
-                                package: package.clone(),
-                                data: json_data.clone(),
-                            });
-                            if package.starts_with("Client.Media.") {
-                                let action = package.rsplit('.').next().unwrap_or("Play").to_string();
-                                let default_url = app.worlds[world_idx].mcmp_default_url.clone();
-                                app.ws_broadcast(WsMessage::McmpMedia {
-                                    world_index: world_idx,
-                                    action,
-                                    data: json_data.clone(),
-                                    default_url,
-                                });
-                            }
-                            // Always track media state; only play audio when enabled + current world
-                            if package.starts_with("Client.Media.") {
-                                let play_audio = app.worlds[world_idx].gmcp_user_enabled
-                                    && world_idx == app.current_world_index;
-                                app.handle_gmcp_media(world_idx, package, json_data, play_audio);
-                            }
-                            // Gate TF hooks on gmcp_user_enabled
-                            if app.worlds[world_idx].gmcp_user_enabled {
-                                app.tf_engine.set_global("gmcp_package", crate::tf::TfValue::String(package.clone()));
-                                app.tf_engine.set_global("gmcp_data", crate::tf::TfValue::String(json_data.clone()));
-                                let results = crate::tf::hooks::fire_hook(&mut app.tf_engine, crate::tf::TfHookEvent::Gmcp);
-                                for r in results {
-                                    if let crate::tf::TfCommandResult::SendToMud(text) = r {
-                                        if let Some(world) = app.worlds.get(world_idx) {
-                                            if let Some(ref tx) = world.command_tx {
-                                                let _ = tx.try_send(WriteCommand::Text(text));
-                                            }
-                                        }
-                                    }
-                                }
-                            }
+                            app.handle_gmcp_received(world_idx, package, json_data);
                         }
                     }
                     AppEvent::MsdpReceived(ref world_name, ref variable, ref value_json) => {
                         if let Some(world_idx) = app.find_world_index(world_name) {
-                            app.worlds[world_idx].msdp_variables.insert(variable.clone(), value_json.clone());
-                            app.tf_engine.set_global("msdp_var", crate::tf::TfValue::String(variable.clone()));
-                            app.tf_engine.set_global("msdp_val", crate::tf::TfValue::String(value_json.clone()));
-                            let results = crate::tf::hooks::fire_hook(&mut app.tf_engine, crate::tf::TfHookEvent::Msdp);
-                            for r in results {
-                                if let crate::tf::TfCommandResult::SendToMud(text) = r {
-                                    if let Some(world) = app.worlds.get(world_idx) {
-                                        if let Some(ref tx) = world.command_tx {
-                                            let _ = tx.try_send(WriteCommand::Text(text));
-                                        }
-                                    }
-                                }
-                            }
-                            app.ws_broadcast(WsMessage::MsdpData {
-                                world_index: world_idx,
-                                variable: variable.clone(),
-                                value: value_json.clone(),
-                            });
+                            app.handle_msdp_received(world_idx, variable, value_json);
                         }
                     }
                     AppEvent::MediaProcessReady(world_idx, key, child, is_music) => {
@@ -11180,109 +12884,33 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                     }
                     AppEvent::Disconnected(ref world_name, conn_id) => {
                         if let Some(world_idx) = app.find_world_index(world_name) {
-                            // Ignore stale disconnect from a previous connection
-                            if conn_id != app.worlds[world_idx].connection_id {
-                                continue;
-                            }
-                            // Fire TF DISCONNECT hook before cleaning up
-                            let hook_result = tf::bridge::fire_event(&mut app.tf_engine, tf::TfHookEvent::Disconnect);
-                            for cmd in hook_result.clay_commands {
-                                let _ = app.tf_engine.execute(&cmd);
-                            }
-
-                            // Push prompt to output before clearing
-                            if !app.worlds[world_idx].prompt.is_empty() {
-                                let prompt_text = app.worlds[world_idx].prompt.trim().to_string();
-                                let seq = app.worlds[world_idx].next_seq;
-                                app.worlds[world_idx].next_seq += 1;
-                                app.worlds[world_idx].output_lines.push(OutputLine::new(prompt_text, seq));
-                            }
-                            app.worlds[world_idx].clear_connection_state(true, true);
-                            // Show disconnection message
-                            let seq = app.worlds[world_idx].next_seq;
-                            app.worlds[world_idx].next_seq += 1;
-                            let disconnect_msg = OutputLine::new_client("Disconnected.".to_string(), seq);
-                            app.worlds[world_idx].output_lines.push(disconnect_msg.clone());
-
-                            // If this is not the current world, increment unseen_lines for activity indicator
-                            if world_idx != app.current_world_index {
-                                if app.worlds[world_idx].unseen_lines == 0 {
-                                    app.worlds[world_idx].first_unseen_at = Some(std::time::Instant::now());
-                                }
-                                app.worlds[world_idx].unseen_lines += 1;
-                            }
-
-                            // Broadcast disconnect message to WebSocket clients
-                            app.ws_broadcast_to_world(world_idx, WsMessage::ServerData {
-                                world_index: world_idx,
-                                data: "Disconnected.\n".to_string(),
-                                is_viewed: true,
-                                ts: disconnect_msg.timestamp.duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs(),
-                                from_server: false,
-                            });
-                            app.ws_broadcast(WsMessage::WorldDisconnected { world_index: world_idx });
+                            if conn_id != app.worlds[world_idx].connection_id { continue; }
+                            app.handle_disconnected(world_idx);
                         }
                     }
                     AppEvent::TelnetDetected(ref world_name) => {
                         if let Some(world_idx) = app.find_world_index(world_name) {
-                            if !app.worlds[world_idx].telnet_mode {
-                                app.worlds[world_idx].telnet_mode = true;
-                            }
+                            app.handle_telnet_detected(world_idx);
                         }
                     }
                     AppEvent::WontEchoSeen(ref world_name) => {
                         if let Some(world_idx) = app.find_world_index(world_name) {
-                            if !app.worlds[world_idx].uses_wont_echo_prompt {
-                                app.worlds[world_idx].uses_wont_echo_prompt = true;
-                            }
+                            app.handle_wont_echo_seen(world_idx);
                         }
                     }
                     AppEvent::NawsRequested(ref world_name) => {
                         if let Some(world_idx) = app.find_world_index(world_name) {
-                            // Mark NAWS as enabled for this world
-                            app.worlds[world_idx].naws_enabled = true;
-                            // Send initial window size
-                            app.send_naws_if_changed(world_idx);
+                            app.handle_naws_requested(world_idx);
                         }
                     }
                     AppEvent::TtypeRequested(ref world_name) => {
                         if let Some(world_idx) = app.find_world_index(world_name) {
-                            // Send terminal type response
-                            // Use TERM environment variable if set, otherwise default to "ANSI"
-                            let term_type = std::env::var("TERM").unwrap_or_else(|_| "ANSI".to_string());
-                            if let Some(ref tx) = app.worlds[world_idx].command_tx {
-                                let ttype_response = build_ttype_response(&term_type);
-                                let _ = tx.try_send(WriteCommand::Raw(ttype_response));
-                            }
+                            app.handle_ttype_requested(world_idx);
                         }
                     }
                     AppEvent::GmcpNegotiated(ref world_name) => {
                         if let Some(world_idx) = app.find_world_index(world_name) {
-                            app.worlds[world_idx].gmcp_enabled = true;
-                            // Build supports list from world settings
-                            let packages_str = app.worlds[world_idx].settings.gmcp_packages.clone();
-                            let packages: Vec<String> = packages_str
-                                .split(',')
-                                .map(|s| s.trim().to_string())
-                                .filter(|s| !s.is_empty())
-                                .collect();
-                            app.worlds[world_idx].gmcp_supported_packages = packages.clone();
-                            // Send Core.Hello and Core.Supports.Set
-                            if let Some(ref tx) = app.worlds[world_idx].command_tx {
-                                let hello = build_gmcp_message("Core.Hello", &format!(
-                                    "{{\"client\":\"Clay\",\"version\":\"{}\"}}",
-                                    VERSION
-                                ));
-                                let _ = tx.try_send(WriteCommand::Raw(hello));
-                                let json_list: Vec<String> = packages.iter()
-                                    .map(|p| format!("\"{}\"", p))
-                                    .collect();
-                                let supports = build_gmcp_message(
-                                    "Core.Supports.Set",
-                                    &format!("[{}]", json_list.join(",")),
-                                );
-                                let _ = tx.try_send(WriteCommand::Raw(supports));
-                            }
+                            app.handle_gmcp_negotiated(world_idx);
                         }
                     }
                     AppEvent::MsdpNegotiated(ref world_name) => {
@@ -11292,146 +12920,17 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                     }
                     AppEvent::GmcpReceived(ref world_name, ref package, ref json_data) => {
                         if let Some(world_idx) = app.find_world_index(world_name) {
-                            // Always store GMCP data
-                            app.worlds[world_idx].gmcp_data.insert(package.clone(), json_data.clone());
-                            // Always store Client.Media.Default URL
-                            if package == "Client.Media.Default" {
-                                if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(json_data) {
-                                    if let Some(url) = parsed.get("url").and_then(|v| v.as_str()) {
-                                        app.worlds[world_idx].mcmp_default_url = url.to_string();
-                                    }
-                                }
-                            }
-                            // Always broadcast to remote clients
-                            app.ws_broadcast(WsMessage::GmcpData {
-                                world_index: world_idx,
-                                package: package.clone(),
-                                data: json_data.clone(),
-                            });
-                            if package.starts_with("Client.Media.") {
-                                let action = package.rsplit('.').next().unwrap_or("Play").to_string();
-                                let default_url = app.worlds[world_idx].mcmp_default_url.clone();
-                                app.ws_broadcast(WsMessage::McmpMedia {
-                                    world_index: world_idx,
-                                    action,
-                                    data: json_data.clone(),
-                                    default_url,
-                                });
-                            }
-                            // Always track media state; only play audio when enabled + current world
-                            if package.starts_with("Client.Media.") {
-                                let play_audio = app.worlds[world_idx].gmcp_user_enabled
-                                    && world_idx == app.current_world_index;
-                                app.handle_gmcp_media(world_idx, package, json_data, play_audio);
-                            }
-                            // Gate TF hooks on gmcp_user_enabled
-                            if app.worlds[world_idx].gmcp_user_enabled {
-                                app.tf_engine.set_global("gmcp_package", crate::tf::TfValue::String(package.clone()));
-                                app.tf_engine.set_global("gmcp_data", crate::tf::TfValue::String(json_data.clone()));
-                                let results = crate::tf::hooks::fire_hook(&mut app.tf_engine, crate::tf::TfHookEvent::Gmcp);
-                                for r in results {
-                                    if let crate::tf::TfCommandResult::SendToMud(text) = r {
-                                        if let Some(world) = app.worlds.get(world_idx) {
-                                            if let Some(ref tx) = world.command_tx {
-                                                let _ = tx.try_send(WriteCommand::Text(text));
-                                            }
-                                        }
-                                    }
-                                }
-                            }
+                            app.handle_gmcp_received(world_idx, package, json_data);
                         }
                     }
                     AppEvent::MsdpReceived(ref world_name, ref variable, ref value_json) => {
                         if let Some(world_idx) = app.find_world_index(world_name) {
-                            // Store MSDP variable
-                            app.worlds[world_idx].msdp_variables.insert(variable.clone(), value_json.clone());
-                            // Fire TF MSDP hook
-                            app.tf_engine.set_global("msdp_var", crate::tf::TfValue::String(variable.clone()));
-                            app.tf_engine.set_global("msdp_val", crate::tf::TfValue::String(value_json.clone()));
-                            let results = crate::tf::hooks::fire_hook(&mut app.tf_engine, crate::tf::TfHookEvent::Msdp);
-                            for r in results {
-                                if let crate::tf::TfCommandResult::SendToMud(text) = r {
-                                    if let Some(world) = app.worlds.get(world_idx) {
-                                        if let Some(ref tx) = world.command_tx {
-                                            let _ = tx.try_send(WriteCommand::Text(text));
-                                        }
-                                    }
-                                }
-                            }
-                            // Broadcast to WebSocket clients
-                            app.ws_broadcast(WsMessage::MsdpData {
-                                world_index: world_idx,
-                                variable: variable.clone(),
-                                value: value_json.clone(),
-                            });
+                            app.handle_msdp_received(world_idx, variable, value_json);
                         }
                     }
                     AppEvent::Prompt(ref world_name, prompt_bytes) => {
                         if let Some(world_idx) = app.find_world_index(world_name) {
-                            app.worlds[world_idx].last_receive_time = Some(std::time::Instant::now());
-                            let encoding = app.worlds[world_idx].settings.encoding;
-                            let prompt_text = encoding.decode(&prompt_bytes);
-                            let prompt_normalized = crate::util::normalize_prompt(&prompt_text);
-
-                            // If world is not connected, display prompt as output instead of input area
-                            if !app.worlds[world_idx].connected {
-                                let seq = app.worlds[world_idx].next_seq;
-                                app.worlds[world_idx].next_seq += 1;
-                                app.worlds[world_idx].output_lines.push(OutputLine::new(prompt_normalized.trim().to_string(), seq));
-                                app.worlds[world_idx].prompt.clear();
-                                continue;
-                            }
-
-                            app.worlds[world_idx].prompt = prompt_normalized.clone();
-
-                            // Broadcast prompt to WebSocket clients
-                            app.ws_broadcast(WsMessage::PromptUpdate {
-                                world_index: world_idx,
-                                prompt: prompt_normalized,
-                            });
-
-                            let world = &mut app.worlds[world_idx];
-                            world.prompt_count += 1;
-
-                            // Skip auto-login if flag is set (from /worlds -l)
-                            if world.skip_auto_login {
-                                continue;
-                            }
-
-                            let auto_type = world.settings.auto_connect_type;
-                            let user = world.settings.user.clone();
-                            let password = world.settings.password.clone();
-                            let prompt_num = world.prompt_count;
-
-                            if !user.is_empty() && !password.is_empty() {
-                                let cmd_to_send = match auto_type {
-                                    AutoConnectType::Prompt => {
-                                        match prompt_num {
-                                            1 if !user.is_empty() => Some(user),
-                                            2 if !password.is_empty() => Some(password),
-                                            _ => None,
-                                        }
-                                    }
-                                    AutoConnectType::MooPrompt => {
-                                        match prompt_num {
-                                            1 if !user.is_empty() => Some(user.clone()),
-                                            2 if !password.is_empty() => Some(password),
-                                            3 if !user.is_empty() => Some(user),
-                                            _ => None,
-                                        }
-                                    }
-                                    AutoConnectType::Connect | AutoConnectType::NoLogin => None,
-                                };
-
-                                if let Some(cmd) = cmd_to_send {
-                                    if let Some(tx) = &world.command_tx {
-                                        let _ = tx.try_send(WriteCommand::Text(cmd));
-                                        world.last_send_time = Some(std::time::Instant::now());
-                                        // Clear prompt since we auto-answered it
-                                        world.prompt.clear();
-                                    }
-                                }
-                            }
+                            app.handle_prompt(world_idx, &prompt_bytes);
                         }
                     }
                     AppEvent::SystemMessage(message) => {
@@ -11597,1710 +13096,47 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                             }
                         }
                     }
-                    // WebSocket events
-                    AppEvent::WsClientConnected(_client_id) => {
-                        // Client connected but not yet authenticated - nothing to do
-                    }
+                    AppEvent::WsClientConnected(_client_id) => {}
                     AppEvent::WsClientDisconnected(client_id) => {
-                        // Client disconnected - remove from ws_client_worlds cache
-                        let had_dimensions = app.ws_client_worlds.get(&client_id).and_then(|s| s.dimensions).is_some();
-                        app.ws_client_worlds.remove(&client_id);
-                        // If client had dimensions, recalculate minimum and send NAWS updates
-                        if had_dimensions {
-                            app.send_naws_to_all_worlds();
-                        }
+                        app.handle_ws_client_disconnected(client_id);
                     }
                     AppEvent::WsAuthKeyValidation(client_id, msg, client_ip) => {
-                        // Validate auth key from AuthRequest
-                        if let WsMessage::AuthRequest { auth_key: Some(key), current_world, .. } = *msg {
-                            let is_valid = app.settings.websocket_auth_keys.contains(&key);
-                            if is_valid {
-                                // Key is valid - authenticate the client
-                                app.ws_set_client_authenticated(client_id, true);
-                                app.ws_send_to_client(client_id, WsMessage::AuthResponse {
-                                    success: true,
-                                    error: None,
-                                    username: None,
-                                    multiuser_mode: false,
-                                });
-                                // Send initial state
-                                let initial_state = app.build_initial_state();
-                                app.ws_send_to_client(client_id, initial_state);
-                                app.ws_mark_initial_state_sent(client_id);
-                                // Set client's world
-                                let world_idx = current_world
-                                    .filter(|&w| w < app.worlds.len())
-                                    .unwrap_or(app.current_world_index);
-                                app.ws_set_client_world(client_id, Some(world_idx));
-                                app.ws_client_worlds.insert(client_id, ClientViewState {
-                                    world_index: world_idx,
-                                    visible_lines: 0,
-                                    dimensions: None,
-                                });
-                                // Send activity count
-                                app.ws_send_to_client(client_id, WsMessage::ActivityUpdate {
-                                    count: app.activity_count(),
-                                });
-                            } else {
-                                // Invalid key - record ban violation
-                                app.ban_list.record_violation(&client_ip, "WebSocket: failed auth key");
-                                app.ws_send_to_client(client_id, WsMessage::AuthResponse {
-                                    success: false,
-                                    error: Some("Invalid auth key".to_string()),
-                                    username: None,
-                                    multiuser_mode: false,
-                                });
-                            }
-                        }
+                        app.handle_ws_auth_key_validation(client_id, *msg, &client_ip);
                     }
                     AppEvent::WsKeyRequest(client_id) => {
-                        // Generate a new auth key for the client using SHA256 hash
-                        use sha2::{Sha256, Digest};
-                        let mut hasher = Sha256::new();
-                        hasher.update(std::time::SystemTime::now()
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .unwrap_or_default()
-                            .as_nanos()
-                            .to_le_bytes());
-                        hasher.update(std::process::id().to_le_bytes());
-                        hasher.update(client_id.to_le_bytes());
-                        hasher.update(app.settings.websocket_auth_keys.len().to_le_bytes());
-                        let key = hex::encode(hasher.finalize());
-                        app.settings.websocket_auth_keys.push(key.clone());
-                        let _ = persistence::save_settings(&app);
-                        app.ws_send_to_client(client_id, WsMessage::KeyGenerated { auth_key: key });
+                        app.handle_ws_key_request(client_id);
                     }
                     AppEvent::WsKeyRevoke(_client_id, key) => {
-                        app.settings.websocket_auth_keys.retain(|k| k != &key);
-                        let _ = persistence::save_settings(&app);
+                        app.handle_ws_key_revoke(&key);
                     }
                     AppEvent::WsClientMessage(client_id, msg) => {
-                        // Extract current_world from AuthRequest before matching (avoids borrow issues)
-                        let auth_current_world = if let WsMessage::AuthRequest { current_world, .. } = &*msg {
-                            *current_world
-                        } else {
-                            None
-                        };
-                        match *msg {
-                            WsMessage::AuthRequest { .. } => {
-                                // Client just authenticated - send initial state
-                                let initial_state = app.build_initial_state();
-                                app.ws_send_to_client(client_id, initial_state);
-                                // Mark client as having received initial state so it receives broadcasts
-                                app.ws_mark_initial_state_sent(client_id);
-                                // Use client's world if provided, otherwise default to console's world
-                                let world_idx = auth_current_world
-                                    .filter(|&w| w < app.worlds.len())
-                                    .unwrap_or(app.current_world_index);
-                                // Set client's initial world so broadcast_to_world_viewers works immediately
-                                app.ws_set_client_world(client_id, Some(world_idx));
-                                // Also update ws_client_worlds cache for ws_client_viewing()
-                                app.ws_client_worlds.insert(client_id, ClientViewState {
-                                    world_index: world_idx,
-                                    visible_lines: 0,
-                                    dimensions: None,
-                                });
-                                // Also send current activity count
-                                app.ws_send_to_client(client_id, WsMessage::ActivityUpdate {
-                                    count: app.activity_count(),
-                                });
-                            }
-                            WsMessage::SendCommand { world_index, ref command } => {
-
-                                // Reset more-mode counter when ANY client sends a command
-                                if world_index < app.worlds.len() {
-                                    app.worlds[world_index].lines_since_pause = 0;
-                                    app.worlds[world_index].last_user_command_time = Some(std::time::Instant::now());
-                                    // Update client's viewing world to ensure they receive output
-                                    // (fixes race condition where client sends command before UpdateViewState)
-                                    let dimensions = app.ws_client_worlds.get(&client_id).and_then(|s| s.dimensions);
-                                    let visible_lines = app.ws_client_worlds.get(&client_id).map(|v| v.visible_lines).unwrap_or(0);
-                                    app.ws_client_worlds.insert(client_id, ClientViewState { world_index, visible_lines, dimensions });
-                                    app.ws_set_client_world(client_id, Some(world_index));
+                        let op = app.handle_ws_client_msg(client_id, *msg, &event_tx);
+                        match op {
+                            WsAsyncAction::Connect { world_index, prev_index, broadcast } => {
+                                if handle_command("/connect", &mut app, event_tx.clone()).await {
+                                    return Ok(());
                                 }
-
-                                // Use shared command parsing
-                                let parsed = parse_command(command);
-
-                                match parsed {
-                                    // Commands handled locally on server
-                                    Command::ActionCommand { name, args } => {
-                                        // Execute action if it exists
-                                        if let Some(action) = app.settings.actions.iter().find(|a| a.name.eq_ignore_ascii_case(&name)) {
-                                            // Skip disabled actions
-                                            if !action.enabled {
-                                                app.ws_broadcast(WsMessage::ServerData {
-                                                    world_index,
-                                                    data: format!("✨ Action '{}' is disabled.", name),
-                                                    is_viewed: false,
-                                                    ts: current_timestamp_secs(),
-                                                    from_server: false,
-                                                });
-                                            } else {
-                                            let commands = split_action_commands(&action.command);
-                                            let mut sent_to_server = false;
-                                            for cmd in commands {
-                                                // Substitute $1-$9 and $* with arguments
-                                                let cmd = substitute_action_args(&cmd, &args);
-
-                                                if cmd.eq_ignore_ascii_case("/gag") || cmd.to_lowercase().starts_with("/gag ") {
-                                                    continue;
-                                                }
-                                                // Unified command system - route through TF parser
-                                                if cmd.starts_with('/') {
-                                                    app.sync_tf_world_info();
-                                                    match app.tf_engine.execute(&cmd) {
-                                                        tf::TfCommandResult::Success(Some(msg)) => {
-                                                            app.ws_broadcast(WsMessage::ServerData {
-                                                                world_index,
-                                                                data: msg,
-                                                                is_viewed: false,
-                                                                ts: current_timestamp_secs(),
-                                                                from_server: false,
-                                                            });
-                                                        }
-                                                        tf::TfCommandResult::Success(None) => {}
-                                                        tf::TfCommandResult::Error(err) => {
-                                                            app.ws_broadcast(WsMessage::ServerData {
-                                                                world_index,
-                                                                data: format!("Error: {}", err),
-                                                                is_viewed: false,
-                                                                ts: current_timestamp_secs(),
-                                                                from_server: false,
-                                                            });
-                                                        }
-                                                        tf::TfCommandResult::SendToMud(text) => {
-                                                            if world_index < app.worlds.len() {
-                                                                if let Some(tx) = &app.worlds[world_index].command_tx {
-                                                                    let _ = tx.try_send(WriteCommand::Text(text));
-                                                                    sent_to_server = true;
-                                                                }
-                                                            }
-                                                        }
-                                                        tf::TfCommandResult::ClayCommand(clay_cmd) => {
-                                                            app.ws_send_to_client(client_id, WsMessage::ExecuteLocalCommand { command: clay_cmd });
-                                                        }
-                                                        tf::TfCommandResult::Recall(opts) => {
-                                                            if world_index < app.worlds.len() {
-                                                                let output_lines = app.worlds[world_index].output_lines.clone();
-                                                                let (matches, header) = execute_recall(&opts, &output_lines);
-                                                                let pattern_str = opts.pattern.as_deref().unwrap_or("*");
-                                                                let ts = current_timestamp_secs();
-
-                                                                if !opts.quiet {
-                                                                    if let Some(h) = header {
-                                                                        app.ws_broadcast(WsMessage::ServerData { world_index, data: h, is_viewed: false, ts , from_server: false });
-                                                                    }
-                                                                }
-                                                                if matches.is_empty() {
-                                                                    app.ws_broadcast(WsMessage::ServerData { world_index, data: format!("✨ No matches for '{}'", pattern_str), is_viewed: false, ts, from_server: false });
-                                                                } else {
-                                                                    for m in matches {
-                                                                        app.ws_broadcast(WsMessage::ServerData { world_index, data: m, is_viewed: false, ts , from_server: false });
-                                                                    }
-                                                                }
-                                                                if !opts.quiet {
-                                                                    app.ws_broadcast(WsMessage::ServerData { world_index, data: "================= Recall end =================".to_string(), is_viewed: false, ts , from_server: false });
-                                                                }
-                                                            }
-                                                        }
-                                                        tf::TfCommandResult::RepeatProcess(process) => {
-                                                            app.tf_engine.processes.push(process);
-                                                        }
-                                                        _ => {}
-                                                    }
-                                                } else if world_index < app.worlds.len() {
-                                                    // Plain text - send to MUD server
-                                                    if let Some(tx) = &app.worlds[world_index].command_tx {
-                                                        let _ = tx.try_send(WriteCommand::Text(cmd));
-                                                        sent_to_server = true;
-                                                    }
-                                                }
-                                            }
-                                            if sent_to_server {
-                                                app.worlds[world_index].last_send_time = Some(std::time::Instant::now());
-                                            }
-                                            }
-                                        } else {
-                                            // No matching action - try TF engine (handles /recall, /set, /echo, etc.)
-                                            app.sync_tf_world_info();
-                                            match app.tf_engine.execute(command) {
-                                                tf::TfCommandResult::Success(Some(msg)) => {
-                                                    app.ws_broadcast(WsMessage::ServerData {
-                                                        world_index, data: msg, is_viewed: false,
-                                                        ts: current_timestamp_secs(), from_server: false,
-                                                    });
-                                                }
-                                                tf::TfCommandResult::Success(None) => {}
-                                                tf::TfCommandResult::Error(err) => {
-                                                    app.ws_broadcast(WsMessage::ServerData {
-                                                        world_index, data: format!("Error: {}", err), is_viewed: false,
-                                                        ts: current_timestamp_secs(), from_server: false,
-                                                    });
-                                                }
-                                                tf::TfCommandResult::SendToMud(text) => {
-                                                    if world_index < app.worlds.len() {
-                                                        if let Some(tx) = &app.worlds[world_index].command_tx {
-                                                            let _ = tx.try_send(WriteCommand::Text(text));
-                                                            app.worlds[world_index].last_send_time = Some(std::time::Instant::now());
-                                                        }
-                                                    }
-                                                }
-                                                tf::TfCommandResult::ClayCommand(clay_cmd) => {
-                                                    app.ws_send_to_client(client_id, WsMessage::ExecuteLocalCommand { command: clay_cmd });
-                                                }
-                                                tf::TfCommandResult::Recall(opts) => {
-                                                    if world_index < app.worlds.len() {
-                                                        let output_lines = app.worlds[world_index].output_lines.clone();
-                                                        let (matches, header) = execute_recall(&opts, &output_lines);
-                                                        let pattern_str = opts.pattern.as_deref().unwrap_or("*");
-                                                        let ts = current_timestamp_secs();
-                                                        if !opts.quiet {
-                                                            if let Some(h) = header {
-                                                                app.ws_broadcast(WsMessage::ServerData { world_index, data: h, is_viewed: false, ts, from_server: false });
-                                                            }
-                                                        }
-                                                        if matches.is_empty() {
-                                                            app.ws_broadcast(WsMessage::ServerData { world_index, data: format!("✨ No matches for '{}'", pattern_str), is_viewed: false, ts, from_server: false });
-                                                        } else {
-                                                            for m in matches {
-                                                                app.ws_broadcast(WsMessage::ServerData { world_index, data: m, is_viewed: false, ts, from_server: false });
-                                                            }
-                                                        }
-                                                        if !opts.quiet {
-                                                            app.ws_broadcast(WsMessage::ServerData { world_index, data: "================= Recall end =================".to_string(), is_viewed: false, ts, from_server: false });
-                                                        }
-                                                    }
-                                                }
-                                                tf::TfCommandResult::RepeatProcess(process) => {
-                                                    app.tf_engine.processes.push(process);
-                                                }
-                                                _ => {
-                                                    app.ws_broadcast(WsMessage::ServerData {
-                                                        world_index,
-                                                        data: format!("Unknown command: /{}", name),
-                                                        is_viewed: false,
-                                                        ts: current_timestamp_secs(),
-                                                        from_server: false,
-                                                    });
-                                                }
-                                            }
-                                        }
-                                    }
-                                    Command::NotACommand { text } => {
-                                        // Regular text - send to MUD
-                                        if world_index < app.worlds.len() {
-                                            if let Some(tx) = &app.worlds[world_index].command_tx {
-                                                if tx.try_send(WriteCommand::Text(text)).is_ok() {
-                                                    app.worlds[world_index].last_send_time = Some(std::time::Instant::now());
-                                                    app.worlds[world_index].prompt.clear();
-                                                }
-                                            }
-                                        }
-                                    }
-                                    Command::Edit { .. } | Command::EditList => {
-                                        // Edit command is handled locally on the client, not on server
-                                        // Send back to client for local execution
-                                        app.ws_send_to_client(client_id, WsMessage::ExecuteLocalCommand { command: command.clone() });
-                                    }
-                                    Command::Tag => {
-                                        // Toggle show_tags setting (same as F2)
-                                        app.show_tags = !app.show_tags;
-                                        app.ws_broadcast(WsMessage::ShowTagsChanged { show_tags: app.show_tags });
-                                    }
-                                    Command::Unknown { cmd } => {
-                                        app.ws_broadcast(WsMessage::ServerData {
-                                            world_index,
-                                            data: format!("Unknown command: {}", cmd),
-                                            is_viewed: false,
-                                            ts: current_timestamp_secs(),
-                                            from_server: false,
-                                        });
-                                    }
-                                    Command::Send { text, all_worlds, target_world, no_newline } => {
-                                        // Handle /send command
-                                        // Helper to create the write command
-                                        let make_write_cmd = |t: &str| -> WriteCommand {
-                                            if no_newline {
-                                                WriteCommand::Raw(t.as_bytes().to_vec())
-                                            } else {
-                                                WriteCommand::Text(t.to_string())
-                                            }
-                                        };
-
-                                        if all_worlds {
-                                            // Send to all connected worlds
-                                            for world in app.worlds.iter_mut() {
-                                                if world.connected {
-                                                    if let Some(tx) = &world.command_tx {
-                                                        let _ = tx.try_send(make_write_cmd(&text));
-                                                        world.last_send_time = Some(std::time::Instant::now());
-                                                    }
-                                                }
-                                            }
-                                        } else if let Some(ref target) = target_world {
-                                            // Send to specific world by name
-                                            if let Some(world) = app.worlds.iter_mut().find(|w| w.name.eq_ignore_ascii_case(target)) {
-                                                if world.connected {
-                                                    if let Some(tx) = &world.command_tx {
-                                                        let _ = tx.try_send(make_write_cmd(&text));
-                                                        world.last_send_time = Some(std::time::Instant::now());
-                                                    }
-                                                } else {
-                                                    app.ws_broadcast(WsMessage::ServerData {
-                                                        world_index,
-                                                        data: format!("World '{}' is not connected.", target),
-                                                        is_viewed: false,
-                                                        ts: current_timestamp_secs(),
-                                                        from_server: false,
-                                                    });
-                                                }
-                                            } else {
-                                                app.ws_broadcast(WsMessage::ServerData {
-                                                    world_index,
-                                                    data: format!("Unknown world: {}", target),
-                                                    is_viewed: false,
-                                                    ts: current_timestamp_secs(),
-                                                    from_server: false,
-                                                });
-                                            }
-                                        } else {
-                                            // Send to current world (the one this command came from)
-                                            if world_index < app.worlds.len() {
-                                                if let Some(tx) = &app.worlds[world_index].command_tx {
-                                                    let _ = tx.try_send(make_write_cmd(&text));
-                                                    app.worlds[world_index].last_send_time = Some(std::time::Instant::now());
-                                                }
-                                            }
-                                        }
-                                    }
-                                    Command::Disconnect => {
-                                        // Disconnect the specified world
-                                        if world_index < app.worlds.len() && app.worlds[world_index].connected {
-                                            // Kill proxy process if one exists
-                                            #[cfg(unix)]
-                                            if let Some(proxy_pid) = app.worlds[world_index].proxy_pid {
-                                                unsafe { libc::kill(proxy_pid as libc::pid_t, libc::SIGTERM); }
-                                            }
-                                            app.worlds[world_index].clear_connection_state(true, true);
-                                            app.ws_broadcast(WsMessage::ServerData {
-                                                world_index,
-                                                data: "Disconnected.".to_string(),
-                                                is_viewed: false,
-                                                ts: current_timestamp_secs(),
-                                                from_server: false,
-                                            });
-                                            app.ws_broadcast(WsMessage::WorldDisconnected { world_index });
-                                        } else {
-                                            app.ws_broadcast(WsMessage::ServerData {
-                                                world_index,
-                                                data: "Not connected.".to_string(),
-                                                is_viewed: false,
-                                                ts: current_timestamp_secs(),
-                                                from_server: false,
-                                            });
-                                        }
-                                    }
-                                    Command::Flush => {
-                                        // Clear output buffer for this world
-                                        if world_index < app.worlds.len() {
-                                            let line_count = app.worlds[world_index].output_lines.len();
-                                            app.worlds[world_index].output_lines.clear();
-                                            app.worlds[world_index].pending_lines.clear();
-                                            app.worlds[world_index].scroll_offset = 0;
-                                            app.worlds[world_index].lines_since_pause = 0;
-                                            app.worlds[world_index].paused = false;
-                                            app.ws_broadcast(WsMessage::WorldFlushed { world_index });
-                                            app.ws_broadcast(WsMessage::ServerData {
-                                                world_index,
-                                                data: format!("Flushed {} lines from output buffer.", line_count),
-                                                is_viewed: false,
-                                                ts: current_timestamp_secs(),
-                                                from_server: false,
-                                            });
-                                        }
-                                    }
-                                    Command::Keepalive => {
-                                        // Show keepalive settings for this world
-                                        if world_index < app.worlds.len() {
-                                            let world = &app.worlds[world_index];
-                                            let info = format!(
-                                                "Keepalive: {} ({})",
-                                                world.settings.keep_alive_type.name(),
-                                                if world.settings.keep_alive_type == KeepAliveType::Custom {
-                                                    world.settings.keep_alive_cmd.clone()
-                                                } else {
-                                                    world.settings.keep_alive_type.name().to_string()
-                                                }
-                                            );
-                                            app.ws_broadcast(WsMessage::ServerData {
-                                                world_index,
-                                                data: info,
-                                                is_viewed: false,
-                                                ts: current_timestamp_secs(),
-                                                from_server: false,
-                                            });
-                                        }
-                                    }
-                                    Command::Gag { pattern } => {
-                                        // TODO: Implement gag patterns storage
-                                        app.ws_broadcast(WsMessage::ServerData {
-                                            world_index,
-                                            data: format!("Gag pattern set: {}", pattern),
-                                            is_viewed: false,
-                                            ts: current_timestamp_secs(),
-                                            from_server: false,
-                                        });
-                                    }
-                                    Command::BanList => {
-                                        // Send current ban list
-                                        let bans = app.ban_list.get_ban_info();
-                                        if bans.is_empty() {
-                                            app.ws_broadcast(WsMessage::ServerData {
-                                                world_index,
-                                                data: "No hosts are currently banned.".to_string(),
-                                                is_viewed: false,
-                                                ts: current_timestamp_secs(),
-                                                from_server: false,
-                                            });
-                                        } else {
-                                            let mut output = String::new();
-                                            output.push_str("\nBanned Hosts:\n");
-                                            output.push_str(&"─".repeat(70));
-                                            output.push_str(&format!("\n{:<20} {:<12} {}\n", "Host", "Type", "Last URL/Reason"));
-                                            output.push_str(&"─".repeat(70));
-                                            output.push('\n');
-                                            for (ip, ban_type, reason) in &bans {
-                                                let reason_display = if reason.is_empty() { "(unknown)" } else { reason };
-                                                output.push_str(&format!("{:<20} {:<12} {}\n", ip, ban_type, reason_display));
-                                            }
-                                            output.push_str(&"─".repeat(70));
-                                            output.push_str("\nUse /unban <host> to remove a ban.");
-                                            app.ws_broadcast(WsMessage::ServerData {
-                                                world_index,
-                                                data: output,
-                                                is_viewed: false,
-                                                ts: current_timestamp_secs(),
-                                                from_server: false,
-                                            });
-                                        }
-                                        app.ws_send_to_client(client_id, WsMessage::BanListResponse { bans });
-                                    }
-                                    Command::Unban { host } => {
-                                        if app.ban_list.remove_ban(&host) {
-                                            // Save settings to persist the change
-                                            let _ = persistence::save_settings(&app);
-                                            app.ws_broadcast(WsMessage::ServerData {
-                                                world_index,
-                                                data: format!("Removed ban for: {}", host),
-                                                is_viewed: false,
-                                                ts: current_timestamp_secs(),
-                                                from_server: false,
-                                            });
-                                            // Broadcast updated ban list
-                                            app.ws_broadcast(WsMessage::BanListResponse { bans: app.ban_list.get_ban_info() });
-                                            app.ws_send_to_client(client_id, WsMessage::UnbanResult { success: true, host, error: None });
-                                        } else {
-                                            app.ws_broadcast(WsMessage::ServerData {
-                                                world_index,
-                                                data: format!("No ban found for: {}", host),
-                                                is_viewed: false,
-                                                ts: current_timestamp_secs(),
-                                                from_server: false,
-                                            });
-                                            app.ws_send_to_client(client_id, WsMessage::UnbanResult { success: false, host, error: Some("No ban found".to_string()) });
-                                        }
-                                    }
-                                    Command::TestMusic => {
-                                        let test_notes = generate_test_music_notes();
-                                        // Play locally on console via mpv/ffplay
-                                        if let Some(ref player_cmd) = app.media_player_cmd {
-                                            let wav_data = generate_wav_from_notes(&test_notes);
-                                            let _ = std::fs::create_dir_all(&app.media_cache_dir);
-                                            let wav_path = app.media_cache_dir.join("ansi_music.wav");
-                                            if std::fs::write(&wav_path, &wav_data).is_ok() {
-                                                let wav_path_str = wav_path.to_string_lossy().to_string();
-                                                let player = player_cmd.clone();
-                                                std::thread::spawn(move || {
-                                                    let mut cmd = std::process::Command::new(&player);
-                                                    match player.as_str() {
-                                                        "mpv" => { cmd.args(["--no-video", "--no-terminal", &wav_path_str]); }
-                                                        "ffplay" => { cmd.args(["-nodisp", "-autoexit", &wav_path_str]); }
-                                                        _ => { cmd.arg(&wav_path_str); }
-                                                    }
-                                                    cmd.stdout(std::process::Stdio::null());
-                                                    cmd.stderr(std::process::Stdio::null());
-                                                    let _ = cmd.status();
-                                                });
-                                            }
-                                        }
-                                        app.ws_broadcast(WsMessage::AnsiMusic {
-                                            world_index,
-                                            notes: test_notes,
-                                        });
-                                        app.ws_broadcast(WsMessage::ServerData {
-                                            world_index,
-                                            data: "Playing test music (Super Mario Bros)...".to_string(),
-                                            is_viewed: false,
-                                            ts: current_timestamp_secs(),
-                                            from_server: false,
-                                        });
-                                    }
-                                    Command::Notify { message } => {
-                                        // Send notification to mobile clients
-                                        let title = if world_index < app.worlds.len() {
-                                            app.worlds[world_index].name.clone()
-                                        } else {
-                                            "Clay".to_string()
-                                        };
-                                        app.ws_broadcast(WsMessage::Notification {
-                                            title,
-                                            message: message.clone(),
-                                        });
-                                        app.ws_broadcast(WsMessage::ServerData {
-                                            world_index,
-                                            data: format!("Notification sent: {}", message),
-                                            is_viewed: false,
-                                            ts: current_timestamp_secs(),
-                                            from_server: false,
-                                        });
-                                    }
-                                    Command::Dump => {
-                                        // Dump all scrollback buffers to ~/.clay.dmp.log
-                                        use std::io::Write;
-                                        let ts = current_timestamp_secs();
-
-                                        let home = get_home_dir();
-                                        let dump_path = format!("{}/{}", home, clay_filename("clay.dmp.log"));
-
-                                        match std::fs::File::create(&dump_path) {
-                                            Ok(mut file) => {
-                                                let mut total_lines = 0;
-                                                for world in app.worlds.iter() {
-                                                    for line in &world.output_lines {
-                                                        let line_ts = line.timestamp
-                                                            .duration_since(std::time::UNIX_EPOCH)
-                                                            .map(|d| d.as_secs())
-                                                            .unwrap_or(0) as i64;
-                                                        let lt = local_time_from_epoch(line_ts);
-                                                        let datetime = format!(
-                                                            "{:04}-{:02}-{:02} {:02}:{:02}:{:02}",
-                                                            lt.year, lt.month, lt.day,
-                                                            lt.hour, lt.minute, lt.second
-                                                        );
-                                                        let _ = writeln!(file, "{},{},{}", world.name, datetime, line.text);
-                                                        total_lines += 1;
-                                                    }
-                                                    for line in &world.pending_lines {
-                                                        let line_ts = line.timestamp
-                                                            .duration_since(std::time::UNIX_EPOCH)
-                                                            .map(|d| d.as_secs())
-                                                            .unwrap_or(0) as i64;
-                                                        let lt = local_time_from_epoch(line_ts);
-                                                        let datetime = format!(
-                                                            "{:04}-{:02}-{:02} {:02}:{:02}:{:02}",
-                                                            lt.year, lt.month, lt.day,
-                                                            lt.hour, lt.minute, lt.second
-                                                        );
-                                                        let _ = writeln!(file, "{},{},{}", world.name, datetime, line.text);
-                                                        total_lines += 1;
-                                                    }
-                                                }
-                                                app.ws_broadcast(WsMessage::ServerData {
-                                                    world_index,
-                                                    data: format!("Dumped {} lines from {} worlds to {}", total_lines, app.worlds.len(), dump_path),
-                                                    is_viewed: false,
-                                                    ts,
-                                                    from_server: false,
-                                                });
-                                            }
-                                            Err(e) => {
-                                                app.ws_broadcast(WsMessage::ServerData {
-                                                    world_index,
-                                                    data: format!("Failed to create dump file: {}", e),
-                                                    is_viewed: false,
-                                                    ts,
-                                                    from_server: false,
-                                                });
-                                            }
-                                        }
-                                    }
-                                    // Commands that should be blocked from remote
-                                    Command::Quit | Command::Reload | Command::Update => {
-                                        app.ws_broadcast(WsMessage::ServerData {
-                                            world_index,
-                                            data: "This command is not available from remote interfaces.".to_string(),
-                                            is_viewed: false,
-                                            ts: current_timestamp_secs(),
-                                            from_server: false,
-                                        });
-                                    }
-                                    // UI popup commands - send back to client for local handling
-                                    Command::Help | Command::Menu | Command::Setup | Command::Web | Command::Actions { .. } |
-                                    Command::WorldsList | Command::WorldSelector | Command::WorldEdit { .. } => {
-                                        app.ws_send_to_client(client_id, WsMessage::ExecuteLocalCommand { command: command.clone() });
-                                    }
-                                    Command::Version => {
-                                        app.ws_send_to_client(client_id, WsMessage::ServerData {
-                                            world_index,
-                                            data: get_version_string(),
-                                            is_viewed: false,
-                                            ts: current_timestamp_secs(),
-                                            from_server: false,
-                                        });
-                                    }
-                                    // AddWorld - add or update world definition
-                                    Command::AddWorld { name, host, port, user, password, use_ssl } => {
-                                        let existing_idx = app.worlds.iter().position(|w| w.name.eq_ignore_ascii_case(&name));
-
-                                        let world_idx = if let Some(idx) = existing_idx {
-                                            idx
-                                        } else {
-                                            let new_world = World::new(&name);
-                                            app.worlds.push(new_world);
-                                            app.worlds.len() - 1
-                                        };
-
-                                        if let Some(h) = host {
-                                            app.worlds[world_idx].settings.hostname = h;
-                                        }
-                                        if let Some(p) = port {
-                                            app.worlds[world_idx].settings.port = p;
-                                        }
-                                        if let Some(u) = user {
-                                            app.worlds[world_idx].settings.user = u;
-                                        }
-                                        if let Some(p) = password {
-                                            app.worlds[world_idx].settings.password = p;
-                                        }
-                                        app.worlds[world_idx].settings.use_ssl = use_ssl;
-
-                                        let _ = persistence::save_settings(&app);
-
-                                        let action = if existing_idx.is_some() { "Updated" } else { "Added" };
-                                        let host_info = if !app.worlds[world_idx].settings.hostname.is_empty() {
-                                            format!(" ({}:{}{})",
-                                                app.worlds[world_idx].settings.hostname,
-                                                app.worlds[world_idx].settings.port,
-                                                if use_ssl { " SSL" } else { "" })
-                                        } else {
-                                            " (connectionless)".to_string()
-                                        };
-                                        app.ws_broadcast(WsMessage::ServerData {
-                                            world_index,
-                                            data: format!("{} world '{}'{}.", action, name, host_info),
-                                            is_viewed: false,
-                                            ts: current_timestamp_secs(),
-                                            from_server: false,
-                                        });
-                                    }
-                                    // Connect command is handled via ConnectWorld message
-                                    Command::Connect { .. } => {
-                                        // Remote clients should use ConnectWorld message instead
-                                        // But we can try to handle it here too
-                                        if world_index < app.worlds.len() && !app.worlds[world_index].connected {
-                                            if app.worlds[world_index].settings.has_connection_settings() {
-                                                // Save current index, connect target, restore
-                                                let prev_index = app.current_world_index;
-                                                app.current_world_index = world_index;
-                                                let _ = handle_command("/connect", &mut app, event_tx.clone()).await;
-                                                app.current_world_index = prev_index;
-                                            } else {
-                                                app.ws_broadcast(WsMessage::ServerData {
-                                                    world_index,
-                                                    data: "No connection settings configured for this world.".to_string(),
-                                                    is_viewed: false,
-                                                    ts: current_timestamp_secs(),
-                                                    from_server: false,
-                                                });
-                                            }
-                                        }
-                                    }
-                                    // WorldSwitch and WorldConnectNoLogin need proper handling
-                                    Command::WorldSwitch { ref name } | Command::WorldConnectNoLogin { ref name } => {
-                                        if let Some(idx) = app.worlds.iter().position(|w| w.name.eq_ignore_ascii_case(name)) {
-                                            // Switch only the requesting client's world, not the console
-                                            let dimensions = app.ws_client_worlds.get(&client_id).and_then(|s| s.dimensions);
-                                            let visible_lines = app.ws_client_worlds.get(&client_id).map(|v| v.visible_lines).unwrap_or(0);
-                                            app.ws_client_worlds.insert(client_id, ClientViewState { world_index: idx, visible_lines, dimensions });
-                                            app.ws_set_client_world(client_id, Some(idx));
-                                            app.ws_send_to_client(client_id, WsMessage::WorldSwitched { new_index: idx });
-                                            // Also send ExecuteLocalCommand so web clients can switch their local view
-                                            app.ws_send_to_client(client_id, WsMessage::ExecuteLocalCommand { command: command.clone() });
-                                            // Connect if not connected and has settings
-                                            if !app.worlds[idx].connected
-                                                && app.worlds[idx].settings.has_connection_settings()
-                                            {
-                                                // For WorldConnectNoLogin, set skip flag
-                                                if matches!(parsed, Command::WorldConnectNoLogin { .. }) {
-                                                    app.worlds[idx].skip_auto_login = true;
-                                                }
-                                                let prev_index = app.current_world_index;
-                                                app.current_world_index = idx;
-                                                let _ = handle_command("/connect", &mut app, event_tx.clone()).await;
-                                                app.current_world_index = prev_index;
-                                            }
-                                        } else {
-                                            app.ws_send_to_client(client_id, WsMessage::ServerData {
-                                                world_index,
-                                                data: format!("World '{}' not found.", name),
-                                                is_viewed: false,
-                                                ts: current_timestamp_secs(),
-                                                from_server: false,
-                                            });
-                                        }
-                                    }
-                                    Command::Dict { .. } | Command::Urban { .. } | Command::Translate { .. } => {
-                                        spawn_api_lookup(event_tx.clone(), client_id, world_index, parsed);
-                                    }
-                                    Command::DictUsage => {
-                                        app.ws_send_to_client(client_id, WsMessage::ServerData {
-                                            world_index,
-                                            data: "Usage: /dict <prefix> <word>".to_string(),
-                                            is_viewed: false,
-                                            ts: current_timestamp_secs(),
-                                            from_server: false,
-                                        });
-                                    }
-                                    Command::UrbanUsage => {
-                                        app.ws_send_to_client(client_id, WsMessage::ServerData {
-                                            world_index,
-                                            data: "Usage: /urban <prefix> <word>".to_string(),
-                                            is_viewed: false,
-                                            ts: current_timestamp_secs(),
-                                            from_server: false,
-                                        });
-                                    }
-                                    Command::TranslateUsage => {
-                                        app.ws_send_to_client(client_id, WsMessage::ServerData {
-                                            world_index,
-                                            data: "Usage: /translate <lang> <prefix> <text>".to_string(),
-                                            is_viewed: false,
-                                            ts: current_timestamp_secs(),
-                                            from_server: false,
-                                        });
-                                    }
-                                    Command::HelpTf => {
-                                        // Execute TF help command and send the result
-                                        match app.tf_engine.execute("#help") {
-                                            tf::TfCommandResult::Success(Some(msg)) => {
-                                                for line in msg.lines() {
-                                                    app.ws_send_to_client(client_id, WsMessage::ServerData {
-                                                        world_index,
-                                                        data: line.to_string(),
-                                                        is_viewed: false,
-                                                        ts: current_timestamp_secs(),
-                                                        from_server: false,
-                                                    });
-                                                }
-                                            }
-                                            _ => {
-                                                app.ws_send_to_client(client_id, WsMessage::ServerData {
-                                                    world_index,
-                                                    data: "TF help not available.".to_string(),
-                                                    is_viewed: false,
-                                                    ts: current_timestamp_secs(),
-                                                    from_server: false,
-                                                });
-                                            }
-                                        }
-                                    }
+                                if broadcast && world_index < app.worlds.len() && app.worlds[world_index].connected {
+                                    let name = app.worlds[world_index].name.clone();
+                                    app.ws_broadcast(WsMessage::WorldConnected { world_index, name });
                                 }
-                            }
-                            WsMessage::SwitchWorld { world_index } => {
-                                // Switch only the requesting client's world, not the console
-                                if world_index < app.worlds.len() {
-                                    let dimensions = app.ws_client_worlds.get(&client_id).and_then(|s| s.dimensions);
-                                    let visible_lines = app.ws_client_worlds.get(&client_id).map(|v| v.visible_lines).unwrap_or(0);
-                                    app.ws_client_worlds.insert(client_id, ClientViewState { world_index, visible_lines, dimensions });
-                                    app.ws_set_client_world(client_id, Some(world_index));
-                                    app.ws_send_to_client(client_id, WsMessage::WorldSwitched { new_index: world_index });
-                                    // Send active media for the new world
-                                    app.ws_send_active_media_to_client(client_id, world_index);
-                                }
-                            }
-                            WsMessage::ConnectWorld { world_index } => {
-                                // Trigger connection for specified world
-                                if world_index < app.worlds.len() && !app.worlds[world_index].connected {
-                                    // Check if world has connection settings
-                                    if !app.worlds[world_index].settings.has_connection_settings() {
-                                        app.ws_broadcast(WsMessage::ServerData {
-                                            world_index,
-                                            data: "No connection settings configured for this world.".to_string(),
-                                            is_viewed: false,
-                                            ts: current_timestamp_secs(),
-                                            from_server: false,
-                                        });
-                                    } else {
-                                        // Save current world index, switch to target, connect, then restore
-                                        let prev_index = app.current_world_index;
-                                        app.current_world_index = world_index;
-                                        if handle_command("/connect", &mut app, event_tx.clone()).await {
-                                            // Quit was triggered (shouldn't happen from /connect)
-                                            return Ok(());
-                                        }
-                                        // Only broadcast WorldConnected if connection actually succeeded
-                                        if app.worlds[world_index].connected {
-                                            let name = app.worlds[world_index].name.clone();
-                                            app.ws_broadcast(WsMessage::WorldConnected { world_index, name });
-                                        }
-                                        // Restore previous world if it wasn't the target
-                                        if prev_index != world_index {
-                                            app.current_world_index = prev_index;
-                                        }
-                                    }
-                                }
-                            }
-                            WsMessage::DisconnectWorld { world_index } => {
-                                // Disconnect specified world
-                                if world_index < app.worlds.len() && app.worlds[world_index].connected {
-                                    let prev_index = app.current_world_index;
-                                    app.current_world_index = world_index;
-                                    if handle_command("/disconnect", &mut app, event_tx.clone()).await {
-                                        return Ok(());
-                                    }
+                                if prev_index != world_index {
                                     app.current_world_index = prev_index;
-                                    // WorldDisconnected broadcast happens via AppEvent::Disconnected
                                 }
                             }
-                            WsMessage::CreateWorld { name } => {
-                                // Create new world and broadcast to all clients
-                                let new_world = World::new(&name);
-                                app.worlds.push(new_world);
-                                let idx = app.worlds.len() - 1;
-                                let world = &app.worlds[idx];
-                                let world_state = WorldStateMsg {
-                                    index: idx,
-                                    name: world.name.clone(),
-                                    connected: false,
-                                    output_lines: Vec::new(),
-                                    pending_lines: Vec::new(),
-                                    output_lines_ts: Vec::new(),
-                                    pending_lines_ts: Vec::new(),
-                                    prompt: String::new(),
-                                    scroll_offset: 0,
-                                    paused: false,
-                                    unseen_lines: 0,
-                                    settings: WorldSettingsMsg {
-                                        hostname: world.settings.hostname.clone(),
-                                        port: world.settings.port.clone(),
-                                        user: world.settings.user.clone(),
-                                        password: world.settings.password.clone(),
-                                        use_ssl: world.settings.use_ssl,
-                                        log_enabled: world.settings.log_enabled,
-                                        encoding: world.settings.encoding.name().to_string(),
-                                        auto_connect_type: world.settings.auto_connect_type.name().to_string(),
-                                        keep_alive_type: world.settings.keep_alive_type.name().to_string(),
-                                        keep_alive_cmd: world.settings.keep_alive_cmd.clone(),
-                                        gmcp_packages: world.settings.gmcp_packages.clone(),
-                                    },
-                                    last_send_secs: None,
-                                    last_recv_secs: None,
-                                    last_nop_secs: None,
-                                    keep_alive_type: world.settings.keep_alive_type.name().to_string(),
-                                    showing_splash: world.showing_splash,
-                                    was_connected: false,
-                                    is_proxy: false,
-                                    gmcp_user_enabled: world.gmcp_user_enabled,
-                                };
-                                app.ws_broadcast(WsMessage::WorldAdded { world: Box::new(world_state) });
-                                let _ = persistence::save_settings(&app);
-                                // Send the new world's index back to the requesting client
-                                app.ws_send_to_client(client_id, WsMessage::WorldCreated { world_index: idx });
-                            }
-                            WsMessage::DeleteWorld { world_index } => {
-                                // Delete specified world (if not the last one)
-                                if app.worlds.len() > 1 && world_index < app.worlds.len() {
-                                    let deleted_name = app.worlds[world_index].name.clone();
-                                    app.worlds.remove(world_index);
-                                    // Adjust current_world_index if needed
-                                    if app.current_world_index >= app.worlds.len() {
-                                        app.current_world_index = app.worlds.len().saturating_sub(1);
-                                    } else if app.current_world_index > world_index {
-                                        app.current_world_index -= 1;
-                                    }
-                                    // Adjust previous_world_index if needed
-                                    if let Some(prev) = app.previous_world_index {
-                                        if prev >= app.worlds.len() {
-                                            app.previous_world_index = Some(app.worlds.len().saturating_sub(1));
-                                        } else if prev > world_index {
-                                            app.previous_world_index = Some(prev - 1);
-                                        }
-                                    }
-                                    app.add_output(&format!("World '{}' deleted.\n", deleted_name));
-                                    // Broadcast WorldRemoved to all clients
-                                    app.ws_broadcast(WsMessage::WorldRemoved { world_index });
-                                    let _ = persistence::save_settings(&app);
+                            WsAsyncAction::Disconnect { world_index, prev_index } => {
+                                let _ = world_index;
+                                if handle_command("/disconnect", &mut app, event_tx.clone()).await {
+                                    return Ok(());
                                 }
+                                app.current_world_index = prev_index;
                             }
-                            WsMessage::MarkWorldSeen { world_index } => {
-                                // A remote client has viewed this world - update their current_world
-                                if world_index < app.worlds.len() {
-                                    // Check if client is switching to a different world
-                                    let old_world_idx = app.ws_client_worlds.get(&client_id).map(|s| s.world_index);
-                                    let switched = old_world_idx.map(|old| old != world_index).unwrap_or(true);
-                                    // Reset lines_since_pause for the old world if switching away and more-mode hasn't triggered
-                                    if let Some(old_idx) = old_world_idx {
-                                        if old_idx != world_index && old_idx < app.worlds.len()
-                                            && app.worlds[old_idx].pending_lines.is_empty()
-                                        {
-                                            app.worlds[old_idx].lines_since_pause = 0;
-                                        }
-                                    }
-                                    // Track which world this client is viewing (sync cache)
-                                    let visible_lines = app.ws_client_worlds
-                                        .get(&client_id)
-                                        .map(|v| v.visible_lines)
-                                        .unwrap_or(0);
-                                    let dimensions = app.ws_client_worlds.get(&client_id).and_then(|s| s.dimensions);
-                                    app.ws_client_worlds.insert(client_id, ClientViewState { world_index, visible_lines, dimensions });
-                                    // Update client's world in WebSocket server (async state)
-                                    app.ws_set_client_world(client_id, Some(world_index));
-
-                                    app.worlds[world_index].mark_seen();
-                                    // Broadcast to all clients so they update their UI
-                                    app.ws_broadcast(WsMessage::UnseenCleared { world_index });
-                                    // Broadcast activity count since a world was just marked as seen
-                                    app.broadcast_activity();
-                                    // Trigger console redraw to update activity indicator
-                                    app.needs_output_redraw = true;
-                                    if switched {
-                                        app.ws_send_active_media_to_client(client_id, world_index);
-                                    }
-                                }
-                            }
-                            WsMessage::UpdateViewState { world_index, visible_lines } => {
-                                // A remote client is reporting its view state (for more-mode threshold calculation)
-                                if world_index < app.worlds.len() {
-                                    // Preserve existing dimensions when updating view state
-                                    let dimensions = app.ws_client_worlds.get(&client_id).and_then(|s| s.dimensions);
-                                    app.ws_client_worlds.insert(client_id, ClientViewState { world_index, visible_lines, dimensions });
-                                    // Update client's world in WebSocket server so broadcast_to_world_viewers works
-                                    app.ws_set_client_world(client_id, Some(world_index));
-                                }
-                            }
-                            WsMessage::UpdateDimensions { width, height } => {
-                                // A remote client is reporting its output dimensions (for NAWS)
-                                if let Some(state) = app.ws_client_worlds.get_mut(&client_id) {
-                                    let old_dims = state.dimensions;
-                                    state.dimensions = Some((width, height));
-                                    // If dimensions changed, send NAWS updates to all worlds
-                                    if old_dims != Some((width, height)) {
-                                        app.send_naws_to_all_worlds();
-                                    }
-                                }
-                            }
-                            WsMessage::ReleasePending { world_index, count } => {
-                                // A remote client is releasing pending lines - sync across all interfaces
-                                if world_index < app.worlds.len() {
-                                    let pending_count = app.worlds[world_index].pending_lines.len();
-                                    if pending_count > 0 {
-                                        // Get client's output width for visual line calculation
-                                        let client_width = app.ws_client_worlds.get(&client_id)
-                                            .and_then(|s| s.dimensions)
-                                            .map(|(w, _)| w as usize)
-                                            .unwrap_or(app.output_width as usize);
-
-                                        // count == 0 means release all; otherwise treat count as visual budget
-                                        let visual_budget = if count == 0 { usize::MAX } else { count };
-
-                                        // Pre-calculate logical lines to release (same logic as release_pending)
-                                        let width = client_width.max(1);
-                                        let mut visual_total = 0;
-                                        let mut logical_count = 0;
-                                        for line in &app.worlds[world_index].pending_lines {
-                                            let vl = visual_line_count(&line.text, width);
-                                            if visual_total > 0 && visual_total + vl > visual_budget {
-                                                break;
-                                            }
-                                            visual_total += vl;
-                                            logical_count += 1;
-                                            if visual_total >= visual_budget {
-                                                break;
-                                            }
-                                        }
-                                        if logical_count == 0 && pending_count > 0 {
-                                            logical_count = 1;
-                                        }
-                                        // For release-all, cap at pending_count
-                                        let to_release = logical_count.min(pending_count);
-
-                                        // Get the lines that will be released (for broadcasting as ServerData)
-                                        let lines_to_broadcast: Vec<String> = app.worlds[world_index]
-                                            .pending_lines
-                                            .iter()
-                                            .take(to_release)
-                                            .map(|line| line.text.replace('\r', ""))
-                                            .collect();
-
-                                        // Release the lines on the server
-                                        app.worlds[world_index].release_pending(visual_budget, client_width);
-
-                                        // Broadcast the released lines to clients viewing this world
-                                        if !lines_to_broadcast.is_empty() {
-                                            let ws_data = lines_to_broadcast.join("\n") + "\n";
-                                            app.ws_broadcast_to_world(world_index, WsMessage::ServerData {
-                                                world_index,
-                                                data: ws_data,
-                                                is_viewed: true,
-                                                ts: current_timestamp_secs(),
-                                                from_server: true,
-                                            });
-                                        }
-
-                                        // Broadcast to all clients so they know how many were released
-                                        app.ws_broadcast(WsMessage::PendingReleased { world_index, count: to_release });
-                                        let new_count = app.worlds[world_index].pending_lines.len();
-                                        app.ws_broadcast(WsMessage::PendingLinesUpdate { world_index, count: new_count });
-
-                                        // Broadcast activity count since pending lines changed
-                                        app.broadcast_activity();
-
-                                        // Update console display
-                                        if world_index == app.current_world_index {
-                                            app.needs_output_redraw = true;
-                                        }
-                                    } else {
-                                        // Client has stale pending_count - sync them with the actual state
-                                        app.ws_broadcast(WsMessage::PendingLinesUpdate { world_index, count: 0 });
-                                        app.broadcast_activity();
-                                    }
-                                }
-                            }
-                            WsMessage::UpdateWorldSettings { world_index, name, hostname, port, user, password, use_ssl, log_enabled, encoding, auto_login, keep_alive_type, keep_alive_cmd, gmcp_packages } => {
-                                // Update world settings from remote client
-                                if world_index < app.worlds.len() {
-                                    app.worlds[world_index].name = name.clone();
-                                    app.worlds[world_index].settings.hostname = hostname.clone();
-                                    app.worlds[world_index].settings.port = port.clone();
-                                    app.worlds[world_index].settings.user = user.clone();
-                                    app.worlds[world_index].settings.password = password.clone();
-                                    app.worlds[world_index].settings.use_ssl = use_ssl;
-                                    app.worlds[world_index].settings.log_enabled = log_enabled;
-                                    app.worlds[world_index].settings.encoding = match encoding.as_str() {
-                                        "latin1" => Encoding::Latin1,
-                                        "fansi" => Encoding::Fansi,
-                                        _ => Encoding::Utf8,
-                                    };
-                                    app.worlds[world_index].settings.auto_connect_type = AutoConnectType::from_name(&auto_login);
-                                    app.worlds[world_index].settings.keep_alive_type = KeepAliveType::from_name(&keep_alive_type);
-                                    app.worlds[world_index].settings.keep_alive_cmd = keep_alive_cmd.clone();
-                                    app.worlds[world_index].settings.gmcp_packages = gmcp_packages.clone();
-                                    // Save settings to persist changes
-                                    let _ = persistence::save_settings(&app);
-                                    // Build settings message for broadcast (encrypt password)
-                                    let settings_msg = WorldSettingsMsg {
-                                        hostname,
-                                        port,
-                                        user,
-                                        password: encrypt_password(&password),
-                                        use_ssl,
-                                        log_enabled,
-                                        encoding,
-                                        auto_connect_type: auto_login,
-                                        keep_alive_type,
-                                        keep_alive_cmd,
-                                        gmcp_packages,
-                                    };
-                                    // Broadcast update to all clients
-                                    app.ws_broadcast(WsMessage::WorldSettingsUpdated {
-                                        world_index,
-                                        settings: settings_msg,
-                                        name,
-                                    });
-                                }
-                            }
-                            WsMessage::UpdateGlobalSettings { more_mode_enabled, spell_check_enabled, temp_convert_enabled, world_switch_mode, show_tags, debug_enabled, ansi_music_enabled, console_theme, gui_theme, gui_transparency, color_offset_percent, input_height, font_name, font_size, web_font_size_phone, web_font_size_tablet, web_font_size_desktop, ws_allow_list, web_secure, http_enabled, http_port, ws_enabled, ws_port, ws_cert_file, ws_key_file, tls_proxy_enabled, dictionary_path } => {
-                                // Update global settings from remote client
-                                app.settings.more_mode_enabled = more_mode_enabled;
-                                app.settings.spell_check_enabled = spell_check_enabled;
-                                app.settings.temp_convert_enabled = temp_convert_enabled;
-                                app.settings.world_switch_mode = WorldSwitchMode::from_name(&world_switch_mode);
-                                app.show_tags = show_tags;
-                                app.settings.debug_enabled = debug_enabled;
-                                app.settings.ansi_music_enabled = ansi_music_enabled;
-                                // Console theme affects the TUI on the server
-                                app.settings.theme = Theme::from_name(&console_theme);
-                                // GUI theme is stored for sending back to GUI clients
-                                app.settings.gui_theme = Theme::from_name(&gui_theme);
-                                app.settings.gui_transparency = gui_transparency.clamp(0.3, 1.0);
-                                app.settings.color_offset_percent = color_offset_percent.min(100);
-                                app.input_height = input_height.clamp(1, 15);
-                                app.input.visible_height = app.input_height;
-                                app.settings.font_name = font_name;
-                                app.settings.font_size = font_size.clamp(8.0, 48.0);
-                                app.settings.web_font_size_phone = web_font_size_phone.clamp(8.0, 48.0);
-                                app.settings.web_font_size_tablet = web_font_size_tablet.clamp(8.0, 48.0);
-                                app.settings.web_font_size_desktop = web_font_size_desktop.clamp(8.0, 48.0);
-                                app.settings.websocket_allow_list = ws_allow_list.clone();
-                                // Update the running WebSocket server's allow list
-                                if let Some(ref server) = app.ws_server {
-                                    server.update_allow_list(&ws_allow_list);
-                                }
-                                // Update web settings
-                                app.settings.web_secure = web_secure;
-                                app.settings.http_enabled = http_enabled;
-                                app.settings.http_port = http_port;
-                                app.settings.ws_enabled = ws_enabled;
-                                app.settings.ws_port = ws_port;
-                                app.settings.websocket_cert_file = ws_cert_file;
-                                app.settings.websocket_key_file = ws_key_file;
-                                app.settings.tls_proxy_enabled = tls_proxy_enabled;
-                                if app.settings.dictionary_path != dictionary_path {
-                                    app.settings.dictionary_path = dictionary_path;
-                                    app.spell_checker = SpellChecker::new(&app.settings.dictionary_path);
-                                }
-                                // Save settings to persist changes
-                                let _ = persistence::save_settings(&app);
-                                // Build settings message for broadcast
-                                let settings_msg = GlobalSettingsMsg {
-                                    more_mode_enabled: app.settings.more_mode_enabled,
-                                    spell_check_enabled: app.settings.spell_check_enabled,
-                                    temp_convert_enabled: app.settings.temp_convert_enabled,
-                                    world_switch_mode: app.settings.world_switch_mode.name().to_string(),
-                                    debug_enabled: app.settings.debug_enabled,
-                                    show_tags: app.show_tags,
-                                    ansi_music_enabled: app.settings.ansi_music_enabled,
-                                    console_theme: app.settings.theme.name().to_string(),
-                                    gui_theme: app.settings.gui_theme.name().to_string(),
-                                    gui_transparency: app.settings.gui_transparency,
-                                    color_offset_percent: app.settings.color_offset_percent,
-                                    input_height: app.input_height,
-                                    font_name: app.settings.font_name.clone(),
-                                    font_size: app.settings.font_size,
-                                    web_font_size_phone: app.settings.web_font_size_phone,
-                                    web_font_size_tablet: app.settings.web_font_size_tablet,
-                                    web_font_size_desktop: app.settings.web_font_size_desktop,
-                                    ws_allow_list: app.settings.websocket_allow_list.clone(),
-                                    web_secure: app.settings.web_secure,
-                                    http_enabled: app.settings.http_enabled,
-                                    http_port: app.settings.http_port,
-                                    ws_enabled: app.settings.ws_enabled,
-                                    ws_port: app.settings.ws_port,
-                                    ws_cert_file: app.settings.websocket_cert_file.clone(),
-                                    ws_key_file: app.settings.websocket_key_file.clone(),
-                                    tls_proxy_enabled: app.settings.tls_proxy_enabled,
-                                    dictionary_path: app.settings.dictionary_path.clone(),
-                                    theme_colors_json: app.gui_theme_colors().to_json(),
-                                };
-                                // Broadcast update to all clients
-                                app.ws_broadcast(WsMessage::GlobalSettingsUpdated {
-                                    settings: settings_msg,
-                                    input_height: app.input_height,
-                                });
-                            }
-                            WsMessage::UpdateActions { actions } => {
-                                // Update actions from remote client
-                                app.settings.actions = actions.clone();
-                                // Save settings to persist changes
-                                let _ = persistence::save_settings(&app);
-                                // Broadcast update to all clients
-                                app.ws_broadcast(WsMessage::ActionsUpdated {
-                                    actions,
-                                });
-                            }
-                            WsMessage::CalculateNextWorld { current_index } => {
-                                // Calculate next world using shared logic
-                                let world_info: Vec<crate::util::WorldSwitchInfo> = app.worlds.iter()
-                                    .map(|w| crate::util::WorldSwitchInfo {
-                                        name: w.name.clone(),
-                                        connected: w.connected,
-                                        unseen_lines: w.unseen_lines,
-                                        pending_lines: w.pending_lines.len(),
-                                        first_unseen_at: w.first_unseen_at,
-                                    })
-                                    .collect();
-                                let next_idx = crate::util::calculate_next_world(
-                                    &world_info,
-                                    current_index,
-                                    app.settings.world_switch_mode,
-                                );
-                                app.ws_send_to_client(client_id, WsMessage::CalculatedWorld { index: next_idx });
-                            }
-                            WsMessage::CalculatePrevWorld { current_index } => {
-                                // Calculate prev world using shared logic
-                                let world_info: Vec<crate::util::WorldSwitchInfo> = app.worlds.iter()
-                                    .map(|w| crate::util::WorldSwitchInfo {
-                                        name: w.name.clone(),
-                                        connected: w.connected,
-                                        unseen_lines: w.unseen_lines,
-                                        pending_lines: w.pending_lines.len(),
-                                        first_unseen_at: w.first_unseen_at,
-                                    })
-                                    .collect();
-                                let prev_idx = crate::util::calculate_prev_world(
-                                    &world_info,
-                                    current_index,
-                                    app.settings.world_switch_mode,
-                                );
-                                app.ws_send_to_client(client_id, WsMessage::CalculatedWorld { index: prev_idx });
-                            }
-                            WsMessage::CalculateOldestPending { current_index } => {
-                                // Find world with oldest pending output (for Escape+w)
-                                // Priority: 1) oldest pending, 2) any unseen, 3) previous world
-                                let mut oldest_idx: Option<usize> = None;
-                                let mut oldest_time: Option<std::time::Instant> = None;
-
-                                // Check for worlds with pending output
-                                for (idx, world) in app.worlds.iter().enumerate() {
-                                    if idx == current_index || world.pending_lines.is_empty() {
-                                        continue;
-                                    }
-                                    if let Some(pending_time) = world.pending_since {
-                                        if oldest_time.is_none() || pending_time < oldest_time.unwrap() {
-                                            oldest_time = Some(pending_time);
-                                            oldest_idx = Some(idx);
-                                        }
-                                    }
-                                }
-
-                                // If no pending, check for unseen output
-                                if oldest_idx.is_none() {
-                                    for (idx, world) in app.worlds.iter().enumerate() {
-                                        if idx != current_index && world.unseen_lines > 0 {
-                                            oldest_idx = Some(idx);
-                                            break;
-                                        }
-                                    }
-                                }
-
-                                // If still none, use previous world
-                                if oldest_idx.is_none() {
-                                    if let Some(prev_idx) = app.previous_world_index {
-                                        if prev_idx != current_index && prev_idx < app.worlds.len() {
-                                            oldest_idx = Some(prev_idx);
-                                        }
-                                    }
-                                }
-
-                                app.ws_send_to_client(client_id, WsMessage::CalculatedWorld { index: oldest_idx });
-                            }
-                            WsMessage::RequestState => {
-                                // Client requested full state resync - send initial state
-                                let initial_state = app.build_initial_state();
-                                app.ws_send_to_client(client_id, initial_state);
-                                // Mark client as having received initial state so it receives broadcasts
-                                app.ws_mark_initial_state_sent(client_id);
-                                // Set client's initial world so broadcast_to_world_viewers works immediately
-                                app.ws_set_client_world(client_id, Some(app.current_world_index));
-                                // Also send current activity count
-                                app.ws_send_to_client(client_id, WsMessage::ActivityUpdate {
-                                    count: app.activity_count(),
-                                });
-                            }
-                            WsMessage::RequestWorldState { world_index } => {
-                                // Client switched to a world and needs current state
-                                if world_index < app.worlds.len() {
-                                    let world = &app.worlds[world_index];
-                                    // Build recent lines from output_lines (last 100 lines for context)
-                                    let recent_lines: Vec<TimestampedLine> = world.output_lines
-                                        .iter()
-                                        .rev()
-                                        .take(100)
-                                        .map(|line| TimestampedLine {
-                                            text: line.text.clone(),
-                                            ts: line.timestamp.duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs(),
-                                            gagged: line.gagged,
-                                            from_server: line.from_server,
-                                            seq: line.seq,
-                                            highlight_color: line.highlight_color.clone(),
-                                        })
-                                        .collect::<Vec<_>>()
-                                        .into_iter()
-                                        .rev()
-                                        .collect();
-
-                                    let pending_count = world.pending_lines.len();
-
-                                    app.ws_send_to_client(client_id, WsMessage::WorldStateResponse {
-                                        world_index,
-                                        pending_count,
-                                        prompt: world.prompt.clone(),
-                                        scroll_offset: world.scroll_offset,
-                                        recent_lines,
-                                    });
-                                }
-                            }
-                            WsMessage::BanListRequest => {
-                                // Send current ban list to client
-                                let bans = app.ban_list.get_ban_info();
-                                app.ws_send_to_client(client_id, WsMessage::BanListResponse { bans });
-                            }
-                            WsMessage::UnbanRequest { host } => {
-                                if app.ban_list.remove_ban(&host) {
-                                    // Save settings to persist the change
-                                    let _ = persistence::save_settings(&app);
-                                    // Broadcast updated ban list to all clients
-                                    app.ws_broadcast(WsMessage::BanListResponse { bans: app.ban_list.get_ban_info() });
-                                    app.ws_send_to_client(client_id, WsMessage::UnbanResult { success: true, host, error: None });
-                                } else {
-                                    app.ws_send_to_client(client_id, WsMessage::UnbanResult { success: false, host, error: Some("No ban found".to_string()) });
-                                }
-                            }
-                            // Theme editor messages
-                            WsMessage::RequestThemeEditorState => {
-                                let themes_json = app.theme_file.to_json_all();
-                                let theme_names: Vec<String> = app.theme_file.themes.keys().cloned().collect();
-                                let active_theme = app.settings.gui_theme.name().to_string();
-                                app.ws_send_to_client(client_id, WsMessage::ThemeEditorState {
-                                    themes_json,
-                                    theme_names,
-                                    active_theme,
-                                });
-                            }
-                            WsMessage::UpdateThemeColors { theme_name, colors_json } => {
-                                let base = if theme_name == "light" {
-                                    theme::ThemeColors::light_default()
-                                } else {
-                                    theme::ThemeColors::dark_default()
-                                };
-                                let colors = theme::ThemeColors::from_json(&colors_json, &base);
-                                app.theme_file.set_theme(&theme_name, colors);
-                                // If updated theme is the active GUI theme, broadcast CSS vars update
-                                if theme_name == app.settings.gui_theme.name() {
-                                    let css_vars = app.gui_theme_colors().to_css_vars();
-                                    let colors_json = app.gui_theme_colors().to_json();
-                                    app.ws_broadcast(WsMessage::ThemeCssVarsUpdated {
-                                        css_vars,
-                                        colors_json: colors_json.clone(),
-                                    });
-                                    // Also broadcast GlobalSettingsUpdated for GUI clients
-                                    let settings_msg = app.build_global_settings_msg();
-                                    app.ws_broadcast(WsMessage::GlobalSettingsUpdated {
-                                        settings: settings_msg,
-                                        input_height: app.input_height,
-                                    });
-                                }
-                            }
-                            WsMessage::AddTheme { name, copy_from } => {
-                                let base_colors = app.theme_file.get(&copy_from).clone();
-                                app.theme_file.set_theme(&name, base_colors);
-                                // Send updated state back to editor
-                                let themes_json = app.theme_file.to_json_all();
-                                let theme_names: Vec<String> = app.theme_file.themes.keys().cloned().collect();
-                                let active_theme = app.settings.gui_theme.name().to_string();
-                                app.ws_send_to_client(client_id, WsMessage::ThemeEditorState {
-                                    themes_json,
-                                    theme_names,
-                                    active_theme,
-                                });
-                            }
-                            WsMessage::DeleteTheme { name } => {
-                                app.theme_file.remove_theme(&name);
-                                // Send updated state back to editor
-                                let themes_json = app.theme_file.to_json_all();
-                                let theme_names: Vec<String> = app.theme_file.themes.keys().cloned().collect();
-                                let active_theme = app.settings.gui_theme.name().to_string();
-                                app.ws_send_to_client(client_id, WsMessage::ThemeEditorState {
-                                    themes_json,
-                                    theme_names,
-                                    active_theme,
-                                });
-                            }
-                            WsMessage::SaveThemeFile => {
-                                let content = app.theme_file.generate_file_content();
-                                let path = std::path::Path::new(&get_home_dir()).join("clay.theme.dat");
-                                match std::fs::write(&path, &content) {
-                                    Ok(_) => {
-                                        app.ws_send_to_client(client_id, WsMessage::ThemeFileSaved { success: true, error: None });
-                                    }
-                                    Err(e) => {
-                                        app.ws_send_to_client(client_id, WsMessage::ThemeFileSaved { success: false, error: Some(e.to_string()) });
-                                    }
-                                }
-                            }
-                            WsMessage::RequestConnectionsList => {
-                                // Generate connections list using same format as master console
-                                let current_idx = app.current_world_index;
-                                const KEEPALIVE_SECS: u64 = 5 * 60;
-                                let worlds_info: Vec<util::WorldListInfo> = app.worlds.iter().enumerate().map(|(idx, world)| {
-                                    let now = std::time::Instant::now();
-                                    let last_activity_elapsed = match (world.last_send_time, world.last_receive_time) {
-                                        (Some(s), Some(r)) => Some(s.max(r).elapsed().as_secs()),
-                                        (Some(s), None) => Some(s.elapsed().as_secs()),
-                                        (None, Some(r)) => Some(r.elapsed().as_secs()),
-                                        (None, None) => None,
-                                    };
-                                    let next_nop = if world.connected {
-                                        last_activity_elapsed.map(|elapsed| KEEPALIVE_SECS.saturating_sub(elapsed))
-                                    } else {
-                                        None
-                                    };
-                                    util::WorldListInfo {
-                                        name: world.name.clone(),
-                                        connected: world.connected,
-                                        is_current: idx == current_idx,
-                                        is_ssl: world.is_tls,
-                                        is_proxy: world.proxy_pid.is_some(),
-                                        unseen_lines: world.unseen_lines,
-                                        last_send_secs: world.last_user_command_time.map(|t| now.duration_since(t).as_secs()),
-                                        last_recv_secs: world.last_receive_time.map(|t| now.duration_since(t).as_secs()),
-                                        last_nop_secs: world.last_nop_time.map(|t| now.duration_since(t).as_secs()),
-                                        next_nop_secs: next_nop,
-                                        buffer_size: world.output_lines.len() + world.pending_lines.len(),
-                                    }
-                                }).collect();
-                                let output = util::format_worlds_list(&worlds_info);
-                                let lines: Vec<String> = output.lines().map(|s| s.to_string()).collect();
-                                app.ws_send_to_client(client_id, WsMessage::ConnectionsListResponse { lines });
-                            }
-                            WsMessage::ReportSeqMismatch { world_index, expected_seq_gt, actual_seq, line_text, source } => {
-                                let world_name = app.worlds.get(world_index).map(|w| w.name.as_str()).unwrap_or("?");
-                                use std::io::Write;
-                                if let Ok(mut f) = std::fs::OpenOptions::new()
-                                    .create(true).append(true)
-                                    .open("clay.output.debug")
-                                {
-                                    let _ = writeln!(f, "SEQ MISMATCH [{}] in '{}': expected seq>{}, got seq={}, text={:?}",
-                                        source, world_name, expected_seq_gt, actual_seq,
-                                        line_text.chars().take(80).collect::<String>());
-                                }
-                            }
-                            WsMessage::ClientTypeDeclaration { client_type } => {
-                                // Update client type in WebSocket server
-                                app.ws_set_client_type(client_id, client_type);
-                            }
-                            WsMessage::CycleWorld { direction } => {
-                                // Client requests to cycle to next/previous world
-                                let current = app.ws_client_worlds.get(&client_id)
-                                    .map(|s| s.world_index)
-                                    .unwrap_or(app.current_world_index);
-
-                                let new_index = if direction == "up" {
-                                    app.calculate_prev_world_from(current)
-                                } else {
-                                    app.calculate_next_world_from(current)
-                                };
-
-                                if let Some(idx) = new_index {
-                                    // Update client's view state (sync state)
-                                    let visible_lines = app.ws_client_worlds.get(&client_id)
-                                        .map(|s| s.visible_lines)
-                                        .unwrap_or(24);
-                                    let dimensions = app.ws_client_worlds.get(&client_id)
-                                        .and_then(|s| s.dimensions);
-                                    app.ws_client_worlds.insert(client_id, ClientViewState {
-                                        world_index: idx,
-                                        visible_lines,
-                                        dimensions,
-                                    });
-                                    // Update client's world in WebSocket server (async state)
-                                    app.ws_set_client_world(client_id, Some(idx));
-
-                                    // Send world switch result with state
-                                    if idx < app.worlds.len() {
-                                        let pending_count = app.worlds[idx].pending_lines.len();
-                                        let paused = app.worlds[idx].paused;
-                                        let world_name = app.worlds[idx].name.clone();
-
-                                        app.ws_send_to_client(client_id, WsMessage::WorldSwitchResult {
-                                            world_index: idx,
-                                            world_name,
-                                            pending_count,
-                                            paused,
-                                        });
-
-                                        // Send initial output lines based on client type
-                                        let client_type = app.ws_get_client_type(client_id);
-                                        let world = &app.worlds[idx];
-                                        let total_lines = world.output_lines.len();
-
-                                        let lines_to_send = match client_type {
-                                            Some(websocket::RemoteClientType::RemoteConsole) => {
-                                                // Console: last screenful (viewport - 2)
-                                                visible_lines.saturating_sub(2).min(total_lines)
-                                            }
-                                            _ => {
-                                                // Web/GUI: full history
-                                                total_lines
-                                            }
-                                        };
-
-                                        if lines_to_send > 0 {
-                                            let start = total_lines.saturating_sub(lines_to_send);
-                                            let lines: Vec<TimestampedLine> = world.output_lines[start..].iter()
-                                                .map(|line| {
-                                                    let ts = line.timestamp
-                                                        .duration_since(std::time::UNIX_EPOCH)
-                                                        .map(|d| d.as_secs())
-                                                        .unwrap_or(0);
-                                                    TimestampedLine {
-                                                        text: line.text.clone(),
-                                                        ts,
-                                                        gagged: line.gagged,
-                                                        from_server: line.from_server,
-                                                        seq: line.seq,
-                                                        highlight_color: line.highlight_color.clone(),
-                                                    }
-                                                })
-                                                .collect();
-
-                                            app.ws_send_to_client(client_id, WsMessage::OutputLines {
-                                                world_index: idx,
-                                                lines,
-                                                is_initial: true,
-                                            });
-                                        }
-
-                                        // Also mark world as seen if it had unseen output
-                                        if app.worlds[idx].unseen_lines > 0 {
-                                            app.worlds[idx].unseen_lines = 0;
-                                            app.worlds[idx].first_unseen_at = None;
-                                            app.ws_broadcast(WsMessage::UnseenCleared { world_index: idx });
-                                            app.broadcast_activity();
-                                        }
-                                    }
-                                }
-                            }
-                            WsMessage::RequestScrollback { world_index, count, before_seq } => {
-                                // Console client requests scrollback from master
-                                if world_index < app.worlds.len() {
-                                    let world = &app.worlds[world_index];
-
-                                    // Find lines to send based on before_seq
-                                    let lines: Vec<TimestampedLine> = if let Some(seq) = before_seq {
-                                        // Send lines with seq < before_seq (older than what client has)
-                                        let eligible: Vec<_> = world.output_lines.iter()
-                                            .filter(|l| l.seq < seq)
-                                            .collect();
-                                        let start = eligible.len().saturating_sub(count);
-                                        eligible[start..].iter()
-                                            .map(|line| {
-                                                let ts = line.timestamp
-                                                    .duration_since(std::time::UNIX_EPOCH)
-                                                    .map(|d| d.as_secs())
-                                                    .unwrap_or(0);
-                                                TimestampedLine {
-                                                    text: line.text.clone(),
-                                                    ts,
-                                                    gagged: line.gagged,
-                                                    from_server: line.from_server,
-                                                    seq: line.seq,
-                                                    highlight_color: line.highlight_color.clone(),
-                                                }
-                                            })
-                                            .collect()
-                                    } else {
-                                        // No before_seq - send last N lines (backwards compatible)
-                                        let total_lines = world.output_lines.len();
-                                        let start = total_lines.saturating_sub(count);
-                                        world.output_lines[start..].iter()
-                                            .map(|line| {
-                                                let ts = line.timestamp
-                                                    .duration_since(std::time::UNIX_EPOCH)
-                                                    .map(|d| d.as_secs())
-                                                    .unwrap_or(0);
-                                                TimestampedLine {
-                                                    text: line.text.clone(),
-                                                    ts,
-                                                    gagged: line.gagged,
-                                                    from_server: line.from_server,
-                                                    seq: line.seq,
-                                                    highlight_color: line.highlight_color.clone(),
-                                                }
-                                            })
-                                            .collect()
-                                    };
-
-                                    app.ws_send_to_client(client_id, WsMessage::ScrollbackLines {
-                                        world_index,
-                                        lines,
-                                    });
-                                }
-                            }
-                            WsMessage::ToggleWorldGmcp { world_index } => {
-                                if world_index < app.worlds.len() {
-                                    app.worlds[world_index].gmcp_user_enabled = !app.worlds[world_index].gmcp_user_enabled;
-                                    // Broadcast toggle state first so clients update before receiving media
-                                    app.ws_broadcast(WsMessage::GmcpUserToggled {
-                                        world_index,
-                                        enabled: app.worlds[world_index].gmcp_user_enabled,
-                                    });
-                                    if app.worlds[world_index].gmcp_user_enabled {
-                                        app.restart_world_media(world_index);
-                                    } else {
-                                        app.stop_world_media(world_index);
-                                    }
-                                    app.needs_output_redraw = true;
-                                }
-                            }
-                            WsMessage::SendGmcp { world_index, ref package, ref data } => {
-                                if world_index < app.worlds.len() {
-                                    if let Some(ref tx) = app.worlds[world_index].command_tx {
-                                        let msg = build_gmcp_message(package, data);
-                                        let _ = tx.try_send(WriteCommand::Raw(msg));
-                                    }
-                                }
-                            }
-                            WsMessage::SendMsdp { world_index, ref variable, ref value } => {
-                                if world_index < app.worlds.len() {
-                                    if let Some(ref tx) = app.worlds[world_index].command_tx {
-                                        let msg = build_msdp_set(variable, value);
-                                        let _ = tx.try_send(WriteCommand::Raw(msg));
-                                    }
-                                }
-                            }
-                            _ => {
-                                // Other message types handled elsewhere or ignored
-                            }
+                            WsAsyncAction::Done => {}
                         }
                     }
-                    // Background connection completed successfully
                     AppEvent::ConnectionSuccess(world_name, cmd_tx, socket_fd, is_tls) => {
-                        let _ = &socket_fd; // used on unix only
-                        if let Some(world_idx) = app.find_world_index(&world_name) {
-                            app.worlds[world_idx].connected = true;
-                            app.worlds[world_idx].was_connected = true;
-                            app.worlds[world_idx].prompt_count = 0;
-                            let now = std::time::Instant::now();
-                            app.worlds[world_idx].last_send_time = Some(now);
-                            app.worlds[world_idx].last_receive_time = Some(now);
-                            app.worlds[world_idx].last_user_command_time = Some(now);
-                            app.worlds[world_idx].last_nop_time = None;
-                            app.worlds[world_idx].is_initial_world = false;
-                            app.worlds[world_idx].command_tx = Some(cmd_tx.clone());
-                            #[cfg(unix)]
-                            { app.worlds[world_idx].socket_fd = socket_fd; }
-                            app.worlds[world_idx].is_tls = is_tls;
-
-                            // Discard any unused initial world
-                            app.discard_initial_world();
-
-                            // Open log file if enabled
-                            if app.worlds[world_idx].settings.log_enabled {
-                                if app.worlds[world_idx].open_log_file() {
-                                    let log_path = app.worlds[world_idx].get_log_path();
-                                    app.add_output_to_world(world_idx, &format!("Logging to: {}", log_path.display()));
-                                } else {
-                                    app.add_output_to_world(world_idx, "Warning: Could not open log file");
-                                }
-                            }
-
-                            // Fire TF CONNECT hook
-                            let hook_result = tf::bridge::fire_event(&mut app.tf_engine, tf::TfHookEvent::Connect);
-                            for cmd in hook_result.send_commands {
-                                let _ = cmd_tx.try_send(WriteCommand::Text(cmd));
-                            }
-                            for cmd in hook_result.clay_commands {
-                                let _ = app.tf_engine.execute(&cmd);
-                            }
-
-                            // Send auto-login if configured
-                            let skip_login = app.worlds[world_idx].skip_auto_login;
-                            app.worlds[world_idx].skip_auto_login = false;
-                            let user = app.worlds[world_idx].settings.user.clone();
-                            let password = app.worlds[world_idx].settings.password.clone();
-                            let auto_connect_type = app.worlds[world_idx].settings.auto_connect_type;
-                            if !skip_login && !user.is_empty() && !password.is_empty() && auto_connect_type == AutoConnectType::Connect {
-                                let connect_cmd = format!("connect {} {}", user, password);
-                                let _ = cmd_tx.try_send(WriteCommand::Text(connect_cmd));
-                            }
-
-                            // Broadcast connection status
-                            app.ws_broadcast(WsMessage::WorldConnected { world_index: world_idx, name: app.worlds[world_idx].name.clone() });
-                        }
+                        app.handle_connection_success(&world_name, cmd_tx, socket_fd, is_tls);
                     }
-                    // Background connection failed
                     AppEvent::ConnectionFailed(world_name, error) => {
                         if let Some(world_idx) = app.find_world_index(&world_name) {
                             app.add_output_to_world(world_idx, &format!("Connection failed: {}", error));
@@ -13666,258 +13502,28 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
             match event {
                 AppEvent::ServerData(ref world_name, bytes) => {
                     if let Some(world_idx) = app.find_world_index(world_name) {
-                        app.worlds[world_idx].last_receive_time = Some(std::time::Instant::now());
-                        // Consider "current" if console OR any web/GUI client is viewing this world
-                        let is_current = world_idx == app.current_world_index || app.ws_client_viewing(world_idx);
-                        let decoded_data = app.worlds[world_idx].settings.encoding.decode(&bytes);
+                        // Use shared server data processing
+                        let console_height = app.output_height;
+                        let console_width = app.output_width;
+                        let commands = app.process_server_data(
+                            world_idx,
+                            &bytes,
+                            console_height,
+                            console_width,
+                            false, // not daemon mode
+                        );
 
-                        // Extract ANSI music sequences FIRST, before any other processing
-                        let (data, music_sequences) = if app.settings.ansi_music_enabled {
-                            ansi_music::extract_music(&decoded_data)
-                        } else {
-                            (decoded_data.clone(), Vec::new())
-                        };
-
-                        // Broadcast music to WebSocket clients (web/GUI play audio)
-                        for notes in music_sequences {
-                            app.ws_broadcast(WsMessage::AnsiMusic {
-                                world_index: world_idx,
-                                notes,
-                            });
+                        // Check if terminal needs full redraw (after splash clear)
+                        if app.worlds[world_idx].needs_redraw {
+                            app.worlds[world_idx].needs_redraw = false;
+                            let _ = terminal.clear();
                         }
 
-                        let world_name_for_triggers = world_name.clone();
-                        let actions = app.settings.actions.clone();
-
-                        // Combine with any partial line from previous data chunk
-                        let had_trigger_partial = !app.worlds[world_idx].trigger_partial_line.is_empty();
-                        let combined_data = if had_trigger_partial {
-                            let mut s = std::mem::take(&mut app.worlds[world_idx].trigger_partial_line);
-                            s.push_str(&data);
-                            s
-                        } else {
-                            data.clone()
-                        };
-
-                        // Process action triggers on complete lines
-                        // Track lines with gagged flag and highlight color: (line, is_gagged, highlight_color)
-                        let mut processed_lines: Vec<(&str, bool, Option<String>)> = Vec::new();
-                        let mut commands_to_execute: Vec<String> = Vec::new();
-                        let mut tf_commands_to_execute: Vec<String> = Vec::new();
-                        let ends_with_newline = combined_data.ends_with('\n');
-                        let lines: Vec<&str> = combined_data.lines().collect();
-                        let line_count = lines.len();
-                        let mut has_partial = false;
-                        // Use persistent flag to track idler filtering across TCP packets
-                        let mut just_filtered_idler = app.worlds[world_idx].just_filtered_idler;
-
-                        for (i, line) in lines.iter().enumerate() {
-                            let is_last = i == line_count - 1;
-                            let is_partial = is_last && !ends_with_newline;
-
-                            // Filter out keep-alive idler message lines (only for Custom/Generic keep-alive types)
-                            let uses_idler_keepalive = matches!(
-                                app.worlds[world_idx].settings.keep_alive_type,
-                                KeepAliveType::Custom | KeepAliveType::Generic
-                            );
-                            if uses_idler_keepalive && line.contains("###_idler_message_") && line.contains("_###") {
-                                just_filtered_idler = true;
-                                continue;
-                            }
-
-                            // Filter blank lines that immediately follow an idler message
-                            if just_filtered_idler && is_visually_empty(line) {
-                                just_filtered_idler = false; // Reset after filtering the blank
-                                continue;
-                            }
-                            just_filtered_idler = false;
-
-                            // Check triggers on complete lines only
-                            if is_partial {
-                                // Store partial line for next chunk - don't process yet
-                                app.worlds[world_idx].trigger_partial_line = line.to_string();
-                                has_partial = true;
-                            } else {
-                                let mut is_gagged = false;
-                                let mut highlight_color: Option<String> = None;
-                                // Check Clay action triggers
-                                if let Some(result) = check_action_triggers(line, &world_name_for_triggers, &actions) {
-                                    commands_to_execute.extend(result.commands);
-                                    is_gagged = result.should_gag;
-                                    highlight_color = result.highlight_color;
-                                }
-                                // Check TF triggers
-                                let tf_result = tf::bridge::process_line(&mut app.tf_engine, line, Some(&world_name_for_triggers));
-                                commands_to_execute.extend(tf_result.send_commands);
-                                tf_commands_to_execute.extend(tf_result.clay_commands);
-                                is_gagged = is_gagged || tf_result.should_gag;
-                                // Output TF messages (from #echo etc)
-                                for msg in &tf_result.messages {
-                                    app.add_tf_output(msg);
-                                }
-                                // Handle substitution
-                                if let Some((sub_text, sub_attrs)) = tf_result.substitution {
-                                    is_gagged = true;
-                                    let sub_with_attrs = if sub_attrs.contains('C') || sub_attrs.contains('B') {
-                                        apply_tf_attrs(&sub_text, &sub_attrs)
-                                    } else {
-                                        sub_text
-                                    };
-                                    app.add_tf_output(&sub_with_attrs);
-                                }
-                                // Only add complete lines with gagged flag and highlight color
-                                processed_lines.push((line, is_gagged, highlight_color));
-                            }
-                        }
-
-                        // Save the idler filter state for next packet
-                        app.worlds[world_idx].just_filtered_idler = just_filtered_idler;
-
-                        // If we have a partial line and world uses WONT ECHO prompts, start timeout
-                        if has_partial && app.worlds[world_idx].prompt.is_empty()
-                            && app.worlds[world_idx].uses_wont_echo_prompt {
-                            app.worlds[world_idx].wont_echo_time = Some(std::time::Instant::now());
-                        }
-
-                        // Separate gagged and non-gagged lines, tracking highlight colors
-                        let non_gagged_lines: Vec<(&str, Option<String>)> = processed_lines.iter()
-                            .filter(|(_, gagged, _)| !gagged)
-                            .map(|(line, _, highlight)| (*line, highlight.clone()))
-                            .collect();
-                        let gagged_lines: Vec<(&str, Option<String>)> = processed_lines.iter()
-                            .filter(|(_, gagged, _)| *gagged)
-                            .map(|(line, _, highlight)| (*line, highlight.clone()))
-                            .collect();
-                        // Create a map of line content to highlight color for non-gagged lines
-                        let highlight_map: std::collections::HashMap<String, Option<String>> = non_gagged_lines.iter()
-                            .filter(|(_, hl)| hl.is_some())
-                            .map(|(line, hl)| (line.to_string(), hl.clone()))
-                            .collect();
-
-                        // Add trailing newline if original ended with newline OR if we have a partial
-                        // (because a partial means there was a newline before it that we need to preserve)
-                        let filtered_data = if non_gagged_lines.is_empty() {
-                            String::new()
-                        } else {
-                            let lines_only: Vec<&str> = non_gagged_lines.iter().map(|(line, _)| *line).collect();
-                            let mut result = lines_only.join("\n");
-                            if ends_with_newline || has_partial {
-                                result.push('\n');
-                            }
-                            result
-                        };
-
-                        if !filtered_data.is_empty() {
-                            let settings = app.settings.clone();
-                            let console_height = app.output_height;
-                            let output_width = app.output_width;
-
-                            // Calculate minimum visible lines among all viewers for synchronized more-mode
-                            let console_viewing = world_idx == app.current_world_index;
-                            let ws_min = app.min_viewer_lines(world_idx);
-                            let output_height = match (console_viewing, ws_min) {
-                                (true, Some(ws)) => console_height.min(ws as u16),
-                                (true, None) => console_height,
-                                (false, Some(ws)) => ws as u16,
-                                (false, None) => console_height,
-                            };
-
-                            // Track pending count before add_output for synchronized more-mode
-                            let pending_before = app.worlds[world_idx].pending_lines.len();
-                            let output_before = app.worlds[world_idx].output_lines.len();
-
-                            app.worlds[world_idx].add_output(&filtered_data, is_current, &settings, output_height, output_width, true, true);
-
-                            // Calculate what went where
-                            let pending_after = app.worlds[world_idx].pending_lines.len();
-                            let output_after = app.worlds[world_idx].output_lines.len();
-                            let lines_to_output = output_after.saturating_sub(output_before);
-                            let lines_to_pending = pending_after.saturating_sub(pending_before);
-
-                            // Apply highlight colors to newly added lines
-                            if !highlight_map.is_empty() {
-                                // Apply to output_lines
-                                for line in app.worlds[world_idx].output_lines.iter_mut().skip(output_before) {
-                                    let plain_text = strip_ansi_codes(&line.text);
-                                    if let Some(hl) = highlight_map.get(&plain_text) {
-                                        line.highlight_color = hl.clone();
-                                    }
-                                }
-                                // Apply to pending_lines
-                                for line in app.worlds[world_idx].pending_lines.iter_mut().skip(pending_before) {
-                                    let plain_text = strip_ansi_codes(&line.text);
-                                    if let Some(hl) = highlight_map.get(&plain_text) {
-                                        line.highlight_color = hl.clone();
-                                    }
-                                }
-                            }
-
-                            // Mark output for redraw if this is the current world
-                            if world_idx == app.current_world_index {
-                                app.needs_output_redraw = true;
-                            }
-                            if app.worlds[world_idx].needs_redraw {
-                                app.worlds[world_idx].needs_redraw = false;
-                                let _ = terminal.clear();
-                            }
-
-                            // For synchronized more-mode: only broadcast lines that went to output_lines
-                            if lines_to_output > 0 {
-                                let output_lines_to_broadcast: Vec<String> = app.worlds[world_idx]
-                                    .output_lines
-                                    .iter()
-                                    .skip(output_before)
-                                    .take(lines_to_output)
-                                    .map(|line| line.text.replace('\r', ""))
-                                    .collect();
-                                let ws_data = output_lines_to_broadcast.join("\n") + "\n";
-                                app.ws_broadcast(WsMessage::ServerData {
-                                    world_index: world_idx,
-                                    data: ws_data,
-                                    is_viewed: is_current,
-                                    ts: current_timestamp_secs(),
-                                    from_server: true,  // This is MUD server data
-                                });
-                            }
-
-                            // Broadcast pending count update if it changed
-                            // Use filtered broadcast to skip clients that received pending in InitialState
-                            if lines_to_pending > 0 || pending_after != pending_before {
-                                app.ws_broadcast(WsMessage::PendingLinesUpdate { world_index: world_idx, count: pending_after });
-                            }
-
-                            // Broadcast updated unseen count so all clients stay in sync
-                            let unseen_count = app.worlds[world_idx].unseen_lines;
-                            if unseen_count > 0 {
-                                app.ws_broadcast(WsMessage::UnseenUpdate {
-                                    world_index: world_idx,
-                                    count: unseen_count,
-                                });
-                            }
-
-                            // Broadcast activity count to keep all clients in sync
-                            app.broadcast_activity();
-                        }
-
-                        // Add gagged lines to output (they'll only show with F2)
-                        for (line, highlight) in gagged_lines {
-                            let seq = app.worlds[world_idx].next_seq;
-                            app.worlds[world_idx].next_seq += 1;
-                            let mut output_line = OutputLine::new_gagged(line.to_string(), seq);
-                            output_line.highlight_color = highlight;
-                            app.worlds[world_idx].output_lines.push(output_line);
-                        }
-                        if !app.worlds[world_idx].paused {
-                            app.worlds[world_idx].scroll_to_bottom();
-                        }
-
-                        // Temporarily set current_world to the triggering world so /send
-                        // without -w sends to the world that triggered the action
+                        // Execute any triggered commands
                         let saved_current_world = app.current_world_index;
                         app.current_world_index = world_idx;
-                        for cmd in commands_to_execute {
+                        for cmd in commands {
                             if cmd.starts_with('/') {
-                                // Unified command system - route through TF parser
                                 app.sync_tf_world_info();
                                 match app.tf_engine.execute(&cmd) {
                                     tf::TfCommandResult::SendToMud(text) => {
@@ -13938,158 +13544,40 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                             }
                         }
                         app.current_world_index = saved_current_world;
-                        // Execute TF-generated Clay commands
-                        for cmd in tf_commands_to_execute {
-                            let _ = app.tf_engine.execute(&cmd);
-                        }
                     }
                 }
                 AppEvent::Disconnected(ref world_name, conn_id) => {
                     if let Some(world_idx) = app.find_world_index(world_name) {
-                        // Ignore stale disconnect from a previous connection
-                        if conn_id != app.worlds[world_idx].connection_id {
-                            continue;
-                        }
-                        // Fire TF DISCONNECT hook before cleaning up
-                        let hook_result = tf::bridge::fire_event(&mut app.tf_engine, tf::TfHookEvent::Disconnect);
-                        for cmd in hook_result.clay_commands {
-                            let _ = app.tf_engine.execute(&cmd);
-                        }
-
-                        // Push prompt to output before clearing
-                        if !app.worlds[world_idx].prompt.is_empty() {
-                            let prompt_text = app.worlds[world_idx].prompt.trim().to_string();
-                            let seq = app.worlds[world_idx].next_seq;
-                            app.worlds[world_idx].next_seq += 1;
-                            app.worlds[world_idx].output_lines.push(OutputLine::new(prompt_text, seq));
-                        }
-                        app.worlds[world_idx].clear_connection_state(true, true);
-                        // Show disconnection message
-                        let seq = app.worlds[world_idx].next_seq;
-                        app.worlds[world_idx].next_seq += 1;
-                        let disconnect_msg = OutputLine::new_client("Disconnected.".to_string(), seq);
-                        app.worlds[world_idx].output_lines.push(disconnect_msg.clone());
-
-                        // If this is not the current world, increment unseen_lines for activity indicator
-                        if world_idx != app.current_world_index {
-                            if app.worlds[world_idx].unseen_lines == 0 {
-                                app.worlds[world_idx].first_unseen_at = Some(std::time::Instant::now());
-                            }
-                            app.worlds[world_idx].unseen_lines += 1;
-                        }
-
-                        // Broadcast disconnect message to WebSocket clients viewing this world
-                        app.ws_broadcast_to_world(world_idx, WsMessage::ServerData {
-                            world_index: world_idx,
-                            data: "Disconnected.\n".to_string(),
-                            is_viewed: true,
-                            ts: disconnect_msg.timestamp.duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs(),
-                            from_server: false,
-                        });
-                        app.ws_broadcast(WsMessage::WorldDisconnected { world_index: world_idx });
+                        if conn_id != app.worlds[world_idx].connection_id { continue; }
+                        app.handle_disconnected(world_idx);
                     }
                 }
                 AppEvent::TelnetDetected(ref world_name) => {
                     if let Some(world_idx) = app.find_world_index(world_name) {
-                        if !app.worlds[world_idx].telnet_mode {
-                            app.worlds[world_idx].telnet_mode = true;
-                        }
+                        app.handle_telnet_detected(world_idx);
                     }
                 }
                 AppEvent::WontEchoSeen(ref world_name) => {
                     if let Some(world_idx) = app.find_world_index(world_name) {
-                        if !app.worlds[world_idx].uses_wont_echo_prompt {
-                            app.worlds[world_idx].uses_wont_echo_prompt = true;
-                        }
+                        app.handle_wont_echo_seen(world_idx);
                     }
                 }
                 AppEvent::NawsRequested(ref world_name) => {
                     if let Some(world_idx) = app.find_world_index(world_name) {
-                        // Mark NAWS as enabled for this world
-                        app.worlds[world_idx].naws_enabled = true;
-                        // Send initial window size
-                        app.send_naws_if_changed(world_idx);
+                        app.handle_naws_requested(world_idx);
                     }
                 }
                 AppEvent::TtypeRequested(ref world_name) => {
                     if let Some(world_idx) = app.find_world_index(world_name) {
-                        // Send terminal type response
-                        // Use TERM environment variable if set, otherwise default to "ANSI"
-                        let term_type = std::env::var("TERM").unwrap_or_else(|_| "ANSI".to_string());
-                        if let Some(ref tx) = app.worlds[world_idx].command_tx {
-                            let ttype_response = build_ttype_response(&term_type);
-                            let _ = tx.try_send(WriteCommand::Raw(ttype_response));
-                        }
+                        app.handle_ttype_requested(world_idx);
                     }
                 }
                 AppEvent::Prompt(ref world_name, prompt_bytes) => {
                     if let Some(world_idx) = app.find_world_index(world_name) {
-                        app.worlds[world_idx].last_receive_time = Some(std::time::Instant::now());
-                        let encoding = app.worlds[world_idx].settings.encoding;
-                        let prompt_text = encoding.decode(&prompt_bytes);
-                        let prompt_normalized = crate::util::normalize_prompt(&prompt_text);
-
-                        // If world is not connected, display prompt as output instead of input area
-                        if !app.worlds[world_idx].connected {
-                            let seq = app.worlds[world_idx].next_seq;
-                            app.worlds[world_idx].next_seq += 1;
-                            app.worlds[world_idx].output_lines.push(OutputLine::new(prompt_normalized.trim().to_string(), seq));
-                            app.worlds[world_idx].prompt.clear();
-                            continue;
-                        }
-
-                        app.worlds[world_idx].prompt = prompt_normalized.clone();
-                        app.ws_broadcast(WsMessage::PromptUpdate {
-                            world_index: world_idx,
-                            prompt: prompt_normalized,
-                        });
-
-                        let world = &mut app.worlds[world_idx];
-                        world.prompt_count += 1;
-
-                        // Skip auto-login if flag is set (from /worlds -l)
-                        if world.skip_auto_login {
-                            continue;
-                        }
-
-                        let auto_type = world.settings.auto_connect_type;
-                        let user = world.settings.user.clone();
-                        let password = world.settings.password.clone();
-                        let prompt_num = world.prompt_count;
-
-                        if !user.is_empty() && !password.is_empty() {
-                            let cmd_to_send = match auto_type {
-                                AutoConnectType::Prompt => {
-                                    match prompt_num {
-                                        1 if !user.is_empty() => Some(user),
-                                        2 if !password.is_empty() => Some(password),
-                                        _ => None,
-                                    }
-                                }
-                                AutoConnectType::MooPrompt => {
-                                    match prompt_num {
-                                        1 if !user.is_empty() => Some(user.clone()),
-                                        2 if !password.is_empty() => Some(password),
-                                        3 if !user.is_empty() => Some(user),
-                                        _ => None,
-                                    }
-                                }
-                                AutoConnectType::Connect | AutoConnectType::NoLogin => None,
-                            };
-
-                            if let Some(cmd) = cmd_to_send {
-                                if let Some(tx) = &world.command_tx {
-                                    let _ = tx.try_send(WriteCommand::Text(cmd));
-                                    world.last_send_time = Some(std::time::Instant::now());
-                                    // Clear prompt since we auto-answered it
-                                    world.prompt.clear();
-                                }
-                            }
-                        }
+                        app.handle_prompt(world_idx, &prompt_bytes);
                     }
                 }
                 AppEvent::SystemMessage(message) => {
-                    // Display system message in current world's output
                     app.add_output(&message);
                 }
                 // Multiuser events are only used in multiuser mode, ignore in normal mode
@@ -14098,45 +13586,19 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                 AppEvent::MultiuserDisconnected(_, _) => {}
                 AppEvent::MultiuserTelnetDetected(_, _) => {}
                 AppEvent::MultiuserPrompt(_, _, _) => {}
-                // SIGUSR1 - only relevant in main console mode, ignore in daemon mode
                 AppEvent::Sigusr1Received => {}
                 AppEvent::UpdateResult(result) => {
-                    // In daemon mode, just show the result message (no reload)
                     match result {
                         Ok(_success) => {
                             app.add_output("Update downloaded but reload is not supported in daemon mode.");
                             let _ = std::fs::remove_file(&_success.temp_path);
                         }
-                        Err(e) => {
-                            app.add_output(&e);
-                        }
+                        Err(e) => { app.add_output(&e); }
                     }
                 }
                 AppEvent::GmcpNegotiated(ref world_name) => {
                     if let Some(world_idx) = app.find_world_index(world_name) {
-                        app.worlds[world_idx].gmcp_enabled = true;
-                        let packages_str = app.worlds[world_idx].settings.gmcp_packages.clone();
-                        let packages: Vec<String> = packages_str
-                            .split(',')
-                            .map(|s| s.trim().to_string())
-                            .filter(|s| !s.is_empty())
-                            .collect();
-                        app.worlds[world_idx].gmcp_supported_packages = packages.clone();
-                        if let Some(ref tx) = app.worlds[world_idx].command_tx {
-                            let hello = build_gmcp_message("Core.Hello", &format!(
-                                "{{\"client\":\"Clay\",\"version\":\"{}\"}}",
-                                VERSION
-                            ));
-                            let _ = tx.try_send(WriteCommand::Raw(hello));
-                            let json_list: Vec<String> = packages.iter()
-                                .map(|p| format!("\"{}\"", p))
-                                .collect();
-                            let supports = build_gmcp_message(
-                                "Core.Supports.Set",
-                                &format!("[{}]", json_list.join(",")),
-                            );
-                            let _ = tx.try_send(WriteCommand::Raw(supports));
-                        }
+                        app.handle_gmcp_negotiated(world_idx);
                     }
                 }
                 AppEvent::MsdpNegotiated(ref world_name) => {
@@ -14146,75 +13608,12 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                 }
                 AppEvent::GmcpReceived(ref world_name, ref package, ref json_data) => {
                     if let Some(world_idx) = app.find_world_index(world_name) {
-                        // Always store GMCP data
-                        app.worlds[world_idx].gmcp_data.insert(package.clone(), json_data.clone());
-                        // Always store Client.Media.Default URL
-                        if package == "Client.Media.Default" {
-                            if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(json_data) {
-                                if let Some(url) = parsed.get("url").and_then(|v| v.as_str()) {
-                                    app.worlds[world_idx].mcmp_default_url = url.to_string();
-                                }
-                            }
-                        }
-                        // Always broadcast to remote clients
-                        app.ws_broadcast(WsMessage::GmcpData {
-                            world_index: world_idx,
-                            package: package.clone(),
-                            data: json_data.clone(),
-                        });
-                        if package.starts_with("Client.Media.") {
-                            let action = package.rsplit('.').next().unwrap_or("Play").to_string();
-                            let default_url = app.worlds[world_idx].mcmp_default_url.clone();
-                            app.ws_broadcast(WsMessage::McmpMedia {
-                                world_index: world_idx,
-                                action,
-                                data: json_data.clone(),
-                                default_url,
-                            });
-                        }
-                        // Always track media state; only play audio when enabled + current world
-                        if package.starts_with("Client.Media.") {
-                            let play_audio = app.worlds[world_idx].gmcp_user_enabled
-                                && world_idx == app.current_world_index;
-                            app.handle_gmcp_media(world_idx, package, json_data, play_audio);
-                        }
-                        // Gate TF hooks on gmcp_user_enabled
-                        if app.worlds[world_idx].gmcp_user_enabled {
-                            app.tf_engine.set_global("gmcp_package", crate::tf::TfValue::String(package.clone()));
-                            app.tf_engine.set_global("gmcp_data", crate::tf::TfValue::String(json_data.clone()));
-                            let results = crate::tf::hooks::fire_hook(&mut app.tf_engine, crate::tf::TfHookEvent::Gmcp);
-                            for r in results {
-                                if let crate::tf::TfCommandResult::SendToMud(text) = r {
-                                    if let Some(world) = app.worlds.get(world_idx) {
-                                        if let Some(ref tx) = world.command_tx {
-                                            let _ = tx.try_send(WriteCommand::Text(text));
-                                        }
-                                    }
-                                }
-                            }
-                        }
+                        app.handle_gmcp_received(world_idx, package, json_data);
                     }
                 }
                 AppEvent::MsdpReceived(ref world_name, ref variable, ref value_json) => {
                     if let Some(world_idx) = app.find_world_index(world_name) {
-                        app.worlds[world_idx].msdp_variables.insert(variable.clone(), value_json.clone());
-                        app.tf_engine.set_global("msdp_var", crate::tf::TfValue::String(variable.clone()));
-                        app.tf_engine.set_global("msdp_val", crate::tf::TfValue::String(value_json.clone()));
-                        let results = crate::tf::hooks::fire_hook(&mut app.tf_engine, crate::tf::TfHookEvent::Msdp);
-                        for r in results {
-                            if let crate::tf::TfCommandResult::SendToMud(text) = r {
-                                if let Some(world) = app.worlds.get(world_idx) {
-                                    if let Some(ref tx) = world.command_tx {
-                                        let _ = tx.try_send(WriteCommand::Text(text));
-                                    }
-                                }
-                            }
-                        }
-                        app.ws_broadcast(WsMessage::MsdpData {
-                            world_index: world_idx,
-                            variable: variable.clone(),
-                            value: value_json.clone(),
-                        });
+                        app.handle_msdp_received(world_idx, variable, value_json);
                     }
                 }
                 // Slack/Discord events
@@ -14313,1477 +13712,48 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                         }
                     }
                 }
-                // WebSocket events (drain loop - complex handlers use primary loop)
                 AppEvent::WsClientConnected(_) => {}
                 AppEvent::WsClientDisconnected(client_id) => {
-                    // Client disconnected - remove from ws_client_worlds cache
-                    let had_dimensions = app.ws_client_worlds.get(&client_id).and_then(|s| s.dimensions).is_some();
-                    app.ws_client_worlds.remove(&client_id);
-                    // If client had dimensions, recalculate minimum and send NAWS updates
-                    if had_dimensions {
-                        app.send_naws_to_all_worlds();
-                    }
+                    app.handle_ws_client_disconnected(client_id);
                 }
                 AppEvent::WsAuthKeyValidation(client_id, msg, client_ip) => {
-                    // Validate auth key from AuthRequest
-                    if let WsMessage::AuthRequest { auth_key: Some(key), current_world, .. } = *msg {
-                        let is_valid = app.settings.websocket_auth_keys.contains(&key);
-                        if is_valid {
-                            app.ws_set_client_authenticated(client_id, true);
-                            app.ws_send_to_client(client_id, WsMessage::AuthResponse {
-                                success: true,
-                                error: None,
-                                username: None,
-                                multiuser_mode: false,
-                            });
-                            let initial_state = app.build_initial_state();
-                            app.ws_send_to_client(client_id, initial_state);
-                            app.ws_mark_initial_state_sent(client_id);
-                            let world_idx = current_world
-                                .filter(|&w| w < app.worlds.len())
-                                .unwrap_or(app.current_world_index);
-                            app.ws_set_client_world(client_id, Some(world_idx));
-                            app.ws_client_worlds.insert(client_id, ClientViewState {
-                                world_index: world_idx,
-                                visible_lines: 0,
-                                dimensions: None,
-                            });
-                            app.ws_send_to_client(client_id, WsMessage::ActivityUpdate {
-                                count: app.activity_count(),
-                            });
-                        } else {
-                            // Invalid key - record ban violation
-                            app.ban_list.record_violation(&client_ip, "WebSocket: failed auth key");
-                            app.ws_send_to_client(client_id, WsMessage::AuthResponse {
-                                success: false,
-                                error: Some("Invalid auth key".to_string()),
-                                username: None,
-                                multiuser_mode: false,
-                            });
-                        }
-                    }
+                    app.handle_ws_auth_key_validation(client_id, *msg, &client_ip);
                 }
                 AppEvent::WsKeyRequest(client_id) => {
-                    use sha2::{Sha256, Digest};
-                    let mut hasher = Sha256::new();
-                    hasher.update(std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .unwrap_or_default()
-                        .as_nanos()
-                        .to_le_bytes());
-                    hasher.update(std::process::id().to_le_bytes());
-                    hasher.update(client_id.to_le_bytes());
-                    hasher.update(app.settings.websocket_auth_keys.len().to_le_bytes());
-                    let key = hex::encode(hasher.finalize());
-                    app.settings.websocket_auth_keys.push(key.clone());
-                    let _ = persistence::save_settings(&app);
-                    app.ws_send_to_client(client_id, WsMessage::KeyGenerated { auth_key: key });
+                    app.handle_ws_key_request(client_id);
                 }
                 AppEvent::WsKeyRevoke(_client_id, key) => {
-                    app.settings.websocket_auth_keys.retain(|k| k != &key);
-                    let _ = persistence::save_settings(&app);
+                    app.handle_ws_key_revoke(&key);
                 }
                 AppEvent::WsClientMessage(client_id, msg) => {
-                    // Handle simple messages in drain loop
-                    // Extract current_world from AuthRequest before matching (avoids borrow issues)
-                    let auth_current_world = if let WsMessage::AuthRequest { current_world, .. } = &*msg {
-                        *current_world
-                    } else {
-                        None
-                    };
-                    match *msg {
-                        WsMessage::AuthRequest { .. } => {
-                            let initial_state = app.build_initial_state();
-                            app.ws_send_to_client(client_id, initial_state);
-                            // Mark client as having received initial state so it receives broadcasts
-                            app.ws_mark_initial_state_sent(client_id);
-                            // Use client's world if provided, otherwise default to console's world
-                            let world_idx = auth_current_world
-                                .filter(|&w| w < app.worlds.len())
-                                .unwrap_or(app.current_world_index);
-                            // Set client's initial world so broadcast_to_world_viewers works immediately
-                            app.ws_set_client_world(client_id, Some(world_idx));
-                            // Also update ws_client_worlds cache for ws_client_viewing()
-                            app.ws_client_worlds.insert(client_id, ClientViewState {
-                                world_index: world_idx,
-                                visible_lines: 0,
-                                dimensions: None,
-                            });
-                            // Also send current activity count
-                            app.ws_send_to_client(client_id, WsMessage::ActivityUpdate {
-                                count: app.activity_count(),
-                            });
-                        }
-                        WsMessage::SendCommand { world_index, ref command } => {
-                            // Reset more-mode counter when ANY client sends a command
-                            if world_index < app.worlds.len() {
-                                app.worlds[world_index].lines_since_pause = 0;
-                                app.worlds[world_index].last_user_command_time = Some(std::time::Instant::now());
-                                // Update client's viewing world to ensure they receive output
-                                // (fixes race condition where client sends command before UpdateViewState)
-                                let dimensions = app.ws_client_worlds.get(&client_id).and_then(|s| s.dimensions);
-                                let visible_lines = app.ws_client_worlds.get(&client_id).map(|v| v.visible_lines).unwrap_or(0);
-                                app.ws_client_worlds.insert(client_id, ClientViewState { world_index, visible_lines, dimensions });
-                                app.ws_set_client_world(client_id, Some(world_index));
+                    let op = app.handle_ws_client_msg(client_id, *msg, &event_tx);
+                    match op {
+                        WsAsyncAction::Connect { world_index, prev_index, broadcast } => {
+                            if handle_command("/connect", &mut app, event_tx.clone()).await {
+                                return Ok(());
                             }
-
-                            // Use shared command parsing
-                            let parsed = parse_command(command);
-
-                            match parsed {
-                                // Commands handled locally on server
-                                Command::ActionCommand { name, args } => {
-                                    // Execute action if it exists
-                                    if let Some(action) = app.settings.actions.iter().find(|a| a.name.eq_ignore_ascii_case(&name)) {
-                                        // Skip disabled actions
-                                        if !action.enabled {
-                                            app.ws_broadcast(WsMessage::ServerData {
-                                                world_index,
-                                                data: format!("✨ Action '{}' is disabled.", name),
-                                                is_viewed: false,
-                                                ts: current_timestamp_secs(),
-                                                from_server: false,
-                                            });
-                                        } else {
-                                        let commands = split_action_commands(&action.command);
-                                        let mut sent_to_server = false;
-                                        for cmd in commands {
-                                            // Substitute $1-$9 and $* with arguments
-                                            let cmd = substitute_action_args(&cmd, &args);
-
-                                            if cmd.eq_ignore_ascii_case("/gag") || cmd.to_lowercase().starts_with("/gag ") {
-                                                continue;
-                                            }
-                                            // Unified command system - route through TF parser
-                                            if cmd.starts_with('/') {
-                                                app.sync_tf_world_info();
-                                                match app.tf_engine.execute(&cmd) {
-                                                    tf::TfCommandResult::Success(Some(msg)) => {
-                                                        app.ws_broadcast(WsMessage::ServerData {
-                                                            world_index,
-                                                            data: msg,
-                                                            is_viewed: false,
-                                                            ts: current_timestamp_secs(),
-                                                            from_server: false,
-                                                        });
-                                                    }
-                                                    tf::TfCommandResult::Success(None) => {}
-                                                    tf::TfCommandResult::Error(err) => {
-                                                        app.ws_broadcast(WsMessage::ServerData {
-                                                            world_index,
-                                                            data: format!("Error: {}", err),
-                                                            is_viewed: false,
-                                                            ts: current_timestamp_secs(),
-                                                            from_server: false,
-                                                        });
-                                                    }
-                                                    tf::TfCommandResult::SendToMud(text) => {
-                                                        if world_index < app.worlds.len() {
-                                                            if let Some(tx) = &app.worlds[world_index].command_tx {
-                                                                let _ = tx.try_send(WriteCommand::Text(text));
-                                                                sent_to_server = true;
-                                                            }
-                                                        }
-                                                    }
-                                                    tf::TfCommandResult::ClayCommand(clay_cmd) => {
-                                                        app.ws_send_to_client(client_id, WsMessage::ExecuteLocalCommand { command: clay_cmd });
-                                                    }
-                                                    tf::TfCommandResult::Recall(opts) => {
-                                                        if world_index < app.worlds.len() {
-                                                            let output_lines = app.worlds[world_index].output_lines.clone();
-                                                            let (matches, header) = execute_recall(&opts, &output_lines);
-                                                            let pattern_str = opts.pattern.as_deref().unwrap_or("*");
-                                                            let ts = current_timestamp_secs();
-
-                                                            if !opts.quiet {
-                                                                if let Some(h) = header {
-                                                                    app.ws_broadcast(WsMessage::ServerData { world_index, data: h, is_viewed: false, ts , from_server: false });
-                                                                }
-                                                            }
-                                                            if matches.is_empty() {
-                                                                app.ws_broadcast(WsMessage::ServerData { world_index, data: format!("✨ No matches for '{}'", pattern_str), is_viewed: false, ts, from_server: false });
-                                                            } else {
-                                                                for m in matches {
-                                                                    app.ws_broadcast(WsMessage::ServerData { world_index, data: m, is_viewed: false, ts , from_server: false });
-                                                                }
-                                                            }
-                                                            if !opts.quiet {
-                                                                app.ws_broadcast(WsMessage::ServerData { world_index, data: "================= Recall end =================".to_string(), is_viewed: false, ts , from_server: false });
-                                                            }
-                                                        }
-                                                    }
-                                                    tf::TfCommandResult::RepeatProcess(process) => {
-                                                        let id = process.id;
-                                                        let interval = format_duration_short(process.interval);
-                                                        let count_str = process.count.map_or("infinite".to_string(), |c| c.to_string());
-                                                        let cmd_str = process.command.clone();
-                                                        app.tf_engine.processes.push(process);
-                                                        app.ws_broadcast(WsMessage::ServerData {
-                                                            world_index,
-                                                            data: format!("% Process {} started: {} every {} ({} times)", id, cmd_str, interval, count_str),
-                                                            is_viewed: false,
-                                                            ts: current_timestamp_secs(),
-                                                            from_server: false,
-                                                        });
-                                                    }
-                                                    _ => {}
-                                                }
-                                            } else if world_index < app.worlds.len() {
-                                                // Plain text - send to MUD server
-                                                if let Some(tx) = &app.worlds[world_index].command_tx {
-                                                    let _ = tx.try_send(WriteCommand::Text(cmd));
-                                                    sent_to_server = true;
-                                                }
-                                            }
-                                        }
-                                        if sent_to_server {
-                                            app.worlds[world_index].last_send_time = Some(std::time::Instant::now());
-                                        }
-                                        }
-                                    } else {
-                                        // No matching action - try TF engine (handles /recall, /set, /echo, etc.)
-                                        app.sync_tf_world_info();
-                                        match app.tf_engine.execute(command) {
-                                            tf::TfCommandResult::Success(Some(msg)) => {
-                                                app.ws_broadcast(WsMessage::ServerData {
-                                                    world_index, data: msg, is_viewed: false,
-                                                    ts: current_timestamp_secs(), from_server: false,
-                                                });
-                                            }
-                                            tf::TfCommandResult::Success(None) => {}
-                                            tf::TfCommandResult::Error(err) => {
-                                                app.ws_broadcast(WsMessage::ServerData {
-                                                    world_index, data: format!("Error: {}", err), is_viewed: false,
-                                                    ts: current_timestamp_secs(), from_server: false,
-                                                });
-                                            }
-                                            tf::TfCommandResult::SendToMud(text) => {
-                                                if world_index < app.worlds.len() {
-                                                    if let Some(tx) = &app.worlds[world_index].command_tx {
-                                                        let _ = tx.try_send(WriteCommand::Text(text));
-                                                        app.worlds[world_index].last_send_time = Some(std::time::Instant::now());
-                                                    }
-                                                }
-                                            }
-                                            tf::TfCommandResult::ClayCommand(clay_cmd) => {
-                                                app.ws_send_to_client(client_id, WsMessage::ExecuteLocalCommand { command: clay_cmd });
-                                            }
-                                            tf::TfCommandResult::Recall(opts) => {
-                                                if world_index < app.worlds.len() {
-                                                    let output_lines = app.worlds[world_index].output_lines.clone();
-                                                    let (matches, header) = execute_recall(&opts, &output_lines);
-                                                    let pattern_str = opts.pattern.as_deref().unwrap_or("*");
-                                                    let ts = current_timestamp_secs();
-                                                    if !opts.quiet {
-                                                        if let Some(h) = header {
-                                                            app.ws_broadcast(WsMessage::ServerData { world_index, data: h, is_viewed: false, ts, from_server: false });
-                                                        }
-                                                    }
-                                                    if matches.is_empty() {
-                                                        app.ws_broadcast(WsMessage::ServerData { world_index, data: format!("✨ No matches for '{}'", pattern_str), is_viewed: false, ts, from_server: false });
-                                                    } else {
-                                                        for m in matches {
-                                                            app.ws_broadcast(WsMessage::ServerData { world_index, data: m, is_viewed: false, ts, from_server: false });
-                                                        }
-                                                    }
-                                                    if !opts.quiet {
-                                                        app.ws_broadcast(WsMessage::ServerData { world_index, data: "================= Recall end =================".to_string(), is_viewed: false, ts, from_server: false });
-                                                    }
-                                                }
-                                            }
-                                            tf::TfCommandResult::RepeatProcess(process) => {
-                                                app.tf_engine.processes.push(process);
-                                            }
-                                            _ => {
-                                                app.ws_broadcast(WsMessage::ServerData {
-                                                    world_index,
-                                                    data: format!("Unknown command: /{}", name),
-                                                    is_viewed: false,
-                                                    ts: current_timestamp_secs(),
-                                                    from_server: false,
-                                                });
-                                            }
-                                        }
-                                    }
-                                }
-                                Command::NotACommand { text } => {
-                                    // Regular text - send to MUD
-                                    if world_index < app.worlds.len() {
-                                        if let Some(tx) = &app.worlds[world_index].command_tx {
-                                            if tx.try_send(WriteCommand::Text(text)).is_ok() {
-                                                app.worlds[world_index].last_send_time = Some(std::time::Instant::now());
-                                                app.worlds[world_index].prompt.clear();
-                                            }
-                                        }
-                                    }
-                                }
-                                Command::Edit { .. } | Command::EditList => {
-                                    // Edit command is handled locally on the client, not on server
-                                    // Send back to client for local execution
-                                    app.ws_send_to_client(client_id, WsMessage::ExecuteLocalCommand { command: command.clone() });
-                                }
-                                Command::Tag => {
-                                    // Toggle show_tags setting (same as F2)
-                                    app.show_tags = !app.show_tags;
-                                    app.ws_broadcast(WsMessage::ShowTagsChanged { show_tags: app.show_tags });
-                                }
-                                Command::Unknown { cmd } => {
-                                    app.ws_broadcast(WsMessage::ServerData {
-                                        world_index,
-                                        data: format!("Unknown command: {}", cmd),
-                                        is_viewed: false,
-                                        ts: current_timestamp_secs(),
-                                        from_server: false,
-                                    });
-                                }
-                                Command::Send { text, all_worlds, target_world, no_newline } => {
-                                    // Handle /send command
-                                    // Helper to create the write command
-                                    let make_write_cmd = |t: &str| -> WriteCommand {
-                                        if no_newline {
-                                            WriteCommand::Raw(t.as_bytes().to_vec())
-                                        } else {
-                                            WriteCommand::Text(t.to_string())
-                                        }
-                                    };
-
-                                    if all_worlds {
-                                        // Send to all connected worlds
-                                        for world in app.worlds.iter_mut() {
-                                            if world.connected {
-                                                if let Some(tx) = &world.command_tx {
-                                                    let _ = tx.try_send(make_write_cmd(&text));
-                                                    world.last_send_time = Some(std::time::Instant::now());
-                                                }
-                                            }
-                                        }
-                                    } else if let Some(ref target) = target_world {
-                                        // Send to specific world by name
-                                        if let Some(world) = app.worlds.iter_mut().find(|w| w.name.eq_ignore_ascii_case(target)) {
-                                            if world.connected {
-                                                if let Some(tx) = &world.command_tx {
-                                                    let _ = tx.try_send(make_write_cmd(&text));
-                                                    world.last_send_time = Some(std::time::Instant::now());
-                                                }
-                                            } else {
-                                                app.ws_broadcast(WsMessage::ServerData {
-                                                    world_index,
-                                                    data: format!("World '{}' is not connected.", target),
-                                                    is_viewed: false,
-                                                    ts: current_timestamp_secs(),
-                                                    from_server: false,
-                                                });
-                                            }
-                                        } else {
-                                            app.ws_broadcast(WsMessage::ServerData {
-                                                world_index,
-                                                data: format!("Unknown world: {}", target),
-                                                is_viewed: false,
-                                                ts: current_timestamp_secs(),
-                                                from_server: false,
-                                            });
-                                        }
-                                    } else {
-                                        // Send to current world (the one this command came from)
-                                        if world_index < app.worlds.len() {
-                                            if let Some(tx) = &app.worlds[world_index].command_tx {
-                                                let _ = tx.try_send(make_write_cmd(&text));
-                                                app.worlds[world_index].last_send_time = Some(std::time::Instant::now());
-                                            }
-                                        }
-                                    }
-                                }
-                                Command::Disconnect => {
-                                    // Disconnect the specified world
-                                    if world_index < app.worlds.len() && app.worlds[world_index].connected {
-                                        // Kill proxy process if one exists
-                                        #[cfg(unix)]
-                                        if let Some(proxy_pid) = app.worlds[world_index].proxy_pid {
-                                            unsafe { libc::kill(proxy_pid as libc::pid_t, libc::SIGTERM); }
-                                        }
-                                        app.worlds[world_index].clear_connection_state(true, true);
-                                        app.ws_broadcast(WsMessage::ServerData {
-                                            world_index,
-                                            data: "Disconnected.".to_string(),
-                                            is_viewed: false,
-                                            ts: current_timestamp_secs(),
-                                            from_server: false,
-                                        });
-                                        app.ws_broadcast(WsMessage::WorldDisconnected { world_index });
-                                    } else {
-                                        app.ws_broadcast(WsMessage::ServerData {
-                                            world_index,
-                                            data: "Not connected.".to_string(),
-                                            is_viewed: false,
-                                            ts: current_timestamp_secs(),
-                                            from_server: false,
-                                        });
-                                    }
-                                }
-                                Command::Flush => {
-                                    // Clear output buffer for this world
-                                    if world_index < app.worlds.len() {
-                                        let line_count = app.worlds[world_index].output_lines.len();
-                                        app.worlds[world_index].output_lines.clear();
-                                        app.worlds[world_index].pending_lines.clear();
-                                        app.worlds[world_index].scroll_offset = 0;
-                                        app.worlds[world_index].lines_since_pause = 0;
-                                        app.worlds[world_index].paused = false;
-                                        app.ws_broadcast(WsMessage::WorldFlushed { world_index });
-                                        app.ws_broadcast(WsMessage::ServerData {
-                                            world_index,
-                                            data: format!("Flushed {} lines from output buffer.", line_count),
-                                            is_viewed: false,
-                                            ts: current_timestamp_secs(),
-                                            from_server: false,
-                                        });
-                                    }
-                                }
-                                Command::Keepalive => {
-                                    // Show keepalive settings for this world
-                                    if world_index < app.worlds.len() {
-                                        let world = &app.worlds[world_index];
-                                        let info = format!(
-                                            "Keepalive: {} ({})",
-                                            world.settings.keep_alive_type.name(),
-                                            if world.settings.keep_alive_type == KeepAliveType::Custom {
-                                                world.settings.keep_alive_cmd.clone()
-                                            } else {
-                                                world.settings.keep_alive_type.name().to_string()
-                                            }
-                                        );
-                                        app.ws_broadcast(WsMessage::ServerData {
-                                            world_index,
-                                            data: info,
-                                            is_viewed: false,
-                                            ts: current_timestamp_secs(),
-                                            from_server: false,
-                                        });
-                                    }
-                                }
-                                Command::Gag { pattern } => {
-                                    // TODO: Implement gag patterns storage
-                                    app.ws_broadcast(WsMessage::ServerData {
-                                        world_index,
-                                        data: format!("Gag pattern set: {}", pattern),
-                                        is_viewed: false,
-                                        ts: current_timestamp_secs(),
-                                        from_server: false,
-                                    });
-                                }
-                                Command::BanList => {
-                                    // Send current ban list
-                                    let bans = app.ban_list.get_ban_info();
-                                    if bans.is_empty() {
-                                        app.ws_broadcast(WsMessage::ServerData {
-                                            world_index,
-                                            data: "No hosts are currently banned.".to_string(),
-                                            is_viewed: false,
-                                            ts: current_timestamp_secs(),
-                                            from_server: false,
-                                        });
-                                    } else {
-                                        let mut output = String::new();
-                                        output.push_str("\nBanned Hosts:\n");
-                                        output.push_str(&"─".repeat(70));
-                                        output.push_str(&format!("\n{:<20} {:<12} {}\n", "Host", "Type", "Last URL/Reason"));
-                                        output.push_str(&"─".repeat(70));
-                                        output.push('\n');
-                                        for (ip, ban_type, reason) in &bans {
-                                            let reason_display = if reason.is_empty() { "(unknown)" } else { reason };
-                                            output.push_str(&format!("{:<20} {:<12} {}\n", ip, ban_type, reason_display));
-                                        }
-                                        output.push_str(&"─".repeat(70));
-                                        output.push_str("\nUse /unban <host> to remove a ban.");
-                                        app.ws_broadcast(WsMessage::ServerData {
-                                            world_index,
-                                            data: output,
-                                            is_viewed: false,
-                                            ts: current_timestamp_secs(),
-                                            from_server: false,
-                                        });
-                                    }
-                                    app.ws_send_to_client(client_id, WsMessage::BanListResponse { bans });
-                                }
-                                Command::Unban { host } => {
-                                    if app.ban_list.remove_ban(&host) {
-                                        // Save settings to persist the change
-                                        let _ = persistence::save_settings(&app);
-                                        app.ws_broadcast(WsMessage::ServerData {
-                                            world_index,
-                                            data: format!("Removed ban for: {}", host),
-                                            is_viewed: false,
-                                            ts: current_timestamp_secs(),
-                                            from_server: false,
-                                        });
-                                        // Broadcast updated ban list
-                                        app.ws_broadcast(WsMessage::BanListResponse { bans: app.ban_list.get_ban_info() });
-                                        app.ws_send_to_client(client_id, WsMessage::UnbanResult { success: true, host, error: None });
-                                    } else {
-                                        app.ws_broadcast(WsMessage::ServerData {
-                                            world_index,
-                                            data: format!("No ban found for: {}", host),
-                                            is_viewed: false,
-                                            ts: current_timestamp_secs(),
-                                            from_server: false,
-                                        });
-                                        app.ws_send_to_client(client_id, WsMessage::UnbanResult { success: false, host, error: Some("No ban found".to_string()) });
-                                    }
-                                }
-                                Command::TestMusic => {
-                                    let test_notes = generate_test_music_notes();
-                                    // Play locally on console via mpv/ffplay
-                                    if let Some(ref player_cmd) = app.media_player_cmd {
-                                        let wav_data = generate_wav_from_notes(&test_notes);
-                                        let _ = std::fs::create_dir_all(&app.media_cache_dir);
-                                        let wav_path = app.media_cache_dir.join("ansi_music.wav");
-                                        if std::fs::write(&wav_path, &wav_data).is_ok() {
-                                            let wav_path_str = wav_path.to_string_lossy().to_string();
-                                            let player = player_cmd.clone();
-                                            std::thread::spawn(move || {
-                                                let mut cmd = std::process::Command::new(&player);
-                                                match player.as_str() {
-                                                    "mpv" => { cmd.args(["--no-video", "--no-terminal", &wav_path_str]); }
-                                                    "ffplay" => { cmd.args(["-nodisp", "-autoexit", &wav_path_str]); }
-                                                    _ => { cmd.arg(&wav_path_str); }
-                                                }
-                                                cmd.stdout(std::process::Stdio::null());
-                                                cmd.stderr(std::process::Stdio::piped());
-                                                if let Ok(output) = cmd.output() {
-                                                    if !output.status.success() {
-                                                        let stderr = String::from_utf8_lossy(&output.stderr);
-                                                        let _ = std::fs::write("/tmp/clay-testmusic.log",
-                                                            format!("Player: {}\nStatus: {}\nStderr: {}", player, output.status, stderr));
-                                                    }
-                                                }
-                                            });
-                                        }
-                                    }
-                                    app.ws_broadcast(WsMessage::AnsiMusic {
-                                        world_index,
-                                        notes: test_notes,
-                                    });
-                                    if app.media_player_cmd.is_some() {
-                                        app.add_output("Playing test music (Super Mario Bros)...");
-                                    } else {
-                                        app.add_output("No audio player found (install mpv or ffplay for console audio)");
-                                    }
-                                }
-                                Command::Notify { message } => {
-                                    // Send notification to mobile clients
-                                    let title = if world_index < app.worlds.len() {
-                                        app.worlds[world_index].name.clone()
-                                    } else {
-                                        "Clay".to_string()
-                                    };
-                                    app.ws_broadcast(WsMessage::Notification {
-                                        title,
-                                        message: message.clone(),
-                                    });
-                                    app.add_output(&format!("Notification sent: {}", message));
-                                }
-                                Command::Dump => {
-                                    // Dump all scrollback buffers to ~/.clay.dmp.log
-                                    use std::io::Write;
-                                    let ts = current_timestamp_secs();
-
-                                    let home = get_home_dir();
-                                    let dump_path = format!("{}/{}", home, clay_filename("clay.dmp.log"));
-
-                                    match std::fs::File::create(&dump_path) {
-                                        Ok(mut file) => {
-                                            let mut total_lines = 0;
-                                            for world in app.worlds.iter() {
-                                                for line in &world.output_lines {
-                                                    let line_ts = line.timestamp
-                                                        .duration_since(std::time::UNIX_EPOCH)
-                                                        .map(|d| d.as_secs())
-                                                        .unwrap_or(0) as i64;
-                                                    let lt = local_time_from_epoch(line_ts);
-                                                    let datetime = format!(
-                                                        "{:04}-{:02}-{:02} {:02}:{:02}:{:02}",
-                                                        lt.year, lt.month, lt.day,
-                                                        lt.hour, lt.minute, lt.second
-                                                    );
-                                                    let _ = writeln!(file, "{},{},{}", world.name, datetime, line.text);
-                                                    total_lines += 1;
-                                                }
-                                                for line in &world.pending_lines {
-                                                    let line_ts = line.timestamp
-                                                        .duration_since(std::time::UNIX_EPOCH)
-                                                        .map(|d| d.as_secs())
-                                                        .unwrap_or(0) as i64;
-                                                    let lt = local_time_from_epoch(line_ts);
-                                                    let datetime = format!(
-                                                        "{:04}-{:02}-{:02} {:02}:{:02}:{:02}",
-                                                        lt.year, lt.month, lt.day,
-                                                        lt.hour, lt.minute, lt.second
-                                                    );
-                                                    let _ = writeln!(file, "{},{},{}", world.name, datetime, line.text);
-                                                    total_lines += 1;
-                                                }
-                                            }
-                                            app.ws_broadcast(WsMessage::ServerData {
-                                                world_index,
-                                                data: format!("Dumped {} lines from {} worlds to {}", total_lines, app.worlds.len(), dump_path),
-                                                is_viewed: false,
-                                                ts,
-                                                from_server: false,
-                                            });
-                                        }
-                                        Err(e) => {
-                                            app.ws_broadcast(WsMessage::ServerData {
-                                                world_index,
-                                                data: format!("Failed to create dump file: {}", e),
-                                                is_viewed: false,
-                                                ts,
-                                                from_server: false,
-                                            });
-                                        }
-                                    }
-                                }
-                                // Commands that should be blocked from remote
-                                Command::Quit | Command::Reload | Command::Update => {
-                                    app.ws_broadcast(WsMessage::ServerData {
-                                        world_index,
-                                        data: "This command is not available from remote interfaces.".to_string(),
-                                        is_viewed: false,
-                                        ts: current_timestamp_secs(),
-                                        from_server: false,
-                                    });
-                                }
-                                // UI popup commands - send back to client for local handling
-                                Command::Help | Command::Menu | Command::Setup | Command::Web | Command::Actions { .. } |
-                                Command::WorldsList | Command::WorldSelector | Command::WorldEdit { .. } => {
-                                    app.ws_send_to_client(client_id, WsMessage::ExecuteLocalCommand { command: command.clone() });
-                                }
-                                Command::Version => {
-                                    app.ws_send_to_client(client_id, WsMessage::ServerData {
-                                        world_index,
-                                        data: get_version_string(),
-                                        is_viewed: false,
-                                        ts: current_timestamp_secs(),
-                                        from_server: false,
-                                    });
-                                }
-                                // AddWorld - add or update world definition
-                                Command::AddWorld { name, host, port, user, password, use_ssl } => {
-                                    let existing_idx = app.worlds.iter().position(|w| w.name.eq_ignore_ascii_case(&name));
-
-                                    let world_idx = if let Some(idx) = existing_idx {
-                                        idx
-                                    } else {
-                                        let new_world = World::new(&name);
-                                        app.worlds.push(new_world);
-                                        app.worlds.len() - 1
-                                    };
-
-                                    if let Some(h) = host {
-                                        app.worlds[world_idx].settings.hostname = h;
-                                    }
-                                    if let Some(p) = port {
-                                        app.worlds[world_idx].settings.port = p;
-                                    }
-                                    if let Some(u) = user {
-                                        app.worlds[world_idx].settings.user = u;
-                                    }
-                                    if let Some(p) = password {
-                                        app.worlds[world_idx].settings.password = p;
-                                    }
-                                    app.worlds[world_idx].settings.use_ssl = use_ssl;
-
-                                    let _ = persistence::save_settings(&app);
-
-                                    let action = if existing_idx.is_some() { "Updated" } else { "Added" };
-                                    let host_info = if !app.worlds[world_idx].settings.hostname.is_empty() {
-                                        format!(" ({}:{}{})",
-                                            app.worlds[world_idx].settings.hostname,
-                                            app.worlds[world_idx].settings.port,
-                                            if use_ssl { " SSL" } else { "" })
-                                    } else {
-                                        " (connectionless)".to_string()
-                                    };
-                                    app.ws_broadcast(WsMessage::ServerData {
-                                        world_index,
-                                        data: format!("{} world '{}'{}.", action, name, host_info),
-                                        is_viewed: false,
-                                        ts: current_timestamp_secs(),
-                                        from_server: false,
-                                    });
-                                }
-                                // Connect command - can't do async in drain loop, use ConnectWorld message
-                                Command::Connect { .. } => {
-                                    app.ws_broadcast(WsMessage::ServerData {
-                                        world_index,
-                                        data: "Use ConnectWorld message for connection.".to_string(),
-                                        is_viewed: false,
-                                        ts: current_timestamp_secs(),
-                                        from_server: false,
-                                    });
-                                }
-                                // WorldSwitch - do the switch part, skip async connect
-                                Command::WorldSwitch { ref name } | Command::WorldConnectNoLogin { ref name } => {
-                                    if let Some(idx) = app.worlds.iter().position(|w| w.name.eq_ignore_ascii_case(name)) {
-                                        // Switch only the requesting client's world, not the console
-                                        let dimensions = app.ws_client_worlds.get(&client_id).and_then(|s| s.dimensions);
-                                        let visible_lines = app.ws_client_worlds.get(&client_id).map(|v| v.visible_lines).unwrap_or(0);
-                                        app.ws_client_worlds.insert(client_id, ClientViewState { world_index: idx, visible_lines, dimensions });
-                                        app.ws_set_client_world(client_id, Some(idx));
-                                        app.ws_send_to_client(client_id, WsMessage::WorldSwitched { new_index: idx });
-                                        // Also send ExecuteLocalCommand so web clients can switch their local view
-                                        app.ws_send_to_client(client_id, WsMessage::ExecuteLocalCommand { command: command.clone() });
-                                        // Note: Connection requires async, use ConnectWorld message
-                                    } else {
-                                        app.ws_send_to_client(client_id, WsMessage::ServerData {
-                                            world_index,
-                                            data: format!("World '{}' not found.", name),
-                                            is_viewed: false,
-                                            ts: current_timestamp_secs(),
-                                            from_server: false,
-                                        });
-                                    }
-                                }
-                                Command::Dict { .. } | Command::Urban { .. } | Command::Translate { .. } => {
-                                    spawn_api_lookup(event_tx.clone(), client_id, world_index, parsed);
-                                }
-                                Command::DictUsage => {
-                                    app.ws_send_to_client(client_id, WsMessage::ServerData {
-                                        world_index,
-                                        data: "Usage: /dict <prefix> <word>".to_string(),
-                                        is_viewed: false,
-                                        ts: current_timestamp_secs(),
-                                        from_server: false,
-                                    });
-                                }
-                                Command::UrbanUsage => {
-                                    app.ws_send_to_client(client_id, WsMessage::ServerData {
-                                        world_index,
-                                        data: "Usage: /urban <prefix> <word>".to_string(),
-                                        is_viewed: false,
-                                        ts: current_timestamp_secs(),
-                                        from_server: false,
-                                    });
-                                }
-                                Command::TranslateUsage => {
-                                    app.ws_send_to_client(client_id, WsMessage::ServerData {
-                                        world_index,
-                                        data: "Usage: /translate <lang> <prefix> <text>".to_string(),
-                                        is_viewed: false,
-                                        ts: current_timestamp_secs(),
-                                        from_server: false,
-                                    });
-                                }
-                                Command::HelpTf => {
-                                    // Execute TF help command and send the result
-                                    match app.tf_engine.execute("#help") {
-                                        tf::TfCommandResult::Success(Some(msg)) => {
-                                            for line in msg.lines() {
-                                                app.ws_send_to_client(client_id, WsMessage::ServerData {
-                                                    world_index,
-                                                    data: line.to_string(),
-                                                    is_viewed: false,
-                                                    ts: current_timestamp_secs(),
-                                                    from_server: false,
-                                                });
-                                            }
-                                        }
-                                        tf::TfCommandResult::Success(None) => {}
-                                        tf::TfCommandResult::Error(err) => {
-                                            app.ws_send_to_client(client_id, WsMessage::ServerData {
-                                                world_index,
-                                                data: format!("Error: {}", err),
-                                                is_viewed: false,
-                                                ts: current_timestamp_secs(),
-                                                from_server: false,
-                                            });
-                                        }
-                                        _ => {}
-                                    }
-                                }
+                            if broadcast && world_index < app.worlds.len() && app.worlds[world_index].connected {
+                                let name = app.worlds[world_index].name.clone();
+                                app.ws_broadcast(WsMessage::WorldConnected { world_index, name });
+                            }
+                            if prev_index != world_index {
+                                app.current_world_index = prev_index;
                             }
                         }
-                        WsMessage::SwitchWorld { world_index } => {
-                            // Switch only the requesting client's world, not the console
-                            if world_index < app.worlds.len() {
-                                let dimensions = app.ws_client_worlds.get(&client_id).and_then(|s| s.dimensions);
-                                let visible_lines = app.ws_client_worlds.get(&client_id).map(|v| v.visible_lines).unwrap_or(0);
-                                app.ws_client_worlds.insert(client_id, ClientViewState { world_index, visible_lines, dimensions });
-                                app.ws_set_client_world(client_id, Some(world_index));
-                                app.ws_send_to_client(client_id, WsMessage::WorldSwitched { new_index: world_index });
-                                // Send active media for the new world
-                                app.ws_send_active_media_to_client(client_id, world_index);
+                        WsAsyncAction::Disconnect { world_index, prev_index } => {
+                            let _ = world_index;
+                            if handle_command("/disconnect", &mut app, event_tx.clone()).await {
+                                return Ok(());
                             }
+                            app.current_world_index = prev_index;
                         }
-                        WsMessage::UpdateWorldSettings { world_index, name, hostname, port, user, password, use_ssl, log_enabled, encoding, auto_login, keep_alive_type, keep_alive_cmd, gmcp_packages } => {
-                            if world_index < app.worlds.len() {
-                                app.worlds[world_index].name = name.clone();
-                                app.worlds[world_index].settings.hostname = hostname.clone();
-                                app.worlds[world_index].settings.port = port.clone();
-                                app.worlds[world_index].settings.user = user.clone();
-                                app.worlds[world_index].settings.password = password.clone();
-                                app.worlds[world_index].settings.use_ssl = use_ssl;
-                                app.worlds[world_index].settings.log_enabled = log_enabled;
-                                app.worlds[world_index].settings.encoding = match encoding.as_str() {
-                                    "latin1" => Encoding::Latin1,
-                                    "fansi" => Encoding::Fansi,
-                                    _ => Encoding::Utf8,
-                                };
-                                app.worlds[world_index].settings.auto_connect_type = AutoConnectType::from_name(&auto_login);
-                                app.worlds[world_index].settings.keep_alive_type = KeepAliveType::from_name(&keep_alive_type);
-                                app.worlds[world_index].settings.keep_alive_cmd = keep_alive_cmd.clone();
-                                app.worlds[world_index].settings.gmcp_packages = gmcp_packages.clone();
-                                let _ = persistence::save_settings(&app);
-                                let settings_msg = WorldSettingsMsg {
-                                    hostname, port, user,
-                                    password: encrypt_password(&password),
-                                    use_ssl,
-                                    log_enabled,
-                                    encoding,
-                                    auto_connect_type: auto_login,
-                                    keep_alive_type,
-                                    keep_alive_cmd,
-                                    gmcp_packages,
-                                };
-                                app.ws_broadcast(WsMessage::WorldSettingsUpdated { world_index, settings: settings_msg, name });
-                            }
-                        }
-                        WsMessage::UpdateGlobalSettings { more_mode_enabled, spell_check_enabled, temp_convert_enabled, world_switch_mode, show_tags, debug_enabled, ansi_music_enabled, console_theme, gui_theme, gui_transparency, color_offset_percent, input_height, font_name, font_size, web_font_size_phone, web_font_size_tablet, web_font_size_desktop, ws_allow_list, web_secure, http_enabled, http_port, ws_enabled, ws_port, ws_cert_file, ws_key_file, tls_proxy_enabled, dictionary_path } => {
-                            app.settings.more_mode_enabled = more_mode_enabled;
-                            app.settings.spell_check_enabled = spell_check_enabled;
-                            app.settings.temp_convert_enabled = temp_convert_enabled;
-                            app.settings.world_switch_mode = WorldSwitchMode::from_name(&world_switch_mode);
-                            app.show_tags = show_tags;
-                            app.settings.debug_enabled = debug_enabled;
-                            app.settings.ansi_music_enabled = ansi_music_enabled;
-                            app.settings.theme = Theme::from_name(&console_theme);
-                            app.settings.gui_theme = Theme::from_name(&gui_theme);
-                            app.settings.gui_transparency = gui_transparency.clamp(0.3, 1.0);
-                            app.settings.color_offset_percent = color_offset_percent.min(100);
-                            app.input_height = input_height.clamp(1, 15);
-                            app.input.visible_height = app.input_height;
-                            app.settings.font_name = font_name;
-                            app.settings.font_size = font_size.clamp(8.0, 48.0);
-                            app.settings.web_font_size_phone = web_font_size_phone.clamp(8.0, 48.0);
-                            app.settings.web_font_size_tablet = web_font_size_tablet.clamp(8.0, 48.0);
-                            app.settings.web_font_size_desktop = web_font_size_desktop.clamp(8.0, 48.0);
-                            app.settings.websocket_allow_list = ws_allow_list.clone();
-                            if let Some(ref server) = app.ws_server {
-                                server.update_allow_list(&ws_allow_list);
-                            }
-                            app.settings.web_secure = web_secure;
-                            app.settings.http_enabled = http_enabled;
-                            app.settings.http_port = http_port;
-                            app.settings.ws_enabled = ws_enabled;
-                            app.settings.ws_port = ws_port;
-                            app.settings.websocket_cert_file = ws_cert_file;
-                            app.settings.websocket_key_file = ws_key_file;
-                            app.settings.tls_proxy_enabled = tls_proxy_enabled;
-                            if app.settings.dictionary_path != dictionary_path {
-                                app.settings.dictionary_path = dictionary_path;
-                                app.spell_checker = SpellChecker::new(&app.settings.dictionary_path);
-                            }
-                            let _ = persistence::save_settings(&app);
-                            let settings_msg = GlobalSettingsMsg {
-                                more_mode_enabled: app.settings.more_mode_enabled,
-                                spell_check_enabled: app.settings.spell_check_enabled,
-                                temp_convert_enabled: app.settings.temp_convert_enabled,
-                                world_switch_mode: app.settings.world_switch_mode.name().to_string(),
-                                debug_enabled: app.settings.debug_enabled,
-                                show_tags: app.show_tags,
-                                ansi_music_enabled: app.settings.ansi_music_enabled,
-                                console_theme: app.settings.theme.name().to_string(),
-                                gui_theme: app.settings.gui_theme.name().to_string(),
-                                gui_transparency: app.settings.gui_transparency,
-                                color_offset_percent: app.settings.color_offset_percent,
-                                input_height: app.input_height,
-                                font_name: app.settings.font_name.clone(),
-                                font_size: app.settings.font_size,
-                                web_font_size_phone: app.settings.web_font_size_phone,
-                                web_font_size_tablet: app.settings.web_font_size_tablet,
-                                web_font_size_desktop: app.settings.web_font_size_desktop,
-                                ws_allow_list: app.settings.websocket_allow_list.clone(),
-                                web_secure: app.settings.web_secure,
-                                http_enabled: app.settings.http_enabled,
-                                http_port: app.settings.http_port,
-                                ws_enabled: app.settings.ws_enabled,
-                                ws_port: app.settings.ws_port,
-                                ws_cert_file: app.settings.websocket_cert_file.clone(),
-                                ws_key_file: app.settings.websocket_key_file.clone(),
-                                tls_proxy_enabled: app.settings.tls_proxy_enabled,
-                                dictionary_path: app.settings.dictionary_path.clone(),
-                                theme_colors_json: app.gui_theme_colors().to_json(),
-                            };
-                            app.ws_broadcast(WsMessage::GlobalSettingsUpdated { settings: settings_msg, input_height: app.input_height });
-                        }
-                        WsMessage::UpdateActions { actions } => {
-                            app.settings.actions = actions.clone();
-                            let _ = persistence::save_settings(&app);
-                            app.ws_broadcast(WsMessage::ActionsUpdated { actions });
-                        }
-                        WsMessage::CalculateNextWorld { current_index } => {
-                            let world_info: Vec<crate::util::WorldSwitchInfo> = app.worlds.iter()
-                                .map(|w| crate::util::WorldSwitchInfo {
-                                    name: w.name.clone(),
-                                    connected: w.connected,
-                                    unseen_lines: w.unseen_lines,
-                                    pending_lines: w.pending_lines.len(),
-                                    first_unseen_at: w.first_unseen_at,
-                                })
-                                .collect();
-                            let next_idx = crate::util::calculate_next_world(
-                                &world_info,
-                                current_index,
-                                app.settings.world_switch_mode,
-                            );
-                            app.ws_send_to_client(client_id, WsMessage::CalculatedWorld { index: next_idx });
-                        }
-                        WsMessage::CalculatePrevWorld { current_index } => {
-                            let world_info: Vec<crate::util::WorldSwitchInfo> = app.worlds.iter()
-                                .map(|w| crate::util::WorldSwitchInfo {
-                                    name: w.name.clone(),
-                                    connected: w.connected,
-                                    unseen_lines: w.unseen_lines,
-                                    pending_lines: w.pending_lines.len(),
-                                    first_unseen_at: w.first_unseen_at,
-                                })
-                                .collect();
-                            let prev_idx = crate::util::calculate_prev_world(
-                                &world_info,
-                                current_index,
-                                app.settings.world_switch_mode,
-                            );
-                            app.ws_send_to_client(client_id, WsMessage::CalculatedWorld { index: prev_idx });
-                        }
-                        WsMessage::CalculateOldestPending { current_index } => {
-                            // Find world with oldest pending output (for Escape+w)
-                            let mut oldest_idx: Option<usize> = None;
-                            let mut oldest_time: Option<std::time::Instant> = None;
-
-                            for (idx, world) in app.worlds.iter().enumerate() {
-                                if idx == current_index || world.pending_lines.is_empty() {
-                                    continue;
-                                }
-                                if let Some(pending_time) = world.pending_since {
-                                    if oldest_time.is_none() || pending_time < oldest_time.unwrap() {
-                                        oldest_time = Some(pending_time);
-                                        oldest_idx = Some(idx);
-                                    }
-                                }
-                            }
-
-                            if oldest_idx.is_none() {
-                                for (idx, world) in app.worlds.iter().enumerate() {
-                                    if idx != current_index && world.unseen_lines > 0 {
-                                        oldest_idx = Some(idx);
-                                        break;
-                                    }
-                                }
-                            }
-
-                            if oldest_idx.is_none() {
-                                if let Some(prev_idx) = app.previous_world_index {
-                                    if prev_idx != current_index && prev_idx < app.worlds.len() {
-                                        oldest_idx = Some(prev_idx);
-                                    }
-                                }
-                            }
-
-                            app.ws_send_to_client(client_id, WsMessage::CalculatedWorld { index: oldest_idx });
-                        }
-                        WsMessage::RequestState => {
-                            // Client requested full state resync - send initial state
-                            let initial_state = app.build_initial_state();
-                            app.ws_send_to_client(client_id, initial_state);
-                            // Mark client as having received initial state so it receives broadcasts
-                            app.ws_mark_initial_state_sent(client_id);
-                            // Set client's initial world so broadcast_to_world_viewers works immediately
-                            app.ws_set_client_world(client_id, Some(app.current_world_index));
-                            // Also send current activity count
-                            app.ws_send_to_client(client_id, WsMessage::ActivityUpdate {
-                                count: app.activity_count(),
-                            });
-                        }
-                        WsMessage::RequestWorldState { world_index } => {
-                            // Client switched to a world and needs current state
-                            if world_index < app.worlds.len() {
-                                let world = &app.worlds[world_index];
-                                // Build recent lines from output_lines (last 100 lines for context)
-                                let recent_lines: Vec<TimestampedLine> = world.output_lines
-                                    .iter()
-                                    .rev()
-                                    .take(100)
-                                    .map(|line| TimestampedLine {
-                                        text: line.text.clone(),
-                                        ts: line.timestamp.duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs(),
-                                        gagged: line.gagged,
-                                        from_server: line.from_server,
-                                        seq: line.seq,
-                                        highlight_color: line.highlight_color.clone(),
-                                    })
-                                    .collect::<Vec<_>>()
-                                    .into_iter()
-                                    .rev()
-                                    .collect();
-
-                                let pending_count = world.pending_lines.len();
-
-                                app.ws_send_to_client(client_id, WsMessage::WorldStateResponse {
-                                    world_index,
-                                    pending_count,
-                                    prompt: world.prompt.clone(),
-                                    scroll_offset: world.scroll_offset,
-                                    recent_lines,
-                                });
-                            }
-                        }
-                        WsMessage::BanListRequest => {
-                            // Send current ban list to client
-                            let bans = app.ban_list.get_ban_info();
-                            app.ws_send_to_client(client_id, WsMessage::BanListResponse { bans });
-                        }
-                        WsMessage::UnbanRequest { host } => {
-                            if app.ban_list.remove_ban(&host) {
-                                // Save settings to persist the change
-                                let _ = persistence::save_settings(&app);
-                                // Broadcast updated ban list to all clients
-                                app.ws_broadcast(WsMessage::BanListResponse { bans: app.ban_list.get_ban_info() });
-                                app.ws_send_to_client(client_id, WsMessage::UnbanResult { success: true, host, error: None });
-                            } else {
-                                app.ws_send_to_client(client_id, WsMessage::UnbanResult { success: false, host, error: Some("No ban found".to_string()) });
-                            }
-                        }
-                        // Theme editor messages
-                        WsMessage::RequestThemeEditorState => {
-                            let themes_json = app.theme_file.to_json_all();
-                            let theme_names: Vec<String> = app.theme_file.themes.keys().cloned().collect();
-                            let active_theme = app.settings.gui_theme.name().to_string();
-                            app.ws_send_to_client(client_id, WsMessage::ThemeEditorState {
-                                themes_json,
-                                theme_names,
-                                active_theme,
-                            });
-                        }
-                        WsMessage::UpdateThemeColors { theme_name, colors_json } => {
-                            let base = if theme_name == "light" {
-                                theme::ThemeColors::light_default()
-                            } else {
-                                theme::ThemeColors::dark_default()
-                            };
-                            let colors = theme::ThemeColors::from_json(&colors_json, &base);
-                            app.theme_file.set_theme(&theme_name, colors);
-                            // If updated theme is the active GUI theme, broadcast CSS vars update
-                            if theme_name == app.settings.gui_theme.name() {
-                                let css_vars = app.gui_theme_colors().to_css_vars();
-                                let colors_json = app.gui_theme_colors().to_json();
-                                app.ws_broadcast(WsMessage::ThemeCssVarsUpdated {
-                                    css_vars,
-                                    colors_json: colors_json.clone(),
-                                });
-                                let settings_msg = app.build_global_settings_msg();
-                                app.ws_broadcast(WsMessage::GlobalSettingsUpdated {
-                                    settings: settings_msg,
-                                    input_height: app.input_height,
-                                });
-                            }
-                        }
-                        WsMessage::AddTheme { name, copy_from } => {
-                            let base_colors = app.theme_file.get(&copy_from).clone();
-                            app.theme_file.set_theme(&name, base_colors);
-                            let themes_json = app.theme_file.to_json_all();
-                            let theme_names: Vec<String> = app.theme_file.themes.keys().cloned().collect();
-                            let active_theme = app.settings.gui_theme.name().to_string();
-                            app.ws_send_to_client(client_id, WsMessage::ThemeEditorState {
-                                themes_json,
-                                theme_names,
-                                active_theme,
-                            });
-                        }
-                        WsMessage::DeleteTheme { name } => {
-                            app.theme_file.remove_theme(&name);
-                            let themes_json = app.theme_file.to_json_all();
-                            let theme_names: Vec<String> = app.theme_file.themes.keys().cloned().collect();
-                            let active_theme = app.settings.gui_theme.name().to_string();
-                            app.ws_send_to_client(client_id, WsMessage::ThemeEditorState {
-                                themes_json,
-                                theme_names,
-                                active_theme,
-                            });
-                        }
-                        WsMessage::SaveThemeFile => {
-                            let content = app.theme_file.generate_file_content();
-                            let path = std::path::Path::new(&get_home_dir()).join("clay.theme.dat");
-                            match std::fs::write(&path, &content) {
-                                Ok(_) => {
-                                    app.ws_send_to_client(client_id, WsMessage::ThemeFileSaved { success: true, error: None });
-                                }
-                                Err(e) => {
-                                    app.ws_send_to_client(client_id, WsMessage::ThemeFileSaved { success: false, error: Some(e.to_string()) });
-                                }
-                            }
-                        }
-                        WsMessage::RequestConnectionsList => {
-                            // Generate connections list for remote console client
-                            let current_idx = app.current_world_index;
-                            const KEEPALIVE_SECS: u64 = 5 * 60;
-                            let worlds_info: Vec<util::WorldListInfo> = app.worlds.iter().enumerate().map(|(idx, world)| {
-                                let now = std::time::Instant::now();
-                                let last_activity_elapsed = match (world.last_send_time, world.last_receive_time) {
-                                    (Some(s), Some(r)) => Some(s.max(r).elapsed().as_secs()),
-                                    (Some(s), None) => Some(s.elapsed().as_secs()),
-                                    (None, Some(r)) => Some(r.elapsed().as_secs()),
-                                    (None, None) => None,
-                                };
-                                let next_nop = if world.connected {
-                                    last_activity_elapsed.map(|elapsed| KEEPALIVE_SECS.saturating_sub(elapsed))
-                                } else {
-                                    None
-                                };
-                                util::WorldListInfo {
-                                    name: world.name.clone(),
-                                    connected: world.connected,
-                                    is_current: idx == current_idx,
-                                    is_ssl: world.is_tls,
-                                    is_proxy: world.proxy_pid.is_some(),
-                                    unseen_lines: world.unseen_lines,
-                                    last_send_secs: world.last_user_command_time.map(|t| now.duration_since(t).as_secs()),
-                                    last_recv_secs: world.last_receive_time.map(|t| now.duration_since(t).as_secs()),
-                                    last_nop_secs: world.last_nop_time.map(|t| now.duration_since(t).as_secs()),
-                                    next_nop_secs: next_nop,
-                                    buffer_size: world.output_lines.len() + world.pending_lines.len(),
-                                }
-                            }).collect();
-                            let output = util::format_worlds_list(&worlds_info);
-                            let lines: Vec<String> = output.lines().map(|s| s.to_string()).collect();
-                            app.ws_send_to_client(client_id, WsMessage::ConnectionsListResponse { lines });
-                        }
-                        WsMessage::ReportSeqMismatch { world_index, expected_seq_gt, actual_seq, line_text, source } => {
-                            let world_name = app.worlds.get(world_index).map(|w| w.name.as_str()).unwrap_or("?");
-                            use std::io::Write;
-                            if let Ok(mut f) = std::fs::OpenOptions::new()
-                                .create(true).append(true)
-                                .open("clay.output.debug")
-                            {
-                                let _ = writeln!(f, "SEQ MISMATCH [{}] in '{}': expected seq>{}, got seq={}, text={:?}",
-                                    source, world_name, expected_seq_gt, actual_seq,
-                                    line_text.chars().take(80).collect::<String>());
-                            }
-                        }
-                        WsMessage::ClientTypeDeclaration { client_type } => {
-                            // Update client type in WebSocket server
-                            app.ws_set_client_type(client_id, client_type);
-                        }
-                        WsMessage::CycleWorld { direction } => {
-                            // Client requests to cycle to next/previous world
-                            let current = app.ws_client_worlds.get(&client_id)
-                                .map(|s| s.world_index)
-                                .unwrap_or(app.current_world_index);
-
-                            let new_index = if direction == "up" {
-                                app.calculate_prev_world_from(current)
-                            } else {
-                                app.calculate_next_world_from(current)
-                            };
-
-                            if let Some(idx) = new_index {
-                                // Update client's view state (sync state)
-                                let visible_lines = app.ws_client_worlds.get(&client_id)
-                                    .map(|s| s.visible_lines)
-                                    .unwrap_or(24);
-                                let dimensions = app.ws_client_worlds.get(&client_id)
-                                    .and_then(|s| s.dimensions);
-                                app.ws_client_worlds.insert(client_id, ClientViewState {
-                                    world_index: idx,
-                                    visible_lines,
-                                    dimensions,
-                                });
-                                // Update client's world in WebSocket server (async state)
-                                app.ws_set_client_world(client_id, Some(idx));
-
-                                // Send world switch result with state
-                                if idx < app.worlds.len() {
-                                    let pending_count = app.worlds[idx].pending_lines.len();
-                                    let paused = app.worlds[idx].paused;
-                                    let world_name = app.worlds[idx].name.clone();
-
-                                    app.ws_send_to_client(client_id, WsMessage::WorldSwitchResult {
-                                        world_index: idx,
-                                        world_name,
-                                        pending_count,
-                                        paused,
-                                    });
-
-                                    // Send initial output lines based on client type
-                                    let client_type = app.ws_get_client_type(client_id);
-                                    let world = &app.worlds[idx];
-                                    let total_lines = world.output_lines.len();
-
-                                    let lines_to_send = match client_type {
-                                        Some(websocket::RemoteClientType::RemoteConsole) => {
-                                            // Console: last screenful (viewport - 2)
-                                            visible_lines.saturating_sub(2).min(total_lines)
-                                        }
-                                        _ => {
-                                            // Web/GUI: full history
-                                            total_lines
-                                        }
-                                    };
-
-                                    if lines_to_send > 0 {
-                                        let start = total_lines.saturating_sub(lines_to_send);
-                                        let lines: Vec<TimestampedLine> = world.output_lines[start..].iter()
-                                            .map(|line| {
-                                                let ts = line.timestamp
-                                                    .duration_since(std::time::UNIX_EPOCH)
-                                                    .map(|d| d.as_secs())
-                                                    .unwrap_or(0);
-                                                TimestampedLine {
-                                                    text: line.text.clone(),
-                                                    ts,
-                                                    gagged: line.gagged,
-                                                    from_server: line.from_server,
-                                                    seq: line.seq,
-                                                    highlight_color: line.highlight_color.clone(),
-                                                }
-                                            })
-                                            .collect();
-
-                                        app.ws_send_to_client(client_id, WsMessage::OutputLines {
-                                            world_index: idx,
-                                            lines,
-                                            is_initial: true,
-                                        });
-                                    }
-
-                                    // Also mark world as seen if it had unseen output
-                                    if app.worlds[idx].unseen_lines > 0 {
-                                        app.worlds[idx].unseen_lines = 0;
-                                        app.worlds[idx].first_unseen_at = None;
-                                        app.ws_broadcast(WsMessage::UnseenCleared { world_index: idx });
-                                        app.broadcast_activity();
-                                    }
-                                }
-                            }
-                        }
-                        WsMessage::MarkWorldSeen { world_index } => {
-                            // A remote client has viewed this world - update their current_world
-                            if world_index < app.worlds.len() {
-                                // Check if client is switching to a different world
-                                let old_world_idx = app.ws_client_worlds.get(&client_id).map(|s| s.world_index);
-                                let switched = old_world_idx.map(|old| old != world_index).unwrap_or(true);
-                                // Reset lines_since_pause for the old world if switching away and more-mode hasn't triggered
-                                if let Some(old_idx) = old_world_idx {
-                                    if old_idx != world_index && old_idx < app.worlds.len()
-                                        && app.worlds[old_idx].pending_lines.is_empty()
-                                    {
-                                        app.worlds[old_idx].lines_since_pause = 0;
-                                    }
-                                }
-                                // Track which world this client is viewing (sync cache)
-                                let visible_lines = app.ws_client_worlds
-                                    .get(&client_id)
-                                    .map(|v| v.visible_lines)
-                                    .unwrap_or(0);
-                                let dimensions = app.ws_client_worlds.get(&client_id).and_then(|s| s.dimensions);
-                                app.ws_client_worlds.insert(client_id, ClientViewState { world_index, visible_lines, dimensions });
-                                // Update client's world in WebSocket server (async state)
-                                app.ws_set_client_world(client_id, Some(world_index));
-
-                                app.worlds[world_index].mark_seen();
-                                // Broadcast to all clients so they update their UI
-                                app.ws_broadcast(WsMessage::UnseenCleared { world_index });
-                                // Broadcast activity count since a world was just marked as seen
-                                app.broadcast_activity();
-                                // Trigger console redraw to update activity indicator
-                                app.needs_output_redraw = true;
-                                if switched {
-                                    app.ws_send_active_media_to_client(client_id, world_index);
-                                }
-                            }
-                        }
-                        WsMessage::UpdateViewState { world_index, visible_lines } => {
-                            // A remote client is reporting its view state (for more-mode threshold calculation)
-                            if world_index < app.worlds.len() {
-                                // Preserve existing dimensions when updating view state
-                                let dimensions = app.ws_client_worlds.get(&client_id).and_then(|s| s.dimensions);
-                                app.ws_client_worlds.insert(client_id, ClientViewState { world_index, visible_lines, dimensions });
-                                // Update client's world in WebSocket server so broadcast_to_world_viewers works
-                                app.ws_set_client_world(client_id, Some(world_index));
-                            }
-                        }
-                        WsMessage::RequestScrollback { world_index, count, before_seq } => {
-                            // Console client requests scrollback from master
-                            if world_index < app.worlds.len() {
-                                let world = &app.worlds[world_index];
-
-                                // Find lines to send based on before_seq
-                                let lines: Vec<TimestampedLine> = if let Some(seq) = before_seq {
-                                    // Send lines with seq < before_seq (older than what client has)
-                                    let eligible: Vec<_> = world.output_lines.iter()
-                                        .filter(|l| l.seq < seq)
-                                        .collect();
-                                    let start = eligible.len().saturating_sub(count);
-                                    eligible[start..].iter()
-                                        .map(|line| {
-                                            let ts = line.timestamp
-                                                .duration_since(std::time::UNIX_EPOCH)
-                                                .map(|d| d.as_secs())
-                                                .unwrap_or(0);
-                                            TimestampedLine {
-                                                text: line.text.clone(),
-                                                ts,
-                                                gagged: line.gagged,
-                                                from_server: line.from_server,
-                                                seq: line.seq,
-                                                highlight_color: line.highlight_color.clone(),
-                                            }
-                                        })
-                                        .collect()
-                                } else {
-                                    // No before_seq - send last N lines (backwards compatible)
-                                    let total_lines = world.output_lines.len();
-                                    let start = total_lines.saturating_sub(count);
-                                    world.output_lines[start..].iter()
-                                        .map(|line| {
-                                            let ts = line.timestamp
-                                                .duration_since(std::time::UNIX_EPOCH)
-                                                .map(|d| d.as_secs())
-                                                .unwrap_or(0);
-                                            TimestampedLine {
-                                                text: line.text.clone(),
-                                                ts,
-                                                gagged: line.gagged,
-                                                from_server: line.from_server,
-                                                seq: line.seq,
-                                                highlight_color: line.highlight_color.clone(),
-                                            }
-                                        })
-                                        .collect()
-                                };
-
-                                app.ws_send_to_client(client_id, WsMessage::ScrollbackLines {
-                                    world_index,
-                                    lines,
-                                });
-                            }
-                        }
-                        WsMessage::CreateWorld { name } => {
-                            let new_world = World::new(&name);
-                            app.worlds.push(new_world);
-                            let idx = app.worlds.len() - 1;
-                            let world = &app.worlds[idx];
-                            let world_state = WorldStateMsg {
-                                index: idx,
-                                name: world.name.clone(),
-                                connected: false,
-                                output_lines: Vec::new(),
-                                pending_lines: Vec::new(),
-                                output_lines_ts: Vec::new(),
-                                pending_lines_ts: Vec::new(),
-                                prompt: String::new(),
-                                scroll_offset: 0,
-                                paused: false,
-                                unseen_lines: 0,
-                                settings: WorldSettingsMsg {
-                                    hostname: world.settings.hostname.clone(),
-                                    port: world.settings.port.clone(),
-                                    user: world.settings.user.clone(),
-                                    password: world.settings.password.clone(),
-                                    use_ssl: world.settings.use_ssl,
-                                    log_enabled: world.settings.log_enabled,
-                                    encoding: world.settings.encoding.name().to_string(),
-                                    auto_connect_type: world.settings.auto_connect_type.name().to_string(),
-                                    keep_alive_type: world.settings.keep_alive_type.name().to_string(),
-                                    keep_alive_cmd: world.settings.keep_alive_cmd.clone(),
-                                    gmcp_packages: world.settings.gmcp_packages.clone(),
-                                },
-                                last_send_secs: None,
-                                last_recv_secs: None,
-                                last_nop_secs: None,
-                                keep_alive_type: world.settings.keep_alive_type.name().to_string(),
-                                showing_splash: world.showing_splash,
-                                was_connected: false,
-                                is_proxy: false,
-                                gmcp_user_enabled: world.gmcp_user_enabled,
-                            };
-                            app.ws_broadcast(WsMessage::WorldAdded { world: Box::new(world_state) });
-                            let _ = persistence::save_settings(&app);
-                            app.ws_send_to_client(client_id, WsMessage::WorldCreated { world_index: idx });
-                        }
-                        WsMessage::DeleteWorld { world_index } => {
-                            if app.worlds.len() > 1 && world_index < app.worlds.len() {
-                                app.worlds.remove(world_index);
-                                if app.current_world_index >= app.worlds.len() {
-                                    app.current_world_index = app.worlds.len().saturating_sub(1);
-                                } else if app.current_world_index > world_index {
-                                    app.current_world_index -= 1;
-                                }
-                                if let Some(prev) = app.previous_world_index {
-                                    if prev >= app.worlds.len() {
-                                        app.previous_world_index = Some(app.worlds.len().saturating_sub(1));
-                                    } else if prev > world_index {
-                                        app.previous_world_index = Some(prev - 1);
-                                    }
-                                }
-                                app.ws_broadcast(WsMessage::WorldRemoved { world_index });
-                                let _ = persistence::save_settings(&app);
-                            }
-                        }
-                        _ => {}
+                        WsAsyncAction::Done => {}
                     }
                 }
-                // Background connection completed successfully
                 AppEvent::ConnectionSuccess(world_name, cmd_tx, socket_fd, is_tls) => {
-                        let _ = &socket_fd; // used on unix only
+                    app.handle_connection_success(&world_name, cmd_tx, socket_fd, is_tls);
+                    // Batch drain shows "Connected!" message (primary select loop doesn't)
                     if let Some(world_idx) = app.find_world_index(&world_name) {
-                        app.worlds[world_idx].connected = true;
-                        app.worlds[world_idx].was_connected = true;
-                        app.worlds[world_idx].prompt_count = 0;
-                        let now = std::time::Instant::now();
-                        app.worlds[world_idx].last_send_time = Some(now);
-                        app.worlds[world_idx].last_receive_time = Some(now);
-                        app.worlds[world_idx].last_user_command_time = Some(now);
-                        app.worlds[world_idx].last_nop_time = None;
-                        app.worlds[world_idx].is_initial_world = false;
-                        app.worlds[world_idx].command_tx = Some(cmd_tx.clone());
-                        #[cfg(unix)]
-                        { app.worlds[world_idx].socket_fd = socket_fd; }
-                        app.worlds[world_idx].is_tls = is_tls;
-
-                        // Discard any unused initial world
-                        app.discard_initial_world();
-
-                        // Open log file if enabled
-                        if app.worlds[world_idx].settings.log_enabled {
-                            if app.worlds[world_idx].open_log_file() {
-                                let log_path = app.worlds[world_idx].get_log_path();
-                                app.add_output_to_world(world_idx, &format!("Logging to: {}", log_path.display()));
-                            } else {
-                                app.add_output_to_world(world_idx, "Warning: Could not open log file");
-                            }
-                        }
-
-                        // Fire TF CONNECT hook
-                        let hook_result = tf::bridge::fire_event(&mut app.tf_engine, tf::TfHookEvent::Connect);
-                        for cmd in hook_result.send_commands {
-                            let _ = cmd_tx.try_send(WriteCommand::Text(cmd));
-                        }
-                        for cmd in hook_result.clay_commands {
-                            let _ = app.tf_engine.execute(&cmd);
-                        }
-
-                        // Send auto-login if configured
-                        let skip_login = app.worlds[world_idx].skip_auto_login;
-                        app.worlds[world_idx].skip_auto_login = false;
-                        let user = app.worlds[world_idx].settings.user.clone();
-                        let password = app.worlds[world_idx].settings.password.clone();
-                        let auto_connect_type = app.worlds[world_idx].settings.auto_connect_type;
-                        if !skip_login && !user.is_empty() && !password.is_empty() && auto_connect_type == AutoConnectType::Connect {
-                            let connect_cmd = format!("connect {} {}", user, password);
-                            let _ = cmd_tx.try_send(WriteCommand::Text(connect_cmd));
-                        }
-
-                        // Broadcast connection status
-                        app.ws_broadcast(WsMessage::WorldConnected { world_index: world_idx, name: app.worlds[world_idx].name.clone() });
                         app.add_output_to_world(world_idx, "Connected!");
                     }
                 }
@@ -19751,6 +17721,43 @@ fn ui(f: &mut Frame, app: &mut App) {
     render_new_popup(f, app);
 }
 
+/// Process an output line for display. Returns None if the line should be skipped.
+/// Returns Some(processed_text) with emoji colorization, client prefix, timestamp/tags, and tab expansion applied.
+fn process_output_line(line: &OutputLine, show_tags: bool, temp_convert_enabled: bool, cached_now: &CachedNow) -> Option<String> {
+    // Skip gagged lines unless show_tags (F2) is enabled
+    if line.gagged && !show_tags {
+        return None;
+    }
+    // Skip lines that are only ANSI codes (cursor control garbage)
+    if is_ansi_only_line(&line.text) {
+        return None;
+    }
+    // For legitimate blank lines (empty or whitespace-only without background colors), render as blank
+    if is_visually_empty(&line.text) && !has_background_color(&line.text) {
+        return Some(String::new());
+    }
+    // Colorize square emoji (🟩🟨 etc.) with ANSI codes
+    let text = colorize_square_emojis(&line.text);
+    // Add ✨ prefix for client-generated messages
+    let text = if !line.from_server {
+        format!("✨ {}", text)
+    } else {
+        text
+    };
+    let processed = if show_tags {
+        // Show timestamp + original text when tags are shown
+        let text_with_temps = if temp_convert_enabled {
+            convert_temperatures(&text)
+        } else {
+            text
+        };
+        format!("\x1b[36m{}\x1b[0m {}", line.format_timestamp_with_now(cached_now), text_with_temps)
+    } else {
+        strip_mud_tag(&text)
+    };
+    Some(processed.replace('\t', "        "))
+}
+
 /// Render output area using raw crossterm (bypasses ratatui's buggy rendering)
 /// Returns early if splash screen or popup is visible (let ratatui handle those)
 fn render_output_crossterm(app: &App) {
@@ -19848,41 +17855,11 @@ fn render_output_crossterm(app: &App) {
     let cached_now = CachedNow::new();
 
     let expand_and_wrap = |line: &OutputLine, term_width: usize, show_tags: bool, highlight_f8: bool, cached_now: &CachedNow| -> Vec<(String, bool, Option<String>)> {
-        // Skip gagged lines unless show_tags (F2) is enabled
-        if line.gagged && !show_tags {
-            return Vec::new();
-        }
-        // Skip lines that are only ANSI codes (cursor control garbage)
-        if is_ansi_only_line(&line.text) {
-            return Vec::new();
-        }
-        // For legitimate blank lines (empty or whitespace-only without background colors), render as blank line
-        // Lines with background colors (like ANSI art) should preserve their ANSI codes
-        if is_visually_empty(&line.text) && !has_background_color(&line.text) {
-            return vec![("".to_string(), false, None)];
-        }
-        // Colorize square emoji (🟩🟨 etc.) with ANSI codes
-        // Note: Discord emoji conversion happens later, after URL wrapping
-        let text = colorize_square_emojis(&line.text);
-        // Add ✨ prefix for client-generated messages
-        let text = if !line.from_server {
-            format!("✨ {}", text)
-        } else {
-            text
+        let expanded = match process_output_line(line, show_tags, temp_convert_enabled, cached_now) {
+            Some(text) if text.is_empty() => return vec![("".to_string(), false, None)],
+            Some(text) => text,
+            None => return Vec::new(),
         };
-        let processed = if show_tags {
-            // Show timestamp + original text when tags are shown
-            // Convert temperatures only if both show_tags AND temp_convert are enabled
-            let text_with_temps = if temp_convert_enabled {
-                convert_temperatures(&text)
-            } else {
-                text.clone()
-            };
-            format!("\x1b[36m{}\x1b[0m {}", line.format_timestamp_with_now(cached_now), text_with_temps)
-        } else {
-            strip_mud_tag(&text)
-        };
-        let expanded = processed.replace('\t', "        ");
         // Wrap URLs with OSC 8 hyperlink sequences for terminal clickability
         let with_links = wrap_urls_with_osc8(&expanded);
         // Convert Discord custom emojis to clickable :name: links (after URL wrapping to avoid conflicts)
@@ -20185,36 +18162,17 @@ fn render_output_area(f: &mut Frame, app: &App, area: Rect) {
         for line_idx in (0..=end_line).rev() {
             let line = &world.output_lines[line_idx];
 
-            // Skip gagged lines unless show_tags (F2) is enabled
-            if line.gagged && !app.show_tags {
-                continue;
-            }
-            // Skip lines that are only ANSI codes (cursor control garbage)
-            if is_ansi_only_line(&line.text) {
-                continue;
-            }
-            // For legitimate blank lines (empty or whitespace without background colors), render as blank line
-            if is_visually_empty(&line.text) && !has_background_color(&line.text) {
-                lines.insert(0, Line::from(""));
-                if lines.len() >= visible_height {
-                    break;
+            let expanded = match process_output_line(line, app.show_tags, app.settings.temp_convert_enabled, &cached_now) {
+                Some(text) if text.is_empty() => {
+                    lines.insert(0, Line::from(""));
+                    if lines.len() >= visible_height {
+                        break;
+                    }
+                    continue;
                 }
-                continue;
-            }
-
-            // Process line: colorize emojis, add client-generated prefix, timestamps/tag stripping, tabs
-            let text = colorize_square_emojis(&line.text);
-            let text = if !line.from_server {
-                format!("✨ {}", text)
-            } else {
-                text
+                Some(text) => text,
+                None => continue,
             };
-            let display_line = if app.show_tags {
-                format!("\x1b[36m{}\x1b[0m {}", line.format_timestamp_with_now(&cached_now), text)
-            } else {
-                strip_mud_tag(&text)
-            };
-            let expanded = display_line.replace('\t', "        ");
 
             // Wrap the line to fit the output area width
             let wrapped = wrap_ansi_line(&expanded, area_width);

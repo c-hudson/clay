@@ -49,6 +49,160 @@ pub fn log_ban(ip: &str, ban_type: &str, reason: &str) {
 }
 
 // ============================================================================
+// Shared HTTP constants and helpers (used by all server implementations)
+// ============================================================================
+
+/// Embedded HTML for the web interface
+const WEB_INDEX_HTML: &str = include_str!("web/index.html");
+
+/// Embedded CSS for the web interface
+const WEB_STYLE_CSS: &str = include_str!("web/style.css");
+
+/// Embedded JavaScript for the web interface
+const WEB_APP_JS: &str = include_str!("web/app.js");
+
+/// Embedded theme editor HTML
+const WEB_THEME_EDITOR_HTML: &str = include_str!("web/theme-editor.html");
+
+/// Parse an HTTP request line and return the method and path
+fn parse_http_request(request: &str) -> Option<(&str, &str)> {
+    let first_line = request.lines().next()?;
+    let mut parts = first_line.split_whitespace();
+    let method = parts.next()?;
+    let path = parts.next()?;
+    Some((method, path))
+}
+
+/// Extract Host header from HTTP request (without port)
+fn get_host_from_request(request: &str) -> String {
+    for line in request.lines() {
+        if line.to_lowercase().starts_with("host:") {
+            let host = line[5..].trim();
+            // Remove port if present
+            if let Some(colon_pos) = host.rfind(':') {
+                return host[..colon_pos].to_string();
+            }
+            return host.to_string();
+        }
+    }
+    String::new()
+}
+
+/// Build an HTTP response with the given status, content type, and body
+fn build_http_response(status: u16, status_text: &str, content_type: &str, body: &str) -> Vec<u8> {
+    format!(
+        "HTTP/1.1 {} {}\r\n\
+         Content-Type: {}; charset=utf-8\r\n\
+         Content-Length: {}\r\n\
+         Cache-Control: no-cache\r\n\
+         Connection: close\r\n\
+         \r\n\
+         {}",
+        status, status_text, content_type, body.len(), body
+    ).into_bytes()
+}
+
+/// Route result from handle_http_routes - indicates whether a 404 violation occurred
+enum RouteResult {
+    /// Route matched, response ready
+    Ok(Vec<u8>),
+    /// 404 - path not found (includes the path for violation tracking)
+    NotFound(Vec<u8>, String),
+    /// Method not allowed
+    MethodNotAllowed(Vec<u8>),
+}
+
+/// Handle HTTP route matching and response generation (shared by all server implementations)
+fn handle_http_routes(
+    request: &str,
+    ws_port: u16,
+    ws_use_tls: bool,
+    theme_css_vars: &str,
+) -> Option<RouteResult> {
+    let (method, path) = parse_http_request(request)?;
+
+    if method != "GET" {
+        return Some(RouteResult::MethodNotAllowed(
+            build_http_response(405, "Method Not Allowed", "text/plain", "Method Not Allowed")
+        ));
+    }
+
+    let host = get_host_from_request(request);
+    let sanitized_host = host.replace(['\\', '\'', '"', '`', '<', '>'], "");
+    let response = match path {
+        "/" | "/index.html" => {
+            let html = WEB_INDEX_HTML
+                .replace("{{WS_HOST}}", &sanitized_host)
+                .replace("{{WS_PORT}}", &ws_port.to_string())
+                .replace("{{WS_PROTOCOL}}", if ws_use_tls { "wss" } else { "ws" })
+                .replace("{{THEME_CSS_VARS}}", theme_css_vars);
+            RouteResult::Ok(build_http_response(200, "OK", "text/html", &html))
+        }
+        "/style.css" => {
+            RouteResult::Ok(build_http_response(200, "OK", "text/css", WEB_STYLE_CSS))
+        }
+        "/app.js" => {
+            RouteResult::Ok(build_http_response(200, "OK", "application/javascript", WEB_APP_JS))
+        }
+        "/theme-editor" => {
+            let html = WEB_THEME_EDITOR_HTML
+                .replace("{{WS_HOST}}", &sanitized_host)
+                .replace("{{WS_PORT}}", &ws_port.to_string())
+                .replace("{{WS_PROTOCOL}}", if ws_use_tls { "wss" } else { "ws" });
+            RouteResult::Ok(build_http_response(200, "OK", "text/html", &html))
+        }
+        "/favicon.ico" => {
+            RouteResult::Ok(build_http_response(204, "No Content", "image/x-icon", ""))
+        }
+        _ => {
+            RouteResult::NotFound(
+                build_http_response(404, "Not Found", "text/plain", "Not Found"),
+                path.to_string(),
+            )
+        }
+    };
+    Some(response)
+}
+
+/// Read an HTTP request from a stream, route it, and write the response.
+/// Returns the 404 path if a violation occurred (for ban tracking).
+async fn serve_http_request<S: AsyncReadExt + AsyncWriteExt + Unpin>(
+    stream: &mut S,
+    ws_port: u16,
+    ws_use_tls: bool,
+    theme_css_vars: &str,
+) -> Option<String> {
+    let mut buf = [0u8; 4096];
+    let n = match stream.read(&mut buf).await {
+        Ok(n) if n > 0 => n,
+        _ => return None,
+    };
+
+    let request = String::from_utf8_lossy(&buf[..n]);
+    let mut violation_path = None;
+
+    if let Some(route_result) = handle_http_routes(&request, ws_port, ws_use_tls, theme_css_vars) {
+        let response = match route_result {
+            RouteResult::Ok(r) => r,
+            RouteResult::MethodNotAllowed(r) => {
+                let _ = stream.write_all(&r).await;
+                return None;
+            }
+            RouteResult::NotFound(r, path) => {
+                violation_path = Some(path);
+                r
+            }
+        };
+
+        if stream.write_all(&response).await.is_ok() {
+            let _ = stream.shutdown().await;
+        }
+    }
+
+    violation_path
+}
+
+// ============================================================================
 // HTTPS Web Interface Server
 // ============================================================================
 
@@ -67,126 +221,6 @@ impl HttpsServer {
             running: Arc::new(RwLock::new(false)),
             shutdown_tx: None,
             port,
-        }
-    }
-}
-
-/// Embedded HTML for the web interface
-#[cfg(feature = "native-tls-backend")]
-const WEB_INDEX_HTML: &str = include_str!("web/index.html");
-
-/// Embedded CSS for the web interface
-#[cfg(feature = "native-tls-backend")]
-const WEB_STYLE_CSS: &str = include_str!("web/style.css");
-
-/// Embedded JavaScript for the web interface
-#[cfg(feature = "native-tls-backend")]
-const WEB_APP_JS: &str = include_str!("web/app.js");
-
-/// Embedded theme editor HTML
-#[cfg(feature = "native-tls-backend")]
-const WEB_THEME_EDITOR_HTML: &str = include_str!("web/theme-editor.html");
-
-/// Parse an HTTP request line and return the method and path
-#[cfg(feature = "native-tls-backend")]
-fn parse_http_request(request: &str) -> Option<(&str, &str)> {
-    let first_line = request.lines().next()?;
-    let mut parts = first_line.split_whitespace();
-    let method = parts.next()?;
-    let path = parts.next()?;
-    Some((method, path))
-}
-
-/// Extract Host header from HTTP request (without port)
-#[cfg(feature = "native-tls-backend")]
-fn get_host_from_request(request: &str) -> String {
-    for line in request.lines() {
-        if line.to_lowercase().starts_with("host:") {
-            let host = line[5..].trim();
-            // Remove port if present
-            if let Some(colon_pos) = host.rfind(':') {
-                return host[..colon_pos].to_string();
-            }
-            return host.to_string();
-        }
-    }
-    String::new()
-}
-
-/// Build an HTTP response with the given status, content type, and body
-#[cfg(feature = "native-tls-backend")]
-fn build_http_response(status: u16, status_text: &str, content_type: &str, body: &str) -> Vec<u8> {
-    format!(
-        "HTTP/1.1 {} {}\r\n\
-         Content-Type: {}; charset=utf-8\r\n\
-         Content-Length: {}\r\n\
-         Cache-Control: no-cache\r\n\
-         Connection: close\r\n\
-         \r\n\
-         {}",
-        status, status_text, content_type, body.len(), body
-    ).into_bytes()
-}
-
-/// Handle an HTTPS connection
-#[cfg(feature = "native-tls-backend")]
-async fn handle_https_client(
-    mut stream: tokio_native_tls::TlsStream<TcpStream>,
-    ws_port: u16,
-    ws_use_tls: bool,
-    _client_ip: String,
-    theme_css_vars: Arc<String>,
-) {
-    let mut buf = [0u8; 4096];
-    let n = match stream.read(&mut buf).await {
-        Ok(n) if n > 0 => n,
-        _ => return,
-    };
-
-    let request = String::from_utf8_lossy(&buf[..n]);
-
-    if let Some((method, path)) = parse_http_request(&request) {
-        if method != "GET" {
-            let response = build_http_response(405, "Method Not Allowed", "text/plain", "Method Not Allowed");
-            let _ = stream.write_all(&response).await;
-            return;
-        }
-
-        let host = get_host_from_request(&request);
-        let response = match path {
-            "/" | "/index.html" => {
-                // Inject WebSocket configuration and theme CSS vars into the HTML
-                let html = WEB_INDEX_HTML
-                    .replace("{{WS_HOST}}", &host.replace(['\\', '\'', '"', '`', '<', '>'], ""))
-                    .replace("{{WS_PORT}}", &ws_port.to_string())
-                    .replace("{{WS_PROTOCOL}}", if ws_use_tls { "wss" } else { "ws" })
-                    .replace("{{THEME_CSS_VARS}}", &theme_css_vars);
-                build_http_response(200, "OK", "text/html", &html)
-            }
-            "/style.css" => {
-                build_http_response(200, "OK", "text/css", WEB_STYLE_CSS)
-            }
-            "/app.js" => {
-                build_http_response(200, "OK", "application/javascript", WEB_APP_JS)
-            }
-            "/theme-editor" => {
-                let html = WEB_THEME_EDITOR_HTML
-                    .replace("{{WS_HOST}}", &host.replace(['\\', '\'', '"', '`', '<', '>'], ""))
-                    .replace("{{WS_PORT}}", &ws_port.to_string())
-                    .replace("{{WS_PROTOCOL}}", if ws_use_tls { "wss" } else { "ws" });
-                build_http_response(200, "OK", "text/html", &html)
-            }
-            "/favicon.ico" => {
-                build_http_response(204, "No Content", "image/x-icon", "")
-            }
-            _ => {
-                build_http_response(404, "Not Found", "text/plain", "Not Found")
-            }
-        };
-
-        if stream.write_all(&response).await.is_ok() {
-            // Ensure the response is fully sent before closing
-            let _ = stream.shutdown().await;
         }
     }
 }
@@ -240,8 +274,8 @@ pub async fn start_https_server(
                             let theme_css_vars = theme_css_vars.clone();
                             tokio::spawn(async move {
                                 match tls_acceptor.accept(stream).await {
-                                    Ok(tls_stream) => {
-                                        handle_https_client(tls_stream, ws_port, ws_use_tls, client_ip, theme_css_vars).await;
+                                    Ok(mut tls_stream) => {
+                                        serve_http_request(&mut tls_stream, ws_port, ws_use_tls, &theme_css_vars).await;
                                     }
                                     Err(e) => {
                                         log_remote_event("TLS-ERROR", &client_ip, &format!("{}", e));
@@ -282,126 +316,6 @@ impl HttpsServer {
             running: Arc::new(RwLock::new(false)),
             shutdown_tx: None,
             port,
-        }
-    }
-}
-
-/// Embedded HTML for the web interface (rustls version)
-#[cfg(feature = "rustls-backend")]
-const WEB_INDEX_HTML: &str = include_str!("web/index.html");
-
-/// Embedded CSS for the web interface (rustls version)
-#[cfg(feature = "rustls-backend")]
-const WEB_STYLE_CSS: &str = include_str!("web/style.css");
-
-/// Embedded JavaScript for the web interface (rustls version)
-#[cfg(feature = "rustls-backend")]
-const WEB_APP_JS: &str = include_str!("web/app.js");
-
-/// Embedded theme editor HTML (rustls version)
-#[cfg(feature = "rustls-backend")]
-const WEB_THEME_EDITOR_HTML: &str = include_str!("web/theme-editor.html");
-
-/// Parse an HTTP request line and return the method and path (rustls version)
-#[cfg(feature = "rustls-backend")]
-fn parse_http_request(request: &str) -> Option<(&str, &str)> {
-    let first_line = request.lines().next()?;
-    let mut parts = first_line.split_whitespace();
-    let method = parts.next()?;
-    let path = parts.next()?;
-    Some((method, path))
-}
-
-/// Extract Host header from HTTP request (without port) - rustls version
-#[cfg(feature = "rustls-backend")]
-fn get_host_from_request(request: &str) -> String {
-    for line in request.lines() {
-        if line.to_lowercase().starts_with("host:") {
-            let host = line[5..].trim();
-            // Remove port if present
-            if let Some(colon_pos) = host.rfind(':') {
-                return host[..colon_pos].to_string();
-            }
-            return host.to_string();
-        }
-    }
-    String::new()
-}
-
-/// Build an HTTP response with the given status, content type, and body (rustls version)
-#[cfg(feature = "rustls-backend")]
-fn build_http_response(status: u16, status_text: &str, content_type: &str, body: &str) -> Vec<u8> {
-    format!(
-        "HTTP/1.1 {} {}\r\n\
-         Content-Type: {}; charset=utf-8\r\n\
-         Content-Length: {}\r\n\
-         Cache-Control: no-cache\r\n\
-         Connection: close\r\n\
-         \r\n\
-         {}",
-        status, status_text, content_type, body.len(), body
-    ).into_bytes()
-}
-
-/// Handle an HTTPS connection (rustls version)
-#[cfg(feature = "rustls-backend")]
-async fn handle_https_client(
-    mut stream: tokio_rustls::server::TlsStream<TcpStream>,
-    ws_port: u16,
-    ws_use_tls: bool,
-    _client_ip: String,
-    theme_css_vars: Arc<String>,
-) {
-    let mut buf = [0u8; 4096];
-    let n = match stream.read(&mut buf).await {
-        Ok(n) if n > 0 => n,
-        _ => return,
-    };
-
-    let request = String::from_utf8_lossy(&buf[..n]);
-
-    if let Some((method, path)) = parse_http_request(&request) {
-        if method != "GET" {
-            let response = build_http_response(405, "Method Not Allowed", "text/plain", "Method Not Allowed");
-            let _ = stream.write_all(&response).await;
-            return;
-        }
-
-        let host = get_host_from_request(&request);
-        let response = match path {
-            "/" | "/index.html" => {
-                // Inject WebSocket configuration and theme CSS vars into the HTML
-                let html = WEB_INDEX_HTML
-                    .replace("{{WS_HOST}}", &host.replace(['\\', '\'', '"', '`', '<', '>'], ""))
-                    .replace("{{WS_PORT}}", &ws_port.to_string())
-                    .replace("{{WS_PROTOCOL}}", if ws_use_tls { "wss" } else { "ws" })
-                    .replace("{{THEME_CSS_VARS}}", &theme_css_vars);
-                build_http_response(200, "OK", "text/html", &html)
-            }
-            "/style.css" => {
-                build_http_response(200, "OK", "text/css", WEB_STYLE_CSS)
-            }
-            "/app.js" => {
-                build_http_response(200, "OK", "application/javascript", WEB_APP_JS)
-            }
-            "/theme-editor" => {
-                let html = WEB_THEME_EDITOR_HTML
-                    .replace("{{WS_HOST}}", &host.replace(['\\', '\'', '"', '`', '<', '>'], ""))
-                    .replace("{{WS_PORT}}", &ws_port.to_string())
-                    .replace("{{WS_PROTOCOL}}", if ws_use_tls { "wss" } else { "ws" });
-                build_http_response(200, "OK", "text/html", &html)
-            }
-            "/favicon.ico" => {
-                build_http_response(204, "No Content", "image/x-icon", "")
-            }
-            _ => {
-                build_http_response(404, "Not Found", "text/plain", "Not Found")
-            }
-        };
-
-        if stream.write_all(&response).await.is_ok() {
-            // Ensure the response is fully sent before closing
-            let _ = stream.shutdown().await;
         }
     }
 }
@@ -488,8 +402,8 @@ pub async fn start_https_server(
                             let theme_css_vars = theme_css_vars.clone();
                             tokio::spawn(async move {
                                 match tls_acceptor.accept(stream).await {
-                                    Ok(tls_stream) => {
-                                        handle_https_client(tls_stream, ws_port, ws_use_tls, client_ip, theme_css_vars).await;
+                                    Ok(mut tls_stream) => {
+                                        serve_http_request(&mut tls_stream, ws_port, ws_use_tls, &theme_css_vars).await;
                                     }
                                     Err(e) => {
                                         log_remote_event("TLS-ERROR", &client_ip, &format!("{}", e));
@@ -686,8 +600,7 @@ impl HttpServer {
     }
 }
 
-/// Handle an HTTP connection (plain TCP, no TLS)
-/// Returns true if a violation occurred (404 access)
+/// Handle an HTTP connection (plain TCP, no TLS) with ban list support
 async fn handle_http_client(
     mut stream: TcpStream,
     ws_port: u16,
@@ -698,108 +611,13 @@ async fn handle_http_client(
 ) {
     // Check if IP is banned
     if ban_list.is_banned(&client_ip) {
-        // Send minimal response and close
         let _ = stream.write_all(b"HTTP/1.1 403 Forbidden\r\nContent-Length: 7\r\nConnection: close\r\n\r\nBanned\n").await;
         return;
     }
 
-    let mut buf = [0u8; 4096];
-    let n = match stream.read(&mut buf).await {
-        Ok(n) if n > 0 => n,
-        _ => return,
-    };
-
-    let request = String::from_utf8_lossy(&buf[..n]);
-
-    // Reuse the parse function from either TLS backend
-    fn parse_request(request: &str) -> Option<(&str, &str)> {
-        let first_line = request.lines().next()?;
-        let mut parts = first_line.split_whitespace();
-        let method = parts.next()?;
-        let path = parts.next()?;
-        Some((method, path))
-    }
-
-    fn get_host(request: &str) -> String {
-        for line in request.lines() {
-            if line.to_lowercase().starts_with("host:") {
-                let host = line[5..].trim();
-                if let Some(colon_pos) = host.rfind(':') {
-                    return host[..colon_pos].to_string();
-                }
-                return host.to_string();
-            }
-        }
-        String::new()
-    }
-
-    fn build_response(status: u16, status_text: &str, content_type: &str, body: &str) -> Vec<u8> {
-        format!(
-            "HTTP/1.1 {} {}\r\n\
-             Content-Type: {}; charset=utf-8\r\n\
-             Content-Length: {}\r\n\
-             Cache-Control: no-cache\r\n\
-             Connection: close\r\n\
-             \r\n\
-             {}",
-            status, status_text, content_type, body.len(), body
-        ).into_bytes()
-    }
-
-    if let Some((method, path)) = parse_request(&request) {
-        if method != "GET" {
-            let response = build_response(405, "Method Not Allowed", "text/plain", "Method Not Allowed");
-            let _ = stream.write_all(&response).await;
-            return;
-        }
-
-        // Read embedded files at compile time
-        const HTTP_INDEX_HTML: &str = include_str!("web/index.html");
-        const HTTP_STYLE_CSS: &str = include_str!("web/style.css");
-        const HTTP_APP_JS: &str = include_str!("web/app.js");
-        const HTTP_THEME_EDITOR_HTML: &str = include_str!("web/theme-editor.html");
-
-        let host = get_host(&request);
-        let response = match path {
-            "/" | "/index.html" => {
-                // Inject WebSocket configuration and theme CSS vars into the HTML
-                let html = HTTP_INDEX_HTML
-                    .replace("{{WS_HOST}}", &host.replace(['\\', '\'', '"', '`', '<', '>'], ""))
-                    .replace("{{WS_PORT}}", &ws_port.to_string())
-                    .replace("{{WS_PROTOCOL}}", if ws_use_tls { "wss" } else { "ws" })
-                    .replace("{{THEME_CSS_VARS}}", &theme_css_vars);
-                build_response(200, "OK", "text/html", &html)
-            }
-            "/style.css" => {
-                build_response(200, "OK", "text/css", HTTP_STYLE_CSS)
-            }
-            "/app.js" => {
-                build_response(200, "OK", "application/javascript", HTTP_APP_JS)
-            }
-            "/theme-editor" => {
-                let html = HTTP_THEME_EDITOR_HTML
-                    .replace("{{WS_HOST}}", &host.replace(['\\', '\'', '"', '`', '<', '>'], ""))
-                    .replace("{{WS_PORT}}", &ws_port.to_string())
-                    .replace("{{WS_PROTOCOL}}", if ws_use_tls { "wss" } else { "ws" });
-                build_response(200, "OK", "text/html", &html)
-            }
-            "/favicon.ico" => {
-                // Return 204 No Content for favicon requests (browsers/WebViews request this)
-                build_response(204, "No Content", "image/x-icon", "")
-            }
-            _ => {
-                // Log the 404 before recording violation
-                log_http_404(&client_ip, path);
-                // Record violation for accessing non-existent page
-                ban_list.record_violation(&client_ip, path);
-                build_response(404, "Not Found", "text/plain", "Not Found")
-            }
-        };
-
-        if stream.write_all(&response).await.is_ok() {
-            // Ensure the response is fully sent before closing
-            let _ = stream.shutdown().await;
-        }
+    if let Some(violation_path) = serve_http_request(&mut stream, ws_port, ws_use_tls, &theme_css_vars).await {
+        log_http_404(&client_ip, &violation_path);
+        ban_list.record_violation(&client_ip, &violation_path);
     }
 }
 
