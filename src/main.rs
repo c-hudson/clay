@@ -2660,6 +2660,39 @@ impl App {
         }
     }
 
+    /// Apply all global settings from a GlobalSettingsMsg to local state.
+    /// Used by remote clients to sync settings from the master on connect and on updates.
+    fn apply_global_settings(&mut self, settings: &GlobalSettingsMsg) {
+        self.settings.more_mode_enabled = settings.more_mode_enabled;
+        self.settings.spell_check_enabled = settings.spell_check_enabled;
+        self.settings.temp_convert_enabled = settings.temp_convert_enabled;
+        self.settings.world_switch_mode = WorldSwitchMode::from_name(&settings.world_switch_mode);
+        self.show_tags = settings.show_tags;
+        self.settings.debug_enabled = settings.debug_enabled;
+        self.settings.ansi_music_enabled = settings.ansi_music_enabled;
+        self.settings.theme = Theme::from_name(&settings.console_theme);
+        self.settings.gui_theme = Theme::from_name(&settings.gui_theme);
+        self.settings.gui_transparency = settings.gui_transparency;
+        self.settings.color_offset_percent = settings.color_offset_percent;
+        self.input_height = settings.input_height;
+        self.input.visible_height = self.input_height;
+        self.settings.font_name = settings.font_name.clone();
+        self.settings.font_size = settings.font_size;
+        self.settings.web_font_size_phone = settings.web_font_size_phone;
+        self.settings.web_font_size_tablet = settings.web_font_size_tablet;
+        self.settings.web_font_size_desktop = settings.web_font_size_desktop;
+        self.settings.websocket_allow_list = settings.ws_allow_list.clone();
+        self.settings.web_secure = settings.web_secure;
+        self.settings.http_enabled = settings.http_enabled;
+        self.settings.http_port = settings.http_port;
+        self.settings.ws_enabled = settings.ws_enabled;
+        self.settings.ws_port = settings.ws_port;
+        self.settings.websocket_cert_file = settings.ws_cert_file.clone();
+        self.settings.websocket_key_file = settings.ws_key_file.clone();
+        self.settings.tls_proxy_enabled = settings.tls_proxy_enabled;
+        self.settings.dictionary_path = settings.dictionary_path.clone();
+    }
+
     /// Ensure there's at least one world (creates initial world if needed)
     /// Also adds splash screen to current world if it has no output
     fn ensure_has_world(&mut self) {
@@ -3428,6 +3461,11 @@ impl App {
                     self.needs_output_redraw = true;
                 }
             }
+            WsMessage::GlobalSettingsUpdated { settings, input_height: _ } => {
+                // Master or another client updated global settings - sync our local copy
+                self.apply_global_settings(&settings);
+                self.needs_output_redraw = true;
+            }
             _ => {}
         }
     }
@@ -3500,11 +3538,7 @@ impl App {
             world
         }).collect();
         self.current_world_index = current_world_index;
-        self.settings.more_mode_enabled = settings.more_mode_enabled;
-        self.settings.spell_check_enabled = settings.spell_check_enabled;
-        self.settings.temp_convert_enabled = settings.temp_convert_enabled;
-        self.show_tags = settings.show_tags;
-        self.input_height = settings.input_height;
+        self.apply_global_settings(&settings);
         self.is_master = false; // Remote client is never master
 
         // If current world has no output, add splash screen
@@ -18027,23 +18061,24 @@ fn render_output_crossterm(app: &App) {
             // Replace \x1b[0m with \x1b[0m<bg_code> to preserve background
             let highlighted = wrapped.replace("\x1b[0m", &format!("\x1b[0m{}", bg));
             let _ = stdout.queue(Print(&highlighted));
+            // Pad with spaces so the highlight background extends to end of line
+            let line_visible_width = visible_width(wrapped);
+            if line_visible_width < term_width {
+                let padding = " ".repeat(term_width - line_visible_width);
+                let _ = stdout.queue(Print(padding));
+            }
         } else {
             let _ = stdout.queue(Print(wrapped));
         }
 
-        let line_visible_width = visible_width(wrapped);
-        if line_visible_width < term_width {
-            let padding = " ".repeat(term_width - line_visible_width);
-            let _ = stdout.queue(Print(padding));
-        }
-
-        let _ = stdout.queue(Print("\x1b[0m"));
+        // Reset colors and erase to end of line - more robust than space padding
+        // for preventing background color bleed on macOS terminals
+        let _ = stdout.queue(Print("\x1b[0m\x1b[K"));
     }
 
     for row_idx in lines_to_show.len()..visible_height {
         let _ = stdout.queue(cursor::MoveTo(0, row_idx as u16));
-        let spaces = " ".repeat(term_width);
-        let _ = stdout.queue(Print(spaces));
+        let _ = stdout.queue(Print("\x1b[K"));
     }
 
     // Render filter popup if visible (must be after output so it's on top)
