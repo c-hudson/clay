@@ -185,6 +185,11 @@ Clay will parse `/addworld` commands from your TF config file and create corresp
 | `F9` | Toggle GMCP media audio |
 | `Ctrl+C` (x2) | Quit |
 
+**Mouse (enabled by default via "Console Mouse" in `/setup`):**
+- Click popup buttons and fields to interact
+- Click list items to select them
+- Click and drag to highlight lines in scrollable content
+
 ## Android App
 
 The Android app (`clay-android.apk`) is a WebSocket client that connects to a running Clay instance:

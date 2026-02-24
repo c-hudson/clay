@@ -147,6 +147,7 @@ pub fn save_settings_to_path(app: &App, path: &std::path::Path) -> io::Result<()
         writeln!(file, "dictionary_path={}", app.settings.dictionary_path)?;
     }
     writeln!(file, "editor_side={}", app.settings.editor_side.name())?;
+    writeln!(file, "mouse_enabled={}", app.settings.mouse_enabled)?;
 
     // Save each world's settings (skip unconfigured worlds that have no connection info)
     for world in &app.worlds {
@@ -589,6 +590,9 @@ pub fn load_settings_from_path(app: &mut App, path: &std::path::Path) -> io::Res
                     }
                     "editor_side" => {
                         app.settings.editor_side = EditorSide::from_name(value);
+                    }
+                    "mouse_enabled" => {
+                        app.settings.mouse_enabled = value == "true";
                     }
                     _ => {}
                 }
@@ -1114,6 +1118,7 @@ pub fn save_reload_state(app: &App) -> io::Result<()> {
         writeln!(file, "dictionary_path={}", app.settings.dictionary_path)?;
     }
     writeln!(file, "editor_side={}", app.settings.editor_side.name())?;
+    writeln!(file, "mouse_enabled={}", app.settings.mouse_enabled)?;
 
     // Save input history (base64 encode each line to handle special chars)
     writeln!(file, "history_count={}", app.input.history.len())?;
@@ -1721,6 +1726,9 @@ pub fn load_reload_state(app: &mut App) -> io::Result<bool> {
                     "editor_side" => {
                         app.settings.editor_side = EditorSide::from_name(value);
                     }
+                    "mouse_enabled" => {
+                        app.settings.mouse_enabled = value == "true";
+                    }
                     "history_count" | "world_count" => {
                         // These are informational, not needed for parsing
                     }
@@ -1933,6 +1941,7 @@ mod tests {
             tls_proxy_enabled: true,           // default: false
             dictionary_path: "/custom/dict".to_string(), // default: ""
             editor_side: EditorSide::Right,    // default: Left
+            mouse_enabled: false,              // default: true
         }
     }
 
@@ -2004,6 +2013,7 @@ mod tests {
         assert_eq!(a.tls_proxy_enabled, b.tls_proxy_enabled, "{context}: tls_proxy_enabled");
         assert_eq!(a.dictionary_path, b.dictionary_path, "{context}: dictionary_path");
         assert_eq!(a.editor_side.name(), b.editor_side.name(), "{context}: editor_side");
+        assert_eq!(a.mouse_enabled, b.mouse_enabled, "{context}: mouse_enabled");
     }
 
     /// Assert all WorldSettings fields match between two instances.
@@ -2110,6 +2120,7 @@ mod tests {
         assert_ne!(non_default.tls_proxy_enabled, default.tls_proxy_enabled, "tls_proxy_enabled should differ");
         assert_ne!(non_default.dictionary_path, default.dictionary_path, "dictionary_path should differ");
         assert_ne!(non_default.editor_side.name(), default.editor_side.name(), "editor_side should differ");
+        assert_ne!(non_default.mouse_enabled, default.mouse_enabled, "mouse_enabled should differ");
     }
 
     #[test]

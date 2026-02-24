@@ -512,6 +512,13 @@ This logic applies to all interfaces (console, web, GUI). Remote clients query t
 - Buttons have highlighted shortcut letters
 - Popups size dynamically based on content
 
+**Mouse Controls (when Console Mouse enabled in /setup, default: on):**
+- Left click on popup buttons to activate them
+- Left click on popup fields to select and edit/toggle them
+- Left click on list items to select them
+- Click and drag in scrollable content or list fields to highlight lines of text
+- Any keyboard input clears the highlight
+
 ### Commands
 
 - `/help` - Show help popup (90% terminal width, scrollable, word-wrapped)
@@ -1148,6 +1155,7 @@ Opened with `/worlds -e` command (uses unified popup system):
 - Input height - Default input area height (1-15 lines)
 - Console Theme - Theme for console interface (dark, light) — uses hardcoded `Theme` enum from `encoding.rs`
 - GUI Theme - Theme for remote GUI/web client (dark, light) — uses customizable `ThemeColors` from `theme.rs` / `~/clay.theme.dat`
+- Console Mouse - Enable mouse support in console popups (default: on) — click buttons/fields, select list items, drag to highlight text
 - TLS Proxy - Enable TLS proxy for preserving TLS connections across hot reload
 
 **Actions (right-aligned buttons):**

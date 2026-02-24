@@ -713,6 +713,38 @@ pub struct PopupState {
     pub custom: HashMap<String, String>,
     /// Actual rendered content height (set during rendering, used for scroll calculations)
     pub actual_content_height: Option<usize>,
+    /// Hit areas for mouse click detection (populated during console rendering)
+    pub hit_areas: Vec<(ratatui::layout::Rect, ElementSelection)>,
+    /// Mouse text highlight state
+    pub highlight: Option<PopupHighlight>,
+    /// Content areas for mouse-to-line mapping (populated during console rendering)
+    pub content_areas: Vec<ContentArea>,
+}
+
+/// Mouse text highlight state for popup content
+#[derive(Debug, Clone)]
+pub struct PopupHighlight {
+    /// Which field contains the highlight
+    pub field_id: FieldId,
+    /// Start line index (content-relative, inclusive)
+    pub start_line: usize,
+    /// End line index (content-relative, inclusive)
+    pub end_line: usize,
+    /// Whether the user is currently dragging
+    pub dragging: bool,
+}
+
+/// Describes a content area for mouse-to-line mapping
+#[derive(Debug, Clone)]
+pub struct ContentArea {
+    /// Screen area where content lines are rendered (excludes headers/scrollbar)
+    pub area: ratatui::layout::Rect,
+    /// Which field this content area belongs to
+    pub field_id: FieldId,
+    /// Current scroll offset of the content
+    pub scroll_offset: usize,
+    /// Total number of content lines
+    pub total_lines: usize,
 }
 
 impl PopupState {
@@ -743,6 +775,9 @@ impl PopupState {
             scroll_offset: 0,
             custom: HashMap::new(),
             actual_content_height: None,
+            hit_areas: Vec::new(),
+            highlight: None,
+            content_areas: Vec::new(),
         }
     }
 

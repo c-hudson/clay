@@ -214,6 +214,8 @@ pub enum WsMessage {
         tls_proxy_enabled: bool,
         #[serde(default)]
         dictionary_path: String,
+        #[serde(default)]
+        mouse_enabled: bool,
     },
 
     // Settings update confirmations (server -> client)
@@ -412,6 +414,8 @@ pub struct GlobalSettingsMsg {
     pub tls_proxy_enabled: bool,
     #[serde(default)]
     pub dictionary_path: String,
+    #[serde(default)]
+    pub mouse_enabled: bool,
     /// Theme colors from ~/clay.theme.dat (serialized as hex strings)
     #[serde(default)]
     pub theme_colors_json: String,

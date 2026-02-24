@@ -94,7 +94,7 @@ use async_recursion::async_recursion;
 use bytes::BytesMut;
 use crossterm::{
     cursor,
-    event::{Event, EventStream, KeyCode, KeyEvent, KeyEventKind, KeyModifiers},
+    event::{Event, EventStream, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEventKind, MouseButton, EnableMouseCapture, DisableMouseCapture},
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen, Clear, ClearType},
 };
@@ -982,6 +982,8 @@ pub struct Settings {
     dictionary_path: String,
     // Editor side for split-screen editor (left or right)
     editor_side: EditorSide,
+    // Mouse click support for console popups
+    mouse_enabled: bool,
 }
 
 impl Default for Settings {
@@ -1018,6 +1020,7 @@ impl Default for Settings {
             tls_proxy_enabled: false,
             dictionary_path: String::new(),
             editor_side: EditorSide::Left,
+            mouse_enabled: true,
         }
     }
 }
@@ -2656,6 +2659,7 @@ impl App {
             ws_key_file: self.settings.websocket_key_file.clone(),
             tls_proxy_enabled: self.settings.tls_proxy_enabled,
             dictionary_path: self.settings.dictionary_path.clone(),
+            mouse_enabled: self.settings.mouse_enabled,
             theme_colors_json: self.gui_theme_colors().to_json(),
         }
     }
@@ -2691,6 +2695,7 @@ impl App {
         self.settings.websocket_key_file = settings.ws_key_file.clone();
         self.settings.tls_proxy_enabled = settings.tls_proxy_enabled;
         self.settings.dictionary_path = settings.dictionary_path.clone();
+        self.settings.mouse_enabled = settings.mouse_enabled;
     }
 
     /// Ensure there's at least one world (creates initial world if needed)
@@ -2959,6 +2964,7 @@ impl App {
             self.settings.tls_proxy_enabled,
             &self.settings.dictionary_path,
             self.settings.editor_side.name(),
+            self.settings.mouse_enabled,
         );
         self.popup_manager.open(def);
 
@@ -6019,7 +6025,7 @@ impl App {
                     });
                 }
             }
-            WsMessage::UpdateGlobalSettings { more_mode_enabled, spell_check_enabled, temp_convert_enabled, world_switch_mode, show_tags, debug_enabled, ansi_music_enabled, console_theme, gui_theme, gui_transparency, color_offset_percent, input_height, font_name, font_size, web_font_size_phone, web_font_size_tablet, web_font_size_desktop, ws_allow_list, web_secure, http_enabled, http_port, ws_enabled, ws_port, ws_cert_file, ws_key_file, tls_proxy_enabled, dictionary_path } => {
+            WsMessage::UpdateGlobalSettings { more_mode_enabled, spell_check_enabled, temp_convert_enabled, world_switch_mode, show_tags, debug_enabled, ansi_music_enabled, console_theme, gui_theme, gui_transparency, color_offset_percent, input_height, font_name, font_size, web_font_size_phone, web_font_size_tablet, web_font_size_desktop, ws_allow_list, web_secure, http_enabled, http_port, ws_enabled, ws_port, ws_cert_file, ws_key_file, tls_proxy_enabled, dictionary_path, mouse_enabled } => {
                 // Update global settings from remote client
                 self.settings.more_mode_enabled = more_mode_enabled;
                 self.settings.spell_check_enabled = spell_check_enabled;
@@ -6055,6 +6061,7 @@ impl App {
                 self.settings.websocket_cert_file = ws_cert_file;
                 self.settings.websocket_key_file = ws_key_file;
                 self.settings.tls_proxy_enabled = tls_proxy_enabled;
+                self.settings.mouse_enabled = mouse_enabled;
                 if self.settings.dictionary_path != dictionary_path {
                     self.settings.dictionary_path = dictionary_path;
                     self.spell_checker = SpellChecker::new(&self.settings.dictionary_path);
@@ -6090,6 +6097,7 @@ impl App {
                     ws_key_file: self.settings.websocket_key_file.clone(),
                     tls_proxy_enabled: self.settings.tls_proxy_enabled,
                     dictionary_path: self.settings.dictionary_path.clone(),
+                    mouse_enabled: self.settings.mouse_enabled,
                     theme_colors_json: self.gui_theme_colors().to_json(),
                 };
                 // Broadcast update to all clients
@@ -6658,6 +6666,7 @@ impl App {
             ws_key_file: self.settings.websocket_key_file.clone(),
             tls_proxy_enabled: self.settings.tls_proxy_enabled,
             dictionary_path: self.settings.dictionary_path.clone(),
+            mouse_enabled: self.settings.mouse_enabled,
             theme_colors_json: self.gui_theme_colors().to_json(),
         };
 
@@ -8157,6 +8166,11 @@ async fn run_console_client(addr: &str) -> io::Result<()> {
         }
     }
 
+    // Enable mouse capture if mouse_enabled setting is on
+    if app.settings.mouse_enabled {
+        let _ = execute!(std::io::stdout(), EnableMouseCapture);
+    }
+
     // Main event loop - use the same ui() function as the normal console
     app.needs_output_redraw = true;
     let mut needs_redraw = true;
@@ -8203,6 +8217,29 @@ async fn run_console_client(addr: &str) -> io::Result<()> {
             maybe_event = event_stream.next() => {
                 if let Some(Ok(event)) = maybe_event {
                     match event {
+                        Event::Mouse(mouse) if app.settings.mouse_enabled && app.has_new_popup() => {
+                            match mouse.kind {
+                                MouseEventKind::Down(MouseButton::Left) => {
+                                    if !handle_popup_mouse_highlight_start(&mut app, mouse.column, mouse.row) {
+                                        let button_clicked = handle_popup_mouse_click(&mut app, mouse.column, mouse.row);
+                                        if button_clicked {
+                                            let enter_key = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
+                                            if handle_remote_client_key(&mut app, enter_key, &ws_tx) {
+                                                break;
+                                            }
+                                        }
+                                    }
+                                }
+                                MouseEventKind::Drag(MouseButton::Left) => {
+                                    handle_popup_mouse_highlight_drag(&mut app, mouse.column, mouse.row);
+                                }
+                                MouseEventKind::Up(MouseButton::Left) => {
+                                    handle_popup_mouse_highlight_end(&mut app);
+                                }
+                                _ => {}
+                            }
+                            needs_redraw = true;
+                        }
                         Event::Key(key) if key.kind == KeyEventKind::Press => {
                             // Handle Ctrl+C with double-press to quit
                             if key.modifiers == KeyModifiers::CONTROL && key.code == KeyCode::Char('c') {
@@ -8268,6 +8305,7 @@ async fn run_console_client(addr: &str) -> io::Result<()> {
     // Cleanup
     ws_write_handle.abort();
     disable_raw_mode()?;
+    let _ = execute!(terminal.backend_mut(), DisableMouseCapture);
     execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
     Ok(())
 }
@@ -8374,6 +8412,16 @@ fn handle_remote_client_key(
                     app.spell_checker = SpellChecker::new(&app.settings.dictionary_path);
                 }
                 app.settings.editor_side = EditorSide::from_name(&settings.editor_side);
+                // Toggle mouse capture based on setting change
+                let mouse_changed = app.settings.mouse_enabled != settings.mouse_enabled;
+                app.settings.mouse_enabled = settings.mouse_enabled;
+                if mouse_changed {
+                    if settings.mouse_enabled {
+                        let _ = execute!(std::io::stdout(), EnableMouseCapture);
+                    } else {
+                        let _ = execute!(std::io::stdout(), DisableMouseCapture);
+                    }
+                }
 
                 // Send UpdateGlobalSettings to daemon
                 let _ = ws_tx.send(WsMessage::UpdateGlobalSettings {
@@ -8404,6 +8452,7 @@ fn handle_remote_client_key(
                     ws_key_file: app.settings.websocket_key_file.clone(),
                     tls_proxy_enabled: app.settings.tls_proxy_enabled,
                     dictionary_path: app.settings.dictionary_path.clone(),
+                    mouse_enabled: app.settings.mouse_enabled,
                 });
             }
             NewPopupAction::WebSaved(settings) => {
@@ -8447,6 +8496,7 @@ fn handle_remote_client_key(
                     ws_key_file: app.settings.websocket_key_file.clone(),
                     tls_proxy_enabled: app.settings.tls_proxy_enabled,
                     dictionary_path: app.settings.dictionary_path.clone(),
+                    mouse_enabled: app.settings.mouse_enabled,
                 });
             }
             NewPopupAction::ConnectionsClose => {
@@ -9033,6 +9083,7 @@ struct SetupSettings {
     tls_proxy: bool,
     dictionary_path: String,
     editor_side: String,
+    mouse_enabled: bool,
 }
 
 /// Settings from the web popup
@@ -9112,7 +9163,8 @@ fn handle_new_popup_key(app: &mut App, key: KeyEvent) -> NewPopupAction {
         SETUP_FIELD_MORE_MODE, SETUP_FIELD_SPELL_CHECK, SETUP_FIELD_TEMP_CONVERT,
         SETUP_FIELD_WORLD_SWITCHING, SETUP_FIELD_DEBUG,
         SETUP_FIELD_INPUT_HEIGHT, SETUP_FIELD_GUI_THEME, SETUP_FIELD_TLS_PROXY,
-        SETUP_FIELD_DICTIONARY, SETUP_FIELD_EDITOR_SIDE, SETUP_BTN_SAVE, SETUP_BTN_CANCEL,
+        SETUP_FIELD_DICTIONARY, SETUP_FIELD_EDITOR_SIDE, SETUP_FIELD_MOUSE,
+        SETUP_BTN_SAVE, SETUP_BTN_CANCEL,
     };
     use popup::definitions::web::{
         WEB_FIELD_PROTOCOL, WEB_FIELD_HTTP_ENABLED, WEB_FIELD_HTTP_PORT,
@@ -9137,6 +9189,11 @@ fn handle_new_popup_key(app: &mut App, key: KeyEvent) -> NewPopupAction {
         WORLD_BTN_SAVE, WORLD_BTN_CANCEL, WORLD_BTN_DELETE, WORLD_BTN_CONNECT,
         WorldType as PopupWorldType, update_field_visibility,
     };
+
+    // Clear mouse highlight on any keyboard interaction
+    if let Some(state) = app.popup_manager.current_mut() {
+        state.highlight = None;
+    }
 
     let popup_id = app.popup_manager.current().map(|s| s.definition.id.clone());
     let is_menu = popup_id == Some(popup::PopupId("menu"));
@@ -9327,6 +9384,7 @@ fn handle_new_popup_key(app: &mut App, key: KeyEvent) -> NewPopupAction {
                         .unwrap_or("").to_string(),
                     editor_side: state.get_selected(SETUP_FIELD_EDITOR_SIDE)
                         .unwrap_or("left").to_string(),
+                    mouse_enabled: state.get_bool(SETUP_FIELD_MOUSE).unwrap_or(true),
                 }
             };
 
@@ -10761,6 +10819,7 @@ async fn main() -> io::Result<()> {
     let result = run_app(&mut terminal).await;
 
     disable_raw_mode()?;
+    let _ = execute!(terminal.backend_mut(), DisableMouseCapture);
     execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
     terminal.show_cursor()?;
 
@@ -12425,6 +12484,11 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
     // Keepalive: send NOP every 5 minutes if telnet mode and idle
     const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(5 * 60);
 
+    // Enable mouse capture if mouse_enabled setting is on
+    if app.settings.mouse_enabled {
+        let _ = execute!(std::io::stdout(), EnableMouseCapture);
+    }
+
     // Use async event stream instead of polling to reduce CPU usage
     let mut event_stream = EventStream::new();
 
@@ -12540,9 +12604,41 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
 
         // Use tokio::select! to efficiently wait for events without busy-polling
         tokio::select! {
-            // Terminal events (keyboard input)
+            // Terminal events (keyboard and mouse input)
             maybe_event = event_stream.next() => {
-                if let Some(Ok(Event::Key(key))) = maybe_event {
+                if let Some(Ok(event)) = maybe_event {
+                // Handle mouse events
+                if let Event::Mouse(mouse) = event {
+                    if app.settings.mouse_enabled && app.has_new_popup() {
+                        match mouse.kind {
+                            MouseEventKind::Down(MouseButton::Left) => {
+                                // Try highlight first (content area click)
+                                if !handle_popup_mouse_highlight_start(&mut app, mouse.column, mouse.row) {
+                                    // Not a content area click - try button/field click
+                                    let button_clicked = handle_popup_mouse_click(&mut app, mouse.column, mouse.row);
+                                    if button_clicked {
+                                        let enter_key = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
+                                        let action = handle_key_event(enter_key, &mut app);
+                                        if let KeyAction::SendCommand(cmd) = action {
+                                            if handle_command(&cmd, &mut app, event_tx.clone()).await {
+                                                return Ok(());
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            MouseEventKind::Drag(MouseButton::Left) => {
+                                handle_popup_mouse_highlight_drag(&mut app, mouse.column, mouse.row);
+                            }
+                            MouseEventKind::Up(MouseButton::Left) => {
+                                handle_popup_mouse_highlight_end(&mut app);
+                            }
+                            _ => {}
+                        }
+                    }
+                    continue;
+                }
+                if let Event::Key(key) = event {
                     if key.kind != KeyEventKind::Press { continue; }
                     match handle_key_event(key, &mut app) {
                         KeyAction::Quit => return Ok(()),
@@ -12569,6 +12665,9 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                             #[cfg(all(unix, not(target_os = "android")))]
                             {
                                 // Restore terminal to normal mode before suspending
+                                if app.settings.mouse_enabled {
+                                    let _ = execute!(std::io::stdout(), DisableMouseCapture);
+                                }
                                 disable_raw_mode()?;
                                 execute!(std::io::stdout(), LeaveAlternateScreen)?;
 
@@ -12580,6 +12679,9 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                 // When we resume (after fg), re-enter raw mode and redraw
                                 enable_raw_mode()?;
                                 execute!(std::io::stdout(), EnterAlternateScreen)?;
+                                if app.settings.mouse_enabled {
+                                    let _ = execute!(std::io::stdout(), EnableMouseCapture);
+                                }
                                 terminal.clear()?;
                                 app.needs_output_redraw = true;
                             }
@@ -12861,6 +12963,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                     app.check_word_ended();
                     app.check_temp_conversion();
                 }
+                } // close if let Some(Ok(event))
             }
 
             // Server events (data from MUD connections)
@@ -13912,6 +14015,155 @@ enum KeyAction {
     None,
 }
 
+/// Handle a mouse click on a popup. Returns true if a button was activated (caller should
+/// then call handle_new_popup_key with Enter to trigger the button action).
+fn handle_popup_mouse_click(app: &mut App, column: u16, row: u16) -> bool {
+    if let Some(state) = app.popup_manager.current_mut() {
+        for (rect, element) in &state.hit_areas {
+            if column >= rect.x && column < rect.x + rect.width
+                && row >= rect.y && row < rect.y + rect.height
+            {
+                match element {
+                    popup::ElementSelection::Field(field_id) => {
+                        let field_id = *field_id;
+                        // If currently editing a different field, commit the edit first
+                        if state.editing {
+                            if let popup::ElementSelection::Field(current_id) = &state.selected {
+                                if *current_id != field_id {
+                                    state.commit_edit();
+                                }
+                            }
+                        }
+                        state.selected = popup::ElementSelection::Field(field_id);
+                        // Toggle or enter edit based on field type
+                        if let Some(field) = state.definition.fields.iter().find(|f| f.id == field_id) {
+                            match &field.kind {
+                                popup::FieldKind::Toggle { .. } => {
+                                    state.toggle_current();
+                                }
+                                popup::FieldKind::Select { .. } => {
+                                    state.cycle_selected();
+                                }
+                                popup::FieldKind::Text { .. } | popup::FieldKind::MultilineText { .. } => {
+                                    if !state.editing {
+                                        state.start_edit();
+                                    }
+                                }
+                                _ => {}
+                            }
+                        }
+                        return false;
+                    }
+                    popup::ElementSelection::Button(button_id) => {
+                        state.selected = popup::ElementSelection::Button(*button_id);
+                        return true; // Caller should trigger button action
+                    }
+                    popup::ElementSelection::None => {}
+                }
+            }
+        }
+    }
+    false
+}
+
+/// Map screen coordinates to a content line in a popup content area.
+/// Returns (field_id, content_line_index) if the click is within a content area.
+fn screen_to_content_line(app: &App, column: u16, row: u16) -> Option<(popup::FieldId, usize)> {
+    if let Some(state) = app.popup_manager.current() {
+        for ca in &state.content_areas {
+            if column >= ca.area.x && column < ca.area.x + ca.area.width
+                && row >= ca.area.y && row < ca.area.y + ca.area.height
+            {
+                let line = ca.scroll_offset + (row - ca.area.y) as usize;
+                if line < ca.total_lines {
+                    return Some((ca.field_id, line));
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Start a mouse highlight on mouse down in a content area.
+/// Returns true if the click was in a content area (highlight started).
+fn handle_popup_mouse_highlight_start(app: &mut App, column: u16, row: u16) -> bool {
+    if let Some((field_id, line)) = screen_to_content_line(app, column, row) {
+        if let Some(state) = app.popup_manager.current_mut() {
+            // Select this field
+            state.selected = popup::ElementSelection::Field(field_id);
+
+            // For list fields, also update the list's selected_index
+            if let Some(field) = state.definition.fields.iter_mut().find(|f| f.id == field_id) {
+                if let popup::FieldKind::List { items, selected_index, .. } = &mut field.kind {
+                    if line < items.len() {
+                        *selected_index = line;
+                    }
+                }
+            }
+
+            state.highlight = Some(popup::PopupHighlight {
+                field_id,
+                start_line: line,
+                end_line: line,
+                dragging: true,
+            });
+        }
+        return true;
+    }
+    // Click was not in a content area - clear any existing highlight
+    if let Some(state) = app.popup_manager.current_mut() {
+        state.highlight = None;
+    }
+    false
+}
+
+/// Extend a mouse highlight on drag.
+fn handle_popup_mouse_highlight_drag(app: &mut App, _column: u16, row: u16) {
+    // Check if we're currently dragging
+    let is_dragging = app.popup_manager.current()
+        .and_then(|s| s.highlight.as_ref())
+        .is_some_and(|h| h.dragging);
+    if !is_dragging {
+        return;
+    }
+
+    // Get the field_id we're highlighting
+    let highlight_field = app.popup_manager.current()
+        .and_then(|s| s.highlight.as_ref())
+        .map(|h| h.field_id);
+    let Some(field_id) = highlight_field else { return };
+
+    // Find the content area for this field and clamp the row
+    let content_line = app.popup_manager.current().and_then(|state| {
+        state.content_areas.iter().find(|ca| ca.field_id == field_id).map(|ca| {
+            let clamped_row = row.max(ca.area.y).min(ca.area.y + ca.area.height.saturating_sub(1));
+            let line = ca.scroll_offset + (clamped_row - ca.area.y) as usize;
+            line.min(ca.total_lines.saturating_sub(1))
+        })
+    });
+
+    if let Some(line) = content_line {
+        if let Some(state) = app.popup_manager.current_mut() {
+            if let Some(highlight) = &mut state.highlight {
+                highlight.end_line = line;
+            }
+        }
+    }
+}
+
+/// End a mouse highlight on mouse up.
+fn handle_popup_mouse_highlight_end(app: &mut App) {
+    if let Some(state) = app.popup_manager.current_mut() {
+        if let Some(highlight) = &mut state.highlight {
+            highlight.dragging = false;
+            // If start == end (single click), clear the highlight
+            if highlight.start_line == highlight.end_line {
+                state.highlight = None;
+            }
+        }
+    }
+}
+
 fn handle_key_event(key: KeyEvent, app: &mut App) -> KeyAction {
 
     // Handle confirm dialog first (highest priority)
@@ -14225,6 +14477,16 @@ fn handle_key_event(key: KeyEvent, app: &mut App) -> KeyAction {
                     app.spell_checker = SpellChecker::new(&app.settings.dictionary_path);
                 }
                 app.settings.editor_side = EditorSide::from_name(&settings.editor_side);
+                // Toggle mouse capture based on setting change
+                let mouse_changed = app.settings.mouse_enabled != settings.mouse_enabled;
+                app.settings.mouse_enabled = settings.mouse_enabled;
+                if mouse_changed {
+                    if settings.mouse_enabled {
+                        let _ = execute!(std::io::stdout(), EnableMouseCapture);
+                    } else {
+                        let _ = execute!(std::io::stdout(), DisableMouseCapture);
+                    }
+                }
                 // Save settings to disk
                 let _ = persistence::save_settings(app);
             }

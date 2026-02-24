@@ -1148,7 +1148,7 @@ pub async fn handle_daemon_ws_message(
                 app.ws_broadcast(WsMessage::WorldSwitched { new_index: world_index });
             }
         }
-        WsMessage::UpdateGlobalSettings { more_mode_enabled, spell_check_enabled, temp_convert_enabled, world_switch_mode, show_tags, debug_enabled, ansi_music_enabled, console_theme, gui_theme, gui_transparency, color_offset_percent, input_height, font_name, font_size, web_font_size_phone, web_font_size_tablet, web_font_size_desktop, ws_allow_list, web_secure, http_enabled, http_port, ws_enabled, ws_port, ws_cert_file, ws_key_file, tls_proxy_enabled, dictionary_path } => {
+        WsMessage::UpdateGlobalSettings { more_mode_enabled, spell_check_enabled, temp_convert_enabled, world_switch_mode, show_tags, debug_enabled, ansi_music_enabled, console_theme, gui_theme, gui_transparency, color_offset_percent, input_height, font_name, font_size, web_font_size_phone, web_font_size_tablet, web_font_size_desktop, ws_allow_list, web_secure, http_enabled, http_port, ws_enabled, ws_port, ws_cert_file, ws_key_file, tls_proxy_enabled, dictionary_path, mouse_enabled } => {
             app.settings.more_mode_enabled = more_mode_enabled;
             app.settings.spell_check_enabled = spell_check_enabled;
             app.settings.temp_convert_enabled = temp_convert_enabled;
@@ -1175,6 +1175,7 @@ pub async fn handle_daemon_ws_message(
             app.settings.websocket_cert_file = ws_cert_file;
             app.settings.websocket_key_file = ws_key_file;
             app.settings.tls_proxy_enabled = tls_proxy_enabled;
+            app.settings.mouse_enabled = mouse_enabled;
             if app.settings.dictionary_path != dictionary_path {
                 app.settings.dictionary_path = dictionary_path;
                 app.spell_checker = SpellChecker::new(&app.settings.dictionary_path);
@@ -1212,6 +1213,7 @@ pub async fn handle_daemon_ws_message(
                 ws_key_file: app.settings.websocket_key_file.clone(),
                 tls_proxy_enabled: app.settings.tls_proxy_enabled,
                 dictionary_path: app.settings.dictionary_path.clone(),
+                mouse_enabled: app.settings.mouse_enabled,
                 theme_colors_json: app.gui_theme_colors().to_json(),
             };
             app.ws_broadcast(WsMessage::GlobalSettingsUpdated { settings, input_height: app.input_height });
@@ -2535,6 +2537,7 @@ pub fn build_multiuser_initial_state(app: &App, username: &str) -> WsMessage {
         ws_key_file: app.settings.websocket_key_file.clone(),
         tls_proxy_enabled: app.settings.tls_proxy_enabled,
         dictionary_path: app.settings.dictionary_path.clone(),
+        mouse_enabled: app.settings.mouse_enabled,
         theme_colors_json: app.gui_theme_colors().to_json(),
     };
 

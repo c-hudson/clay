@@ -2264,6 +2264,7 @@ impl RemoteGuiApp {
                 ws_key_file: self.ws_key_file.clone(),
                 tls_proxy_enabled: self.tls_proxy_enabled,
                 dictionary_path: self.dictionary_path.clone(),
+                mouse_enabled: false,
             });
         }
     }

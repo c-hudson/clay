@@ -11,7 +11,7 @@ use ratatui::{
 };
 
 use super::{
-    ButtonStyle, ElementSelection, FieldKind, PopupLayout, PopupState,
+    ButtonStyle, ContentArea, ElementSelection, FieldKind, PopupLayout, PopupState,
 };
 use crate::encoding::Theme;
 
@@ -210,22 +210,29 @@ fn calculate_content_height(state: &PopupState) -> usize {
 }
 
 /// Render popup content (fields and buttons)
-fn render_popup_content(f: &mut Frame, state: &PopupState, area: Rect, theme: &Theme) {
+fn render_popup_content(f: &mut Frame, state: &mut PopupState, area: Rect, theme: &Theme) {
     let mut y = area.y;
     let available_width = area.width as usize;
     let layout = &state.definition.layout;
 
+    // Clear hit areas and content areas for this render pass
+    state.hit_areas.clear();
+    state.content_areas.clear();
+
     // Render fields
-    for field in &state.definition.fields {
-        if !field.visible {
+    let has_buttons = !state.definition.buttons.is_empty();
+    let num_fields = state.definition.fields.len();
+    let blank_line_before_list = layout.blank_line_before_list;
+    let mut field_hit_areas: Vec<(Rect, super::FieldId)> = Vec::new();
+    let mut content_area_infos: Vec<ContentArea> = Vec::new();
+    for i in 0..num_fields {
+        if !state.definition.fields[i].visible {
             continue;
         }
 
-        let is_selected = matches!(&state.selected, ElementSelection::Field(id) if *id == field.id);
-
         // Add blank line before list if configured
-        if layout.blank_line_before_list {
-            if let FieldKind::List { .. } = &field.kind {
+        if blank_line_before_list {
+            if let FieldKind::List { .. } = &state.definition.fields[i].kind {
                 y += 1;
             }
         }
@@ -233,10 +240,10 @@ fn render_popup_content(f: &mut Frame, state: &PopupState, area: Rect, theme: &T
         // Calculate remaining height available for this field
         let remaining_height = (area.y + area.height).saturating_sub(y) as usize;
         // Reserve space for buttons if present (1 blank line + 1 button row)
-        let button_space = if !state.definition.buttons.is_empty() { 2 } else { 0 };
+        let button_space = if has_buttons { 2 } else { 0 };
         let available_for_field = remaining_height.saturating_sub(button_space);
 
-        let field_height = match &field.kind {
+        let field_height = match &state.definition.fields[i].kind {
             FieldKind::Label { text } => text.lines().count().max(1) as u16,
             FieldKind::MultilineText { visible_lines, .. } => *visible_lines as u16,
             FieldKind::List { visible_height, headers, .. } => {
@@ -254,10 +261,48 @@ fn render_popup_content(f: &mut Frame, state: &PopupState, area: Rect, theme: &T
         };
 
         let field_area = Rect::new(area.x, y, area.width, field_height);
-        render_field(f, state, field, field_area, is_selected, theme);
+        let field_id = state.definition.fields[i].id;
+        let is_selected = matches!(&state.selected, ElementSelection::Field(id) if *id == field_id);
 
+        // Collect content area info for mouse highlighting
+        match &state.definition.fields[i].kind {
+            FieldKind::ScrollableContent { lines, scroll_offset, .. } => {
+                content_area_infos.push(ContentArea {
+                    area: field_area,
+                    field_id,
+                    scroll_offset: *scroll_offset,
+                    total_lines: lines.len(),
+                });
+            }
+            FieldKind::List { items, headers, scroll_offset, .. } => {
+                let header_rows = if headers.is_some() { 1 } else { 0 };
+                let list_area = Rect::new(
+                    field_area.x,
+                    field_area.y + header_rows as u16,
+                    field_area.width,
+                    field_area.height.saturating_sub(header_rows as u16),
+                );
+                content_area_infos.push(ContentArea {
+                    area: list_area,
+                    field_id,
+                    scroll_offset: *scroll_offset,
+                    total_lines: items.len(),
+                });
+            }
+            _ => {}
+        }
+
+        render_field(f, state, &state.definition.fields[i], field_area, is_selected, theme);
+
+        field_hit_areas.push((field_area, field_id));
         y += field_height;
     }
+    // Record field hit areas for mouse click detection
+    for (area, id) in field_hit_areas {
+        state.hit_areas.push((area, ElementSelection::Field(id)));
+    }
+    // Record content areas for mouse highlighting
+    state.content_areas = content_area_infos;
 
     // Render buttons if present
     if !state.definition.buttons.is_empty() {
@@ -606,11 +651,25 @@ fn render_field(
             // Use actual area height minus header row if present
             let header_rows = if headers.is_some() { 1 } else { 0 };
             let actual_visible = (area.height as usize).saturating_sub(header_rows);
-            render_list_field(f, items, *selected_index, *scroll_offset, actual_visible, headers, column_widths, area, is_selected, theme);
+            let highlight_range = state.highlight.as_ref().and_then(|h| {
+                if h.field_id == field.id {
+                    Some((h.start_line.min(h.end_line), h.start_line.max(h.end_line)))
+                } else {
+                    None
+                }
+            });
+            render_list_field(f, items, *selected_index, *scroll_offset, actual_visible, headers, column_widths, area, is_selected, highlight_range, theme);
         }
 
         FieldKind::ScrollableContent { lines, scroll_offset, visible_height } => {
-            render_scrollable_content(f, lines, *scroll_offset, *visible_height, area, theme);
+            let highlight_range = state.highlight.as_ref().and_then(|h| {
+                if h.field_id == field.id {
+                    Some((h.start_line.min(h.end_line), h.start_line.max(h.end_line)))
+                } else {
+                    None
+                }
+            });
+            render_scrollable_content(f, lines, *scroll_offset, *visible_height, area, highlight_range, theme);
         }
     }
 }
@@ -711,6 +770,7 @@ fn render_list_field(
     stored_column_widths: &Option<Vec<usize>>,
     area: Rect,
     _is_selected: bool,
+    highlight_range: Option<(usize, usize)>,
     theme: &Theme,
 ) {
     let prefix_width = 2; // "* " or "  "
@@ -829,11 +889,17 @@ fn render_list_field(
         // Pad to fill the entire row width (so highlight extends to scrollbar)
         let padded_text = format!("{:<width$}", full_text, width = content_width);
 
+        let is_highlighted = highlight_range.is_some_and(|(start, end)| *idx >= start && *idx <= end);
+
         let style = if is_item_selected {
             Style::default()
                 .fg(theme.fg_accent())
                 .bg(theme.selection_bg())
                 .add_modifier(Modifier::BOLD)
+        } else if is_highlighted {
+            Style::default()
+                .fg(theme.fg())
+                .bg(theme.selection_bg())
         } else if item.style.is_connected {
             Style::default().fg(theme.fg_success())
         } else if item.style.is_disabled {
@@ -889,6 +955,7 @@ fn render_scrollable_content(
     scroll_offset: usize,
     visible_height: usize,
     area: Rect,
+    highlight_range: Option<(usize, usize)>,
     theme: &Theme,
 ) {
     let actual_height = visible_height.min(area.height as usize);
@@ -901,14 +968,19 @@ fn render_scrollable_content(
             break;
         }
 
+        let content_line_idx = scroll_offset + i;
+        let is_highlighted = highlight_range.is_some_and(|(start, end)| content_line_idx >= start && content_line_idx <= end);
+
         let row_area = Rect::new(area.x, row_y, area.width.saturating_sub(1), 1);
         // Pad line to fill the row area (prevents background bleed-through)
         let display_text = truncate_str(line, area.width as usize - 2);
         let padded_text = format!("{:<width$}", display_text, width = row_area.width as usize);
-        let text_line = Line::from(Span::styled(
-            padded_text,
-            Style::default().fg(theme.fg()).bg(theme.popup_bg()),
-        ));
+        let style = if is_highlighted {
+            Style::default().fg(theme.fg()).bg(theme.selection_bg())
+        } else {
+            Style::default().fg(theme.fg()).bg(theme.popup_bg())
+        };
+        let text_line = Line::from(Span::styled(padded_text, style));
         f.render_widget(Paragraph::new(text_line), row_area);
     }
 
@@ -974,9 +1046,18 @@ fn build_button_spans(button: &super::Button, state: &PopupState, theme: &Theme)
     spans
 }
 
-fn render_buttons(f: &mut Frame, state: &PopupState, area: Rect, theme: &Theme) {
+fn render_buttons(f: &mut Frame, state: &mut PopupState, area: Rect, theme: &Theme) {
     let button_spacing = "  ";
     let bg_style = Style::default().bg(theme.popup_bg());
+
+    // Collect button widths for hit area tracking
+    let button_widths: Vec<(super::ButtonId, usize, bool)> = state.definition.buttons.iter()
+        .filter(|b| b.enabled)
+        .map(|b| {
+            let width = b.label.len() + 2; // "[label]"
+            (b.id, width, b.left_align)
+        })
+        .collect();
 
     // Split buttons into left-aligned and right-aligned groups
     let has_left_buttons = state.definition.buttons.iter().any(|b| b.enabled && b.left_align);
@@ -998,6 +1079,33 @@ fn render_buttons(f: &mut Frame, state: &PopupState, area: Rect, theme: &Theme) 
         let left_width: usize = left_spans.iter().map(|s| s.content.len()).sum();
         let right_width: usize = right_spans.iter().map(|s| s.content.len()).sum();
         let gap = (area.width as usize).saturating_sub(left_width + right_width + 2); // 1 margin each side
+
+        // Track button positions for hit areas
+        let mut x_pos = area.x + 1; // left margin
+        for &(btn_id, btn_width, is_left) in &button_widths {
+            if is_left {
+                let prev_x = x_pos;
+                if prev_x > area.x + 1 { x_pos += 2; } // spacing
+                state.hit_areas.push((
+                    Rect::new(x_pos, area.y, btn_width as u16, 1),
+                    ElementSelection::Button(btn_id),
+                ));
+                x_pos += btn_width as u16;
+            }
+        }
+        // Right-aligned buttons start after gap
+        x_pos = area.x + 1 + left_width as u16 + gap as u16;
+        for &(btn_id, btn_width, is_left) in &button_widths {
+            if !is_left {
+                let prev_x = x_pos;
+                if prev_x > area.x + 1 + left_width as u16 + gap as u16 { x_pos += 2; }
+                state.hit_areas.push((
+                    Rect::new(x_pos, area.y, btn_width as u16, 1),
+                    ElementSelection::Button(btn_id),
+                ));
+                x_pos += btn_width as u16;
+            }
+        }
 
         let mut positioned_spans = Vec::new();
         positioned_spans.push(Span::styled(" ".to_string(), bg_style)); // left margin
@@ -1032,6 +1140,16 @@ fn render_buttons(f: &mut Frame, state: &PopupState, area: Rect, theme: &Theme) 
         } else {
             (area.width as usize).saturating_sub(total_width) / 2
         };
+
+        // Track button positions for hit areas
+        let mut x_pos = area.x + padding as u16;
+        for &(btn_id, btn_width, _) in &button_widths {
+            state.hit_areas.push((
+                Rect::new(x_pos, area.y, btn_width as u16, 1),
+                ElementSelection::Button(btn_id),
+            ));
+            x_pos += btn_width as u16 + 2; // button width + spacing
+        }
 
         let mut positioned_spans = vec![Span::styled(" ".repeat(padding), bg_style)];
         positioned_spans.extend(spans);
