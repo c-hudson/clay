@@ -2513,6 +2513,8 @@ pub struct App {
     pub needs_output_redraw: bool,
     /// True if terminal needs full clear (for Ctrl+L redraw in --console mode)
     pub needs_terminal_clear: bool,
+    /// True if mouse capture is currently active in the terminal
+    pub mouse_capture_active: bool,
     /// True if running in multiuser mode (--multiuser flag)
     pub multiuser_mode: bool,
     /// User accounts (multiuser mode only)
@@ -2595,6 +2597,7 @@ impl App {
             is_reload: false, // Set to true in run_app if started from hot reload
             needs_output_redraw: true, // Start with true to ensure initial render
             needs_terminal_clear: false, // Set to true by Ctrl+L in --console mode
+            mouse_capture_active: false, // Toggled dynamically when popups open/close
             multiuser_mode: false, // Set to true in main if started with --multiuser
             users: Vec::new(),
             ban_list: BanList::new(),
@@ -8166,11 +8169,6 @@ async fn run_console_client(addr: &str) -> io::Result<()> {
         }
     }
 
-    // Enable mouse capture if mouse_enabled setting is on
-    if app.settings.mouse_enabled {
-        let _ = execute!(std::io::stdout(), EnableMouseCapture);
-    }
-
     // Main event loop - use the same ui() function as the normal console
     app.needs_output_redraw = true;
     let mut needs_redraw = true;
@@ -8195,6 +8193,18 @@ async fn run_console_client(addr: &str) -> io::Result<()> {
                 terminal.clear()?;
             }
             popup_was_visible = any_popup_visible;
+
+            // Toggle mouse capture when popup visibility changes
+            if app.settings.mouse_enabled {
+                let want_mouse = any_popup_visible;
+                if want_mouse && !app.mouse_capture_active {
+                    let _ = execute!(std::io::stdout(), EnableMouseCapture);
+                    app.mouse_capture_active = true;
+                } else if !want_mouse && app.mouse_capture_active {
+                    let _ = execute!(std::io::stdout(), DisableMouseCapture);
+                    app.mouse_capture_active = false;
+                }
+            }
 
             // Handle Ctrl+L terminal clear request
             if app.needs_terminal_clear {
@@ -8412,15 +8422,11 @@ fn handle_remote_client_key(
                     app.spell_checker = SpellChecker::new(&app.settings.dictionary_path);
                 }
                 app.settings.editor_side = EditorSide::from_name(&settings.editor_side);
-                // Toggle mouse capture based on setting change
-                let mouse_changed = app.settings.mouse_enabled != settings.mouse_enabled;
+                // Update mouse setting; if disabled, turn off capture immediately
                 app.settings.mouse_enabled = settings.mouse_enabled;
-                if mouse_changed {
-                    if settings.mouse_enabled {
-                        let _ = execute!(std::io::stdout(), EnableMouseCapture);
-                    } else {
-                        let _ = execute!(std::io::stdout(), DisableMouseCapture);
-                    }
+                if !settings.mouse_enabled && app.mouse_capture_active {
+                    let _ = execute!(std::io::stdout(), DisableMouseCapture);
+                    app.mouse_capture_active = false;
                 }
 
                 // Send UpdateGlobalSettings to daemon
@@ -12484,11 +12490,6 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
     // Keepalive: send NOP every 5 minutes if telnet mode and idle
     const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(5 * 60);
 
-    // Enable mouse capture if mouse_enabled setting is on
-    if app.settings.mouse_enabled {
-        let _ = execute!(std::io::stdout(), EnableMouseCapture);
-    }
-
     // Use async event stream instead of polling to reduce CPU usage
     let mut event_stream = EventStream::new();
 
@@ -12665,7 +12666,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                             #[cfg(all(unix, not(target_os = "android")))]
                             {
                                 // Restore terminal to normal mode before suspending
-                                if app.settings.mouse_enabled {
+                                if app.mouse_capture_active {
                                     let _ = execute!(std::io::stdout(), DisableMouseCapture);
                                 }
                                 disable_raw_mode()?;
@@ -12679,7 +12680,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                 // When we resume (after fg), re-enter raw mode and redraw
                                 enable_raw_mode()?;
                                 execute!(std::io::stdout(), EnterAlternateScreen)?;
-                                if app.settings.mouse_enabled {
+                                if app.mouse_capture_active {
                                     let _ = execute!(std::io::stdout(), EnableMouseCapture);
                                 }
                                 terminal.clear()?;
@@ -13935,6 +13936,18 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
         let popup_visibility_changed = any_popup_visible != app.popup_was_visible;
         app.popup_was_visible = any_popup_visible;
 
+        // Toggle mouse capture when popup visibility changes
+        if app.settings.mouse_enabled {
+            let want_mouse = any_popup_visible;
+            if want_mouse && !app.mouse_capture_active {
+                let _ = execute!(std::io::stdout(), EnableMouseCapture);
+                app.mouse_capture_active = true;
+            } else if !want_mouse && app.mouse_capture_active {
+                let _ = execute!(std::io::stdout(), DisableMouseCapture);
+                app.mouse_capture_active = false;
+            }
+        }
+
         // Handle terminal clear request (e.g., after closing editor)
         if app.needs_terminal_clear {
             execute!(
@@ -14477,15 +14490,11 @@ fn handle_key_event(key: KeyEvent, app: &mut App) -> KeyAction {
                     app.spell_checker = SpellChecker::new(&app.settings.dictionary_path);
                 }
                 app.settings.editor_side = EditorSide::from_name(&settings.editor_side);
-                // Toggle mouse capture based on setting change
-                let mouse_changed = app.settings.mouse_enabled != settings.mouse_enabled;
+                // Update mouse setting; if disabled, turn off capture immediately
                 app.settings.mouse_enabled = settings.mouse_enabled;
-                if mouse_changed {
-                    if settings.mouse_enabled {
-                        let _ = execute!(std::io::stdout(), EnableMouseCapture);
-                    } else {
-                        let _ = execute!(std::io::stdout(), DisableMouseCapture);
-                    }
+                if !settings.mouse_enabled && app.mouse_capture_active {
+                    let _ = execute!(std::io::stdout(), DisableMouseCapture);
+                    app.mouse_capture_active = false;
                 }
                 // Save settings to disk
                 let _ = persistence::save_settings(app);
