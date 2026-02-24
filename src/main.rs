@@ -8173,8 +8173,7 @@ async fn run_console_client(addr: &str) -> io::Result<()> {
     app.needs_output_redraw = true;
     let mut needs_redraw = true;
 
-    // Track popup visibility for transition detection
-    let mut popup_was_visible = false;
+
 
     loop {
         // Draw if needed
@@ -8182,17 +8181,15 @@ async fn run_console_client(addr: &str) -> io::Result<()> {
             // Check current popup visibility
             let any_popup_visible = app.has_new_popup() || app.confirm_dialog.visible;
 
-            // Only clear when TRANSITIONING to a popup (not on every frame)
-            // This prevents slow performance from excessive redraws
-            if any_popup_visible && !popup_was_visible {
-                // Use crossterm directly to ensure screen is cleared
+            // If transitioning to popup, clear ratatui buffer for clean popup rendering
+            if any_popup_visible && !app.popup_was_visible {
                 execute!(
                     std::io::stdout(),
                     crossterm::terminal::Clear(crossterm::terminal::ClearType::All)
                 )?;
                 terminal.clear()?;
             }
-            popup_was_visible = any_popup_visible;
+            app.popup_was_visible = any_popup_visible;
 
             // Toggle mouse capture when popup visibility changes
             if app.settings.mouse_enabled {
@@ -13928,10 +13925,12 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
             || app.filter_popup.visible
             || app.has_new_popup();
 
-        // If transitioning from no popup to popup, clear terminal to sync ratatui with terminal state
+        // If transitioning from no popup to popup, clear ratatui's buffer so it fully redraws
+        // the popup area without artifacts from stale buffer state
         if any_popup_visible && !app.popup_was_visible {
             terminal.clear()?;
         }
+
         // Detect popup visibility change before updating
         let popup_visibility_changed = any_popup_visible != app.popup_was_visible;
         app.popup_was_visible = any_popup_visible;
@@ -18064,7 +18063,7 @@ fn process_output_line(line: &OutputLine, show_tags: bool, temp_convert_enabled:
 }
 
 /// Render output area using raw crossterm (bypasses ratatui's buggy rendering)
-/// Returns early if splash screen or popup is visible (let ratatui handle those)
+/// Returns early if splash screen, popup, or editor is visible (let ratatui handle those)
 fn render_output_crossterm(app: &App) {
     use std::io::Write;
     use crossterm::{style::Print, QueueableCommand};
