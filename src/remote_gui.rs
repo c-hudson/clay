@@ -2903,20 +2903,23 @@ impl RemoteGuiApp {
                     i += 1;
                 }
             } else if c == '\u{200D}' {
-                // Zero Width Joiner - part of ZWJ emoji sequence
+                // Zero Width Joiner - buffer it, don't push yet
+                // If followed by a colored square, both get dropped (graceful degradation)
                 prev_was_zwj = true;
-                segment.push(c);
             } else {
                 // Check for colored square emoji and render as colored blocks
                 // But not if it's part of a ZWJ sequence (e.g., 🐈‍⬛ = cat + ZWJ + ⬛)
-                if !prev_was_zwj {
-                    if let Some((r, g, b)) = Self::colored_square_rgb(c) {
+                if let Some((r, g, b)) = Self::colored_square_rgb(c) {
+                    if prev_was_zwj {
+                        // Square is part of a ZWJ sequence - drop both ZWJ and square
+                        // egui can't render ZWJ sequences, so just show base emoji
+                    } else {
+                        // Standalone square - replace with colored block characters
                         // Flush current segment first
                         if !segment.is_empty() {
                             Self::append_segment_with_shades(&segment, &font_id, current_color, current_bg, theme_bg, color_offset_percent, &style, job);
                             segment.clear();
                         }
-                        // Add two block characters with the emoji's color
                         let square_color = egui::Color32::from_rgb(r, g, b);
                         job.append(
                             "██",
@@ -2928,9 +2931,13 @@ impl RemoteGuiApp {
                                 ..Default::default()
                             },
                         );
-                        prev_was_zwj = false;
-                        continue;
                     }
+                    prev_was_zwj = false;
+                    continue;
+                }
+                if prev_was_zwj {
+                    // ZWJ not followed by a colored square - keep it
+                    segment.push('\u{200D}');
                 }
                 prev_was_zwj = false;
                 segment.push(c);
@@ -3088,24 +3095,31 @@ impl RemoteGuiApp {
                     let mut prev_zwj = false;
                     for c in txt.chars() {
                         if c == '\u{200D}' {
+                            // Buffer ZWJ - don't push yet
                             prev_zwj = true;
-                            current_text.push(c);
-                        } else if !prev_zwj {
-                            if let Some(color) = Self::colored_square_color(c) {
+                        } else if let Some(color) = Self::colored_square_color(c) {
+                            if prev_zwj {
+                                // Square is part of ZWJ sequence - drop both
+                            } else {
+                                // Standalone square
                                 if !current_text.is_empty() {
                                     segments.push(DiscordSegment::Text(current_text.clone()));
                                     current_text.clear();
                                 }
                                 segments.push(DiscordSegment::ColoredSquare(color));
-                                prev_zwj = false;
-                            } else {
-                                prev_zwj = false;
-                                current_text.push(c);
                             }
+                            prev_zwj = false;
                         } else {
+                            if prev_zwj {
+                                // ZWJ not followed by colored square - keep it
+                                current_text.push('\u{200D}');
+                            }
                             prev_zwj = false;
                             current_text.push(c);
                         }
+                    }
+                    if prev_zwj {
+                        current_text.push('\u{200D}');
                     }
                     if !current_text.is_empty() {
                         segments.push(DiscordSegment::Text(current_text));
