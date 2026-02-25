@@ -730,23 +730,30 @@ pub fn colorize_square_emojis(s: &str) -> String {
     let mut prev_was_zwj = false;
     for c in s.chars() {
         if c == '\u{200D}' {
-            // Zero Width Joiner - part of an emoji ZWJ sequence (e.g., 🐈‍⬛ black cat)
+            // Zero Width Joiner - buffer it, don't push yet
+            // If followed by a colored square, both get dropped (graceful degradation)
             prev_was_zwj = true;
-            result.push(c);
         } else if let Some((r, g, b)) = colored_square_rgb(c) {
             if prev_was_zwj {
-                // Square is part of a ZWJ sequence - don't replace it
-                result.push(c);
+                // Square is part of a ZWJ sequence (e.g., 🐈‍⬛ black cat)
+                // Drop both the ZWJ and the square - terminal can't render ZWJ sequences,
+                // so just show the base emoji (🐈)
             } else {
                 // Standalone square - replace with colored block characters
-                // Use ANSI true-color (24-bit) foreground code with FULL BLOCK (█)
                 result.push_str(&format!("\x1b[38;2;{};{};{}m██\x1b[0m", r, g, b));
             }
             prev_was_zwj = false;
         } else {
+            if prev_was_zwj {
+                // ZWJ not followed by a colored square - keep it
+                result.push('\u{200D}');
+            }
             prev_was_zwj = false;
             result.push(c);
         }
+    }
+    if prev_was_zwj {
+        result.push('\u{200D}');
     }
     result
 }
