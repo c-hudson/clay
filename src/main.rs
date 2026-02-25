@@ -17692,7 +17692,7 @@ fn process_pending_tf_commands(app: &mut App) {
 }
 
 // Break characters for word wrapping within long words
-const BREAK_CHARS: &[char] = &['[', ']', '(', ')', ',', '\\', '/', '-', '&', '=', '?', '.', ';'];
+const BREAK_CHARS: &[char] = &[']', ')', ',', '\\', '/', '-', '_', '&', '=', '?', ';'];
 
 // Wrap a line with ANSI codes by visible width, preferring to break at word boundaries
 // Similar to CSS white-space: pre-wrap; word-wrap: break-word

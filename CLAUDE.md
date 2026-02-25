@@ -218,8 +218,10 @@ On startup, each world displays a colorful ASCII art splash screen with the tagl
 
 All interfaces (console, web, GUI) use consistent word wrapping for long words:
 
-- Words longer than 15 characters can break at specific characters: `[ ] ( ) , \ / - & = ?`
-- Period (`.`) is excluded to avoid breaking filenames (e.g., `image.png`) and domain names
+- Words longer than 15 characters can break at specific characters: `] ) , \ / - _ & = ? ;`
+- Period (`.`) is excluded to avoid breaking filenames (e.g., `image.png`) and numbers (e.g., `3.14`)
+- Opening brackets `[` `(` are excluded to keep them with the content that follows
+- Underscore (`_`) is included for identifiers (e.g., `my_long_variable_name`)
 - Console: `wrap_ansi_line` tracks break opportunities and uses them when wrapping long words
 - Web: `insertWordBreaks()` inserts zero-width spaces after break characters
 - GUI: `insert_word_breaks()` inserts zero-width spaces, skipping ANSI escape sequences

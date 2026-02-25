@@ -989,8 +989,26 @@
                 clearTimeout(connectionTimeout);
                 connectionTimeout = null;
             }
+            if (wakePongTimeout) {
+                clearTimeout(wakePongTimeout);
+                wakePongTimeout = null;
+            }
             if (ws) ws.readyState = WebSocket.CLOSED;
             authenticated = false;
+            hasReceivedInitialState = false;
+
+            // Server reload - auto-reconnect with retry
+            if (reloadReconnect) {
+                reloadReconnectAttempts++;
+                if (reloadReconnectAttempts <= 5) {
+                    var delay = reloadReconnectAttempts === 1 ? 2000 : 1000;
+                    setTimeout(connect, delay);
+                } else {
+                    reloadReconnect = false;
+                }
+                return;
+            }
+
             showConnecting(false);
             connectionFailures++;
 
@@ -3204,7 +3222,7 @@
     // Must be applied BEFORE parseAnsi (on raw text, not HTML)
     function insertWordBreaks(text) {
         const ZWSP = '\u200B'; // Zero-width space
-        const BREAK_CHARS = ['[', ']', '(', ')', ',', '\\', '/', '-', '&', '=', '?', '.', ';', ' '];
+        const BREAK_CHARS = [']', ')', ',', '\\', '/', '-', '_', '&', '=', '?', ';', ' '];
         const MIN_WORD_LEN = 15;
 
         let result = '';
@@ -6485,6 +6503,16 @@
                     // WebSocket is already closed, reconnect immediately
                     connectionFailures = 0;
                     connect();
+                } else if (ws.readyState === WebSocket.CONNECTING) {
+                    // Still connecting from before sleep - kill it and start fresh
+                    try { ws.close(); } catch (e) {}
+                    connectionFailures = 0;
+                    connect();
+                } else if (ws.readyState === WebSocket.OPEN && !authenticated) {
+                    // Socket open but not authenticated - stale from before sleep
+                    try { ws.close(); } catch (e) {}
+                    connectionFailures = 0;
+                    connect();
                 } else if (ws.readyState === WebSocket.OPEN && authenticated) {
                     // Socket looks open - verify with a ping
                     try {
@@ -6559,6 +6587,57 @@
     // Expose native WebSocket check for debugging
     window.isUsingNativeWebSocket = function() {
         return usingNativeWebSocket;
+    };
+
+    // Called by Android when the 1-hour background shutdown timer fires
+    window.onBackgroundTimeout = function() {
+        debugLog('Background timeout - connection closed by Android');
+        authenticated = false;
+        hasReceivedInitialState = false;
+        // Don't auto-reconnect here - we're in the background and Android disconnected
+        // to save power. Reconnection will happen when user returns (checkConnectionOnResume).
+    };
+
+    // Called by Android onResume when interface is loaded but not connected.
+    // This handles cases where the connection died in the background (timeout,
+    // silent TCP death, etc.) and the visibilitychange event may not fire.
+    window.checkConnectionOnResume = function() {
+        debugLog('checkConnectionOnResume: ws=' + (ws ? ws.readyState : 'null') + ' auth=' + authenticated);
+        if (!ws || ws.readyState === WebSocket.CLOSED || ws.readyState === WebSocket.CLOSING) {
+            // Connection is dead, reconnect
+            connectionFailures = 0;
+            connect();
+        } else if (ws.readyState === WebSocket.CONNECTING) {
+            // Stale connecting attempt, kill and retry
+            try { ws.close(); } catch (e) {}
+            connectionFailures = 0;
+            connect();
+        } else if (ws.readyState === WebSocket.OPEN && !authenticated) {
+            // Socket open but not authenticated - stale
+            try { ws.close(); } catch (e) {}
+            connectionFailures = 0;
+            connect();
+        } else if (ws.readyState === WebSocket.OPEN && authenticated) {
+            // Looks connected - verify with ping (same as visibilitychange handler)
+            if (wakePongTimeout) {
+                clearTimeout(wakePongTimeout);
+                wakePongTimeout = null;
+            }
+            try {
+                ws.send(JSON.stringify({ type: 'Ping' }));
+            } catch (e) {
+                ws.close();
+                connectionFailures = 0;
+                connect();
+                return;
+            }
+            wakePongTimeout = setTimeout(function() {
+                wakePongTimeout = null;
+                if (ws) { ws.close(); }
+                connectionFailures = 0;
+                connect();
+            }, 3000);
+        }
     };
 
     // Start the app

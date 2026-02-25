@@ -727,12 +727,24 @@ pub fn wrap_urls_with_osc8(s: &str) -> String {
 /// (Emoji fonts typically ignore ANSI colors, so we use block characters instead)
 pub fn colorize_square_emojis(s: &str) -> String {
     let mut result = String::with_capacity(s.len() * 2);
+    let mut prev_was_zwj = false;
     for c in s.chars() {
-        if let Some((r, g, b)) = colored_square_rgb(c) {
-            // Replace emoji with two colored block characters (emoji are typically 2 cells wide)
-            // Use ANSI true-color (24-bit) foreground code with FULL BLOCK (█)
-            result.push_str(&format!("\x1b[38;2;{};{};{}m██\x1b[0m", r, g, b));
+        if c == '\u{200D}' {
+            // Zero Width Joiner - part of an emoji ZWJ sequence (e.g., 🐈‍⬛ black cat)
+            prev_was_zwj = true;
+            result.push(c);
+        } else if let Some((r, g, b)) = colored_square_rgb(c) {
+            if prev_was_zwj {
+                // Square is part of a ZWJ sequence - don't replace it
+                result.push(c);
+            } else {
+                // Standalone square - replace with colored block characters
+                // Use ANSI true-color (24-bit) foreground code with FULL BLOCK (█)
+                result.push_str(&format!("\x1b[38;2;{};{};{}m██\x1b[0m", r, g, b));
+            }
+            prev_was_zwj = false;
         } else {
+            prev_was_zwj = false;
             result.push(c);
         }
     }

@@ -2698,6 +2698,7 @@ impl RemoteGuiApp {
         let mut style = AnsiStyle { blink_visible, ..Default::default() };
         let mut chars = text.chars().peekable();
         let mut segment = String::new();
+        let mut prev_was_zwj = false;
 
         while let Some(c) = chars.next() {
             if c == '\x1b' && chars.peek() == Some(&'[') {
@@ -2901,29 +2902,38 @@ impl RemoteGuiApp {
                     }
                     i += 1;
                 }
+            } else if c == '\u{200D}' {
+                // Zero Width Joiner - part of ZWJ emoji sequence
+                prev_was_zwj = true;
+                segment.push(c);
             } else {
                 // Check for colored square emoji and render as colored blocks
-                if let Some((r, g, b)) = Self::colored_square_rgb(c) {
-                    // Flush current segment first
-                    if !segment.is_empty() {
-                        Self::append_segment_with_shades(&segment, &font_id, current_color, current_bg, theme_bg, color_offset_percent, &style, job);
-                        segment.clear();
+                // But not if it's part of a ZWJ sequence (e.g., 🐈‍⬛ = cat + ZWJ + ⬛)
+                if !prev_was_zwj {
+                    if let Some((r, g, b)) = Self::colored_square_rgb(c) {
+                        // Flush current segment first
+                        if !segment.is_empty() {
+                            Self::append_segment_with_shades(&segment, &font_id, current_color, current_bg, theme_bg, color_offset_percent, &style, job);
+                            segment.clear();
+                        }
+                        // Add two block characters with the emoji's color
+                        let square_color = egui::Color32::from_rgb(r, g, b);
+                        job.append(
+                            "██",
+                            0.0,
+                            egui::TextFormat {
+                                font_id: font_id.clone(),
+                                color: square_color,
+                                background: current_bg,
+                                ..Default::default()
+                            },
+                        );
+                        prev_was_zwj = false;
+                        continue;
                     }
-                    // Add two block characters with the emoji's color
-                    let square_color = egui::Color32::from_rgb(r, g, b);
-                    job.append(
-                        "██",
-                        0.0,
-                        egui::TextFormat {
-                            font_id: font_id.clone(),
-                            color: square_color,
-                            background: current_bg,
-                            ..Default::default()
-                        },
-                    );
-                } else {
-                    segment.push(c);
                 }
+                prev_was_zwj = false;
+                segment.push(c);
             }
         }
 
@@ -3075,14 +3085,25 @@ impl RemoteGuiApp {
                 DiscordSegment::Text(txt) => {
                     // Split text at colored square emoji
                     let mut current_text = String::new();
+                    let mut prev_zwj = false;
                     for c in txt.chars() {
-                        if let Some(color) = Self::colored_square_color(c) {
-                            if !current_text.is_empty() {
-                                segments.push(DiscordSegment::Text(current_text.clone()));
-                                current_text.clear();
+                        if c == '\u{200D}' {
+                            prev_zwj = true;
+                            current_text.push(c);
+                        } else if !prev_zwj {
+                            if let Some(color) = Self::colored_square_color(c) {
+                                if !current_text.is_empty() {
+                                    segments.push(DiscordSegment::Text(current_text.clone()));
+                                    current_text.clear();
+                                }
+                                segments.push(DiscordSegment::ColoredSquare(color));
+                                prev_zwj = false;
+                            } else {
+                                prev_zwj = false;
+                                current_text.push(c);
                             }
-                            segments.push(DiscordSegment::ColoredSquare(color));
                         } else {
+                            prev_zwj = false;
                             current_text.push(c);
                         }
                     }
@@ -3115,7 +3136,7 @@ impl RemoteGuiApp {
     /// Skips ANSI escape sequences to avoid corrupting them
     fn insert_word_breaks(text: &str) -> String {
         const ZWSP: char = '\u{200B}'; // Zero-width space
-        const BREAK_CHARS: &[char] = &['[', ']', '(', ')', ',', '\\', '/', '-', '&', '=', '?', '.', ';', ' '];
+        const BREAK_CHARS: &[char] = &[']', ')', ',', '\\', '/', '-', '_', '&', '=', '?', ';', ' '];
         const MIN_WORD_LEN: usize = 15;
 
         let mut result = String::with_capacity(text.len() * 2);
