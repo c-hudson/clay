@@ -26,6 +26,7 @@ Other commands:
 cargo build --features remote-gui    # Build with remote GUI client (requires X11/Wayland)
 cargo run                            # Run the client
 cargo run -- --remote=host:port      # Run as remote GUI client
+cargo run -- --webview=host:port     # Run as webview GUI client
 cargo test                           # Run all tests
 cargo test test_name                 # Run a single test
 cargo clippy                         # Lint
@@ -116,6 +117,9 @@ cargo build --features remote-gui
 # Build with GUI and audio support
 cargo build --features remote-gui-audio
 
+# Build with GUI, audio, and webview support
+cargo build --features remote-gui-audio,webview-gui
+
 # Output: target/debug/clay
 ```
 
@@ -126,9 +130,9 @@ cargo build --features remote-gui-audio
 rustup target add x86_64-apple-darwin
 rustup target add aarch64-apple-darwin
 
-# Build for both architectures with GUI and audio
-cargo build --release --target x86_64-apple-darwin --features remote-gui-audio
-cargo build --release --target aarch64-apple-darwin --features remote-gui-audio
+# Build for both architectures with GUI, audio, and webview
+cargo build --release --target x86_64-apple-darwin --features remote-gui-audio,webview-gui
+cargo build --release --target aarch64-apple-darwin --features remote-gui-audio,webview-gui
 
 # Combine into universal binary
 lipo -create \
@@ -153,6 +157,7 @@ file clay-macos-universal
 - Hot reload (`/reload`, `Ctrl+R`, `SIGUSR1`)
 - TLS proxy for preserving connections across reload
 - Remote GUI client (native Cocoa window)
+- WebView GUI client (with `webview-gui` feature)
 - ANSI music playback (with `remote-gui-audio` feature)
 - WebSocket/HTTP/HTTPS servers
 - Spell checking (`/usr/share/dict/words` exists on macOS)
@@ -436,6 +441,7 @@ Prompts that are auto-answered are immediately cleared and not displayed in the 
 
 **Remote GUI:**
 - `src/remote_gui.rs` - Remote GUI client (egui, WebSocket connection)
+- `src/webview_gui.rs` - WebView GUI client (wry/tao, WebSocket connection via embedded web interface)
 
 **Web Interface:**
 - `src/web/index.html` - Web interface HTML template
