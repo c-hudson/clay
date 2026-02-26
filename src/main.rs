@@ -15,6 +15,8 @@ pub mod daemon;
 pub mod theme;
 #[cfg(feature = "remote-gui")]
 pub mod remote_gui;
+#[cfg(feature = "webview-gui")]
+pub mod webview_gui;
 #[cfg(test)]
 pub mod testserver;
 #[cfg(test)]
@@ -961,6 +963,7 @@ pub struct Settings {
     web_font_size_phone: f32,
     web_font_size_tablet: f32,
     web_font_size_desktop: f32,
+    web_font_weight: u16,
     // Web server settings (consolidated)
     web_secure: bool,              // Protocol: true=Secure (https/wss), false=Non-Secure (http/ws)
     http_enabled: bool,            // Enable HTTP/HTTPS web server (name depends on web_secure)
@@ -984,6 +987,8 @@ pub struct Settings {
     editor_side: EditorSide,
     // Mouse click support for console popups
     mouse_enabled: bool,
+    // ZWJ emoji sequence handling (true = pass through, false = strip ZWJ + colored square)
+    zwj_enabled: bool,
 }
 
 impl Default for Settings {
@@ -1005,6 +1010,7 @@ impl Default for Settings {
             web_font_size_phone: 10.0,   // Default for phones
             web_font_size_tablet: 14.0,  // Default for tablets
             web_font_size_desktop: 18.0, // Default for desktop
+            web_font_weight: 400,      // Default font weight (normal)
             web_secure: false,         // Default to non-secure
             http_enabled: false,
             http_port: 9000,
@@ -1021,6 +1027,7 @@ impl Default for Settings {
             dictionary_path: String::new(),
             editor_side: EditorSide::Left,
             mouse_enabled: true,
+            zwj_enabled: false,
         }
     }
 }
@@ -1192,6 +1199,8 @@ pub enum Command {
     Flush,
     /// /menu - show menu popup to select windows/popups
     Menu,
+    /// /font - show font settings popup (web/GUI only)
+    Font,
     /// /send [-W] [-w<world>] [-n] <text> - send text
     Send { text: String, all_worlds: bool, target_world: Option<String>, no_newline: bool },
     /// /keepalive - show keepalive settings
@@ -1288,6 +1297,7 @@ pub fn parse_command(input: &str) -> Command {
         "/disconnect" | "/dc" => Command::Disconnect,
         "/flush" => Command::Flush,
         "/menu" => Command::Menu,
+        "/font" => Command::Font,
         "/send" => parse_send_command(args, trimmed),
         "/keepalive" => Command::Keepalive,
         "/gag" => {
@@ -2533,6 +2543,8 @@ pub struct App {
     pub server_activity_count: usize,
     /// Master GUI mode: channel to send messages to the embedded GUI
     pub gui_tx: Option<mpsc::UnboundedSender<WsMessage>>,
+    /// Master GUI mode: callback to wake the GUI for immediate repaint
+    pub gui_repaint: Option<std::sync::Arc<dyn Fn() + Send + Sync>>,
     /// Console media player command ("mpv", "ffplay", or None)
     pub media_player_cmd: Option<String>,
     /// Directory for cached media files
@@ -2607,6 +2619,7 @@ impl App {
             ws_client_tx: None, // Set when running as remote client (--console mode)
             server_activity_count: 0, // Activity count from server (remote client mode)
             gui_tx: None, // Set when running in master GUI mode (--gui)
+            gui_repaint: None,
             media_player_cmd: detect_media_player(),
             media_cache_dir: {
                 let home = get_home_dir();
@@ -2652,6 +2665,7 @@ impl App {
             web_font_size_phone: self.settings.web_font_size_phone,
             web_font_size_tablet: self.settings.web_font_size_tablet,
             web_font_size_desktop: self.settings.web_font_size_desktop,
+            web_font_weight: self.settings.web_font_weight,
             ws_allow_list: self.settings.websocket_allow_list.clone(),
             web_secure: self.settings.web_secure,
             http_enabled: self.settings.http_enabled,
@@ -2663,6 +2677,7 @@ impl App {
             tls_proxy_enabled: self.settings.tls_proxy_enabled,
             dictionary_path: self.settings.dictionary_path.clone(),
             mouse_enabled: self.settings.mouse_enabled,
+            zwj_enabled: self.settings.zwj_enabled,
             theme_colors_json: self.gui_theme_colors().to_json(),
         }
     }
@@ -2688,6 +2703,7 @@ impl App {
         self.settings.web_font_size_phone = settings.web_font_size_phone;
         self.settings.web_font_size_tablet = settings.web_font_size_tablet;
         self.settings.web_font_size_desktop = settings.web_font_size_desktop;
+        self.settings.web_font_weight = settings.web_font_weight;
         self.settings.websocket_allow_list = settings.ws_allow_list.clone();
         self.settings.web_secure = settings.web_secure;
         self.settings.http_enabled = settings.http_enabled;
@@ -2699,6 +2715,7 @@ impl App {
         self.settings.tls_proxy_enabled = settings.tls_proxy_enabled;
         self.settings.dictionary_path = settings.dictionary_path.clone();
         self.settings.mouse_enabled = settings.mouse_enabled;
+        self.settings.zwj_enabled = settings.zwj_enabled;
     }
 
     /// Ensure there's at least one world (creates initial world if needed)
@@ -2968,6 +2985,7 @@ impl App {
             &self.settings.dictionary_path,
             self.settings.editor_side.name(),
             self.settings.mouse_enabled,
+            self.settings.zwj_enabled,
         );
         self.popup_manager.open(def);
 
@@ -3397,6 +3415,10 @@ impl App {
                     }
                     Command::Menu => {
                         self.open_menu_popup_new();
+                    }
+                    Command::Font => {
+                        // Font popup is handled by each client type locally
+                        // Remote GUI opens its own font popup
                     }
                     _ => {
                         // Unknown local command - ignore or log
@@ -4146,6 +4168,10 @@ impl App {
         // Send to embedded GUI channel (master GUI mode)
         if let Some(ref tx) = self.gui_tx {
             let _ = tx.send(msg.clone());
+            // Wake the GUI for immediate repaint
+            if let Some(ref repaint) = self.gui_repaint {
+                repaint();
+            }
         }
         // Broadcast to WebSocket server
         if let Some(ref server) = self.ws_server {
@@ -4190,6 +4216,9 @@ impl App {
         if client_id == 0 {
             if let Some(ref tx) = self.gui_tx {
                 let _ = tx.send(msg);
+                if let Some(ref repaint) = self.gui_repaint {
+                    repaint();
+                }
             }
             return;
         }
@@ -5010,10 +5039,13 @@ impl App {
 
             // Send auto-login if configured
             let skip_login = self.worlds[world_idx].skip_auto_login;
-            self.worlds[world_idx].skip_auto_login = false;
             let user = self.worlds[world_idx].settings.user.clone();
             let password = self.worlds[world_idx].settings.password.clone();
             let auto_connect_type = self.worlds[world_idx].settings.auto_connect_type;
+            // Only clear skip flag here for Connect type; Prompt/MooPrompt check it later in handle_prompt
+            if auto_connect_type == AutoConnectType::Connect {
+                self.worlds[world_idx].skip_auto_login = false;
+            }
             if !skip_login && !user.is_empty() && !password.is_empty() && auto_connect_type == AutoConnectType::Connect {
                 let connect_cmd = format!("connect {} {}", user, password);
                 let _ = cmd_tx.try_send(WriteCommand::Text(connect_cmd));
@@ -5545,7 +5577,7 @@ impl App {
                 });
             }
             // UI popup commands - send back to client for local handling
-            Command::Help | Command::Menu | Command::Setup | Command::Web | Command::Actions { .. } |
+            Command::Help | Command::Menu | Command::Font | Command::Setup | Command::Web | Command::Actions { .. } |
             Command::WorldsList | Command::WorldSelector | Command::WorldEdit { .. } => {
                 self.ws_send_to_client(client_id, WsMessage::ExecuteLocalCommand { command: command.to_string() });
             }
@@ -6028,7 +6060,7 @@ impl App {
                     });
                 }
             }
-            WsMessage::UpdateGlobalSettings { more_mode_enabled, spell_check_enabled, temp_convert_enabled, world_switch_mode, show_tags, debug_enabled, ansi_music_enabled, console_theme, gui_theme, gui_transparency, color_offset_percent, input_height, font_name, font_size, web_font_size_phone, web_font_size_tablet, web_font_size_desktop, ws_allow_list, web_secure, http_enabled, http_port, ws_enabled, ws_port, ws_cert_file, ws_key_file, tls_proxy_enabled, dictionary_path, mouse_enabled } => {
+            WsMessage::UpdateGlobalSettings { more_mode_enabled, spell_check_enabled, temp_convert_enabled, world_switch_mode, show_tags, debug_enabled, ansi_music_enabled, console_theme, gui_theme, gui_transparency, color_offset_percent, input_height, font_name, font_size, web_font_size_phone, web_font_size_tablet, web_font_size_desktop, web_font_weight, ws_allow_list, web_secure, http_enabled, http_port, ws_enabled, ws_port, ws_cert_file, ws_key_file, tls_proxy_enabled, dictionary_path, mouse_enabled, zwj_enabled } => {
                 // Update global settings from remote client
                 self.settings.more_mode_enabled = more_mode_enabled;
                 self.settings.spell_check_enabled = spell_check_enabled;
@@ -6050,6 +6082,7 @@ impl App {
                 self.settings.web_font_size_phone = web_font_size_phone.clamp(8.0, 48.0);
                 self.settings.web_font_size_tablet = web_font_size_tablet.clamp(8.0, 48.0);
                 self.settings.web_font_size_desktop = web_font_size_desktop.clamp(8.0, 48.0);
+                self.settings.web_font_weight = web_font_weight.clamp(100, 900);
                 self.settings.websocket_allow_list = ws_allow_list.clone();
                 // Update the running WebSocket server's allow list
                 if let Some(ref server) = self.ws_server {
@@ -6065,6 +6098,7 @@ impl App {
                 self.settings.websocket_key_file = ws_key_file;
                 self.settings.tls_proxy_enabled = tls_proxy_enabled;
                 self.settings.mouse_enabled = mouse_enabled;
+                self.settings.zwj_enabled = zwj_enabled;
                 if self.settings.dictionary_path != dictionary_path {
                     self.settings.dictionary_path = dictionary_path;
                     self.spell_checker = SpellChecker::new(&self.settings.dictionary_path);
@@ -6090,6 +6124,7 @@ impl App {
                     web_font_size_phone: self.settings.web_font_size_phone,
                     web_font_size_tablet: self.settings.web_font_size_tablet,
                     web_font_size_desktop: self.settings.web_font_size_desktop,
+                    web_font_weight: self.settings.web_font_weight,
                     ws_allow_list: self.settings.websocket_allow_list.clone(),
                     web_secure: self.settings.web_secure,
                     http_enabled: self.settings.http_enabled,
@@ -6101,6 +6136,7 @@ impl App {
                     tls_proxy_enabled: self.settings.tls_proxy_enabled,
                     dictionary_path: self.settings.dictionary_path.clone(),
                     mouse_enabled: self.settings.mouse_enabled,
+                    zwj_enabled: self.settings.zwj_enabled,
                     theme_colors_json: self.gui_theme_colors().to_json(),
                 };
                 // Broadcast update to all clients
@@ -6659,6 +6695,7 @@ impl App {
             web_font_size_phone: self.settings.web_font_size_phone,
             web_font_size_tablet: self.settings.web_font_size_tablet,
             web_font_size_desktop: self.settings.web_font_size_desktop,
+            web_font_weight: self.settings.web_font_weight,
             ws_allow_list: self.settings.websocket_allow_list.clone(),
             web_secure: self.settings.web_secure,
             http_enabled: self.settings.http_enabled,
@@ -6670,6 +6707,7 @@ impl App {
             tls_proxy_enabled: self.settings.tls_proxy_enabled,
             dictionary_path: self.settings.dictionary_path.clone(),
             mouse_enabled: self.settings.mouse_enabled,
+            zwj_enabled: self.settings.zwj_enabled,
             theme_colors_json: self.gui_theme_colors().to_json(),
         };
 
@@ -8342,6 +8380,9 @@ fn handle_remote_client_key(
                     Command::Menu => {
                         app.open_menu_popup_new();
                     }
+                    Command::Font => {
+                        app.add_output("Font settings are available in the web and GUI interfaces.");
+                    }
                     Command::Setup => {
                         app.open_setup_popup_new();
                     }
@@ -8425,6 +8466,7 @@ fn handle_remote_client_key(
                     let _ = execute!(std::io::stdout(), DisableMouseCapture);
                     app.mouse_capture_active = false;
                 }
+                app.settings.zwj_enabled = settings.zwj_enabled;
 
                 // Send UpdateGlobalSettings to daemon
                 let _ = ws_tx.send(WsMessage::UpdateGlobalSettings {
@@ -8445,6 +8487,7 @@ fn handle_remote_client_key(
                     web_font_size_phone: app.settings.web_font_size_phone,
                     web_font_size_tablet: app.settings.web_font_size_tablet,
                     web_font_size_desktop: app.settings.web_font_size_desktop,
+                    web_font_weight: app.settings.web_font_weight,
                     ws_allow_list: app.settings.websocket_allow_list.clone(),
                     web_secure: app.settings.web_secure,
                     http_enabled: app.settings.http_enabled,
@@ -8456,6 +8499,7 @@ fn handle_remote_client_key(
                     tls_proxy_enabled: app.settings.tls_proxy_enabled,
                     dictionary_path: app.settings.dictionary_path.clone(),
                     mouse_enabled: app.settings.mouse_enabled,
+                    zwj_enabled: app.settings.zwj_enabled,
                 });
             }
             NewPopupAction::WebSaved(settings) => {
@@ -8489,6 +8533,7 @@ fn handle_remote_client_key(
                     web_font_size_phone: app.settings.web_font_size_phone,
                     web_font_size_tablet: app.settings.web_font_size_tablet,
                     web_font_size_desktop: app.settings.web_font_size_desktop,
+                    web_font_weight: app.settings.web_font_weight,
                     ws_allow_list: app.settings.websocket_allow_list.clone(),
                     web_secure: app.settings.web_secure,
                     http_enabled: app.settings.http_enabled,
@@ -8500,6 +8545,7 @@ fn handle_remote_client_key(
                     tls_proxy_enabled: app.settings.tls_proxy_enabled,
                     dictionary_path: app.settings.dictionary_path.clone(),
                     mouse_enabled: app.settings.mouse_enabled,
+                    zwj_enabled: app.settings.zwj_enabled,
                 });
             }
             NewPopupAction::ConnectionsClose => {
@@ -8897,6 +8943,9 @@ fn handle_remote_client_key(
                     Command::Menu => {
                         app.open_menu_popup_new();
                     }
+                    Command::Font => {
+                        app.add_output("Font settings are available in the web and GUI interfaces.");
+                    }
                     Command::Setup => {
                         app.open_setup_popup_new();
                     }
@@ -9087,6 +9136,7 @@ struct SetupSettings {
     dictionary_path: String,
     editor_side: String,
     mouse_enabled: bool,
+    zwj_enabled: bool,
 }
 
 /// Settings from the web popup
@@ -9166,7 +9216,7 @@ fn handle_new_popup_key(app: &mut App, key: KeyEvent) -> NewPopupAction {
         SETUP_FIELD_MORE_MODE, SETUP_FIELD_SPELL_CHECK, SETUP_FIELD_TEMP_CONVERT,
         SETUP_FIELD_WORLD_SWITCHING, SETUP_FIELD_DEBUG,
         SETUP_FIELD_INPUT_HEIGHT, SETUP_FIELD_GUI_THEME, SETUP_FIELD_TLS_PROXY,
-        SETUP_FIELD_DICTIONARY, SETUP_FIELD_EDITOR_SIDE, SETUP_FIELD_MOUSE,
+        SETUP_FIELD_DICTIONARY, SETUP_FIELD_EDITOR_SIDE, SETUP_FIELD_MOUSE, SETUP_FIELD_ZWJ,
         SETUP_BTN_SAVE, SETUP_BTN_CANCEL,
     };
     use popup::definitions::web::{
@@ -9388,6 +9438,7 @@ fn handle_new_popup_key(app: &mut App, key: KeyEvent) -> NewPopupAction {
                     editor_side: state.get_selected(SETUP_FIELD_EDITOR_SIDE)
                         .unwrap_or("left").to_string(),
                     mouse_enabled: state.get_bool(SETUP_FIELD_MOUSE).unwrap_or(true),
+                    zwj_enabled: state.get_bool(SETUP_FIELD_ZWJ).unwrap_or(false),
                 }
             };
 
@@ -10670,9 +10721,41 @@ async fn main() -> io::Result<()> {
             }
         });
 
-    if gui_arg.is_some() && console_arg.is_some() {
-        eprintln!("Error: --gui and --console are mutually exclusive.");
+    // Parse --webgui or --webgui=host:port
+    let webgui_arg = std::env::args()
+        .find(|a| a == "--webgui" || a.starts_with("--webgui="))
+        .and_then(|a| {
+            if a == "--webgui" {
+                Some(None)
+            } else {
+                a.strip_prefix("--webgui=").map(|addr| Some(addr.to_string()))
+            }
+        });
+
+    // Check mutual exclusivity of GUI mode flags
+    let mode_count = [gui_arg.is_some(), console_arg.is_some(), webgui_arg.is_some()]
+        .iter().filter(|&&x| x).count();
+    if mode_count > 1 {
+        eprintln!("Error: --gui, --console, and --webgui are mutually exclusive.");
         return Ok(());
+    }
+
+    // Handle --webgui before other GUI modes
+    if let Some(webgui) = webgui_arg {
+        #[cfg(feature = "webview-gui")]
+        {
+            return match webgui {
+                Some(ref addr) => webview_gui::run_remote_webgui(addr),
+                None => webview_gui::run_master_webgui(),
+            };
+        }
+        #[cfg(not(feature = "webview-gui"))]
+        {
+            let _ = webgui;
+            eprintln!("Error: --webgui requires the 'webview-gui' feature.");
+            eprintln!("Rebuild with: cargo build --features webview-gui");
+            return Ok(());
+        }
     }
 
     let has_gui_flag = gui_arg.is_some();
@@ -10838,9 +10921,13 @@ async fn main() -> io::Result<()> {
 pub async fn run_app_headless(
     gui_tx: mpsc::UnboundedSender<WsMessage>,
     mut gui_rx: mpsc::UnboundedReceiver<WsMessage>,
+    ws_override: Option<(u16, String)>,  // (port, password) for auto-started WS
+    gui_repaint: Option<std::sync::Arc<dyn Fn() + Send + Sync>>,
 ) -> io::Result<()> {
     let mut app = App::new();
     app.gui_tx = Some(gui_tx.clone());
+    let gui_repaint_clone = gui_repaint.clone();
+    app.gui_repaint = gui_repaint;
 
     // Check if we're in reload mode (via --reload command line argument)
     let is_reload = std::env::args().any(|a| a == "--reload");
@@ -11081,6 +11168,13 @@ pub async fn run_app_headless(
         }
     }
 
+    // Apply WS override for webview-gui master mode (local-only WS server)
+    if let Some((ws_port, ref ws_password)) = ws_override {
+        app.settings.ws_enabled = true;
+        app.settings.ws_port = ws_port;
+        app.settings.websocket_password = ws_password.clone();
+    }
+
     // Start WebSocket server if enabled
     if app.settings.ws_enabled && !app.settings.websocket_password.is_empty() {
         let mut server = WebSocketServer::new(
@@ -11091,6 +11185,11 @@ pub async fn run_app_headless(
             false,
             app.ban_list.clone(),
         );
+
+        // Bind to localhost only for webview-gui master mode
+        if ws_override.is_some() {
+            server.bind_addr = "127.0.0.1".to_string();
+        }
 
         #[cfg(feature = "native-tls-backend")]
         let tls_configured = if app.settings.web_secure
@@ -11193,8 +11292,9 @@ pub async fn run_app_headless(
         }
     }
 
-    // Re-set gui_tx after potential reload state load (reload clears it)
+    // Re-set gui_tx and repaint callback after potential reload state load (reload clears them)
     app.gui_tx = Some(gui_tx);
+    app.gui_repaint = gui_repaint_clone;
 
     // Send initial state to the GUI
     let initial_state = app.build_initial_state();
@@ -11205,17 +11305,20 @@ pub async fn run_app_headless(
     let mut keepalive_interval = tokio::time::interval(Duration::from_secs(60));
     keepalive_interval.tick().await;
 
-    // Prompt timeout detection
-    let mut prompt_check_interval = tokio::time::interval(Duration::from_millis(150));
-    prompt_check_interval.tick().await;
+    // Conditional timers: sleep far-future when inactive, reset to short interval when needed.
+    const FAR_FUTURE: Duration = Duration::from_secs(86400);
 
-    // TF repeat process ticks
-    let mut process_tick_interval = tokio::time::interval(Duration::from_secs(1));
-    process_tick_interval.tick().await;
+    // Prompt timeout detection — only active when a world has wont_echo_time set
+    let prompt_check_sleep = tokio::time::sleep(FAR_FUTURE);
+    tokio::pin!(prompt_check_sleep);
 
-    // Pending count update interval (2 seconds) for Phase 3 output routing
-    let mut pending_update_interval = tokio::time::interval(Duration::from_secs(2));
-    pending_update_interval.tick().await;
+    // TF repeat process ticks — only active when processes exist
+    let process_tick_sleep = tokio::time::sleep(FAR_FUTURE);
+    tokio::pin!(process_tick_sleep);
+
+    // Pending count broadcast — only active when worlds have pending lines
+    let pending_update_sleep = tokio::time::sleep(FAR_FUTURE);
+    tokio::pin!(pending_update_sleep);
 
     // SIGUSR1 handler for hot reload
     #[cfg(all(unix, not(target_os = "android")))]
@@ -11277,6 +11380,14 @@ pub async fn run_app_headless(
                             let commands = app.process_server_data(
                                 world_idx, bytes, 24, 80, true,
                             );
+                            // Activate prompt check if server data set wont_echo_time
+                            if app.worlds[world_idx].wont_echo_time.is_some() {
+                                prompt_check_sleep.as_mut().reset(tokio::time::Instant::now() + Duration::from_millis(150));
+                            }
+                            // Activate pending update if lines were paused
+                            if !app.worlds[world_idx].pending_lines.is_empty() {
+                                pending_update_sleep.as_mut().reset(tokio::time::Instant::now() + Duration::from_secs(2));
+                            }
                             let saved_current_world = app.current_world_index;
                             app.current_world_index = world_idx;
                             for cmd in commands {
@@ -11555,8 +11666,8 @@ pub async fn run_app_headless(
                 }
             }
 
-            // Prompt timeout check
-            _ = prompt_check_interval.tick() => {
+            // Prompt timeout check — only fires when a world has wont_echo_time set
+            _ = &mut prompt_check_sleep => {
                 let now = std::time::Instant::now();
                 for world in &mut app.worlds {
                     if let Some(wont_echo_time) = world.wont_echo_time {
@@ -11617,10 +11728,17 @@ pub async fn run_app_headless(
                         }
                     }
                 }
+                // Re-arm: check again in 150ms if any world still needs it
+                let any_pending = app.worlds.iter().any(|w| w.wont_echo_time.is_some());
+                if any_pending {
+                    prompt_check_sleep.as_mut().reset(tokio::time::Instant::now() + Duration::from_millis(150));
+                } else {
+                    prompt_check_sleep.as_mut().reset(tokio::time::Instant::now() + FAR_FUTURE);
+                }
             }
 
-            // TF repeat process tick
-            _ = process_tick_interval.tick() => {
+            // TF repeat process tick — only fires when processes exist
+            _ = &mut process_tick_sleep => {
                 let now = std::time::Instant::now();
                 let mut to_remove = vec![];
                 let process_count = app.tf_engine.processes.len();
@@ -11701,10 +11819,16 @@ pub async fn run_app_headless(
                 for i in to_remove.into_iter().rev() {
                     app.tf_engine.processes.remove(i);
                 }
+                // Re-arm: tick again in 1s if processes remain
+                if !app.tf_engine.processes.is_empty() {
+                    process_tick_sleep.as_mut().reset(tokio::time::Instant::now() + Duration::from_secs(1));
+                } else {
+                    process_tick_sleep.as_mut().reset(tokio::time::Instant::now() + FAR_FUTURE);
+                }
             }
 
-            // Pending count update timer (every 2 seconds) - broadcast to world viewers if changed
-            _ = pending_update_interval.tick() => {
+            // Pending count update — only fires when worlds have pending lines
+            _ = &mut pending_update_sleep => {
                 let now = std::time::Instant::now();
                 for world in app.worlds.iter_mut() {
                     // Only send updates if world has pending lines and count has changed
@@ -11734,6 +11858,20 @@ pub async fn run_app_headless(
                         });
                     }
                 }
+                // Re-arm: check again in 2s if any world still has pending lines
+                let any_pending = app.worlds.iter().any(|w| !w.pending_lines.is_empty());
+                if any_pending {
+                    pending_update_sleep.as_mut().reset(tokio::time::Instant::now() + Duration::from_secs(2));
+                } else {
+                    pending_update_sleep.as_mut().reset(tokio::time::Instant::now() + FAR_FUTURE);
+                }
+            }
+        }
+
+        // Activate process tick sleep if processes were added during this iteration
+        if !app.tf_engine.processes.is_empty() {
+            if process_tick_sleep.deadline() > tokio::time::Instant::now() + Duration::from_secs(2) {
+                process_tick_sleep.as_mut().reset(tokio::time::Instant::now() + Duration::from_secs(1));
             }
         }
     }
@@ -12525,17 +12663,21 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
     // Skip the first tick which fires immediately
     keepalive_interval.tick().await;
 
-    // Create interval for prompt timeout detection (150ms)
-    let mut prompt_check_interval = tokio::time::interval(Duration::from_millis(150));
-    prompt_check_interval.tick().await;
+    // Conditional timers: sleep far-future when inactive, reset to short interval when needed.
+    // This eliminates ~8 wakeups/sec when idle (was: 6.7 + 1.0 + 0.5).
+    const FAR_FUTURE: Duration = Duration::from_secs(86400);
 
-    // Create interval for TF repeat process ticks (1 second)
-    let mut process_tick_interval = tokio::time::interval(Duration::from_secs(1));
-    process_tick_interval.tick().await;
+    // Prompt timeout detection — only active when a world has wont_echo_time set
+    let prompt_check_sleep = tokio::time::sleep(FAR_FUTURE);
+    tokio::pin!(prompt_check_sleep);
 
-    // Pending count update interval (2 seconds) for Phase 3 output routing
-    let mut pending_update_interval = tokio::time::interval(Duration::from_secs(2));
-    pending_update_interval.tick().await;
+    // TF repeat process ticks — only active when processes exist
+    let process_tick_sleep = tokio::time::sleep(FAR_FUTURE);
+    tokio::pin!(process_tick_sleep);
+
+    // Pending count broadcast — only active when worlds have pending lines
+    let pending_update_sleep = tokio::time::sleep(FAR_FUTURE);
+    tokio::pin!(pending_update_sleep);
 
     // Set the app pointer for crash recovery
     // SAFETY: app lives for the duration of this function and the pointer is only used
@@ -12595,6 +12737,9 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
             debug_log(true, &format!("LOOP: iteration {}", loop_count));
         }
 
+        // Track whether this iteration changed visible state requiring a redraw
+        let mut needs_draw = false;
+
         // Reap any zombie child processes (TLS proxies that have exited)
         // This is a fast non-blocking call that prevents defunct processes from accumulating
         #[cfg(all(unix, not(target_os = "android")))]
@@ -12604,6 +12749,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
         tokio::select! {
             // Terminal events (keyboard and mouse input)
             maybe_event = event_stream.next() => {
+                needs_draw = true;
                 if let Some(Ok(event)) = maybe_event {
                 // Handle mouse events
                 if let Event::Mouse(mouse) = event {
@@ -12966,6 +13112,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
 
             // Server events (data from MUD connections)
             Some(event) = event_rx.recv() => {
+                needs_draw = true;
                 match event {
                     AppEvent::ServerData(ref world_name, bytes) => {
                         if let Some(world_idx) = app.find_world_index(world_name) {
@@ -12979,6 +13126,15 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                 console_width,
                                 false, // not daemon mode
                             );
+
+                            // Activate prompt check if server data set wont_echo_time
+                            if app.worlds[world_idx].wont_echo_time.is_some() {
+                                prompt_check_sleep.as_mut().reset(tokio::time::Instant::now() + Duration::from_millis(150));
+                            }
+                            // Activate pending update if lines were paused
+                            if !app.worlds[world_idx].pending_lines.is_empty() {
+                                pending_update_sleep.as_mut().reset(tokio::time::Instant::now() + Duration::from_secs(2));
+                            }
 
                             // Check if terminal needs full redraw (after splash clear)
                             if app.worlds[world_idx].needs_redraw {
@@ -13361,6 +13517,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
 
             // Periodic timer for clock updates and keepalive checks (once per minute)
             _ = keepalive_interval.tick() => {
+                needs_draw = true; // Clock display updates every minute
                 // Check keepalive for all connected worlds (send NOP if no activity in 5 min)
                 for world in &mut app.worlds {
                     if world.connected {
@@ -13438,8 +13595,8 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                 // Redraw to update the clock display in separator bar
             }
 
-            // Prompt timeout check (every 150ms)
-            _ = prompt_check_interval.tick() => {
+            // Prompt timeout check — only fires when a world has wont_echo_time set
+            _ = &mut prompt_check_sleep => {
                 let now = std::time::Instant::now();
                 for world in &mut app.worlds {
                     // Check if there's a partial line waiting to become a prompt
@@ -13448,6 +13605,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                         if now.duration_since(wont_echo_time) >= Duration::from_millis(150) {
                             // Check if there's a partial line to extract as prompt
                             if !world.trigger_partial_line.is_empty() && world.prompt.is_empty() {
+                                needs_draw = true; // Prompt extracted — redraw input area
                                 // Extract partial line as prompt
                                 let prompt_text = std::mem::take(&mut world.trigger_partial_line);
                                 let normalized = crate::util::normalize_prompt(&prompt_text);
@@ -13504,10 +13662,18 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                         }
                     }
                 }
+                // Re-arm: check again in 150ms if any world still needs it
+                let any_pending_prompt = app.worlds.iter().any(|w| w.wont_echo_time.is_some());
+                if any_pending_prompt {
+                    prompt_check_sleep.as_mut().reset(tokio::time::Instant::now() + Duration::from_millis(150));
+                } else {
+                    prompt_check_sleep.as_mut().reset(tokio::time::Instant::now() + FAR_FUTURE);
+                }
             }
 
-            // TF repeat process tick
-            _ = process_tick_interval.tick() => {
+            // TF repeat process tick — only fires when processes exist
+            _ = &mut process_tick_sleep => {
+                needs_draw = true; // Process may produce output
                 let now = std::time::Instant::now();
                 let mut to_remove = vec![];
                 let process_count = app.tf_engine.processes.len();
@@ -13594,10 +13760,16 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                 for i in to_remove.into_iter().rev() {
                     app.tf_engine.processes.remove(i);
                 }
+                // Re-arm: tick again in 1s if processes remain
+                if !app.tf_engine.processes.is_empty() {
+                    process_tick_sleep.as_mut().reset(tokio::time::Instant::now() + Duration::from_secs(1));
+                } else {
+                    process_tick_sleep.as_mut().reset(tokio::time::Instant::now() + FAR_FUTURE);
+                }
             }
 
-            // Pending count update timer (every 2 seconds) - broadcast to world viewers if changed
-            _ = pending_update_interval.tick() => {
+            // Pending count update — only fires when worlds have pending lines
+            _ = &mut pending_update_sleep => {
                 let now = std::time::Instant::now();
                 for world in app.worlds.iter_mut() {
                     // Only send updates if world has pending lines and count has changed
@@ -13627,6 +13799,13 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                         });
                     }
                 }
+                // Re-arm: check again in 2s if any world still has pending lines
+                let any_pending_lines = app.worlds.iter().any(|w| !w.pending_lines.is_empty());
+                if any_pending_lines {
+                    pending_update_sleep.as_mut().reset(tokio::time::Instant::now() + Duration::from_secs(2));
+                } else {
+                    pending_update_sleep.as_mut().reset(tokio::time::Instant::now() + FAR_FUTURE);
+                }
             }
         }
 
@@ -13634,6 +13813,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
         // This ensures the render always shows the most current state
         // (the select! above processes only one event; drain remaining here)
         while let Ok(event) = event_rx.try_recv() {
+            needs_draw = true;
             match event {
                 AppEvent::ServerData(ref world_name, bytes) => {
                     if let Some(world_idx) = app.find_world_index(world_name) {
@@ -13647,6 +13827,15 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                             console_width,
                             false, // not daemon mode
                         );
+
+                        // Activate prompt check if server data set wont_echo_time
+                        if app.worlds[world_idx].wont_echo_time.is_some() {
+                            prompt_check_sleep.as_mut().reset(tokio::time::Instant::now() + Duration::from_millis(150));
+                        }
+                        // Activate pending update if lines were paused
+                        if !app.worlds[world_idx].pending_lines.is_empty() {
+                            pending_update_sleep.as_mut().reset(tokio::time::Instant::now() + Duration::from_secs(2));
+                        }
 
                         // Check if terminal needs full redraw (after splash clear)
                         if app.worlds[world_idx].needs_redraw {
@@ -13920,69 +14109,80 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
         }
 
         // Now draw with the most up-to-date state (after all events processed)
-        // Check if any popup is now visible
-        let any_popup_visible = app.confirm_dialog.visible
-            || app.filter_popup.visible
-            || app.has_new_popup();
-
-        // If transitioning from no popup to popup, clear ratatui's buffer so it fully redraws
-        // the popup area without artifacts from stale buffer state
-        if any_popup_visible && !app.popup_was_visible {
-            terminal.clear()?;
-        }
-
-        // Detect popup visibility change before updating
-        let popup_visibility_changed = any_popup_visible != app.popup_was_visible;
-        app.popup_was_visible = any_popup_visible;
-
-        // Toggle mouse capture when popup visibility changes
-        if app.settings.mouse_enabled {
-            let want_mouse = any_popup_visible;
-            if want_mouse && !app.mouse_capture_active {
-                let _ = execute!(std::io::stdout(), EnableMouseCapture);
-                app.mouse_capture_active = true;
-            } else if !want_mouse && app.mouse_capture_active {
-                let _ = execute!(std::io::stdout(), DisableMouseCapture);
-                app.mouse_capture_active = false;
+        // Activate process tick sleep if processes were added during this iteration
+        if !app.tf_engine.processes.is_empty() {
+            // Only reset if the sleep is far-future (avoid resetting an already-short timer)
+            if process_tick_sleep.deadline() > tokio::time::Instant::now() + Duration::from_secs(2) {
+                process_tick_sleep.as_mut().reset(tokio::time::Instant::now() + Duration::from_secs(1));
             }
         }
 
-        // Handle terminal clear request (e.g., after closing editor)
-        if app.needs_terminal_clear {
-            execute!(
-                std::io::stdout(),
-                crossterm::terminal::Clear(crossterm::terminal::ClearType::All)
-            )?;
-            terminal.clear()?;
-            app.needs_terminal_clear = false;
-        }
+        // Skip drawing when no visible state changed (e.g., pending update WS broadcast)
+        if needs_draw {
+            // Check if any popup is now visible
+            let any_popup_visible = app.confirm_dialog.visible
+                || app.filter_popup.visible
+                || app.has_new_popup();
 
-        // Use ratatui for everything, but render output area with raw crossterm
-        // after the ratatui draw (ratatui's Paragraph has rendering bugs)
-        terminal.draw(|f| ui(f, &mut app))?;
-
-        // Render output area with crossterm only when needed (optimization)
-        // Also redraw when popup visibility changes
-        if app.needs_output_redraw || popup_visibility_changed {
-            render_output_crossterm(&app);
-            app.needs_output_redraw = false;
-            // Mark current world as seen since its output was just displayed
-            let has_unseen = app.current_world().unseen_lines > 0;
-            let has_pending = !app.current_world().pending_lines.is_empty();
-            if has_unseen {
-                app.current_world_mut().mark_seen();
-                // Broadcast to WebSocket clients
-                app.ws_broadcast(WsMessage::UnseenCleared { world_index: app.current_world_index });
-                // Broadcast activity count since a world was just marked as seen
-                app.broadcast_activity();
+            // If transitioning from no popup to popup, clear ratatui's buffer so it fully redraws
+            // the popup area without artifacts from stale buffer state
+            if any_popup_visible && !app.popup_was_visible {
+                terminal.clear()?;
             }
-            // If more mode is disabled but world has orphaned pending_lines, release them
-            if has_pending && !app.settings.more_mode_enabled {
-                let world = app.current_world_mut();
-                world.output_lines.append(&mut world.pending_lines);
-                world.pending_since = None;
-                world.paused = false;
-                world.scroll_to_bottom();
+
+            // Detect popup visibility change before updating
+            let popup_visibility_changed = any_popup_visible != app.popup_was_visible;
+            app.popup_was_visible = any_popup_visible;
+
+            // Toggle mouse capture when popup visibility changes
+            if app.settings.mouse_enabled {
+                let want_mouse = any_popup_visible;
+                if want_mouse && !app.mouse_capture_active {
+                    let _ = execute!(std::io::stdout(), EnableMouseCapture);
+                    app.mouse_capture_active = true;
+                } else if !want_mouse && app.mouse_capture_active {
+                    let _ = execute!(std::io::stdout(), DisableMouseCapture);
+                    app.mouse_capture_active = false;
+                }
+            }
+
+            // Handle terminal clear request (e.g., after closing editor)
+            if app.needs_terminal_clear {
+                execute!(
+                    std::io::stdout(),
+                    crossterm::terminal::Clear(crossterm::terminal::ClearType::All)
+                )?;
+                terminal.clear()?;
+                app.needs_terminal_clear = false;
+            }
+
+            // Use ratatui for everything, but render output area with raw crossterm
+            // after the ratatui draw (ratatui's Paragraph has rendering bugs)
+            terminal.draw(|f| ui(f, &mut app))?;
+
+            // Render output area with crossterm only when needed (optimization)
+            // Also redraw when popup visibility changes
+            if app.needs_output_redraw || popup_visibility_changed {
+                render_output_crossterm(&app);
+                app.needs_output_redraw = false;
+                // Mark current world as seen since its output was just displayed
+                let has_unseen = app.current_world().unseen_lines > 0;
+                let has_pending = !app.current_world().pending_lines.is_empty();
+                if has_unseen {
+                    app.current_world_mut().mark_seen();
+                    // Broadcast to WebSocket clients
+                    app.ws_broadcast(WsMessage::UnseenCleared { world_index: app.current_world_index });
+                    // Broadcast activity count since a world was just marked as seen
+                    app.broadcast_activity();
+                }
+                // If more mode is disabled but world has orphaned pending_lines, release them
+                if has_pending && !app.settings.more_mode_enabled {
+                    let world = app.current_world_mut();
+                    world.output_lines.append(&mut world.pending_lines);
+                    world.pending_since = None;
+                    world.paused = false;
+                    world.scroll_to_bottom();
+                }
             }
         }
     }
@@ -14495,6 +14695,7 @@ fn handle_key_event(key: KeyEvent, app: &mut App) -> KeyAction {
                     let _ = execute!(std::io::stdout(), DisableMouseCapture);
                     app.mouse_capture_active = false;
                 }
+                app.settings.zwj_enabled = settings.zwj_enabled;
                 // Save settings to disk
                 let _ = persistence::save_settings(app);
             }
@@ -16326,6 +16527,9 @@ async fn handle_command(cmd: &str, app: &mut App, event_tx: mpsc::Sender<AppEven
         Command::Menu => {
             app.open_menu_popup_new();
         }
+        Command::Font => {
+            app.add_output("Font settings are available in the web and GUI interfaces.");
+        }
         Command::Quit => {
             // Kill all TLS proxy processes before quitting
             for world in &app.worlds {
@@ -18027,7 +18231,7 @@ fn ui(f: &mut Frame, app: &mut App) {
 
 /// Process an output line for display. Returns None if the line should be skipped.
 /// Returns Some(processed_text) with emoji colorization, client prefix, timestamp/tags, and tab expansion applied.
-fn process_output_line(line: &OutputLine, show_tags: bool, temp_convert_enabled: bool, cached_now: &CachedNow) -> Option<String> {
+fn process_output_line(line: &OutputLine, show_tags: bool, temp_convert_enabled: bool, zwj_enabled: bool, cached_now: &CachedNow) -> Option<String> {
     // Skip gagged lines unless show_tags (F2) is enabled
     if line.gagged && !show_tags {
         return None;
@@ -18041,7 +18245,7 @@ fn process_output_line(line: &OutputLine, show_tags: bool, temp_convert_enabled:
         return Some(String::new());
     }
     // Colorize square emoji (🟩🟨 etc.) with ANSI codes
-    let text = colorize_square_emojis(&line.text);
+    let text = colorize_square_emojis(&line.text, zwj_enabled);
     // Add ✨ prefix for client-generated messages
     let text = if !line.from_server {
         format!("✨ {}", text)
@@ -18146,6 +18350,7 @@ fn render_output_crossterm(app: &App) {
 
     let show_tags = app.show_tags;
     let temp_convert_enabled = app.settings.temp_convert_enabled;
+    let zwj_enabled = app.settings.zwj_enabled;
     let highlight_actions = app.highlight_actions;
     let world_name = &world.name;
     // Pre-compile action patterns once (not per-line)
@@ -18159,7 +18364,7 @@ fn render_output_crossterm(app: &App) {
     let cached_now = CachedNow::new();
 
     let expand_and_wrap = |line: &OutputLine, term_width: usize, show_tags: bool, highlight_f8: bool, cached_now: &CachedNow| -> Vec<(String, bool, Option<String>)> {
-        let expanded = match process_output_line(line, show_tags, temp_convert_enabled, cached_now) {
+        let expanded = match process_output_line(line, show_tags, temp_convert_enabled, zwj_enabled, cached_now) {
             Some(text) if text.is_empty() => return vec![("".to_string(), false, None)],
             Some(text) => text,
             None => return Vec::new(),
@@ -18467,7 +18672,7 @@ fn render_output_area(f: &mut Frame, app: &App, area: Rect) {
         for line_idx in (0..=end_line).rev() {
             let line = &world.output_lines[line_idx];
 
-            let expanded = match process_output_line(line, app.show_tags, app.settings.temp_convert_enabled, &cached_now) {
+            let expanded = match process_output_line(line, app.show_tags, app.settings.temp_convert_enabled, app.settings.zwj_enabled, &cached_now) {
                 Some(text) if text.is_empty() => {
                     lines.insert(0, Line::from(""));
                     if lines.len() >= visible_height {
@@ -22090,7 +22295,7 @@ mod tests {
             "connections", "l", "worlds", "world", "connect", "disconnect", "dc",
             "flush", "menu", "send", "keepalive", "gag", "ban", "unban",
             "testmusic", "dump", "notify", "addworld", "edit", "tag", "tags",
-            "dict", "urban", "translate", "tr",
+            "dict", "urban", "translate", "tr", "font",
         ].into_iter().map(|s| s.to_string()).collect();
         rust_commands.sort();
         rust_commands.dedup();

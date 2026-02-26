@@ -61,6 +61,12 @@ image = { version = "0.24", optional = true, default-features = false, features 
 arboard = { version = ">=3, <3.4", optional = true }  # 3.4+ pulls moxcms (Rust 2024 edition)
 # Audio playback for ANSI music (optional, requires ALSA dev libraries on Linux)
 rodio = { version = "0.17", optional = true, default-features = false, features = ["wav"] }
+# WebView GUI (native WebView window using system browser engine)
+wry = { version = "0.48", optional = true }
+tao = { version = "0.34", optional = true }
+webkit2gtk = { version = "2.0", optional = true }
+gdk = { version = "0.18", optional = true }
+gtk = { version = "0.18", optional = true }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 # GUI client for macOS (uses native Cocoa, no x11 feature needed)
@@ -71,6 +77,9 @@ image = { version = "0.24", optional = true, default-features = false, features 
 arboard = { version = ">=3, <3.4", optional = true }  # 3.4+ pulls moxcms (Rust 2024 edition)
 # Audio playback for ANSI music (uses CoreAudio on macOS automatically)
 rodio = { version = "0.17", optional = true, default-features = false, features = ["wav"] }
+# WebView GUI (native WebView window using system browser engine)
+wry = { version = "0.48", optional = true }
+tao = { version = "0.34", optional = true }
 
 [target.'cfg(windows)'.dependencies]
 # GUI client for Windows (no x11 feature needed)
@@ -81,6 +90,9 @@ image = { version = "0.24", optional = true, default-features = false, features 
 arboard = { version = ">=3, <3.4", optional = true }  # 3.4+ pulls moxcms (Rust 2024 edition)
 # Audio playback for ANSI music (uses WASAPI on Windows automatically)
 rodio = { version = "0.17", optional = true, default-features = false, features = ["wav"] }
+# WebView GUI (native WebView window using system browser engine)
+wry = { version = "0.48", optional = true }
+tao = { version = "0.34", optional = true }
 
 [target.'cfg(windows)'.build-dependencies]
 winres = "0.1"
@@ -92,6 +104,7 @@ rustls-backend = ["tokio-rustls", "rustls", "rustls-pemfile", "webpki-roots", "t
 remote-gui = ["eframe", "egui", "egui_extras", "image"]
 remote-gui-clipboard = ["remote-gui", "arboard"]
 remote-gui-audio = ["remote-gui", "rodio"]
+webview-gui = ["wry", "tao", "webkit2gtk", "gdk", "gtk"]
 
 [patch.crates-io]
 winit = { path = "winit-0.28.7-patched" }

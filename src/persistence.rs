@@ -121,6 +121,7 @@ pub fn save_settings_to_path(app: &App, path: &std::path::Path) -> io::Result<()
     writeln!(file, "web_font_size_phone={}", app.settings.web_font_size_phone)?;
     writeln!(file, "web_font_size_tablet={}", app.settings.web_font_size_tablet)?;
     writeln!(file, "web_font_size_desktop={}", app.settings.web_font_size_desktop)?;
+    writeln!(file, "web_font_weight={}", app.settings.web_font_weight)?;
     writeln!(file, "web_secure={}", app.settings.web_secure)?;
     writeln!(file, "http_enabled={}", app.settings.http_enabled)?;
     writeln!(file, "http_port={}", app.settings.http_port)?;
@@ -148,6 +149,7 @@ pub fn save_settings_to_path(app: &App, path: &std::path::Path) -> io::Result<()
     }
     writeln!(file, "editor_side={}", app.settings.editor_side.name())?;
     writeln!(file, "mouse_enabled={}", app.settings.mouse_enabled)?;
+    writeln!(file, "zwj_enabled={}", app.settings.zwj_enabled)?;
 
     // Save each world's settings (skip unconfigured worlds that have no connection info)
     for world in &app.worlds {
@@ -487,6 +489,11 @@ pub fn load_settings_from_path(app: &mut App, path: &std::path::Path) -> io::Res
                             app.settings.web_font_size_desktop = s.clamp(8.0, 48.0);
                         }
                     }
+                    "web_font_weight" => {
+                        if let Ok(w) = value.parse::<u16>() {
+                            app.settings.web_font_weight = w.clamp(100, 900);
+                        }
+                    }
                     "gui_transparency" => {
                         if let Ok(t) = value.parse::<f32>() {
                             app.settings.gui_transparency = t.clamp(0.3, 1.0);
@@ -593,6 +600,9 @@ pub fn load_settings_from_path(app: &mut App, path: &std::path::Path) -> io::Res
                     }
                     "mouse_enabled" => {
                         app.settings.mouse_enabled = value == "true";
+                    }
+                    "zwj_enabled" => {
+                        app.settings.zwj_enabled = value == "true";
                     }
                     _ => {}
                 }
@@ -1087,6 +1097,7 @@ pub fn save_reload_state(app: &App) -> io::Result<()> {
     writeln!(file, "web_font_size_phone={}", app.settings.web_font_size_phone)?;
     writeln!(file, "web_font_size_tablet={}", app.settings.web_font_size_tablet)?;
     writeln!(file, "web_font_size_desktop={}", app.settings.web_font_size_desktop)?;
+    writeln!(file, "web_font_weight={}", app.settings.web_font_weight)?;
     writeln!(file, "web_secure={}", app.settings.web_secure)?;
     writeln!(file, "http_enabled={}", app.settings.http_enabled)?;
     writeln!(file, "http_port={}", app.settings.http_port)?;
@@ -1119,6 +1130,7 @@ pub fn save_reload_state(app: &App) -> io::Result<()> {
     }
     writeln!(file, "editor_side={}", app.settings.editor_side.name())?;
     writeln!(file, "mouse_enabled={}", app.settings.mouse_enabled)?;
+    writeln!(file, "zwj_enabled={}", app.settings.zwj_enabled)?;
 
     // Save input history (base64 encode each line to handle special chars)
     writeln!(file, "history_count={}", app.input.history.len())?;
@@ -1631,6 +1643,11 @@ pub fn load_reload_state(app: &mut App) -> io::Result<bool> {
                             app.settings.web_font_size_desktop = s.clamp(8.0, 48.0);
                         }
                     }
+                    "web_font_weight" => {
+                        if let Ok(w) = value.parse::<u16>() {
+                            app.settings.web_font_weight = w.clamp(100, 900);
+                        }
+                    }
                     "gui_transparency" => {
                         if let Ok(t) = value.parse::<f32>() {
                             app.settings.gui_transparency = t.clamp(0.3, 1.0);
@@ -1728,6 +1745,9 @@ pub fn load_reload_state(app: &mut App) -> io::Result<bool> {
                     }
                     "mouse_enabled" => {
                         app.settings.mouse_enabled = value == "true";
+                    }
+                    "zwj_enabled" => {
+                        app.settings.zwj_enabled = value == "true";
                     }
                     "history_count" | "world_count" => {
                         // These are informational, not needed for parsing
@@ -1914,6 +1934,7 @@ mod tests {
             web_font_size_phone: 12.0,         // default: 10.0
             web_font_size_tablet: 16.0,        // default: 14.0
             web_font_size_desktop: 20.0,       // default: 18.0
+            web_font_weight: 200,              // default: 400
             web_secure: true,                  // default: false
             http_enabled: true,                // default: false
             http_port: 8080,                   // default: 9000
@@ -1942,6 +1963,7 @@ mod tests {
             dictionary_path: "/custom/dict".to_string(), // default: ""
             editor_side: EditorSide::Right,    // default: Left
             mouse_enabled: false,              // default: true
+            zwj_enabled: true,                 // default: false
         }
     }
 
@@ -1989,6 +2011,7 @@ mod tests {
         assert_eq!(a.web_font_size_phone, b.web_font_size_phone, "{context}: web_font_size_phone");
         assert_eq!(a.web_font_size_tablet, b.web_font_size_tablet, "{context}: web_font_size_tablet");
         assert_eq!(a.web_font_size_desktop, b.web_font_size_desktop, "{context}: web_font_size_desktop");
+        assert_eq!(a.web_font_weight, b.web_font_weight, "{context}: web_font_weight");
         assert_eq!(a.web_secure, b.web_secure, "{context}: web_secure");
         assert_eq!(a.http_enabled, b.http_enabled, "{context}: http_enabled");
         assert_eq!(a.http_port, b.http_port, "{context}: http_port");
@@ -2014,6 +2037,7 @@ mod tests {
         assert_eq!(a.dictionary_path, b.dictionary_path, "{context}: dictionary_path");
         assert_eq!(a.editor_side.name(), b.editor_side.name(), "{context}: editor_side");
         assert_eq!(a.mouse_enabled, b.mouse_enabled, "{context}: mouse_enabled");
+        assert_eq!(a.zwj_enabled, b.zwj_enabled, "{context}: zwj_enabled");
     }
 
     /// Assert all WorldSettings fields match between two instances.
@@ -2106,6 +2130,7 @@ mod tests {
         assert_ne!(non_default.web_font_size_phone, default.web_font_size_phone, "web_font_size_phone should differ");
         assert_ne!(non_default.web_font_size_tablet, default.web_font_size_tablet, "web_font_size_tablet should differ");
         assert_ne!(non_default.web_font_size_desktop, default.web_font_size_desktop, "web_font_size_desktop should differ");
+        assert_ne!(non_default.web_font_weight, default.web_font_weight, "web_font_weight should differ");
         assert_ne!(non_default.web_secure, default.web_secure, "web_secure should differ");
         assert_ne!(non_default.http_enabled, default.http_enabled, "http_enabled should differ");
         assert_ne!(non_default.http_port, default.http_port, "http_port should differ");
@@ -2121,6 +2146,7 @@ mod tests {
         assert_ne!(non_default.dictionary_path, default.dictionary_path, "dictionary_path should differ");
         assert_ne!(non_default.editor_side.name(), default.editor_side.name(), "editor_side should differ");
         assert_ne!(non_default.mouse_enabled, default.mouse_enabled, "mouse_enabled should differ");
+        assert_ne!(non_default.zwj_enabled, default.zwj_enabled, "zwj_enabled should differ");
     }
 
     #[test]

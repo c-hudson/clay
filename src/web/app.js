@@ -179,6 +179,9 @@
         setupColorOffsetMinus: document.getElementById('setup-color-offset-minus'),
         setupColorOffsetPlus: document.getElementById('setup-color-offset-plus'),
         setupThemeSelect: document.getElementById('setup-theme-select'),
+        setupTransparencyRow: document.getElementById('setup-transparency-row'),
+        setupTransparencySlider: document.getElementById('setup-transparency-slider'),
+        setupTransparencyValue: document.getElementById('setup-transparency-value'),
         setupSaveBtn: document.getElementById('setup-save-btn'),
         setupCancelBtn: document.getElementById('setup-cancel-btn'),
         // Filter popup (F4)
@@ -186,7 +189,25 @@
         filterInput: document.getElementById('filter-input'),
         // Menu popup (/menu)
         menuModal: document.getElementById('menu-modal'),
-        menuList: document.getElementById('menu-list')
+        menuList: document.getElementById('menu-list'),
+        // Font popup (/font)
+        fontModal: document.getElementById('font-modal'),
+        fontFamilyList: document.getElementById('font-family-list'),
+        fontCloseBtn: document.getElementById('font-close-btn'),
+        fontPhoneMinus: document.getElementById('font-phone-minus'),
+        fontPhonePlus: document.getElementById('font-phone-plus'),
+        fontPhoneValue: document.getElementById('font-phone-value'),
+        fontTabletMinus: document.getElementById('font-tablet-minus'),
+        fontTabletPlus: document.getElementById('font-tablet-plus'),
+        fontTabletValue: document.getElementById('font-tablet-value'),
+        fontDesktopMinus: document.getElementById('font-desktop-minus'),
+        fontDesktopPlus: document.getElementById('font-desktop-plus'),
+        fontDesktopValue: document.getElementById('font-desktop-value'),
+        fontWeightMinus: document.getElementById('font-weight-minus'),
+        fontWeightPlus: document.getElementById('font-weight-plus'),
+        fontWeightValue: document.getElementById('font-weight-value'),
+        fontCancelBtn: document.getElementById('font-cancel-btn'),
+        fontSaveBtn: document.getElementById('font-save-btn')
     };
 
     // State
@@ -288,10 +309,38 @@
     let setupTlsProxy = false;
     let setupInputHeightValue = 1;
     let setupGuiTheme = 'dark';
+    let setupTransparency = 1.0;
 
     // Filter popup state (F4)
     let filterPopupOpen = false;
     let filterText = '';
+
+    // Font popup state (/font)
+    let fontPopupOpen = false;
+    let fontName = '';  // Shared font family name (synced from server)
+    let guiFontSize = 14.0;  // GUI font size (not used by web, but preserved for server)
+    let fontEditName = '';
+    let fontEditSizePhone = 10;
+    let fontEditSizeTablet = 14;
+    let fontEditSizeDesktop = 18;
+    let webFontWeight = 400;
+    let fontEditWeight = 400;
+
+    // Font families (matching remote GUI FONT_FAMILIES)
+    const FONT_FAMILIES = [
+        ['', 'System Default'],
+        ['Monospace', 'Monospace'],
+        ['DejaVu Sans Mono', 'DejaVu Sans Mono'],
+        ['Liberation Mono', 'Liberation Mono'],
+        ['Ubuntu Mono', 'Ubuntu Mono'],
+        ['Fira Code', 'Fira Code'],
+        ['Source Code Pro', 'Source Code Pro'],
+        ['JetBrains Mono', 'JetBrains Mono'],
+        ['Hack', 'Hack'],
+        ['Inconsolata', 'Inconsolata'],
+        ['Courier New', 'Courier New'],
+        ['Consolas', 'Consolas'],
+    ];
 
     // Menu popup state (/menu)
     let menuPopupOpen = false;
@@ -300,6 +349,7 @@
         { label: 'Help', command: '/help' },
         { label: 'Settings', command: '/setup' },
         { label: 'Web Settings', command: '/web' },
+        { label: 'Font', command: '/font' },
         { label: 'Actions', command: '/actions' },
         { label: 'World Selector', command: '/worlds' },
         { label: 'Connected Worlds', command: '/connections' }
@@ -317,7 +367,7 @@
 
     // Per-device font size tracking (saved separately for phone/tablet/desktop)
     let deviceType = 'desktop';  // 'phone', 'tablet', or 'desktop'
-    let deviceModeOverride = null;  // null = auto, or 'phone', 'tablet', 'desktop'
+    let deviceModeOverride = window.WEBVIEW_DEVICE_OVERRIDE || null;  // null = auto, or 'phone', 'tablet', 'desktop'
     let webFontSizePhone = 10.0;
     let webFontSizeTablet = 14.0;
     let webFontSizeDesktop = 18.0;
@@ -370,9 +420,41 @@
             }
             css += '}';
             el.textContent = css;
+            // Re-apply window opacity for webview mode
+            if (window.WEBVIEW_MODE) applyTransparency(guiTransparency);
         } catch (e) {
             // ignore parse errors
         }
+    }
+
+    // Apply window transparency (webview mode only)
+    // Uses GTK window opacity via IPC — sets _NET_WM_WINDOW_OPACITY on X11.
+    // This is compositor-managed (instant, reliable), unlike per-pixel alpha through
+    // WebKit2GTK's rendering pipeline which has timing/ghosting issues.
+    let guiTransparency = 1.0;
+    function applyTransparency(alpha) {
+        guiTransparency = alpha;
+        if (!window.WEBVIEW_MODE || !window.ipc) return;
+        window.ipc.postMessage('opacity:' + alpha);
+    }
+
+    // Apply font family to the interface
+    function applyFontFamily(name) {
+        fontName = name;
+        if (name && name !== '') {
+            document.documentElement.style.setProperty('--mono-override', "'" + name + "', var(--mono)");
+        } else {
+            document.documentElement.style.setProperty('--mono-override', 'var(--mono)');
+        }
+        // Apply to elements that use monospace fonts
+        const monoStyle = name && name !== '' ? "'" + name + "', var(--mono)" : '';
+        elements.output.style.fontFamily = monoStyle || '';
+        elements.input.style.fontFamily = monoStyle || '';
+        if (elements.prompt) elements.prompt.style.fontFamily = monoStyle || '';
+    }
+
+    function applyFontWeight(w) {
+        document.body.style.fontWeight = w;
     }
 
     // ============================================================================
@@ -386,7 +468,7 @@
         'worlds', 'world', 'connections', 'l', 'connect', 'disconnect', 'dc',
         'flush', 'menu', 'send', 'keepalive', 'gag', 'ban', 'unban',
         'testmusic', 'dump', 'notify', 'addworld', 'edit', 'tag', 'tags',
-        'dict', 'urban', 'translate', 'tr',
+        'dict', 'urban', 'translate', 'tr', 'font',
     ];
 
     function isInternalCommand(name) {
@@ -784,6 +866,7 @@
         setupEventListeners();
         updateAndroidUI();
         loadAuthKey();  // Load saved auth key for passwordless login
+        applyTransparency(guiTransparency);  // Set initial #app background in webview mode
         connect();
         updateTime();
         setInterval(updateTime, 1000);
@@ -1147,6 +1230,12 @@
                 hideCertWarning();
                 showConnecting(false);
 
+                // Auto-authenticate for embedded WebView GUI (pre-hashed password)
+                if (window.AUTO_PASSWORD) {
+                    ws.send(JSON.stringify({ type: 'AuthRequest', password_hash: window.AUTO_PASSWORD }));
+                    return;
+                }
+
                 // Check for saved credentials (Android auto-login)
                 let savedPassword = null;
                 let savedUsername = null;
@@ -1296,6 +1385,8 @@
                 if (msg.multiuser_mode) {
                     enableMultiuserAuthUI();
                 }
+                // WebView auto-auth already sent from onopen; skip everything else
+                if (window.AUTO_PASSWORD) break;
                 // Try auth key first (if not multiuser mode - keys are single-user only)
                 if (!msg.multiuser_mode && authKey && tryAuthWithKey()) {
                     // Key auth attempt sent, wait for response
@@ -1523,6 +1614,16 @@
                     if (msg.settings.color_offset_percent !== undefined) {
                         colorOffsetPercent = msg.settings.color_offset_percent;
                     }
+                    if (msg.settings.gui_transparency !== undefined) {
+                        applyTransparency(msg.settings.gui_transparency);
+                    }
+                    // Load font name and GUI font size
+                    if (msg.settings.font_name !== undefined) {
+                        applyFontFamily(msg.settings.font_name);
+                    }
+                    if (msg.settings.font_size !== undefined) {
+                        guiFontSize = msg.settings.font_size;
+                    }
                     // Load per-device font sizes
                     if (msg.settings.web_font_size_phone !== undefined) {
                         webFontSizePhone = msg.settings.web_font_size_phone;
@@ -1537,7 +1638,16 @@
                     const fontPx = deviceType === 'phone' ? webFontSizePhone :
                                    deviceType === 'tablet' ? webFontSizeTablet : webFontSizeDesktop;
                     setFontSize(clampFontSize(fontPx), false);  // Don't send back to server
+                    // Load font weight
+                    if (msg.settings.web_font_weight !== undefined) {
+                        webFontWeight = msg.settings.web_font_weight;
+                        applyFontWeight(webFontWeight);
+                    }
                 }
+                // Calculate activity count from world data (don't wait for ActivityUpdate message)
+                serverActivityCount = worlds.filter((w, i) =>
+                    i !== currentWorldIndex && (w.unseen_lines > 0 || (w.pending_count || 0) > 0)
+                ).length;
                 renderOutput();
                 updateStatusBar();
                 // Send initial view state for synchronized more-mode
@@ -1736,10 +1846,11 @@
                 break;
 
             case 'WorldFlushed':
-                // Clear output buffer for this world
+                // Clear output buffer for this world (splash screen cleared, etc.)
                 if (msg.world_index !== undefined && worlds[msg.world_index]) {
                     worlds[msg.world_index].output_lines = [];
                     worlds[msg.world_index].pendingCount = 0;
+                    worlds[msg.world_index].showing_splash = false;
                     // Clear the cache for this world
                     if (worldOutputCache[msg.world_index]) {
                         worldOutputCache[msg.world_index] = [];
@@ -1862,6 +1973,38 @@
                         if (oldOffset !== colorOffsetPercent) {
                             renderOutput(); // Re-render with new color offset
                         }
+                    }
+                    if (msg.settings.gui_transparency !== undefined) {
+                        applyTransparency(msg.settings.gui_transparency);
+                    }
+                    // Font settings
+                    if (msg.settings.font_name !== undefined) {
+                        applyFontFamily(msg.settings.font_name);
+                    }
+                    if (msg.settings.font_size !== undefined) {
+                        guiFontSize = msg.settings.font_size;
+                    }
+                    if (msg.settings.web_font_size_phone !== undefined) {
+                        webFontSizePhone = msg.settings.web_font_size_phone;
+                    }
+                    if (msg.settings.web_font_size_tablet !== undefined) {
+                        webFontSizeTablet = msg.settings.web_font_size_tablet;
+                    }
+                    if (msg.settings.web_font_size_desktop !== undefined) {
+                        webFontSizeDesktop = msg.settings.web_font_size_desktop;
+                    }
+                    // Apply the right font size for current device type
+                    if (msg.settings.web_font_size_phone !== undefined ||
+                        msg.settings.web_font_size_tablet !== undefined ||
+                        msg.settings.web_font_size_desktop !== undefined) {
+                        const fontPx = deviceType === 'phone' ? webFontSizePhone :
+                                       deviceType === 'tablet' ? webFontSizeTablet : webFontSizeDesktop;
+                        setFontSize(clampFontSize(fontPx), false);
+                    }
+                    // Apply font weight
+                    if (msg.settings.web_font_weight !== undefined) {
+                        webFontWeight = msg.settings.web_font_weight;
+                        applyFontWeight(webFontWeight);
                     }
                 }
                 break;
@@ -2369,6 +2512,12 @@
         // Reset lines since pause counter on user input
         linesSincePause = 0;
 
+        // Clear splash on user input (server will also clear and send WorldFlushed)
+        if (worlds[currentWorldIndex] && worlds[currentWorldIndex].showing_splash) {
+            worlds[currentWorldIndex].showing_splash = false;
+            renderOutput();
+        }
+
         const sent = send({
             type: 'SendCommand',
             world_index: currentWorldIndex,
@@ -2455,6 +2604,10 @@
 
             case '/menu':
                 openMenuPopup();
+                break;
+
+            case '/font':
+                openFontPopup();
                 break;
 
             case '/edit':
@@ -2637,6 +2790,23 @@
         return false;
     }
 
+    // Get raw ANSI text for given line indices (used by WebView debug selection)
+    window.getDebugSelectionText = function(lineIndices) {
+        var world = worlds[currentWorldIndex];
+        if (!world) return '';
+        var lines = world.output_lines || [];
+        var parts = [];
+        for (var i = 0; i < lineIndices.length; i++) {
+            var idx = lineIndices[i];
+            if (idx >= 0 && idx < lines.length) {
+                var lineObj = lines[idx];
+                var raw = typeof lineObj === 'string' ? lineObj : lineObj.text;
+                parts.push(String(raw).replace(/\x1b/g, '<esc>'));
+            }
+        }
+        return parts.join('\n');
+    };
+
     // Render splash screen in output area
     function renderSplashScreen() {
         if (!splashLines || splashLines.length === 0) return;
@@ -2660,6 +2830,16 @@
             if (splashLines && splashLines.length > 0) {
                 renderSplashScreen();
             }
+            return;
+        }
+
+        // WebView mode: show image splash instead of text splash
+        if (window.WEBVIEW_MODE && world.showing_splash) {
+            elements.output.innerHTML = '<div style="display:flex;flex-direction:column;align-items:center;justify-content:center;height:100%;gap:5px;">' +
+                '<img src="clay://localhost/clay2.png" alt="Clay" style="width:200px;height:200px;">' +
+                '<div style="color:#ff87ff;font-style:italic;">A 90dies mud client written today</div>' +
+                '<div style="color:#888;">/help for how to use clay</div>' +
+                '</div>';
             return;
         }
 
@@ -2713,7 +2893,7 @@
                 html = `<span class="action-highlight">${html}</span>`;
             }
 
-            htmlParts.push(html);
+            htmlParts.push(`<span data-line-idx="${i}">${html}</span>`);
         }
 
         // Join with <br> tags for explicit line breaks
@@ -2779,7 +2959,7 @@
 
         // Append to output with a <br> prefix (if not first line)
         const prefix = elements.output.childNodes.length > 0 ? '<br>' : '';
-        elements.output.insertAdjacentHTML('beforeend', prefix + html);
+        elements.output.insertAdjacentHTML('beforeend', prefix + `<span data-line-idx="${lineIndex}">${html}</span>`);
 
         scheduleScrollToBottom();
     }
@@ -3755,12 +3935,20 @@
             elements.statusMore.style.display = 'none';
         }
 
-        // Activity badge
+        // Activity badge with hover tooltip showing which worlds have activity
         if (serverActivityCount > 0) {
             elements.activityCount.textContent = serverActivityCount;
             elements.activityIndicator.style.display = '';
+            // Build tooltip listing worlds with activity
+            const activeWorlds = worlds
+                .filter((w, i) => i !== currentWorldIndex && ((w.unseen_lines || 0) > 0 || (w.pending_count || 0) > 0))
+                .map(w => w.name);
+            elements.activityIndicator.title = activeWorlds.length > 0
+                ? 'Unseen: ' + activeWorlds.join(', ')
+                : '';
         } else {
             elements.activityIndicator.style.display = 'none';
+            elements.activityIndicator.title = '';
         }
     }
 
@@ -4223,6 +4411,7 @@
         setupInputHeightValue = inputHeight;
         setupGuiTheme = guiTheme;
         setupColorOffset = colorOffsetPercent;
+        setupTransparency = guiTransparency;
         elements.setupModal.className = 'modal visible';
         elements.setupModal.style.display = 'flex';
         updateSetupPopupUI();
@@ -4263,6 +4452,45 @@
         // Theme dropdown
         elements.setupThemeSelect.value = setupGuiTheme.charAt(0).toUpperCase() + setupGuiTheme.slice(1);
         updateCustomDropdown(elements.setupThemeSelect);
+        // Transparency slider (webview mode only)
+        if (window.WEBVIEW_MODE && elements.setupTransparencyRow) {
+            elements.setupTransparencyRow.style.display = '';
+            elements.setupTransparencySlider.value = Math.round(setupTransparency * 100);
+            elements.setupTransparencyValue.textContent = Math.round(setupTransparency * 100) + '%';
+        }
+    }
+
+    // Build an UpdateGlobalSettings message with current state
+    function buildUpdateGlobalSettings() {
+        return {
+            type: 'UpdateGlobalSettings',
+            more_mode_enabled: moreModeEnabled,
+            spell_check_enabled: true,
+            temp_convert_enabled: tempConvertEnabled,
+            world_switch_mode: worldSwitchMode,
+            show_tags: showTags,
+            ansi_music_enabled: ansiMusicEnabled,
+            input_height: inputHeight,
+            console_theme: consoleTheme,
+            gui_theme: guiTheme,
+            gui_transparency: guiTransparency,
+            color_offset_percent: colorOffsetPercent,
+            font_name: fontName,
+            font_size: guiFontSize,
+            web_font_size_phone: webFontSizePhone,
+            web_font_size_tablet: webFontSizeTablet,
+            web_font_size_desktop: webFontSizeDesktop,
+            web_font_weight: webFontWeight,
+            ws_allow_list: wsAllowList,
+            web_secure: webSecure,
+            http_enabled: httpEnabled,
+            http_port: httpPort,
+            ws_enabled: wsEnabled,
+            ws_port: wsPort,
+            ws_cert_file: wsCertFile,
+            ws_key_file: wsKeyFile,
+            tls_proxy_enabled: tlsProxyEnabled
+        };
     }
 
     function saveSetupSettings() {
@@ -4282,39 +4510,15 @@
         colorOffsetPercent = setupColorOffset;
         applyTheme(guiTheme);
         setInputHeight(setupInputHeightValue);
+        applyTransparency(setupTransparency);
 
         // Re-render output with new show_tags and color_offset settings
         renderOutput();
 
         // Send to server
-        send({
-            type: 'UpdateGlobalSettings',
-            more_mode_enabled: moreModeEnabled,
-            spell_check_enabled: true,
-            temp_convert_enabled: tempConvertEnabled,
-            world_switch_mode: worldSwitchMode,
-            show_tags: showTags,
-            ansi_music_enabled: ansiMusicEnabled,
-            input_height: setupInputHeightValue,
-            console_theme: consoleTheme,
-            gui_theme: guiTheme,
-            gui_transparency: 1.0,
-            color_offset_percent: colorOffsetPercent,
-            font_name: '',
-            font_size: 14.0,
-            web_font_size_phone: webFontSizePhone,
-            web_font_size_tablet: webFontSizeTablet,
-            web_font_size_desktop: webFontSizeDesktop,
-            ws_allow_list: wsAllowList,
-            web_secure: webSecure,
-            http_enabled: httpEnabled,
-            http_port: httpPort,
-            ws_enabled: wsEnabled,
-            ws_port: wsPort,
-            ws_cert_file: wsCertFile,
-            ws_key_file: wsKeyFile,
-            tls_proxy_enabled: tlsProxyEnabled
-        });
+        const msg = buildUpdateGlobalSettings();
+        msg.input_height = setupInputHeightValue;
+        send(msg);
 
         closeSetupPopup();
     }
@@ -4383,35 +4587,91 @@
         wsKeyFile = elements.webKeyFile.value;
 
         // Send to server
-        send({
-            type: 'UpdateGlobalSettings',
-            more_mode_enabled: moreModeEnabled,
-            spell_check_enabled: true,
-            temp_convert_enabled: tempConvertEnabled,
-            world_switch_mode: worldSwitchMode,
-            show_tags: showTags,
-            ansi_music_enabled: ansiMusicEnabled,
-            input_height: inputHeight,
-            console_theme: consoleTheme,
-            gui_theme: guiTheme,
-            gui_transparency: 1.0,
-            font_name: '',
-            font_size: 14.0,
-            web_font_size_phone: webFontSizePhone,
-            web_font_size_tablet: webFontSizeTablet,
-            web_font_size_desktop: webFontSizeDesktop,
-            ws_allow_list: wsAllowList,
-            web_secure: webSecure,
-            http_enabled: httpEnabled,
-            http_port: httpPort,
-            ws_enabled: wsEnabled,
-            ws_port: wsPort,
-            ws_cert_file: wsCertFile,
-            ws_key_file: wsKeyFile,
-            tls_proxy_enabled: tlsProxyEnabled
-        });
+        send(buildUpdateGlobalSettings());
 
         closeWebPopup();
+    }
+
+    // Font popup functions (/font)
+    function openFontPopup() {
+        fontPopupOpen = true;
+        // Copy current state to edit state
+        fontEditName = fontName;
+        fontEditSizePhone = Math.round(webFontSizePhone);
+        fontEditSizeTablet = Math.round(webFontSizeTablet);
+        fontEditSizeDesktop = Math.round(webFontSizeDesktop);
+        fontEditWeight = webFontWeight;
+        elements.fontModal.className = 'modal visible';
+        elements.fontModal.style.display = 'flex';
+        renderFontFamilyList();
+        updateFontPopupUI();
+    }
+
+    function closeFontPopup() {
+        fontPopupOpen = false;
+        elements.fontModal.className = 'modal';
+        elements.fontModal.style.display = 'none';
+        focusInputWithKeyboard();
+    }
+
+    function renderFontFamilyList() {
+        const list = elements.fontFamilyList;
+        list.innerHTML = '';
+        FONT_FAMILIES.forEach(function(entry) {
+            const value = entry[0];
+            const label = entry[1];
+            const item = document.createElement('div');
+            item.className = 'font-family-item' + (value === fontEditName ? ' selected' : '');
+            item.textContent = label;
+            if (value && value !== '') {
+                item.style.fontFamily = "'" + value + "', monospace";
+            }
+            item.addEventListener('click', function() {
+                fontEditName = value;
+                // Update selection highlighting
+                list.querySelectorAll('.font-family-item').forEach(function(el) {
+                    el.classList.remove('selected');
+                });
+                item.classList.add('selected');
+            });
+            list.appendChild(item);
+        });
+        // Scroll selected item into view
+        const selected = list.querySelector('.font-family-item.selected');
+        if (selected) {
+            selected.scrollIntoView({ block: 'nearest' });
+        }
+    }
+
+    function updateFontPopupUI() {
+        elements.fontPhoneValue.textContent = fontEditSizePhone;
+        elements.fontTabletValue.textContent = fontEditSizeTablet;
+        elements.fontDesktopValue.textContent = fontEditSizeDesktop;
+        elements.fontWeightValue.textContent = fontEditWeight;
+    }
+
+    function saveFontSettings() {
+        // Apply font family
+        applyFontFamily(fontEditName);
+
+        // Apply font sizes
+        webFontSizePhone = fontEditSizePhone;
+        webFontSizeTablet = fontEditSizeTablet;
+        webFontSizeDesktop = fontEditSizeDesktop;
+
+        // Apply font weight
+        webFontWeight = fontEditWeight;
+        applyFontWeight(webFontWeight);
+
+        // Apply the right font size for current device
+        const fontPx = deviceType === 'phone' ? webFontSizePhone :
+                       deviceType === 'tablet' ? webFontSizeTablet : webFontSizeDesktop;
+        setFontSize(clampFontSize(fontPx), false);
+
+        // Send to server
+        send(buildUpdateGlobalSettings());
+
+        closeFontPopup();
     }
 
     // Worlds list popup functions (/connections, /l)
@@ -5085,7 +5345,7 @@
 
     // Check if any popup is open
     function isAnyPopupOpen() {
-        return actionsListPopupOpen || actionsEditorPopupOpen || actionsConfirmPopupOpen || worldsPopupOpen || worldSelectorPopupOpen || worldConfirmPopupOpen || webPopupOpen || setupPopupOpen;
+        return actionsListPopupOpen || actionsEditorPopupOpen || actionsConfirmPopupOpen || worldsPopupOpen || worldSelectorPopupOpen || worldConfirmPopupOpen || webPopupOpen || setupPopupOpen || fontPopupOpen;
     }
 
     // Check if a world should be included in cycling (connected OR has activity)
@@ -5177,6 +5437,9 @@
                 break;
             case 'web':
                 openWebPopup();
+                break;
+            case 'font':
+                openFontPopup();
                 break;
             case 'toggle-tags':
                 showTags = !showTags;
@@ -5289,32 +5552,7 @@
 
         // Save to server so it persists across sessions
         if (sendToServer && authenticated) {
-            send({
-                type: 'UpdateGlobalSettings',
-                more_mode_enabled: moreModeEnabled,
-                spell_check_enabled: true,
-                world_switch_mode: worldSwitchMode,
-                show_tags: showTags,
-                ansi_music_enabled: ansiMusicEnabled,
-                input_height: inputHeight,
-                console_theme: consoleTheme,
-                gui_theme: guiTheme,
-                gui_transparency: 1.0,
-                font_name: '',
-                font_size: 14.0,
-                web_font_size_phone: webFontSizePhone,
-                web_font_size_tablet: webFontSizeTablet,
-                web_font_size_desktop: webFontSizeDesktop,
-                ws_allow_list: wsAllowList,
-                web_secure: webSecure,
-                http_enabled: httpEnabled,
-                http_port: httpPort,
-                ws_enabled: wsEnabled,
-                ws_port: wsPort,
-                ws_cert_file: wsCertFile,
-                ws_key_file: wsKeyFile,
-                tls_proxy_enabled: tlsProxyEnabled
-            });
+            send(buildUpdateGlobalSettings());
         }
 
         // Update view state for synchronized more-mode (visible lines changed with font size)
@@ -5648,6 +5886,10 @@
             if (selection && selection.toString().length > 0) {
                 return;
             }
+            // In WebView mode, don't steal focus from output area (allows text selection)
+            if (window.WEBVIEW_MODE && e.target.closest('#output-container')) {
+                return;
+            }
             // Don't steal focus from modals, status/nav bars, or form elements
             if (!elements.authModal.classList.contains('visible') &&
                 !elements.actionsListModal.classList.contains('visible') &&
@@ -5972,6 +6214,15 @@
                 if (e.key === 'Escape') {
                     e.preventDefault();
                     closeWebPopup();
+                }
+                return;
+            }
+
+            // Handle font popup
+            if (fontPopupOpen) {
+                if (e.key === 'Escape') {
+                    e.preventDefault();
+                    closeFontPopup();
                 }
                 return;
             }
@@ -6407,6 +6658,14 @@
         elements.setupThemeSelect.onchange = function() {
             setupGuiTheme = this.value.toLowerCase();
         };
+        if (elements.setupTransparencySlider) {
+            elements.setupTransparencySlider.oninput = function() {
+                setupTransparency = parseInt(this.value, 10) / 100;
+                elements.setupTransparencyValue.textContent = this.value + '%';
+                // Live preview
+                applyTransparency(setupTransparency);
+            };
+        }
         elements.setupSaveBtn.onclick = saveSetupSettings;
         elements.setupCancelBtn.onclick = closeSetupPopup;
 
@@ -6426,6 +6685,43 @@
         elements.webSaveBtn.onclick = saveWebSettings;
         elements.webCancelBtn.onclick = closeWebPopup;
         elements.webCloseBtn.onclick = closeWebPopup;
+
+        // Font popup
+        elements.fontCloseBtn.onclick = closeFontPopup;
+        elements.fontCancelBtn.onclick = closeFontPopup;
+        elements.fontSaveBtn.onclick = saveFontSettings;
+        elements.fontWeightMinus.onclick = function() {
+            fontEditWeight = Math.max(100, fontEditWeight - 100);
+            updateFontPopupUI();
+        };
+        elements.fontWeightPlus.onclick = function() {
+            fontEditWeight = Math.min(900, fontEditWeight + 100);
+            updateFontPopupUI();
+        };
+        elements.fontPhoneMinus.onclick = function() {
+            fontEditSizePhone = Math.max(9, fontEditSizePhone - 1);
+            updateFontPopupUI();
+        };
+        elements.fontPhonePlus.onclick = function() {
+            fontEditSizePhone = Math.min(20, fontEditSizePhone + 1);
+            updateFontPopupUI();
+        };
+        elements.fontTabletMinus.onclick = function() {
+            fontEditSizeTablet = Math.max(9, fontEditSizeTablet - 1);
+            updateFontPopupUI();
+        };
+        elements.fontTabletPlus.onclick = function() {
+            fontEditSizeTablet = Math.min(20, fontEditSizeTablet + 1);
+            updateFontPopupUI();
+        };
+        elements.fontDesktopMinus.onclick = function() {
+            fontEditSizeDesktop = Math.max(9, fontEditSizeDesktop - 1);
+            updateFontPopupUI();
+        };
+        elements.fontDesktopPlus.onclick = function() {
+            fontEditSizeDesktop = Math.min(20, fontEditSizeDesktop + 1);
+            updateFontPopupUI();
+        };
 
         // Password change modal handlers
         if (elements.passwordSaveBtn) {

@@ -351,6 +351,8 @@ pub struct RemoteGuiApp {
     ws_tx: Option<mpsc::UnboundedSender<WsMessage>>,
     /// Channel for receiving messages from WebSocket
     ws_rx: Option<mpsc::UnboundedReceiver<WsMessage>>,
+    /// egui context for requesting repaints from background tasks
+    egui_ctx: Option<egui::Context>,
     /// Runtime handle for async operations
     runtime: tokio::runtime::Handle,
     /// Flag indicating password was submitted
@@ -415,6 +417,7 @@ pub struct RemoteGuiApp {
     web_font_size_phone: f32,
     web_font_size_tablet: f32,
     web_font_size_desktop: f32,
+    web_font_weight: u16,
     /// Temp field for font editor
     edit_font_name: String,
     /// Temp field for font size editor
@@ -521,6 +524,8 @@ pub struct RemoteGuiApp {
     tls_proxy_enabled: bool,
     /// Custom dictionary path for spell checking
     dictionary_path: String,
+    /// ZWJ emoji sequence handling
+    zwj_enabled: bool,
     /// Audio output stream (must stay alive for audio to play)
     #[cfg(all(feature = "rodio", not(target_os = "android")))]
     audio_stream: Option<rodio::OutputStream>,
@@ -571,6 +576,14 @@ pub struct RemoteGuiApp {
     cached_font_size: f32,
     /// Last color_offset_percent
     cached_color_offset: u8,
+    /// Frame profiling: count of update() calls in current second
+    prof_frame_count: u32,
+    /// Frame profiling: time of last stats dump
+    prof_last_dump: std::time::Instant,
+    /// Frame profiling: log file handle
+    prof_log: Option<std::fs::File>,
+    /// Frame profiling: reasons for repaint this second
+    prof_reasons: Vec<&'static str>,
 }
 
 /// Square wave audio source for ANSI music playback
@@ -667,6 +680,7 @@ impl RemoteGuiApp {
             completion_index: 0,
             ws_tx: None,
             ws_rx: None,
+            egui_ctx: None,
             runtime,
             password_submitted: false,
             auto_connect_attempted: false,
@@ -706,6 +720,7 @@ impl RemoteGuiApp {
             web_font_size_phone: 10.0,
             web_font_size_tablet: 14.0,
             web_font_size_desktop: 18.0,
+            web_font_weight: 400,
             edit_font_name: String::new(),
             edit_font_size: String::from("14.0"),
             edit_font_scale: String::from("1.05"),
@@ -764,6 +779,7 @@ impl RemoteGuiApp {
             ansi_music_enabled: true,
             tls_proxy_enabled: false,
             dictionary_path: String::new(),
+            zwj_enabled: false,
             #[cfg(all(feature = "rodio", not(target_os = "android")))]
             audio_stream: None,
             #[cfg(all(feature = "rodio", not(target_os = "android")))]
@@ -790,6 +806,15 @@ impl RemoteGuiApp {
             cached_filter_text: String::new(),
             cached_font_size: 0.0,
             cached_color_offset: 0,
+            prof_frame_count: 0,
+            prof_last_dump: std::time::Instant::now(),
+            prof_log: {
+                let path = std::env::current_dir()
+                    .unwrap_or_else(|_| std::path::PathBuf::from("."))
+                    .join("clay.gui.profile.log");
+                std::fs::File::create(&path).ok()
+            },
+            prof_reasons: Vec::new(),
         };
         app.load_remote_settings();
         app
@@ -1084,6 +1109,7 @@ impl RemoteGuiApp {
         let password_hash = hash_password(&self.password);
         let password_submitted = self.password_submitted;
         let ws_url_for_fallback = self.ws_url.clone();
+        let egui_ctx = self.egui_ctx.clone();
 
         self.runtime.spawn(async move {
             // Try to connect - for wss:// we need to configure TLS
@@ -1192,6 +1218,10 @@ impl RemoteGuiApp {
                                 if let Ok(ws_msg) = serde_json::from_str::<WsMessage>(&text) {
                                     if tx.send(ws_msg).is_err() {
                                         break;
+                                    }
+                                    // Wake egui to process the message immediately
+                                    if let Some(ref ctx) = egui_ctx {
+                                        ctx.request_repaint();
                                     }
                                 }
                             }
@@ -1333,6 +1363,7 @@ impl RemoteGuiApp {
                         self.web_font_size_phone = settings.web_font_size_phone;
                         self.web_font_size_tablet = settings.web_font_size_tablet;
                         self.web_font_size_desktop = settings.web_font_size_desktop;
+                        self.web_font_weight = settings.web_font_weight;
                         self.transparency = settings.gui_transparency;
                         self.color_offset_percent = settings.color_offset_percent;
                         self.ws_allow_list = settings.ws_allow_list;
@@ -1352,6 +1383,7 @@ impl RemoteGuiApp {
                         self.ansi_music_enabled = settings.ansi_music_enabled;
                         self.tls_proxy_enabled = settings.tls_proxy_enabled;
                         self.dictionary_path = settings.dictionary_path.clone();
+                        self.zwj_enabled = settings.zwj_enabled;
                         self.actions = actions;
                         // Send initial view state for synchronized more-mode
                         if let Some(ref tx) = self.ws_tx {
@@ -1562,6 +1594,7 @@ impl RemoteGuiApp {
                         self.web_font_size_phone = settings.web_font_size_phone;
                         self.web_font_size_tablet = settings.web_font_size_tablet;
                         self.web_font_size_desktop = settings.web_font_size_desktop;
+                        self.web_font_weight = settings.web_font_weight;
                         self.transparency = settings.gui_transparency;
                         self.color_offset_percent = settings.color_offset_percent;
                         self.ws_allow_list = settings.ws_allow_list;
@@ -1581,6 +1614,7 @@ impl RemoteGuiApp {
                         self.ansi_music_enabled = settings.ansi_music_enabled;
                         self.tls_proxy_enabled = settings.tls_proxy_enabled;
                         self.dictionary_path = settings.dictionary_path.clone();
+                        self.zwj_enabled = settings.zwj_enabled;
                         deferred_save_remote = true;
                     }
                     WsMessage::SetInputBuffer { text } => {
@@ -1730,6 +1764,15 @@ impl RemoteGuiApp {
                             Command::Menu => {
                                 self.popup_state = PopupState::Menu;
                                 self.menu_selected = 0;
+                            }
+                            Command::Font => {
+                                self.edit_font_name = self.font_name.clone();
+                                self.edit_font_size = format!("{:.1}", self.font_size);
+                                self.edit_font_scale = format!("{:.2}", self.font_scale);
+                                self.edit_font_y_offset = format!("{:.2}", self.font_y_offset);
+                                self.edit_font_baseline_offset = format!("{:.2}", self.font_baseline_offset);
+                                self.popup_state = PopupState::Font;
+                                self.popup_scroll_to_selected = true;
                             }
                             Command::Setup => {
                                 self.popup_state = PopupState::Setup;
@@ -2254,6 +2297,7 @@ impl RemoteGuiApp {
                 web_font_size_phone: self.web_font_size_phone,
                 web_font_size_tablet: self.web_font_size_tablet,
                 web_font_size_desktop: self.web_font_size_desktop,
+                web_font_weight: self.web_font_weight,
                 ws_allow_list: self.ws_allow_list.clone(),
                 web_secure: self.web_secure,
                 http_enabled: self.http_enabled,
@@ -2265,6 +2309,7 @@ impl RemoteGuiApp {
                 tls_proxy_enabled: self.tls_proxy_enabled,
                 dictionary_path: self.dictionary_path.clone(),
                 mouse_enabled: false,
+                zwj_enabled: self.zwj_enabled,
             });
         }
     }
@@ -2685,7 +2730,7 @@ impl RemoteGuiApp {
     }
 
     /// Append ANSI-colored text to an existing LayoutJob
-    fn append_ansi_to_job(text: &str, default_color: egui::Color32, font_id: egui::FontId, job: &mut egui::text::LayoutJob, is_light_theme: bool, color_offset_percent: u8, blink_visible: bool) {
+    fn append_ansi_to_job(text: &str, default_color: egui::Color32, font_id: egui::FontId, job: &mut egui::text::LayoutJob, is_light_theme: bool, color_offset_percent: u8, blink_visible: bool, zwj_enabled: bool) {
         // Theme background for shade character blending
         let theme_bg = if is_light_theme {
             egui::Color32::from_rgb(255, 255, 255)
@@ -2903,16 +2948,23 @@ impl RemoteGuiApp {
                     i += 1;
                 }
             } else if c == '\u{200D}' {
-                // Zero Width Joiner - buffer it, don't push yet
-                // If followed by a colored square, both get dropped (graceful degradation)
+                // Zero Width Joiner
+                if zwj_enabled {
+                    // Pass through for native rendering attempt
+                    segment.push(c);
+                }
+                // Buffer state regardless (to track if next char is colored square)
                 prev_was_zwj = true;
             } else {
                 // Check for colored square emoji and render as colored blocks
                 // But not if it's part of a ZWJ sequence (e.g., 🐈‍⬛ = cat + ZWJ + ⬛)
                 if let Some((r, g, b)) = Self::colored_square_rgb(c) {
                     if prev_was_zwj {
-                        // Square is part of a ZWJ sequence - drop both ZWJ and square
-                        // egui can't render ZWJ sequences, so just show base emoji
+                        if zwj_enabled {
+                            // Pass through the square too for native ZWJ rendering
+                            segment.push(c);
+                        }
+                        // When disabled, drop both ZWJ and square (show just base emoji)
                     } else {
                         // Standalone square - replace with colored block characters
                         // Flush current segment first
@@ -2935,7 +2987,7 @@ impl RemoteGuiApp {
                     prev_was_zwj = false;
                     continue;
                 }
-                if prev_was_zwj {
+                if prev_was_zwj && !zwj_enabled {
                     // ZWJ not followed by a colored square - keep it
                     segment.push('\u{200D}');
                 }
@@ -3053,7 +3105,7 @@ impl RemoteGuiApp {
     }
 
     /// Parse text into segments of plain text, Discord emojis, and colored squares
-    fn parse_discord_segments(text: &str) -> Vec<DiscordSegment> {
+    fn parse_discord_segments(text: &str, zwj_enabled: bool) -> Vec<DiscordSegment> {
         use regex::Regex;
 
         static RE: OnceLock<Regex> = OnceLock::new();
@@ -3095,11 +3147,18 @@ impl RemoteGuiApp {
                     let mut prev_zwj = false;
                     for c in txt.chars() {
                         if c == '\u{200D}' {
-                            // Buffer ZWJ - don't push yet
+                            // Buffer ZWJ
+                            if zwj_enabled {
+                                current_text.push(c);
+                            }
                             prev_zwj = true;
                         } else if let Some(color) = Self::colored_square_color(c) {
                             if prev_zwj {
-                                // Square is part of ZWJ sequence - drop both
+                                if zwj_enabled {
+                                    // Pass through square for native ZWJ rendering
+                                    current_text.push(c);
+                                }
+                                // When disabled, drop both ZWJ and square
                             } else {
                                 // Standalone square
                                 if !current_text.is_empty() {
@@ -3110,7 +3169,7 @@ impl RemoteGuiApp {
                             }
                             prev_zwj = false;
                         } else {
-                            if prev_zwj {
+                            if prev_zwj && !zwj_enabled {
                                 // ZWJ not followed by colored square - keep it
                                 current_text.push('\u{200D}');
                             }
@@ -3118,7 +3177,7 @@ impl RemoteGuiApp {
                             current_text.push(c);
                         }
                     }
-                    if prev_zwj {
+                    if prev_zwj && !zwj_enabled {
                         current_text.push('\u{200D}');
                     }
                     if !current_text.is_empty() {
@@ -3200,8 +3259,9 @@ impl RemoteGuiApp {
         link_color: egui::Color32,
         color_offset_percent: u8,
         blink_visible: bool,
+        zwj_enabled: bool,
     ) {
-        let segments = Self::parse_discord_segments(text);
+        let segments = Self::parse_discord_segments(text, zwj_enabled);
         let available_width = ui.available_width();
 
         // Check if this line has Discord emoji or colored squares
@@ -3223,7 +3283,7 @@ impl RemoteGuiApp {
                                 },
                                 ..Default::default()
                             };
-                            Self::append_ansi_to_job(&txt_with_breaks, default_color, font_id.clone(), &mut job, is_light_theme, color_offset_percent, blink_visible);
+                            Self::append_ansi_to_job(&txt_with_breaks, default_color, font_id.clone(), &mut job, is_light_theme, color_offset_percent, blink_visible, zwj_enabled);
                             let galley = ui.fonts(|f| f.layout_job(job));
                             ui.label(galley);
                         }
@@ -3265,7 +3325,7 @@ impl RemoteGuiApp {
                     let urls = Self::find_urls(txt);
                     if urls.is_empty() {
                         let txt_with_breaks = Self::insert_word_breaks(txt);
-                        Self::append_ansi_to_job(&txt_with_breaks, default_color, font_id.clone(), &mut job, is_light_theme, color_offset_percent, blink_visible);
+                        Self::append_ansi_to_job(&txt_with_breaks, default_color, font_id.clone(), &mut job, is_light_theme, color_offset_percent, blink_visible, zwj_enabled);
                     } else {
                         let char_to_byte: Vec<usize> = txt.char_indices().map(|(i, _)| i).collect();
                         let txt_char_count = char_to_byte.len();
@@ -3276,7 +3336,7 @@ impl RemoteGuiApp {
                                 let start_byte = char_to_byte.get(last_end_char).copied().unwrap_or(0);
                                 let end_byte = char_to_byte.get(start_char).copied().unwrap_or(txt.len());
                                 let before = Self::insert_word_breaks(&txt[start_byte..end_byte]);
-                                Self::append_ansi_to_job(&before, default_color, font_id.clone(), &mut job, is_light_theme, color_offset_percent, blink_visible);
+                                Self::append_ansi_to_job(&before, default_color, font_id.clone(), &mut job, is_light_theme, color_offset_percent, blink_visible, zwj_enabled);
                             }
 
                             let clean_url = crate::util::strip_ansi_codes(&url);
@@ -3298,7 +3358,7 @@ impl RemoteGuiApp {
                         if last_end_char < txt_char_count {
                             let start_byte = char_to_byte.get(last_end_char).copied().unwrap_or(txt.len());
                             let after = Self::insert_word_breaks(&txt[start_byte..]);
-                            Self::append_ansi_to_job(&after, default_color, font_id.clone(), &mut job, is_light_theme, color_offset_percent, blink_visible);
+                            Self::append_ansi_to_job(&after, default_color, font_id.clone(), &mut job, is_light_theme, color_offset_percent, blink_visible, zwj_enabled);
                         }
                     }
                 }
@@ -3358,20 +3418,31 @@ impl RemoteGuiApp {
 
 impl eframe::App for RemoteGuiApp {
     fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
-        // Use transparent clear color so window transparency works
         let theme = self.theme.clone();
         let bg = theme.bg();
+        // On Windows, always use opaque (transparency disabled to reduce CPU)
+        #[cfg(windows)]
+        let a = 1.0_f32;
+        #[cfg(not(windows))]
         let a = self.transparency;
         [bg.r() as f32 / 255.0, bg.g() as f32 / 255.0, bg.b() as f32 / 255.0, a]
     }
 
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        let frame_start = std::time::Instant::now();
+
+        // Store context for background tasks to request repaints
+        if self.egui_ctx.is_none() {
+            self.egui_ctx = Some(ctx.clone());
+        }
+
         // Skip rendering until screen has valid dimensions
         // This prevents NaN panics from egui layout calculations on startup
         let screen = ctx.screen_rect();
         if screen.width() <= 0.0 || screen.height() <= 0.0 ||
            screen.width().is_nan() || screen.height().is_nan() ||
            !screen.width().is_finite() || !screen.height().is_finite() {
+            self.prof_reasons.push("invalid_screen");
             ctx.request_repaint();
             return;
         }
@@ -3379,34 +3450,39 @@ impl eframe::App for RemoteGuiApp {
         // Process incoming WebSocket messages
         let had_messages = self.process_messages();
         if had_messages {
+            self.prof_reasons.push("ws_message");
             ctx.request_repaint(); // Immediate repaint when new data arrives
         }
 
         // Handle reload reconnect with retry
+        // IMPORTANT: Only call request_repaint_after when scheduling the NEXT attempt.
+        // Calling it every frame sets egui's outstanding=1, causing infinite 60fps loop.
         if let Some(reconnect_at) = self.reload_reconnect_at {
             if std::time::Instant::now() >= reconnect_at {
+                self.prof_reasons.push("reconnect_timer");
                 self.reload_reconnect_attempts += 1;
                 if self.reload_reconnect_attempts <= 5 {
                     self.connect_websocket();
                     self.reload_reconnect_at = Some(std::time::Instant::now() + std::time::Duration::from_secs(1));
+                    ctx.request_repaint_after(std::time::Duration::from_secs(1));
                 } else {
                     self.reload_reconnect_at = None;
                 }
             }
-            ctx.request_repaint_after(std::time::Duration::from_millis(100));
         }
 
         // Blink animation: toggle every 500ms (only when blink text exists)
+        // IMPORTANT: Only call request_repaint_after when we actually toggle.
+        // Calling it every frame sets egui's outstanding=1, causing infinite 60fps loop.
         if self.has_blink_text {
             if self.blink_last_toggle.elapsed() >= std::time::Duration::from_millis(500) {
+                self.prof_reasons.push("blink");
                 self.blink_visible = !self.blink_visible;
                 self.blink_last_toggle = std::time::Instant::now();
                 self.output_dirty = true;
-                ctx.request_repaint();
+                // Schedule next toggle in 500ms (outstanding=1 settle frame is fine — just one extra)
+                ctx.request_repaint_after(std::time::Duration::from_millis(500));
             }
-            let time_since_toggle = self.blink_last_toggle.elapsed();
-            let next_toggle = std::time::Duration::from_millis(500).saturating_sub(time_since_toggle);
-            ctx.request_repaint_after(next_toggle);
         }
 
         // Apply theme to egui visuals (clone to avoid borrowing self)
@@ -3564,10 +3640,56 @@ impl eframe::App for RemoteGuiApp {
         }
         ctx.set_style(style);
 
-        // Request repaint after a short delay to keep polling messages
-        // Using request_repaint_after instead of request_repaint allows egui to
-        // prioritize immediate keyboard/mouse events over background polling
-        ctx.request_repaint_after(std::time::Duration::from_millis(50));
+        // DO NOT call request_repaint_after() unconditionally here!
+        // In egui 0.24, every request_repaint_after() sets outstanding=1, which
+        // causes begin_frame to fire an IMMEDIATE repaint callback on the next frame,
+        // creating an infinite 60fps loop. Instead, only request repaints when we
+        // actually need them (ws_message, blink, reconnect). The WebSocket background
+        // task calls ctx.request_repaint() when messages arrive.
+
+        // Frame profiling: count frames and dump stats every second
+        let frame_elapsed = frame_start.elapsed();
+        self.prof_frame_count += 1;
+        // Check egui's raw input state for repaint triggers
+        let has_pointer_events = ctx.input(|i| !i.raw.events.is_empty());
+        let has_pointer_delta = ctx.input(|i| i.pointer.delta() != egui::Vec2::ZERO);
+        let has_scroll = ctx.input(|i| i.scroll_delta != egui::Vec2::ZERO);
+        let num_events = ctx.input(|i| i.raw.events.len());
+        if has_pointer_events { self.prof_reasons.push("raw_events"); }
+        if has_pointer_delta { self.prof_reasons.push("pointer_delta"); }
+        if has_scroll { self.prof_reasons.push("scroll_delta"); }
+        if self.prof_reasons.is_empty() {
+            self.prof_reasons.push("idle/safety_net");
+        }
+        let since_last_dump = self.prof_last_dump.elapsed();
+        if since_last_dump >= std::time::Duration::from_secs(1) {
+            if let Some(ref mut log) = self.prof_log {
+                use std::io::Write;
+                let reasons: Vec<&str> = self.prof_reasons.drain(..).collect();
+                let mut reason_counts = std::collections::HashMap::<&str, u32>::new();
+                for r in &reasons {
+                    *reason_counts.entry(r).or_insert(0) += 1;
+                }
+                let mut reason_str: Vec<String> = reason_counts.iter()
+                    .map(|(k, v)| if *v > 1 { format!("{}x{}", k, v) } else { k.to_string() })
+                    .collect();
+                reason_str.sort();
+                let _ = writeln!(log, "[{:.1}s] {} frames in {:.1}s ({:.1} fps), last_frame={:.2}ms, events={}, reasons: {}",
+                    frame_start.duration_since(self.prof_last_dump).as_secs_f64()
+                        + self.prof_last_dump.elapsed().as_secs_f64(),
+                    self.prof_frame_count,
+                    since_last_dump.as_secs_f64(),
+                    self.prof_frame_count as f64 / since_last_dump.as_secs_f64(),
+                    frame_elapsed.as_secs_f64() * 1000.0,
+                    num_events,
+                    reason_str.join(", "),
+                );
+                let _ = log.flush();
+            }
+            self.prof_frame_count = 0;
+            self.prof_last_dump = std::time::Instant::now();
+            self.prof_reasons.clear();
+        }
 
         // Wait for settings before rendering UI (prevents theme flash)
         // Visuals are already applied above so the background color is correct
@@ -3588,7 +3710,12 @@ impl eframe::App for RemoteGuiApp {
                     }
                 });
             self.frame_count += 1;
-            ctx.request_repaint();
+            // Don't busy-loop; the WebSocket background task will call
+            // ctx.request_repaint() when settings arrive. Only schedule
+            // a safety check in case the message is missed.
+            if self.frame_count == 1 {
+                ctx.request_repaint_after(std::time::Duration::from_millis(500));
+            }
             return;
         }
 
@@ -4488,6 +4615,15 @@ impl eframe::App for RemoteGuiApp {
                                     self.popup_state = PopupState::Menu;
                                     self.menu_selected = 0;
                                 }
+                                super::Command::Font => {
+                                    self.edit_font_name = self.font_name.clone();
+                                    self.edit_font_size = format!("{:.1}", self.font_size);
+                                    self.edit_font_scale = format!("{:.2}", self.font_scale);
+                                    self.edit_font_y_offset = format!("{:.2}", self.font_y_offset);
+                                    self.edit_font_baseline_offset = format!("{:.2}", self.font_baseline_offset);
+                                    self.popup_state = PopupState::Font;
+                                    self.popup_scroll_to_selected = true;
+                                }
                                 super::Command::Actions { .. } => {
                                     self.open_actions_list_unified();
                                 }
@@ -5242,7 +5378,7 @@ impl eframe::App for RemoteGuiApp {
                                 };
                                 // Apply word breaks for long words
                                 let line_text = Self::insert_word_breaks(&line_text);
-                                Self::append_ansi_to_job(&line_text, default_color, font_id.clone(), &mut combined_job, is_light_theme, self.color_offset_percent, self.blink_visible);
+                                Self::append_ansi_to_job(&line_text, default_color, font_id.clone(), &mut combined_job, is_light_theme, self.color_offset_percent, self.blink_visible, self.zwj_enabled);
 
                                 if i < display_lines.len() - 1 {
                                     combined_job.append("\n", 0.0, egui::TextFormat {
@@ -5344,6 +5480,7 @@ impl eframe::App for RemoteGuiApp {
                                         emoji_link_color,
                                         emoji_color_offset,
                                         emoji_blink_visible,
+                                        self.zwj_enabled,
                                     );
                                 }
 
@@ -7022,6 +7159,7 @@ impl eframe::App for RemoteGuiApp {
                 // Note: show_tags is not in setup anymore - controlled by F2 or /tag
                 let mut ansi_music = self.ansi_music_enabled;
                 let mut tls_proxy = self.tls_proxy_enabled;
+                let mut zwj_enabled = self.zwj_enabled;
                 let mut input_height = self.input_height;
                 let mut gui_theme = self.theme.clone();
                 let mut transparency = self.transparency;
@@ -7451,11 +7589,14 @@ impl eframe::App for RemoteGuiApp {
                                 });
                                 ui.add_space(6.0);
 
-                                // Row 3: TLS Proxy
+                                // Row 3: TLS Proxy, ZWJ Sequence
                                 ui.horizontal(|ui| {
                                     ui.set_height(row_height);
                                     ui.allocate_ui(egui::vec2(col_total_width, row_height), |ui| {
                                         toggle_col(ui, "TLS PROXY", "tls_proxy_toggle", &mut tls_proxy);
+                                    });
+                                    ui.allocate_ui(egui::vec2(col_total_width, row_height), |ui| {
+                                        toggle_col(ui, "ZWJ SEQUENCE", "zwj_toggle", &mut zwj_enabled);
                                     });
                                 });
                         });
@@ -7479,6 +7620,7 @@ impl eframe::App for RemoteGuiApp {
                 // Note: show_tags is not in setup anymore - controlled by F2 or /tag
                 self.ansi_music_enabled = ansi_music;
                 self.tls_proxy_enabled = tls_proxy;
+                self.zwj_enabled = zwj_enabled;
                 self.input_height = input_height;
                 self.theme = gui_theme;
                 self.transparency = transparency;
@@ -8393,6 +8535,15 @@ impl eframe::App for RemoteGuiApp {
                         }
                         super::Command::Setup => self.popup_state = PopupState::Setup,
                         super::Command::Web => self.popup_state = PopupState::Web,
+                        super::Command::Font => {
+                            self.edit_font_name = self.font_name.clone();
+                            self.edit_font_size = format!("{:.1}", self.font_size);
+                            self.edit_font_scale = format!("{:.2}", self.font_scale);
+                            self.edit_font_y_offset = format!("{:.2}", self.font_y_offset);
+                            self.edit_font_baseline_offset = format!("{:.2}", self.font_baseline_offset);
+                            self.popup_state = PopupState::Font;
+                            self.popup_scroll_to_selected = true;
+                        }
                         super::Command::Actions { .. } => {
                             self.open_actions_list_unified();
                         }
@@ -9792,8 +9943,15 @@ pub fn run(addr: &str, runtime: tokio::runtime::Handle) -> io::Result<()> {
 
     let mut viewport = egui::ViewportBuilder::default()
         .with_inner_size([800.0, 600.0])
-        .with_title("Clay Mud Client")
-        .with_transparent(true);
+        .with_title("Clay Mud Client");
+
+    // Only enable transparency on non-Windows platforms.
+    // On Windows, transparent windows force DWM compositing every frame,
+    // causing high idle CPU even when the window is fully opaque.
+    #[cfg(not(windows))]
+    {
+        viewport = viewport.with_transparent(true);
+    }
 
     // Set window icon from embedded PNG
     if let Some(icon) = load_app_icon() {
@@ -9838,17 +9996,31 @@ pub fn run_master_gui() -> std::io::Result<()> {
         }
     }
 
-    // Build a multi-threaded tokio runtime for the App
-    let runtime = tokio::runtime::Runtime::new()?;
+    // Build a tokio runtime for the App with limited threads to reduce idle CPU
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()?;
     let handle = runtime.handle().clone();
 
     // Create bidirectional channels between App and GUI
     let (app_to_gui_tx, app_to_gui_rx) = mpsc::unbounded_channel::<crate::WsMessage>();
     let (gui_to_app_tx, gui_to_app_rx) = mpsc::unbounded_channel::<crate::WsMessage>();
 
+    // Shared container for egui context — GUI fills this in on creation,
+    // App uses it to wake the GUI immediately when sending messages
+    let egui_ctx_holder: std::sync::Arc<std::sync::OnceLock<egui::Context>> =
+        std::sync::Arc::new(std::sync::OnceLock::new());
+    let egui_ctx_for_app = egui_ctx_holder.clone();
+    let gui_repaint: std::sync::Arc<dyn Fn() + Send + Sync> = std::sync::Arc::new(move || {
+        if let Some(ctx) = egui_ctx_for_app.get() {
+            ctx.request_repaint();
+        }
+    });
+
     // Spawn the headless App on the tokio runtime
     handle.spawn(async move {
-        if let Err(e) = crate::run_app_headless(app_to_gui_tx, gui_to_app_rx).await {
+        if let Err(e) = crate::run_app_headless(app_to_gui_tx, gui_to_app_rx, None, Some(gui_repaint)).await {
             eprintln!("App error: {}", e);
         }
     });
@@ -9856,8 +10028,13 @@ pub fn run_master_gui() -> std::io::Result<()> {
     // Run the GUI on the main thread (required by eframe/windowing systems)
     let mut viewport = egui::ViewportBuilder::default()
         .with_inner_size([800.0, 600.0])
-        .with_title("Clay Mud Client")
-        .with_transparent(true);
+        .with_title("Clay Mud Client");
+
+    // Only enable transparency on non-Windows platforms.
+    #[cfg(not(windows))]
+    {
+        viewport = viewport.with_transparent(true);
+    }
 
     // Set window icon from embedded PNG
     if let Some(icon) = load_app_icon() {
@@ -9875,6 +10052,8 @@ pub fn run_master_gui() -> std::io::Result<()> {
         options,
         Box::new(move |cc| {
             egui_extras::install_image_loaders(&cc.egui_ctx);
+            // Fill in the shared egui context so the App can wake the GUI
+            let _ = egui_ctx_holder.set(cc.egui_ctx.clone());
             Box::new(RemoteGuiApp::new_master(app_to_gui_rx, gui_to_app_tx, handle))
                 as Box<dyn eframe::App>
         }),

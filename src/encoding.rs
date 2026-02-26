@@ -725,26 +725,35 @@ pub fn wrap_urls_with_osc8(s: &str) -> String {
 /// Replace colored square emoji with ANSI-colored block characters for console display
 /// This ensures emoji like 🟩🟨 display in their proper colors in terminals
 /// (Emoji fonts typically ignore ANSI colors, so we use block characters instead)
-pub fn colorize_square_emojis(s: &str) -> String {
+pub fn colorize_square_emojis(s: &str, zwj_enabled: bool) -> String {
     let mut result = String::with_capacity(s.len() * 2);
     let mut prev_was_zwj = false;
     for c in s.chars() {
         if c == '\u{200D}' {
-            // Zero Width Joiner - pass through as-is
-            // Modern terminals render ZWJ sequences natively (e.g., 🐈‍⬛ as black cat)
+            // Zero Width Joiner
             prev_was_zwj = true;
-            result.push(c);
+            if zwj_enabled {
+                // Pass through ZWJ for native rendering
+                result.push(c);
+            }
+            // When disabled, buffer but don't push (will be stripped along with following square)
         } else if let Some((r, g, b)) = colored_square_rgb(c) {
             if prev_was_zwj {
-                // Square is part of a ZWJ sequence - pass through untouched
-                // so the terminal can render the combined emoji natively
-                result.push(c);
+                if zwj_enabled {
+                    // Pass through untouched for native ZWJ sequence rendering
+                    result.push(c);
+                }
+                // When disabled, drop both ZWJ and colored square (show just base emoji)
             } else {
                 // Standalone square - replace with colored block characters
                 result.push_str(&format!("\x1b[38;2;{};{};{}m██\x1b[0m", r, g, b));
             }
             prev_was_zwj = false;
         } else {
+            if prev_was_zwj && !zwj_enabled {
+                // ZWJ was buffered but not followed by colored square - keep it
+                result.push('\u{200D}');
+            }
             prev_was_zwj = false;
             result.push(c);
         }

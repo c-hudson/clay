@@ -203,6 +203,8 @@ pub enum WsMessage {
         web_font_size_phone: f32,
         web_font_size_tablet: f32,
         web_font_size_desktop: f32,
+        #[serde(default = "default_web_font_weight")]
+        web_font_weight: u16,
         ws_allow_list: String,
         web_secure: bool,
         http_enabled: bool,
@@ -216,6 +218,8 @@ pub enum WsMessage {
         dictionary_path: String,
         #[serde(default)]
         mouse_enabled: bool,
+        #[serde(default)]
+        zwj_enabled: bool,
     },
 
     // Settings update confirmations (server -> client)
@@ -402,6 +406,8 @@ pub struct GlobalSettingsMsg {
     pub web_font_size_tablet: f32,
     #[serde(default = "default_web_font_size_desktop")]
     pub web_font_size_desktop: f32,
+    #[serde(default = "default_web_font_weight")]
+    pub web_font_weight: u16,
     pub ws_allow_list: String,
     pub web_secure: bool,
     pub http_enabled: bool,
@@ -416,6 +422,8 @@ pub struct GlobalSettingsMsg {
     pub dictionary_path: String,
     #[serde(default)]
     pub mouse_enabled: bool,
+    #[serde(default)]
+    pub zwj_enabled: bool,
     /// Theme colors from ~/clay.theme.dat (serialized as hex strings)
     #[serde(default)]
     pub theme_colors_json: String,
@@ -435,6 +443,10 @@ fn default_web_font_size_tablet() -> f32 {
 
 fn default_web_font_size_desktop() -> f32 {
     18.0
+}
+
+fn default_web_font_weight() -> u16 {
+    400
 }
 
 /// Type of remote client connected via WebSocket
@@ -482,6 +494,8 @@ pub struct WebSocketServer {
     pub running: Arc<RwLock<bool>>,
     pub shutdown_tx: Option<tokio::sync::oneshot::Sender<()>>,
     pub port: u16,
+    /// Bind address (default "0.0.0.0", can be set to "127.0.0.1" for local-only)
+    pub bind_addr: String,
     pub allow_list: Arc<std::sync::RwLock<Vec<String>>>,
     /// Single whitelisted host that can connect without password
     /// Set when a user authenticates from an allow-list host
@@ -514,6 +528,7 @@ impl WebSocketServer {
             running: Arc::new(RwLock::new(false)),
             shutdown_tx: None,
             port,
+            bind_addr: "0.0.0.0".to_string(),
             allow_list: Arc::new(std::sync::RwLock::new(allow_list_vec)),
             whitelisted_host: Arc::new(std::sync::RwLock::new(whitelisted_host)),
             multiuser_mode,
@@ -839,7 +854,7 @@ pub async fn start_websocket_server(
     server: &mut WebSocketServer,
     event_tx: mpsc::Sender<AppEvent>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let addr = format!("0.0.0.0:{}", server.port);
+    let addr = format!("{}:{}", server.bind_addr, server.port);
     let listener = TcpListener::bind(&addr).await?;
 
     let (shutdown_tx, mut shutdown_rx) = tokio::sync::oneshot::channel::<()>();

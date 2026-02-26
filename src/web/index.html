@@ -5,7 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0, interactive-widget=resizes-content, viewport-fit=cover">
     <title>Clay MUD Client</title>
     <link rel="preconnect" href="https://fonts.googleapis.com">
-    <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600;700&family=Nunito:wght@400;500;600;700&display=swap" rel="stylesheet">
+    <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@100;200;300;400;500;600;700&family=Nunito:wght@400;500;600;700&display=swap" rel="stylesheet">
     <link rel="stylesheet" href="/style.css">
     <style id="theme-vars">:root { {{THEME_CSS_VARS}} }</style>
 </head>
@@ -73,6 +73,7 @@
             <div class="menu-sep"></div>
             <div class="menu-item" data-action="setup">Setup<span class="shortcut">/setup</span></div>
             <div class="menu-item" data-action="web">Web Settings<span class="shortcut">/web</span></div>
+            <div class="menu-item" data-action="font">Font<span class="shortcut">/font</span></div>
             <div class="menu-sep"></div>
             <div class="menu-item" data-action="toggle-tags">Toggle Tags<span class="shortcut">F2</span></div>
             <div class="menu-item" data-action="filter">Filter<span class="shortcut">F4</span></div>
@@ -468,6 +469,15 @@
                             </div>
                         </div>
                     </div>
+                    <div class="setting-row" id="setup-transparency-row" style="display:none">
+                        <span class="setting-label">Transparency</span>
+                        <div class="setting-value" style="flex:1">
+                            <div class="slider-container">
+                                <input type="range" id="setup-transparency-slider" min="30" max="100" value="100" class="slider">
+                                <span id="setup-transparency-value" class="stepper-value" style="min-width:36px;text-align:center">100%</span>
+                            </div>
+                        </div>
+                    </div>
                     <div class="settings-two-column">
                         <div class="settings-column">
                             <div class="setting-row">
@@ -496,6 +506,66 @@
                 <div class="popup-footer">
                     <button id="setup-cancel-btn" class="btn">Cancel</button>
                     <button id="setup-save-btn" class="btn btn-primary">Save</button>
+                </div>
+            </div>
+        </div>
+
+        <!-- Font popup (/font) -->
+        <div id="font-modal" class="modal">
+            <div class="modal-content font-modal-content">
+                <div class="popup-header">
+                    <span class="popup-title">Font</span>
+                    <button id="font-close-btn" class="popup-close">&#10005;</button>
+                </div>
+                <div class="popup-body">
+                    <div class="font-family-label">Font family</div>
+                    <div class="font-family-list" id="font-family-list"></div>
+                    <div class="font-size-section">
+                        <div class="setting-row">
+                            <span class="setting-label">Weight</span>
+                            <div class="setting-value">
+                                <div class="stepper">
+                                    <button id="font-weight-minus" class="stepper-btn">&#8722;</button>
+                                    <span id="font-weight-value" class="stepper-value">400</span>
+                                    <button id="font-weight-plus" class="stepper-btn">+</button>
+                                </div>
+                            </div>
+                        </div>
+                        <div class="setting-row">
+                            <span class="setting-label">Phone</span>
+                            <div class="setting-value">
+                                <div class="stepper">
+                                    <button id="font-phone-minus" class="stepper-btn">&#8722;</button>
+                                    <span id="font-phone-value" class="stepper-value">10</span>
+                                    <button id="font-phone-plus" class="stepper-btn">+</button>
+                                </div>
+                            </div>
+                        </div>
+                        <div class="setting-row">
+                            <span class="setting-label">Tablet</span>
+                            <div class="setting-value">
+                                <div class="stepper">
+                                    <button id="font-tablet-minus" class="stepper-btn">&#8722;</button>
+                                    <span id="font-tablet-value" class="stepper-value">14</span>
+                                    <button id="font-tablet-plus" class="stepper-btn">+</button>
+                                </div>
+                            </div>
+                        </div>
+                        <div class="setting-row">
+                            <span class="setting-label">Desktop</span>
+                            <div class="setting-value">
+                                <div class="stepper">
+                                    <button id="font-desktop-minus" class="stepper-btn">&#8722;</button>
+                                    <span id="font-desktop-value" class="stepper-value">18</span>
+                                    <button id="font-desktop-plus" class="stepper-btn">+</button>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+                <div class="popup-footer">
+                    <button id="font-cancel-btn" class="btn">Cancel</button>
+                    <button id="font-save-btn" class="btn btn-primary">Save</button>
                 </div>
             </div>
         </div>

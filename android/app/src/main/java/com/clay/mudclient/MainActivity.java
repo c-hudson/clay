@@ -870,6 +870,11 @@ public class MainActivity extends AppCompatActivity {
         // Cancel background shutdown timer since user is back
         cancelBackgroundShutdownTimer();
 
+        // Always resume WebView timers/JS execution (may have been paused in onPause)
+        if (webView != null) {
+            webView.onResume();
+        }
+
         // Don't interfere if initial delayed load is pending
         if (isInitialLoadPending) {
             return;
@@ -899,16 +904,17 @@ public class MainActivity extends AppCompatActivity {
                 android.util.Log.i("Clay", "Loading interface: interfaceLoaded=" + interfaceLoaded +
                     ", loadedUrl=" + loadedInterfaceUrl + ", expectedUrl=" + expectedUrl);
                 loadWebInterface();
-            } else if (isConnected && messagesSentSinceAck > 0) {
-                // Returning from background with unacked messages - trigger resync
-                android.util.Log.i("Clay", "Resuming with " + messagesSentSinceAck + " unacked messages, triggering resync");
+            } else if (webView != null) {
+                // Interface loaded - always verify connection health on resume.
+                // Java's isConnected flag can be stale if the WS died silently,
+                // so let JS check the actual socket state and reconnect if needed.
+                // This also handles the visibilitychange event not firing on some Android versions.
                 messagesSentSinceAck = 0;
                 webView.evaluateJavascript(
-                    "if (typeof triggerResync === 'function') triggerResync();",
+                    "if (typeof checkConnectionOnResume === 'function') checkConnectionOnResume();",
                     null
                 );
             }
-            // Don't reload if just returning from background with interface intact
         }
     }
 

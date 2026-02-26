@@ -3,9 +3,9 @@
 :root {
     --mono: 'JetBrains Mono', 'Cascadia Code', 'Fira Code', 'Consolas', 'Monaco', 'Lucida Console', monospace;
     --sans: 'Nunito', system-ui, sans-serif;
-    --bg-color: var(--theme-bg, #000000);
-    --text-color: var(--theme-fg, #c0c0c0);
-    --input-bg: var(--theme-bg-deep, #000000);
+    --bg-color: var(--theme-bg, #121212);
+    --text-color: var(--theme-fg, #e8e4ec);
+    --input-bg: var(--theme-bg-deep, #0a0a0a);
     --border-color: var(--theme-border-medium, #404040);
     --accent-color: var(--theme-accent, #00cdcd);
     --error-color: var(--theme-error, #cd0000);
@@ -57,22 +57,6 @@ body {
     position: relative;
 }
 
-/* Paw watermark */
-#app::before {
-    content: '';
-    position: absolute;
-    bottom: 70px;
-    right: 16px;
-    width: 80px;
-    height: 80px;
-    opacity: 0.025;
-    background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Cellipse cx='50' cy='65' rx='22' ry='26' fill='%23d4845a'/%3E%3Cellipse cx='28' cy='35' rx='11' ry='14' fill='%23d4845a' transform='rotate(-15 28 35)'/%3E%3Cellipse cx='72' cy='35' rx='11' ry='14' fill='%23d4845a' transform='rotate(15 72 35)'/%3E%3Cellipse cx='18' cy='58' rx='9' ry='12' fill='%23d4845a' transform='rotate(-25 18 58)'/%3E%3Cellipse cx='82' cy='58' rx='9' ry='12' fill='%23d4845a' transform='rotate(25 82 58)'/%3E%3C/svg%3E");
-    background-size: contain;
-    background-repeat: no-repeat;
-    pointer-events: none;
-    z-index: 0;
-}
-
 /* ─── Output Area ─── */
 #output-container {
     flex: 1;
@@ -86,7 +70,7 @@ body {
     position: relative;
     z-index: 1;
     scrollbar-width: thin;
-    scrollbar-color: var(--theme-border-medium, #333) transparent;
+    scrollbar-color: var(--theme-border-light, #888) var(--theme-bg, #121212);
 }
 
 #output {
@@ -446,14 +430,20 @@ body {
     border: none;
     color: var(--text-color);
     font-family: var(--mono);
+    font-weight: inherit;
     font-size: inherit;
-    line-height: 1.2;
+    line-height: 1.0;
     padding: 2px;
     outline: none;
     caret-color: #ffffff;
     resize: none;
     overflow-y: auto;
     min-height: 3.6em;
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+    font-variant-ligatures: none;
+    text-rendering: geometricPrecision;
+    letter-spacing: 0;
 }
 
 #send-btn {
@@ -605,20 +595,21 @@ body.device-phone #output-container { padding: 6px 10px; }
 
 /* ─── Scrollbar ─── */
 ::-webkit-scrollbar {
-    width: 6px;
+    width: 12px;
 }
 
 ::-webkit-scrollbar-track {
-    background: transparent;
+    background: var(--theme-bg, #121212);
 }
 
 ::-webkit-scrollbar-thumb {
-    background: var(--theme-border-medium, #333);
-    border-radius: 3px;
+    background: var(--theme-border-light, #888);
+    border: 2px solid var(--theme-bg, #121212);
+    border-radius: 6px;
 }
 
 ::-webkit-scrollbar-thumb:hover {
-    background: var(--theme-bg-hover, #444);
+    background: var(--theme-fg-muted, #aaa);
 }
 
 /* ─── Modal ─── */
@@ -1788,6 +1779,33 @@ body.device-phone #output-container { padding: 6px 10px; }
     font-size: 12px;
 }
 
+/* Slider container */
+.slider-container {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+}
+
+.slider {
+    -webkit-appearance: none;
+    appearance: none;
+    flex: 1;
+    height: 4px;
+    background: var(--theme-bg, #121212);
+    border-radius: 2px;
+    outline: none;
+}
+
+.slider::-webkit-slider-thumb {
+    -webkit-appearance: none;
+    appearance: none;
+    width: 14px;
+    height: 14px;
+    border-radius: 50%;
+    background: var(--accent-color, #0891b2);
+    cursor: pointer;
+}
+
 /* Buttons (mockup style) */
 .setup-modal-content .btn {
     padding: 9px 6px;
@@ -1821,6 +1839,119 @@ body.device-phone #output-container { padding: 6px 10px; }
     background: #22d3ee;
     border-color: #22d3ee;
     color: #08080a;
+}
+
+/* ─── Font popup ─── */
+.font-modal-content {
+    width: min(90vw, 360px);
+    max-width: 95vw;
+    padding: 0;
+    background: var(--theme-bg-elevated, #1a1a1f);
+    border: 1px solid var(--theme-border-subtle, rgba(255, 255, 255, 0.1));
+    border-radius: 8px;
+    box-shadow: 0 16px 48px rgba(0, 0, 0, 0.5);
+    box-sizing: border-box;
+}
+
+.font-modal-content .popup-header {
+    padding: 8px 12px 2px 12px;
+}
+
+.font-modal-content .popup-title {
+    font-size: 11px;
+    font-weight: 600;
+    color: var(--text-color);
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+}
+
+.font-modal-content .popup-body {
+    padding: 6px 12px 12px 12px;
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+}
+
+.font-modal-content .popup-footer {
+    display: flex;
+    align-items: center;
+    justify-content: flex-end;
+    gap: 6px;
+    padding: 8px 12px;
+    background: transparent;
+}
+
+.font-modal-content .btn {
+    padding: 9px 6px;
+    width: 70px;
+    background: var(--theme-bg-hover, #222228);
+    border: 1px solid var(--theme-border-subtle, rgba(255, 255, 255, 0.1));
+    border-radius: 4px;
+    color: var(--theme-fg-secondary, #a1a1aa);
+    font-family: inherit;
+    font-size: 10px;
+    font-weight: 500;
+    text-transform: uppercase;
+    letter-spacing: 0.03em;
+    cursor: pointer;
+    transition: all 0.1s ease;
+}
+
+.font-modal-content .btn:hover {
+    background: var(--theme-bg-elevated, #1a1a1f);
+    color: var(--text-color);
+    border-color: var(--theme-fg-muted, #52525b);
+}
+
+.font-modal-content .btn-primary {
+    background: #0891b2;
+    border-color: #0891b2;
+    color: #08080a;
+}
+
+.font-modal-content .btn-primary:hover {
+    background: #22d3ee;
+    border-color: #22d3ee;
+    color: #08080a;
+}
+
+.font-family-label {
+    color: var(--theme-fg-secondary, #a1a1aa);
+    font-size: 12px;
+    padding-bottom: 4px;
+}
+
+.font-family-list {
+    max-height: 200px;
+    overflow-y: auto;
+    background: var(--theme-bg, #08080a);
+    border: 1px solid var(--theme-border-subtle, rgba(255, 255, 255, 0.1));
+    border-radius: 4px;
+    padding: 2px;
+    margin-bottom: 8px;
+}
+
+.font-family-item {
+    padding: 5px 8px;
+    font-size: 12px;
+    cursor: pointer;
+    border-radius: 3px;
+    color: var(--text-color);
+    white-space: nowrap;
+}
+
+.font-family-item:hover {
+    background: var(--theme-bg-hover, rgba(255, 255, 255, 0.1));
+}
+
+.font-family-item.selected {
+    background: rgba(8, 145, 178, 0.3);
+    color: #22d3ee;
+}
+
+.font-size-section .setting-label {
+    width: 60px;
+    min-width: 60px;
 }
 
 /* ─── Web Settings popup ─── */

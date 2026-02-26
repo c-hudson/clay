@@ -98,8 +98,8 @@ impl ThemeColors {
     pub fn dark_default() -> Self {
         Self {
             // Background hierarchy
-            bg: ThemeColor::new(0x12, 0x12, 0x12),      // #121212
-            bg_deep: ThemeColor::new(0x15, 0x11, 0x19),  // #151119
+            bg: ThemeColor::new(0x13, 0x19, 0x26),      // #131926
+            bg_deep: ThemeColor::new(0x13, 0x19, 0x26),  // #131926
             bg_surface: ThemeColor::new(0x1c, 0x17, 0x22), // #1c1722
             bg_elevated: ThemeColor::new(0x1f, 0x1f, 0x1f), // #1f1f1f
             bg_hover: ThemeColor::new(0x2c, 0x25, 0x35),  // #2c2535

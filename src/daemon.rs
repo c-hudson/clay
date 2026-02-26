@@ -150,9 +150,10 @@ pub async fn run_daemon_server() -> io::Result<()> {
 
     println!("Daemon running. Press Ctrl+C to stop.");
 
-    // Create interval for TF repeat process ticks (1 second)
-    let mut process_tick_interval = tokio::time::interval(std::time::Duration::from_secs(1));
-    process_tick_interval.tick().await; // Skip first immediate tick
+    // Conditional timer: sleep far-future when no processes, reset to 1s when needed
+    const FAR_FUTURE: std::time::Duration = std::time::Duration::from_secs(86400);
+    let process_tick_sleep = tokio::time::sleep(FAR_FUTURE);
+    tokio::pin!(process_tick_sleep);
 
     // Main event loop - handles MUD connections and WebSocket messages
     loop {
@@ -160,8 +161,8 @@ pub async fn run_daemon_server() -> io::Result<()> {
         reap_zombie_children();
 
         tokio::select! {
-            // TF repeat process tick
-            _ = process_tick_interval.tick() => {
+            // TF repeat process tick — only fires when processes exist
+            _ = &mut process_tick_sleep => {
                 let now = std::time::Instant::now();
                 let mut to_remove = vec![];
                 let process_count = app.tf_engine.processes.len();
@@ -233,6 +234,12 @@ pub async fn run_daemon_server() -> io::Result<()> {
                 }
                 for i in to_remove.into_iter().rev() {
                     app.tf_engine.processes.remove(i);
+                }
+                // Re-arm: tick again in 1s if processes remain
+                if !app.tf_engine.processes.is_empty() {
+                    process_tick_sleep.as_mut().reset(tokio::time::Instant::now() + std::time::Duration::from_secs(1));
+                } else {
+                    process_tick_sleep.as_mut().reset(tokio::time::Instant::now() + FAR_FUTURE);
                 }
             }
             Some(event) = event_rx.recv() => {
@@ -339,6 +346,13 @@ pub async fn run_daemon_server() -> io::Result<()> {
                     }
                     _ => {}
                 }
+            }
+        }
+
+        // Activate process tick sleep if processes were added during this iteration
+        if !app.tf_engine.processes.is_empty() {
+            if process_tick_sleep.deadline() > tokio::time::Instant::now() + std::time::Duration::from_secs(2) {
+                process_tick_sleep.as_mut().reset(tokio::time::Instant::now() + std::time::Duration::from_secs(1));
             }
         }
     }
@@ -908,7 +922,7 @@ pub async fn handle_daemon_ws_message(
                     });
                 }
                 // UI popup commands - send back to client for local handling
-                Command::Help | Command::Menu | Command::Setup | Command::Web | Command::Actions { .. } |
+                Command::Help | Command::Menu | Command::Font | Command::Setup | Command::Web | Command::Actions { .. } |
                 Command::WorldsList | Command::WorldSelector | Command::WorldEdit { .. } => {
                     app.ws_send_to_client(client_id, WsMessage::ExecuteLocalCommand { command: command.clone() });
                 }
@@ -1148,7 +1162,7 @@ pub async fn handle_daemon_ws_message(
                 app.ws_broadcast(WsMessage::WorldSwitched { new_index: world_index });
             }
         }
-        WsMessage::UpdateGlobalSettings { more_mode_enabled, spell_check_enabled, temp_convert_enabled, world_switch_mode, show_tags, debug_enabled, ansi_music_enabled, console_theme, gui_theme, gui_transparency, color_offset_percent, input_height, font_name, font_size, web_font_size_phone, web_font_size_tablet, web_font_size_desktop, ws_allow_list, web_secure, http_enabled, http_port, ws_enabled, ws_port, ws_cert_file, ws_key_file, tls_proxy_enabled, dictionary_path, mouse_enabled } => {
+        WsMessage::UpdateGlobalSettings { more_mode_enabled, spell_check_enabled, temp_convert_enabled, world_switch_mode, show_tags, debug_enabled, ansi_music_enabled, console_theme, gui_theme, gui_transparency, color_offset_percent, input_height, font_name, font_size, web_font_size_phone, web_font_size_tablet, web_font_size_desktop, web_font_weight, ws_allow_list, web_secure, http_enabled, http_port, ws_enabled, ws_port, ws_cert_file, ws_key_file, tls_proxy_enabled, dictionary_path, mouse_enabled, zwj_enabled } => {
             app.settings.more_mode_enabled = more_mode_enabled;
             app.settings.spell_check_enabled = spell_check_enabled;
             app.settings.temp_convert_enabled = temp_convert_enabled;
@@ -1166,6 +1180,7 @@ pub async fn handle_daemon_ws_message(
             app.settings.web_font_size_phone = web_font_size_phone;
             app.settings.web_font_size_tablet = web_font_size_tablet;
             app.settings.web_font_size_desktop = web_font_size_desktop;
+            app.settings.web_font_weight = web_font_weight;
             app.settings.websocket_allow_list = ws_allow_list;
             app.settings.web_secure = web_secure;
             app.settings.http_enabled = http_enabled;
@@ -1176,6 +1191,7 @@ pub async fn handle_daemon_ws_message(
             app.settings.websocket_key_file = ws_key_file;
             app.settings.tls_proxy_enabled = tls_proxy_enabled;
             app.settings.mouse_enabled = mouse_enabled;
+            app.settings.zwj_enabled = zwj_enabled;
             if app.settings.dictionary_path != dictionary_path {
                 app.settings.dictionary_path = dictionary_path;
                 app.spell_checker = SpellChecker::new(&app.settings.dictionary_path);
@@ -1203,6 +1219,7 @@ pub async fn handle_daemon_ws_message(
                 web_font_size_phone: app.settings.web_font_size_phone,
                 web_font_size_tablet: app.settings.web_font_size_tablet,
                 web_font_size_desktop: app.settings.web_font_size_desktop,
+                web_font_weight: app.settings.web_font_weight,
                 ws_allow_list: app.settings.websocket_allow_list.clone(),
                 web_secure: app.settings.web_secure,
                 http_enabled: app.settings.http_enabled,
@@ -1214,6 +1231,7 @@ pub async fn handle_daemon_ws_message(
                 tls_proxy_enabled: app.settings.tls_proxy_enabled,
                 dictionary_path: app.settings.dictionary_path.clone(),
                 mouse_enabled: app.settings.mouse_enabled,
+                zwj_enabled: app.settings.zwj_enabled,
                 theme_colors_json: app.gui_theme_colors().to_json(),
             };
             app.ws_broadcast(WsMessage::GlobalSettingsUpdated { settings, input_height: app.input_height });
@@ -1756,9 +1774,10 @@ keep_alive_type=Generic
 
     println!("Multiuser server running. Press Ctrl+C to stop.");
 
-    // Create interval for TF repeat process ticks (1 second)
-    let mut process_tick_interval = tokio::time::interval(std::time::Duration::from_secs(1));
-    process_tick_interval.tick().await; // Skip first immediate tick
+    // Conditional timer: sleep far-future when no processes, reset to 1s when needed
+    const FAR_FUTURE_MU: std::time::Duration = std::time::Duration::from_secs(86400);
+    let process_tick_sleep = tokio::time::sleep(FAR_FUTURE_MU);
+    tokio::pin!(process_tick_sleep);
 
     // Main event loop - only handles WebSocket events
     loop {
@@ -1767,8 +1786,8 @@ keep_alive_type=Generic
         reap_zombie_children();
 
         tokio::select! {
-            // TF repeat process tick
-            _ = process_tick_interval.tick() => {
+            // TF repeat process tick — only fires when processes exist
+            _ = &mut process_tick_sleep => {
                 let now = std::time::Instant::now();
                 let mut to_remove = vec![];
                 let process_count = app.tf_engine.processes.len();
@@ -1844,6 +1863,12 @@ keep_alive_type=Generic
                 }
                 for i in to_remove.into_iter().rev() {
                     app.tf_engine.processes.remove(i);
+                }
+                // Re-arm: tick again in 1s if processes remain
+                if !app.tf_engine.processes.is_empty() {
+                    process_tick_sleep.as_mut().reset(tokio::time::Instant::now() + std::time::Duration::from_secs(1));
+                } else {
+                    process_tick_sleep.as_mut().reset(tokio::time::Instant::now() + FAR_FUTURE_MU);
                 }
             }
             Some(event) = event_rx.recv() => {
@@ -1987,6 +2012,13 @@ keep_alive_type=Generic
             _ = tokio::signal::ctrl_c() => {
                 println!("\nShutting down multiuser server...");
                 break;
+            }
+        }
+
+        // Activate process tick sleep if processes were added during this iteration
+        if !app.tf_engine.processes.is_empty() {
+            if process_tick_sleep.deadline() > tokio::time::Instant::now() + std::time::Duration::from_secs(2) {
+                process_tick_sleep.as_mut().reset(tokio::time::Instant::now() + std::time::Duration::from_secs(1));
             }
         }
     }
@@ -2527,6 +2559,7 @@ pub fn build_multiuser_initial_state(app: &App, username: &str) -> WsMessage {
         web_font_size_phone: app.settings.web_font_size_phone,
         web_font_size_tablet: app.settings.web_font_size_tablet,
         web_font_size_desktop: app.settings.web_font_size_desktop,
+        web_font_weight: app.settings.web_font_weight,
         ws_allow_list: app.settings.websocket_allow_list.clone(),
         web_secure: app.settings.web_secure,
         http_enabled: app.settings.http_enabled,
@@ -2538,6 +2571,7 @@ pub fn build_multiuser_initial_state(app: &App, username: &str) -> WsMessage {
         tls_proxy_enabled: app.settings.tls_proxy_enabled,
         dictionary_path: app.settings.dictionary_path.clone(),
         mouse_enabled: app.settings.mouse_enabled,
+        zwj_enabled: app.settings.zwj_enabled,
         theme_colors_json: app.gui_theme_colors().to_json(),
     };
 

@@ -52,6 +52,11 @@ fn main() {
     // On Windows, embed the application icon into the executable
     #[cfg(target_os = "windows")]
     embed_windows_icon();
+
+    // On Windows GNU targets with webview-gui, copy WebView2Loader.dll next to the binary.
+    // The static lib (WebView2LoaderStatic.lib) is MSVC-only and can't be used with MinGW.
+    // Without this DLL next to the exe, Windows silently fails to start the process.
+    copy_webview2_dll_if_needed();
 }
 
 /// Embed Windows PE metadata (version info, description) and optionally an icon.
@@ -285,6 +290,73 @@ fn parse_tzif_block(data: &[u8], time_size: usize) -> Option<i64> {
     let ttinfo_offset = ttinfos_start + type_idx * 6;
     let utoff = i32::from_be_bytes(data[ttinfo_offset..ttinfo_offset + 4].try_into().ok()?);
     Some(utoff as i64)
+}
+
+/// Copy WebView2Loader.dll to the target output directory when cross-compiling
+/// for Windows GNU with the webview-gui feature enabled.
+/// The static lib (WebView2LoaderStatic.lib) is MSVC-compiled and references MSVC CRT
+/// symbols (__security_cookie, etc.) that don't exist in MinGW, so static linking
+/// is not possible with the GNU toolchain.
+fn copy_webview2_dll_if_needed() {
+    // Only needed for windows-gnu targets (MSVC links statically)
+    let target_os = std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
+    let target_env = std::env::var("CARGO_CFG_TARGET_ENV").unwrap_or_default();
+    if target_os != "windows" || target_env == "msvc" {
+        return;
+    }
+
+    // Only needed when webview-gui feature is enabled
+    if std::env::var("CARGO_FEATURE_WEBVIEW_GUI").is_err() {
+        return;
+    }
+
+    // OUT_DIR is like: target/<triple>/debug/build/clay-<hash>/out
+    // Navigate up 3 levels to get: target/<triple>/debug/
+    let out_dir = match std::env::var("OUT_DIR") {
+        Ok(d) => std::path::PathBuf::from(d),
+        Err(_) => return,
+    };
+    let target_dir = match out_dir.parent().and_then(|p| p.parent()).and_then(|p| p.parent()) {
+        Some(d) => d,
+        None => return,
+    };
+
+    // Determine arch subdirectory in webview2-com-sys crate
+    let target_arch = std::env::var("CARGO_CFG_TARGET_ARCH").unwrap_or_default();
+    let arch_dir = match target_arch.as_str() {
+        "x86_64" => "x64",
+        "x86" => "x86",
+        "aarch64" => "arm64",
+        _ => return,
+    };
+
+    // Find WebView2Loader.dll in the cargo registry
+    let cargo_home = std::env::var("CARGO_HOME")
+        .or_else(|_| std::env::var("HOME").map(|h| format!("{}/.cargo", h)))
+        .unwrap_or_else(|_| String::from(".cargo"));
+    let registry_src = Path::new(&cargo_home).join("registry").join("src");
+
+    if let Ok(entries) = fs::read_dir(&registry_src) {
+        for index_entry in entries.flatten() {
+            let index_dir = index_entry.path();
+            if let Ok(crates) = fs::read_dir(&index_dir) {
+                for crate_entry in crates.flatten() {
+                    let name = crate_entry.file_name();
+                    let name_str = name.to_string_lossy();
+                    if name_str.starts_with("webview2-com-sys-") {
+                        let dll_src = crate_entry.path().join(arch_dir).join("WebView2Loader.dll");
+                        if dll_src.exists() {
+                            let dll_dest = target_dir.join("WebView2Loader.dll");
+                            let _ = fs::copy(&dll_src, &dll_dest);
+                            return;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    eprintln!("cargo:warning=WebView2Loader.dll not found in cargo registry. clay.exe will not run without it.");
 }
 
 fn collect_source_files(dir: &Path, files: &mut BTreeSet<String>) {
