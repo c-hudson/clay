@@ -23,7 +23,7 @@ use crate::websocket::hash_password;
 
 /// Open a URL in the system's default browser (platform-specific).
 fn open_url_in_browser(url: &str) {
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "android"))]
     { let _ = std::process::Command::new("xdg-open").arg(url).spawn(); }
     #[cfg(target_os = "macos")]
     { let _ = std::process::Command::new("open").arg(url).spawn(); }
@@ -420,6 +420,7 @@ fn create_webview_window(title: &str, params: &WebViewParams) -> io::Result<()> 
         target_os = "freebsd",
         target_os = "netbsd",
         target_os = "openbsd",
+        target_os = "android",
     ))]
     {
         use webkit2gtk::{WebContextExt, WebContext};
@@ -484,6 +485,7 @@ fn create_webview_window(title: &str, params: &WebViewParams) -> io::Result<()> 
         target_os = "freebsd",
         target_os = "netbsd",
         target_os = "openbsd",
+        target_os = "android",
     ))]
     let _webview = {
         use tao::platform::unix::WindowExtUnix;
@@ -500,6 +502,7 @@ fn create_webview_window(title: &str, params: &WebViewParams) -> io::Result<()> 
         target_os = "freebsd",
         target_os = "netbsd",
         target_os = "openbsd",
+        target_os = "android",
     )))]
     let _webview = builder.build(&window)
         .map_err(|e| io::Error::other(format!("Failed to create WebView: {}", e)))?;
@@ -524,6 +527,7 @@ fn create_webview_window(title: &str, params: &WebViewParams) -> io::Result<()> 
                     target_os = "freebsd",
                     target_os = "netbsd",
                     target_os = "openbsd",
+                    target_os = "android",
                 ))]
                 {
                     use tao::platform::unix::WindowExtUnix;
@@ -537,6 +541,7 @@ fn create_webview_window(title: &str, params: &WebViewParams) -> io::Result<()> 
                     target_os = "freebsd",
                     target_os = "netbsd",
                     target_os = "openbsd",
+                    target_os = "android",
                 )))]
                 { let _ = opacity; }
             }
