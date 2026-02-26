@@ -107,6 +107,18 @@ diff -ruN '--exclude=.cargo-checksum.json' /home/adrick/.cargo/registry/src/inde
  use crate::{
    dpi::{PhysicalPosition, PhysicalSize, Position, Size},
    error, event,
+diff -ruN '--exclude=.cargo-checksum.json' /home/adrick/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tao-0.34.5/src/platform_impl/linux/event_loop.rs tao-0.34.5-patched/src/platform_impl/linux/event_loop.rs
+--- /home/adrick/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tao-0.34.5/src/platform_impl/linux/event_loop.rs	2006-07-23 20:21:28.000000000 -0500
++++ tao-0.34.5-patched/src/platform_impl/linux/event_loop.rs	2026-02-26 17:11:39.180380490 -0600
+@@ -1199,7 +1199,7 @@
+   );
+ }
+ 
+-#[cfg(target_os = "linux")]
++#[cfg(any(target_os = "linux", target_os = "android"))]
+ fn is_main_thread() -> bool {
+   use libc::{c_long, getpid, syscall, SYS_gettid};
+ 
 diff -ruN '--exclude=.cargo-checksum.json' /home/adrick/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tao-0.34.5/src/platform_impl/mod.rs tao-0.34.5-patched/src/platform_impl/mod.rs
 --- /home/adrick/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tao-0.34.5/src/platform_impl/mod.rs	2006-07-23 20:21:28.000000000 -0500
 +++ tao-0.34.5-patched/src/platform_impl/mod.rs	2026-02-26 16:52:20.031960408 -0600

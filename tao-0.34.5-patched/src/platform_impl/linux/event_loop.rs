@@ -1199,7 +1199,7 @@ fn assert_is_main_thread(suggested_method: &str) {
   );
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "android"))]
 fn is_main_thread() -> bool {
   use libc::{c_long, getpid, syscall, SYS_gettid};
 
