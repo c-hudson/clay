@@ -1,6 +1,6 @@
 #!/bin/bash
-# Apply Termux/Android X11 patches to winit, glutin, and glutin-winit
-# These patches enable the remote GUI (egui) to run on Termux with Termux:X11
+# Apply Termux/Android X11 patches to winit, glutin, glutin-winit, tao, and wry
+# These patches enable the remote GUI (egui) and webview GUI (wry) to run on Termux with Termux:X11
 #
 # Usage: ./patches/apply-patches.sh
 #   Run from the clay project root directory BEFORE cargo build.
@@ -13,8 +13,8 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
 cd "$PROJECT_DIR"
 
-CRATE_NAMES=("winit-0.28.7" "glutin-0.30.10" "glutin-winit-0.3.0")
-PATCHED_DIRS=("winit-0.28.7-patched" "glutin-0.30.10-patched" "glutin-winit-0.3.0-patched")
+CRATE_NAMES=("winit-0.28.7" "glutin-0.30.10" "glutin-winit-0.3.0" "tao-0.34.5" "wry-0.48.1")
+PATCHED_DIRS=("winit-0.28.7-patched" "glutin-0.30.10-patched" "glutin-winit-0.3.0-patched" "tao-0.34.5-patched" "wry-0.48.1-patched")
 
 # Check if all patched dirs already have real content (not stubs)
 all_done=true

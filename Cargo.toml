@@ -110,6 +110,8 @@ webview-gui = ["wry", "tao", "webkit2gtk", "gdk", "gtk"]
 winit = { path = "winit-0.28.7-patched" }
 glutin = { path = "glutin-0.30.10-patched" }
 glutin-winit = { path = "glutin-winit-0.3.0-patched" }
+tao = { path = "tao-0.34.5-patched" }
+wry = { path = "wry-0.48.1-patched" }
 
 [[bin]]
 name = "clay-test-server"

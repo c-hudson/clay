@@ -1,0 +1,201 @@
+diff -ruN '--exclude=.cargo-checksum.json' /home/adrick/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/wry-0.48.1/build.rs wry-0.48.1-patched/build.rs
+--- /home/adrick/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/wry-0.48.1/build.rs	2006-07-23 20:21:28.000000000 -0500
++++ wry-0.48.1-patched/build.rs	2026-02-26 16:53:24.103104463 -0600
+@@ -8,7 +8,8 @@
+     println!("cargo:rustc-link-lib=framework=WebKit");
+   }
+ 
+-  if target_os == "android" {
++  // Skip Kotlin code generation on Android when using GTK/webkit2gtk backend
++  if target_os == "android" && !cfg!(feature = "os-webview") {
+     use std::{fs, path::PathBuf};
+ 
+     fn env_var(var: &str) -> String {
+@@ -101,12 +102,15 @@
+ 
+   let target = std::env::var("TARGET").unwrap_or_default();
+   let android = target.contains("android");
+-  let linux = !android
++  // On Android with os-webview feature, treat as Linux (use GTK/webkit2gtk)
++  let android_as_linux = android && cfg!(feature = "os-webview");
++  let linux = (!android || android_as_linux)
+     && (target.contains("linux")
+       || target.contains("freebsd")
+       || target.contains("dragonfly")
+       || target.contains("netbsd")
+-      || target.contains("openbsd"));
++      || target.contains("openbsd")
++      || android_as_linux);
+   alias("linux", linux);
+   alias("gtk", cfg!(feature = "os-webview") && linux);
+ }
+diff -ruN '--exclude=.cargo-checksum.json' /home/adrick/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/wry-0.48.1/.cargo/config.toml wry-0.48.1-patched/.cargo/config.toml
+--- /home/adrick/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/wry-0.48.1/.cargo/config.toml	2006-07-23 20:21:28.000000000 -0500
++++ wry-0.48.1-patched/.cargo/config.toml	1969-12-31 18:00:00.000000000 -0600
+@@ -1,4 +0,0 @@
+-# [build]
+-# target = "aarch64-linux-android"
+-[target.x86_64-apple-darwin]
+-rustflags = ["-C", "link-arg=-mmacosx-version-min=10.12"]
+diff -ruN '--exclude=.cargo-checksum.json' /home/adrick/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/wry-0.48.1/.cargo-ok wry-0.48.1-patched/.cargo-ok
+--- /home/adrick/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/wry-0.48.1/.cargo-ok	2026-02-25 00:07:15.098949287 -0600
++++ wry-0.48.1-patched/.cargo-ok	1969-12-31 18:00:00.000000000 -0600
+@@ -1 +0,0 @@
+-{"v":1}
+\ No newline at end of file
+diff -ruN '--exclude=.cargo-checksum.json' /home/adrick/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/wry-0.48.1/Cargo.toml wry-0.48.1-patched/Cargo.toml
+--- /home/adrick/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/wry-0.48.1/Cargo.toml	1969-12-31 18:00:01.000000000 -0600
++++ wry-0.48.1-patched/Cargo.toml	2026-02-26 16:54:39.993458501 -0600
+@@ -241,36 +241,36 @@
+ [target.'cfg(any(target_os = "ios", target_os = "macos"))'.dependencies.url]
+ version = "2.5"
+ 
+-[target.'cfg(any(target_os = "linux", target_os = "dragonfly", target_os = "freebsd", target_os = "openbsd", target_os = "netbsd"))'.dependencies.gdkx11]
++[target.'cfg(any(target_os = "linux", target_os = "dragonfly", target_os = "freebsd", target_os = "openbsd", target_os = "netbsd", target_os = "android"))'.dependencies.gdkx11]
+ version = "0.18"
+ optional = true
+ 
+-[target.'cfg(any(target_os = "linux", target_os = "dragonfly", target_os = "freebsd", target_os = "openbsd", target_os = "netbsd"))'.dependencies.gtk]
++[target.'cfg(any(target_os = "linux", target_os = "dragonfly", target_os = "freebsd", target_os = "openbsd", target_os = "netbsd", target_os = "android"))'.dependencies.gtk]
+ version = "0.18"
+ optional = true
+ 
+-[target.'cfg(any(target_os = "linux", target_os = "dragonfly", target_os = "freebsd", target_os = "openbsd", target_os = "netbsd"))'.dependencies.javascriptcore-rs]
++[target.'cfg(any(target_os = "linux", target_os = "dragonfly", target_os = "freebsd", target_os = "openbsd", target_os = "netbsd", target_os = "android"))'.dependencies.javascriptcore-rs]
+ version = "=1.1.2"
+ features = ["v2_28"]
+ optional = true
+ 
+-[target.'cfg(any(target_os = "linux", target_os = "dragonfly", target_os = "freebsd", target_os = "openbsd", target_os = "netbsd"))'.dependencies.percent-encoding]
++[target.'cfg(any(target_os = "linux", target_os = "dragonfly", target_os = "freebsd", target_os = "openbsd", target_os = "netbsd", target_os = "android"))'.dependencies.percent-encoding]
+ version = "2.3"
+ 
+-[target.'cfg(any(target_os = "linux", target_os = "dragonfly", target_os = "freebsd", target_os = "openbsd", target_os = "netbsd"))'.dependencies.soup3]
++[target.'cfg(any(target_os = "linux", target_os = "dragonfly", target_os = "freebsd", target_os = "openbsd", target_os = "netbsd", target_os = "android"))'.dependencies.soup3]
+ version = "0.5"
+ optional = true
+ 
+-[target.'cfg(any(target_os = "linux", target_os = "dragonfly", target_os = "freebsd", target_os = "openbsd", target_os = "netbsd"))'.dependencies.webkit2gtk]
++[target.'cfg(any(target_os = "linux", target_os = "dragonfly", target_os = "freebsd", target_os = "openbsd", target_os = "netbsd", target_os = "android"))'.dependencies.webkit2gtk]
+ version = "=2.0.1"
+ features = ["v2_38"]
+ optional = true
+ 
+-[target.'cfg(any(target_os = "linux", target_os = "dragonfly", target_os = "freebsd", target_os = "openbsd", target_os = "netbsd"))'.dependencies.webkit2gtk-sys]
++[target.'cfg(any(target_os = "linux", target_os = "dragonfly", target_os = "freebsd", target_os = "openbsd", target_os = "netbsd", target_os = "android"))'.dependencies.webkit2gtk-sys]
+ version = "=2.0.1"
+ optional = true
+ 
+-[target.'cfg(any(target_os = "linux", target_os = "dragonfly", target_os = "freebsd", target_os = "openbsd", target_os = "netbsd"))'.dependencies.x11-dl]
++[target.'cfg(any(target_os = "linux", target_os = "dragonfly", target_os = "freebsd", target_os = "openbsd", target_os = "netbsd", target_os = "android"))'.dependencies.x11-dl]
+ version = "2.21"
+ optional = true
+ 
+diff -ruN '--exclude=.cargo-checksum.json' /home/adrick/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/wry-0.48.1/.cargo_vcs_info.json wry-0.48.1-patched/.cargo_vcs_info.json
+--- /home/adrick/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/wry-0.48.1/.cargo_vcs_info.json	1969-12-31 18:00:01.000000000 -0600
++++ wry-0.48.1-patched/.cargo_vcs_info.json	1969-12-31 18:00:00.000000000 -0600
+@@ -1,6 +0,0 @@
+-{
+-  "git": {
+-    "sha1": "c528ecf0fcda0597a371f0e9f1b0e9acba3b25f0"
+-  },
+-  "path_in_vcs": ""
+-}
+\ No newline at end of file
+diff -ruN '--exclude=.cargo-checksum.json' /home/adrick/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/wry-0.48.1/.gitignore wry-0.48.1-patched/.gitignore
+--- /home/adrick/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/wry-0.48.1/.gitignore	2006-07-23 20:21:28.000000000 -0500
++++ wry-0.48.1-patched/.gitignore	1969-12-31 18:00:00.000000000 -0600
+@@ -1,10 +0,0 @@
+-# Copyright 2020-2023 Tauri Programme within The Commons Conservancy
+-# SPDX-License-Identifier: Apache-2.0
+-# SPDX-License-Identifier: MIT
+-
+-target
+-Cargo.lock
+-gh-pages
+-.DS_Store
+-examples/test_video.mp4
+-.vscode/
+diff -ruN '--exclude=.cargo-checksum.json' /home/adrick/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/wry-0.48.1/.license_template wry-0.48.1-patched/.license_template
+--- /home/adrick/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/wry-0.48.1/.license_template	2006-07-23 20:21:28.000000000 -0500
++++ wry-0.48.1-patched/.license_template	1969-12-31 18:00:00.000000000 -0600
+@@ -1,3 +0,0 @@
+-// Copyright {20\d{2}(-20\d{2})?} Tauri Programme within The Commons Conservancy
+-// SPDX-License-Identifier: Apache-2.0
+-// SPDX-License-Identifier: MIT
+\ No newline at end of file
+diff -ruN '--exclude=.cargo-checksum.json' /home/adrick/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/wry-0.48.1/src/lib.rs wry-0.48.1-patched/src/lib.rs
+--- /home/adrick/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/wry-0.48.1/src/lib.rs	2006-07-23 20:21:28.000000000 -0500
++++ wry-0.48.1-patched/src/lib.rs	2026-02-26 16:54:03.855813865 -0600
+@@ -249,22 +249,22 @@
+ 
+ mod error;
+ mod proxy;
+-#[cfg(any(target_os = "macos", target_os = "android", target_os = "ios"))]
++#[cfg(any(target_os = "macos", all(target_os = "android", not(gtk)), target_os = "ios"))]
+ mod util;
+ mod web_context;
+ 
+-#[cfg(target_os = "android")]
++#[cfg(all(target_os = "android", not(gtk)))]
+ pub(crate) mod android;
+-#[cfg(target_os = "android")]
++#[cfg(all(target_os = "android", not(gtk)))]
+ pub use crate::android::android_setup;
+-#[cfg(target_os = "android")]
++#[cfg(all(target_os = "android", not(gtk)))]
+ pub mod prelude {
+   pub use crate::android::{binding::*, dispatch, find_class, Context};
+   pub use tao_macros::{android_fn, generate_package_name};
+ }
+-#[cfg(target_os = "android")]
++#[cfg(all(target_os = "android", not(gtk)))]
+ pub use android::JniHandle;
+-#[cfg(target_os = "android")]
++#[cfg(all(target_os = "android", not(gtk)))]
+ use android::*;
+ 
+ #[cfg(gtk)]
+@@ -1450,7 +1450,7 @@
+   }
+ }
+ 
+-#[cfg(target_os = "android")]
++#[cfg(all(target_os = "android", not(gtk)))]
+ #[derive(Default)]
+ pub(crate) struct PlatformSpecificWebViewAttributes {
+   on_webview_created:
+@@ -1460,7 +1460,7 @@
+   https_scheme: bool,
+ }
+ 
+-#[cfg(target_os = "android")]
++#[cfg(all(target_os = "android", not(gtk)))]
+ pub trait WebViewBuilderExtAndroid {
+   fn on_webview_created<
+     F: Fn(prelude::Context<'_, '_>) -> std::result::Result<(), jni::errors::Error> + Send + 'static,
+@@ -1487,7 +1487,7 @@
+   fn with_https_scheme(self, enabled: bool) -> Self;
+ }
+ 
+-#[cfg(target_os = "android")]
++#[cfg(all(target_os = "android", not(gtk)))]
+ impl WebViewBuilderExtAndroid for WebViewBuilder<'_> {
+   fn on_webview_created<
+     F: Fn(prelude::Context<'_, '_>) -> std::result::Result<(), jni::errors::Error> + Send + 'static,
+@@ -2020,13 +2020,13 @@
+   }
+ }
+ 
+-#[cfg(target_os = "android")]
++#[cfg(all(target_os = "android", not(gtk)))]
+ /// Additional methods on `WebView` that are specific to Android
+ pub trait WebViewExtAndroid {
+   fn handle(&self) -> JniHandle;
+ }
+ 
+-#[cfg(target_os = "android")]
++#[cfg(all(target_os = "android", not(gtk)))]
+ impl WebViewExtAndroid for WebView {
+   fn handle(&self) -> JniHandle {
+     JniHandle

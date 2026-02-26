@@ -1,0 +1,131 @@
+diff -ruN '--exclude=.cargo-checksum.json' /home/adrick/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tao-0.34.5/.cargo-ok tao-0.34.5-patched/.cargo-ok
+--- /home/adrick/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tao-0.34.5/.cargo-ok	2026-02-25 00:07:15.012947796 -0600
++++ tao-0.34.5-patched/.cargo-ok	1969-12-31 18:00:00.000000000 -0600
+@@ -1 +0,0 @@
+-{"v":1}
+\ No newline at end of file
+diff -ruN '--exclude=.cargo-checksum.json' /home/adrick/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tao-0.34.5/Cargo.toml tao-0.34.5-patched/Cargo.toml
+--- /home/adrick/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tao-0.34.5/Cargo.toml	1969-12-31 18:00:01.000000000 -0600
++++ tao-0.34.5-patched/Cargo.toml	2026-02-26 16:52:44.748401849 -0600
+@@ -254,23 +254,23 @@
+ [target.'cfg(any(target_os = "ios", target_os = "macos"))'.dependencies.objc2]
+ version = "0.6"
+ 
+-[target.'cfg(any(target_os = "linux", target_os = "dragonfly", target_os = "freebsd", target_os = "openbsd", target_os = "netbsd"))'.dependencies.dlopen2]
++[target.'cfg(any(target_os = "linux", target_os = "dragonfly", target_os = "freebsd", target_os = "openbsd", target_os = "netbsd", target_os = "android"))'.dependencies.dlopen2]
+ version = "0.8.0"
+ 
+-[target.'cfg(any(target_os = "linux", target_os = "dragonfly", target_os = "freebsd", target_os = "openbsd", target_os = "netbsd"))'.dependencies.gdkwayland-sys]
++[target.'cfg(any(target_os = "linux", target_os = "dragonfly", target_os = "freebsd", target_os = "openbsd", target_os = "netbsd", target_os = "android"))'.dependencies.gdkwayland-sys]
+ version = "0.18.0"
+ 
+-[target.'cfg(any(target_os = "linux", target_os = "dragonfly", target_os = "freebsd", target_os = "openbsd", target_os = "netbsd"))'.dependencies.gdkx11-sys]
++[target.'cfg(any(target_os = "linux", target_os = "dragonfly", target_os = "freebsd", target_os = "openbsd", target_os = "netbsd", target_os = "android"))'.dependencies.gdkx11-sys]
+ version = "0.18"
+ optional = true
+ 
+-[target.'cfg(any(target_os = "linux", target_os = "dragonfly", target_os = "freebsd", target_os = "openbsd", target_os = "netbsd"))'.dependencies.gtk]
++[target.'cfg(any(target_os = "linux", target_os = "dragonfly", target_os = "freebsd", target_os = "openbsd", target_os = "netbsd", target_os = "android"))'.dependencies.gtk]
+ version = "0.18"
+ 
+-[target.'cfg(any(target_os = "linux", target_os = "dragonfly", target_os = "freebsd", target_os = "openbsd", target_os = "netbsd"))'.dependencies.parking_lot]
++[target.'cfg(any(target_os = "linux", target_os = "dragonfly", target_os = "freebsd", target_os = "openbsd", target_os = "netbsd", target_os = "android"))'.dependencies.parking_lot]
+ version = "0.12"
+ 
+-[target.'cfg(any(target_os = "linux", target_os = "dragonfly", target_os = "freebsd", target_os = "openbsd", target_os = "netbsd"))'.dependencies.x11-dl]
++[target.'cfg(any(target_os = "linux", target_os = "dragonfly", target_os = "freebsd", target_os = "openbsd", target_os = "netbsd", target_os = "android"))'.dependencies.x11-dl]
+ version = "2.21"
+ optional = true
+ 
+diff -ruN '--exclude=.cargo-checksum.json' /home/adrick/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tao-0.34.5/.cargo_vcs_info.json tao-0.34.5-patched/.cargo_vcs_info.json
+--- /home/adrick/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tao-0.34.5/.cargo_vcs_info.json	1969-12-31 18:00:01.000000000 -0600
++++ tao-0.34.5-patched/.cargo_vcs_info.json	1969-12-31 18:00:00.000000000 -0600
+@@ -1,7 +0,0 @@
+-{
+-  "git": {
+-    "sha1": "3c2b4447aa53151ae96d30a60928d1d71e9bb5fc",
+-    "dirty": true
+-  },
+-  "path_in_vcs": ""
+-}
+\ No newline at end of file
+diff -ruN '--exclude=.cargo-checksum.json' /home/adrick/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tao-0.34.5/src/event.rs tao-0.34.5-patched/src/event.rs
+--- /home/adrick/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tao-0.34.5/src/event.rs	2006-07-23 20:21:28.000000000 -0500
++++ tao-0.34.5-patched/src/event.rs	2026-02-26 16:52:32.567184306 -0600
+@@ -743,7 +743,7 @@
+   pub(crate) platform_specific: platform_impl::KeyEventExtra,
+ }
+ 
+-#[cfg(not(any(target_os = "android", target_os = "ios")))]
++#[cfg(not(any(all(target_os = "android", not(feature = "x11")), target_os = "ios")))]
+ impl KeyEvent {
+   /// Identical to `KeyEvent::text` but this is affected by <kbd>Ctrl</kbd>.
+   ///
+@@ -767,7 +767,7 @@
+   }
+ }
+ 
+-#[cfg(any(target_os = "android", target_os = "ios"))]
++#[cfg(any(all(target_os = "android", not(feature = "x11")), target_os = "ios"))]
+ impl KeyEvent {
+   /// Identical to `KeyEvent::text`.
+   pub fn text_with_all_modifiers(&self) -> Option<&str> {
+diff -ruN '--exclude=.cargo-checksum.json' /home/adrick/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tao-0.34.5/src/platform/android.rs tao-0.34.5-patched/src/platform/android.rs
+--- /home/adrick/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tao-0.34.5/src/platform/android.rs	2006-07-23 20:21:28.000000000 -0500
++++ tao-0.34.5-patched/src/platform/android.rs	2026-02-26 16:52:22.835010478 -0600
+@@ -2,7 +2,7 @@
+ // Copyright 2021-2023 Tauri Programme within The Commons Conservancy
+ // SPDX-License-Identifier: Apache-2.0
+ 
+-#![cfg(target_os = "android")]
++#![cfg(all(target_os = "android", not(feature = "x11")))]
+ 
+ pub mod prelude {
+   pub use crate::platform_impl::ndk_glue::*;
+diff -ruN '--exclude=.cargo-checksum.json' /home/adrick/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tao-0.34.5/src/platform/unix.rs tao-0.34.5-patched/src/platform/unix.rs
+--- /home/adrick/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tao-0.34.5/src/platform/unix.rs	2006-07-23 20:21:28.000000000 -0500
++++ tao-0.34.5-patched/src/platform/unix.rs	2026-02-26 16:52:21.802992043 -0600
+@@ -7,7 +7,8 @@
+   target_os = "dragonfly",
+   target_os = "freebsd",
+   target_os = "netbsd",
+-  target_os = "openbsd"
++  target_os = "openbsd",
++  target_os = "android"
+ ))]
+ 
+ #[cfg(feature = "x11")]
+diff -ruN '--exclude=.cargo-checksum.json' /home/adrick/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tao-0.34.5/src/platform_impl/android/mod.rs tao-0.34.5-patched/src/platform_impl/android/mod.rs
+--- /home/adrick/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tao-0.34.5/src/platform_impl/android/mod.rs	2006-07-23 20:21:28.000000000 -0500
++++ tao-0.34.5-patched/src/platform_impl/android/mod.rs	2026-02-26 16:52:23.813027948 -0600
+@@ -2,7 +2,7 @@
+ // Copyright 2021-2023 Tauri Programme within The Commons Conservancy
+ // SPDX-License-Identifier: Apache-2.0
+ 
+-#![cfg(target_os = "android")]
++#![cfg(all(target_os = "android", not(feature = "x11")))]
+ use crate::{
+   dpi::{PhysicalPosition, PhysicalSize, Position, Size},
+   error, event,
+diff -ruN '--exclude=.cargo-checksum.json' /home/adrick/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tao-0.34.5/src/platform_impl/mod.rs tao-0.34.5-patched/src/platform_impl/mod.rs
+--- /home/adrick/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tao-0.34.5/src/platform_impl/mod.rs	2006-07-23 20:21:28.000000000 -0500
++++ tao-0.34.5-patched/src/platform_impl/mod.rs	2026-02-26 16:52:20.031960408 -0600
+@@ -10,16 +10,14 @@
+   target_os = "dragonfly",
+   target_os = "freebsd",
+   target_os = "netbsd",
+-  target_os = "openbsd"
++  target_os = "openbsd",
++  target_os = "android"
+ ))]
+ #[path = "linux/mod.rs"]
+ mod platform;
+ #[cfg(target_os = "macos")]
+ #[path = "macos/mod.rs"]
+ mod platform;
+-#[cfg(target_os = "android")]
+-#[path = "android/mod.rs"]
+-mod platform;
+ #[cfg(target_os = "ios")]
+ #[path = "ios/mod.rs"]
+ mod platform;
