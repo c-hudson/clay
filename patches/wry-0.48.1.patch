@@ -126,7 +126,7 @@ diff -ruN '--exclude=.cargo-checksum.json' /home/adrick/.cargo/registry/src/inde
 \ No newline at end of file
 diff -ruN '--exclude=.cargo-checksum.json' /home/adrick/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/wry-0.48.1/src/lib.rs wry-0.48.1-patched/src/lib.rs
 --- /home/adrick/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/wry-0.48.1/src/lib.rs	2006-07-23 20:21:28.000000000 -0500
-+++ wry-0.48.1-patched/src/lib.rs	2026-02-26 16:54:03.855813865 -0600
++++ wry-0.48.1-patched/src/lib.rs	2026-02-26 17:13:55.094616063 -0600
 @@ -249,22 +249,22 @@
  
  mod error;
@@ -156,7 +156,23 @@ diff -ruN '--exclude=.cargo-checksum.json' /home/adrick/.cargo/registry/src/inde
  use android::*;
  
  #[cfg(gtk)]
-@@ -1450,7 +1450,7 @@
+@@ -843,6 +843,7 @@
+         target_os = "freebsd",
+         target_os = "netbsd",
+         target_os = "openbsd",
++        target_os = "android",
+       ))]
+       if let Some(context) = &mut b.attrs.context {
+         context.register_custom_protocol(name.clone())?;
+@@ -895,6 +896,7 @@
+         target_os = "freebsd",
+         target_os = "netbsd",
+         target_os = "openbsd",
++        target_os = "android",
+       ))]
+       if let Some(context) = &mut b.attrs.context {
+         context.register_custom_protocol(name.clone())?;
+@@ -1450,7 +1452,7 @@
    }
  }
  
@@ -165,7 +181,7 @@ diff -ruN '--exclude=.cargo-checksum.json' /home/adrick/.cargo/registry/src/inde
  #[derive(Default)]
  pub(crate) struct PlatformSpecificWebViewAttributes {
    on_webview_created:
-@@ -1460,7 +1460,7 @@
+@@ -1460,7 +1462,7 @@
    https_scheme: bool,
  }
  
@@ -174,7 +190,7 @@ diff -ruN '--exclude=.cargo-checksum.json' /home/adrick/.cargo/registry/src/inde
  pub trait WebViewBuilderExtAndroid {
    fn on_webview_created<
      F: Fn(prelude::Context<'_, '_>) -> std::result::Result<(), jni::errors::Error> + Send + 'static,
-@@ -1487,7 +1487,7 @@
+@@ -1487,7 +1489,7 @@
    fn with_https_scheme(self, enabled: bool) -> Self;
  }
  
@@ -183,7 +199,31 @@ diff -ruN '--exclude=.cargo-checksum.json' /home/adrick/.cargo/registry/src/inde
  impl WebViewBuilderExtAndroid for WebViewBuilder<'_> {
    fn on_webview_created<
      F: Fn(prelude::Context<'_, '_>) -> std::result::Result<(), jni::errors::Error> + Send + 'static,
-@@ -2020,13 +2020,13 @@
+@@ -1533,6 +1535,7 @@
+   target_os = "freebsd",
+   target_os = "netbsd",
+   target_os = "openbsd",
++  target_os = "android",
+ ))]
+ #[derive(Default)]
+ pub(crate) struct PlatformSpecificWebViewAttributes {
+@@ -1545,6 +1548,7 @@
+   target_os = "freebsd",
+   target_os = "netbsd",
+   target_os = "openbsd",
++  target_os = "android",
+ ))]
+ pub trait WebViewBuilderExtUnix<'a> {
+   /// Consume the builder and create the webview inside a GTK container widget, such as GTK window.
+@@ -1571,6 +1575,7 @@
+   target_os = "freebsd",
+   target_os = "netbsd",
+   target_os = "openbsd",
++  target_os = "android",
+ ))]
+ impl<'a> WebViewBuilderExtUnix<'a> for WebViewBuilder<'a> {
+   fn build_gtk<W>(self, widget: &'a W) -> Result<WebView>
+@@ -2020,13 +2025,13 @@
    }
  }
  

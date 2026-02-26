@@ -843,6 +843,7 @@ impl<'a> WebViewBuilder<'a> {
         target_os = "freebsd",
         target_os = "netbsd",
         target_os = "openbsd",
+        target_os = "android",
       ))]
       if let Some(context) = &mut b.attrs.context {
         context.register_custom_protocol(name.clone())?;
@@ -895,6 +896,7 @@ impl<'a> WebViewBuilder<'a> {
         target_os = "freebsd",
         target_os = "netbsd",
         target_os = "openbsd",
+        target_os = "android",
       ))]
       if let Some(context) = &mut b.attrs.context {
         context.register_custom_protocol(name.clone())?;
@@ -1533,6 +1535,7 @@ impl WebViewBuilderExtAndroid for WebViewBuilder<'_> {
   target_os = "freebsd",
   target_os = "netbsd",
   target_os = "openbsd",
+  target_os = "android",
 ))]
 #[derive(Default)]
 pub(crate) struct PlatformSpecificWebViewAttributes {
@@ -1545,6 +1548,7 @@ pub(crate) struct PlatformSpecificWebViewAttributes {
   target_os = "freebsd",
   target_os = "netbsd",
   target_os = "openbsd",
+  target_os = "android",
 ))]
 pub trait WebViewBuilderExtUnix<'a> {
   /// Consume the builder and create the webview inside a GTK container widget, such as GTK window.
@@ -1571,6 +1575,7 @@ pub trait WebViewBuilderExtUnix<'a> {
   target_os = "freebsd",
   target_os = "netbsd",
   target_os = "openbsd",
+  target_os = "android",
 ))]
 impl<'a> WebViewBuilderExtUnix<'a> for WebViewBuilder<'a> {
   fn build_gtk<W>(self, widget: &'a W) -> Result<WebView>
