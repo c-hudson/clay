@@ -283,7 +283,7 @@ pub enum WsMessage {
     /// Periodic pending count update (sent every 2 seconds when pending count changes)
     PendingCountUpdate { world_index: usize, count: usize },
     /// Response to RequestScrollback with historical lines
-    ScrollbackLines { world_index: usize, lines: Vec<TimestampedLine> },
+    ScrollbackLines { world_index: usize, lines: Vec<TimestampedLine>, #[serde(default)] backfill_complete: bool },
     /// World switch result with appropriate initial data
     WorldSwitchResult {
         world_index: usize,
@@ -359,6 +359,9 @@ pub struct WorldStateMsg {
     // Whether GMCP user processing is enabled (F9 toggle)
     #[serde(default)]
     pub gmcp_user_enabled: bool,
+    // Total number of output lines on the server (for lazy backfill)
+    #[serde(default)]
+    pub total_output_lines: usize,
 }
 
 /// World settings for WebSocket protocol

@@ -233,6 +233,13 @@
     let inputHeight = 1;
     let splashLines = [];  // Splash screen lines for multiuser mode
 
+    // Lazy backfill state
+    let backfillInProgress = false;
+    let backfillWorldQueue = [];
+    let backfillCurrentWorld = null;
+    const BACKFILL_CHUNK_SIZE = 500;
+    const BACKFILL_DELAY_MS = 200;
+
     // Cached rendered output per world (array of DOM elements)
     let worldOutputCache = [];
 
@@ -1548,6 +1555,15 @@
                     } else {
                         world.output_lines = [];
                     }
+                    // Track oldest seq for backfill deduplication
+                    world._oldest_seq = null;
+                    if (world.output_lines.length > 0) {
+                        let minSeq = Infinity;
+                        for (const line of world.output_lines) {
+                            if (line.seq !== undefined && line.seq < minSeq) minSeq = line.seq;
+                        }
+                        if (minSeq !== Infinity) world._oldest_seq = minSeq;
+                    }
                     // Don't merge pending_lines - they stay on the server and are
                     // released via PgDn/Tab, then broadcast as ServerData.
                     // This avoids duplicate lines when pending is released.
@@ -1652,6 +1668,8 @@
                 updateStatusBar();
                 // Send initial view state for synchronized more-mode
                 sendViewStateIfChanged();
+                // Schedule lazy backfill of remaining scrollback history
+                startBackfill();
                 // Handle pending reconnect command (resend after reconnection)
                 if (pendingReconnectCommand !== null) {
                     // Switch to the world that was active when the command failed
@@ -2206,8 +2224,42 @@
                 break;
 
             case 'ScrollbackLines':
-                // Response to RequestScrollback (for console clients, web clients don't use this)
-                // Web clients have full history so this is typically not needed
+                // Response to RequestScrollback - prepend lines to output
+                if (msg.world_index !== undefined && worlds[msg.world_index] && msg.lines && msg.lines.length > 0) {
+                    const world = worlds[msg.world_index];
+                    const wasBottom = isAtBottom();
+                    const container = elements.outputContainer;
+                    const oldScrollHeight = container.scrollHeight;
+
+                    // Prepend received lines (they are older than what we have)
+                    world.output_lines = msg.lines.concat(world.output_lines);
+
+                    // Update oldest seq for next backfill request
+                    let minSeq = Infinity;
+                    for (const line of msg.lines) {
+                        if (line.seq !== undefined && line.seq < minSeq) minSeq = line.seq;
+                    }
+                    if (minSeq !== Infinity) world._oldest_seq = minSeq;
+
+                    // Re-render if viewing this world
+                    if (msg.world_index === currentWorldIndex) {
+                        renderOutput();
+                        // Maintain scroll position: if was at bottom, stay at bottom;
+                        // otherwise adjust scrollTop by the height difference (new content at top)
+                        if (wasBottom) {
+                            scrollToBottom();
+                        } else {
+                            const newScrollHeight = container.scrollHeight;
+                            container.scrollTop += (newScrollHeight - oldScrollHeight);
+                        }
+                    }
+                }
+                // Continue or finish backfill
+                if (msg.backfill_complete) {
+                    backfillNextWorld();
+                } else {
+                    scheduleNextBackfillChunk();
+                }
                 break;
 
             case 'ServerReloading':
@@ -2316,6 +2368,77 @@
             return true;
         }
         return false;
+    }
+
+    // --- Lazy Backfill Orchestration ---
+
+    // Start backfill after InitialState is processed.
+    // Builds a queue of worlds that need backfill (current world first).
+    function startBackfill() {
+        backfillInProgress = false;
+        backfillWorldQueue = [];
+        backfillCurrentWorld = null;
+
+        // Build queue: current world first, then others
+        const queue = [];
+        worlds.forEach((world, idx) => {
+            const total = world.total_output_lines || 0;
+            const received = world.output_lines ? world.output_lines.length : 0;
+            if (total > received && world._oldest_seq !== null) {
+                if (idx === currentWorldIndex) {
+                    queue.unshift(idx);
+                } else {
+                    queue.push(idx);
+                }
+            }
+        });
+
+        if (queue.length === 0) return;
+
+        backfillWorldQueue = queue;
+        backfillInProgress = true;
+        // Delay before first request to let UI settle
+        setTimeout(function() {
+            backfillNextWorld();
+        }, 500);
+    }
+
+    // Move to the next world in the backfill queue
+    function backfillNextWorld() {
+        if (backfillWorldQueue.length === 0) {
+            backfillInProgress = false;
+            backfillCurrentWorld = null;
+            return;
+        }
+        backfillCurrentWorld = backfillWorldQueue.shift();
+        requestBackfillChunk(backfillCurrentWorld);
+    }
+
+    // Send a RequestScrollback for the given world
+    function requestBackfillChunk(worldIndex) {
+        const world = worlds[worldIndex];
+        if (!world || world._oldest_seq === null) {
+            // Nothing to backfill, skip to next world
+            backfillNextWorld();
+            return;
+        }
+        send({
+            type: 'RequestScrollback',
+            world_index: worldIndex,
+            count: BACKFILL_CHUNK_SIZE,
+            before_seq: world._oldest_seq
+        });
+    }
+
+    // Schedule the next chunk after a short delay
+    function scheduleNextBackfillChunk() {
+        if (backfillCurrentWorld === null) return;
+        const worldIdx = backfillCurrentWorld;
+        setTimeout(function() {
+            if (backfillCurrentWorld === worldIdx) {
+                requestBackfillChunk(worldIdx);
+            }
+        }, BACKFILL_DELAY_MS);
     }
 
     // Try to authenticate with saved auth key (passwordless)

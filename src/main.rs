@@ -2539,6 +2539,10 @@ pub struct App {
     pub ws_client_tx: Option<mpsc::UnboundedSender<WsMessage>>,
     /// Activity count from server (used in remote client mode, i.e. --console)
     pub server_activity_count: usize,
+    /// Remote client backfill: queue of (world_index, total_output_lines) to backfill
+    pub backfill_queue: Vec<(usize, usize)>,
+    /// Remote client backfill: next request to send (world_index, before_seq)
+    pub backfill_next: Option<(usize, Option<u64>)>,
     /// Master GUI mode: channel to send messages to the embedded GUI
     pub gui_tx: Option<mpsc::UnboundedSender<WsMessage>>,
     /// Master GUI mode: callback to wake the GUI for immediate repaint
@@ -2616,6 +2620,8 @@ impl App {
             theme_file: theme::ThemeFile::with_defaults(),
             ws_client_tx: None, // Set when running as remote client (--console mode)
             server_activity_count: 0, // Activity count from server (remote client mode)
+            backfill_queue: Vec::new(),
+            backfill_next: None,
             gui_tx: None, // Set when running in master GUI mode (--gui)
             gui_repaint: None,
             media_player_cmd: detect_media_player(),
@@ -3467,7 +3473,7 @@ impl App {
                     self.needs_output_redraw = true;
                 }
             }
-            WsMessage::ScrollbackLines { world_index, lines } => {
+            WsMessage::ScrollbackLines { world_index, lines, backfill_complete } => {
                 // Response to RequestScrollback - prepend lines to output
                 if let Some(world) = self.worlds.get_mut(world_index) {
                     // Insert at the beginning of output_lines
@@ -3488,6 +3494,17 @@ impl App {
                     // Adjust scroll_offset to keep viewing the same content
                     world.scroll_offset += prepended_count;
                     self.needs_output_redraw = true;
+                }
+                // Track backfill progress for remote console
+                if !backfill_complete {
+                    // More lines available - request next chunk
+                    if let Some(world) = self.worlds.get(world_index) {
+                        let oldest_seq = world.output_lines.first().map(|l| l.seq);
+                        self.backfill_next = Some((world_index, oldest_seq));
+                    }
+                } else {
+                    // This world is done - advance to next world in queue
+                    self.backfill_advance_to_next();
                 }
             }
             WsMessage::GlobalSettingsUpdated { settings, input_height: _ } => {
@@ -3587,6 +3604,43 @@ impl App {
                 }
             }
         }
+    }
+
+    /// Advance backfill to the next world in the queue.
+    /// Sets backfill_next so the main loop can send the request.
+    fn backfill_advance_to_next(&mut self) {
+        while let Some((world_idx, _total)) = self.backfill_queue.first().copied() {
+            self.backfill_queue.remove(0);
+            if let Some(world) = self.worlds.get(world_idx) {
+                let oldest_seq = world.output_lines.first().map(|l| l.seq);
+                if oldest_seq.is_some() {
+                    self.backfill_next = Some((world_idx, oldest_seq));
+                    return;
+                }
+            }
+        }
+        // Queue empty - backfill complete
+        self.backfill_next = None;
+    }
+
+    /// Initialize backfill queue from InitialState worlds data.
+    /// Called after init_from_initial_state() with the original WorldStateMsg data.
+    fn init_backfill(&mut self, world_totals: &[(usize, usize)]) {
+        self.backfill_queue.clear();
+        self.backfill_next = None;
+        // Current world first for best UX, then others
+        let mut queue: Vec<(usize, usize)> = Vec::new();
+        for &(idx, total) in world_totals {
+            let received = self.worlds.get(idx).map(|w| w.output_lines.len()).unwrap_or(0);
+            if total > received {
+                if idx == self.current_world_index {
+                    queue.insert(0, (idx, total));
+                } else {
+                    queue.push((idx, total));
+                }
+            }
+        }
+        self.backfill_queue = queue;
     }
 
     /// Find world index by name (case-insensitive), also checks reader_name for renamed worlds
@@ -5850,6 +5904,7 @@ impl App {
                     was_connected: false,
                     is_proxy: false,
                     gmcp_user_enabled: world.gmcp_user_enabled,
+                    total_output_lines: 0,
                 };
                 self.ws_broadcast(WsMessage::WorldAdded { world: Box::new(world_state) });
                 let _ = persistence::save_settings(self);
@@ -6556,9 +6611,11 @@ impl App {
                             .collect()
                     };
 
+                    let backfill_complete = lines.len() < count;
                     self.ws_send_to_client(client_id, WsMessage::ScrollbackLines {
                         world_index,
                         lines,
+                        backfill_complete,
                     });
                 }
             }
@@ -6605,9 +6662,9 @@ impl App {
     /// Only sends output_lines (not pending_lines) - clients see the More indicator
     /// and release pending via PgDn/Tab, avoiding duplicate line bugs.
     fn build_initial_state(&self) -> WsMessage {
-        // Cap output lines to prevent massive InitialState messages that exceed WebSocket limits.
-        // 5000 lines per world keeps the message well under the 16MB frame size.
-        const MAX_INITIAL_LINES: usize = 5000;
+        // Send only the most recent lines in InitialState for fast initial load.
+        // Clients backfill remaining history via RequestScrollback after rendering.
+        const MAX_INITIAL_LINES: usize = 75;
 
         let worlds: Vec<WorldStateMsg> = self.worlds.iter().enumerate().map(|(idx, world)| {
             // Create timestamped versions (add sparkle prefix for client-generated messages)
@@ -6672,6 +6729,7 @@ impl App {
                 was_connected: world.was_connected,
                 is_proxy: world.proxy_pid.is_some(),
                 gmcp_user_enabled: world.gmcp_user_enabled,
+                total_output_lines: world.output_lines.len(),
             }
         }).collect();
 
@@ -8179,8 +8237,14 @@ async fn run_console_client(addr: &str) -> io::Result<()> {
                         // Auth success - continue waiting for InitialState
                     }
                     WsMessage::InitialState { worlds, current_world_index, settings, splash_lines, .. } => {
+                        // Save world totals for backfill before consuming worlds vec
+                        let world_totals: Vec<(usize, usize)> = worlds.iter()
+                            .map(|w| (w.index, w.total_output_lines))
+                            .collect();
                         // Initialize app state from server
                         app.init_from_initial_state(worlds, current_world_index, settings, splash_lines);
+                        // Initialize backfill queue
+                        app.init_backfill(&world_totals);
                         // Declare client type to server (RemoteConsole for TUI clients)
                         let _ = ws_tx.send(WsMessage::ClientTypeDeclaration {
                             client_type: websocket::RemoteClientType::RemoteConsole,
@@ -8209,7 +8273,9 @@ async fn run_console_client(addr: &str) -> io::Result<()> {
     app.needs_output_redraw = true;
     let mut needs_redraw = true;
 
-
+    // Backfill timer: fires after initial delay to start requesting scrollback history
+    let mut backfill_timer = std::pin::pin!(tokio::time::sleep(std::time::Duration::from_millis(500)));
+    let mut backfill_timer_active = !app.backfill_queue.is_empty();
 
     loop {
         // Draw if needed
@@ -8330,6 +8396,14 @@ async fn run_console_client(addr: &str) -> io::Result<()> {
                     Some(Ok(Message::Text(text))) => {
                         if let Ok(ws_msg) = serde_json::from_str::<WsMessage>(&text) {
                             app.handle_remote_ws_message(ws_msg);
+                            // After processing ScrollbackLines, backfill_next may be set
+                            if let Some((world_idx, before_seq)) = app.backfill_next.take() {
+                                let _ = ws_tx.send(WsMessage::RequestScrollback {
+                                    world_index: world_idx,
+                                    count: 500,
+                                    before_seq,
+                                });
+                            }
                             needs_redraw = true;
                         }
                     }
@@ -8340,6 +8414,19 @@ async fn run_console_client(addr: &str) -> io::Result<()> {
                         break;
                     }
                     _ => {}
+                }
+            }
+            // Backfill timer: start requesting scrollback history after initial delay
+            () = &mut backfill_timer, if backfill_timer_active => {
+                backfill_timer_active = false;
+                // Start backfill from the first world in the queue
+                app.backfill_advance_to_next();
+                if let Some((world_idx, before_seq)) = app.backfill_next.take() {
+                    let _ = ws_tx.send(WsMessage::RequestScrollback {
+                        world_index: world_idx,
+                        count: 500,
+                        before_seq,
+                    });
                 }
             }
         }

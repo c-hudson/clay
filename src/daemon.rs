@@ -1513,9 +1513,11 @@ pub async fn handle_daemon_ws_message(
                         .collect()
                 };
 
+                let backfill_complete = lines.len() < count;
                 app.ws_send_to_client(client_id, WsMessage::ScrollbackLines {
                     world_index,
                     lines,
+                    backfill_complete,
                 });
             }
         }
@@ -1557,6 +1559,7 @@ pub async fn handle_daemon_ws_message(
                 was_connected: false,
                 is_proxy: false,
                 gmcp_user_enabled: world.gmcp_user_enabled,
+                total_output_lines: 0,
             };
             app.ws_broadcast(WsMessage::WorldAdded { world: Box::new(world_state) });
             let _ = persistence::save_settings(app);
@@ -2531,6 +2534,7 @@ pub fn build_multiuser_initial_state(app: &App, username: &str) -> WsMessage {
                 was_connected: world.was_connected,
                 is_proxy: world.proxy_pid.is_some(),
                 gmcp_user_enabled: world.gmcp_user_enabled,
+                total_output_lines: world.output_lines.len(),
             }
         }).collect();
 
