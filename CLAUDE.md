@@ -82,7 +82,7 @@ cargo build --no-default-features --features rustls-backend,webview-gui
 ./target/debug/clay --gui=hostname:port
 ```
 
-The patches modify tao and wry to use the X11/EGL backend on Android instead of the Android-native windowing backend. Stub `Cargo.toml` and `src/lib.rs` files are checked into git so that `[patch.crates-io]` resolves on fresh clones without running `apply-patches.sh`. Only Termux needs to run the script to replace stubs with real patched sources for `--features webview-gui` builds.
+The patches modify tao and wry to use the X11/EGL backend on Android instead of the Android-native windowing backend. The patched sources are not checked into git. Running `apply-patches.sh` downloads the crates, applies patches, and adds a `[patch.crates-io]` section to `Cargo.toml`. Only Termux needs this for `--features webview-gui` builds.
 
 **Limitations on Termux:**
 - Hot reload (`/reload`, `Ctrl+R`, `SIGUSR1`) is not available - exec() and signals are limited on Android

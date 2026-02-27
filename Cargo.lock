@@ -332,7 +332,7 @@ dependencies = [
 
 [[package]]
 name = "clay"
-version = "1.0.0-alpha"
+version = "1.0.0-beta"
 dependencies = [
  "aes-gcm",
  "ansi-to-tui",
@@ -3240,6 +3240,8 @@ dependencies = [
 [[package]]
 name = "tao"
 version = "0.34.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f3a753bdc39c07b192151523a3f77cd0394aa75413802c883a0f6f6a0e5ee2e7"
 dependencies = [
  "bitflags 2.11.0",
  "block2 0.6.2",
@@ -4533,6 +4535,8 @@ checksum = "d7249219f66ced02969388cf2bb044a09756a083d0fab1e566056b04d9fbcaa5"
 [[package]]
 name = "wry"
 version = "0.48.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a2e33c08b174442ff80d5c791020696f9f8b4e4a87b8cfc7494aad6167ec44e1"
 dependencies = [
  "base64 0.22.1",
  "block2 0.5.1",

@@ -85,10 +85,6 @@ native-tls-backend = ["tokio-native-tls", "native-tls", "tokio-tungstenite/nativ
 rustls-backend = ["tokio-rustls", "rustls", "rustls-pemfile", "webpki-roots", "tokio-tungstenite/rustls-tls-webpki-roots"]
 webview-gui = ["wry", "tao", "webkit2gtk", "gdk", "gtk", "rodio"]
 
-[patch.crates-io]
-tao = { path = "tao-0.34.5-patched" }
-wry = { path = "wry-0.48.1-patched" }
-
 [[bin]]
 name = "clay-test-server"
 path = "src/bin/clay-test-server.rs"
