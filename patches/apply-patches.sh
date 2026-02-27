@@ -16,11 +16,17 @@ cd "$PROJECT_DIR"
 CRATE_NAMES=("winit-0.28.7" "glutin-0.30.10" "glutin-winit-0.3.0" "tao-0.34.5" "wry-0.48.1")
 PATCHED_DIRS=("winit-0.28.7-patched" "glutin-0.30.10-patched" "glutin-winit-0.3.0-patched" "tao-0.34.5-patched" "wry-0.48.1-patched")
 
-# Check if all patched dirs already have real content (not stubs)
+# Check if all patched dirs are fully patched.
+# Uses a .patched marker file to avoid false positives when git pull
+# restores stub Cargo.toml over real source files.
+is_patched() {
+    local dir="$1"
+    [ -f "$dir/.patched" ] && [ -d "$dir/src" ] && [ "$(find "$dir/src" -name '*.rs' | wc -l)" -gt 1 ]
+}
+
 all_done=true
 for i in "${!CRATE_NAMES[@]}"; do
-    dst="${PATCHED_DIRS[$i]}"
-    if [ ! -d "$dst/src" ] || [ "$(find "$dst/src" -name '*.rs' | wc -l)" -le 1 ]; then
+    if ! is_patched "${PATCHED_DIRS[$i]}"; then
         all_done=false
         break
     fi
@@ -39,7 +45,7 @@ needs_fetch=false
 
 # winit stub
 dst="${PATCHED_DIRS[0]}"
-if [ ! -d "$dst/src" ] || [ "$(find "$dst/src" -name '*.rs' | wc -l)" -le 1 ]; then
+if ! is_patched "$dst"; then
     needs_fetch=true
     rm -rf "$dst"
     mkdir -p "$dst/src"
@@ -71,7 +77,7 @@ fi
 
 # glutin stub
 dst="${PATCHED_DIRS[1]}"
-if [ ! -d "$dst/src" ] || [ "$(find "$dst/src" -name '*.rs' | wc -l)" -le 1 ]; then
+if ! is_patched "$dst"; then
     needs_fetch=true
     rm -rf "$dst"
     mkdir -p "$dst/src"
@@ -98,7 +104,7 @@ fi
 
 # glutin-winit stub
 dst="${PATCHED_DIRS[2]}"
-if [ ! -d "$dst/src" ] || [ "$(find "$dst/src" -name '*.rs' | wc -l)" -le 1 ]; then
+if ! is_patched "$dst"; then
     needs_fetch=true
     rm -rf "$dst"
     mkdir -p "$dst/src"
@@ -147,6 +153,11 @@ for i in "${!CRATE_NAMES[@]}"; do
     patch="$SCRIPT_DIR/$crate.patch"
     src="$REGISTRY_DIR/$crate"
 
+    if is_patched "$dst"; then
+        echo "  $crate: already patched, skipping"
+        continue
+    fi
+
     if [ ! -d "$src" ]; then
         echo "Error: Source crate not found at $src"
         exit 1
@@ -165,6 +176,9 @@ for i in "${!CRATE_NAMES[@]}"; do
     cd "$dst"
     patch -p1 --no-backup-if-mismatch < "$patch"
     cd "$PROJECT_DIR"
+
+    # Write marker so git pull doesn't fool the check
+    touch "$dst/.patched"
 
     echo "  $crate: done"
 done
