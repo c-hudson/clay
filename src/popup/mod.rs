@@ -1,13 +1,10 @@
 //! Unified popup/window management system
 //!
 //! This module provides a single data model for popups that can be rendered
-//! by console (ratatui), GUI (egui), and web (JavaScript) interfaces.
+//! by console (ratatui) and web (JavaScript) interfaces.
 
 pub mod console_renderer;
 pub mod definitions;
-
-#[cfg(feature = "remote-gui")]
-pub mod gui_renderer;
 
 use std::collections::HashMap;
 

@@ -23,10 +23,10 @@ cargo build --target x86_64-unknown-linux-musl --no-default-features --features 
 
 Other commands:
 ```bash
-cargo build --features remote-gui    # Build with remote GUI client (requires X11/Wayland)
+cargo build --features webview-gui   # Build with webview GUI client
 cargo run                            # Run the client
-cargo run -- --remote=host:port      # Run as remote GUI client
-cargo run -- --webview=host:port     # Run as webview GUI client
+cargo run -- --gui=host:port         # Run as GUI client connecting to remote Clay
+cargo run -- --console=host:port     # Run as console client connecting to remote Clay
 cargo test                           # Run all tests
 cargo test test_name                 # Run a single test
 cargo clippy                         # Lint
@@ -64,25 +64,25 @@ pkg install rust
 cargo build --no-default-features --features rustls-backend
 ```
 
-**Building with Remote GUI on Termux (requires Termux:X11):**
+**Building with WebView GUI on Termux (requires Termux:X11):**
 
 ```bash
 # Install X11 dependencies
 pkg install x11-repo
 pkg install libx11 libxcursor libxrandr libxi libxfixes
 
-# Apply patches to winit/glutin for Android X11 support (one-time setup)
-# This creates stubs, runs cargo fetch, then applies patches automatically
+# Apply patches to tao/wry for Android X11 support (one-time setup)
+# Runs cargo fetch, then applies patches automatically
 ./patches/apply-patches.sh
 
 # Build with GUI
-cargo build --no-default-features --features rustls-backend,remote-gui
+cargo build --no-default-features --features rustls-backend,webview-gui
 
 # Run GUI client (from within Termux:X11 desktop)
 ./target/debug/clay --gui=hostname:port
 ```
 
-The patches modify winit, glutin, and glutin-winit to use the X11/EGL backend on Android instead of the Android-native windowing backend. Stub `Cargo.toml` and `src/lib.rs` files are checked into git so that `[patch.crates-io]` resolves on fresh clones without running `apply-patches.sh`. Only Termux needs to run the script to replace stubs with real patched sources for `--features remote-gui` builds.
+The patches modify tao and wry to use the X11/EGL backend on Android instead of the Android-native windowing backend. Stub `Cargo.toml` and `src/lib.rs` files are checked into git so that `[patch.crates-io]` resolves on fresh clones without running `apply-patches.sh`. Only Termux needs to run the script to replace stubs with real patched sources for `--features webview-gui` builds.
 
 **Limitations on Termux:**
 - Hot reload (`/reload`, `Ctrl+R`, `SIGUSR1`) is not available - exec() and signals are limited on Android
@@ -91,7 +91,7 @@ The patches modify winit, glutin, and glutin-winit to use the X11/EGL backend on
 
 **What works on Termux:**
 - Core MUD client (connect, send, receive)
-- Remote GUI client (with Termux:X11 and patches applied)
+- WebView GUI client (with Termux:X11 and patches applied)
 - Multiple worlds
 - TLS connections (direct, not via proxy)
 - More-mode pausing
@@ -111,14 +111,8 @@ curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 # Build without GUI (terminal client only)
 cargo build --no-default-features --features rustls-backend
 
-# Build with GUI client
-cargo build --features remote-gui
-
-# Build with GUI and audio support
-cargo build --features remote-gui-audio
-
-# Build with GUI, audio, and webview support
-cargo build --features remote-gui-audio,webview-gui
+# Build with GUI client (webview + audio)
+cargo build --features webview-gui
 
 # Output: target/debug/clay
 ```
@@ -130,9 +124,9 @@ cargo build --features remote-gui-audio,webview-gui
 rustup target add x86_64-apple-darwin
 rustup target add aarch64-apple-darwin
 
-# Build for both architectures with GUI, audio, and webview
-cargo build --release --target x86_64-apple-darwin --features remote-gui-audio,webview-gui
-cargo build --release --target aarch64-apple-darwin --features remote-gui-audio,webview-gui
+# Build for both architectures with GUI and audio
+cargo build --release --target x86_64-apple-darwin --features webview-gui
+cargo build --release --target aarch64-apple-darwin --features webview-gui
 
 # Combine into universal binary
 lipo -create \
@@ -156,9 +150,8 @@ file clay-macos-universal
 - TLS/SSL connections
 - Hot reload (`/reload`, `Ctrl+R`, `SIGUSR1`)
 - TLS proxy for preserving connections across reload
-- Remote GUI client (native Cocoa window)
 - WebView GUI client (with `webview-gui` feature)
-- ANSI music playback (with `remote-gui-audio` feature)
+- ANSI music playback (with `webview-gui` feature)
 - WebSocket/HTTP/HTTPS servers
 - Spell checking (`/usr/share/dict/words` exists on macOS)
 - All TUI features
@@ -175,7 +168,7 @@ Clay is a terminal-based MUD (Multi-User Dungeon) client built with ratatui/cros
 - **InputArea**: Input buffer with viewport scrolling, command history, cursor position
 - **SpellChecker**: System dictionary-based spell checking with Levenshtein-distance suggestions (uses /usr/share/dict/words)
 - **Settings**: Global preferences (more_mode_enabled, spell_check_enabled, world_switch_mode, websocket_enabled, websocket_port, websocket_password, https_enabled, https_port)
-- **WebSocketServer**: Embedded WebSocket server for remote GUI clients
+- **WebSocketServer**: Embedded WebSocket server for GUI/web clients
 - **PopupManager**: Unified popup system for all modal dialogs (world editor, setup, web settings, help, world selector, actions, confirmations)
 - **FilterPopup**: Modal filter popup for searching/filtering output text (F4)
 - **Encoding**: Character encoding enum (Utf8, Latin1, Fansi) with decode method
@@ -250,7 +243,7 @@ Encoding is configurable per-world in the world settings popup.
 **Colored Square Emoji:**
 - Colored square emoji (🟥🟧🟨🟩🟦🟪🟫⬛⬜) are rendered with proper colors
 - Console: Replaced with ANSI true-color block characters (██) since terminal emoji fonts ignore foreground colors
-- Remote GUI: Rendered as colored rectangles using egui
+- WebView GUI: Native browser rendering (same as web)
 - Web: Native emoji rendering (browser handles colors)
 - Implementation: `colorize_square_emojis()` in encoding.rs, `has_colored_squares()` in GUI
 
@@ -425,7 +418,6 @@ Prompts that are auto-answered are immediately cleared and not displayed in the 
 **Popup System:**
 - `src/popup/mod.rs` - Unified popup system (PopupManager, field types, layout)
 - `src/popup/console_renderer.rs` - Console/TUI popup rendering (ratatui)
-- `src/popup/gui_renderer.rs` - GUI popup rendering (egui)
 - `src/popup/definitions/` - Individual popup definitions (actions, confirm, connections, filter, help, menu, setup, web, world_editor, world_selector)
 
 **TF (TinyFugue) Engine:**
@@ -439,8 +431,7 @@ Prompts that are auto-answered are immediately cleared and not displayed in the 
 - `src/tf/hooks.rs` - Hook event system (CONNECT, DISCONNECT, LOAD, etc.)
 - `src/tf/bridge.rs` - Bridge between TF engine and App (command results → app actions)
 
-**Remote GUI:**
-- `src/remote_gui.rs` - Remote GUI client (egui, WebSocket connection)
+**GUI:**
 - `src/webview_gui.rs` - WebView GUI client (wry/tao, WebSocket connection via embedded web interface)
 
 **Web Interface:**
@@ -455,7 +446,7 @@ Prompts that are auto-answered are immediately cleared and not displayed in the 
 - `src/bin/clay-test-server.rs` - Standalone test server binary
 
 **Data Files:**
-- `clay2.png` - Logo image used in remote GUI login screen and Android app icon
+- `clay2.png` - Logo image used in Android app icon
 - `android/app/src/main/res/mipmap-*/` - Android launcher icons (generated from clay2.png)
 - `websockets.readme` - WebSocket protocol documentation
 - `~/.clay.dat` - Settings file (created on first save)
@@ -702,7 +693,7 @@ Clay includes a TinyFugue compatibility layer. TF commands work with both `/` an
 
 ### ANSI Music
 
-The client supports ANSI music sequences (BBS-style PC speaker music). When enabled, music sequences are extracted from MUD output and played through the web interface or remote GUI.
+The client supports ANSI music sequences (BBS-style PC speaker music). When enabled, music sequences are extracted from MUD output and played through the web interface or WebView GUI.
 
 **Format:** `ESC [ M <music_string> Ctrl-N` or `ESC [ N <music_string> Ctrl-N`
 - Also supports `MF` (foreground) and `MB` (background) modifiers
@@ -714,12 +705,12 @@ The client supports ANSI music sequences (BBS-style PC speaker music). When enab
 
 **Playback:**
 - Web interface: Uses Web Audio API with square wave oscillator
-- Remote GUI: Uses rodio library (requires `remote-gui-audio` feature and ALSA dev libraries)
+- WebView GUI: Uses rodio library (requires `webview-gui` feature and ALSA dev libraries on Linux)
 - Console: No audio playback (music sequences are stripped from display)
 
 **Building with audio support:**
 ```bash
-cargo build --features remote-gui-audio  # Requires libasound2-dev on Linux
+cargo build --features webview-gui  # Requires libasound2-dev on Linux
 ```
 
 ### GMCP Media (MCMP Protocol)
@@ -817,7 +808,7 @@ The client includes automatic crash recovery:
 
 ### WebSocket Server
 
-The client includes an embedded WebSocket server that allows remote GUI clients to connect and control the MUD sessions.
+The client includes an embedded WebSocket server that allows GUI and web clients to connect and control the MUD sessions.
 
 **Configuration (in Web Settings - /web):**
 - `WS enabled` - Enable/disable the WebSocket server
@@ -991,41 +982,28 @@ Pattern: *pages you*
 Command: /notify Page received: $0
 ```
 
-### Remote GUI Client
+### WebView GUI Client
 
-A graphical client mode that connects to a running Clay's WebSocket server.
+A graphical client mode using the system WebView (wry/tao). Can run standalone or connect to a remote Clay instance.
 
 **Building:**
 ```bash
-cargo build --features remote-gui    # Requires X11 or Wayland
+cargo build --features webview-gui
 ```
 
 **Running:**
 ```bash
-./clay --remote=hostname:port
+./clay --gui                    # Standalone mode
+./clay --gui=hostname:port      # Connect to remote Clay instance
 ```
 
 **Features:**
-- Graphical window using egui
-- Login screen displays clay2.png logo (200x200) with password entry
+- Native WebView window using system browser engine (wry/tao)
+- Uses the same web interface as the browser client
 - Authentication follows allow list and whitelisting rules (same as web interface)
-- World tabs at top showing connection status (● connected, ○ disconnected)
-- Scrollable output area with ANSI color support
-- Clickable URLs in output (underlined, pointer cursor on hover, click to open browser)
-- Input field at bottom with prompt display
-- Status bar showing connection state
-- Click world tabs to switch between worlds
-- Send commands to any connected world
-- Command history with Ctrl+P/N navigation
-- MUD tag stripping toggle (F2)
-- Output filtering (F4)
+- ANSI music playback via rodio (included with webview-gui feature)
 - World switching is GUI-local (doesn't affect console)
-- Hamburger menu with: Worlds List, World Selector, World Editor, Setup, Font, Toggle Tags, Toggle Highlight, Resync
-- Debug Selection: Right-click highlighted text to see raw ANSI codes (ESC shown as `<esc>`)
-
-**Limitations:**
-- The remote-gui feature cannot be built in headless environments
-- Requires X11 or Wayland display server
+- Default mode on macOS and Windows (when webview-gui feature is compiled in)
 
 ### Remote Console Client
 
@@ -1068,7 +1046,7 @@ cargo build --target x86_64-unknown-linux-musl --no-default-features --features 
 
 ### GUI Keyboard Shortcuts
 
-The remote GUI client supports keyboard shortcuts similar to the console client:
+The WebView GUI client supports keyboard shortcuts similar to the console client:
 
 **World Switching:**
 - `Up/Down` - Cycle through active worlds (follows world switching rules from master)
@@ -1162,7 +1140,7 @@ Opened with `/worlds -e` command (uses unified popup system):
 - Show tags - Show/hide MUD tags at start of lines (default: hidden)
 - Input height - Default input area height (1-15 lines)
 - Console Theme - Theme for console interface (dark, light) — uses hardcoded `Theme` enum from `encoding.rs`
-- GUI Theme - Theme for remote GUI/web client (dark, light) — uses customizable `ThemeColors` from `theme.rs` / `~/clay.theme.dat`
+- GUI Theme - Theme for GUI/web client (dark, light) — uses customizable `ThemeColors` from `theme.rs` / `~/clay.theme.dat`
 - Console Mouse - Enable mouse support in console popups (default: on) — click buttons/fields, select list items, drag to highlight text
 - TLS Proxy - Enable TLS proxy for preserving TLS connections across hot reload
 

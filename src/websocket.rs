@@ -456,7 +456,7 @@ pub enum RemoteClientType {
     /// Web browser client - receives full history, scrolls locally
     #[default]
     Web,
-    /// Remote GUI client (egui) - receives full history, scrolls locally
+    /// GUI client (webview) - receives full history, scrolls locally
     RemoteGUI,
     /// Remote console client (TUI) - receives screenful, requests scrollback from master
     RemoteConsole,

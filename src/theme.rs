@@ -40,12 +40,6 @@ impl ThemeColor {
         ratatui::style::Color::Rgb(self.r, self.g, self.b)
     }
 
-    /// Convert to egui Color32 (only available with GUI features)
-    #[cfg(feature = "remote-gui")]
-    pub fn to_egui(&self) -> egui::Color32 {
-        egui::Color32::from_rgb(self.r, self.g, self.b)
-    }
-
     /// Convert to (r, g, b) tuple
     pub fn to_tuple(&self) -> (u8, u8, u8) {
         (self.r, self.g, self.b)

@@ -13,8 +13,6 @@ pub mod http;
 pub mod persistence;
 pub mod daemon;
 pub mod theme;
-#[cfg(feature = "remote-gui")]
-pub mod remote_gui;
 #[cfg(feature = "webview-gui")]
 pub mod webview_gui;
 #[cfg(test)]
@@ -10648,29 +10646,103 @@ fn handle_remote_filter_popup_key(app: &mut App, key: KeyEvent) {
 
 #[tokio::main]
 async fn main() -> io::Result<()> {
-    // Check for -v or --version to show version and exit
-    if std::env::args().any(|a| a == "-v" || a == "--version") {
-        println!("{}", get_version_string());
+    // =========================================================================
+    // CLI argument parsing - single structured pass with validation
+    // =========================================================================
+    let args: Vec<String> = std::env::args().skip(1).collect();
+
+    let mut show_version = false;
+    let mut show_help = false;
+    let mut conf_path: Option<String> = None;
+    let mut daemon_mode = false;
+    let mut multiuser_mode = false;
+    let mut is_reload_arg = false;
+    let mut is_crash_arg = false;
+    let mut tls_proxy_config: Option<String> = None;
+    let mut console_arg: Option<Option<String>> = None;  // None=not set, Some(None)=bare, Some(Some(addr))=with addr
+    let mut gui_arg: Option<Option<String>> = None;
+
+    for arg in &args {
+        match arg.as_str() {
+            "-v" | "--version" => show_version = true,
+            "-h" | "--help" => show_help = true,
+            "-D" => daemon_mode = true,
+            "--multiuser" => multiuser_mode = true,
+            "--reload" => is_reload_arg = true,
+            "--crash" => is_crash_arg = true,
+            "--console" => console_arg = Some(None),
+            "--gui" => gui_arg = Some(None),
+            _ if arg.starts_with("--conf=") => conf_path = Some(arg[7..].to_string()),
+            _ if arg.starts_with("--console=") => console_arg = Some(Some(arg[10..].to_string())),
+            _ if arg.starts_with("--gui=") => gui_arg = Some(Some(arg[6..].to_string())),
+            _ if arg.starts_with("--tls-proxy=") => tls_proxy_config = Some(arg[12..].to_string()),
+            _ => {
+                eprintln!("Error: Unknown option '{}'. Use -h for help.", arg);
+                std::process::exit(1);
+            }
+        }
+    }
+
+    // Handle -h / --help
+    if show_help {
+        println!("Clay MUD Client v{}", VERSION);
+        println!();
+        println!("Usage: clay [OPTIONS]");
+        println!();
+        println!("Options:");
+        println!("    --console            Run in console (TUI) mode");
+        println!("    --console=host:port  Connect to a Clay server via console");
+        println!("    --gui                Run in GUI (webview) mode");
+        println!("    --gui=host:port      Connect to a Clay server via GUI");
+        println!("    -D                   Run as headless daemon server");
+        println!("    --multiuser          Run as multiuser server");
+        println!("    --conf=<path>        Use custom config file (default: ~/.clay.dat)");
+        println!("    -v, --version        Show version and build information");
+        println!("    -h, --help           Show this help message");
+        println!();
+        println!("Defaults:");
+        println!("    Windows/macOS: --gui");
+        println!("    Linux/Termux:  --console");
         return Ok(());
     }
 
-    // Check for --conf=<path> to use a custom config file
-    if let Some(conf_arg) = std::env::args().find(|a| a.starts_with("--conf=")) {
-        let conf_path = conf_arg.strip_prefix("--conf=").unwrap();
-        set_custom_config_path(PathBuf::from(conf_path));
+    // Handle -v / --version with feature info
+    if show_version {
+        let mut features = Vec::new();
+        if cfg!(feature = "rustls-backend") { features.push("rustls"); }
+        if cfg!(feature = "native-tls-backend") { features.push("native-tls"); }
+        if cfg!(feature = "webview-gui") { features.push("webview-gui"); }
+        let features_str = if features.is_empty() {
+            "none".to_string()
+        } else {
+            features.join(", ")
+        };
+        println!("Clay v{} (build {}-{})", VERSION, BUILD_DATE, BUILD_HASH);
+        println!("Features: {}", features_str);
+        return Ok(());
+    }
+
+    // Set custom config path if specified
+    if let Some(ref path) = conf_path {
+        set_custom_config_path(PathBuf::from(path));
     }
 
     // Log startup for debugging reload/crash issues
-    let is_reload_arg = std::env::args().any(|a| a == "--reload");
-    let is_crash_arg = std::env::args().any(|a| a == "--crash");
     debug_log(true, &format!("STARTUP: {} (reload={}, crash={})", get_version_string(), is_reload_arg, is_crash_arg));
 
-    // Check for --tls-proxy=config_path argument for TLS proxy mode (not available on Android)
-    // This is used internally when spawning TLS proxy processes
-    // Config file contains host:port on first line, socket_path on second line
+    // Validate mutual exclusivity
+    if console_arg.is_some() && gui_arg.is_some() {
+        eprintln!("Error: --console and --gui are mutually exclusive.");
+        std::process::exit(1);
+    }
+    if (daemon_mode || multiuser_mode) && (console_arg.is_some() || gui_arg.is_some()) {
+        eprintln!("Error: -D/--multiuser cannot be combined with --console/--gui.");
+        std::process::exit(1);
+    }
+
+    // Handle --tls-proxy (internal, used when spawning TLS proxy processes)
     #[cfg(all(unix, not(target_os = "android")))]
-    if let Some(proxy_arg) = std::env::args().find(|a| a.starts_with("--tls-proxy=")) {
-        let config_path = proxy_arg.strip_prefix("--tls-proxy=").unwrap();
+    if let Some(ref config_path) = tls_proxy_config {
         if let Ok(contents) = std::fs::read_to_string(config_path) {
             let lines: Vec<&str> = contents.lines().collect();
             if lines.len() >= 2 {
@@ -10679,7 +10751,6 @@ async fn main() -> io::Result<()> {
                     let host = host_port[0];
                     let port = host_port[1];
                     let socket_path = PathBuf::from(lines[1]);
-                    // Delete the config file now that we've read it (cleanup)
                     let _ = std::fs::remove_file(config_path);
                     run_tls_proxy_async(host, port, &socket_path).await;
                 }
@@ -10688,76 +10759,17 @@ async fn main() -> io::Result<()> {
         return Ok(());
     }
 
-    // Check for --multiuser mode
-    if std::env::args().any(|a| a == "--multiuser") {
+    // Handle --multiuser mode
+    if multiuser_mode {
         return run_multiuser_server().await;
     }
 
-    // Check for -D (daemon mode) - run as background server only
-    let daemon_mode = std::env::args().any(|a| a == "-D");
+    // Handle -D (daemon mode)
     if daemon_mode {
         return run_daemon_server().await;
     }
 
-    // Parse --gui or --gui=host:port
-    let gui_arg = std::env::args()
-        .find(|a| a == "--gui" || a.starts_with("--gui="))
-        .and_then(|a| {
-            if a == "--gui" {
-                Some(None)
-            } else {
-                a.strip_prefix("--gui=").map(|addr| Some(addr.to_string()))
-            }
-        });
-
-    // Parse --console or --console=host:port
-    let console_arg = std::env::args()
-        .find(|a| a == "--console" || a.starts_with("--console="))
-        .and_then(|a| {
-            if a == "--console" {
-                Some(None)
-            } else {
-                a.strip_prefix("--console=").map(|addr| Some(addr.to_string()))
-            }
-        });
-
-    // Parse --webgui or --webgui=host:port
-    let webgui_arg = std::env::args()
-        .find(|a| a == "--webgui" || a.starts_with("--webgui="))
-        .and_then(|a| {
-            if a == "--webgui" {
-                Some(None)
-            } else {
-                a.strip_prefix("--webgui=").map(|addr| Some(addr.to_string()))
-            }
-        });
-
-    // Check mutual exclusivity of GUI mode flags
-    let mode_count = [gui_arg.is_some(), console_arg.is_some(), webgui_arg.is_some()]
-        .iter().filter(|&&x| x).count();
-    if mode_count > 1 {
-        eprintln!("Error: --gui, --console, and --webgui are mutually exclusive.");
-        return Ok(());
-    }
-
-    // Handle --webgui before other GUI modes
-    if let Some(webgui) = webgui_arg {
-        #[cfg(feature = "webview-gui")]
-        {
-            return match webgui {
-                Some(ref addr) => webview_gui::run_remote_webgui(addr),
-                None => webview_gui::run_master_webgui(),
-            };
-        }
-        #[cfg(not(feature = "webview-gui"))]
-        {
-            let _ = webgui;
-            eprintln!("Error: --webgui requires the 'webview-gui' feature.");
-            eprintln!("Rebuild with: cargo build --features webview-gui");
-            return Ok(());
-        }
-    }
-
+    // Determine interface mode: GUI vs Console
     let has_gui_flag = gui_arg.is_some();
     let (use_gui, remote_addr) = if let Some(addr_opt) = gui_arg {
         (true, addr_opt)
@@ -10766,17 +10778,17 @@ async fn main() -> io::Result<()> {
     } else {
         // Default: Mac/Windows -> GUI (if feature available), others -> Console
         let default_gui = (cfg!(target_os = "macos") || cfg!(windows))
-            && cfg!(feature = "remote-gui");
+            && cfg!(feature = "webview-gui");
         (default_gui, None)
     };
 
-    // Fall back to console if GUI not available
-    let use_gui = use_gui && cfg!(feature = "remote-gui");
+    // Fall back to console if webview-gui feature not available
+    let use_gui = use_gui && cfg!(feature = "webview-gui");
     if has_gui_flag && !use_gui {
-        #[cfg(not(feature = "remote-gui"))]
+        #[cfg(not(feature = "webview-gui"))]
         {
-            eprintln!("Warning: --gui requires the 'remote-gui' feature. Falling back to console.");
-            eprintln!("Rebuild with: cargo build --features remote-gui");
+            eprintln!("Warning: --gui requires the 'webview-gui' feature. Falling back to console.");
+            eprintln!("Rebuild with: cargo build --features webview-gui");
         }
     }
 
@@ -10793,25 +10805,25 @@ async fn main() -> io::Result<()> {
     match (use_gui, remote_addr) {
         // Remote GUI: connect to a running Clay instance via WebSocket
         (true, Some(ref addr)) => {
-            #[cfg(feature = "remote-gui")]
+            #[cfg(feature = "webview-gui")]
             {
-                return remote_gui::run_remote_gui(addr);
+                return webview_gui::run_remote_webgui(addr);
             }
-            #[cfg(not(feature = "remote-gui"))]
+            #[cfg(not(feature = "webview-gui"))]
             {
                 let _ = addr;
-                unreachable!("use_gui should be false when remote-gui feature is not available");
+                unreachable!("use_gui should be false when webview-gui feature is not available");
             }
         }
-        // Master GUI: run App in-process with egui GUI
+        // Master GUI: run App in-process with webview GUI
         (true, None) => {
-            #[cfg(feature = "remote-gui")]
+            #[cfg(feature = "webview-gui")]
             {
-                return remote_gui::run_master_gui();
+                return webview_gui::run_master_webgui();
             }
-            #[cfg(not(feature = "remote-gui"))]
+            #[cfg(not(feature = "webview-gui"))]
             {
-                unreachable!("use_gui should be false when remote-gui feature is not available");
+                unreachable!("use_gui should be false when webview-gui feature is not available");
             }
         }
         // Remote console: connect to a running Clay instance via WebSocket
