@@ -120,6 +120,8 @@ body {
 .ansi-bold { font-weight: bold; }
 .ansi-italic { font-style: italic; }
 .ansi-underline { text-decoration: underline; }
+.ansi-blink { animation: ansi-blink 1s step-end infinite; }
+@keyframes ansi-blink { 0%, 75% { opacity: 1; } 76%, 100% { opacity: 0; } }
 
 /* ANSI background colors */
 .ansi-bg-black { background-color: var(--theme-ansi-0, #000000); }

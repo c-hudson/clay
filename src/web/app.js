@@ -2241,14 +2241,13 @@
                     }
                     if (minSeq !== Infinity) world._oldest_seq = minSeq;
 
-                    // Re-render if viewing this world
-                    if (msg.world_index === currentWorldIndex) {
+                    // Re-render only if user has scrolled up into history.
+                    // Backfill lines are old content at the top — not visible when at bottom.
+                    // Skipping renderOutput() avoids restarting CSS animations (e.g. blink).
+                    if (msg.world_index === currentWorldIndex && !wasBottom) {
                         renderOutput();
-                        // Maintain scroll position: if was at bottom, stay at bottom;
-                        // otherwise adjust scrollTop by the height difference (new content at top)
-                        if (wasBottom) {
-                            scrollToBottom();
-                        } else {
+                        // Adjust scrollTop by the height difference (new content at top)
+                        {
                             const newScrollHeight = container.scrollHeight;
                             container.scrollTop += (newScrollHeight - oldScrollHeight);
                         }
@@ -2623,8 +2622,6 @@
     // ExecuteLocalCommand for UI/popup commands.
     function sendCommand() {
         const cmd = elements.input.value;
-        // Don't send empty commands, or any commands if not authenticated
-        if (cmd.length === 0) return;
         if (!authenticated) return;
 
         // Release all pending lines when sending a command
@@ -3090,11 +3087,12 @@
     // Parse ANSI escape codes (supports 16, 256, and true color)
     function parseAnsi(text) {
         // Handle various escape character representations
-        // Some systems send \x1b, others might send \u001b, or the character might be escaped in JSON
-        // Normalize to the standard ESC character
+        // Some systems send \x1b or \u001b as literal text (double-encoded)
+        // Real ESC characters (0x1B) are already correct from JSON parsing
+        // Note: \e normalization removed - it falsely converts literal \e in MUD
+        // output (e.g., MUSH code, regex patterns) into ESC characters
         text = text.replace(/\\x1b/gi, '\x1b');
         text = text.replace(/\\u001b/gi, '\x1b');
-        text = text.replace(/\\e/gi, '\x1b');
 
         // First, strip ALL ANSI CSI sequences (not just SGR)
         // This handles cursor control, screen clearing, etc.
@@ -3300,7 +3298,7 @@
 
             // Build HTML from segments
             let html = '';
-            const baseClasses = classes.filter(c => !c.startsWith('ansi-') || c.startsWith('ansi-bg-') || ['ansi-bold', 'ansi-italic', 'ansi-underline'].includes(c));
+            const baseClasses = classes.filter(c => !c.startsWith('ansi-') || c.startsWith('ansi-bg-') || ['ansi-bold', 'ansi-italic', 'ansi-underline', 'ansi-blink'].includes(c));
 
             for (const seg of segments) {
                 const escapedChars = escapeHtml(seg.chars);
@@ -3387,9 +3385,11 @@
                     currentClasses.push('ansi-italic');
                 } else if (code === 4) {
                     currentClasses.push('ansi-underline');
+                } else if (code === 5 || code === 6) {
+                    currentClasses.push('ansi-blink');
                 } else if (code >= 30 && code <= 37) {
                     // Basic foreground colors - use bright variant if bold is active
-                    currentClasses = currentClasses.filter(c => !c.startsWith('ansi-') || c.startsWith('ansi-bg-') || c === 'ansi-bold' || c === 'ansi-italic' || c === 'ansi-underline');
+                    currentClasses = currentClasses.filter(c => !c.startsWith('ansi-') || c.startsWith('ansi-bg-') || c === 'ansi-bold' || c === 'ansi-italic' || c === 'ansi-underline' || c === 'ansi-blink');
                     currentFgStyle = '';
                     const colors = ['black', 'red', 'green', 'yellow', 'blue', 'magenta', 'cyan', 'white'];
                     const isBold = currentClasses.includes('ansi-bold');
@@ -3400,7 +3400,7 @@
                         // 256-color mode: 38;5;N
                         const colorNum = codes[i + 2];
                         const rgb = color256ToRgb(colorNum);
-                        currentClasses = currentClasses.filter(c => !c.startsWith('ansi-') || c.startsWith('ansi-bg-') || c === 'ansi-bold' || c === 'ansi-italic' || c === 'ansi-underline');
+                        currentClasses = currentClasses.filter(c => !c.startsWith('ansi-') || c.startsWith('ansi-bg-') || c === 'ansi-bold' || c === 'ansi-italic' || c === 'ansi-underline' || c === 'ansi-blink');
                         currentFgStyle = `color:rgb(${rgb[0]},${rgb[1]},${rgb[2]});`;
                         i += 2;
                     } else if (codes[i + 1] === 2 && codes.length > i + 4) {
@@ -3408,13 +3408,13 @@
                         const r = codes[i + 2];
                         const g = codes[i + 3];
                         const b = codes[i + 4];
-                        currentClasses = currentClasses.filter(c => !c.startsWith('ansi-') || c.startsWith('ansi-bg-') || c === 'ansi-bold' || c === 'ansi-italic' || c === 'ansi-underline');
+                        currentClasses = currentClasses.filter(c => !c.startsWith('ansi-') || c.startsWith('ansi-bg-') || c === 'ansi-bold' || c === 'ansi-italic' || c === 'ansi-underline' || c === 'ansi-blink');
                         currentFgStyle = `color:rgb(${r},${g},${b});`;
                         i += 4;
                     }
                 } else if (code === 39) {
                     // Default foreground color
-                    currentClasses = currentClasses.filter(c => !c.startsWith('ansi-') || c.startsWith('ansi-bg-') || c === 'ansi-bold' || c === 'ansi-italic' || c === 'ansi-underline');
+                    currentClasses = currentClasses.filter(c => !c.startsWith('ansi-') || c.startsWith('ansi-bg-') || c === 'ansi-bold' || c === 'ansi-italic' || c === 'ansi-underline' || c === 'ansi-blink');
                     currentFgStyle = '';
                 } else if (code >= 40 && code <= 47) {
                     // Basic background colors
@@ -3446,7 +3446,7 @@
                     currentBgStyle = '';
                 } else if (code >= 90 && code <= 97) {
                     // Bright foreground colors
-                    currentClasses = currentClasses.filter(c => !c.startsWith('ansi-') || c.startsWith('ansi-bg-') || c === 'ansi-bold' || c === 'ansi-italic' || c === 'ansi-underline');
+                    currentClasses = currentClasses.filter(c => !c.startsWith('ansi-') || c.startsWith('ansi-bg-') || c === 'ansi-bold' || c === 'ansi-italic' || c === 'ansi-underline' || c === 'ansi-blink');
                     currentFgStyle = '';
                     const colors = ['black', 'red', 'green', 'yellow', 'blue', 'magenta', 'cyan', 'white'];
                     currentClasses.push('ansi-bright-' + colors[code - 90]);
@@ -3492,7 +3492,8 @@
 
         // Final cleanup: strip any orphaned ANSI-like patterns that weren't matched
         // (e.g., [0m, [1;32m, [37m) - these appear when ESC char was lost
-        result = result.replace(/\[([0-9;]*)m/g, '');
+        // Negative lookahead prevents stripping [m from text like [match(, [menu], etc.
+        result = result.replace(/\[([0-9;]*)m(?![a-zA-Z])/g, '');
 
         // Strip orphan ESC characters and the control picture symbol for ESC (␛ U+241B)
         // These can appear when ANSI sequences are incomplete or corrupted
