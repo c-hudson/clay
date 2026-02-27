@@ -400,7 +400,9 @@ pub fn strip_non_sgr_sequences(s: &str) -> String {
                     if (chars.peek() == Some(&'M') || chars.peek() == Some(&'N')) && {
                         let mut lookahead = chars.clone();
                         lookahead.next(); // skip M/N
-                        matches!(lookahead.peek(), Some(&('A'..='G' | 'a'..='g' | 'O' | 'o' | 'T' | 't' | 'L' | 'l' | '0'..='9' | ' ' | '<' | '>')))
+                        // Allow any letter (notes A-G, octave O, tempo T, length L,
+                        // rest P, style S, execute X, modifiers F/B, etc.)
+                        matches!(lookahead.peek(), Some(&('A'..='Z' | 'a'..='z' | '0'..='9' | ' ' | '<' | '>' | '.' | '#' | '+' | '-')))
                     } {
                         let music_prefix = chars.next().unwrap(); // consume M or N
                         // Preserve the sequence - add ESC [ M/N and continue collecting until terminator

@@ -2990,6 +2990,7 @@ impl App {
             self.settings.editor_side.name(),
             self.settings.mouse_enabled,
             self.settings.zwj_enabled,
+            self.settings.ansi_music_enabled,
         );
         self.popup_manager.open(def);
 
@@ -8552,6 +8553,7 @@ fn handle_remote_client_key(
                     app.mouse_capture_active = false;
                 }
                 app.settings.zwj_enabled = settings.zwj_enabled;
+                app.settings.ansi_music_enabled = settings.ansi_music;
 
                 // Send UpdateGlobalSettings to daemon
                 let _ = ws_tx.send(WsMessage::UpdateGlobalSettings {
@@ -9222,6 +9224,7 @@ struct SetupSettings {
     editor_side: String,
     mouse_enabled: bool,
     zwj_enabled: bool,
+    ansi_music: bool,
 }
 
 /// Settings from the web popup
@@ -9301,7 +9304,7 @@ fn handle_new_popup_key(app: &mut App, key: KeyEvent) -> NewPopupAction {
         SETUP_FIELD_MORE_MODE, SETUP_FIELD_SPELL_CHECK, SETUP_FIELD_TEMP_CONVERT,
         SETUP_FIELD_WORLD_SWITCHING, SETUP_FIELD_DEBUG,
         SETUP_FIELD_INPUT_HEIGHT, SETUP_FIELD_GUI_THEME, SETUP_FIELD_TLS_PROXY,
-        SETUP_FIELD_DICTIONARY, SETUP_FIELD_EDITOR_SIDE, SETUP_FIELD_MOUSE, SETUP_FIELD_ZWJ,
+        SETUP_FIELD_DICTIONARY, SETUP_FIELD_EDITOR_SIDE, SETUP_FIELD_MOUSE, SETUP_FIELD_ZWJ, SETUP_FIELD_ANSI_MUSIC,
         SETUP_BTN_SAVE, SETUP_BTN_CANCEL,
     };
     use popup::definitions::web::{
@@ -9524,6 +9527,7 @@ fn handle_new_popup_key(app: &mut App, key: KeyEvent) -> NewPopupAction {
                         .unwrap_or("left").to_string(),
                     mouse_enabled: state.get_bool(SETUP_FIELD_MOUSE).unwrap_or(true),
                     zwj_enabled: state.get_bool(SETUP_FIELD_ZWJ).unwrap_or(false),
+                    ansi_music: state.get_bool(SETUP_FIELD_ANSI_MUSIC).unwrap_or(true),
                 }
             };
 
@@ -14795,6 +14799,7 @@ fn handle_key_event(key: KeyEvent, app: &mut App) -> KeyAction {
                     app.mouse_capture_active = false;
                 }
                 app.settings.zwj_enabled = settings.zwj_enabled;
+                app.settings.ansi_music_enabled = settings.ansi_music;
                 // Save settings to disk
                 let _ = persistence::save_settings(app);
             }
@@ -20491,8 +20496,8 @@ mod tests {
         assert_eq!(strip_mud_tag("[chat:] message"), "message");
         assert_eq!(strip_mud_tag("[ooc(player)] text"), "text");
 
-        // With leading whitespace
-        assert_eq!(strip_mud_tag("  [channel:] hello"), "  hello");
+        // Indented lines are NOT stripped (preserves MUSH code like [match(...)])
+        assert_eq!(strip_mud_tag("  [channel:] hello"), "  [channel:] hello");
 
         // With ANSI color prefix
         assert_eq!(strip_mud_tag("\x1b[31m[channel:] hello"), "\x1b[31mhello");
