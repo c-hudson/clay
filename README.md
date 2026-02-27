@@ -3,7 +3,7 @@
 A terminal-based MUD (Multi-User Dungeon) client built with Rust featuring multi-world support, ANSI color rendering, and a web interface.
 
 ![Clay screenshot showing one instance with remote terminal, Firefox web client, native GUI, and theme editor](screenshot.png)
-*A single Clay instance viewed simultaneously from a remote terminal, a Firefox web client, and a native egui GUI — with the browser-based theme editor open for live color customization.*
+*A single Clay instance viewed simultaneously from a remote terminal, a Firefox web client, and a native WebView GUI — with the browser-based theme editor open for live color customization.*
 
 ## Features
 
@@ -11,7 +11,7 @@ A terminal-based MUD (Multi-User Dungeon) client built with Rust featuring multi
 - **SSL/TLS** - Secure connections with full TLS support
 - **ANSI Colors** - Full ANSI color and formatting support (256-color, true color)
 - **Web Interface** - Browser-based client via WebSocket
-- **Remote GUI** - Optional graphical client using egui
+- **WebView GUI** - Native graphical client using system WebView (wry/tao)
 - **Remote Console** - Connect to a running Clay instance from another terminal
 - **More-Mode** - Pagination for fast-scrolling output
 - **Scrollback** - Unlimited history with PageUp/PageDown navigation
@@ -60,15 +60,13 @@ chmod +x clay
 ### Linux
 
 ```bash
-# Install dependencies (Debian/Ubuntu)
-sudo apt install libasound2-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev libxcb1-dev pkg-config
-
-# Build with GUI + audio
-cargo build --release --features remote-gui-audio
-
 # Static binary for any Linux (TUI only, no GUI)
 rustup target add x86_64-unknown-linux-musl
 cargo build --release --target x86_64-unknown-linux-musl --no-default-features --features rustls-backend
+
+# Build with WebView GUI + audio (requires GTK/WebKit dev libraries)
+sudo apt install libwebkit2gtk-4.1-dev libgtk-3-dev libasound2-dev
+cargo build --release --features webview-gui
 ```
 
 ### macOS
@@ -77,8 +75,8 @@ cargo build --release --target x86_64-unknown-linux-musl --no-default-features -
 # Install Rust
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 
-# Build with GUI + audio
-cargo build --release --features remote-gui-audio
+# Build with WebView GUI + audio
+cargo build --release --features webview-gui
 ```
 
 ### Windows
@@ -86,8 +84,8 @@ cargo build --release --features remote-gui-audio
 ```bash
 # Install Rust from https://rustup.rs
 
-# Build with GUI + audio
-cargo build --release --features remote-gui-audio
+# Build with WebView GUI + audio (uses WebView2)
+cargo build --release --features webview-gui
 ```
 
 ### Termux (Android)
@@ -106,8 +104,8 @@ cargo build --release --no-default-features --features rustls-backend
 # Run the TUI client
 ./clay
 
-# Run as remote GUI client (connects to running Clay instance)
-./clay --remote=hostname:port
+# Run as WebView GUI client (connects to running Clay instance)
+./clay --gui=hostname:port
 
 # Run as remote console client
 ./clay --console=hostname:port
