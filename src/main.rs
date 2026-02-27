@@ -21,7 +21,7 @@ pub mod testserver;
 pub mod testharness;
 
 // Version information
-const VERSION: &str = "1.0.0-alpha";
+const VERSION: &str = "1.0.0-beta";
 const BUILD_HASH: &str = env!("BUILD_HASH");
 const BUILD_DATE: &str = env!("BUILD_DATE");
 
