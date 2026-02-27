@@ -3933,6 +3933,9 @@
         const leadingWsLen = text.length - trimmed.length;
         const leadingWs = text.substring(0, leadingWsLen);
 
+        // Don't strip tags from indented lines - real MUD tags are never indented
+        if (leadingWsLen > 0) return text;
+
         // Parse through ANSI codes to find actual content start
         let i = 0;
         let ansiPrefix = '';

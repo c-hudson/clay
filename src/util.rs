@@ -258,6 +258,11 @@ pub fn strip_mud_tag(text: &str) -> String {
     let leading_ws_len = text.len() - trimmed.len();
     let leading_ws = &text[..leading_ws_len];
 
+    // Don't strip tags from indented lines - real MUD tags are never indented
+    if leading_ws_len > 0 {
+        return text.to_string();
+    }
+
     // Check if line starts with [ (possibly after ANSI codes)
     let mut chars = trimmed.chars().peekable();
     let mut ansi_prefix = String::new();
