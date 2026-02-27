@@ -464,12 +464,18 @@ fn create_webview_window(title: &str, params: &WebViewParams) -> io::Result<()> 
         // Open external links in the system browser instead of navigating the WebView.
         // Links use target="_blank", which triggers new_window_req_handler.
         .with_new_window_req_handler(|url| {
-            open_url_in_browser(&url);
-            false // don't open a new webview window
+            // On Windows WebView2, custom protocol "clay" is served as http://clay.localhost/
+            if url.starts_with("clay://") || url.contains("://clay.localhost") {
+                false // our protocol — don't open in browser
+            } else {
+                open_url_in_browser(&url);
+                false
+            }
         })
         // Block navigation away from our app (e.g. if a link doesn't use target="_blank")
         .with_navigation_handler(|url| {
-            if url.starts_with("clay://") {
+            // On Windows WebView2, custom protocol "clay" is served as http://clay.localhost/
+            if url.starts_with("clay://") || url.contains("://clay.localhost") {
                 true // allow our custom protocol
             } else {
                 open_url_in_browser(&url);
