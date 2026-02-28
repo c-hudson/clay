@@ -138,8 +138,8 @@ pub fn create_setup_popup(
             "ANSI Music",
             FieldKind::toggle(ansi_music),
         ))
-        .with_button(Button::new(SETUP_BTN_SAVE, "Save").primary().with_shortcut('S'))
         .with_button(Button::new(SETUP_BTN_CANCEL, "Cancel").with_shortcut('C'))
+        .with_button(Button::new(SETUP_BTN_SAVE, "Save").primary().with_shortcut('S'))
         .with_layout(PopupLayout {
             label_width: 17,
             min_width: 40,

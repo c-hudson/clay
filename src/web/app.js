@@ -170,6 +170,7 @@
         setupMoreModeToggle: document.getElementById('setup-more-mode-toggle'),
         // Note: show tags removed from setup - controlled by F2 or /tag command
         setupAnsiMusicToggle: document.getElementById('setup-ansi-music-toggle'),
+        setupZwjToggle: document.getElementById('setup-zwj-toggle'),
         setupTlsProxyToggle: document.getElementById('setup-tls-proxy-toggle'),
         setupWorldSwitchSelect: document.getElementById('setup-world-switch-select'),
         setupInputHeightValue: document.getElementById('setup-input-height-value'),
@@ -313,6 +314,7 @@
     // Note: show tags removed from setup - controlled by F2 or /tag command
     let setupColorOffset = 0;
     let setupAnsiMusic = true;
+    let setupZwj = false;
     let setupTlsProxy = false;
     let setupInputHeightValue = 1;
     let setupGuiTheme = 'dark';
@@ -390,6 +392,7 @@
     // ANSI Music audio context (lazily initialized)
     let audioContext = null;
     let ansiMusicEnabled = true;  // Will be synced from server settings
+    let zwjEnabled = false;  // Will be synced from server settings
 
     // MCMP (MUD Client Media Protocol) state
     let mcmpDefaultUrl = '';
@@ -1583,6 +1586,9 @@
                     if (msg.settings.ansi_music_enabled !== undefined) {
                         ansiMusicEnabled = msg.settings.ansi_music_enabled;
                     }
+                    if (msg.settings.zwj_enabled !== undefined) {
+                        zwjEnabled = msg.settings.zwj_enabled;
+                    }
                     if (msg.settings.tls_proxy_enabled !== undefined) {
                         tlsProxyEnabled = msg.settings.tls_proxy_enabled;
                     }
@@ -1940,6 +1946,9 @@
                     }
                     if (msg.settings.ansi_music_enabled !== undefined) {
                         ansiMusicEnabled = msg.settings.ansi_music_enabled;
+                    }
+                    if (msg.settings.zwj_enabled !== undefined) {
+                        zwjEnabled = msg.settings.zwj_enabled;
                     }
                     if (msg.settings.tls_proxy_enabled !== undefined) {
                         tlsProxyEnabled = msg.settings.tls_proxy_enabled;
@@ -4534,6 +4543,7 @@
         setupWorldSwitchMode = worldSwitchMode;
         // Note: show tags removed from setup - controlled by F2 or /tag command
         setupAnsiMusic = ansiMusicEnabled;
+        setupZwj = zwjEnabled;
         setupTlsProxy = tlsProxyEnabled;
         setupInputHeightValue = inputHeight;
         setupGuiTheme = guiTheme;
@@ -4563,6 +4573,11 @@
             elements.setupAnsiMusicToggle.classList.add('active');
         } else {
             elements.setupAnsiMusicToggle.classList.remove('active');
+        }
+        if (setupZwj) {
+            elements.setupZwjToggle.classList.add('active');
+        } else {
+            elements.setupZwjToggle.classList.remove('active');
         }
         if (setupTlsProxy) {
             elements.setupTlsProxyToggle.classList.add('active');
@@ -4616,7 +4631,8 @@
             ws_port: wsPort,
             ws_cert_file: wsCertFile,
             ws_key_file: wsKeyFile,
-            tls_proxy_enabled: tlsProxyEnabled
+            tls_proxy_enabled: tlsProxyEnabled,
+            zwj_enabled: zwjEnabled
         };
     }
 
@@ -4632,6 +4648,7 @@
         worldSwitchMode = setupWorldSwitchMode;
         // Note: show tags removed from setup - controlled by F2 or /tag command
         ansiMusicEnabled = setupAnsiMusic;
+        zwjEnabled = setupZwj;
         tlsProxyEnabled = setupTlsProxy;
         guiTheme = setupGuiTheme;
         colorOffsetPercent = setupColorOffset;
@@ -5527,6 +5544,23 @@
         }
     }
 
+    // Request world with oldest pending/unseen output from server (Escape+w / Alt+w)
+    function requestOldestPendingWorld() {
+        if (ws && ws.readyState === WebSocket.OPEN) {
+            ws.send(JSON.stringify({
+                type: 'CalculateOldestPending',
+                current_index: currentWorldIndex
+            }));
+        }
+    }
+
+    // Escape+key sequence tracking (mirrors console's last_escape pattern)
+    let lastEscapeTime = 0;
+
+    function isRecentEscape() {
+        return (Date.now() - lastEscapeTime) < 500;
+    }
+
     // Toggle menu dropdown (unified - opens upward from button)
     function toggleMenu(anchorBtn) {
         menuOpen = !menuOpen;
@@ -6411,10 +6445,18 @@
                     elements.outputContainer.scrollBy(0, elements.outputContainer.clientHeight);
                 }
                 elements.input.focus();
-            } else if (e.key === 'j' && e.altKey) {
+            } else if (e.key === 'j' && (e.altKey || isRecentEscape())) {
+                // Alt+j or Escape+j: Jump to end, release all pending
+                lastEscapeTime = 0;
                 e.preventDefault();
                 releaseAll();
                 scrollToBottom();
+                elements.input.focus();
+            } else if (e.key === 'w' && (e.altKey || isRecentEscape())) {
+                // Alt+w or Escape+w: Switch to world with activity
+                lastEscapeTime = 0;
+                e.preventDefault();
+                requestOldestPendingWorld();
                 elements.input.focus();
             } else if (e.key === 'PageUp') {
                 e.preventDefault();
@@ -6452,6 +6494,9 @@
                 // Escape: Close device mode modal if open
                 e.preventDefault();
                 hideDeviceModeModal();
+            } else if (e.key === 'Escape') {
+                // Track bare Escape for Escape+key sequences
+                lastEscapeTime = Date.now();
             }
         };
 
@@ -6486,11 +6531,17 @@
                     // Scroll down one screenful (like more)
                     elements.outputContainer.scrollBy(0, elements.outputContainer.clientHeight);
                 }
-            } else if (e.key === 'j' && e.altKey) {
-                // Alt+j: Jump to end, release all pending
+            } else if (e.key === 'j' && (e.altKey || isRecentEscape())) {
+                // Alt+j or Escape+j: Jump to end, release all pending
+                lastEscapeTime = 0;
                 e.preventDefault();
                 releaseAll();
                 scrollToBottom();
+            } else if (e.key === 'w' && (e.altKey || isRecentEscape())) {
+                // Alt+w or Escape+w: Switch to world with activity
+                lastEscapeTime = 0;
+                e.preventDefault();
+                requestOldestPendingWorld();
             } else if (e.key === 'ArrowUp' && e.altKey) {
                 // Alt+Up: Increase input height
                 e.preventDefault();
@@ -6571,6 +6622,9 @@
                         releaseScreenful();
                     }
                 }
+            } else if (e.key === 'Escape') {
+                // Track bare Escape for Escape+key sequences
+                lastEscapeTime = Date.now();
             }
             // Note: F2, F3, F4 are handled at document level (before this handler)
         });
@@ -6749,6 +6803,10 @@
         // Note: show tags removed from setup - controlled by F2 or /tag command
         elements.setupAnsiMusicToggle.onclick = function() {
             setupAnsiMusic = !setupAnsiMusic;
+            updateSetupPopupUI();
+        };
+        elements.setupZwjToggle.onclick = function() {
+            setupZwj = !setupZwj;
             updateSetupPopupUI();
         };
         elements.setupTlsProxyToggle.onclick = function() {
