@@ -8346,6 +8346,28 @@ async fn run_console_client(addr: &str) -> io::Result<()> {
                                 MouseEventKind::Up(MouseButton::Left) => {
                                     handle_popup_mouse_highlight_end(&mut app);
                                 }
+                                MouseEventKind::ScrollUp => {
+                                    if let Some(state) = app.popup_manager.current_mut() {
+                                        state.mouse_scroll_up();
+                                    }
+                                    // Fast direct render bypassing ratatui
+                                    let tc = app.settings.theme;
+                                    if let Some(state) = app.popup_manager.current() {
+                                        popup::console_renderer::render_popup_content_direct(state, &tc);
+                                    }
+                                    continue; // Skip full redraw
+                                }
+                                MouseEventKind::ScrollDown => {
+                                    if let Some(state) = app.popup_manager.current_mut() {
+                                        state.mouse_scroll_down();
+                                    }
+                                    // Fast direct render bypassing ratatui
+                                    let tc = app.settings.theme;
+                                    if let Some(state) = app.popup_manager.current() {
+                                        popup::console_renderer::render_popup_content_direct(state, &tc);
+                                    }
+                                    continue; // Skip full redraw
+                                }
                                 _ => {}
                             }
                             needs_redraw = true;
@@ -12879,6 +12901,26 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                             }
                             MouseEventKind::Up(MouseButton::Left) => {
                                 handle_popup_mouse_highlight_end(&mut app);
+                            }
+                            MouseEventKind::ScrollUp => {
+                                if let Some(state) = app.popup_manager.current_mut() {
+                                    state.mouse_scroll_up();
+                                }
+                                // Fast direct render bypassing ratatui
+                                let tc = app.settings.theme;
+                                if let Some(state) = app.popup_manager.current() {
+                                    popup::console_renderer::render_popup_content_direct(state, &tc);
+                                }
+                            }
+                            MouseEventKind::ScrollDown => {
+                                if let Some(state) = app.popup_manager.current_mut() {
+                                    state.mouse_scroll_down();
+                                }
+                                // Fast direct render bypassing ratatui
+                                let tc = app.settings.theme;
+                                if let Some(state) = app.popup_manager.current() {
+                                    popup::console_renderer::render_popup_content_direct(state, &tc);
+                                }
                             }
                             _ => {}
                         }

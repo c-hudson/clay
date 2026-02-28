@@ -1194,6 +1194,218 @@ fn truncate_str(s: &str, max_width: usize) -> String {
 }
 
 // ============================================================================
+// Direct crossterm popup content renderer (bypasses ratatui for fast scroll)
+// ============================================================================
+
+/// Convert a ratatui Color to a crossterm Color
+fn to_crossterm_color(c: ratatui::style::Color) -> crossterm::style::Color {
+    match c {
+        ratatui::style::Color::Reset => crossterm::style::Color::Reset,
+        ratatui::style::Color::Black => crossterm::style::Color::Black,
+        ratatui::style::Color::Red => crossterm::style::Color::DarkRed,
+        ratatui::style::Color::Green => crossterm::style::Color::DarkGreen,
+        ratatui::style::Color::Yellow => crossterm::style::Color::DarkYellow,
+        ratatui::style::Color::Blue => crossterm::style::Color::DarkBlue,
+        ratatui::style::Color::Magenta => crossterm::style::Color::DarkMagenta,
+        ratatui::style::Color::Cyan => crossterm::style::Color::DarkCyan,
+        ratatui::style::Color::Gray => crossterm::style::Color::Grey,
+        ratatui::style::Color::DarkGray => crossterm::style::Color::DarkGrey,
+        ratatui::style::Color::LightRed => crossterm::style::Color::Red,
+        ratatui::style::Color::LightGreen => crossterm::style::Color::Green,
+        ratatui::style::Color::LightYellow => crossterm::style::Color::Yellow,
+        ratatui::style::Color::LightBlue => crossterm::style::Color::Blue,
+        ratatui::style::Color::LightMagenta => crossterm::style::Color::Magenta,
+        ratatui::style::Color::LightCyan => crossterm::style::Color::Cyan,
+        ratatui::style::Color::White => crossterm::style::Color::White,
+        ratatui::style::Color::Rgb(r, g, b) => crossterm::style::Color::Rgb { r, g, b },
+        ratatui::style::Color::Indexed(i) => crossterm::style::Color::AnsiValue(i),
+    }
+}
+
+/// Render just the scrollable/list content of a popup directly to stdout using crossterm.
+/// This is much faster than a full ratatui terminal.draw() cycle because it skips
+/// output area, separator bar, and input area rendering.
+pub fn render_popup_content_direct(state: &PopupState, theme: &Theme) {
+    use std::io::Write;
+    use crossterm::{cursor::MoveTo, style::{SetForegroundColor, SetBackgroundColor, SetAttribute, Print, Attribute}, QueueableCommand};
+
+    if !state.visible {
+        return;
+    }
+
+    let mut stdout = std::io::stdout();
+
+    // Find content areas to re-render (populated during last full render)
+    if state.content_areas.is_empty() {
+        return;
+    }
+
+    let popup_bg = to_crossterm_color(theme.popup_bg());
+
+    for field in &state.definition.fields {
+        match &field.kind {
+            FieldKind::List { items, selected_index, scroll_offset, visible_height, headers, column_widths, .. } => {
+                // Find the content area for this field
+                let ca = state.content_areas.iter().find(|ca| ca.field_id == field.id);
+                let area = match ca {
+                    Some(ca) => ca.area,
+                    None => continue,
+                };
+
+                let needs_scrollbar = items.len() > *visible_height;
+                let scrollbar_width: u16 = if needs_scrollbar { 1 } else { 0 };
+                let content_width = area.width.saturating_sub(scrollbar_width) as usize;
+
+                let col_widths: Vec<usize> = if let Some(widths) = column_widths {
+                    widths.clone()
+                } else {
+                    let num_columns = headers.as_ref().map(|h| h.len()).unwrap_or_else(|| {
+                        items.first().map(|i| i.columns.len()).unwrap_or(1)
+                    });
+                    let mut widths = vec![0; num_columns];
+                    if let Some(hdrs) = headers {
+                        for (i, h) in hdrs.iter().enumerate() {
+                            if i < widths.len() { widths[i] = widths[i].max(h.len()); }
+                        }
+                    }
+                    for item in items.iter() {
+                        for (i, col) in item.columns.iter().enumerate() {
+                            if i < widths.len() { widths[i] = widths[i].max(col.len()); }
+                        }
+                    }
+                    widths
+                };
+
+                let col_spacing = 2;
+                // content_area already excludes header rows, so use area.y directly
+                let items_start_y = area.y;
+                let actual_visible = (*visible_height).min(area.height as usize);
+
+                let max_scroll = items.len().saturating_sub(actual_visible);
+                let effective_scroll = (*scroll_offset).min(max_scroll);
+
+                // Render visible items
+                for i in 0..actual_visible {
+                    let row_y = items_start_y + i as u16;
+                    let item_idx = effective_scroll + i;
+
+                    let _ = stdout.queue(MoveTo(area.x, row_y));
+
+                    if item_idx < items.len() {
+                        let item = &items[item_idx];
+                        let is_item_selected = item_idx == *selected_index;
+
+                        // Choose colors
+                        let (fg, bg, bold) = if is_item_selected {
+                            (to_crossterm_color(theme.fg_accent()), to_crossterm_color(theme.selection_bg()), true)
+                        } else if item.style.is_connected {
+                            (to_crossterm_color(theme.fg_success()), popup_bg, false)
+                        } else if item.style.is_disabled {
+                            (to_crossterm_color(theme.fg_dim()), popup_bg, false)
+                        } else {
+                            (to_crossterm_color(theme.fg()), popup_bg, false)
+                        };
+
+                        // Build text
+                        let mut text = String::new();
+                        for (col_idx, col) in item.columns.iter().enumerate() {
+                            if col_idx < col_widths.len() {
+                                text.push_str(&format!("{:<width$}", col, width = col_widths[col_idx]));
+                                if col_idx < item.columns.len() - 1 {
+                                    text.push_str(&" ".repeat(col_spacing));
+                                }
+                            }
+                        }
+
+                        let prefix = if item.style.is_current { "* " } else { "  " };
+                        let full_text = format!("{}{}", prefix, text);
+                        let padded = format!("{:<width$}", truncate_str(&full_text, content_width), width = content_width);
+
+                        let _ = stdout.queue(SetForegroundColor(fg));
+                        let _ = stdout.queue(SetBackgroundColor(bg));
+                        if bold {
+                            let _ = stdout.queue(SetAttribute(Attribute::Bold));
+                        }
+                        let _ = stdout.queue(Print(&padded));
+                        if bold {
+                            let _ = stdout.queue(SetAttribute(Attribute::NoBold));
+                        }
+                    } else {
+                        // Empty row (shouldn't happen but fill with background)
+                        let _ = stdout.queue(SetForegroundColor(to_crossterm_color(theme.fg())));
+                        let _ = stdout.queue(SetBackgroundColor(popup_bg));
+                        let _ = stdout.queue(Print(" ".repeat(content_width)));
+                    }
+
+                    // Scrollbar
+                    if needs_scrollbar {
+                        let thumb_size = ((actual_visible as f64 / items.len() as f64) * actual_visible as f64).max(1.0) as usize;
+                        let thumb_pos = if max_scroll == 0 { 0 } else {
+                            ((effective_scroll as f64 / max_scroll as f64) * (actual_visible - thumb_size) as f64) as usize
+                        };
+                        let ch = if i >= thumb_pos && i < thumb_pos + thumb_size { "█" } else { "│" };
+                        let _ = stdout.queue(SetForegroundColor(to_crossterm_color(theme.fg_dim())));
+                        let _ = stdout.queue(SetBackgroundColor(popup_bg));
+                        let _ = stdout.queue(Print(ch));
+                    }
+                }
+
+                let _ = stdout.queue(SetAttribute(Attribute::Reset));
+            }
+
+            FieldKind::ScrollableContent { lines, scroll_offset, visible_height, .. } => {
+                let ca = state.content_areas.iter().find(|ca| ca.field_id == field.id);
+                let area = match ca {
+                    Some(ca) => ca.area,
+                    None => continue,
+                };
+
+                let actual_height = (*visible_height).min(area.height as usize);
+                let total_lines = lines.len();
+                let scrollbar_width: u16 = if total_lines > actual_height { 1 } else { 0 };
+
+                for i in 0..actual_height {
+                    let row_y = area.y + i as u16;
+                    let line_idx = scroll_offset + i;
+
+                    let _ = stdout.queue(MoveTo(area.x, row_y));
+                    let _ = stdout.queue(SetForegroundColor(to_crossterm_color(theme.fg())));
+                    let _ = stdout.queue(SetBackgroundColor(popup_bg));
+
+                    let row_width = area.width.saturating_sub(scrollbar_width) as usize;
+                    if line_idx < lines.len() {
+                        let display = truncate_str(&lines[line_idx], row_width);
+                        let padded = format!("{:<width$}", display, width = row_width);
+                        let _ = stdout.queue(Print(&padded));
+                    } else {
+                        let _ = stdout.queue(Print(" ".repeat(row_width)));
+                    }
+
+                    // Scrollbar
+                    if total_lines > actual_height {
+                        let thumb_size = ((actual_height as f64 / total_lines as f64) * actual_height as f64).max(1.0) as usize;
+                        let max_scroll = total_lines.saturating_sub(actual_height);
+                        let thumb_pos = if max_scroll == 0 { 0 } else {
+                            ((*scroll_offset as f64 / max_scroll as f64) * (actual_height - thumb_size) as f64) as usize
+                        };
+                        let ch = if i >= thumb_pos && i < thumb_pos + thumb_size { "█" } else { "│" };
+                        let _ = stdout.queue(SetForegroundColor(to_crossterm_color(theme.fg_dim())));
+                        let _ = stdout.queue(SetBackgroundColor(popup_bg));
+                        let _ = stdout.queue(Print(ch));
+                    }
+                }
+
+                let _ = stdout.queue(SetAttribute(Attribute::Reset));
+            }
+
+            _ => {}
+        }
+    }
+
+    let _ = stdout.flush();
+}
+
+// ============================================================================
 // Specialized popup renderers
 // ============================================================================
 

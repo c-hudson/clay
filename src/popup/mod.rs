@@ -1641,6 +1641,28 @@ impl PopupState {
         }
     }
 
+    /// Handle mouse scroll: moves list selection or scrolls content
+    pub fn mouse_scroll_up(&mut self) {
+        for field in &self.definition.fields {
+            if matches!(&field.kind, FieldKind::List { .. }) {
+                self.list_select_up();
+                return;
+            }
+        }
+        self.scroll_up(1);
+    }
+
+    /// Handle mouse scroll down: moves list selection or scrolls content
+    pub fn mouse_scroll_down(&mut self) {
+        for field in &self.definition.fields {
+            if matches!(&field.kind, FieldKind::List { .. }) {
+                self.list_select_down();
+                return;
+            }
+        }
+        self.scroll_down(1);
+    }
+
     /// Get the currently selected item in a list field
     pub fn get_selected_list_item(&self) -> Option<&ListItem> {
         // Find the first list field and get its selected item
