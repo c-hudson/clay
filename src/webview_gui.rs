@@ -16,6 +16,8 @@ use wry::WebViewBuilder;
 enum WvEvent {
     /// Set window opacity (0.0 = fully transparent, 1.0 = fully opaque)
     SetOpacity(f64),
+    /// Close the window and exit
+    Quit,
 }
 
 use crate::theme::{ThemeColors, ThemeFile};
@@ -469,7 +471,9 @@ fn create_webview_window(title: &str, params: &WebViewParams) -> io::Result<()> 
         .with_devtools(cfg!(debug_assertions))
         .with_ipc_handler(move |req| {
             let body = req.body();
-            if let Some(rest) = body.strip_prefix("opacity:") {
+            if body == "quit" {
+                let _ = proxy.send_event(WvEvent::Quit);
+            } else if let Some(rest) = body.strip_prefix("opacity:") {
                 if let Ok(opacity) = rest.parse::<f64>() {
                     let _ = proxy.send_event(WvEvent::SetOpacity(opacity));
                 }
@@ -535,6 +539,9 @@ fn create_webview_window(title: &str, params: &WebViewParams) -> io::Result<()> 
                 event: WindowEvent::CloseRequested,
                 ..
             } => {
+                *control_flow = ControlFlow::Exit;
+            }
+            Event::UserEvent(WvEvent::Quit) => {
                 *control_flow = ControlFlow::Exit;
             }
             Event::UserEvent(WvEvent::SetOpacity(opacity)) => {

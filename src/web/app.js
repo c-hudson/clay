@@ -2857,8 +2857,12 @@
                 break;
 
             case '/quit':
-                // Close the window/tab (works in WebView GUI)
-                window.close();
+                // Close the window — use IPC for WebView GUI, window.close() for browser
+                if (window.ipc && window.ipc.postMessage) {
+                    window.ipc.postMessage('quit');
+                } else {
+                    window.close();
+                }
                 break;
 
             default:
