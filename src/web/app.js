@@ -6241,8 +6241,8 @@
             if (selection && selection.toString().length > 0) {
                 return;
             }
-            // In WebView mode, don't steal focus from output area (allows text selection)
-            if (window.WEBVIEW_MODE && e.target.closest('#output-container')) {
+            // Don't steal focus from output area (allows text selection with mouse)
+            if (e.target.closest('#output-container')) {
                 return;
             }
             // Don't steal focus from modals, status/nav bars, or form elements
@@ -6282,8 +6282,20 @@
                     menuOpen;
             }
 
+            // Track mouse interaction on output area to prevent focus-stealing during text selection
+            let outputPointerDown = false;
+            elements.outputContainer.addEventListener('mousedown', function() {
+                outputPointerDown = true;
+            });
+            document.addEventListener('mouseup', function() {
+                // Delay clearing so blur/touchend handlers can still see the flag
+                setTimeout(function() { outputPointerDown = false; }, 200);
+            });
+
             // Global touchend handler - refocus input after any touch interaction
             document.addEventListener('touchend', function(e) {
+                // Skip if mouse is interacting with output area (text selection)
+                if (outputPointerDown) return;
                 // Skip if touching interactive elements
                 if (e.target.closest('input, textarea, button, a, select, .custom-dropdown, .menu-item, .modal')) {
                     return;
@@ -6292,9 +6304,17 @@
                 if (isAnyModalOpen()) {
                     return;
                 }
+                // Don't steal focus if user has selected text (for copy)
+                const selection = window.getSelection();
+                if (selection && selection.toString().length > 0) {
+                    return;
+                }
                 // Refocus input after a very short delay
                 requestAnimationFrame(function() {
                     if (!isAnyModalOpen() && document.activeElement !== elements.input) {
+                        const sel = window.getSelection();
+                        if (sel && sel.toString().length > 0) return;
+                        if (outputPointerDown) return;
                         focusInputWithKeyboard();
                     }
                 });
@@ -6304,12 +6324,19 @@
             elements.input.addEventListener('blur', function() {
                 // Use requestAnimationFrame for fastest possible refocus
                 requestAnimationFrame(function() {
+                    // Don't refocus if mouse is interacting with output area (text selection)
+                    if (outputPointerDown) return;
                     // Don't refocus if a modal is open or interacting with form elements
                     if (isAnyModalOpen() ||
                         document.activeElement?.tagName === 'SELECT' ||
                         document.activeElement?.tagName === 'INPUT' ||
                         document.activeElement?.tagName === 'TEXTAREA' ||
                         document.activeElement?.closest('.custom-dropdown')) {
+                        return;
+                    }
+                    // Don't steal focus if user has selected text (for copy)
+                    const selection = window.getSelection();
+                    if (selection && selection.toString().length > 0) {
                         return;
                     }
                     // Refocus to keep keyboard visible
@@ -6319,6 +6346,9 @@
 
             // Periodic check to ensure input stays focused (every 500ms)
             setInterval(function() {
+                if (outputPointerDown) return;
+                const sel = window.getSelection();
+                if (sel && sel.toString().length > 0) return;
                 if (!isAnyModalOpen() &&
                     document.activeElement !== elements.input &&
                     document.activeElement?.tagName !== 'SELECT' &&
