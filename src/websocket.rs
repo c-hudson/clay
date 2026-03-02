@@ -602,7 +602,10 @@ impl WebSocketServer {
         // Use try_read to avoid blocking in async context
         if let Ok(clients) = self.clients.try_read() {
             for client in clients.values() {
-                if client.authenticated {
+                // Only broadcast to clients that are authenticated AND have received InitialState
+                // This prevents ServerData from reaching clients before InitialState,
+                // which causes SEQ MISMATCH errors and duplicate/flickering messages
+                if client.authenticated && client.received_initial_state {
                     // In multiuser mode, only send to clients with matching username
                     if self.multiuser_mode {
                         if client.username.as_deref() == owner {

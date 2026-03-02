@@ -15694,7 +15694,7 @@ fn handle_key_event(key: KeyEvent, app: &mut App) -> KeyAction {
     }
 
     // Shift+Up/Down - configurable behavior
-    if key.code == KeyCode::Up && key.modifiers == KeyModifiers::SHIFT {
+    if key.code == KeyCode::Up && key.modifiers.contains(KeyModifiers::SHIFT) && !key.modifiers.contains(KeyModifiers::CONTROL) && !key.modifiers.contains(KeyModifiers::ALT) {
         match app.settings.shift_arrow_up_down_mode {
             ArrowKeyMode::CycleWorlds => {
                 app.prev_world();
@@ -15711,7 +15711,7 @@ fn handle_key_event(key: KeyEvent, app: &mut App) -> KeyAction {
             }
         }
     }
-    if key.code == KeyCode::Down && key.modifiers == KeyModifiers::SHIFT {
+    if key.code == KeyCode::Down && key.modifiers.contains(KeyModifiers::SHIFT) && !key.modifiers.contains(KeyModifiers::CONTROL) && !key.modifiers.contains(KeyModifiers::ALT) {
         match app.settings.shift_arrow_up_down_mode {
             ArrowKeyMode::CycleWorlds => {
                 app.next_world();
