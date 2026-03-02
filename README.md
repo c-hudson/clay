@@ -186,6 +186,7 @@ Clay will parse `/addworld` commands from your TF config file and create corresp
 **Mouse (enabled by default via "Console Mouse" in `/setup`):**
 - Click popup buttons and fields to interact
 - Click list items to select them
+- Scroll wheel to scroll lists and scrollable content in popups
 - Click and drag to highlight lines in scrollable content
 
 ## Android App

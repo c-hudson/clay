@@ -220,6 +220,10 @@ pub enum WsMessage {
         mouse_enabled: bool,
         #[serde(default)]
         zwj_enabled: bool,
+        #[serde(default)]
+        arrow_up_down_mode: String,
+        #[serde(default)]
+        shift_arrow_up_down_mode: String,
     },
 
     // Settings update confirmations (server -> client)
@@ -436,6 +440,10 @@ pub struct GlobalSettingsMsg {
     pub mouse_enabled: bool,
     #[serde(default)]
     pub zwj_enabled: bool,
+    #[serde(default)]
+    pub arrow_up_down_mode: String,
+    #[serde(default)]
+    pub shift_arrow_up_down_mode: String,
     /// Theme colors from ~/clay.theme.dat (serialized as hex strings)
     #[serde(default)]
     pub theme_colors_json: String,

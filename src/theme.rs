@@ -577,7 +577,7 @@ mod tests {
     #[test]
     fn test_dark_defaults_exist() {
         let dark = ThemeColors::dark_default();
-        assert_eq!(dark.bg, ThemeColor::new(0x12, 0x12, 0x12));
+        assert_eq!(dark.bg, ThemeColor::new(0x13, 0x19, 0x26));
         assert_eq!(dark.fg, ThemeColor::new(0xe8, 0xe4, 0xec));
         assert_eq!(dark.accent, ThemeColor::new(0x26, 0x57, 0xba));
         assert_eq!(dark.ansi[0], ThemeColor::new(0, 0, 0));
@@ -648,7 +648,7 @@ ansi.15 = #eeeeee
         let file = ThemeFile::parse("");
         // Should still have defaults
         let dark = file.get("dark");
-        assert_eq!(dark.bg, ThemeColor::new(0x12, 0x12, 0x12));
+        assert_eq!(dark.bg, ThemeColor::new(0x13, 0x19, 0x26));
     }
 
     #[test]
@@ -657,7 +657,7 @@ ansi.15 = #eeeeee
         let file = ThemeFile::parse(content);
         let dark = file.get("dark");
         // bg should be default (invalid color ignored)
-        assert_eq!(dark.bg, ThemeColor::new(0x12, 0x12, 0x12));
+        assert_eq!(dark.bg, ThemeColor::new(0x13, 0x19, 0x26));
         // fg should be overridden
         assert_eq!(dark.fg, ThemeColor::new(0, 255, 0));
     }
@@ -667,7 +667,7 @@ ansi.15 = #eeeeee
         let file = ThemeFile::with_defaults();
         let theme = file.get("nonexistent");
         // Should fall back to dark
-        assert_eq!(theme.bg, ThemeColor::new(0x12, 0x12, 0x12));
+        assert_eq!(theme.bg, ThemeColor::new(0x13, 0x19, 0x26));
     }
 
     #[test]
@@ -691,19 +691,19 @@ ansi.15 = #eeeeee
         let content = ThemeFile::generate_default_file();
         assert!(content.contains("[theme:dark]"));
         assert!(content.contains("[theme:light]"));
-        assert!(content.contains("bg = #121212"));
+        assert!(content.contains("bg = #131926"));
         assert!(content.contains("ansi.0 = #000000"));
         // Should be re-parseable
         let file = ThemeFile::parse(&content);
         let dark = file.get("dark");
-        assert_eq!(dark.bg, ThemeColor::new(0x12, 0x12, 0x12));
+        assert_eq!(dark.bg, ThemeColor::new(0x13, 0x19, 0x26));
     }
 
     #[test]
     fn test_to_css_vars() {
         let theme = ThemeColors::dark_default();
         let css = theme.to_css_vars();
-        assert!(css.contains("--theme-bg: #121212;"));
+        assert!(css.contains("--theme-bg: #131926;"));
         assert!(css.contains("--theme-fg: #e8e4ec;"));
         assert!(css.contains("--theme-ansi-0: #000000;"));
         assert!(css.contains("--theme-ansi-15: #ffffff;"));

@@ -171,6 +171,8 @@
         // Note: show tags removed from setup - controlled by F2 or /tag command
         setupAnsiMusicToggle: document.getElementById('setup-ansi-music-toggle'),
         setupZwjToggle: document.getElementById('setup-zwj-toggle'),
+        setupArrowUpDownSelect: document.getElementById('setup-arrow-updown-select'),
+        setupShiftArrowSelect: document.getElementById('setup-shift-arrow-select'),
         setupTlsProxyToggle: document.getElementById('setup-tls-proxy-toggle'),
         setupWorldSwitchSelect: document.getElementById('setup-world-switch-select'),
         setupInputHeightValue: document.getElementById('setup-input-height-value'),
@@ -188,6 +190,11 @@
         // Filter popup (F4)
         filterPopup: document.getElementById('filter-popup'),
         filterInput: document.getElementById('filter-input'),
+        // Help popup (/help)
+        helpModal: document.getElementById('help-modal'),
+        helpContent: document.getElementById('help-content'),
+        helpCloseBtn: document.getElementById('help-close-btn'),
+        helpOkBtn: document.getElementById('help-ok-btn'),
         // Menu popup (/menu)
         menuModal: document.getElementById('menu-modal'),
         menuList: document.getElementById('menu-list'),
@@ -261,6 +268,8 @@
 
     // Settings
     let worldSwitchMode = 'Unseen First';  // 'Unseen First' or 'Alphabetical'
+    let arrowUpDownMode = 'cycle_worlds';  // 'cycle_worlds' or 'input_line'
+    let shiftArrowUpDownMode = 'input_line'; // 'cycle_worlds' or 'input_line'
 
     // Actions state
     let actions = [];
@@ -315,6 +324,8 @@
     let setupColorOffset = 0;
     let setupAnsiMusic = true;
     let setupZwj = false;
+    let setupArrowUpDown = 'cycle_worlds';
+    let setupShiftArrowUpDown = 'input_line';
     let setupTlsProxy = false;
     let setupInputHeightValue = 1;
     let setupGuiTheme = 'dark';
@@ -350,6 +361,9 @@
         ['Courier New', 'Courier New'],
         ['Consolas', 'Consolas'],
     ];
+
+    // Help popup state (/help)
+    let helpPopupOpen = false;
 
     // Menu popup state (/menu)
     let menuPopupOpen = false;
@@ -1667,6 +1681,12 @@
                         webFontWeight = msg.settings.web_font_weight;
                         applyFontWeight(webFontWeight);
                     }
+                    if (msg.settings.arrow_up_down_mode !== undefined) {
+                        arrowUpDownMode = msg.settings.arrow_up_down_mode;
+                    }
+                    if (msg.settings.shift_arrow_up_down_mode !== undefined) {
+                        shiftArrowUpDownMode = msg.settings.shift_arrow_up_down_mode;
+                    }
                 }
                 // Calculate activity count from world data (don't wait for ActivityUpdate message)
                 serverActivityCount = worlds.filter((w, i) =>
@@ -2063,6 +2083,12 @@
                     if (msg.settings.web_font_weight !== undefined) {
                         webFontWeight = msg.settings.web_font_weight;
                         applyFontWeight(webFontWeight);
+                    }
+                    if (msg.settings.arrow_up_down_mode !== undefined) {
+                        arrowUpDownMode = msg.settings.arrow_up_down_mode;
+                    }
+                    if (msg.settings.shift_arrow_up_down_mode !== undefined) {
+                        shiftArrowUpDownMode = msg.settings.shift_arrow_up_down_mode;
                     }
                 }
                 break;
@@ -2703,6 +2729,31 @@
         elements.prompt.textContent = '';
     }
 
+    // Navigate to previous command in history
+    function historyPrev() {
+        if (commandHistory.length > 0) {
+            if (historyIndex === -1) {
+                historyIndex = commandHistory.length - 1;
+            } else if (historyIndex > 0) {
+                historyIndex--;
+            }
+            elements.input.value = commandHistory[historyIndex];
+        }
+    }
+
+    // Navigate to next command in history
+    function historyNext() {
+        if (historyIndex !== -1) {
+            if (historyIndex < commandHistory.length - 1) {
+                historyIndex++;
+                elements.input.value = commandHistory[historyIndex];
+            } else {
+                historyIndex = -1;
+                elements.input.value = '';
+            }
+        }
+    }
+
     // Execute a command locally (called from server via ExecuteLocalCommand message).
     // The server's parse_command() is the single source of truth for command parsing.
     // This function only handles the UI/popup side of commands.
@@ -2759,7 +2810,7 @@
                 break;
 
             case '/help':
-                // Help popup not implemented in web, just ignore
+                openHelpPopup();
                 break;
 
             case '/menu':
@@ -2834,6 +2885,107 @@
     function updateFilter() {
         filterText = elements.filterInput.value;
         renderOutput();
+    }
+
+    // Help popup functions (/help)
+    const helpLines = [
+        'Commands:',
+        '',
+        '  Connection:',
+        '  /connect [host port [ssl]] Connect to server',
+        '  /disconnect (or /dc)       Disconnect from server',
+        '  /worlds                    Open world selector',
+        '  /worlds <name>             Connect to or create world',
+        '  /worlds -e [name]          Edit world settings',
+        '  /worlds -l <name>          Connect without auto-login',
+        '  /connections (or /l)       List connected worlds',
+        '  /addworld <name> [host] [port] [-s]',
+        '                             Add or update world (-s=SSL)',
+        '  /keepalive                 Show keepalive settings',
+        '',
+        '  Communication:',
+        '  /send [-W] [-w<world>] [-n] <text>',
+        '                             Send text to world(s)',
+        '                             -W=all worlds, -n=no newline',
+        '  /notify <message>          Send notification to mobile',
+        '',
+        '  Lookup & Translation:',
+        '  /dict <prefix> <word>      Look up word definition',
+        '  /urban <prefix> <word>     Look up Urban Dictionary',
+        '  /translate <lang> <prefix> <text>',
+        '                             Translate text (or /tr)',
+        '                             <lang> = code (es) or name (spanish)',
+        '',
+        '  Actions & Triggers:',
+        '  /actions [world]           Open actions editor',
+        '  /gag <pattern>             Gag lines matching pattern',
+        '  /<action_name> [args]      Execute named action',
+        '',
+        '  Settings:',
+        '  /setup                     Open global settings',
+        '  /web                       Open web/WebSocket settings',
+        '  /tag                       Toggle MUD tag display (F2)',
+        '',
+        '  Display:',
+        '  /menu                      Open menu popup',
+        '  /flush                     Clear output buffer',
+        '  /dump                      Dump scrollback to file',
+        '  /edit [file]               Open split-screen editor',
+        '',
+        '  System:',
+        '  /help                      Show this help',
+        '  /help tf                   Show TF commands help',
+        '  /version                   Show version info',
+        '  /reload                    Hot reload binary',
+        '  /testmusic                 Test ANSI music playback',
+        '  /quit                      Exit client',
+        '',
+        '  Security:',
+        '  /ban                       Show banned hosts',
+        '  /unban <host>              Remove host from ban list',
+        '',
+        'TF Commands:',
+        '  For TinyFugue compatibility commands (triggers, macros,',
+        '  variables, control flow), use:  /help tf  or  /tfhelp',
+        '',
+        'World Switching:',
+        '  Up/Down                    Switch between active worlds',
+        '  Shift+Up/Down              Switch between all worlds',
+        '  Alt+W                      Switch to world with activity',
+        '',
+        'Input:',
+        '  Left/Right, Ctrl+B/F       Move cursor',
+        '  Ctrl+Up/Down               Move cursor up/down lines',
+        '  Alt+Up/Down                Resize input area',
+        '  Ctrl+U                     Clear input',
+        '  Ctrl+W                     Delete word',
+        '  Ctrl+P/N                   Command history',
+        '  Ctrl+Q                     Spell suggestions',
+        '  Ctrl+A, Home/End           Jump to start/end',
+        '  Tab                        Command completion',
+        '',
+        'Output:',
+        '  PageUp/PageDown            Scroll output',
+        '  Tab                        Release one screenful (paused)',
+        '  Alt+J                      Jump to end, release all',
+        '',
+        'Display:',
+        '  F1                         Show this help',
+        '  F2                         Toggle MUD tag display',
+        '  F4                         Filter output',
+        '  F8                         Highlight action matches',
+    ];
+
+    function openHelpPopup() {
+        helpPopupOpen = true;
+        elements.helpContent.textContent = helpLines.join('\n');
+        elements.helpModal.classList.add('visible');
+    }
+
+    function closeHelpPopup() {
+        helpPopupOpen = false;
+        elements.helpModal.classList.remove('visible');
+        elements.input.focus();
     }
 
     // Menu popup functions (/menu)
@@ -4575,6 +4727,8 @@
         // Note: show tags removed from setup - controlled by F2 or /tag command
         setupAnsiMusic = ansiMusicEnabled;
         setupZwj = zwjEnabled;
+        setupArrowUpDown = arrowUpDownMode;
+        setupShiftArrowUpDown = shiftArrowUpDownMode;
         setupTlsProxy = tlsProxyEnabled;
         setupInputHeightValue = inputHeight;
         setupGuiTheme = guiTheme;
@@ -4618,6 +4772,11 @@
         // World switching dropdown
         elements.setupWorldSwitchSelect.value = setupWorldSwitchMode;
         updateCustomDropdown(elements.setupWorldSwitchSelect);
+        // Arrow key mode dropdowns
+        elements.setupArrowUpDownSelect.value = setupArrowUpDown;
+        updateCustomDropdown(elements.setupArrowUpDownSelect);
+        elements.setupShiftArrowSelect.value = setupShiftArrowUpDown;
+        updateCustomDropdown(elements.setupShiftArrowSelect);
         // Input height stepper
         elements.setupInputHeightValue.textContent = setupInputHeightValue;
         // Color offset stepper
@@ -4663,7 +4822,9 @@
             ws_cert_file: wsCertFile,
             ws_key_file: wsKeyFile,
             tls_proxy_enabled: tlsProxyEnabled,
-            zwj_enabled: zwjEnabled
+            zwj_enabled: zwjEnabled,
+            arrow_up_down_mode: arrowUpDownMode,
+            shift_arrow_up_down_mode: shiftArrowUpDownMode
         };
     }
 
@@ -4680,6 +4841,8 @@
         // Note: show tags removed from setup - controlled by F2 or /tag command
         ansiMusicEnabled = setupAnsiMusic;
         zwjEnabled = setupZwj;
+        arrowUpDownMode = setupArrowUpDown;
+        shiftArrowUpDownMode = setupShiftArrowUpDown;
         tlsProxyEnabled = setupTlsProxy;
         guiTheme = setupGuiTheme;
         colorOffsetPercent = setupColorOffset;
@@ -6202,6 +6365,14 @@
             }
         });
 
+        // Help popup button handlers
+        if (elements.helpCloseBtn) {
+            elements.helpCloseBtn.addEventListener('click', closeHelpPopup);
+        }
+        if (elements.helpOkBtn) {
+            elements.helpOkBtn.addEventListener('click', closeHelpPopup);
+        }
+
         // Menu popup item click handlers
         elements.menuList.querySelectorAll('.menu-item').forEach((item, i) => {
             item.addEventListener('click', () => {
@@ -6226,7 +6397,16 @@
             }
 
             // Handle F-keys and shortcuts globally (before popup checks which have early returns)
-            if (e.key === 'F2') {
+            if (e.key === 'F1') {
+                // F1: Toggle help popup
+                e.preventDefault();
+                if (helpPopupOpen) {
+                    closeHelpPopup();
+                } else {
+                    openHelpPopup();
+                }
+                return;
+            } else if (e.key === 'F2') {
                 // F2: Toggle MUD tag display
                 e.preventDefault();
                 showTags = !showTags;
@@ -6251,6 +6431,15 @@
                     closeFilterPopup();
                 } else {
                     openFilterPopup();
+                }
+                return;
+            }
+
+            // Handle help popup
+            if (helpPopupOpen) {
+                if (e.key === 'Escape' || e.key === 'Enter') {
+                    e.preventDefault();
+                    closeHelpPopup();
                 }
                 return;
             }
@@ -6508,14 +6697,40 @@
                     }
                 }
             } else if (e.key === 'ArrowUp' && !e.ctrlKey && !e.shiftKey && !e.altKey && document.activeElement !== elements.input) {
-                // Up: Switch to previous active world (request from server)
+                // Up: configurable behavior (when not focused on input)
                 e.preventDefault();
-                requestPrevWorld();
+                if (arrowUpDownMode === 'cycle_worlds') {
+                    requestPrevWorld();
+                } else if (arrowUpDownMode === 'command_history') {
+                    historyPrev();
+                }
                 elements.input.focus();
             } else if (e.key === 'ArrowDown' && !e.ctrlKey && !e.shiftKey && !e.altKey && document.activeElement !== elements.input) {
-                // Down: Switch to next active world (request from server)
+                // Down: configurable behavior (when not focused on input)
                 e.preventDefault();
-                requestNextWorld();
+                if (arrowUpDownMode === 'cycle_worlds') {
+                    requestNextWorld();
+                } else if (arrowUpDownMode === 'command_history') {
+                    historyNext();
+                }
+                elements.input.focus();
+            } else if (e.key === 'ArrowUp' && e.shiftKey && !e.ctrlKey && !e.altKey && document.activeElement !== elements.input) {
+                // Shift+Up: configurable behavior (when not focused on input)
+                e.preventDefault();
+                if (shiftArrowUpDownMode === 'cycle_worlds') {
+                    requestPrevWorld();
+                } else if (shiftArrowUpDownMode === 'command_history') {
+                    historyPrev();
+                }
+                elements.input.focus();
+            } else if (e.key === 'ArrowDown' && e.shiftKey && !e.ctrlKey && !e.altKey && document.activeElement !== elements.input) {
+                // Shift+Down: configurable behavior (when not focused on input)
+                e.preventDefault();
+                if (shiftArrowUpDownMode === 'cycle_worlds') {
+                    requestNextWorld();
+                } else if (shiftArrowUpDownMode === 'command_history') {
+                    historyNext();
+                }
                 elements.input.focus();
             } else if (e.key === 'Escape' && filterPopupOpen) {
                 // Escape: Close filter popup if open
@@ -6586,38 +6801,53 @@
                     setInputHeight(inputHeight - 1);
                 }
             } else if (e.key === 'ArrowUp' && !e.ctrlKey && !e.shiftKey && !e.altKey) {
-                // Up: Switch to previous active world (request from server)
-                // Ctrl+Up lets browser handle cursor movement in multi-line input
-                e.preventDefault();
-                requestPrevWorld();
+                // Up: configurable behavior
+                if (arrowUpDownMode === 'cycle_worlds') {
+                    e.preventDefault();
+                    requestPrevWorld();
+                } else if (arrowUpDownMode === 'command_history') {
+                    e.preventDefault();
+                    historyPrev();
+                }
+                // else: let browser handle cursor movement in multi-line input
             } else if (e.key === 'ArrowDown' && !e.ctrlKey && !e.shiftKey && !e.altKey) {
-                // Down: Switch to next active world (request from server)
-                // Ctrl+Down lets browser handle cursor movement in multi-line input
-                e.preventDefault();
-                requestNextWorld();
+                // Down: configurable behavior
+                if (arrowUpDownMode === 'cycle_worlds') {
+                    e.preventDefault();
+                    requestNextWorld();
+                } else if (arrowUpDownMode === 'command_history') {
+                    e.preventDefault();
+                    historyNext();
+                }
+                // else: let browser handle cursor movement in multi-line input
+            } else if (e.key === 'ArrowUp' && e.shiftKey && !e.ctrlKey && !e.altKey) {
+                // Shift+Up: configurable behavior
+                if (shiftArrowUpDownMode === 'cycle_worlds') {
+                    e.preventDefault();
+                    requestPrevWorld();
+                } else if (shiftArrowUpDownMode === 'command_history') {
+                    e.preventDefault();
+                    historyPrev();
+                }
+                // else: let browser handle cursor movement
+            } else if (e.key === 'ArrowDown' && e.shiftKey && !e.ctrlKey && !e.altKey) {
+                // Shift+Down: configurable behavior
+                if (shiftArrowUpDownMode === 'cycle_worlds') {
+                    e.preventDefault();
+                    requestNextWorld();
+                } else if (shiftArrowUpDownMode === 'command_history') {
+                    e.preventDefault();
+                    historyNext();
+                }
+                // else: let browser handle cursor movement
             } else if (e.key === 'p' && e.ctrlKey) {
                 // Ctrl+P: Previous command in history
                 e.preventDefault();
-                if (commandHistory.length > 0) {
-                    if (historyIndex === -1) {
-                        historyIndex = commandHistory.length - 1;
-                    } else if (historyIndex > 0) {
-                        historyIndex--;
-                    }
-                    elements.input.value = commandHistory[historyIndex];
-                }
+                historyPrev();
             } else if (e.key === 'n' && e.ctrlKey) {
                 // Ctrl+N: Next command in history
                 e.preventDefault();
-                if (historyIndex !== -1) {
-                    if (historyIndex < commandHistory.length - 1) {
-                        historyIndex++;
-                        elements.input.value = commandHistory[historyIndex];
-                    } else {
-                        historyIndex = -1;
-                        elements.input.value = '';
-                    }
-                }
+                historyNext();
             } else if (e.key === 'u' && e.ctrlKey) {
                 // Ctrl+U: Clear input
                 e.preventDefault();
@@ -6846,6 +7076,12 @@
         };
         elements.setupWorldSwitchSelect.onchange = function() {
             setupWorldSwitchMode = this.value;
+        };
+        elements.setupArrowUpDownSelect.onchange = function() {
+            setupArrowUpDown = this.value;
+        };
+        elements.setupShiftArrowSelect.onchange = function() {
+            setupShiftArrowUpDown = this.value;
         };
         elements.setupHeightMinus.onclick = function() {
             if (setupInputHeightValue > 1) {

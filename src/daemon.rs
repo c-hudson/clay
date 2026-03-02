@@ -1216,7 +1216,7 @@ pub async fn handle_daemon_ws_message(
                 app.ws_broadcast(WsMessage::WorldSwitched { new_index: world_index });
             }
         }
-        WsMessage::UpdateGlobalSettings { more_mode_enabled, spell_check_enabled, temp_convert_enabled, world_switch_mode, show_tags, debug_enabled, ansi_music_enabled, console_theme, gui_theme, gui_transparency, color_offset_percent, input_height, font_name, font_size, web_font_size_phone, web_font_size_tablet, web_font_size_desktop, web_font_weight, ws_allow_list, web_secure, http_enabled, http_port, ws_enabled, ws_port, ws_cert_file, ws_key_file, tls_proxy_enabled, dictionary_path, mouse_enabled, zwj_enabled } => {
+        WsMessage::UpdateGlobalSettings { more_mode_enabled, spell_check_enabled, temp_convert_enabled, world_switch_mode, show_tags, debug_enabled, ansi_music_enabled, console_theme, gui_theme, gui_transparency, color_offset_percent, input_height, font_name, font_size, web_font_size_phone, web_font_size_tablet, web_font_size_desktop, web_font_weight, ws_allow_list, web_secure, http_enabled, http_port, ws_enabled, ws_port, ws_cert_file, ws_key_file, tls_proxy_enabled, dictionary_path, mouse_enabled, zwj_enabled, arrow_up_down_mode, shift_arrow_up_down_mode } => {
             app.settings.more_mode_enabled = more_mode_enabled;
             app.settings.spell_check_enabled = spell_check_enabled;
             app.settings.temp_convert_enabled = temp_convert_enabled;
@@ -1246,6 +1246,8 @@ pub async fn handle_daemon_ws_message(
             app.settings.tls_proxy_enabled = tls_proxy_enabled;
             app.settings.mouse_enabled = mouse_enabled;
             app.settings.zwj_enabled = zwj_enabled;
+            app.settings.arrow_up_down_mode = ArrowKeyMode::from_name(&arrow_up_down_mode);
+            app.settings.shift_arrow_up_down_mode = ArrowKeyMode::from_name(&shift_arrow_up_down_mode);
             if app.settings.dictionary_path != dictionary_path {
                 app.settings.dictionary_path = dictionary_path;
                 app.spell_checker = SpellChecker::new(&app.settings.dictionary_path);
@@ -1286,6 +1288,8 @@ pub async fn handle_daemon_ws_message(
                 dictionary_path: app.settings.dictionary_path.clone(),
                 mouse_enabled: app.settings.mouse_enabled,
                 zwj_enabled: app.settings.zwj_enabled,
+                arrow_up_down_mode: app.settings.arrow_up_down_mode.name().to_string(),
+                shift_arrow_up_down_mode: app.settings.shift_arrow_up_down_mode.name().to_string(),
                 theme_colors_json: app.gui_theme_colors().to_json(),
             };
             app.ws_broadcast(WsMessage::GlobalSettingsUpdated { settings, input_height: app.input_height });
@@ -2656,6 +2660,8 @@ pub fn build_multiuser_initial_state(app: &App, username: &str) -> WsMessage {
         dictionary_path: app.settings.dictionary_path.clone(),
         mouse_enabled: app.settings.mouse_enabled,
         zwj_enabled: app.settings.zwj_enabled,
+        arrow_up_down_mode: app.settings.arrow_up_down_mode.name().to_string(),
+        shift_arrow_up_down_mode: app.settings.shift_arrow_up_down_mode.name().to_string(),
         theme_colors_json: app.gui_theme_colors().to_json(),
     };
 

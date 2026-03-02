@@ -45,24 +45,32 @@ struct WebViewParams {
     theme_css: String,
 }
 
-/// Load the user's GUI theme CSS vars for initial HTML rendering.
-/// Reads gui_theme name from ~/.clay.dat and theme colors from ~/clay.theme.dat.
-fn load_user_theme_css() -> String {
+/// Read the gui_theme name from ~/.clay.dat (defaults to "dark").
+fn load_gui_theme_name() -> String {
     let home = crate::get_home_dir();
     if home == "." {
-        return ThemeColors::dark_default().to_css_vars();
+        return "dark".to_string();
     }
-
-    // Read gui_theme name from ~/.clay.dat (scan for gui_theme= line)
     let settings_path = format!("{}/{}", home, crate::clay_filename("clay.dat"));
-    let gui_theme_name = std::fs::read_to_string(&settings_path)
+    std::fs::read_to_string(&settings_path)
         .ok()
         .and_then(|content| {
             content.lines()
                 .find(|l| l.starts_with("gui_theme="))
                 .map(|l| l.trim_start_matches("gui_theme=").to_string())
         })
-        .unwrap_or_else(|| "dark".to_string());
+        .unwrap_or_else(|| "dark".to_string())
+}
+
+/// Load the user's GUI theme CSS vars for initial HTML rendering.
+/// Reads gui_theme name from ~/.clay.dat and theme colors from ~/clay.theme.dat.
+fn load_user_theme_css() -> String {
+    let home = crate::get_home_dir();
+    let gui_theme_name = load_gui_theme_name();
+
+    if home == "." {
+        return ThemeColors::dark_default().to_css_vars();
+    }
 
     // Load theme colors from ~/clay.theme.dat
     let theme_path = format!("{}/{}", home, crate::clay_filename("clay.theme.dat"));
@@ -407,8 +415,14 @@ fn create_webview_window(title: &str, params: &WebViewParams) -> io::Result<()> 
     let event_loop = EventLoopBuilder::<WvEvent>::with_user_event().build();
     let proxy: EventLoopProxy<WvEvent> = event_loop.create_proxy();
 
+    let window_theme = if load_gui_theme_name() == "light" {
+        Some(tao::window::Theme::Light)
+    } else {
+        Some(tao::window::Theme::Dark)
+    };
     let window = WindowBuilder::new()
         .with_title(title)
+        .with_theme(window_theme)
         .with_inner_size(tao::dpi::LogicalSize::new(800.0, 600.0))
         .build(&event_loop)
         .map_err(|e| io::Error::other(format!("Failed to create window: {}", e)))?;

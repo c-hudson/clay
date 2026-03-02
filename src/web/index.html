@@ -140,6 +140,20 @@
             </div>
         </div>
 
+        <!-- Help popup (/help) -->
+        <div id="help-modal" class="modal">
+            <div class="modal-content help-modal-content">
+                <div class="popup-header">
+                    <span class="popup-title">Help</span>
+                    <button id="help-close-btn" class="popup-close">&#10005;</button>
+                </div>
+                <div id="help-content" class="help-content"></div>
+                <div class="modal-buttons">
+                    <button id="help-ok-btn" class="action-btn btn-primary">Ok</button>
+                </div>
+            </div>
+        </div>
+
         <!-- Menu popup (/menu) -->
         <div id="menu-modal" class="modal">
             <div class="modal-content menu-modal-content">
@@ -504,6 +518,26 @@
                                 <span class="setting-label">ZWJ Sequence</span>
                                 <div class="setting-value">
                                     <div id="setup-zwj-toggle" class="toggle"></div>
+                                </div>
+                            </div>
+                            <div class="setting-row">
+                                <span class="setting-label">Up/Down arrow</span>
+                                <div class="setting-value">
+                                    <select id="setup-arrow-updown-select" class="form-select">
+                                        <option value="cycle_worlds">Cycle Worlds</option>
+                                        <option value="input_line">Input Up/Down</option>
+                                        <option value="command_history">Command History</option>
+                                    </select>
+                                </div>
+                            </div>
+                            <div class="setting-row">
+                                <span class="setting-label">Shift+Up/Down</span>
+                                <div class="setting-value">
+                                    <select id="setup-shift-arrow-select" class="form-select">
+                                        <option value="cycle_worlds">Cycle Worlds</option>
+                                        <option value="input_line">Input Up/Down</option>
+                                        <option value="command_history">Command History</option>
+                                    </select>
                                 </div>
                             </div>
                         </div>

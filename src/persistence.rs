@@ -150,6 +150,8 @@ pub fn save_settings_to_path(app: &App, path: &std::path::Path) -> io::Result<()
     writeln!(file, "editor_side={}", app.settings.editor_side.name())?;
     writeln!(file, "mouse_enabled={}", app.settings.mouse_enabled)?;
     writeln!(file, "zwj_enabled={}", app.settings.zwj_enabled)?;
+    writeln!(file, "arrow_up_down_mode={}", app.settings.arrow_up_down_mode.name())?;
+    writeln!(file, "shift_arrow_up_down_mode={}", app.settings.shift_arrow_up_down_mode.name())?;
 
     // Save each world's settings (skip unconfigured worlds that have no connection info)
     for world in &app.worlds {
@@ -603,6 +605,12 @@ pub fn load_settings_from_path(app: &mut App, path: &std::path::Path) -> io::Res
                     }
                     "zwj_enabled" => {
                         app.settings.zwj_enabled = value == "true";
+                    }
+                    "arrow_up_down_mode" => {
+                        app.settings.arrow_up_down_mode = ArrowKeyMode::from_name(value);
+                    }
+                    "shift_arrow_up_down_mode" => {
+                        app.settings.shift_arrow_up_down_mode = ArrowKeyMode::from_name(value);
                     }
                     _ => {}
                 }
@@ -1131,6 +1139,8 @@ pub fn save_reload_state(app: &App) -> io::Result<()> {
     writeln!(file, "editor_side={}", app.settings.editor_side.name())?;
     writeln!(file, "mouse_enabled={}", app.settings.mouse_enabled)?;
     writeln!(file, "zwj_enabled={}", app.settings.zwj_enabled)?;
+    writeln!(file, "arrow_up_down_mode={}", app.settings.arrow_up_down_mode.name())?;
+    writeln!(file, "shift_arrow_up_down_mode={}", app.settings.shift_arrow_up_down_mode.name())?;
 
     // Save input history (base64 encode each line to handle special chars)
     writeln!(file, "history_count={}", app.input.history.len())?;
@@ -1749,6 +1759,12 @@ pub fn load_reload_state(app: &mut App) -> io::Result<bool> {
                     "zwj_enabled" => {
                         app.settings.zwj_enabled = value == "true";
                     }
+                    "arrow_up_down_mode" => {
+                        app.settings.arrow_up_down_mode = ArrowKeyMode::from_name(value);
+                    }
+                    "shift_arrow_up_down_mode" => {
+                        app.settings.shift_arrow_up_down_mode = ArrowKeyMode::from_name(value);
+                    }
                     "history_count" | "world_count" => {
                         // These are informational, not needed for parsing
                     }
@@ -1964,6 +1980,8 @@ mod tests {
             editor_side: EditorSide::Right,    // default: Left
             mouse_enabled: false,              // default: true
             zwj_enabled: true,                 // default: false
+            arrow_up_down_mode: ArrowKeyMode::InputLine, // default: CycleWorlds
+            shift_arrow_up_down_mode: ArrowKeyMode::CycleWorlds, // default: InputLine
         }
     }
 
@@ -2038,6 +2056,8 @@ mod tests {
         assert_eq!(a.editor_side.name(), b.editor_side.name(), "{context}: editor_side");
         assert_eq!(a.mouse_enabled, b.mouse_enabled, "{context}: mouse_enabled");
         assert_eq!(a.zwj_enabled, b.zwj_enabled, "{context}: zwj_enabled");
+        assert_eq!(a.arrow_up_down_mode.name(), b.arrow_up_down_mode.name(), "{context}: arrow_up_down_mode");
+        assert_eq!(a.shift_arrow_up_down_mode.name(), b.shift_arrow_up_down_mode.name(), "{context}: shift_arrow_up_down_mode");
     }
 
     /// Assert all WorldSettings fields match between two instances.
@@ -2147,6 +2167,8 @@ mod tests {
         assert_ne!(non_default.editor_side.name(), default.editor_side.name(), "editor_side should differ");
         assert_ne!(non_default.mouse_enabled, default.mouse_enabled, "mouse_enabled should differ");
         assert_ne!(non_default.zwj_enabled, default.zwj_enabled, "zwj_enabled should differ");
+        assert_ne!(non_default.arrow_up_down_mode.name(), default.arrow_up_down_mode.name(), "arrow_up_down_mode should differ");
+        assert_ne!(non_default.shift_arrow_up_down_mode.name(), default.shift_arrow_up_down_mode.name(), "shift_arrow_up_down_mode should differ");
     }
 
     #[test]

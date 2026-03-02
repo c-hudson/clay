@@ -41,7 +41,7 @@ pub fn get_custom_config_path() -> Option<&'static PathBuf> {
 
 /// Get the full version string including build hash
 pub fn get_version_string() -> String {
-    format!("\u{2728} Clay v{} (build {}-{})", VERSION, BUILD_DATE, BUILD_HASH)
+    format!("Clay v{} (build {}-{})", VERSION, BUILD_DATE, BUILD_HASH)
 }
 
 // Re-export commonly used types from modules
@@ -314,6 +314,33 @@ impl EditorSide {
         match name.to_lowercase().as_str() {
             "right" => EditorSide::Right,
             _ => EditorSide::Left,
+        }
+    }
+}
+
+/// What Up/Down or Shift+Up/Down arrow keys do
+#[derive(Clone, Copy, PartialEq, Default)]
+pub enum ArrowKeyMode {
+    #[default]
+    CycleWorlds,
+    InputLine,
+    CommandHistory,
+}
+
+impl ArrowKeyMode {
+    pub fn name(&self) -> &'static str {
+        match self {
+            ArrowKeyMode::CycleWorlds => "cycle_worlds",
+            ArrowKeyMode::InputLine => "input_line",
+            ArrowKeyMode::CommandHistory => "command_history",
+        }
+    }
+
+    pub fn from_name(name: &str) -> Self {
+        match name.to_lowercase().as_str() {
+            "input_line" => ArrowKeyMode::InputLine,
+            "command_history" => ArrowKeyMode::CommandHistory,
+            _ => ArrowKeyMode::CycleWorlds,
         }
     }
 }
@@ -987,6 +1014,9 @@ pub struct Settings {
     mouse_enabled: bool,
     // ZWJ emoji sequence handling (true = pass through, false = strip ZWJ + colored square)
     zwj_enabled: bool,
+    // Arrow key behavior settings
+    arrow_up_down_mode: ArrowKeyMode,       // What Up/Down does (default: CycleWorlds)
+    shift_arrow_up_down_mode: ArrowKeyMode, // What Shift+Up/Down does (default: InputLine)
 }
 
 impl Default for Settings {
@@ -1026,6 +1056,8 @@ impl Default for Settings {
             editor_side: EditorSide::Left,
             mouse_enabled: true,
             zwj_enabled: false,
+            arrow_up_down_mode: ArrowKeyMode::CycleWorlds,
+            shift_arrow_up_down_mode: ArrowKeyMode::InputLine,
         }
     }
 }
@@ -2684,6 +2716,8 @@ impl App {
             dictionary_path: self.settings.dictionary_path.clone(),
             mouse_enabled: self.settings.mouse_enabled,
             zwj_enabled: self.settings.zwj_enabled,
+            arrow_up_down_mode: self.settings.arrow_up_down_mode.name().to_string(),
+            shift_arrow_up_down_mode: self.settings.shift_arrow_up_down_mode.name().to_string(),
             theme_colors_json: self.gui_theme_colors().to_json(),
         }
     }
@@ -2993,6 +3027,8 @@ impl App {
             self.settings.mouse_enabled,
             self.settings.zwj_enabled,
             self.settings.ansi_music_enabled,
+            self.settings.arrow_up_down_mode.name(),
+            self.settings.shift_arrow_up_down_mode.name(),
         );
         self.popup_manager.open(def);
 
@@ -6201,7 +6237,7 @@ impl App {
                     });
                 }
             }
-            WsMessage::UpdateGlobalSettings { more_mode_enabled, spell_check_enabled, temp_convert_enabled, world_switch_mode, show_tags, debug_enabled, ansi_music_enabled, console_theme, gui_theme, gui_transparency, color_offset_percent, input_height, font_name, font_size, web_font_size_phone, web_font_size_tablet, web_font_size_desktop, web_font_weight, ws_allow_list, web_secure, http_enabled, http_port, ws_enabled, ws_port, ws_cert_file, ws_key_file, tls_proxy_enabled, dictionary_path, mouse_enabled, zwj_enabled } => {
+            WsMessage::UpdateGlobalSettings { more_mode_enabled, spell_check_enabled, temp_convert_enabled, world_switch_mode, show_tags, debug_enabled, ansi_music_enabled, console_theme, gui_theme, gui_transparency, color_offset_percent, input_height, font_name, font_size, web_font_size_phone, web_font_size_tablet, web_font_size_desktop, web_font_weight, ws_allow_list, web_secure, http_enabled, http_port, ws_enabled, ws_port, ws_cert_file, ws_key_file, tls_proxy_enabled, dictionary_path, mouse_enabled, zwj_enabled, arrow_up_down_mode, shift_arrow_up_down_mode } => {
                 // Update global settings from remote client
                 self.settings.more_mode_enabled = more_mode_enabled;
                 self.settings.spell_check_enabled = spell_check_enabled;
@@ -6240,6 +6276,8 @@ impl App {
                 self.settings.tls_proxy_enabled = tls_proxy_enabled;
                 self.settings.mouse_enabled = mouse_enabled;
                 self.settings.zwj_enabled = zwj_enabled;
+                self.settings.arrow_up_down_mode = ArrowKeyMode::from_name(&arrow_up_down_mode);
+                self.settings.shift_arrow_up_down_mode = ArrowKeyMode::from_name(&shift_arrow_up_down_mode);
                 if self.settings.dictionary_path != dictionary_path {
                     self.settings.dictionary_path = dictionary_path;
                     self.spell_checker = SpellChecker::new(&self.settings.dictionary_path);
@@ -6278,6 +6316,8 @@ impl App {
                     dictionary_path: self.settings.dictionary_path.clone(),
                     mouse_enabled: self.settings.mouse_enabled,
                     zwj_enabled: self.settings.zwj_enabled,
+                    arrow_up_down_mode: self.settings.arrow_up_down_mode.name().to_string(),
+                    shift_arrow_up_down_mode: self.settings.shift_arrow_up_down_mode.name().to_string(),
                     theme_colors_json: self.gui_theme_colors().to_json(),
                 };
                 // Broadcast update to all clients
@@ -6864,6 +6904,8 @@ impl App {
             dictionary_path: self.settings.dictionary_path.clone(),
             mouse_enabled: self.settings.mouse_enabled,
             zwj_enabled: self.settings.zwj_enabled,
+            arrow_up_down_mode: self.settings.arrow_up_down_mode.name().to_string(),
+            shift_arrow_up_down_mode: self.settings.shift_arrow_up_down_mode.name().to_string(),
             theme_colors_json: self.gui_theme_colors().to_json(),
         };
 
@@ -8681,6 +8723,8 @@ fn handle_remote_client_key(
                 }
                 app.settings.zwj_enabled = settings.zwj_enabled;
                 app.settings.ansi_music_enabled = settings.ansi_music;
+                app.settings.arrow_up_down_mode = ArrowKeyMode::from_name(&settings.arrow_up_down);
+                app.settings.shift_arrow_up_down_mode = ArrowKeyMode::from_name(&settings.shift_arrow_up_down);
 
                 // Send UpdateGlobalSettings to daemon
                 let _ = ws_tx.send(WsMessage::UpdateGlobalSettings {
@@ -8714,6 +8758,8 @@ fn handle_remote_client_key(
                     dictionary_path: app.settings.dictionary_path.clone(),
                     mouse_enabled: app.settings.mouse_enabled,
                     zwj_enabled: app.settings.zwj_enabled,
+                    arrow_up_down_mode: app.settings.arrow_up_down_mode.name().to_string(),
+                    shift_arrow_up_down_mode: app.settings.shift_arrow_up_down_mode.name().to_string(),
                 });
             }
             NewPopupAction::WebSaved(settings) => {
@@ -8760,6 +8806,8 @@ fn handle_remote_client_key(
                     dictionary_path: app.settings.dictionary_path.clone(),
                     mouse_enabled: app.settings.mouse_enabled,
                     zwj_enabled: app.settings.zwj_enabled,
+                    arrow_up_down_mode: app.settings.arrow_up_down_mode.name().to_string(),
+                    shift_arrow_up_down_mode: app.settings.shift_arrow_up_down_mode.name().to_string(),
                 });
             }
             NewPopupAction::ConnectionsClose => {
@@ -9074,13 +9122,61 @@ fn handle_remote_client_key(
                 app.input_height += 1;
             }
         }
+        (KeyModifiers::SHIFT, Up) => {
+            // Shift+Up - configurable behavior
+            match app.settings.shift_arrow_up_down_mode {
+                ArrowKeyMode::CycleWorlds => {
+                    let _ = ws_tx.send(WsMessage::CalculatePrevWorld { current_index: app.current_world_index });
+                }
+                ArrowKeyMode::InputLine => {
+                    app.input.move_cursor_up();
+                }
+                ArrowKeyMode::CommandHistory => {
+                    app.input.history_prev();
+                }
+            }
+        }
+        (KeyModifiers::SHIFT, Down) => {
+            // Shift+Down - configurable behavior
+            match app.settings.shift_arrow_up_down_mode {
+                ArrowKeyMode::CycleWorlds => {
+                    let _ = ws_tx.send(WsMessage::CalculateNextWorld { current_index: app.current_world_index });
+                }
+                ArrowKeyMode::InputLine => {
+                    app.input.move_cursor_down();
+                }
+                ArrowKeyMode::CommandHistory => {
+                    app.input.history_next();
+                }
+            }
+        }
         (_, Up) => {
-            // Request previous active world from server
-            let _ = ws_tx.send(WsMessage::CalculatePrevWorld { current_index: app.current_world_index });
+            // Up - configurable behavior
+            match app.settings.arrow_up_down_mode {
+                ArrowKeyMode::CycleWorlds => {
+                    let _ = ws_tx.send(WsMessage::CalculatePrevWorld { current_index: app.current_world_index });
+                }
+                ArrowKeyMode::InputLine => {
+                    app.input.move_cursor_up();
+                }
+                ArrowKeyMode::CommandHistory => {
+                    app.input.history_prev();
+                }
+            }
         }
         (_, Down) => {
-            // Request next active world from server
-            let _ = ws_tx.send(WsMessage::CalculateNextWorld { current_index: app.current_world_index });
+            // Down - configurable behavior
+            match app.settings.arrow_up_down_mode {
+                ArrowKeyMode::CycleWorlds => {
+                    let _ = ws_tx.send(WsMessage::CalculateNextWorld { current_index: app.current_world_index });
+                }
+                ArrowKeyMode::InputLine => {
+                    app.input.move_cursor_down();
+                }
+                ArrowKeyMode::CommandHistory => {
+                    app.input.history_next();
+                }
+            }
         }
         (_, PageUp) => {
             // Scroll up (towards older content) = decrease scroll_offset
@@ -9373,6 +9469,8 @@ struct SetupSettings {
     mouse_enabled: bool,
     zwj_enabled: bool,
     ansi_music: bool,
+    arrow_up_down: String,
+    shift_arrow_up_down: String,
 }
 
 /// Settings from the web popup
@@ -9453,6 +9551,7 @@ fn handle_new_popup_key(app: &mut App, key: KeyEvent) -> NewPopupAction {
         SETUP_FIELD_WORLD_SWITCHING, SETUP_FIELD_DEBUG,
         SETUP_FIELD_INPUT_HEIGHT, SETUP_FIELD_GUI_THEME, SETUP_FIELD_TLS_PROXY,
         SETUP_FIELD_DICTIONARY, SETUP_FIELD_EDITOR_SIDE, SETUP_FIELD_MOUSE, SETUP_FIELD_ZWJ, SETUP_FIELD_ANSI_MUSIC,
+        SETUP_FIELD_ARROW_UP_DOWN, SETUP_FIELD_SHIFT_ARROW_UP_DOWN,
         SETUP_BTN_SAVE, SETUP_BTN_CANCEL,
     };
     use popup::definitions::web::{
@@ -9676,6 +9775,10 @@ fn handle_new_popup_key(app: &mut App, key: KeyEvent) -> NewPopupAction {
                     mouse_enabled: state.get_bool(SETUP_FIELD_MOUSE).unwrap_or(true),
                     zwj_enabled: state.get_bool(SETUP_FIELD_ZWJ).unwrap_or(false),
                     ansi_music: state.get_bool(SETUP_FIELD_ANSI_MUSIC).unwrap_or(true),
+                    arrow_up_down: state.get_selected(SETUP_FIELD_ARROW_UP_DOWN)
+                        .unwrap_or("cycle_worlds").to_string(),
+                    shift_arrow_up_down: state.get_selected(SETUP_FIELD_SHIFT_ARROW_UP_DOWN)
+                        .unwrap_or("input_line").to_string(),
                 }
             };
 
@@ -14978,6 +15081,8 @@ fn handle_key_event(key: KeyEvent, app: &mut App) -> KeyAction {
                 }
                 app.settings.zwj_enabled = settings.zwj_enabled;
                 app.settings.ansi_music_enabled = settings.ansi_music;
+                app.settings.arrow_up_down_mode = ArrowKeyMode::from_name(&settings.arrow_up_down);
+                app.settings.shift_arrow_up_down_mode = ArrowKeyMode::from_name(&settings.shift_arrow_up_down);
                 // Save settings to disk
                 let _ = persistence::save_settings(app);
             }
@@ -15588,6 +15693,42 @@ fn handle_key_event(key: KeyEvent, app: &mut App) -> KeyAction {
         return KeyAction::None;
     }
 
+    // Shift+Up/Down - configurable behavior
+    if key.code == KeyCode::Up && key.modifiers == KeyModifiers::SHIFT {
+        match app.settings.shift_arrow_up_down_mode {
+            ArrowKeyMode::CycleWorlds => {
+                app.prev_world();
+                return KeyAction::SwitchedWorld(app.current_world_index);
+            }
+            ArrowKeyMode::InputLine => {
+                app.input.move_cursor_up();
+                return KeyAction::None;
+            }
+            ArrowKeyMode::CommandHistory => {
+                app.input.history_prev();
+                app.spell_state.reset();
+                return KeyAction::None;
+            }
+        }
+    }
+    if key.code == KeyCode::Down && key.modifiers == KeyModifiers::SHIFT {
+        match app.settings.shift_arrow_up_down_mode {
+            ArrowKeyMode::CycleWorlds => {
+                app.next_world();
+                return KeyAction::SwitchedWorld(app.current_world_index);
+            }
+            ArrowKeyMode::InputLine => {
+                app.input.move_cursor_down();
+                return KeyAction::None;
+            }
+            ArrowKeyMode::CommandHistory => {
+                app.input.history_next();
+                app.spell_state.reset();
+                return KeyAction::None;
+            }
+        }
+    }
+
     // Alt+Up/Down - resize input area
     if key.code == KeyCode::Up && key.modifiers.contains(KeyModifiers::ALT) {
         app.increase_input_height();
@@ -15665,14 +15806,40 @@ fn handle_key_event(key: KeyEvent, app: &mut App) -> KeyAction {
             KeyAction::None
         }
 
-        // Switch worlds (Up/Down without modifiers)
+        // Up/Down without modifiers - configurable behavior
         (KeyModifiers::NONE, KeyCode::Up) => {
-            app.prev_world();
-            KeyAction::SwitchedWorld(app.current_world_index)
+            match app.settings.arrow_up_down_mode {
+                ArrowKeyMode::CycleWorlds => {
+                    app.prev_world();
+                    KeyAction::SwitchedWorld(app.current_world_index)
+                }
+                ArrowKeyMode::InputLine => {
+                    app.input.move_cursor_up();
+                    KeyAction::None
+                }
+                ArrowKeyMode::CommandHistory => {
+                    app.input.history_prev();
+                    app.spell_state.reset();
+                    KeyAction::None
+                }
+            }
         }
         (KeyModifiers::NONE, KeyCode::Down) => {
-            app.next_world();
-            KeyAction::SwitchedWorld(app.current_world_index)
+            match app.settings.arrow_up_down_mode {
+                ArrowKeyMode::CycleWorlds => {
+                    app.next_world();
+                    KeyAction::SwitchedWorld(app.current_world_index)
+                }
+                ArrowKeyMode::InputLine => {
+                    app.input.move_cursor_down();
+                    KeyAction::None
+                }
+                ArrowKeyMode::CommandHistory => {
+                    app.input.history_next();
+                    app.spell_state.reset();
+                    KeyAction::None
+                }
+            }
         }
 
         // Clear input

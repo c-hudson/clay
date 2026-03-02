@@ -515,6 +515,7 @@ This logic applies to all interfaces (console, web, GUI). Remote clients query t
 - Left click on popup buttons to activate them
 - Left click on popup fields to select and edit/toggle them
 - Left click on list items to select them
+- Scroll wheel up/down to scroll list items and scrollable content in popups
 - Click and drag in scrollable content or list fields to highlight lines of text
 - Any keyboard input clears the highlight
 
@@ -527,7 +528,7 @@ This logic applies to all interfaces (console, web, GUI). Remote clients query t
   - `-W` - Send to all connected worlds
   - `-n` - Send without end-of-line marker (CR/LF)
   - No flags: Send to current world
-- `/setup` - Open Global Settings popup (more mode, spell check, temp convert, world switching, show tags, input height, themes, TLS proxy)
+- `/setup` - Open Global Settings popup (more mode, spell check, temp convert, world switching, show tags, input height, themes, mouse, ZWJ, ANSI music, TLS proxy)
 - `/web` - Open Web Settings popup (HTTP/HTTPS servers, WebSocket settings, TLS configuration)
 - `/worlds` - Open World Selector popup (list all worlds, filter, connect or edit)
 - `/worlds <name>` - Connect to world if exists (opens editor if no hostname/port configured), otherwise create and open editor
@@ -933,6 +934,7 @@ Note: HTTP automatically starts the non-secure WebSocket server if not already r
 - `PageUp/PageDown` - Scroll output history
 - `Tab` - Release one screenful when paused; scroll down one screenful otherwise (like `more`)
 - `Escape+j` - Jump to end, release all pending
+- `Escape+w` or `Alt+w` - Switch to world with activity (oldest pending/unseen)
 - `Ctrl+P/N` - Command history navigation
 - `Ctrl+U` - Clear input
 - `Ctrl+W` - Delete word before cursor
@@ -1141,7 +1143,9 @@ Opened with `/worlds -e` command (uses unified popup system):
 - Input height - Default input area height (1-15 lines)
 - Console Theme - Theme for console interface (dark, light) — uses hardcoded `Theme` enum from `encoding.rs`
 - GUI Theme - Theme for GUI/web client (dark, light) — uses customizable `ThemeColors` from `theme.rs` / `~/clay.theme.dat`
-- Console Mouse - Enable mouse support in console popups (default: on) — click buttons/fields, select list items, drag to highlight text
+- Console Mouse - Enable mouse support in console popups (default: on) — click buttons/fields, select list items, scroll wheel, drag to highlight text
+- ZWJ Sequence - Enable Zero Width Joiner sequence rendering (for combined emoji)
+- ANSI Music - Enable ANSI music sequence playback
 - TLS Proxy - Enable TLS proxy for preserving TLS connections across hot reload
 
 **Actions (right-aligned buttons):**

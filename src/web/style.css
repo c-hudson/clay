@@ -2045,6 +2045,26 @@ body.device-phone #output-container { padding: 6px 10px; }
     border-top: 1px solid var(--theme-border-subtle, #333);
 }
 
+/* Help popup */
+.help-modal-content {
+    min-width: min(500px, 95vw);
+    max-width: min(90vw, 700px);
+    width: 90vw;
+    padding: 12px;
+    box-sizing: border-box;
+    font-family: var(--mono);
+    font-size: 13px;
+}
+
+.help-content {
+    max-height: 60vh;
+    overflow-y: auto;
+    white-space: pre;
+    line-height: 1.4;
+    padding: 4px 0;
+    color: var(--text-color);
+}
+
 /* Slider (kept for compatibility) */
 .slider-container {
     display: flex;
