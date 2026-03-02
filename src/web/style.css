@@ -62,7 +62,7 @@ body {
     flex: 1;
     overflow-y: auto;
     overflow-x: hidden;
-    padding: 8px 14px;
+    padding: 4px;
     background-color: var(--bg-color);
     -webkit-overflow-scrolling: touch;
     overscroll-behavior: contain;
@@ -410,7 +410,7 @@ body {
 #input-container {
     display: flex;
     align-items: center;
-    padding: 4px 10px;
+    padding: 4px;
     background-color: var(--bg-color);
     border-top: none;
     overflow: hidden;

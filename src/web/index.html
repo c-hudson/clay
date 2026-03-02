@@ -531,7 +531,7 @@
                                 </div>
                             </div>
                             <div class="setting-row">
-                                <span class="setting-label">Shift+Up/Down</span>
+                                <span class="setting-label">Ctrl+Up/Down</span>
                                 <div class="setting-value">
                                     <select id="setup-shift-arrow-select" class="form-select">
                                         <option value="cycle_worlds">Cycle Worlds</option>
@@ -636,17 +636,7 @@
                         <label id="http-port-label">HTTP port</label>
                         <input type="text" id="web-http-port" autocomplete="off" class="web-input">
                     </div>
-                    <div class="web-field">
-                        <label id="ws-label">WS enabled</label>
-                        <select id="web-ws-enabled-select" class="form-select">
-                            <option value="off">off</option>
-                            <option value="on">on</option>
-                        </select>
-                    </div>
-                    <div class="web-field">
-                        <label id="ws-port-label">WS port</label>
-                        <input type="text" id="web-ws-port" autocomplete="off" class="web-input">
-                    </div>
+                    <!-- WS enabled and WS port removed — WS now shares the HTTP port -->
                     <div class="web-field">
                         <label>Allow List</label>
                         <input type="text" id="web-allow-list" autocomplete="off" class="web-input" placeholder="localhost, 192.168.*">

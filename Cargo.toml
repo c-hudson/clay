@@ -16,6 +16,7 @@ unicode-width = "0.1"
 regex = "1"
 futures = "0.3"
 aes-gcm = "0.10"
+getrandom = "0.2"
 base64 = "0.21"
 
 # TLS support - native-tls by default, rustls for static builds

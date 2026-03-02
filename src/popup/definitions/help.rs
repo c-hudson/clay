@@ -75,7 +75,7 @@ pub const HELP_LINES: &[&str] = &[
     "",
     "World Switching:",
     "  Up/Down                    Switch between active worlds",
-    "  Shift+Up/Down              Switch between all worlds",
+    "  Ctrl+Up/Down               Switch between all worlds",
     "  Alt+W                      Switch to world with activity",
     "",
     "Input:",

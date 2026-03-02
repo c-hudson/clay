@@ -168,7 +168,7 @@ pub fn create_setup_popup(
         ))
         .with_field(Field::new(
             SETUP_FIELD_SHIFT_ARROW_UP_DOWN,
-            "Shift+Up/Down",
+            "Ctrl+Up/Down",
             FieldKind::select(arrow_key_options(), shift_arrow_up_down_idx),
         ))
         .with_button(Button::new(SETUP_BTN_CANCEL, "Cancel").with_shortcut('C'))

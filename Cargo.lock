@@ -342,6 +342,7 @@ dependencies = [
  "crossterm",
  "futures",
  "gdk",
+ "getrandom 0.2.17",
  "gtk",
  "hashbrown 0.14.5",
  "hex",

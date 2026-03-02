@@ -26,6 +26,8 @@ pub enum WsMessage {
     // Server hello (sent immediately on connection, before auth)
     ServerHello {
         multiuser_mode: bool,  // True if server requires username + password
+        #[serde(default)]
+        challenge: String,     // Random challenge for challenge-response auth
     },
 
     // Authentication
@@ -39,6 +41,8 @@ pub enum WsMessage {
         auth_key: Option<String>,  // Device auth key (alternative to password)
         #[serde(default)]
         request_key: bool,  // If true, request a new auth key after successful password auth
+        #[serde(default)]
+        challenge_response: bool,  // If true, password_hash is SHA256(SHA256(password) + challenge)
     },
     AuthResponse {
         success: bool,
@@ -209,8 +213,10 @@ pub enum WsMessage {
         web_secure: bool,
         http_enabled: bool,
         http_port: u16,
-        ws_enabled: bool,
-        ws_port: u16,
+        #[serde(default)]
+        ws_enabled: bool,  // Legacy — ignored, kept for backward compat
+        #[serde(default)]
+        ws_port: u16,      // Legacy — ignored, kept for backward compat
         ws_cert_file: String,
         ws_key_file: String,
         tls_proxy_enabled: bool,
@@ -378,14 +384,15 @@ pub struct WorldStateMsg {
 }
 
 /// World settings for WebSocket protocol
-/// Password is always transmitted encrypted (with "ENC:" prefix)
+/// Password field is empty when sent from server; has_password indicates if one is configured.
+/// Client sends encrypted password only when user edits it.
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct WorldSettingsMsg {
     pub hostname: String,
     pub port: String,
     pub user: String,
     #[serde(default)]
-    pub password: String,  // Always encrypted when transmitted
+    pub password: String,  // Empty from server; encrypted when client sends updates
     pub use_ssl: bool,
     pub log_enabled: bool,
     pub encoding: String,
@@ -394,6 +401,8 @@ pub struct WorldSettingsMsg {
     pub keep_alive_cmd: String,
     #[serde(default)]
     pub gmcp_packages: String,
+    #[serde(default)]
+    pub has_password: bool,  // True if a password is configured (password field is empty)
 }
 
 /// Global settings for WebSocket protocol
@@ -428,10 +437,14 @@ pub struct GlobalSettingsMsg {
     pub web_secure: bool,
     pub http_enabled: bool,
     pub http_port: u16,
-    pub ws_enabled: bool,
-    pub ws_port: u16,
-    pub ws_cert_file: String,
-    pub ws_key_file: String,
+    #[serde(default)]
+    pub ws_enabled: bool,  // Legacy — ignored, kept for backward compat
+    #[serde(default)]
+    pub ws_port: u16,      // Legacy — ignored, kept for backward compat
+    pub ws_cert_file: String,  // Empty from server; populated when client sends updates
+    pub ws_key_file: String,   // Empty from server; populated when client sends updates
+    #[serde(default)]
+    pub tls_configured: bool,  // True if TLS cert+key are configured
     #[serde(default)]
     pub tls_proxy_enabled: bool,
     #[serde(default)]
@@ -558,6 +571,22 @@ impl WebSocketServer {
             tls_acceptor: None,
             #[cfg(feature = "rustls-backend")]
             tls_acceptor: None,
+        }
+    }
+
+    /// Extract shared connection state for the unified HTTP+WS server.
+    /// The HTTP server uses this to hand off WebSocket upgrade requests.
+    pub fn connection_state(&self, event_tx: mpsc::Sender<crate::AppEvent>) -> crate::http::WsConnectionState {
+        crate::http::WsConnectionState {
+            clients: self.clients.clone(),
+            next_client_id: self.next_client_id.clone(),
+            password_hash: self.password_hash.clone(),
+            allow_list: self.allow_list.clone(),
+            whitelisted_host: self.whitelisted_host.clone(),
+            event_tx,
+            multiuser_mode: self.multiuser_mode,
+            users: self.users.clone(),
+            ban_list: self.ban_list.clone(),
         }
     }
 
@@ -851,6 +880,14 @@ pub fn hash_password(password: &str) -> String {
     hex::encode(hasher.finalize())
 }
 
+/// Compute SHA256(stored_hash + challenge) for challenge-response auth verification
+pub fn hash_with_challenge(stored_hash: &str, challenge: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(stored_hash.as_bytes());
+    hasher.update(challenge.as_bytes());
+    hex::encode(hasher.finalize())
+}
+
 /// Check if an IP address is in the allow list (supports wildcards like 192.168.1.*)
 pub fn is_ip_in_allow_list(ip: &str, allow_list: &[String]) -> bool {
     // Normalize localhost
@@ -861,6 +898,10 @@ pub fn is_ip_in_allow_list(ip: &str, allow_list: &[String]) -> bool {
         let normalized_pattern = if pattern == "127.0.0.1" || pattern == "::1" { "localhost" } else { pattern.as_str() };
 
         if let Some(prefix) = normalized_pattern.strip_suffix('*') {
+            // Reject overly broad wildcards (must have at least 4 chars before * and contain a dot)
+            if prefix.len() < 4 || !prefix.contains('.') {
+                continue;
+            }
             // Wildcard match: check if IP starts with pattern prefix
             if normalized_ip.starts_with(prefix) {
                 return true;
@@ -1094,8 +1135,15 @@ where
     // Create channel for sending messages to this client
     let (tx, mut rx) = mpsc::unbounded_channel::<WsMessage>();
 
+    // Generate random challenge for challenge-response auth
+    let challenge = {
+        let mut bytes = [0u8; 16];
+        getrandom::getrandom(&mut bytes).unwrap_or_default();
+        hex::encode(bytes)
+    };
+
     // Send ServerHello immediately to tell client about multiuser mode
-    let _ = tx.send(WsMessage::ServerHello { multiuser_mode });
+    let _ = tx.send(WsMessage::ServerHello { multiuser_mode, challenge: challenge.clone() });
 
     // Add client to clients map (auto-authenticated if whitelisted)
     {
@@ -1124,7 +1172,7 @@ where
         };
         let _ = tx.send(response);
         // Create a fake AuthRequest to trigger initial state send
-        let _ = event_tx.send(AppEvent::WsClientMessage(client_id, Box::new(WsMessage::AuthRequest { username: None, password_hash: String::new(), current_world: None, auth_key: None, request_key: false }))).await;
+        let _ = event_tx.send(AppEvent::WsClientMessage(client_id, Box::new(WsMessage::AuthRequest { username: None, password_hash: String::new(), current_world: None, auth_key: None, request_key: false, challenge_response: false }))).await;
     }
 
     // Spawn task to send messages from rx to WebSocket
@@ -1146,25 +1194,32 @@ where
             Ok(WsRawMessage::Text(text)) => {
                 if let Ok(ws_msg) = serde_json::from_str::<WsMessage>(&text) {
                     match &ws_msg {
-                        WsMessage::AuthRequest { username, password_hash: client_hash, auth_key, request_key, .. } => {
+                        WsMessage::AuthRequest { username, password_hash: client_hash, auth_key, request_key, challenge_response: uses_challenge, .. } => {
                             // Try auth_key first (device key authentication)
                             // auth_key validation must happen in the app since keys are stored there
-                            // So we forward to app and let it respond
+                            // So we forward to app and let it respond (include challenge for verification)
                             if auth_key.is_some() && !auth_key.as_ref().unwrap().is_empty() {
                                 // Forward to app for key validation
                                 // App will send AuthResponse directly
-                                let _ = event_tx.send(AppEvent::WsAuthKeyValidation(client_id, Box::new(ws_msg.clone()), client_ip.clone())).await;
+                                let _ = event_tx.send(AppEvent::WsAuthKeyValidation(client_id, Box::new(ws_msg.clone()), client_ip.clone(), challenge.clone())).await;
                                 continue;
                             }
 
                             // Fall back to password-based authentication
+                            // If challenge_response is true, client sent SHA256(SHA256(password) + challenge)
+                            // We compare by computing SHA256(stored_hash + challenge) on our side
                             let (auth_success, auth_error, auth_username) = if multiuser_mode {
                                 // Multiuser mode: require username and validate against users map
                                 match username {
                                     Some(uname) if !uname.is_empty() => {
                                         let users_guard = users.read().unwrap();
                                         if let Some(user_cred) = users_guard.get(uname) {
-                                            if user_cred.password_hash == *client_hash {
+                                            let matches = if *uses_challenge {
+                                                hash_with_challenge(&user_cred.password_hash, &challenge) == *client_hash
+                                            } else {
+                                                user_cred.password_hash == *client_hash
+                                            };
+                                            if matches {
                                                 (true, None, Some(uname.clone()))
                                             } else {
                                                 (false, Some("Authentication failed".to_string()), None)
@@ -1177,7 +1232,12 @@ where
                                 }
                             } else {
                                 // Single-user mode: just validate password
-                                if *client_hash == password_hash {
+                                let matches = if *uses_challenge {
+                                    hash_with_challenge(&password_hash, &challenge) == *client_hash
+                                } else {
+                                    *client_hash == password_hash
+                                };
+                                if matches {
                                     (true, None, None)
                                 } else {
                                     (false, Some("Invalid password".to_string()), None)

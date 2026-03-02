@@ -150,8 +150,7 @@
         webProtocolSelect: document.getElementById('web-protocol-select'),
         webHttpEnabledSelect: document.getElementById('web-http-enabled-select'),
         webHttpPort: document.getElementById('web-http-port'),
-        webWsEnabledSelect: document.getElementById('web-ws-enabled-select'),
-        webWsPort: document.getElementById('web-ws-port'),
+        // webWsEnabledSelect and webWsPort removed — WS shares HTTP port
         webAllowList: document.getElementById('web-allow-list'),
         webCertFile: document.getElementById('web-cert-file'),
         webKeyFile: document.getElementById('web-key-file'),
@@ -162,8 +161,8 @@
         webCloseBtn: document.getElementById('web-close-btn'),
         httpLabel: document.getElementById('http-label'),
         httpPortLabel: document.getElementById('http-port-label'),
-        wsLabel: document.getElementById('ws-label'),
-        wsPortLabel: document.getElementById('ws-port-label'),
+        // wsLabel removed — WS shares HTTP port
+        // wsPortLabel removed — WS shares HTTP port
         // Setup popup
         setupModal: document.getElementById('setup-modal'),
         setupCloseBtn: document.getElementById('setup-close-btn'),
@@ -228,6 +227,7 @@
     let deferredAutoLoginUsername = null;  // Saved username waiting for ServerHello
     let authKey = null;  // Device auth key for passwordless authentication
     let authKeyPending = false;  // True when trying key-based auth (to fall back to password on failure)
+    let serverChallenge = '';  // Challenge from ServerHello for challenge-response auth
     let hasReceivedInitialState = false;  // True after first InitialState (to preserve world on resync)
     let worlds = [];
     let currentWorldIndex = 0;
@@ -309,6 +309,7 @@
     let wsAllowList = '';
     let wsCertFile = '';
     let wsKeyFile = '';
+    let tlsConfigured = false;  // True if server has TLS cert+key configured
     // Temporary editing state for web popup (only saved on Save button)
     let editWebSecure = false;
     let editHttpEnabled = false;
@@ -1202,7 +1203,10 @@
         const host = window.WS_HOST || window.location.hostname;
         // Use ws:// fallback if we've already failed with wss://
         const protocol = usingWsFallback ? 'ws' : window.WS_PROTOCOL;
-        const wsUrl = `${protocol}://${host}:${window.WS_PORT}`;
+        // WS_PORT=0 means WS shares the HTTP port (unified server)
+        const port = (window.WS_PORT && window.WS_PORT !== 0)
+            ? window.WS_PORT : (window.location.port || (protocol === 'wss' ? '443' : '80'));
+        const wsUrl = `${protocol}://${host}:${port}`;
 
         debugLog('connect() protocol=' + protocol + ' hasNative=' + hasNativeWebSocket());
 
@@ -1400,6 +1404,8 @@
     function handleMessage(msg) {
         switch (msg.type) {
             case 'ServerHello':
+                // Store challenge for challenge-response auth
+                serverChallenge = msg.challenge || '';
                 // Server tells us upfront if it's in multiuser mode
                 if (msg.multiuser_mode) {
                     enableMultiuserAuthUI();
@@ -1630,11 +1636,14 @@
                     if (msg.settings.ws_allow_list !== undefined) {
                         wsAllowList = msg.settings.ws_allow_list;
                     }
-                    if (msg.settings.ws_cert_file !== undefined) {
+                    if (msg.settings.ws_cert_file !== undefined && msg.settings.ws_cert_file) {
                         wsCertFile = msg.settings.ws_cert_file;
                     }
-                    if (msg.settings.ws_key_file !== undefined) {
+                    if (msg.settings.ws_key_file !== undefined && msg.settings.ws_key_file) {
                         wsKeyFile = msg.settings.ws_key_file;
+                    }
+                    if (msg.settings.tls_configured !== undefined) {
+                        tlsConfigured = msg.settings.tls_configured;
                     }
                     if (msg.settings.world_switch_mode !== undefined) {
                         worldSwitchMode = msg.settings.world_switch_mode;
@@ -1952,7 +1961,7 @@
                 // Update display if it's the current world
                 if (msg.world_index === currentWorldIndex) {
                     if (msg.prompt) {
-                        elements.prompt.innerHTML = parseAnsi(msg.prompt);
+                        elements.prompt.innerHTML = sanitizeHtml(parseAnsi(msg.prompt));
                     } else {
                         elements.prompt.textContent = '';
                     }
@@ -2029,11 +2038,14 @@
                     if (msg.settings.ws_allow_list !== undefined) {
                         wsAllowList = msg.settings.ws_allow_list;
                     }
-                    if (msg.settings.ws_cert_file !== undefined) {
+                    if (msg.settings.ws_cert_file !== undefined && msg.settings.ws_cert_file) {
                         wsCertFile = msg.settings.ws_cert_file;
                     }
-                    if (msg.settings.ws_key_file !== undefined) {
+                    if (msg.settings.ws_key_file !== undefined && msg.settings.ws_key_file) {
                         wsKeyFile = msg.settings.ws_key_file;
+                    }
+                    if (msg.settings.tls_configured !== undefined) {
+                        tlsConfigured = msg.settings.tls_configured;
                     }
                     if (msg.settings.console_theme !== undefined) {
                         consoleTheme = msg.settings.console_theme;
@@ -2225,7 +2237,7 @@
                         // Update prompt
                         world.prompt = msg.prompt || '';
                         if (world.prompt) {
-                            elements.prompt.innerHTML = parseAnsi(world.prompt);
+                            elements.prompt.innerHTML = sanitizeHtml(parseAnsi(world.prompt));
                         } else {
                             elements.prompt.textContent = '';
                         }
@@ -2507,15 +2519,28 @@
     }
 
     // Try to authenticate with saved auth key (passwordless)
-    function tryAuthWithKey() {
+    async function tryAuthWithKey() {
         if (!authKey || !ws || ws.readyState !== WebSocket.OPEN) return false;
 
         debugLog('tryAuthWithKey: attempting key-based auth');
         authKeyPending = true;
+        // Challenge-response: send SHA256(auth_key + challenge) instead of raw key
+        let keyValue = authKey;
+        let usesChallenge = false;
+        if (serverChallenge) {
+            try {
+                keyValue = await hashPassword(authKey + serverChallenge);
+                usesChallenge = true;
+            } catch (e) {
+                keyValue = sha256Fallback(authKey + serverChallenge);
+                usesChallenge = true;
+            }
+        }
         const msg = {
             type: 'AuthRequest',
             password_hash: '',  // Empty - using key instead
-            auth_key: authKey
+            auth_key: keyValue,
+            challenge_response: usesChallenge
         };
         if (currentWorldIndex !== undefined) {
             msg.current_world = currentWorldIndex;
@@ -2544,9 +2569,11 @@
         // Store username for saving on success (Android auto-login)
         pendingAuthUsername = username;
 
-        // Hash password with SHA-256
-        hashPassword(password).then(hash => {
-            const msg = { type: 'AuthRequest', password_hash: hash, request_key: true };
+        // Hash password with SHA-256, then apply challenge-response
+        hashPassword(password).then(async hash => {
+            // Challenge-response: SHA256(SHA256(password) + challenge)
+            const challengeHash = serverChallenge ? await hashPassword(hash + serverChallenge) : hash;
+            const msg = { type: 'AuthRequest', password_hash: challengeHash, request_key: true, challenge_response: !!serverChallenge };
             if (username) {
                 msg.username = username;
             }
@@ -2558,7 +2585,8 @@
         }).catch(err => {
             // Try fallback directly if hashPassword somehow failed
             const hash = sha256Fallback(password);
-            const msg = { type: 'AuthRequest', password_hash: hash, request_key: true };
+            const challengeHash = serverChallenge ? sha256Fallback(hash + serverChallenge) : hash;
+            const msg = { type: 'AuthRequest', password_hash: challengeHash, request_key: true, challenge_response: !!serverChallenge };
             if (username) {
                 msg.username = username;
             }
@@ -2851,7 +2879,7 @@
             // Update prompt to show new world's prompt
             const world = worlds[currentWorldIndex];
             if (world && world.prompt) {
-                elements.prompt.innerHTML = parseAnsi(world.prompt);
+                elements.prompt.innerHTML = sanitizeHtml(parseAnsi(world.prompt));
             } else {
                 elements.prompt.textContent = '';
             }
@@ -2950,7 +2978,7 @@
         '',
         'World Switching:',
         '  Up/Down                    Switch between active worlds',
-        '  Shift+Up/Down              Switch between all worlds',
+        '  Ctrl+Up/Down               Switch between all worlds',
         '  Alt+W                      Switch to world with activity',
         '',
         'Input:',
@@ -3710,6 +3738,11 @@
         const div = document.createElement('div');
         div.textContent = text;
         return div.innerHTML;
+    }
+
+    // Defense-in-depth: strip any event handler attributes from parsed HTML
+    function sanitizeHtml(html) {
+        return html.replace(/\bon\w+\s*=/gi, 'data-blocked=');
     }
 
     // Insert zero-width spaces after break characters in long words (>15 chars)
@@ -4872,7 +4905,6 @@
         // Copy global state to edit state
         editWebSecure = webSecure;
         editHttpEnabled = httpEnabled;
-        editWsEnabled = wsEnabled;
         elements.webModal.className = 'modal visible';
         elements.webModal.style.display = 'flex';
         updateWebPopupUI();
@@ -4892,19 +4924,27 @@
         // Update labels based on protocol
         elements.httpLabel.textContent = editWebSecure ? 'HTTPS enabled' : 'HTTP enabled';
         elements.httpPortLabel.textContent = editWebSecure ? 'HTTPS port' : 'HTTP port';
-        elements.wsLabel.textContent = editWebSecure ? 'WSS enabled' : 'WS enabled';
-        elements.wsPortLabel.textContent = editWebSecure ? 'WSS port' : 'WS port';
-
         // Update select dropdowns (use edit state)
         elements.webHttpEnabledSelect.value = editHttpEnabled ? 'on' : 'off';
-        elements.webWsEnabledSelect.value = editWsEnabled ? 'on' : 'off';
 
         // Update input fields (from global state - text fields are read on save)
         elements.webHttpPort.value = httpPort;
-        elements.webWsPort.value = wsPort;
         elements.webAllowList.value = wsAllowList;
-        elements.webCertFile.value = wsCertFile;
-        elements.webKeyFile.value = wsKeyFile;
+        // Show placeholder if TLS configured but paths not sent from server
+        if (tlsConfigured && !wsCertFile) {
+            elements.webCertFile.value = '';
+            elements.webCertFile.placeholder = 'Configured';
+        } else {
+            elements.webCertFile.value = wsCertFile;
+            elements.webCertFile.placeholder = '';
+        }
+        if (tlsConfigured && !wsKeyFile) {
+            elements.webKeyFile.value = '';
+            elements.webKeyFile.placeholder = 'Configured';
+        } else {
+            elements.webKeyFile.value = wsKeyFile;
+            elements.webKeyFile.placeholder = '';
+        }
 
         // Show/hide TLS fields based on protocol
         elements.tlsCertField.style.display = editWebSecure ? 'flex' : 'none';
@@ -4915,11 +4955,8 @@
         // Copy edit state to global state
         webSecure = editWebSecure;
         httpEnabled = editHttpEnabled;
-        wsEnabled = editWsEnabled;
-
         // Read text field values from UI
         httpPort = parseInt(elements.webHttpPort.value) || 9000;
-        wsPort = parseInt(elements.webWsPort.value) || 9001;
         wsAllowList = elements.webAllowList.value;
         wsCertFile = elements.webCertFile.value;
         wsKeyFile = elements.webKeyFile.value;
@@ -5485,7 +5522,14 @@
         elements.worldEditHostname.value = world.settings?.hostname || '';
         elements.worldEditPort.value = world.settings?.port || '';
         elements.worldEditUser.value = world.settings?.user || '';
-        elements.worldEditPassword.value = world.settings?.password || '';
+        // Show placeholder if password is configured but not sent (server sends empty + has_password)
+        if (world.settings?.has_password && !world.settings?.password) {
+            elements.worldEditPassword.value = '';
+            elements.worldEditPassword.placeholder = '••••••••';
+        } else {
+            elements.worldEditPassword.value = world.settings?.password || '';
+            elements.worldEditPassword.placeholder = '';
+        }
         const logEnabled = world.settings?.log_enabled || false;
         if (logEnabled) {
             elements.worldEditLoggingToggle.classList.add('active');
@@ -5550,7 +5594,7 @@
             hostname: elements.worldEditHostname.value,
             port: elements.worldEditPort.value,
             user: elements.worldEditUser.value,
-            password: elements.worldEditPassword.value,
+            password: elements.worldEditPassword.value,  // Empty means "not changed" (server preserves existing)
             use_ssl: elements.worldEditSslToggle.classList.contains('active'),
             log_enabled: elements.worldEditLoggingToggle.classList.contains('active'),
             encoding: elements.worldEditEncodingSelect.value,
@@ -7160,10 +7204,6 @@
             editHttpEnabled = this.value === 'on';
             updateWebPopupUI();
         };
-        elements.webWsEnabledSelect.onchange = function() {
-            editWsEnabled = this.value === 'on';
-            updateWebPopupUI();
-        };
         elements.webSaveBtn.onclick = saveWebSettings;
         elements.webCancelBtn.onclick = closeWebPopup;
         elements.webCloseBtn.onclick = closeWebPopup;
@@ -7325,11 +7365,12 @@
             warning.id = 'cert-warning';
             warning.style.cssText = 'position:fixed;top:10px;left:50%;transform:translateX(-50%);background:#c00;color:#fff;padding:15px 20px;border-radius:8px;z-index:2000;text-align:center;max-width:90%;';
             const host = window.location.hostname;
-            const certUrl = `https://${host}:${window.WS_PORT}/`;
+            const certPort = window.location.port || '443';
+            const certUrl = `https://${host}:${certPort}/`;
             warning.innerHTML = `
                 <div style="margin-bottom:10px;font-weight:bold;">WebSocket Connection Failed</div>
-                <div style="margin-bottom:10px;">If using a self-signed certificate, you need to accept it for the WebSocket port.</div>
-                <a href="${certUrl}" target="_blank" style="color:#fff;text-decoration:underline;">Click here to accept the certificate for port ${window.WS_PORT}</a>
+                <div style="margin-bottom:10px;">If using a self-signed certificate, you need to accept it.</div>
+                <a href="${certUrl}" target="_blank" style="color:#fff;text-decoration:underline;">Click here to accept the certificate for port ${certPort}</a>
                 <div style="margin-top:10px;font-size:12px;">Then refresh this page.</div>
             `;
             document.body.appendChild(warning);

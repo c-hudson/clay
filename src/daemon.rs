@@ -41,66 +41,31 @@ pub async fn run_daemon_server() -> io::Result<()> {
 
     let (event_tx, mut event_rx) = mpsc::channel::<AppEvent>(100);
 
-    // Start WebSocket server if enabled
-    if app.settings.ws_enabled && !app.settings.websocket_password.is_empty() {
-        let mut server = WebSocketServer::new(
+    // Create WebSocket server state (for client management, no standalone listener)
+    let ws_state = if !app.settings.websocket_password.is_empty() {
+        let server = WebSocketServer::new(
             &app.settings.websocket_password,
-            app.settings.ws_port,
+            app.settings.http_port,
             &app.settings.websocket_allow_list,
             app.settings.websocket_whitelisted_host.clone(),
             false, // Not multiuser mode
             app.ban_list.clone(),
         );
-
-        // Configure TLS if secure mode enabled
-        #[cfg(feature = "native-tls-backend")]
-        let tls_configured = if app.settings.web_secure
-            && !app.settings.websocket_cert_file.is_empty()
-            && !app.settings.websocket_key_file.is_empty()
-        {
-            match server.configure_tls(&app.settings.websocket_cert_file, &app.settings.websocket_key_file) {
-                Ok(()) => true,
-                Err(e) => {
-                    eprintln!("Warning: Failed to configure TLS: {}", e);
-                    false
-                }
-            }
-        } else {
-            false
-        };
-        #[cfg(feature = "rustls-backend")]
-        let tls_configured = if app.settings.web_secure
-            && !app.settings.websocket_cert_file.is_empty()
-            && !app.settings.websocket_key_file.is_empty()
-        {
-            match server.configure_tls(&app.settings.websocket_cert_file, &app.settings.websocket_key_file) {
-                Ok(()) => true,
-                Err(e) => {
-                    eprintln!("Warning: Failed to configure TLS: {}", e);
-                    false
-                }
-            }
-        } else {
-            false
-        };
-
-        if let Err(e) = start_websocket_server(&mut server, event_tx.clone()).await {
-            eprintln!("Failed to start WebSocket server: {}", e);
-            return Ok(());
-        }
-        let protocol = if tls_configured { "wss" } else { "ws" };
-        println!("WebSocket: {}://0.0.0.0:{}", protocol, app.settings.ws_port);
+        let state = Arc::new(server.connection_state(event_tx.clone()));
         app.ws_server = Some(server);
-    }
+        Some(state)
+    } else {
+        None
+    };
 
-    // Start HTTP/HTTPS server if enabled
+    // Start unified HTTP+WS server if enabled
     if app.settings.http_enabled {
         let has_cert = !app.settings.websocket_cert_file.is_empty()
             && !app.settings.websocket_key_file.is_empty();
         let web_secure = app.settings.web_secure;
 
         if web_secure && has_cert {
-            // Start HTTPS
+            // Start HTTPS+WSS
             #[cfg(any(feature = "native-tls-backend", feature = "rustls-backend"))]
             {
                 let mut https_server = HttpsServer::new(app.settings.http_port);
@@ -108,12 +73,13 @@ pub async fn run_daemon_server() -> io::Result<()> {
                     &mut https_server,
                     &app.settings.websocket_cert_file,
                     &app.settings.websocket_key_file,
-                    app.settings.ws_port,
-                    true,
+                    ws_state.clone(),
+                    app.ban_list.clone(),
                     app.gui_theme_colors().to_css_vars(),
                 ).await {
                     Ok(()) => {
-                        println!("HTTPS: https://0.0.0.0:{}", app.settings.http_port);
+                        let protocol = if ws_state.is_some() { "HTTPS+WSS" } else { "HTTPS" };
+                        println!("{}: https://0.0.0.0:{}", protocol, app.settings.http_port);
                         app.https_server = Some(https_server);
                     }
                     Err(e) => {
@@ -122,11 +88,12 @@ pub async fn run_daemon_server() -> io::Result<()> {
                 }
             }
         } else {
-            // Start HTTP
+            // Start HTTP+WS
             let mut http_server = HttpServer::new(app.settings.http_port);
-            match start_http_server(&mut http_server, app.settings.ws_port, false, app.ban_list.clone(), app.gui_theme_colors().to_css_vars()).await {
+            match start_http_server(&mut http_server, ws_state.clone(), app.ban_list.clone(), app.gui_theme_colors().to_css_vars()).await {
                 Ok(()) => {
-                    println!("HTTP: http://0.0.0.0:{}", app.settings.http_port);
+                    let protocol = if ws_state.is_some() { "HTTP+WS" } else { "HTTP" };
+                    println!("{}: http://0.0.0.0:{}", protocol, app.settings.http_port);
                     app.http_server = Some(http_server);
                 }
                 Err(e) => {
@@ -137,8 +104,8 @@ pub async fn run_daemon_server() -> io::Result<()> {
     }
 
     // Check if any servers are running
-    if app.ws_server.is_none() && app.http_server.is_none() && app.https_server.is_none() {
-        eprintln!("Error: No servers started. Enable WebSocket or HTTP in settings.");
+    if app.http_server.is_none() && app.https_server.is_none() {
+        eprintln!("Error: No servers started. Enable HTTP in settings.");
         eprintln!("Use /web command to configure, or edit ~/.clay.dat");
         return Ok(());
     }
@@ -1216,7 +1183,7 @@ pub async fn handle_daemon_ws_message(
                 app.ws_broadcast(WsMessage::WorldSwitched { new_index: world_index });
             }
         }
-        WsMessage::UpdateGlobalSettings { more_mode_enabled, spell_check_enabled, temp_convert_enabled, world_switch_mode, show_tags, debug_enabled, ansi_music_enabled, console_theme, gui_theme, gui_transparency, color_offset_percent, input_height, font_name, font_size, web_font_size_phone, web_font_size_tablet, web_font_size_desktop, web_font_weight, ws_allow_list, web_secure, http_enabled, http_port, ws_enabled, ws_port, ws_cert_file, ws_key_file, tls_proxy_enabled, dictionary_path, mouse_enabled, zwj_enabled, arrow_up_down_mode, shift_arrow_up_down_mode } => {
+        WsMessage::UpdateGlobalSettings { more_mode_enabled, spell_check_enabled, temp_convert_enabled, world_switch_mode, show_tags, debug_enabled, ansi_music_enabled, console_theme, gui_theme, gui_transparency, color_offset_percent, input_height, font_name, font_size, web_font_size_phone, web_font_size_tablet, web_font_size_desktop, web_font_weight, ws_allow_list, web_secure, http_enabled, http_port, ws_enabled: _, ws_port: _, ws_cert_file, ws_key_file, tls_proxy_enabled, dictionary_path, mouse_enabled, zwj_enabled, arrow_up_down_mode, shift_arrow_up_down_mode } => {
             app.settings.more_mode_enabled = more_mode_enabled;
             app.settings.spell_check_enabled = spell_check_enabled;
             app.settings.temp_convert_enabled = temp_convert_enabled;
@@ -1239,8 +1206,6 @@ pub async fn handle_daemon_ws_message(
             app.settings.web_secure = web_secure;
             app.settings.http_enabled = http_enabled;
             app.settings.http_port = http_port;
-            app.settings.ws_enabled = ws_enabled;
-            app.settings.ws_port = ws_port;
             app.settings.websocket_cert_file = ws_cert_file;
             app.settings.websocket_key_file = ws_key_file;
             app.settings.tls_proxy_enabled = tls_proxy_enabled;
@@ -1256,42 +1221,8 @@ pub async fn handle_daemon_ws_message(
             // Save settings
             let _ = persistence::save_settings(app);
 
-            // Broadcast updated settings
-            let settings = GlobalSettingsMsg {
-                more_mode_enabled: app.settings.more_mode_enabled,
-                spell_check_enabled: app.settings.spell_check_enabled,
-                temp_convert_enabled: app.settings.temp_convert_enabled,
-                world_switch_mode: app.settings.world_switch_mode.name().to_string(),
-                debug_enabled: app.settings.debug_enabled,
-                show_tags: app.show_tags,
-                ansi_music_enabled: app.settings.ansi_music_enabled,
-                input_height: app.input_height,
-                console_theme: app.settings.theme.name().to_string(),
-                gui_theme: app.settings.gui_theme.name().to_string(),
-                gui_transparency: app.settings.gui_transparency,
-                color_offset_percent: app.settings.color_offset_percent,
-                font_name: app.settings.font_name.clone(),
-                font_size: app.settings.font_size,
-                web_font_size_phone: app.settings.web_font_size_phone,
-                web_font_size_tablet: app.settings.web_font_size_tablet,
-                web_font_size_desktop: app.settings.web_font_size_desktop,
-                web_font_weight: app.settings.web_font_weight,
-                ws_allow_list: app.settings.websocket_allow_list.clone(),
-                web_secure: app.settings.web_secure,
-                http_enabled: app.settings.http_enabled,
-                http_port: app.settings.http_port,
-                ws_enabled: app.settings.ws_enabled,
-                ws_port: app.settings.ws_port,
-                ws_cert_file: app.settings.websocket_cert_file.clone(),
-                ws_key_file: app.settings.websocket_key_file.clone(),
-                tls_proxy_enabled: app.settings.tls_proxy_enabled,
-                dictionary_path: app.settings.dictionary_path.clone(),
-                mouse_enabled: app.settings.mouse_enabled,
-                zwj_enabled: app.settings.zwj_enabled,
-                arrow_up_down_mode: app.settings.arrow_up_down_mode.name().to_string(),
-                shift_arrow_up_down_mode: app.settings.shift_arrow_up_down_mode.name().to_string(),
-                theme_colors_json: app.gui_theme_colors().to_json(),
-            };
+            // Broadcast updated settings (use build_global_settings_msg to avoid leaking sensitive data)
+            let settings = app.build_global_settings_msg();
             app.ws_broadcast(WsMessage::GlobalSettingsUpdated { settings, input_height: app.input_height });
         }
         WsMessage::ToggleWorldGmcp { world_index } => {
@@ -1618,7 +1549,8 @@ pub async fn handle_daemon_ws_message(
                     hostname: world.settings.hostname.clone(),
                     port: world.settings.port.clone(),
                     user: world.settings.user.clone(),
-                    password: world.settings.password.clone(),
+                    password: String::new(),
+                    has_password: !world.settings.password.is_empty(),
                     use_ssl: world.settings.use_ssl,
                     log_enabled: world.settings.log_enabled,
                     encoding: world.settings.encoding.name().to_string(),
@@ -1681,7 +1613,8 @@ pub async fn handle_daemon_ws_message(
                 let _ = persistence::save_settings(app);
                 let settings_msg = WorldSettingsMsg {
                     hostname, port, user,
-                    password: encrypt_password(&password),
+                    has_password: !password.is_empty(),
+                    password: String::new(),
                     use_ssl, log_enabled, encoding,
                     auto_connect_type: auto_login,
                     keep_alive_type, keep_alive_cmd, gmcp_packages,
@@ -1711,8 +1644,6 @@ pub async fn run_multiuser_server() -> io::Result<()> {
         if input.trim().eq_ignore_ascii_case("y") || input.trim().eq_ignore_ascii_case("yes") {
             // Create sample multiuser configuration
             let sample_config = r#"[global]
-ws_enabled=true
-ws_port=9002
 http_enabled=true
 http_port=9000
 
@@ -1776,77 +1707,35 @@ keep_alive_type=Generic
 
     let (event_tx, mut event_rx) = mpsc::channel::<AppEvent>(100);
 
-    // Start WebSocket server (required for multiuser mode)
-    if !app.settings.ws_enabled {
-        eprintln!("Warning: WebSocket server not enabled. Enabling for multiuser mode.");
-        app.settings.ws_enabled = true;
-    }
-
-    // Start the WebSocket server
-    let mut server = WebSocketServer::new(
+    // Create WebSocket server state (for client management, no standalone listener)
+    let server = WebSocketServer::new(
         &app.settings.websocket_password,
-        app.settings.ws_port,
+        app.settings.http_port,
         &app.settings.websocket_allow_list,
         app.settings.websocket_whitelisted_host.clone(),
         app.multiuser_mode,
         app.ban_list.clone(),
     );
 
-    // Configure TLS if secure mode and cert/key files are specified
-    #[cfg(feature = "native-tls-backend")]
-    let tls_configured = if app.settings.web_secure
-        && !app.settings.websocket_cert_file.is_empty()
-        && !app.settings.websocket_key_file.is_empty()
-    {
-        match server.configure_tls(&app.settings.websocket_cert_file, &app.settings.websocket_key_file) {
-            Ok(()) => true,
-            Err(e) => {
-                eprintln!("Warning: Failed to configure WSS TLS: {}", e);
-                false
-            }
-        }
-    } else {
-        false
-    };
-    #[cfg(feature = "rustls-backend")]
-    let tls_configured = if app.settings.web_secure
-        && !app.settings.websocket_cert_file.is_empty()
-        && !app.settings.websocket_key_file.is_empty()
-    {
-        match server.configure_tls(&app.settings.websocket_cert_file, &app.settings.websocket_key_file) {
-            Ok(()) => true,
-            Err(e) => {
-                eprintln!("Warning: Failed to configure WSS TLS: {}", e);
-                false
-            }
-        }
-    } else {
-        false
-    };
-
     // Add user credentials to the WebSocket server for multiuser authentication
     for user in &app.users {
         server.add_user(&user.name, &user.password);
     }
 
-    if let Err(e) = start_websocket_server(&mut server, event_tx.clone()).await {
-        eprintln!("Failed to start WebSocket server: {}", e);
-        return Ok(());
-    }
-    let protocol = if tls_configured { "wss" } else { "ws" };
-    println!("WebSocket server started on port {} ({})", app.settings.ws_port, protocol);
+    let ws_state = Arc::new(server.connection_state(event_tx.clone()));
     app.ws_server = Some(server);
 
-    // Start HTTP server if enabled
-    if app.settings.http_enabled {
+    // Start unified HTTP+WS server
+    {
         let mut http_server = HttpServer::new(app.settings.http_port);
-        match start_http_server(&mut http_server, app.settings.ws_port, false, app.ban_list.clone(), app.gui_theme_colors().to_css_vars()).await {
+        match start_http_server(&mut http_server, Some(ws_state.clone()), app.ban_list.clone(), app.gui_theme_colors().to_css_vars()).await {
             Ok(()) => {
-                println!("HTTP server started on port {}", app.settings.http_port);
+                println!("HTTP+WS: http://0.0.0.0:{}", app.settings.http_port);
                 app.http_server = Some(http_server);
             }
             Err(e) => {
-                eprintln!("Warning: Failed to start HTTP server: {}", e);
+                eprintln!("Warning: Failed to start HTTP+WS server: {}", e);
+                return Ok(());
             }
         }
     }
@@ -2601,7 +2490,8 @@ pub fn build_multiuser_initial_state(app: &App, username: &str) -> WsMessage {
                     hostname: world.settings.hostname.clone(),
                     port: world.settings.port.clone(),
                     user: world.settings.user.clone(),
-                    password: world.settings.password.clone(),
+                    password: String::new(),
+                    has_password: !world.settings.password.is_empty(),
                     use_ssl: world.settings.use_ssl,
                     log_enabled: world.settings.log_enabled,
                     encoding: world.settings.encoding.name().to_string(),
@@ -2628,42 +2518,8 @@ pub fn build_multiuser_initial_state(app: &App, username: &str) -> WsMessage {
         .cloned()
         .collect();
 
-    // Build settings (same for all users for now)
-    let settings = GlobalSettingsMsg {
-        more_mode_enabled: app.settings.more_mode_enabled,
-        spell_check_enabled: app.settings.spell_check_enabled,
-        temp_convert_enabled: app.settings.temp_convert_enabled,
-        world_switch_mode: app.settings.world_switch_mode.name().to_string(),
-        debug_enabled: app.settings.debug_enabled,
-        show_tags: app.show_tags,
-        ansi_music_enabled: app.settings.ansi_music_enabled,
-        console_theme: app.settings.theme.name().to_string(),
-        gui_theme: app.settings.gui_theme.name().to_string(),
-        gui_transparency: app.settings.gui_transparency,
-        color_offset_percent: app.settings.color_offset_percent,
-        input_height: app.input_height,
-        font_name: app.settings.font_name.clone(),
-        font_size: app.settings.font_size,
-        web_font_size_phone: app.settings.web_font_size_phone,
-        web_font_size_tablet: app.settings.web_font_size_tablet,
-        web_font_size_desktop: app.settings.web_font_size_desktop,
-        web_font_weight: app.settings.web_font_weight,
-        ws_allow_list: app.settings.websocket_allow_list.clone(),
-        web_secure: app.settings.web_secure,
-        http_enabled: app.settings.http_enabled,
-        http_port: app.settings.http_port,
-        ws_enabled: app.settings.ws_enabled,
-        ws_port: app.settings.ws_port,
-        ws_cert_file: app.settings.websocket_cert_file.clone(),
-        ws_key_file: app.settings.websocket_key_file.clone(),
-        tls_proxy_enabled: app.settings.tls_proxy_enabled,
-        dictionary_path: app.settings.dictionary_path.clone(),
-        mouse_enabled: app.settings.mouse_enabled,
-        zwj_enabled: app.settings.zwj_enabled,
-        arrow_up_down_mode: app.settings.arrow_up_down_mode.name().to_string(),
-        shift_arrow_up_down_mode: app.settings.shift_arrow_up_down_mode.name().to_string(),
-        theme_colors_json: app.gui_theme_colors().to_json(),
-    };
+    // Build settings (uses build_global_settings_msg to avoid leaking sensitive data)
+    let settings = app.build_global_settings_msg();
 
     // Find current world index for this user
     // Use the first world they have a connection to, or 9999 if none (no world selected)

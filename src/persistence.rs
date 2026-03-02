@@ -16,26 +16,72 @@ use crate::{
     get_settings_path, get_multiuser_settings_path, get_reload_state_path, debug_log,
 };
 
-/// Encryption key for password storage (padded to 32 bytes for AES-256)
-pub(crate) const PASSWORD_ENCRYPTION_KEY: &[u8; 32] = b"nonsupersecretpassword#\0\0\0\0\0\0\0\0\0";
+/// Legacy encryption key — only used for decrypting old .clay.dat files
+const LEGACY_ENCRYPTION_KEY: &[u8; 32] = b"nonsupersecretpassword#\0\0\0\0\0\0\0\0\0";
 
-/// Encrypt a password using AES-256-GCM and return base64-encoded result
+/// Per-machine encryption key, loaded from ~/.clay.key (generated on first run)
+static MACHINE_KEY: std::sync::OnceLock<[u8; 32]> = std::sync::OnceLock::new();
+
+fn machine_key() -> &'static [u8; 32] {
+    MACHINE_KEY.get_or_init(|| {
+        load_or_generate_key()
+    })
+}
+
+fn key_file_path() -> PathBuf {
+    let home = crate::get_home_dir();
+    PathBuf::from(home).join(crate::clay_filename("clay.key"))
+}
+
+fn load_or_generate_key() -> [u8; 32] {
+    let path = key_file_path();
+
+    // Try to read existing key
+    if let Ok(data) = std::fs::read(&path) {
+        if data.len() == 32 {
+            let mut key = [0u8; 32];
+            key.copy_from_slice(&data);
+            return key;
+        }
+    }
+
+    // Generate new random key
+    let mut key = [0u8; 32];
+    getrandom::getrandom(&mut key).expect("Failed to generate random key");
+
+    // Write with restrictive permissions
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        if let Ok(mut f) = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(&path)
+        {
+            let _ = f.write_all(&key);
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = std::fs::write(&path, &key);
+    }
+
+    key
+}
+
+/// Encrypt a password using AES-256-GCM with per-machine key and random nonce
 pub fn encrypt_password(password: &str) -> String {
     if password.is_empty() {
         return String::new();
     }
 
-    let cipher = Aes256Gcm::new(PASSWORD_ENCRYPTION_KEY.into());
+    let cipher = Aes256Gcm::new(machine_key().into());
 
-    // Use a fixed nonce derived from the password length (not cryptographically ideal,
-    // but acceptable for this obfuscation use case with a known key)
+    // Generate random 12-byte nonce
     let mut nonce_bytes = [0u8; 12];
-    nonce_bytes[0] = (password.len() & 0xFF) as u8;
-    nonce_bytes[1] = ((password.len() >> 8) & 0xFF) as u8;
-    // Add some variation based on first few chars
-    for (i, b) in password.bytes().take(10).enumerate() {
-        nonce_bytes[2 + i] = b;
-    }
+    getrandom::getrandom(&mut nonce_bytes).expect("Failed to generate random nonce");
     let nonce = Nonce::from_slice(&nonce_bytes);
 
     match cipher.encrypt(nonce, password.as_bytes()) {
@@ -52,7 +98,7 @@ pub fn encrypt_password(password: &str) -> String {
     }
 }
 
-/// Decrypt a password. Returns the original string if it's not encrypted or decryption fails.
+/// Decrypt a password. Tries machine key first, falls back to legacy key for migration.
 pub fn decrypt_password(stored: &str) -> String {
     if stored.is_empty() {
         return String::new();
@@ -78,16 +124,21 @@ pub fn decrypt_password(stored: &str) -> String {
 
     let (nonce_bytes, ciphertext) = combined.split_at(12);
     let nonce = Nonce::from_slice(nonce_bytes);
-    let cipher = Aes256Gcm::new(PASSWORD_ENCRYPTION_KEY.into());
 
-    match cipher.decrypt(nonce, ciphertext) {
-        Ok(plaintext) => String::from_utf8_lossy(&plaintext).to_string(),
-        Err(_) => {
-            // Decryption failed - might be a plain password that happens to start with "ENC:"
-            // This is unlikely but we handle it gracefully
-            stored.to_string()
-        }
+    // Try machine key first
+    let cipher = Aes256Gcm::new(machine_key().into());
+    if let Ok(plaintext) = cipher.decrypt(nonce, ciphertext) {
+        return String::from_utf8_lossy(&plaintext).to_string();
     }
+
+    // Fall back to legacy key (old .clay.dat files)
+    let legacy_cipher = Aes256Gcm::new(LEGACY_ENCRYPTION_KEY.into());
+    if let Ok(plaintext) = legacy_cipher.decrypt(nonce, ciphertext) {
+        return String::from_utf8_lossy(&plaintext).to_string();
+    }
+
+    // Both failed — return as-is
+    stored.to_string()
 }
 
 pub fn save_settings(app: &App) -> io::Result<()> {
@@ -125,8 +176,6 @@ pub fn save_settings_to_path(app: &App, path: &std::path::Path) -> io::Result<()
     writeln!(file, "web_secure={}", app.settings.web_secure)?;
     writeln!(file, "http_enabled={}", app.settings.http_enabled)?;
     writeln!(file, "http_port={}", app.settings.http_port)?;
-    writeln!(file, "ws_enabled={}", app.settings.ws_enabled)?;
-    writeln!(file, "ws_port={}", app.settings.ws_port)?;
     if !app.settings.websocket_password.is_empty() {
         writeln!(file, "websocket_password={}", encrypt_password(&app.settings.websocket_password))?;
     }
@@ -139,9 +188,11 @@ pub fn save_settings_to_path(app: &App, path: &std::path::Path) -> io::Result<()
     if !app.settings.websocket_key_file.is_empty() {
         writeln!(file, "websocket_key_file={}", app.settings.websocket_key_file)?;
     }
-    // Save device auth keys (encrypted)
-    for key in &app.settings.websocket_auth_keys {
-        writeln!(file, "websocket_auth_key={}", encrypt_password(key))?;
+    // Save device auth keys (encrypted, with timestamp)
+    for ak in &app.settings.websocket_auth_keys {
+        if !ak.is_expired() {
+            writeln!(file, "websocket_auth_key={}|{}", encrypt_password(&ak.key), ak.created_at)?;
+        }
     }
     writeln!(file, "tls_proxy_enabled={}", app.settings.tls_proxy_enabled)?;
     if !app.settings.dictionary_path.is_empty() {
@@ -509,24 +560,9 @@ pub fn load_settings_from_path(app: &mut App, path: &std::path::Path) -> io::Res
                     "web_secure" => {
                         app.settings.web_secure = value == "true";
                     }
-                    "ws_enabled" => {
-                        app.settings.ws_enabled = value == "true";
-                    }
-                    "ws_port" => {
-                        if let Ok(p) = value.parse::<u16>() {
-                            app.settings.ws_port = p;
-                        }
-                    }
-                    // Legacy: websocket_enabled maps to ws_enabled
-                    "websocket_enabled" => {
-                        app.settings.ws_enabled = value == "true";
-                    }
-                    // Legacy: websocket_port maps to ws_port
-                    "websocket_port" => {
-                        if let Ok(p) = value.parse::<u16>() {
-                            app.settings.ws_port = p;
-                        }
-                    }
+                    // Legacy: ws_enabled/ws_port/websocket_enabled/websocket_port — silently ignored
+                    "ws_enabled" | "websocket_enabled" => {}
+                    "ws_port" | "websocket_port" => {}
                     // Legacy: websocket_use_tls maps to web_secure
                     "websocket_use_tls" => {
                         app.settings.web_secure = value == "true";
@@ -544,10 +580,24 @@ pub fn load_settings_from_path(app: &mut App, path: &std::path::Path) -> io::Res
                         app.settings.websocket_key_file = value.to_string();
                     }
                     "websocket_auth_key" => {
-                        // Load device auth key (decrypt it)
-                        let key = decrypt_password(value);
+                        // Load device auth key (format: ENC:...|timestamp or legacy ENC:...)
+                        let (enc_part, timestamp) = if let Some(pipe_pos) = value.rfind('|') {
+                            let ts_str = &value[pipe_pos + 1..];
+                            if let Ok(ts) = ts_str.parse::<u64>() {
+                                (&value[..pipe_pos], ts)
+                            } else {
+                                (value, std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs())
+                            }
+                        } else {
+                            // Legacy format without timestamp — give fresh 30-day window
+                            (value, std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs())
+                        };
+                        let key = decrypt_password(enc_part);
                         if !key.is_empty() {
-                            app.settings.websocket_auth_keys.push(key);
+                            let ak = crate::AuthKey { key, created_at: timestamp };
+                            if !ak.is_expired() {
+                                app.settings.websocket_auth_keys.push(ak);
+                            }
                         }
                     }
                     "http_enabled" => {
@@ -575,20 +625,8 @@ pub fn load_settings_from_path(app: &mut App, path: &std::path::Path) -> io::Res
                             }
                         }
                     }
-                    "ws_nonsecure_enabled" => {
-                        // Legacy: ws_nonsecure maps to ws_enabled when not secure
-                        if value == "true" && !app.settings.web_secure {
-                            app.settings.ws_enabled = true;
-                        }
-                    }
-                    "ws_nonsecure_port" => {
-                        // Legacy: ws_nonsecure_port was separate, now ws_port is used for both
-                        if let Ok(p) = value.parse::<u16>() {
-                            if !app.settings.web_secure {
-                                app.settings.ws_port = p;
-                            }
-                        }
-                    }
+                    // Legacy: ws_nonsecure_enabled/ws_nonsecure_port — silently ignored
+                    "ws_nonsecure_enabled" | "ws_nonsecure_port" => {}
                     // Legacy: ignore global encoding, it's now per-world
                     "encoding" => {}
                     "tls_proxy_enabled" => {
@@ -899,12 +937,8 @@ pub fn load_multiuser_settings(app: &mut App) -> io::Result<()> {
             // Global settings
             else {
                 match key {
-                    "ws_enabled" => app.settings.ws_enabled = value == "true",
-                    "ws_port" => {
-                        if let Ok(p) = value.parse::<u16>() {
-                            app.settings.ws_port = p;
-                        }
-                    }
+                    // Legacy: ws_enabled/ws_port — silently ignored
+                    "ws_enabled" | "ws_port" => {}
                     "websocket_password" => app.settings.websocket_password = decrypt_password(value),
                     "websocket_allow_list" => app.settings.websocket_allow_list = value.to_string(),
                     "websocket_cert_file" => app.settings.websocket_cert_file = value.to_string(),
@@ -932,8 +966,6 @@ pub fn save_multiuser_settings(app: &App) -> io::Result<()> {
 
     // [global] section
     writeln!(file, "[global]")?;
-    writeln!(file, "ws_enabled={}", app.settings.ws_enabled)?;
-    writeln!(file, "ws_port={}", app.settings.ws_port)?;
     if !app.settings.websocket_password.is_empty() {
         writeln!(file, "websocket_password={}", encrypt_password(&app.settings.websocket_password))?;
     }
@@ -1109,8 +1141,6 @@ pub fn save_reload_state(app: &App) -> io::Result<()> {
     writeln!(file, "web_secure={}", app.settings.web_secure)?;
     writeln!(file, "http_enabled={}", app.settings.http_enabled)?;
     writeln!(file, "http_port={}", app.settings.http_port)?;
-    writeln!(file, "ws_enabled={}", app.settings.ws_enabled)?;
-    writeln!(file, "ws_port={}", app.settings.ws_port)?;
     if !app.settings.websocket_password.is_empty() {
         writeln!(file, "websocket_password={}", encrypt_password(&app.settings.websocket_password))?;
     }
@@ -1671,24 +1701,9 @@ pub fn load_reload_state(app: &mut App) -> io::Result<bool> {
                     "web_secure" => {
                         app.settings.web_secure = value == "true";
                     }
-                    "ws_enabled" => {
-                        app.settings.ws_enabled = value == "true";
-                    }
-                    "ws_port" => {
-                        if let Ok(p) = value.parse::<u16>() {
-                            app.settings.ws_port = p;
-                        }
-                    }
-                    // Legacy: websocket_enabled maps to ws_enabled
-                    "websocket_enabled" => {
-                        app.settings.ws_enabled = value == "true";
-                    }
-                    // Legacy: websocket_port maps to ws_port
-                    "websocket_port" => {
-                        if let Ok(p) = value.parse::<u16>() {
-                            app.settings.ws_port = p;
-                        }
-                    }
+                    // Legacy: ws_enabled/ws_port/websocket_enabled/websocket_port — silently ignored
+                    "ws_enabled" | "websocket_enabled" => {}
+                    "ws_port" | "websocket_port" => {}
                     // Legacy: websocket_use_tls maps to web_secure
                     "websocket_use_tls" => {
                         app.settings.web_secure = value == "true";
@@ -1730,18 +1745,8 @@ pub fn load_reload_state(app: &mut App) -> io::Result<bool> {
                             }
                         }
                     }
-                    "ws_nonsecure_enabled" => {
-                        if value == "true" && !app.settings.web_secure {
-                            app.settings.ws_enabled = true;
-                        }
-                    }
-                    "ws_nonsecure_port" => {
-                        if let Ok(p) = value.parse::<u16>() {
-                            if !app.settings.web_secure {
-                                app.settings.ws_port = p;
-                            }
-                        }
-                    }
+                    // Legacy: ws_nonsecure_enabled/ws_nonsecure_port — silently ignored
+                    "ws_nonsecure_enabled" | "ws_nonsecure_port" => {}
                     // Legacy: ignore global encoding, it's now per-world
                     "encoding" => {}
                     "tls_proxy_enabled" => {
@@ -1954,14 +1959,18 @@ mod tests {
             web_secure: true,                  // default: false
             http_enabled: true,                // default: false
             http_port: 8080,                   // default: 9000
-            ws_enabled: true,                  // default: false
-            ws_port: 8081,                     // default: 9001
             websocket_password: "testpass".to_string(),     // default: ""
             websocket_allow_list: "192.168.1.1".to_string(), // default: ""
             websocket_whitelisted_host: Some("10.0.0.1".to_string()), // default: None (not persisted to .clay.dat)
             websocket_cert_file: "/tmp/cert.pem".to_string(), // default: ""
             websocket_key_file: "/tmp/key.pem".to_string(),   // default: ""
-            websocket_auth_keys: vec!["key1".to_string(), "key2".to_string()], // default: []
+            websocket_auth_keys: {
+                let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
+                vec![
+                    crate::AuthKey { key: "key1".to_string(), created_at: now },
+                    crate::AuthKey { key: "key2".to_string(), created_at: now },
+                ]
+            }, // default: []
             actions: vec![
                 {
                     let mut a = Action::new();
@@ -2033,14 +2042,15 @@ mod tests {
         assert_eq!(a.web_secure, b.web_secure, "{context}: web_secure");
         assert_eq!(a.http_enabled, b.http_enabled, "{context}: http_enabled");
         assert_eq!(a.http_port, b.http_port, "{context}: http_port");
-        assert_eq!(a.ws_enabled, b.ws_enabled, "{context}: ws_enabled");
-        assert_eq!(a.ws_port, b.ws_port, "{context}: ws_port");
         assert_eq!(a.websocket_password, b.websocket_password, "{context}: websocket_password");
         assert_eq!(a.websocket_allow_list, b.websocket_allow_list, "{context}: websocket_allow_list");
         // websocket_whitelisted_host is not persisted to .clay.dat (runtime state)
         assert_eq!(a.websocket_cert_file, b.websocket_cert_file, "{context}: websocket_cert_file");
         assert_eq!(a.websocket_key_file, b.websocket_key_file, "{context}: websocket_key_file");
-        assert_eq!(a.websocket_auth_keys, b.websocket_auth_keys, "{context}: websocket_auth_keys");
+        assert_eq!(a.websocket_auth_keys.len(), b.websocket_auth_keys.len(), "{context}: websocket_auth_keys.len()");
+        for (i, (ak_a, ak_b)) in a.websocket_auth_keys.iter().zip(b.websocket_auth_keys.iter()).enumerate() {
+            assert_eq!(ak_a.key, ak_b.key, "{context}: auth_key[{i}].key");
+        }
         assert_eq!(a.actions.len(), b.actions.len(), "{context}: actions.len()");
         for (i, (aa, bb)) in a.actions.iter().zip(b.actions.iter()).enumerate() {
             assert_eq!(aa.name, bb.name, "{context}: action[{i}].name");
@@ -2154,8 +2164,6 @@ mod tests {
         assert_ne!(non_default.web_secure, default.web_secure, "web_secure should differ");
         assert_ne!(non_default.http_enabled, default.http_enabled, "http_enabled should differ");
         assert_ne!(non_default.http_port, default.http_port, "http_port should differ");
-        assert_ne!(non_default.ws_enabled, default.ws_enabled, "ws_enabled should differ");
-        assert_ne!(non_default.ws_port, default.ws_port, "ws_port should differ");
         assert_ne!(non_default.websocket_password, default.websocket_password, "websocket_password should differ");
         assert_ne!(non_default.websocket_allow_list, default.websocket_allow_list, "websocket_allow_list should differ");
         assert_ne!(non_default.websocket_cert_file, default.websocket_cert_file, "websocket_cert_file should differ");

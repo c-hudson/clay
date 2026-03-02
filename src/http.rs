@@ -1,8 +1,63 @@
 use std::collections::{HashMap, HashSet};
+use std::pin::Pin;
 use std::sync::Arc;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpStream;
+use std::task::{Context, Poll};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::sync::RwLock;
+
+// ============================================================================
+// PrefixedStream — replays pre-read bytes before reading from inner stream
+// ============================================================================
+
+/// A stream wrapper that replays buffered bytes before reading from the inner stream.
+/// Used to pass pre-read HTTP headers to the WebSocket handshake handler.
+pub struct PrefixedStream<S> {
+    prefix: Vec<u8>,
+    prefix_pos: usize,
+    inner: S,
+}
+
+impl<S> PrefixedStream<S> {
+    pub fn new(prefix: Vec<u8>, inner: S) -> Self {
+        Self { prefix, prefix_pos: 0, inner }
+    }
+}
+
+impl<S: AsyncRead + Unpin> AsyncRead for PrefixedStream<S> {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        let this = self.get_mut();
+        if this.prefix_pos < this.prefix.len() {
+            let remaining = &this.prefix[this.prefix_pos..];
+            let to_copy = remaining.len().min(buf.remaining());
+            buf.put_slice(&remaining[..to_copy]);
+            this.prefix_pos += to_copy;
+            return Poll::Ready(Ok(()));
+        }
+        Pin::new(&mut this.inner).poll_read(cx, buf)
+    }
+}
+
+impl<S: AsyncWrite + Unpin> AsyncWrite for PrefixedStream<S> {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        Pin::new(&mut self.get_mut().inner).poll_write(cx, buf)
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.get_mut().inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.get_mut().inner).poll_shutdown(cx)
+    }
+}
 
 // ============================================================================
 // Remote Connection Logging
@@ -89,17 +144,25 @@ fn get_host_from_request(request: &str) -> String {
 }
 
 /// Build an HTTP response with the given status, content type, and body
-fn build_http_response(status: u16, status_text: &str, content_type: &str, body: &str) -> Vec<u8> {
-    format!(
+fn build_http_response(status: u16, status_text: &str, content_type: &str, body: &str, is_https: bool) -> Vec<u8> {
+    let mut headers = format!(
         "HTTP/1.1 {} {}\r\n\
          Content-Type: {}; charset=utf-8\r\n\
          Content-Length: {}\r\n\
-         Cache-Control: no-cache\r\n\
-         Connection: close\r\n\
-         \r\n\
-         {}",
-        status, status_text, content_type, body.len(), body
-    ).into_bytes()
+         Cache-Control: no-store\r\n\
+         X-Frame-Options: DENY\r\n\
+         X-Content-Type-Options: nosniff\r\n\
+         Referrer-Policy: no-referrer\r\n\
+         Content-Security-Policy: default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data: https://cdn.discordapp.com; connect-src 'self' ws: wss:; frame-ancestors 'none'\r\n\
+         Connection: close\r\n",
+        status, status_text, content_type, body.len()
+    );
+    if is_https {
+        headers.push_str("Strict-Transport-Security: max-age=31536000\r\n");
+    }
+    headers.push_str("\r\n");
+    headers.push_str(body);
+    headers.into_bytes()
 }
 
 /// Route result from handle_http_routes - indicates whether a 404 violation occurred
@@ -112,51 +175,66 @@ enum RouteResult {
     MethodNotAllowed(Vec<u8>),
 }
 
+/// Check if an HTTP request is a WebSocket upgrade request
+fn is_websocket_upgrade(request: &str) -> bool {
+    for line in request.lines() {
+        let lower = line.to_lowercase();
+        if lower.starts_with("upgrade:") && lower.contains("websocket") {
+            return true;
+        }
+    }
+    false
+}
+
 /// Handle HTTP route matching and response generation (shared by all server implementations)
+/// WS_PORT is injected as 0 (sentinel) — the JS client uses window.location.port
 fn handle_http_routes(
     request: &str,
-    ws_port: u16,
     ws_use_tls: bool,
     theme_css_vars: &str,
+    is_https: bool,
 ) -> Option<RouteResult> {
     let (method, path) = parse_http_request(request)?;
 
     if method != "GET" {
         return Some(RouteResult::MethodNotAllowed(
-            build_http_response(405, "Method Not Allowed", "text/plain", "Method Not Allowed")
+            build_http_response(405, "Method Not Allowed", "text/plain", "Method Not Allowed", is_https)
         ));
     }
 
     let host = get_host_from_request(request);
-    let sanitized_host = host.replace(['\\', '\'', '"', '`', '<', '>'], "");
+    // Only allow hostname-valid characters (alphanumeric, dots, hyphens, colons for port)
+    let sanitized_host: String = host.chars()
+        .filter(|c| c.is_ascii_alphanumeric() || *c == '.' || *c == '-' || *c == ':')
+        .collect();
     let response = match path {
         "/" | "/index.html" => {
             let html = WEB_INDEX_HTML
                 .replace("{{WS_HOST}}", &sanitized_host)
-                .replace("{{WS_PORT}}", &ws_port.to_string())
+                .replace("{{WS_PORT}}", "0")
                 .replace("{{WS_PROTOCOL}}", if ws_use_tls { "wss" } else { "ws" })
                 .replace("{{THEME_CSS_VARS}}", theme_css_vars);
-            RouteResult::Ok(build_http_response(200, "OK", "text/html", &html))
+            RouteResult::Ok(build_http_response(200, "OK", "text/html", &html, is_https))
         }
         "/style.css" => {
-            RouteResult::Ok(build_http_response(200, "OK", "text/css", WEB_STYLE_CSS))
+            RouteResult::Ok(build_http_response(200, "OK", "text/css", WEB_STYLE_CSS, is_https))
         }
         "/app.js" => {
-            RouteResult::Ok(build_http_response(200, "OK", "application/javascript", WEB_APP_JS))
+            RouteResult::Ok(build_http_response(200, "OK", "application/javascript", WEB_APP_JS, is_https))
         }
         "/theme-editor" => {
             let html = WEB_THEME_EDITOR_HTML
                 .replace("{{WS_HOST}}", &sanitized_host)
-                .replace("{{WS_PORT}}", &ws_port.to_string())
+                .replace("{{WS_PORT}}", "0")
                 .replace("{{WS_PROTOCOL}}", if ws_use_tls { "wss" } else { "ws" });
-            RouteResult::Ok(build_http_response(200, "OK", "text/html", &html))
+            RouteResult::Ok(build_http_response(200, "OK", "text/html", &html, is_https))
         }
         "/favicon.ico" => {
-            RouteResult::Ok(build_http_response(204, "No Content", "image/x-icon", ""))
+            RouteResult::Ok(build_http_response(204, "No Content", "image/x-icon", "", is_https))
         }
         _ => {
             RouteResult::NotFound(
-                build_http_response(404, "Not Found", "text/plain", "Not Found"),
+                build_http_response(404, "Not Found", "text/plain", "Not Found", is_https),
                 path.to_string(),
             )
         }
@@ -164,32 +242,65 @@ fn handle_http_routes(
     Some(response)
 }
 
-/// Read an HTTP request from a stream, route it, and write the response.
-/// Returns the 404 path if a violation occurred (for ban tracking).
-async fn serve_http_request<S: AsyncReadExt + AsyncWriteExt + Unpin>(
-    stream: &mut S,
-    ws_port: u16,
+/// Route an incoming connection: detect WebSocket upgrades vs HTTP requests.
+/// If ws_state is provided and the request is a WebSocket upgrade, hands off to the WS handler.
+/// Otherwise, serves static HTTP content.
+async fn route_connection<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
+    mut stream: S,
+    ws_state: Option<Arc<WsConnectionState>>,
     ws_use_tls: bool,
     theme_css_vars: &str,
-) -> Option<String> {
+    client_addr: std::net::SocketAddr,
+    ban_list: &BanList,
+    is_https: bool,
+) {
+    let client_ip = client_addr.ip().to_string();
+
     let mut buf = [0u8; 4096];
     let n = match stream.read(&mut buf).await {
         Ok(n) if n > 0 => n,
-        _ => return None,
+        _ => return,
     };
 
     let request = String::from_utf8_lossy(&buf[..n]);
-    let mut violation_path = None;
 
-    if let Some(route_result) = handle_http_routes(&request, ws_port, ws_use_tls, theme_css_vars) {
+    // Check for WebSocket upgrade
+    if is_websocket_upgrade(&request) {
+        if let Some(ws_state) = ws_state {
+            let client_id = ws_state.next_client_id();
+            let prefixed = PrefixedStream::new(buf[..n].to_vec(), stream);
+            let _ = crate::websocket::handle_ws_client(
+                prefixed,
+                client_id,
+                ws_state.clients.clone(),
+                ws_state.password_hash.clone(),
+                ws_state.allow_list.clone(),
+                ws_state.whitelisted_host.clone(),
+                client_addr,
+                ws_state.event_tx.clone(),
+                ws_state.multiuser_mode,
+                ws_state.users.clone(),
+                ws_state.ban_list.clone(),
+            ).await;
+        } else {
+            // WebSocket not configured (no password set)
+            let response = build_http_response(503, "Service Unavailable", "text/plain", "WebSocket not configured", is_https);
+            let _ = stream.write_all(&response).await;
+        }
+        return;
+    }
+
+    // Normal HTTP request
+    if let Some(route_result) = handle_http_routes(&request, ws_use_tls, theme_css_vars, is_https) {
         let response = match route_result {
             RouteResult::Ok(r) => r,
             RouteResult::MethodNotAllowed(r) => {
                 let _ = stream.write_all(&r).await;
-                return None;
+                return;
             }
             RouteResult::NotFound(r, path) => {
-                violation_path = Some(path);
+                log_http_404(&client_ip, &path);
+                ban_list.record_violation(&client_ip, &path);
                 r
             }
         };
@@ -198,8 +309,28 @@ async fn serve_http_request<S: AsyncReadExt + AsyncWriteExt + Unpin>(
             let _ = stream.shutdown().await;
         }
     }
+}
 
-    violation_path
+/// Shared WebSocket connection state passed from WebSocketServer to the unified HTTP+WS server.
+pub struct WsConnectionState {
+    pub clients: Arc<RwLock<HashMap<u64, crate::websocket::WsClientInfo>>>,
+    pub next_client_id: Arc<std::sync::Mutex<u64>>,
+    pub password_hash: String,
+    pub allow_list: Arc<std::sync::RwLock<Vec<String>>>,
+    pub whitelisted_host: Arc<std::sync::RwLock<Option<String>>>,
+    pub event_tx: tokio::sync::mpsc::Sender<crate::AppEvent>,
+    pub multiuser_mode: bool,
+    pub users: Arc<std::sync::RwLock<HashMap<String, crate::websocket::UserCredential>>>,
+    pub ban_list: BanList,
+}
+
+impl WsConnectionState {
+    pub fn next_client_id(&self) -> u64 {
+        let mut id = self.next_client_id.lock().unwrap();
+        let current = *id;
+        *id += 1;
+        current
+    }
 }
 
 // ============================================================================
@@ -225,14 +356,14 @@ impl HttpsServer {
     }
 }
 
-/// Start the HTTPS server
+/// Start the HTTPS server (unified HTTP+WS)
 #[cfg(feature = "native-tls-backend")]
 pub async fn start_https_server(
     server: &mut HttpsServer,
     cert_file: &str,
     key_file: &str,
-    ws_port: u16,
-    ws_use_tls: bool,
+    ws_state: Option<Arc<WsConnectionState>>,
+    ban_list: BanList,
     theme_css_vars: String,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     use std::fs::File;
@@ -267,15 +398,19 @@ pub async fn start_https_server(
                 result = listener.accept() => {
                     match result {
                         Ok((stream, addr)) => {
-                            // Disable Nagle's algorithm for lower latency
+                            let client_ip = addr.ip().to_string();
+                            if ban_list.is_banned(&client_ip) {
+                                continue;
+                            }
                             let _ = stream.set_nodelay(true);
                             let tls_acceptor = tls_acceptor.clone();
-                            let client_ip = addr.ip().to_string();
                             let theme_css_vars = theme_css_vars.clone();
+                            let ws_state = ws_state.clone();
+                            let ban_list = ban_list.clone();
                             tokio::spawn(async move {
                                 match tls_acceptor.accept(stream).await {
-                                    Ok(mut tls_stream) => {
-                                        serve_http_request(&mut tls_stream, ws_port, ws_use_tls, &theme_css_vars).await;
+                                    Ok(tls_stream) => {
+                                        route_connection(tls_stream, ws_state, true, &theme_css_vars, addr, &ban_list, true).await;
                                     }
                                     Err(e) => {
                                         log_remote_event("TLS-ERROR", &client_ip, &format!("{}", e));
@@ -320,14 +455,14 @@ impl HttpsServer {
     }
 }
 
-/// Start the HTTPS server (rustls version)
+/// Start the HTTPS server (rustls version, unified HTTP+WS)
 #[cfg(feature = "rustls-backend")]
 pub async fn start_https_server(
     server: &mut HttpsServer,
     cert_file: &str,
     key_file: &str,
-    ws_port: u16,
-    ws_use_tls: bool,
+    ws_state: Option<Arc<WsConnectionState>>,
+    ban_list: BanList,
     theme_css_vars: String,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     use std::fs::File;
@@ -395,15 +530,19 @@ pub async fn start_https_server(
                 result = listener.accept() => {
                     match result {
                         Ok((stream, addr)) => {
-                            // Disable Nagle's algorithm for lower latency
+                            let client_ip = addr.ip().to_string();
+                            if ban_list.is_banned(&client_ip) {
+                                continue;
+                            }
                             let _ = stream.set_nodelay(true);
                             let tls_acceptor = tls_acceptor.clone();
-                            let client_ip = addr.ip().to_string();
                             let theme_css_vars = theme_css_vars.clone();
+                            let ws_state = ws_state.clone();
+                            let ban_list = ban_list.clone();
                             tokio::spawn(async move {
                                 match tls_acceptor.accept(stream).await {
-                                    Ok(mut tls_stream) => {
-                                        serve_http_request(&mut tls_stream, ws_port, ws_use_tls, &theme_css_vars).await;
+                                    Ok(tls_stream) => {
+                                        route_connection(tls_stream, ws_state, true, &theme_css_vars, addr, &ban_list, true).await;
                                     }
                                     Err(e) => {
                                         log_remote_event("TLS-ERROR", &client_ip, &format!("{}", e));
@@ -600,32 +739,10 @@ impl HttpServer {
     }
 }
 
-/// Handle an HTTP connection (plain TCP, no TLS) with ban list support
-async fn handle_http_client(
-    mut stream: TcpStream,
-    ws_port: u16,
-    ws_use_tls: bool,
-    ban_list: BanList,
-    client_ip: String,
-    theme_css_vars: Arc<String>,
-) {
-    // Check if IP is banned
-    if ban_list.is_banned(&client_ip) {
-        let _ = stream.write_all(b"HTTP/1.1 403 Forbidden\r\nContent-Length: 7\r\nConnection: close\r\n\r\nBanned\n").await;
-        return;
-    }
-
-    if let Some(violation_path) = serve_http_request(&mut stream, ws_port, ws_use_tls, &theme_css_vars).await {
-        log_http_404(&client_ip, &violation_path);
-        ban_list.record_violation(&client_ip, &violation_path);
-    }
-}
-
-/// Start the HTTP server (plain TCP, no TLS)
+/// Start the HTTP server (plain TCP, no TLS, unified HTTP+WS)
 pub async fn start_http_server(
     server: &mut HttpServer,
-    ws_port: u16,
-    ws_use_tls: bool,
+    ws_state: Option<Arc<WsConnectionState>>,
     ban_list: BanList,
     theme_css_vars: String,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -647,18 +764,16 @@ pub async fn start_http_server(
                     match result {
                         Ok((mut stream, addr)) => {
                             let client_ip = addr.ip().to_string();
-                            // Check if banned before processing
                             if ban_list.is_banned(&client_ip) {
-                                // Send minimal response and close
                                 let _ = stream.write_all(b"HTTP/1.1 403 Forbidden\r\nContent-Length: 7\r\nConnection: close\r\n\r\nBanned\n").await;
                                 continue;
                             }
-                            // Disable Nagle's algorithm for lower latency
                             let _ = stream.set_nodelay(true);
                             let ban_list_clone = ban_list.clone();
                             let theme_css_vars = theme_css_vars.clone();
+                            let ws_state = ws_state.clone();
                             tokio::spawn(async move {
-                                handle_http_client(stream, ws_port, ws_use_tls, ban_list_clone, client_ip, theme_css_vars).await;
+                                route_connection(stream, ws_state, false, &theme_css_vars, addr, &ban_list_clone, false).await;
                             });
                         }
                         Err(_) => break,

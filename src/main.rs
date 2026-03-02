@@ -58,7 +58,7 @@ pub use util::{get_binary_name, strip_ansi_codes, visual_line_count, get_current
 pub use websocket::{
     WsMessage, WorldStateMsg, WorldSettingsMsg, GlobalSettingsMsg, TimestampedLine,
     WsClientInfo, WebSocketServer,
-    hash_password, is_ip_in_allow_list, start_websocket_server,
+    hash_password, hash_with_challenge, is_ip_in_allow_list,
 };
 pub use actions::{
     Action, MatchType, ActionTriggerResult,
@@ -318,7 +318,7 @@ impl EditorSide {
     }
 }
 
-/// What Up/Down or Shift+Up/Down arrow keys do
+/// What Up/Down or Ctrl+Up/Down arrow keys do
 #[derive(Clone, Copy, PartialEq, Default)]
 pub enum ArrowKeyMode {
     #[default]
@@ -968,6 +968,35 @@ pub fn enable_tcp_keepalive(tcp_stream: &TcpStream) {
     let _ = sock_ref.set_tcp_keepalive(&keepalive);
 }
 
+/// An authentication key with creation timestamp for expiry
+#[derive(Clone, Debug)]
+pub struct AuthKey {
+    pub key: String,
+    pub created_at: u64,  // Unix timestamp
+}
+
+impl AuthKey {
+    const EXPIRY_SECS: u64 = 30 * 24 * 3600;  // 30 days
+
+    fn new(key: String) -> Self {
+        Self {
+            key,
+            created_at: std::time::SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs(),
+        }
+    }
+
+    fn is_expired(&self) -> bool {
+        let now = std::time::SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        now.saturating_sub(self.created_at) > Self::EXPIRY_SECS
+    }
+}
+
 #[derive(Clone)]
 pub struct Settings {
     pub more_mode_enabled: bool,
@@ -993,15 +1022,14 @@ pub struct Settings {
     web_secure: bool,              // Protocol: true=Secure (https/wss), false=Non-Secure (http/ws)
     http_enabled: bool,            // Enable HTTP/HTTPS web server (name depends on web_secure)
     http_port: u16,                // Port for HTTP/HTTPS web interface
-    ws_enabled: bool,              // Enable WS/WSS server (name depends on web_secure)
-    ws_port: u16,                  // Port for WS/WSS server
     websocket_password: String,
     websocket_allow_list: String,  // CSV list of hosts that can be whitelisted
     websocket_whitelisted_host: Option<String>,  // Currently whitelisted host (authenticated from allow list)
     websocket_cert_file: String,   // Path to TLS certificate file (PEM) - only used when web_secure=true
     websocket_key_file: String,    // Path to TLS private key file (PEM) - only used when web_secure=true
     // Persistent auth keys for passwordless device authentication (generated after successful password auth)
-    websocket_auth_keys: Vec<String>,
+    // Keys expire after 30 days
+    websocket_auth_keys: Vec<AuthKey>,
     // User-defined actions/triggers
     actions: Vec<Action>,
     // TLS proxy for connection preservation over hot reload
@@ -1016,7 +1044,7 @@ pub struct Settings {
     zwj_enabled: bool,
     // Arrow key behavior settings
     arrow_up_down_mode: ArrowKeyMode,       // What Up/Down does (default: CycleWorlds)
-    shift_arrow_up_down_mode: ArrowKeyMode, // What Shift+Up/Down does (default: InputLine)
+    shift_arrow_up_down_mode: ArrowKeyMode, // What Ctrl+Up/Down does (default: InputLine)
 }
 
 impl Default for Settings {
@@ -1042,8 +1070,6 @@ impl Default for Settings {
             web_secure: false,         // Default to non-secure
             http_enabled: false,
             http_port: 9000,
-            ws_enabled: false,
-            ws_port: 9001,
             websocket_password: String::new(),
             websocket_allow_list: String::new(),
             websocket_whitelisted_host: None,
@@ -2708,10 +2734,11 @@ impl App {
             web_secure: self.settings.web_secure,
             http_enabled: self.settings.http_enabled,
             http_port: self.settings.http_port,
-            ws_enabled: self.settings.ws_enabled,
-            ws_port: self.settings.ws_port,
-            ws_cert_file: self.settings.websocket_cert_file.clone(),
-            ws_key_file: self.settings.websocket_key_file.clone(),
+            ws_enabled: false,  // Legacy
+            ws_port: 0,        // Legacy
+            ws_cert_file: String::new(),
+            ws_key_file: String::new(),
+            tls_configured: !self.settings.websocket_cert_file.is_empty() && !self.settings.websocket_key_file.is_empty(),
             tls_proxy_enabled: self.settings.tls_proxy_enabled,
             dictionary_path: self.settings.dictionary_path.clone(),
             mouse_enabled: self.settings.mouse_enabled,
@@ -2748,10 +2775,14 @@ impl App {
         self.settings.web_secure = settings.web_secure;
         self.settings.http_enabled = settings.http_enabled;
         self.settings.http_port = settings.http_port;
-        self.settings.ws_enabled = settings.ws_enabled;
-        self.settings.ws_port = settings.ws_port;
-        self.settings.websocket_cert_file = settings.ws_cert_file.clone();
-        self.settings.websocket_key_file = settings.ws_key_file.clone();
+        // ws_enabled and ws_port are legacy — ignored
+        // Only update cert/key if non-empty (server sends empty to avoid leaking paths)
+        if !settings.ws_cert_file.is_empty() {
+            self.settings.websocket_cert_file = settings.ws_cert_file.clone();
+        }
+        if !settings.ws_key_file.is_empty() {
+            self.settings.websocket_key_file = settings.ws_key_file.clone();
+        }
         self.settings.tls_proxy_enabled = settings.tls_proxy_enabled;
         self.settings.dictionary_path = settings.dictionary_path.clone();
         self.settings.mouse_enabled = settings.mouse_enabled;
@@ -3046,8 +3077,6 @@ impl App {
             self.settings.web_secure,
             self.settings.http_enabled,
             &self.settings.http_port.to_string(),
-            self.settings.ws_enabled,
-            &self.settings.ws_port.to_string(),
             &self.settings.websocket_password,
             &self.settings.websocket_allow_list,
             &self.settings.websocket_cert_file,
@@ -5057,9 +5086,21 @@ impl App {
     }
 
     /// Handle WsAuthKeyValidation event.
-    fn handle_ws_auth_key_validation(&mut self, client_id: u64, msg: WsMessage, client_ip: &str) {
-        if let WsMessage::AuthRequest { auth_key: Some(key), current_world, .. } = msg {
-            let is_valid = self.settings.websocket_auth_keys.contains(&key);
+    fn handle_ws_auth_key_validation(&mut self, client_id: u64, msg: WsMessage, client_ip: &str, challenge: &str) {
+        if let WsMessage::AuthRequest { auth_key: Some(key), current_world, challenge_response: uses_challenge, .. } = msg {
+            // Prune expired keys
+            self.settings.websocket_auth_keys.retain(|ak| !ak.is_expired());
+
+            // If challenge_response, client sent SHA256(auth_key + challenge)
+            // We compute SHA256(stored_key + challenge) for each stored key and compare
+            let is_valid = if uses_challenge {
+                use crate::websocket::hash_with_challenge;
+                self.settings.websocket_auth_keys.iter().any(|ak| {
+                    hash_with_challenge(&ak.key, challenge) == key
+                })
+            } else {
+                self.settings.websocket_auth_keys.iter().any(|ak| ak.key == key)
+            };
             if is_valid {
                 self.ws_set_client_authenticated(client_id, true);
                 self.ws_send_to_client(client_id, WsMessage::AuthResponse {
@@ -5105,14 +5146,14 @@ impl App {
         hasher.update(client_id.to_le_bytes());
         hasher.update(self.settings.websocket_auth_keys.len().to_le_bytes());
         let key = hex::encode(hasher.finalize());
-        self.settings.websocket_auth_keys.push(key.clone());
+        self.settings.websocket_auth_keys.push(AuthKey::new(key.clone()));
         let _ = persistence::save_settings(self);
         self.ws_send_to_client(client_id, WsMessage::KeyGenerated { auth_key: key });
     }
 
     /// Handle WsKeyRevoke event.
     fn handle_ws_key_revoke(&mut self, key: &str) {
-        self.settings.websocket_auth_keys.retain(|k| k != key);
+        self.settings.websocket_auth_keys.retain(|ak| ak.key != key);
         let _ = persistence::save_settings(self);
     }
 
@@ -6005,7 +6046,8 @@ impl App {
                         hostname: world.settings.hostname.clone(),
                         port: world.settings.port.clone(),
                         user: world.settings.user.clone(),
-                        password: world.settings.password.clone(),
+                        password: String::new(),
+                        has_password: !world.settings.password.is_empty(),
                         use_ssl: world.settings.use_ssl,
                         log_enabled: world.settings.log_enabled,
                         encoding: world.settings.encoding.name().to_string(),
@@ -6201,7 +6243,10 @@ impl App {
                     self.worlds[world_index].settings.hostname = hostname.clone();
                     self.worlds[world_index].settings.port = port.clone();
                     self.worlds[world_index].settings.user = user.clone();
-                    self.worlds[world_index].settings.password = password.clone();
+                    // Only update password if client sent one (empty means "not changed")
+                    if !password.is_empty() {
+                        self.worlds[world_index].settings.password = password.clone();
+                    }
                     self.worlds[world_index].settings.use_ssl = use_ssl;
                     self.worlds[world_index].settings.log_enabled = log_enabled;
                     self.worlds[world_index].settings.encoding = match encoding.as_str() {
@@ -6215,12 +6260,13 @@ impl App {
                     self.worlds[world_index].settings.gmcp_packages = gmcp_packages.clone();
                     // Save settings to persist changes
                     let _ = persistence::save_settings(self);
-                    // Build settings message for broadcast (encrypt password)
+                    // Build settings message for broadcast (don't leak password)
                     let settings_msg = WorldSettingsMsg {
                         hostname,
                         port,
                         user,
-                        password: encrypt_password(&password),
+                        has_password: !password.is_empty(),
+                        password: String::new(),
                         use_ssl,
                         log_enabled,
                         encoding,
@@ -6237,7 +6283,7 @@ impl App {
                     });
                 }
             }
-            WsMessage::UpdateGlobalSettings { more_mode_enabled, spell_check_enabled, temp_convert_enabled, world_switch_mode, show_tags, debug_enabled, ansi_music_enabled, console_theme, gui_theme, gui_transparency, color_offset_percent, input_height, font_name, font_size, web_font_size_phone, web_font_size_tablet, web_font_size_desktop, web_font_weight, ws_allow_list, web_secure, http_enabled, http_port, ws_enabled, ws_port, ws_cert_file, ws_key_file, tls_proxy_enabled, dictionary_path, mouse_enabled, zwj_enabled, arrow_up_down_mode, shift_arrow_up_down_mode } => {
+            WsMessage::UpdateGlobalSettings { more_mode_enabled, spell_check_enabled, temp_convert_enabled, world_switch_mode, show_tags, debug_enabled, ansi_music_enabled, console_theme, gui_theme, gui_transparency, color_offset_percent, input_height, font_name, font_size, web_font_size_phone, web_font_size_tablet, web_font_size_desktop, web_font_weight, ws_allow_list, web_secure, http_enabled, http_port, ws_enabled: _, ws_port: _, ws_cert_file, ws_key_file, tls_proxy_enabled, dictionary_path, mouse_enabled, zwj_enabled, arrow_up_down_mode, shift_arrow_up_down_mode } => {
                 // Update global settings from remote client
                 self.settings.more_mode_enabled = more_mode_enabled;
                 self.settings.spell_check_enabled = spell_check_enabled;
@@ -6269,8 +6315,7 @@ impl App {
                 self.settings.web_secure = web_secure;
                 self.settings.http_enabled = http_enabled;
                 self.settings.http_port = http_port;
-                self.settings.ws_enabled = ws_enabled;
-                self.settings.ws_port = ws_port;
+                // ws_enabled and ws_port are legacy — ignored
                 self.settings.websocket_cert_file = ws_cert_file;
                 self.settings.websocket_key_file = ws_key_file;
                 self.settings.tls_proxy_enabled = tls_proxy_enabled;
@@ -6284,42 +6329,8 @@ impl App {
                 }
                 // Save settings to persist changes
                 let _ = persistence::save_settings(self);
-                // Build settings message for broadcast
-                let settings_msg = GlobalSettingsMsg {
-                    more_mode_enabled: self.settings.more_mode_enabled,
-                    spell_check_enabled: self.settings.spell_check_enabled,
-                    temp_convert_enabled: self.settings.temp_convert_enabled,
-                    world_switch_mode: self.settings.world_switch_mode.name().to_string(),
-                    debug_enabled: self.settings.debug_enabled,
-                    show_tags: self.show_tags,
-                    ansi_music_enabled: self.settings.ansi_music_enabled,
-                    console_theme: self.settings.theme.name().to_string(),
-                    gui_theme: self.settings.gui_theme.name().to_string(),
-                    gui_transparency: self.settings.gui_transparency,
-                    color_offset_percent: self.settings.color_offset_percent,
-                    input_height: self.input_height,
-                    font_name: self.settings.font_name.clone(),
-                    font_size: self.settings.font_size,
-                    web_font_size_phone: self.settings.web_font_size_phone,
-                    web_font_size_tablet: self.settings.web_font_size_tablet,
-                    web_font_size_desktop: self.settings.web_font_size_desktop,
-                    web_font_weight: self.settings.web_font_weight,
-                    ws_allow_list: self.settings.websocket_allow_list.clone(),
-                    web_secure: self.settings.web_secure,
-                    http_enabled: self.settings.http_enabled,
-                    http_port: self.settings.http_port,
-                    ws_enabled: self.settings.ws_enabled,
-                    ws_port: self.settings.ws_port,
-                    ws_cert_file: self.settings.websocket_cert_file.clone(),
-                    ws_key_file: self.settings.websocket_key_file.clone(),
-                    tls_proxy_enabled: self.settings.tls_proxy_enabled,
-                    dictionary_path: self.settings.dictionary_path.clone(),
-                    mouse_enabled: self.settings.mouse_enabled,
-                    zwj_enabled: self.settings.zwj_enabled,
-                    arrow_up_down_mode: self.settings.arrow_up_down_mode.name().to_string(),
-                    shift_arrow_up_down_mode: self.settings.shift_arrow_up_down_mode.name().to_string(),
-                    theme_colors_json: self.gui_theme_colors().to_json(),
-                };
+                // Build settings message for broadcast (uses build_global_settings_msg to avoid leaking sensitive data)
+                let settings_msg = self.build_global_settings_msg();
                 // Broadcast update to all clients
                 self.ws_broadcast(WsMessage::GlobalSettingsUpdated {
                     settings: settings_msg,
@@ -6852,7 +6863,8 @@ impl App {
                     hostname: world.settings.hostname.clone(),
                     port: world.settings.port.clone(),
                     user: world.settings.user.clone(),
-                    password: world.settings.password.clone(),
+                    password: String::new(),
+                    has_password: !world.settings.password.is_empty(),
                     use_ssl: world.settings.use_ssl,
                     log_enabled: world.settings.log_enabled,
                     encoding: world.settings.encoding.name().to_string(),
@@ -6873,41 +6885,7 @@ impl App {
             }
         }).collect();
 
-        let settings = GlobalSettingsMsg {
-            more_mode_enabled: self.settings.more_mode_enabled,
-            spell_check_enabled: self.settings.spell_check_enabled,
-            temp_convert_enabled: self.settings.temp_convert_enabled,
-            world_switch_mode: self.settings.world_switch_mode.name().to_string(),
-            debug_enabled: self.settings.debug_enabled,
-            show_tags: self.show_tags,
-            ansi_music_enabled: self.settings.ansi_music_enabled,
-            console_theme: self.settings.theme.name().to_string(),
-            gui_theme: self.settings.gui_theme.name().to_string(),
-            gui_transparency: self.settings.gui_transparency,
-            color_offset_percent: self.settings.color_offset_percent,
-            input_height: self.input_height,
-            font_name: self.settings.font_name.clone(),
-            font_size: self.settings.font_size,
-            web_font_size_phone: self.settings.web_font_size_phone,
-            web_font_size_tablet: self.settings.web_font_size_tablet,
-            web_font_size_desktop: self.settings.web_font_size_desktop,
-            web_font_weight: self.settings.web_font_weight,
-            ws_allow_list: self.settings.websocket_allow_list.clone(),
-            web_secure: self.settings.web_secure,
-            http_enabled: self.settings.http_enabled,
-            http_port: self.settings.http_port,
-            ws_enabled: self.settings.ws_enabled,
-            ws_port: self.settings.ws_port,
-            ws_cert_file: self.settings.websocket_cert_file.clone(),
-            ws_key_file: self.settings.websocket_key_file.clone(),
-            tls_proxy_enabled: self.settings.tls_proxy_enabled,
-            dictionary_path: self.settings.dictionary_path.clone(),
-            mouse_enabled: self.settings.mouse_enabled,
-            zwj_enabled: self.settings.zwj_enabled,
-            arrow_up_down_mode: self.settings.arrow_up_down_mode.name().to_string(),
-            shift_arrow_up_down_mode: self.settings.shift_arrow_up_down_mode.name().to_string(),
-            theme_colors_json: self.gui_theme_colors().to_json(),
-        };
+        let settings = self.build_global_settings_msg();
 
         WsMessage::InitialState {
             worlds,
@@ -7409,7 +7387,7 @@ pub enum AppEvent {
     WsClientConnected(u64),                    // client_id
     WsClientDisconnected(u64),                 // client_id
     WsClientMessage(u64, Box<WsMessage>),      // client_id, message
-    WsAuthKeyValidation(u64, Box<WsMessage>, String),   // client_id, AuthRequest with auth_key, client_ip
+    WsAuthKeyValidation(u64, Box<WsMessage>, String, String),   // client_id, AuthRequest with auth_key, client_ip, challenge
     WsKeyRequest(u64),                         // client_id - generate and send new auth key
     WsKeyRevoke(u64, String),                  // client_id, auth_key to revoke
     // Multiuser mode events (include username for per-user connection isolation)
@@ -8232,12 +8210,12 @@ async fn run_console_client(addr: &str) -> io::Result<()> {
         }
     });
 
-    // Wait for ServerHello to know if we're in multiuser mode
-    let multiuser_mode = loop {
+    // Wait for ServerHello to know if we're in multiuser mode and get challenge
+    let (multiuser_mode, server_challenge) = loop {
         match ws_read.next().await {
             Some(Ok(Message::Text(text))) => {
-                if let Ok(WsMessage::ServerHello { multiuser_mode: is_multiuser }) = serde_json::from_str::<WsMessage>(&text) {
-                    break is_multiuser;
+                if let Ok(WsMessage::ServerHello { multiuser_mode: is_multiuser, challenge }) = serde_json::from_str::<WsMessage>(&text) {
+                    break (is_multiuser, challenge);
                 }
             }
             Some(Ok(Message::Close(_))) | None => {
@@ -8306,9 +8284,10 @@ async fn run_console_client(addr: &str) -> io::Result<()> {
                         KeyCode::Enter => {
                             disable_raw_mode()?;
                             println!(); // Move to next line after password
-                            // Send authentication
+                            // Send authentication with challenge-response
                             let password_hash = hash_password(&password);
-                            let _ = ws_tx.send(WsMessage::AuthRequest { password_hash, username, current_world: None, auth_key: None, request_key: false });
+                            let challenge_hash = hash_with_challenge(&password_hash, &server_challenge);
+                            let _ = ws_tx.send(WsMessage::AuthRequest { password_hash: challenge_hash, username, current_world: None, auth_key: None, request_key: false, challenge_response: true });
                             break;
                         }
                         KeyCode::Char(c) => {
@@ -8750,8 +8729,8 @@ fn handle_remote_client_key(
                     web_secure: app.settings.web_secure,
                     http_enabled: app.settings.http_enabled,
                     http_port: app.settings.http_port,
-                    ws_enabled: app.settings.ws_enabled,
-                    ws_port: app.settings.ws_port,
+                    ws_enabled: false,  // Legacy
+                    ws_port: 0,        // Legacy
                     ws_cert_file: app.settings.websocket_cert_file.clone(),
                     ws_key_file: app.settings.websocket_key_file.clone(),
                     tls_proxy_enabled: app.settings.tls_proxy_enabled,
@@ -8767,8 +8746,6 @@ fn handle_remote_client_key(
                 app.settings.web_secure = settings.web_secure;
                 app.settings.http_enabled = settings.http_enabled;
                 app.settings.http_port = settings.http_port.parse().unwrap_or(9000);
-                app.settings.ws_enabled = settings.ws_enabled;
-                app.settings.ws_port = settings.ws_port.parse().unwrap_or(9002);
                 app.settings.websocket_allow_list = settings.ws_allow_list.clone();
                 app.settings.websocket_cert_file = settings.ws_cert_file.clone();
                 app.settings.websocket_key_file = settings.ws_key_file.clone();
@@ -8798,8 +8775,8 @@ fn handle_remote_client_key(
                     web_secure: app.settings.web_secure,
                     http_enabled: app.settings.http_enabled,
                     http_port: app.settings.http_port,
-                    ws_enabled: app.settings.ws_enabled,
-                    ws_port: app.settings.ws_port,
+                    ws_enabled: false,  // Legacy
+                    ws_port: 0,         // Legacy
                     ws_cert_file: app.settings.websocket_cert_file.clone(),
                     ws_key_file: app.settings.websocket_key_file.clone(),
                     tls_proxy_enabled: app.settings.tls_proxy_enabled,
@@ -9105,10 +9082,32 @@ fn handle_remote_client_key(
             app.needs_output_redraw = true;
         }
         (KeyModifiers::CONTROL, Up) => {
-            app.input.move_cursor_up();
+            // Ctrl+Up - configurable behavior (same as Shift+Up)
+            match app.settings.shift_arrow_up_down_mode {
+                ArrowKeyMode::CycleWorlds => {
+                    let _ = ws_tx.send(WsMessage::CalculatePrevWorld { current_index: app.current_world_index });
+                }
+                ArrowKeyMode::InputLine => {
+                    app.input.move_cursor_up();
+                }
+                ArrowKeyMode::CommandHistory => {
+                    app.input.history_prev();
+                }
+            }
         }
         (KeyModifiers::CONTROL, Down) => {
-            app.input.move_cursor_down();
+            // Ctrl+Down - configurable behavior (same as Shift+Down)
+            match app.settings.shift_arrow_up_down_mode {
+                ArrowKeyMode::CycleWorlds => {
+                    let _ = ws_tx.send(WsMessage::CalculateNextWorld { current_index: app.current_world_index });
+                }
+                ArrowKeyMode::InputLine => {
+                    app.input.move_cursor_down();
+                }
+                ArrowKeyMode::CommandHistory => {
+                    app.input.history_next();
+                }
+            }
         }
         (KeyModifiers::ALT, Up) => {
             // Resize input area smaller
@@ -9478,8 +9477,6 @@ struct WebSettings {
     web_secure: bool,
     http_enabled: bool,
     http_port: String,
-    ws_enabled: bool,
-    ws_port: String,
     ws_password: String,
     ws_allow_list: String,
     ws_cert_file: String,
@@ -9556,7 +9553,7 @@ fn handle_new_popup_key(app: &mut App, key: KeyEvent) -> NewPopupAction {
     };
     use popup::definitions::web::{
         WEB_FIELD_PROTOCOL, WEB_FIELD_HTTP_ENABLED, WEB_FIELD_HTTP_PORT,
-        WEB_FIELD_WS_ENABLED, WEB_FIELD_WS_PORT, WEB_FIELD_WS_PASSWORD,
+        WEB_FIELD_WS_PASSWORD,
         WEB_FIELD_WS_ALLOW_LIST, WEB_FIELD_WS_CERT_FILE, WEB_FIELD_WS_KEY_FILE,
         WEB_BTN_SAVE, WEB_BTN_CANCEL, update_tls_visibility,
     };
@@ -9972,8 +9969,6 @@ fn handle_new_popup_key(app: &mut App, key: KeyEvent) -> NewPopupAction {
                     web_secure: state.get_selected(WEB_FIELD_PROTOCOL) == Some("secure"),
                     http_enabled: state.get_bool(WEB_FIELD_HTTP_ENABLED).unwrap_or(false),
                     http_port: state.get_text(WEB_FIELD_HTTP_PORT).unwrap_or("9000").to_string(),
-                    ws_enabled: state.get_bool(WEB_FIELD_WS_ENABLED).unwrap_or(false),
-                    ws_port: state.get_text(WEB_FIELD_WS_PORT).unwrap_or("9002").to_string(),
                     ws_password: state.get_text(WEB_FIELD_WS_PASSWORD).unwrap_or("").to_string(),
                     ws_allow_list: state.get_text(WEB_FIELD_WS_ALLOW_LIST).unwrap_or("").to_string(),
                     ws_cert_file: state.get_text(WEB_FIELD_WS_CERT_FILE).unwrap_or("").to_string(),
@@ -11522,65 +11517,31 @@ pub async fn run_app_headless(
         }
     }
 
-    // Apply WS override for webview-gui master mode (local-only WS server)
-    if let Some((ws_port, ref ws_password)) = ws_override {
-        app.settings.ws_enabled = true;
-        app.settings.ws_port = ws_port;
+    // Apply WS override for webview-gui master mode (local-only server)
+    if let Some((_ws_port, ref ws_password)) = ws_override {
+        app.settings.http_enabled = true;
+        app.settings.http_port = _ws_port;
         app.settings.websocket_password = ws_password.clone();
     }
 
-    // Start WebSocket server if enabled
-    if app.settings.ws_enabled && !app.settings.websocket_password.is_empty() {
-        let mut server = WebSocketServer::new(
+    // Create WebSocket server state (for client management, no standalone listener)
+    let ws_state = if !app.settings.websocket_password.is_empty() {
+        let server = WebSocketServer::new(
             &app.settings.websocket_password,
-            app.settings.ws_port,
+            app.settings.http_port,
             &app.settings.websocket_allow_list,
             app.settings.websocket_whitelisted_host.clone(),
             false,
             app.ban_list.clone(),
         );
+        let state = Arc::new(server.connection_state(event_tx.clone()));
+        app.ws_server = Some(server);
+        Some(state)
+    } else {
+        None
+    };
 
-        // Bind to localhost only for webview-gui master mode
-        if ws_override.is_some() {
-            server.bind_addr = "127.0.0.1".to_string();
-        }
-
-        #[cfg(feature = "native-tls-backend")]
-        let tls_configured = if app.settings.web_secure
-            && !app.settings.websocket_cert_file.is_empty()
-            && !app.settings.websocket_key_file.is_empty()
-        {
-            match server.configure_tls(&app.settings.websocket_cert_file, &app.settings.websocket_key_file) {
-                Ok(()) => true,
-                Err(e) => { eprintln!("Warning: Failed to configure WSS TLS: {}", e); false }
-            }
-        } else { false };
-        #[cfg(feature = "rustls-backend")]
-        let tls_configured = if app.settings.web_secure
-            && !app.settings.websocket_cert_file.is_empty()
-            && !app.settings.websocket_key_file.is_empty()
-        {
-            match server.configure_tls(&app.settings.websocket_cert_file, &app.settings.websocket_key_file) {
-                Ok(()) => true,
-                Err(e) => { eprintln!("Warning: Failed to configure WSS TLS: {}", e); false }
-            }
-        } else { false };
-
-        if let Err(e) = start_websocket_server(&mut server, event_tx.clone()).await {
-            let err_str = e.to_string();
-            if !err_str.contains("Address in use") && !err_str.contains("address already in use") {
-                eprintln!("Warning: Failed to start WebSocket server: {}", e);
-            }
-        } else {
-            if !app.is_reload {
-                let protocol = if tls_configured { "wss" } else { "ws" };
-                debug_log(true, &format!("WebSocket server started on port {} ({})", app.settings.ws_port, protocol));
-            }
-            app.ws_server = Some(server);
-        }
-    }
-
-    // Start HTTP/HTTPS server if enabled
+    // Start unified HTTP+WS server if enabled
     if app.settings.http_enabled {
         if app.settings.web_secure
             && !app.settings.websocket_cert_file.is_empty()
@@ -11593,8 +11554,8 @@ pub async fn run_app_headless(
                     &mut https_server,
                     &app.settings.websocket_cert_file,
                     &app.settings.websocket_key_file,
-                    app.settings.ws_port,
-                    true,
+                    ws_state.clone(),
+                    app.ban_list.clone(),
                     app.gui_theme_colors().to_css_vars(),
                 ).await {
                     Ok(()) => { app.https_server = Some(https_server); }
@@ -11613,8 +11574,8 @@ pub async fn run_app_headless(
                     &mut https_server,
                     &app.settings.websocket_cert_file,
                     &app.settings.websocket_key_file,
-                    app.settings.ws_port,
-                    true,
+                    ws_state.clone(),
+                    app.ban_list.clone(),
                     app.gui_theme_colors().to_css_vars(),
                 ).await {
                     Ok(()) => { app.https_server = Some(https_server); }
@@ -11630,8 +11591,7 @@ pub async fn run_app_headless(
             let mut http_server = HttpServer::new(app.settings.http_port);
             match start_http_server(
                 &mut http_server,
-                app.settings.ws_port,
-                false,
+                ws_state.clone(),
                 app.ban_list.clone(),
                 app.gui_theme_colors().to_css_vars(),
             ).await {
@@ -11811,8 +11771,8 @@ pub async fn run_app_headless(
                     AppEvent::WsClientDisconnected(client_id) => {
                         app.handle_ws_client_disconnected(client_id);
                     }
-                    AppEvent::WsAuthKeyValidation(client_id, msg, client_ip) => {
-                        app.handle_ws_auth_key_validation(client_id, *msg, &client_ip);
+                    AppEvent::WsAuthKeyValidation(client_id, msg, client_ip, challenge) => {
+                        app.handle_ws_auth_key_validation(client_id, *msg, &client_ip, &challenge);
                     }
                     AppEvent::WsKeyRequest(client_id) => {
                         app.handle_ws_key_request(client_id);
@@ -12839,71 +12799,30 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
 
     debug_log(true, "STARTUP: Keepalives sent, starting servers...");
 
-    // Start WebSocket server if enabled (ws:// or wss:// based on web_secure setting)
-    if app.settings.ws_enabled && !app.settings.websocket_password.is_empty() {
-        let mut server = WebSocketServer::new(
+    // Create WebSocket server state (for client management, no standalone listener)
+    let ws_state = if !app.settings.websocket_password.is_empty() {
+        let server = WebSocketServer::new(
             &app.settings.websocket_password,
-            app.settings.ws_port,
+            app.settings.http_port,
             &app.settings.websocket_allow_list,
             app.settings.websocket_whitelisted_host.clone(),
             app.multiuser_mode,
             app.ban_list.clone(),
         );
+        let state = Arc::new(server.connection_state(event_tx.clone()));
+        app.ws_server = Some(server);
+        Some(state)
+    } else {
+        None
+    };
 
-        // Configure TLS if secure mode and cert/key files are specified
-        #[cfg(feature = "native-tls-backend")]
-        let tls_configured = if app.settings.web_secure
-            && !app.settings.websocket_cert_file.is_empty()
-            && !app.settings.websocket_key_file.is_empty()
-        {
-            match server.configure_tls(&app.settings.websocket_cert_file, &app.settings.websocket_key_file) {
-                Ok(()) => true,
-                Err(e) => {
-                    app.add_output(&format!("Warning: Failed to configure WSS TLS: {}", e));
-                    false
-                }
-            }
-        } else {
-            false
-        };
-        #[cfg(feature = "rustls-backend")]
-        let tls_configured = if app.settings.web_secure
-            && !app.settings.websocket_cert_file.is_empty()
-            && !app.settings.websocket_key_file.is_empty()
-        {
-            match server.configure_tls(&app.settings.websocket_cert_file, &app.settings.websocket_key_file) {
-                Ok(()) => true,
-                Err(e) => {
-                    app.add_output(&format!("Warning: Failed to configure WSS TLS: {}", e));
-                    false
-                }
-            }
-        } else {
-            false
-        };
-
-        if let Err(e) = start_websocket_server(&mut server, event_tx.clone()).await {
-            // Don't show error if port is in use (likely another clay instance)
-            let err_str = e.to_string();
-            if !err_str.contains("Address in use") && !err_str.contains("address already in use") {
-                app.add_output(&format!("Warning: Failed to start WebSocket server: {}", e));
-            }
-        } else {
-            if !app.is_reload {
-                let protocol = if tls_configured { "wss" } else { "ws" };
-                app.add_output(&format!("WebSocket server started on port {} ({})", app.settings.ws_port, protocol));
-            }
-            app.ws_server = Some(server);
-        }
-    }
-
-    // Start HTTP/HTTPS web interface server if enabled
+    // Start unified HTTP+WS server if enabled
     if app.settings.http_enabled {
         if app.settings.web_secure
             && !app.settings.websocket_cert_file.is_empty()
             && !app.settings.websocket_key_file.is_empty()
         {
-            // Start HTTPS server (secure mode)
+            // Start HTTPS+WSS server (secure mode)
             #[cfg(feature = "native-tls-backend")]
             {
                 let mut https_server = HttpsServer::new(app.settings.http_port);
@@ -12911,13 +12830,13 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                     &mut https_server,
                     &app.settings.websocket_cert_file,
                     &app.settings.websocket_key_file,
-                    app.settings.ws_port,
-                    true, // HTTPS uses secure WebSocket (wss://)
+                    ws_state.clone(),
+                    app.ban_list.clone(),
                     app.gui_theme_colors().to_css_vars(),
                 ).await {
                     Ok(()) => {
                         if !app.is_reload {
-                            app.add_output(&format!("HTTPS web interface started on port {} (wss://localhost:{})", app.settings.http_port, app.settings.ws_port));
+                            app.add_output(&format!("HTTPS web interface started on port {}", app.settings.http_port));
                         }
                         app.https_server = Some(https_server);
                     }
@@ -12936,13 +12855,13 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                     &mut https_server,
                     &app.settings.websocket_cert_file,
                     &app.settings.websocket_key_file,
-                    app.settings.ws_port,
-                    true, // HTTPS uses secure WebSocket (wss://)
+                    ws_state.clone(),
+                    app.ban_list.clone(),
                     app.gui_theme_colors().to_css_vars(),
                 ).await {
                     Ok(()) => {
                         if !app.is_reload {
-                            app.add_output(&format!("HTTPS web interface started on port {} (wss://localhost:{})", app.settings.http_port, app.settings.ws_port));
+                            app.add_output(&format!("HTTPS web interface started on port {}", app.settings.http_port));
                         }
                         app.https_server = Some(https_server);
                     }
@@ -12955,18 +12874,17 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                 }
             }
         } else {
-            // Start HTTP server (non-secure mode)
+            // Start HTTP+WS server (non-secure mode)
             let mut http_server = HttpServer::new(app.settings.http_port);
             match start_http_server(
                 &mut http_server,
-                app.settings.ws_port,
-                false, // HTTP uses non-secure WebSocket (ws://)
+                ws_state.clone(),
                 app.ban_list.clone(),
                 app.gui_theme_colors().to_css_vars(),
             ).await {
                 Ok(()) => {
                     if !app.is_reload {
-                        app.add_output(&format!("HTTP web interface started on port {} (ws://localhost:{})", app.settings.http_port, app.settings.ws_port));
+                        app.add_output(&format!("HTTP web interface started on port {}", app.settings.http_port));
                     }
                     app.http_server = Some(http_server);
                 }
@@ -13770,8 +13688,8 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                     AppEvent::WsClientDisconnected(client_id) => {
                         app.handle_ws_client_disconnected(client_id);
                     }
-                    AppEvent::WsAuthKeyValidation(client_id, msg, client_ip) => {
-                        app.handle_ws_auth_key_validation(client_id, *msg, &client_ip);
+                    AppEvent::WsAuthKeyValidation(client_id, msg, client_ip, challenge) => {
+                        app.handle_ws_auth_key_validation(client_id, *msg, &client_ip, &challenge);
                     }
                     AppEvent::WsKeyRequest(client_id) => {
                         app.handle_ws_key_request(client_id);
@@ -14423,8 +14341,8 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                 AppEvent::WsClientDisconnected(client_id) => {
                     app.handle_ws_client_disconnected(client_id);
                 }
-                AppEvent::WsAuthKeyValidation(client_id, msg, client_ip) => {
-                    app.handle_ws_auth_key_validation(client_id, *msg, &client_ip);
+                AppEvent::WsAuthKeyValidation(client_id, msg, client_ip, challenge) => {
+                    app.handle_ws_auth_key_validation(client_id, *msg, &client_ip, &challenge);
                 }
                 AppEvent::WsKeyRequest(client_id) => {
                     app.handle_ws_key_request(client_id);
@@ -15091,8 +15009,6 @@ fn handle_key_event(key: KeyEvent, app: &mut App) -> KeyAction {
                 app.settings.web_secure = settings.web_secure;
                 app.settings.http_enabled = settings.http_enabled;
                 app.settings.http_port = settings.http_port.parse().unwrap_or(9000);
-                app.settings.ws_enabled = settings.ws_enabled;
-                app.settings.ws_port = settings.ws_port.parse().unwrap_or(9002);
                 app.settings.websocket_password = settings.ws_password;
                 app.settings.websocket_allow_list = settings.ws_allow_list;
                 app.settings.websocket_cert_file = settings.ws_cert_file;
@@ -15683,14 +15599,40 @@ fn handle_key_event(key: KeyEvent, app: &mut App) -> KeyAction {
         return KeyAction::None;
     }
 
-    // Ctrl+Up/Down - move cursor up/down in multi-line input
+    // Ctrl+Up/Down - configurable behavior (same as Shift+Up/Down)
     if key.code == KeyCode::Up && key.modifiers.contains(KeyModifiers::CONTROL) && !key.modifiers.contains(KeyModifiers::ALT) {
-        app.input.move_cursor_up();
-        return KeyAction::None;
+        match app.settings.shift_arrow_up_down_mode {
+            ArrowKeyMode::CycleWorlds => {
+                app.prev_world();
+                return KeyAction::SwitchedWorld(app.current_world_index);
+            }
+            ArrowKeyMode::InputLine => {
+                app.input.move_cursor_up();
+                return KeyAction::None;
+            }
+            ArrowKeyMode::CommandHistory => {
+                app.input.history_prev();
+                app.spell_state.reset();
+                return KeyAction::None;
+            }
+        }
     }
     if key.code == KeyCode::Down && key.modifiers.contains(KeyModifiers::CONTROL) && !key.modifiers.contains(KeyModifiers::ALT) {
-        app.input.move_cursor_down();
-        return KeyAction::None;
+        match app.settings.shift_arrow_up_down_mode {
+            ArrowKeyMode::CycleWorlds => {
+                app.next_world();
+                return KeyAction::SwitchedWorld(app.current_world_index);
+            }
+            ArrowKeyMode::InputLine => {
+                app.input.move_cursor_down();
+                return KeyAction::None;
+            }
+            ArrowKeyMode::CommandHistory => {
+                app.input.history_next();
+                app.spell_state.reset();
+                return KeyAction::None;
+            }
+        }
     }
 
     // Shift+Up/Down - configurable behavior
@@ -20339,7 +20281,7 @@ mod tests {
         let client_password = "test";
         let client_hash = hash_password(client_password);
         println!("Client sending hash: {}", client_hash);
-        let auth_msg = WsMessage::AuthRequest { password_hash: client_hash, username: None, current_world: None, auth_key: None, request_key: false };
+        let auth_msg = WsMessage::AuthRequest { password_hash: client_hash, username: None, current_world: None, auth_key: None, request_key: false, challenge_response: false };
         let json = serde_json::to_string(&auth_msg).unwrap();
         ws_sink.send(WsRawMessage::Text(json.into())).await.unwrap();
 
@@ -21065,6 +21007,7 @@ mod tests {
             current_world: None,
             auth_key: None,
             request_key: false,
+            challenge_response: false,
         };
         let json = serde_json::to_string(&auth_msg).unwrap();
         ws_sink.send(WsRawMessage::Text(json.into())).await.unwrap();
@@ -21168,6 +21111,7 @@ mod tests {
             current_world: None,
             auth_key: None,
             request_key: false,
+            challenge_response: false,
         };
         sink1.send(WsRawMessage::Text(serde_json::to_string(&auth1).unwrap().into())).await.unwrap();
         let error1 = if let Some(Ok(WsRawMessage::Text(text))) = source1.next().await {
@@ -21187,6 +21131,7 @@ mod tests {
             current_world: None,
             auth_key: None,
             request_key: false,
+            challenge_response: false,
         };
         sink2.send(WsRawMessage::Text(serde_json::to_string(&auth2).unwrap().into())).await.unwrap();
         let error2 = if let Some(Ok(WsRawMessage::Text(text))) = source2.next().await {
@@ -21313,11 +21258,12 @@ mod tests {
             current_world: None,
             auth_key: Some("test_key".to_string()),
             request_key: false,
+            challenge_response: false,
         };
-        let event = AppEvent::WsAuthKeyValidation(1, Box::new(msg), "10.0.0.1".to_string());
+        let event = AppEvent::WsAuthKeyValidation(1, Box::new(msg), "10.0.0.1".to_string(), "test_challenge".to_string());
 
         // Verify we can extract the IP from the event
-        if let AppEvent::WsAuthKeyValidation(_client_id, _msg, client_ip) = event {
+        if let AppEvent::WsAuthKeyValidation(_client_id, _msg, client_ip, _challenge) = event {
             assert_eq!(client_ip, "10.0.0.1");
         } else {
             panic!("Event should be WsAuthKeyValidation");
@@ -21376,6 +21322,7 @@ mod tests {
             current_world: None,
             auth_key: None,
             request_key: false,
+            challenge_response: false,
         };
         sink.send(WsRawMessage::Text(serde_json::to_string(&auth).unwrap().into())).await.unwrap();
 

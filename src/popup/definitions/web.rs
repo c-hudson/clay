@@ -31,13 +31,10 @@ pub fn protocol_options() -> Vec<SelectOption> {
 }
 
 /// Create the web settings popup definition with current values
-#[allow(clippy::too_many_arguments)]
 pub fn create_web_popup(
     web_secure: bool,
     http_enabled: bool,
     http_port: &str,
-    ws_enabled: bool,
-    ws_port: &str,
     ws_password: &str,
     ws_allow_list: &str,
     ws_cert_file: &str,
@@ -60,16 +57,6 @@ pub fn create_web_popup(
             WEB_FIELD_HTTP_PORT,
             "HTTP Port",
             FieldKind::text(http_port),
-        ))
-        .with_field(Field::new(
-            WEB_FIELD_WS_ENABLED,
-            "WS Enabled",
-            FieldKind::toggle(ws_enabled),
-        ))
-        .with_field(Field::new(
-            WEB_FIELD_WS_PORT,
-            "WS Port",
-            FieldKind::text(ws_port),
         ))
         .with_field(Field::new(
             WEB_FIELD_WS_PASSWORD,
@@ -139,7 +126,7 @@ mod tests {
     fn test_web_popup_creation() {
         let def = create_web_popup(
             false, true, "9000",
-            true, "9001", "secret", "",
+            "secret", "",
             "/path/to/cert", "/path/to/key",
         );
         let state = PopupState::new(def);
@@ -153,7 +140,7 @@ mod tests {
         // Non-secure mode - TLS fields hidden
         let def = create_web_popup(
             false, true, "9000",
-            true, "9001", "secret", "",
+            "secret", "",
             "", "",
         );
         let state = PopupState::new(def);
@@ -164,7 +151,7 @@ mod tests {
         // Secure mode - TLS fields visible
         let def = create_web_popup(
             true, true, "9000",
-            true, "9001", "secret", "",
+            "secret", "",
             "", "",
         );
         let state = PopupState::new(def);
