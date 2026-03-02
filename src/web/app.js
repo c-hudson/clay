@@ -1056,11 +1056,6 @@
         // Base64 encoded version for safer message passing from Java
         window.onNativeWebSocketMessageBase64 = function(base64Data) {
             try {
-                // Acknowledge receipt to Android
-                if (window.Android && window.Android.messageAck) {
-                    window.Android.messageAck();
-                }
-
                 // Decode Base64 to string
                 const data = atob(base64Data);
                 // Convert from UTF-8 bytes to string
@@ -1567,6 +1562,13 @@
                         }
                         if (minSeq !== Infinity) world._oldest_seq = minSeq;
                     }
+                    // Track max seq for duplicate detection
+                    world._max_seq = 0;
+                    for (const line of world.output_lines) {
+                        if (line.seq !== undefined && line.seq > world._max_seq) {
+                            world._max_seq = line.seq;
+                        }
+                    }
                     // Don't merge pending_lines - they stay on the server and are
                     // released via PgDn/Tab, then broadcast as ServerData.
                     // This avoids duplicate lines when pending is released.
@@ -1716,6 +1718,29 @@
                         worldOutputCache[msg.world_index] = [];
                     }
                     if (msg.data) {
+                        // Dedup: skip ServerData that has already been received (e.g., after resync)
+                        if (msg.seq && msg.seq > 0 && world._max_seq && msg.seq <= world._max_seq) {
+                            const dupInfo = {
+                                world_index: msg.world_index,
+                                msg_seq: msg.seq,
+                                max_seq: world._max_seq,
+                                line_count: msg.data.split('\n').length,
+                                first_line: msg.data.substring(0, 200),
+                                timestamp: new Date().toISOString()
+                            };
+                            console.warn('DUPLICATE ServerData detected:', dupInfo);
+                            // Report to server for persistent logging
+                            send({
+                                type: 'ReportDuplicate',
+                                world_index: msg.world_index,
+                                line_seq: msg.seq,
+                                max_seq: world._max_seq,
+                                line_text: msg.data.substring(0, 200),
+                                source: window.Android ? 'android' : 'web'
+                            });
+                            break;
+                        }
+
                         // Get timestamp from message or use current time
                         const lineTs = msg.ts || Math.floor(Date.now() / 1000);
 
@@ -1742,6 +1767,7 @@
                             partialLines[msg.world_index] = rawLines.pop();
                         }
 
+                        let appendedLineCount = 0;
                         rawLines.forEach(line => {
                             // Strip ANSI codes to check if line has actual content
                             // Some MUDs send trailing ANSI reset codes after newlines
@@ -1755,8 +1781,9 @@
                                 return;
                             }
                             const lineIndex = world.output_lines.length;
-                            const lineSeq = (msg.seq !== undefined) ? msg.seq + lineIndex : lineIndex;
+                            const lineSeq = (msg.seq !== undefined && msg.seq > 0) ? msg.seq + appendedLineCount : lineIndex;
                             world.output_lines.push({ text: truncateIfNeeded(line), ts: lineTs, seq: lineSeq });
+                            appendedLineCount++;
                             // Verify sequence order
                             if (lineIndex > 0) {
                                 const prevSeq = world.output_lines[lineIndex - 1].seq;
@@ -1778,6 +1805,10 @@
                             // Note: Don't track unseen_lines locally - server handles centralized tracking
                             // and sends UnseenUpdate messages to keep all clients in sync
                         });
+                        // Update _max_seq after appending lines
+                        if (msg.seq && msg.seq > 0 && appendedLineCount > 0) {
+                            world._max_seq = Math.max(world._max_seq || 0, msg.seq + appendedLineCount - 1);
+                        }
                         if (msg.world_index !== currentWorldIndex) {
                             updateStatusBar();
                         }
@@ -7064,6 +7095,9 @@
             ws.send(JSON.stringify({ type: 'RequestState' }));
         }
     };
+
+    // Heartbeat ack function for Android to verify WebView responsiveness
+    window.heartbeatAck = function() { return "ok"; };
 
     // Expose native WebSocket check for debugging
     window.isUsingNativeWebSocket = function() {

@@ -90,7 +90,7 @@ pub enum WsMessage {
     /// is_viewed: true if any interface (console/web/GUI) is viewing this world
     /// ts: timestamp in seconds since Unix epoch (when the line was received)
     /// from_server: true if data came from MUD server, false if client-generated
-    ServerData { world_index: usize, data: String, is_viewed: bool, #[serde(default)] ts: u64, #[serde(default = "default_true")] from_server: bool },
+    ServerData { world_index: usize, data: String, is_viewed: bool, #[serde(default)] ts: u64, #[serde(default = "default_true")] from_server: bool, #[serde(default)] seq: u64 },
     WorldConnected { world_index: usize, name: String },
     WorldDisconnected { world_index: usize },
     WorldAdded { world: Box<WorldStateMsg> },
@@ -262,6 +262,15 @@ pub enum WsMessage {
         actual_seq: u64,
         line_text: String,
         source: String,  // "web", "gui", "console"
+    },
+
+    /// Report a duplicate ServerData detected by a remote client (client -> server)
+    ReportDuplicate {
+        world_index: usize,
+        line_seq: u64,
+        max_seq: u64,
+        line_text: String,
+        source: String,  // "web", "gui", "android", "console"
     },
 
     // Remote instance handling (client -> server)

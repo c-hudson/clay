@@ -66,10 +66,10 @@ public class MainActivity extends AppCompatActivity {
     private Handler backgroundShutdownHandler;
     private Runnable backgroundShutdownRunnable;
     private NativeWebSocket nativeWebSocket;
-    private long lastMessageSentTime = 0;
-    private long lastMessageAckTime = 0;
-    private int messagesSentSinceAck = 0;
-    private static final int MAX_UNACKED_MESSAGES = 50;  // Trigger resync after this many unacked messages
+    private Handler heartbeatHandler;
+    private Runnable heartbeatRunnable;
+    private int missedHeartbeats = 0;
+    private static final int HEARTBEAT_INTERVAL_MS = 30000; // 30 seconds
 
     // JavaScript interface for communication between web and Android
     public class AndroidInterface {
@@ -128,9 +128,10 @@ public class MainActivity extends AppCompatActivity {
                     startService(serviceIntent);
                 }
 
-                // Mark as connected and start keepalive
+                // Mark as connected and start keepalive + heartbeat
                 isConnected = true;
                 startKeepalive();
+                startHeartbeat();
             });
         }
 
@@ -139,6 +140,7 @@ public class MainActivity extends AppCompatActivity {
             runOnUiThread(() -> {
                 isConnected = false;
                 stopKeepalive();
+                stopHeartbeat();
 
                 Intent serviceIntent = new Intent(MainActivity.this, ClayForegroundService.class);
                 stopService(serviceIntent);
@@ -149,18 +151,6 @@ public class MainActivity extends AppCompatActivity {
         public void keepaliveAck() {
             // Called by JavaScript to acknowledge keepalive ping
             // This helps detect if the WebView is actually responsive
-        }
-
-        @JavascriptInterface
-        public void messageAck() {
-            // Called by JavaScript to acknowledge receiving a WebSocket message
-            lastMessageAckTime = System.currentTimeMillis();
-            messagesSentSinceAck = 0;
-        }
-
-        @JavascriptInterface
-        public int getUnackedMessageCount() {
-            return messagesSentSinceAck;
         }
 
         @JavascriptInterface
@@ -244,10 +234,6 @@ public class MainActivity extends AppCompatActivity {
                     @Override
                     public void onMessage(String message) {
                         runOnUiThread(() -> {
-                            // Track message sending for acknowledgment
-                            lastMessageSentTime = System.currentTimeMillis();
-                            messagesSentSinceAck++;
-
                             // Use Base64 encoding to safely pass message to JavaScript
                             // This handles all special characters without escaping issues
                             String base64 = android.util.Base64.encodeToString(
@@ -258,17 +244,6 @@ public class MainActivity extends AppCompatActivity {
                                 "if (typeof onNativeWebSocketMessageBase64 === 'function') onNativeWebSocketMessageBase64(\"" + base64 + "\");",
                                 null
                             );
-
-                            // If too many messages without acknowledgment, JavaScript may be stuck
-                            // Trigger a resync to recover
-                            if (messagesSentSinceAck >= MAX_UNACKED_MESSAGES) {
-                                android.util.Log.w("Clay", "Too many unacked messages (" + messagesSentSinceAck + "), triggering resync");
-                                messagesSentSinceAck = 0;  // Reset to avoid repeated resyncs
-                                webView.evaluateJavascript(
-                                    "if (typeof triggerResync === 'function') triggerResync();",
-                                    null
-                                );
-                            }
                         });
                     }
 
@@ -494,6 +469,49 @@ public class MainActivity extends AppCompatActivity {
         }
     }
 
+    private void startHeartbeat() {
+        if (heartbeatHandler == null) {
+            heartbeatHandler = new Handler(Looper.getMainLooper());
+        }
+
+        missedHeartbeats = 0;
+        heartbeatRunnable = new Runnable() {
+            @Override
+            public void run() {
+                if (isConnected && webView != null) {
+                    webView.evaluateJavascript(
+                        "typeof heartbeatAck === 'function' && heartbeatAck()",
+                        value -> {
+                            if (value != null && value.contains("ok")) {
+                                missedHeartbeats = 0;
+                            } else {
+                                missedHeartbeats++;
+                                if (missedHeartbeats >= 2) {
+                                    android.util.Log.w("Clay", "WebView unresponsive (" + missedHeartbeats + " missed heartbeats), triggering resync");
+                                    missedHeartbeats = 0;
+                                    webView.evaluateJavascript(
+                                        "if (typeof triggerResync === 'function') triggerResync();",
+                                        null
+                                    );
+                                }
+                            }
+                        }
+                    );
+                    heartbeatHandler.postDelayed(this, HEARTBEAT_INTERVAL_MS);
+                }
+            }
+        };
+
+        heartbeatHandler.postDelayed(heartbeatRunnable, HEARTBEAT_INTERVAL_MS);
+    }
+
+    private void stopHeartbeat() {
+        if (heartbeatHandler != null && heartbeatRunnable != null) {
+            heartbeatHandler.removeCallbacks(heartbeatRunnable);
+            heartbeatRunnable = null;
+        }
+    }
+
     private void startBackgroundShutdownTimer() {
         // Only start timer if connected - no point otherwise
         if (!isConnected) {
@@ -515,6 +533,7 @@ public class MainActivity extends AppCompatActivity {
                     // Stop the foreground service and disconnect
                     isConnected = false;
                     stopKeepalive();
+                    stopHeartbeat();
 
                     Intent serviceIntent = new Intent(MainActivity.this, ClayForegroundService.class);
                     stopService(serviceIntent);
@@ -909,7 +928,7 @@ public class MainActivity extends AppCompatActivity {
                 // Java's isConnected flag can be stale if the WS died silently,
                 // so let JS check the actual socket state and reconnect if needed.
                 // This also handles the visibilitychange event not firing on some Android versions.
-                messagesSentSinceAck = 0;
+                missedHeartbeats = 0;
                 webView.evaluateJavascript(
                     "if (typeof checkConnectionOnResume === 'function') checkConnectionOnResume();",
                     null
@@ -939,6 +958,7 @@ public class MainActivity extends AppCompatActivity {
     @Override
     protected void onDestroy() {
         stopKeepalive();
+        stopHeartbeat();
         cancelBackgroundShutdownTimer();
         super.onDestroy();
     }

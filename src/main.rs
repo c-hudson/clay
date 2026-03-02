@@ -1897,6 +1897,7 @@ pub struct World {
     pub active_media: std::collections::HashMap<String, String>, // key -> Client.Media.Play JSON (for restart on world switch)
     pub gmcp_user_enabled: bool,     // True if user has enabled GMCP processing (F9 toggle)
     pub connection_id: u64,          // Incremented on each connection, used to ignore stale disconnect events
+    pub max_received_seq: u64,       // Highest seq received from server (remote console dedup)
 }
 
 impl World {
@@ -1966,6 +1967,7 @@ impl World {
             active_media: std::collections::HashMap::new(),
             gmcp_user_enabled: false,
             connection_id: 0,
+            max_received_seq: 0,
         }
     }
 
@@ -3227,34 +3229,61 @@ impl App {
     /// Handle incoming WebSocket message when running as remote client
     fn handle_remote_ws_message(&mut self, msg: WsMessage) {
         match msg {
-            WsMessage::ServerData { world_index, data, from_server, .. } => {
+            WsMessage::ServerData { world_index, data, from_server, seq: msg_seq, .. } => {
                 if let Some(world) = self.worlds.get_mut(world_index) {
-                    // Check if user was at bottom before adding lines
-                    let was_at_bottom = world.is_at_bottom();
+                    // Dedup: skip ServerData that has already been received (e.g., after resync)
+                    if msg_seq > 0 && msg_seq <= world.max_received_seq {
+                        // Log duplicate to debug file
+                        use std::io::Write as _;
+                        if let Ok(mut f) = std::fs::OpenOptions::new()
+                            .create(true).append(true)
+                            .open("clay.output.debug")
+                        {
+                            let _ = writeln!(f, "DUPLICATE [console] in '{}': line_seq={}, max_seq={}, text={:?}",
+                                world.name, msg_seq, world.max_received_seq,
+                                data.chars().take(200).collect::<String>());
+                        }
+                        // Report back to server
+                        if let Some(ref tx) = self.ws_client_tx {
+                            let _ = tx.send(WsMessage::ReportDuplicate {
+                                world_index,
+                                line_seq: msg_seq,
+                                max_seq: world.max_received_seq,
+                                line_text: data.chars().take(200).collect(),
+                                source: "console".to_string(),
+                            });
+                        }
+                    } else {
+                        // Check if user was at bottom before adding lines
+                        let was_at_bottom = world.is_at_bottom();
 
-                    for line in data.lines() {
-                        // Preserve from_server flag for Ctrl+L filtering
-                        let seq = world.next_seq;
-                        world.next_seq += 1;
-                        let output_line = if from_server {
-                            OutputLine::new(line.to_string(), seq)
-                        } else {
-                            OutputLine::new_client(line.to_string(), seq)
-                        };
-                        world.output_lines.push(output_line);
-                    }
+                        let line_count = data.lines().count();
+                        for (i, line) in data.lines().enumerate() {
+                            // Preserve from_server flag for Ctrl+L filtering
+                            let seq = world.next_seq;
+                            world.next_seq += 1;
+                            let output_line = if from_server {
+                                OutputLine::new(line.to_string(), seq)
+                            } else {
+                                OutputLine::new_client(line.to_string(), seq)
+                            };
+                            world.output_lines.push(output_line);
+                            // Track max received seq from server
+                            if msg_seq > 0 {
+                                world.max_received_seq = msg_seq + i as u64;
+                            }
+                        }
 
-                    // Keep scroll at bottom if user was viewing latest output
-                    // For console client, daemon controls more-mode so always scroll if at bottom
-                    // (paused only affects the indicator, not scrolling)
-                    if was_at_bottom {
-                        world.scroll_offset = world.output_lines.len().saturating_sub(1);
-                    }
+                        // Keep scroll at bottom if user was viewing latest output
+                        if was_at_bottom {
+                            world.scroll_offset = world.output_lines.len().saturating_sub(1);
+                        }
 
-                    if world_index != self.current_world_index {
-                        world.unseen_lines += data.lines().count();
+                        if world_index != self.current_world_index {
+                            world.unseen_lines += line_count;
+                        }
+                        self.needs_output_redraw = true;
                     }
-                    self.needs_output_redraw = true;
                 }
             }
             WsMessage::WorldConnected { world_index, .. } => {
@@ -3311,8 +3340,11 @@ impl App {
                     world.prompt = prompt;
                     world.pending_count = pending_count;
                     world.paused = pending_count > 0;
-                    // Append recent lines
+                    // Append recent lines, skipping any already received (dedup)
                     for tl in recent_lines {
+                        if tl.seq > 0 && tl.seq <= world.max_received_seq {
+                            continue; // Skip duplicate line
+                        }
                         let seq = world.next_seq;
                         world.next_seq += 1;
                         world.output_lines.push(OutputLine {
@@ -3323,6 +3355,9 @@ impl App {
                             seq,
                             highlight_color: tl.highlight_color,
                         });
+                        if tl.seq > 0 {
+                            world.max_received_seq = tl.seq;
+                        }
                     }
                     self.needs_output_redraw = true;
                 }
@@ -3544,6 +3579,8 @@ impl App {
             }).collect();
             // Update next_seq to continue from highest seq in output_lines
             world.next_seq = world.output_lines.iter().map(|l| l.seq).max().unwrap_or(0).saturating_add(1);
+            // Set max_received_seq for dedup (highest seq we've received from server)
+            world.max_received_seq = world.next_seq.saturating_sub(1);
             world.unseen_lines = w.unseen_lines;
             // Use server's scroll_offset, or set to end of buffer if showing splash
             world.scroll_offset = if w.showing_splash {
@@ -3949,6 +3986,7 @@ impl App {
             is_viewed: true,
             ts: current_timestamp_secs(),
             from_server: false,  // Client-generated message
+            seq: 0,
         });
 
         // Mark output for redraw since we added content
@@ -3996,6 +4034,7 @@ impl App {
             is_viewed: is_current,
             ts: current_timestamp_secs(),
             from_server: false,  // Client-generated message
+            seq: 0,
         });
 
         if world_idx == self.current_world_index {
@@ -4646,6 +4685,13 @@ impl App {
             // Lines that went to pending_lines will be broadcast when released
             // Only send to clients viewing this world (Phase 2 output routing)
             if lines_to_output > 0 {
+                // Get the seq of the first line being broadcast (for client-side dedup)
+                let first_seq = self.worlds[world_idx]
+                    .output_lines
+                    .get(skip_count)
+                    .map(|l| l.seq)
+                    .unwrap_or(0);
+
                 // Get only the lines that went to output_lines
                 let output_lines_to_broadcast: Vec<String> = self.worlds[world_idx]
                     .output_lines
@@ -4663,6 +4709,7 @@ impl App {
                     is_viewed: true,  // Clients viewing this world consider it "viewed"
                     ts: current_timestamp_secs(),
                     from_server: true,
+                    seq: first_seq,
                 });
             }
 
@@ -4752,6 +4799,7 @@ impl App {
             is_viewed: true,
             ts: disconnect_msg.timestamp.duration_since(UNIX_EPOCH).unwrap_or_default().as_secs(),
             from_server: false,
+            seq: 0,
         });
         self.ws_broadcast(WsMessage::WorldDisconnected { world_index: world_idx });
     }
@@ -5129,6 +5177,7 @@ impl App {
                             is_viewed: false,
                             ts: current_timestamp_secs(),
                             from_server: false,
+                            seq: 0,
                         });
                     } else {
                         let commands = split_action_commands(&action.command);
@@ -5151,6 +5200,7 @@ impl App {
                                             is_viewed: false,
                                             ts: current_timestamp_secs(),
                                             from_server: false,
+                                            seq: 0,
                                         });
                                     }
                                     tf::TfCommandResult::Success(None) => {}
@@ -5161,6 +5211,7 @@ impl App {
                                             is_viewed: false,
                                             ts: current_timestamp_secs(),
                                             from_server: false,
+                                            seq: 0,
                                         });
                                     }
                                     tf::TfCommandResult::SendToMud(text) => {
@@ -5183,18 +5234,18 @@ impl App {
 
                                             if !opts.quiet {
                                                 if let Some(h) = header {
-                                                    self.ws_broadcast(WsMessage::ServerData { world_index, data: h, is_viewed: false, ts , from_server: false });
+                                                    self.ws_broadcast(WsMessage::ServerData { world_index, data: h, is_viewed: false, ts , from_server: false, seq: 0 });
                                                 }
                                             }
                                             if matches.is_empty() {
-                                                self.ws_broadcast(WsMessage::ServerData { world_index, data: format!("\u{2728} No matches for '{}'", pattern_str), is_viewed: false, ts, from_server: false });
+                                                self.ws_broadcast(WsMessage::ServerData { world_index, data: format!("\u{2728} No matches for '{}'", pattern_str), is_viewed: false, ts, from_server: false, seq: 0 });
                                             } else {
                                                 for m in matches {
-                                                    self.ws_broadcast(WsMessage::ServerData { world_index, data: m, is_viewed: false, ts , from_server: false });
+                                                    self.ws_broadcast(WsMessage::ServerData { world_index, data: m, is_viewed: false, ts , from_server: false, seq: 0 });
                                                 }
                                             }
                                             if !opts.quiet {
-                                                self.ws_broadcast(WsMessage::ServerData { world_index, data: "================= Recall end =================".to_string(), is_viewed: false, ts , from_server: false });
+                                                self.ws_broadcast(WsMessage::ServerData { world_index, data: "================= Recall end =================".to_string(), is_viewed: false, ts , from_server: false, seq: 0 });
                                             }
                                         }
                                     }
@@ -5223,6 +5274,7 @@ impl App {
                             self.ws_broadcast(WsMessage::ServerData {
                                 world_index, data: msg, is_viewed: false,
                                 ts: current_timestamp_secs(), from_server: false,
+                                seq: 0,
                             });
                         }
                         tf::TfCommandResult::Success(None) => {}
@@ -5230,6 +5282,7 @@ impl App {
                             self.ws_broadcast(WsMessage::ServerData {
                                 world_index, data: format!("Error: {}", err), is_viewed: false,
                                 ts: current_timestamp_secs(), from_server: false,
+                                seq: 0,
                             });
                         }
                         tf::TfCommandResult::SendToMud(text) => {
@@ -5251,18 +5304,18 @@ impl App {
                                 let ts = current_timestamp_secs();
                                 if !opts.quiet {
                                     if let Some(h) = header {
-                                        self.ws_broadcast(WsMessage::ServerData { world_index, data: h, is_viewed: false, ts, from_server: false });
+                                        self.ws_broadcast(WsMessage::ServerData { world_index, data: h, is_viewed: false, ts, from_server: false, seq: 0 });
                                     }
                                 }
                                 if matches.is_empty() {
-                                    self.ws_broadcast(WsMessage::ServerData { world_index, data: format!("\u{2728} No matches for '{}'", pattern_str), is_viewed: false, ts, from_server: false });
+                                    self.ws_broadcast(WsMessage::ServerData { world_index, data: format!("\u{2728} No matches for '{}'", pattern_str), is_viewed: false, ts, from_server: false, seq: 0 });
                                 } else {
                                     for m in matches {
-                                        self.ws_broadcast(WsMessage::ServerData { world_index, data: m, is_viewed: false, ts, from_server: false });
+                                        self.ws_broadcast(WsMessage::ServerData { world_index, data: m, is_viewed: false, ts, from_server: false, seq: 0 });
                                     }
                                 }
                                 if !opts.quiet {
-                                    self.ws_broadcast(WsMessage::ServerData { world_index, data: "================= Recall end =================".to_string(), is_viewed: false, ts, from_server: false });
+                                    self.ws_broadcast(WsMessage::ServerData { world_index, data: "================= Recall end =================".to_string(), is_viewed: false, ts, from_server: false, seq: 0 });
                                 }
                             }
                         }
@@ -5276,6 +5329,7 @@ impl App {
                                 is_viewed: false,
                                 ts: current_timestamp_secs(),
                                 from_server: false,
+                                seq: 0,
                             });
                         }
                     }
@@ -5309,6 +5363,7 @@ impl App {
                     is_viewed: false,
                     ts: current_timestamp_secs(),
                     from_server: false,
+                    seq: 0,
                 });
             }
             Command::Send { text, all_worlds, target_world, no_newline } => {
@@ -5347,6 +5402,7 @@ impl App {
                                 is_viewed: false,
                                 ts: current_timestamp_secs(),
                                 from_server: false,
+                                seq: 0,
                             });
                         }
                     } else {
@@ -5356,6 +5412,7 @@ impl App {
                             is_viewed: false,
                             ts: current_timestamp_secs(),
                             from_server: false,
+                            seq: 0,
                         });
                     }
                 } else {
@@ -5383,6 +5440,7 @@ impl App {
                         is_viewed: false,
                         ts: current_timestamp_secs(),
                         from_server: false,
+                        seq: 0,
                     });
                     self.ws_broadcast(WsMessage::WorldDisconnected { world_index });
                 } else {
@@ -5392,6 +5450,7 @@ impl App {
                         is_viewed: false,
                         ts: current_timestamp_secs(),
                         from_server: false,
+                        seq: 0,
                     });
                 }
             }
@@ -5411,6 +5470,7 @@ impl App {
                         is_viewed: false,
                         ts: current_timestamp_secs(),
                         from_server: false,
+                        seq: 0,
                     });
                 }
             }
@@ -5433,6 +5493,7 @@ impl App {
                         is_viewed: false,
                         ts: current_timestamp_secs(),
                         from_server: false,
+                        seq: 0,
                     });
                 }
             }
@@ -5444,6 +5505,7 @@ impl App {
                     is_viewed: false,
                     ts: current_timestamp_secs(),
                     from_server: false,
+                    seq: 0,
                 });
             }
             Command::BanList => {
@@ -5456,6 +5518,7 @@ impl App {
                         is_viewed: false,
                         ts: current_timestamp_secs(),
                         from_server: false,
+                        seq: 0,
                     });
                 } else {
                     let mut output = String::new();
@@ -5476,6 +5539,7 @@ impl App {
                         is_viewed: false,
                         ts: current_timestamp_secs(),
                         from_server: false,
+                        seq: 0,
                     });
                 }
                 self.ws_send_to_client(client_id, WsMessage::BanListResponse { bans });
@@ -5490,6 +5554,7 @@ impl App {
                         is_viewed: false,
                         ts: current_timestamp_secs(),
                         from_server: false,
+                        seq: 0,
                     });
                     // Broadcast updated ban list
                     self.ws_broadcast(WsMessage::BanListResponse { bans: self.ban_list.get_ban_info() });
@@ -5501,6 +5566,7 @@ impl App {
                         is_viewed: false,
                         ts: current_timestamp_secs(),
                         from_server: false,
+                        seq: 0,
                     });
                     self.ws_send_to_client(client_id, WsMessage::UnbanResult { success: false, host, error: Some("No ban found".to_string()) });
                 }
@@ -5538,6 +5604,7 @@ impl App {
                     is_viewed: false,
                     ts: current_timestamp_secs(),
                     from_server: false,
+                    seq: 0,
                 });
             }
             Command::Notify { message } => {
@@ -5557,6 +5624,7 @@ impl App {
                     is_viewed: false,
                     ts: current_timestamp_secs(),
                     from_server: false,
+                    seq: 0,
                 });
             }
             Command::Dump => {
@@ -5606,6 +5674,7 @@ impl App {
                             is_viewed: false,
                             ts,
                             from_server: false,
+                            seq: 0,
                         });
                     }
                     Err(e) => {
@@ -5615,6 +5684,7 @@ impl App {
                             is_viewed: false,
                             ts,
                             from_server: false,
+                            seq: 0,
                         });
                     }
                 }
@@ -5627,6 +5697,7 @@ impl App {
                     is_viewed: false,
                     ts: current_timestamp_secs(),
                     from_server: false,
+                    seq: 0,
                 });
             }
             // UI popup commands - send back to client for local handling
@@ -5641,6 +5712,7 @@ impl App {
                     is_viewed: false,
                     ts: current_timestamp_secs(),
                     from_server: false,
+                    seq: 0,
                 });
             }
             // AddWorld - add or update world definition
@@ -5686,6 +5758,7 @@ impl App {
                     is_viewed: false,
                     ts: current_timestamp_secs(),
                     from_server: false,
+                    seq: 0,
                 });
             }
             // Connect command - needs async follow-up
@@ -5702,6 +5775,7 @@ impl App {
                             is_viewed: false,
                             ts: current_timestamp_secs(),
                             from_server: false,
+                            seq: 0,
                         });
                     }
                 }
@@ -5736,6 +5810,7 @@ impl App {
                         is_viewed: false,
                         ts: current_timestamp_secs(),
                         from_server: false,
+                        seq: 0,
                     });
                 }
             }
@@ -5749,6 +5824,7 @@ impl App {
                     is_viewed: false,
                     ts: current_timestamp_secs(),
                     from_server: false,
+                    seq: 0,
                 });
             }
             Command::UrbanUsage => {
@@ -5758,6 +5834,7 @@ impl App {
                     is_viewed: false,
                     ts: current_timestamp_secs(),
                     from_server: false,
+                    seq: 0,
                 });
             }
             Command::TranslateUsage => {
@@ -5767,6 +5844,7 @@ impl App {
                     is_viewed: false,
                     ts: current_timestamp_secs(),
                     from_server: false,
+                    seq: 0,
                 });
             }
             Command::HelpTf => {
@@ -5780,6 +5858,7 @@ impl App {
                                 is_viewed: false,
                                 ts: current_timestamp_secs(),
                                 from_server: false,
+                                seq: 0,
                             });
                         }
                     }
@@ -5790,6 +5869,7 @@ impl App {
                             is_viewed: false,
                             ts: current_timestamp_secs(),
                             from_server: false,
+                            seq: 0,
                         });
                     }
                 }
@@ -5849,6 +5929,7 @@ impl App {
                             is_viewed: false,
                             ts: current_timestamp_secs(),
                             from_server: false,
+                            seq: 0,
                         });
                     } else {
                         // Save current world index, switch to target, connect, then restore
@@ -6029,7 +6110,12 @@ impl App {
                         // For release-all, cap at pending_count
                         let to_release = logical_count.min(pending_count);
 
-                        // Get the lines that will be released (for broadcasting as ServerData)
+                        // Get the seq and text of lines that will be released (for broadcasting as ServerData)
+                        let first_pending_seq = self.worlds[world_index]
+                            .pending_lines
+                            .first()
+                            .map(|l| l.seq)
+                            .unwrap_or(0);
                         let lines_to_broadcast: Vec<String> = self.worlds[world_index]
                             .pending_lines
                             .iter()
@@ -6049,6 +6135,7 @@ impl App {
                                 is_viewed: true,
                                 ts: current_timestamp_secs(),
                                 from_server: true,
+                                seq: first_pending_seq,
                             });
                         }
 
@@ -6464,6 +6551,18 @@ impl App {
                     let _ = writeln!(f, "SEQ MISMATCH [{}] in '{}': expected seq>{}, got seq={}, text={:?}",
                         source, world_name, expected_seq_gt, actual_seq,
                         line_text.chars().take(80).collect::<String>());
+                }
+            }
+            WsMessage::ReportDuplicate { world_index, line_seq, max_seq, line_text, source } => {
+                let world_name = self.worlds.get(world_index).map(|w| w.name.as_str()).unwrap_or("?");
+                use std::io::Write;
+                if let Ok(mut f) = std::fs::OpenOptions::new()
+                    .create(true).append(true)
+                    .open("clay.output.debug")
+                {
+                    let _ = writeln!(f, "DUPLICATE [{}] in '{}': line_seq={}, max_seq={}, text={:?}",
+                        source, world_name, line_seq, max_seq,
+                        line_text.chars().take(200).collect::<String>());
                 }
             }
             WsMessage::ClientTypeDeclaration { client_type } => {
@@ -7211,7 +7310,12 @@ impl App {
             logical_count = 1;
         }
 
-        // Get the lines that will be released (for broadcasting as ServerData)
+        // Get the seq and text of lines that will be released (for broadcasting as ServerData)
+        let first_pending_seq = self.worlds[world_idx]
+            .pending_lines
+            .first()
+            .map(|l| l.seq)
+            .unwrap_or(0);
         let lines_to_broadcast: Vec<String> = self.worlds[world_idx]
             .pending_lines
             .iter()
@@ -7232,6 +7336,7 @@ impl App {
                 is_viewed: true,
                 ts: current_timestamp_secs(),
                 from_server: true,
+                seq: first_pending_seq,
             });
         }
 
@@ -9068,7 +9173,7 @@ fn handle_remote_client_key(
                         // Request connections list from server (includes timing info)
                         let _ = ws_tx.send(WsMessage::RequestConnectionsList);
                     }
-                    Command::WorldSwitch { ref name } | Command::WorldConnectNoLogin { ref name } => {
+                    Command::WorldSwitch { ref name } => {
                         // /worlds <name> - switch to world if it exists
                         if let Some(idx) = app.worlds.iter().position(|w| w.name.eq_ignore_ascii_case(name)) {
                             app.current_world_index = idx;
@@ -9079,6 +9184,27 @@ fn handle_remote_client_key(
                             }
                         } else {
                             // World doesn't exist - could create it, but for now just show message
+                            let ci = app.current_world_index;
+                            let seq = app.worlds[ci].next_seq;
+                            app.worlds[ci].next_seq += 1;
+                            app.worlds[ci].output_lines.push(
+                                OutputLine::new_client(format!("World '{}' not found.", name), seq)
+                            );
+                        }
+                    }
+                    Command::WorldConnectNoLogin { ref name } => {
+                        // /worlds -l <name> - send to server as SendCommand so skip_auto_login is set
+                        if let Some(idx) = app.worlds.iter().position(|w| w.name.eq_ignore_ascii_case(name)) {
+                            app.current_world_index = idx;
+                            let _ = ws_tx.send(WsMessage::MarkWorldSeen { world_index: idx });
+                            if !app.worlds[idx].connected {
+                                // Send as command so server parses -l flag and sets skip_auto_login
+                                let _ = ws_tx.send(WsMessage::SendCommand {
+                                    world_index: idx,
+                                    command: format!("/worlds -l {}", name),
+                                });
+                            }
+                        } else {
                             let ci = app.current_world_index;
                             let seq = app.worlds[ci].next_seq;
                             app.worlds[ci].next_seq += 1;
@@ -11603,6 +11729,7 @@ pub async fn run_app_headless(
                             is_viewed: true,
                             ts: current_timestamp_secs(),
                             from_server: false,
+                            seq: 0,
                         });
                     }
                     AppEvent::Sigusr1Received => {
@@ -11657,6 +11784,7 @@ pub async fn run_app_headless(
                                 is_viewed: false,
                                 ts: current_timestamp_secs(),
                                 from_server: false,
+                                seq: 0,
                             }),
                         }
                     }
@@ -11903,6 +12031,7 @@ pub async fn run_app_headless(
                                     is_viewed: true,
                                     ts: current_timestamp_secs(),
                                     from_server: false,
+                                    seq: 0,
                                 });
                             }
                             tf::TfCommandResult::Error(err) => {
@@ -11916,6 +12045,7 @@ pub async fn run_app_headless(
                                     is_viewed: true,
                                     ts: current_timestamp_secs(),
                                     from_server: false,
+                                    seq: 0,
                                 });
                             }
                             tf::TfCommandResult::RepeatProcess(process) => {
@@ -13476,6 +13606,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                         is_viewed: is_current,
                                         ts: current_timestamp_secs(),
                                         from_server: false,
+                                        seq: 0,
                                     });
                                 }
 
@@ -13593,6 +13724,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                 is_viewed: false,
                                 ts: current_timestamp_secs(),
                                 from_server: false,
+                                seq: 0,
                             }),
                         }
                     }
@@ -13859,6 +13991,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                     is_viewed: true,
                                     ts: current_timestamp_secs(),
                                     from_server: false,
+                                    seq: 0,
                                 });
                             }
                             tf::TfCommandResult::Error(err) => {
@@ -13872,6 +14005,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                     is_viewed: true,
                                     ts: current_timestamp_secs(),
                                     from_server: false,
+                                    seq: 0,
                                 });
                             }
                             tf::TfCommandResult::ClayCommand(clay_cmd) => {
@@ -14144,6 +14278,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                 is_viewed: is_current,
                                 ts: current_timestamp_secs(),
                                 from_server: false,
+                                seq: 0,
                             });
                         }
 
@@ -14247,6 +14382,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                             is_viewed: false,
                             ts: current_timestamp_secs(),
                             from_server: false,
+                            seq: 0,
                         }),
                     }
                 }
@@ -15397,7 +15533,12 @@ fn handle_key_event(key: KeyEvent, app: &mut App) -> KeyAction {
         if app.current_world().paused {
             let world_idx = app.current_world_index;
 
-            // Get the lines that will be released (for broadcasting as ServerData)
+            // Get the seq and text of lines that will be released (for broadcasting as ServerData)
+            let first_pending_seq = app.worlds[world_idx]
+                .pending_lines
+                .first()
+                .map(|l| l.seq)
+                .unwrap_or(0);
             let lines_to_broadcast: Vec<String> = app.worlds[world_idx]
                 .pending_lines
                 .iter()
@@ -15416,6 +15557,7 @@ fn handle_key_event(key: KeyEvent, app: &mut App) -> KeyAction {
                     is_viewed: true,
                     ts: current_timestamp_secs(),
                     from_server: true,
+                    seq: first_pending_seq,
                 });
             }
 
@@ -16935,15 +17077,14 @@ async fn handle_command(cmd: &str, app: &mut App, event_tx: mpsc::Sender<AppEven
                                 // Send auto-login if configured (for Connect type)
                                 // Requires BOTH username AND password to be set
                                 let skip_login = app.current_world().skip_auto_login;
-                                app.current_world_mut().skip_auto_login = false;
+                                let auto_connect_type = app.current_world().settings.auto_connect_type;
+                                // Only clear skip flag for Connect type; Prompt/MooPrompt check it later in handle_prompt
+                                if auto_connect_type == AutoConnectType::Connect {
+                                    app.current_world_mut().skip_auto_login = false;
+                                }
                                 let user = app.current_world().settings.user.clone();
                                 let password = app.current_world().settings.password.clone();
-                                let auto_connect_type = app.current_world().settings.auto_connect_type;
-                                // DEBUG: trace auto-login conditions (proxy path)
-                                debug_log(true, &format!("[proxy] Auto-login check: skip={}, user='{}', pass_len={}, type={}",
-                                    skip_login, user, password.len(), auto_connect_type.name()));
                                 if !skip_login && !user.is_empty() && !password.is_empty() && auto_connect_type == AutoConnectType::Connect {
-                                    debug_log(true, "[proxy] Auto-login sending immediately");
                                     let connect_cmd = format!("connect {} {}", user, password);
                                     let _ = cmd_tx.send(WriteCommand::Text(connect_cmd)).await;
                                 }
