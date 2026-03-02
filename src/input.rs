@@ -274,8 +274,11 @@ impl InputArea {
 
         // Calculate target display-width offset from start of buffer
         let target_display_width = if current_line == 1 {
-            // Moving to first line (which has prompt)
-            current_col.min(first_line_capacity.saturating_sub(1))
+            // Moving to first line (which has prompt) - maintain screen column
+            // current_col is screen column on line 1 (no prompt), so subtract
+            // prompt_len to get the text column on line 0
+            let target_text_col = current_col.saturating_sub(self.prompt_len);
+            target_text_col.min(first_line_capacity.saturating_sub(1))
         } else {
             // Moving to a non-first line
             let width_before_target_line = first_line_capacity + (current_line - 2) * width;
@@ -323,8 +326,10 @@ impl InputArea {
 
         // Calculate target display-width offset on next line
         let target_display_width = if current_line == 0 {
-            // Moving from first line to second line
-            first_line_capacity + current_col.min(width - 1)
+            // Moving from first line to second line - maintain screen column
+            // current_col is text column on line 0, screen column is prompt_len + current_col
+            let screen_col = self.prompt_len + current_col;
+            first_line_capacity + screen_col.min(width - 1)
         } else {
             // Moving from non-first line to next line
             let width_before_next_line = first_line_capacity + current_line * width;
