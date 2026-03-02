@@ -5766,8 +5766,28 @@ impl App {
                     }
                 }
             }
+            Command::Quit => {
+                // Tell the requesting client to close (GUI window closes)
+                // Server keeps running — /quit only affects the remote client
+                self.ws_send_to_client(client_id, WsMessage::ExecuteLocalCommand { command: "/quit".to_string() });
+            }
+            Command::Update => {
+                self.add_output("Checking for updates...");
+                #[cfg(all(unix, not(target_os = "android")))]
+                {
+                    let event_tx_clone = event_tx.clone();
+                    tokio::spawn(async move {
+                        let result = check_and_download_update().await;
+                        let _ = event_tx_clone.send(AppEvent::UpdateResult(result)).await;
+                    });
+                }
+                #[cfg(any(target_os = "android", not(unix)))]
+                {
+                    self.add_output("Update is not available on this platform.");
+                }
+            }
             // Commands that should be blocked from remote
-            Command::Quit | Command::Reload | Command::Update => {
+            Command::Reload => {
                 self.ws_broadcast(WsMessage::ServerData {
                     world_index,
                     data: "This command is not available from remote interfaces.".to_string(),

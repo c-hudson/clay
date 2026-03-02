@@ -1447,6 +1447,8 @@
                     connectionFailures = 0;
                     multiuserMode = msg.multiuser_mode || false;
                     showAuthModal(false);
+                    hideConnectionErrorModal();
+                    hideReconnectModal();
                     elements.authError.textContent = '';
                     elements.input.focus();
                     // Update UI based on multiuser mode
@@ -2852,6 +2854,11 @@
             case '/edit':
                 // Open split-screen editor locally
                 // (handled by specific client-side logic if implemented)
+                break;
+
+            case '/quit':
+                // Close the window/tab (works in WebView GUI)
+                window.close();
                 break;
 
             default:
