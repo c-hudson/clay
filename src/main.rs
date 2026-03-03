@@ -2416,7 +2416,13 @@ impl World {
     pub fn mark_seen(&mut self) {
         self.unseen_lines = 0;
         self.first_unseen_at = None;
-        // Clear new line indicators on displayed lines (pending lines keep theirs)
+        // Note: marked_new is NOT cleared here — triangles should remain visible
+        // until Ctrl+L or switching away from the world.
+    }
+
+    /// Clear new line indicator flags on all output lines.
+    /// Called when switching away from a world or on Ctrl+L.
+    pub fn clear_new_line_indicators(&mut self) {
         for line in &mut self.output_lines {
             line.marked_new = false;
         }
@@ -3808,6 +3814,8 @@ impl App {
             if self.worlds[old_index].pending_lines.is_empty() {
                 self.worlds[old_index].lines_since_pause = 0;
             }
+            // Clear new line indicators on the world we're leaving
+            self.worlds[old_index].clear_new_line_indicators();
             // Track previous world for Alt+w fallback
             self.previous_world_index = Some(self.current_world_index);
             self.current_world_index = index;
