@@ -18,6 +18,8 @@ enum WvEvent {
     SetOpacity(f64),
     /// Close the window and exit
     Quit,
+    /// Show an update status message in the WebView
+    UpdateStatus(String),
 }
 
 use crate::theme::{ThemeColors, ThemeFile};
@@ -471,6 +473,31 @@ fn create_webview_window(title: &str, params: &WebViewParams) -> io::Result<()> 
             let body = req.body();
             if body == "quit" {
                 let _ = proxy.send_event(WvEvent::Quit);
+            } else if body == "update" || body == "update-force" {
+                let force = body == "update-force";
+                let proxy_clone = proxy.clone();
+                std::thread::spawn(move || {
+                    let rt = match tokio::runtime::Runtime::new() {
+                        Ok(rt) => rt,
+                        Err(e) => {
+                            let _ = proxy_clone.send_event(WvEvent::UpdateStatus(
+                                format!("Failed to start update: {}", e)
+                            ));
+                            return;
+                        }
+                    };
+                    let result = rt.block_on(crate::check_and_download_update(force));
+                    match result {
+                        Ok(success) => {
+                            // Install the update
+                            let msg = install_update(&success.temp_path, &success.version);
+                            let _ = proxy_clone.send_event(WvEvent::UpdateStatus(msg));
+                        }
+                        Err(e) => {
+                            let _ = proxy_clone.send_event(WvEvent::UpdateStatus(e));
+                        }
+                    }
+                });
             } else if let Some(rest) = body.strip_prefix("opacity:") {
                 if let Ok(opacity) = rest.parse::<f64>() {
                     let _ = proxy.send_event(WvEvent::SetOpacity(opacity));
@@ -498,6 +525,14 @@ fn create_webview_window(title: &str, params: &WebViewParams) -> io::Result<()> 
                 false // block and open in browser
             }
         });
+
+    // On Windows, disable browser accelerator keys (Ctrl+L, Ctrl+N, etc.)
+    // so they reach our JS key handler instead of being swallowed by WebView2.
+    #[cfg(windows)]
+    let builder = {
+        use wry::WebViewBuilderExtWindows;
+        builder.with_browser_accelerator_keys(false)
+    };
 
     // On Linux/GTK, must use build_gtk() to properly embed WebView in tao's GTK container.
     // build(&window) silently produces a non-visible webview on Linux.
@@ -570,7 +605,64 @@ fn create_webview_window(title: &str, params: &WebViewParams) -> io::Result<()> 
                 )))]
                 { let _ = opacity; }
             }
+            Event::UserEvent(WvEvent::UpdateStatus(ref msg)) => {
+                // Show update status in WebView via JS
+                let escaped = msg.replace('\\', "\\\\").replace('\'', "\\'");
+                let _ = _webview.evaluate_script(&format!("window.showUpdateStatus('{}')", escaped));
+            }
             _ => {}
         }
     });
+}
+
+/// Install a downloaded update binary, returning a status message
+#[cfg(not(target_os = "android"))]
+fn install_update(temp_path: &std::path::Path, version: &str) -> String {
+    // Get current executable path
+    let exe_path = match std::env::current_exe() {
+        Ok(p) => p,
+        Err(e) => {
+            let _ = std::fs::remove_file(temp_path);
+            return format!("Cannot find current binary: {}", e);
+        }
+    };
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if let Err(e) = std::fs::set_permissions(temp_path, std::fs::Permissions::from_mode(0o755)) {
+            let _ = std::fs::remove_file(temp_path);
+            return format!("Failed to set permissions: {}", e);
+        }
+    }
+
+    // Try rename first, fall back to copy (may fail cross-device)
+    if let Err(e) = std::fs::rename(temp_path, &exe_path) {
+        match std::fs::copy(temp_path, &exe_path) {
+            Ok(_) => {
+                let _ = std::fs::remove_file(temp_path);
+            }
+            Err(e2) => {
+                // On Windows, can't overwrite running exe — try rename-and-replace
+                #[cfg(windows)]
+                {
+                    let old_path = exe_path.with_extension("exe.old");
+                    let _ = std::fs::remove_file(&old_path); // clean up previous .old
+                    if std::fs::rename(&exe_path, &old_path).is_ok() {
+                        if let Err(e3) = std::fs::rename(temp_path, &exe_path) {
+                            // Restore the old binary
+                            let _ = std::fs::rename(&old_path, &exe_path);
+                            let _ = std::fs::remove_file(temp_path);
+                            return format!("Failed to install update: {}", e3);
+                        }
+                        return format!("Updated to Clay v{} — please restart.", version);
+                    }
+                }
+                let _ = std::fs::remove_file(temp_path);
+                return format!("Failed to install update: {} (rename: {})", e2, e);
+            }
+        }
+    }
+
+    format!("Updated to Clay v{} — please restart.", version)
 }

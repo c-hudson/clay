@@ -1,9 +1,9 @@
 //! Additional builtin commands for TinyFugue compatibility.
 //!
 //! Implements:
-//! - Output commands: #beep, #gag, #ungag, #recall, #quote
-//! - File operations: #load, #save, #log
-//! - Miscellaneous: #time, #sh, #lcd
+//! - Output commands: /beep, /gag, /ungag, /recall, /quote
+//! - File operations: /load, /save, /log
+//! - Miscellaneous: /time, /sh, /lcd
 
 use std::fs;
 use std::path::Path;
@@ -11,13 +11,13 @@ use std::io::{BufRead, BufReader};
 use std::time::{Duration, Instant};
 use super::{TfEngine, TfProcess, TfCommandResult, RecallOptions, RecallSource, RecallRange, RecallMatchStyle};
 
-/// #beep - Sound the terminal bell
+/// /beep - Sound the terminal bell
 pub fn cmd_beep() -> TfCommandResult {
     // Return a special message that the main app can interpret
     TfCommandResult::Success(Some("\x07".to_string()))
 }
 
-/// #time [format] - Display current time
+/// /time [format] - Display current time
 pub fn cmd_time(args: &str) -> TfCommandResult {
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -42,7 +42,7 @@ pub fn cmd_time(args: &str) -> TfCommandResult {
     }
 }
 
-/// #lcd [directory] - Change local directory
+/// /lcd [directory] - Change local directory
 pub fn cmd_lcd(engine: &mut TfEngine, args: &str) -> TfCommandResult {
     let dir = args.trim();
 
@@ -85,7 +85,7 @@ pub fn cmd_lcd(engine: &mut TfEngine, args: &str) -> TfCommandResult {
     }
 }
 
-/// #sh command - Execute shell command
+/// /sh command - Execute shell command
 pub fn cmd_sh(args: &str) -> TfCommandResult {
     let cmd = args.trim();
 
@@ -124,7 +124,7 @@ pub fn cmd_sh(args: &str) -> TfCommandResult {
     }
 }
 
-/// #quote [options] [prefix] source [suffix] - Generate text from file, command, or literal
+/// /quote [options] [prefix] source [suffix] - Generate text from file, command, or literal
 ///
 /// Sources:
 ///   '"file"     - Read lines from a file
@@ -140,12 +140,12 @@ pub fn cmd_sh(args: &str) -> TfCommandResult {
 ///   -S          - Synchronous mode (wait for completion)
 ///
 /// Examples:
-///   #quote hello world           - Send "hello world" to MUD
-///   #quote '"/etc/motd"          - Send each line of /etc/motd to MUD
-///   #quote say '"/tmp/lines.txt" - Send "say <line>" for each line
-///   #quote think `"/version"     - Send "think <version>" to MUD
-///   #quote !"ls -la"             - Send output of shell ls command
-///   #quote -decho '"config.txt"  - Display file contents locally
+///   /quote hello world           - Send "hello world" to MUD
+///   /quote '"/etc/motd"          - Send each line of /etc/motd to MUD
+///   /quote say '"/tmp/lines.txt" - Send "say <line>" for each line
+///   /quote think `"/version"     - Send "think <version>" to MUD
+///   /quote !"ls -la"             - Send output of shell ls command
+///   /quote -decho '"config.txt"  - Display file contents locally
 pub fn cmd_quote(engine: &mut super::TfEngine, args: &str) -> TfCommandResult {
     use super::QuoteDisposition;
     use std::process::{Command, Stdio};
@@ -156,6 +156,7 @@ pub fn cmd_quote(engine: &mut super::TfEngine, args: &str) -> TfCommandResult {
 
     let mut input = args.trim();
     let mut disposition = QuoteDisposition::Send;
+    let mut disposition_explicit = false;
     let mut world: Option<String> = None;
     let mut _synchronous = false;
     let mut _on_prompt = false;  // -P flag: run on prompt (not yet implemented)
@@ -204,6 +205,7 @@ pub fn cmd_quote(engine: &mut super::TfEngine, args: &str) -> TfCommandResult {
             input = input[space_pos..].trim_start();
 
             if let Some(disp_str) = opt.strip_prefix("-d") {
+                disposition_explicit = true;
                 disposition = match disp_str {
                     "send" => QuoteDisposition::Send,
                     "echo" => QuoteDisposition::Echo,
@@ -439,6 +441,16 @@ pub fn cmd_quote(engine: &mut super::TfEngine, args: &str) -> TfCommandResult {
         return TfCommandResult::Success(Some("(no output)".to_string()));
     }
 
+    // If the user didn't explicitly set -d and the prefix starts with /,
+    // auto-set disposition to Exec so the resulting lines are executed as commands
+    // instead of sent to the MUD (e.g., "/quote /echo !who" should run /echo on each line)
+    if !disposition_explicit && !prefix.is_empty() {
+        let trimmed_prefix = prefix.trim();
+        if trimmed_prefix.starts_with('/') {
+            disposition = QuoteDisposition::Exec;
+        }
+    }
+
     TfCommandResult::Quote {
         lines,
         disposition,
@@ -448,10 +460,10 @@ pub fn cmd_quote(engine: &mut super::TfEngine, args: &str) -> TfCommandResult {
     }
 }
 
-/// #recall [-<count>] <pattern> - Search output history
+/// /recall [-<count>] <pattern> - Search output history
 /// Examples:
-///   #recall *combat*     - Show all lines matching *combat*
-///   #recall -10 *combat* - Show last 10 lines matching *combat*
+///   /recall *combat*     - Show all lines matching *combat*
+///   /recall -10 *combat* - Show last 10 lines matching *combat*
 /// Parse a time string like "1:30" or "1:30:45" into seconds
 fn parse_time_to_seconds(s: &str) -> Option<f64> {
     let parts: Vec<&str> = s.split(':').collect();
@@ -733,7 +745,7 @@ pub fn cmd_recall(args: &str) -> TfCommandResult {
     TfCommandResult::Recall(opts)
 }
 
-/// #gag pattern - Add a gag pattern (suppress matching output)
+/// /gag pattern - Add a gag pattern (suppress matching output)
 /// Note: Returns a message for main.rs integration
 pub fn cmd_gag(engine: &mut TfEngine, args: &str) -> TfCommandResult {
     let pattern = args.trim();
@@ -763,7 +775,7 @@ pub fn cmd_gag(engine: &mut TfEngine, args: &str) -> TfCommandResult {
     TfCommandResult::Success(Some(format!("Gagging '{}'", pattern)))
 }
 
-/// #ungag pattern - Remove a gag pattern
+/// /ungag pattern - Remove a gag pattern
 pub fn cmd_ungag(engine: &mut TfEngine, args: &str) -> TfCommandResult {
     let pattern = args.trim();
 
@@ -818,7 +830,7 @@ fn resolve_file_path(engine: &TfEngine, filename: &str) -> Option<String> {
     }
 
     // Search order for relative paths:
-    // 1. Current directory (from #lcd or actual cwd)
+    // 1. Current directory (from /lcd or actual cwd)
     // 2. Directories in TFPATH
     // 3. TFLIBDIR
 
@@ -862,7 +874,7 @@ fn resolve_file_path(engine: &TfEngine, filename: &str) -> Option<String> {
     None
 }
 
-/// Internal load implementation used by both #load and #require
+/// Internal load implementation used by both /load and /require
 fn load_file_internal(engine: &mut TfEngine, filename: &str, quiet: bool) -> TfCommandResult {
     // Resolve the file path
     let resolved = match resolve_file_path(engine, filename) {
@@ -886,19 +898,76 @@ fn load_file_internal(engine: &mut TfEngine, filename: &str, quiet: bool) -> TfC
     }
 
     let reader = BufReader::new(file);
+    let lines_iter = reader.lines().map(|l| l.unwrap_or_default());
+    let (line_results, exit_early) = load_lines(engine, lines_iter, &resolved);
+    results.extend(line_results);
+
+    // Remove this file from the loading stack
+    engine.loading_files.pop();
+
+    // Fire LOAD hook (even for early exit)
+    let hook_results = super::hooks::fire_hook(engine, super::TfHookEvent::Load);
+    results.extend(hook_results);
+
+    // Collect errors for detailed output
+    let errors: Vec<String> = results.iter()
+        .filter_map(|r| match r {
+            TfCommandResult::Error(e) => Some(e.clone()),
+            _ => None,
+        })
+        .collect();
+
+    if !errors.is_empty() {
+        // Build multi-line output with summary and error details
+        let mut output = format!("Loaded '{}' with {} error(s)", resolved, errors.len());
+        for error in &errors {
+            output.push_str(&format!("\n   {}", error));
+        }
+        TfCommandResult::Error(output)
+    } else if exit_early {
+        // Success with early exit - no output (silent)
+        TfCommandResult::Success(None)
+    } else {
+        // Success - no completion output (silent like TF)
+        TfCommandResult::Success(None)
+    }
+}
+
+/// Load TF commands from a string (for tests and embedded scripts)
+#[cfg(test)]
+pub fn load_from_str(engine: &mut TfEngine, content: &str) -> TfCommandResult {
+    let source = "<embedded>";
+    let lines_iter = content.lines().map(|l| l.to_string());
+    let (results, _exit_early) = load_lines(engine, lines_iter, source);
+
+    let errors: Vec<String> = results.iter()
+        .filter_map(|r| match r {
+            TfCommandResult::Error(e) => Some(e.clone()),
+            _ => None,
+        })
+        .collect();
+
+    if !errors.is_empty() {
+        let mut output = format!("Loaded with {} error(s)", errors.len());
+        for error in &errors {
+            output.push_str(&format!("\n   {}", error));
+        }
+        TfCommandResult::Error(output)
+    } else {
+        TfCommandResult::Success(None)
+    }
+}
+
+/// Core line processing shared by file loading and string loading.
+/// Returns (results, exit_early).
+fn load_lines(engine: &mut super::TfEngine, lines: impl Iterator<Item = String>, source: &str) -> (Vec<TfCommandResult>, bool) {
+    let mut results = Vec::new();
     let mut line_num = 0;
     let mut continued_line = String::new();
     let mut exit_early = false;
 
-    for line in reader.lines() {
+    for line in lines {
         line_num += 1;
-        let line = match line {
-            Ok(l) => l,
-            Err(e) => {
-                results.push(TfCommandResult::Error(format!("Line {}: {}", line_num, e)));
-                continue;
-            }
-        };
 
         // Strip leading whitespace
         let trimmed = line.trim_start();
@@ -955,10 +1024,10 @@ fn load_file_internal(engine: &mut TfEngine, filename: &str, quiet: bool) -> TfC
 
         match &result {
             TfCommandResult::Error(e) => {
-                results.push(TfCommandResult::Error(format!("{}:{}: {}", resolved, line_num, e)));
+                results.push(TfCommandResult::Error(format!("{}:{}: {}", source, line_num, e)));
             }
             TfCommandResult::ExitLoad => {
-                // #exit was called - stop loading this file
+                // /exit was called - stop loading
                 exit_early = true;
                 break;
             }
@@ -966,35 +1035,7 @@ fn load_file_internal(engine: &mut TfEngine, filename: &str, quiet: bool) -> TfC
         }
     }
 
-    // Remove this file from the loading stack
-    engine.loading_files.pop();
-
-    // Fire LOAD hook (even for early exit)
-    let hook_results = super::hooks::fire_hook(engine, super::TfHookEvent::Load);
-    results.extend(hook_results);
-
-    // Collect errors for detailed output
-    let errors: Vec<String> = results.iter()
-        .filter_map(|r| match r {
-            TfCommandResult::Error(e) => Some(e.clone()),
-            _ => None,
-        })
-        .collect();
-
-    if !errors.is_empty() {
-        // Build multi-line output with summary and error details
-        let mut output = format!("Loaded '{}' with {} error(s)", resolved, errors.len());
-        for error in &errors {
-            output.push_str(&format!("\n   {}", error));
-        }
-        TfCommandResult::Error(output)
-    } else if exit_early {
-        // Success with early exit - no output (silent)
-        TfCommandResult::Success(None)
-    } else {
-        // Success - no completion output (silent like TF)
-        TfCommandResult::Success(None)
-    }
+    (results, exit_early)
 }
 
 /// /load [-q] filename - Load and execute a TF script file
@@ -1080,9 +1121,9 @@ pub fn cmd_loaded(engine: &mut TfEngine, args: &str) -> TfCommandResult {
     TfCommandResult::Success(None)
 }
 
-/// #exit - Abort loading the current file early
+/// /exit - Abort loading the current file early
 ///
-/// When called during #load or #require, stops reading the current file.
+/// When called during /load or /require, stops reading the current file.
 /// When called outside of file loading, this is equivalent to /quit.
 pub fn cmd_exit(engine: &TfEngine) -> TfCommandResult {
     if engine.loading_files.is_empty() {
@@ -1094,7 +1135,7 @@ pub fn cmd_exit(engine: &TfEngine) -> TfCommandResult {
     }
 }
 
-/// #save filename - Save macros to a file
+/// /save filename - Save macros to a file
 pub fn cmd_save(engine: &TfEngine, args: &str) -> TfCommandResult {
     let filename = args.trim();
 
@@ -1211,7 +1252,7 @@ pub fn cmd_save(engine: &TfEngine, args: &str) -> TfCommandResult {
     }
 }
 
-/// #log [filename] - Toggle logging to file
+/// /log [filename] - Toggle logging to file
 /// Note: Actual logging needs main.rs integration, this just returns a message
 pub fn cmd_log(args: &str) -> TfCommandResult {
     let filename = args.trim();
@@ -1255,7 +1296,7 @@ pub fn parse_tf_time(s: &str) -> Option<Duration> {
     }
 }
 
-/// #repeat [-w[world]] [-n] {[-time]|-S|-P} count command
+/// /repeat [-w[world]] [-n] {[-time]|-S|-P} count command
 pub fn cmd_repeat(engine: &mut TfEngine, args: &str) -> TfCommandResult {
     let args = args.trim();
     if args.is_empty() {
@@ -1407,7 +1448,7 @@ pub fn cmd_repeat(engine: &mut TfEngine, args: &str) -> TfCommandResult {
     TfCommandResult::RepeatProcess(process)
 }
 
-/// #ps - List background processes
+/// /ps - List background processes
 pub fn cmd_ps(engine: &TfEngine) -> TfCommandResult {
     if engine.processes.is_empty() {
         return TfCommandResult::Success(Some("No background processes.".to_string()));
@@ -1446,7 +1487,7 @@ fn format_duration(d: Duration) -> String {
     }
 }
 
-/// #kill pid - Kill background process
+/// /kill pid - Kill background process
 pub fn cmd_kill(engine: &mut TfEngine, args: &str) -> TfCommandResult {
     let pid_str = args.trim();
     if pid_str.is_empty() {
@@ -1698,23 +1739,123 @@ mod tests {
         assert!(!engine.macros.iter().any(|m| m.attributes.gag && m.trigger.as_ref().map(|t| t.pattern == "spam*").unwrap_or(false)));
     }
 
+    const CRYPT_TF: &str = r#";
+;
+; encrypt.tf
+;    This is an implimentation of some really simple encryption.
+;    Its probably slightly more effective then say rot13. Don't
+;    trust this code to deter dedicated people. Trust this code
+;    to baffle newbies.
+;
+; Useage:
+;    /e <text>                 Encrypts <text> using the password set by
+;                              the /passwd command.
+;    /passwd <text>            Set the password to <text>.
+;
+
+/def random = /echo -- %R
+
+/def passwd = \
+   /let i=0%;\
+   /let eol=$[strlen({*})]%;\
+   /while (i < eol) \
+      /let char=$[ascii(substr({*},i,1))]%;\
+      /if (char >= 32) \
+         /if (char <=  126) \
+            /let tmppwd=%tmppwd$[char(char)]%;\
+         /endif%;\
+      /endif%;\
+      /test ++i%;\
+   /done%;\
+   /def crypt_pwd=%tmppwd%;\
+
+/def encrypt = \
+   /let i=0%;\
+    /while (i < strlen({*})) \
+      /let char=$[mod(ascii(substr({*},i,1)) + \
+         ascii(substr(${crypt_pwd},mod(i,strlen(${crypt_pwd})),1)) - \
+         64,95)+32]%;\
+      /let printable=x$(/makeprintable %{i} %{char})x%;\
+      /let result=%result$[substr(printable,1,strlen(printable)-2)]%;\
+      /test ++i%;\
+   /done%;\
+   /echo -- %result%;\
+
+/def decrypt = \
+   /let i=1%;\
+   /let j=0%;\
+   /while (i < (strlen({-1}) - 1)) \
+      /let char=$[ascii(substr({-1},i,1))]%;\
+      /if ({1} & char == 92) \
+         /let char=$[ascii(substr({-1},++i,1))]%;\
+      /elseif ({1} & (substr({-1},i,2)) =/ "%b") \
+         /let char=32%;\
+         /test ++i%;\
+      /endif%;\
+      /let code=$[substr(code,0,strlen(code)-1)]$[char(mod({char} - \
+         ascii(substr(${crypt_pwd},j,1)) + 190,95) + 32)]a%;\
+      /let j=$[mod(++j,strlen(${crypt_pwd}))]%;\
+      /test ++i%;\
+   /done%;\
+   /echo -- $[substr(code,0,strlen(code)-1)]
+
+/def makeprintable = \
+   /if ({-1} == 32) \
+      /echo -- \%b%;\
+   /elseif ({1} == 0) \
+      /echo -- $[char({-1})]%;\
+   /elseif ({-1}==92 | {-1}==91 | {-1}==93 | {-1}==123 | {-1}==125 | {-1}==37) \
+      /echo -- \\$[char({-1})]%;\
+   /else \
+      /echo -- $[char({-1})]%;\
+   /endif
+
+/def e = \
+   /echo -- say \\$(/encrypt %*3.14)%;\
+   say \\$(/encrypt %*3.14)
+
+/def p = \
+   +pub \\$(/encrypt %*3.14)
+
+/def -p5000 -mregexp -t' (say|says|says,|say,) "(.*)"$$' \
+      listen_mush = \
+   /if (substr({P2},0,1) =~ "\\") \
+   	/let dcrypt=$(/decrypt 1 x%P2x)%;\
+   /else \
+        /let dcrypt=$(/decrypt 0 x%P2x)%;\
+   /endif%;\
+   /if (dcrypt =/ "*3.14") \
+      /if (dcrypt =/ "\:*") \
+         /echo -w${world_name} -ag -- %*%;\
+         /substitute -aCred -- %% * %PL $[substr(dcrypt,strstr(dcrypt,":")+1,\
+            strlen(dcrypt)-5)]%;\
+      /else \
+         /echo -w${world_name} -ag -- %*%;\
+         /substitute -aCred -- %% %PL %P1 \
+            "$[substr(dcrypt,0,strlen(dcrypt)-4)]"%;\
+      /endif%;\
+   /endif
+
+;/passwd welcometoencryptionpartyongarth
+/passwd Fredrik
+; /passwd test
+"#;
+
     #[test]
     fn test_load_crypt_tf() {
         let mut engine = TfEngine::new();
 
-        // Load crypt.tf from the project root
-        let result = cmd_load(&mut engine, "crypt.tf");
+        // Load crypt.tf from embedded content
+        let result = load_from_str(&mut engine, CRYPT_TF);
 
-        // Check loading succeeded (or at least didn't hard error)
-        // Note: Some commands like #passwd might produce errors since they try to execute
         match &result {
             TfCommandResult::Success(_) => {
                 // Good - loaded successfully
             }
             TfCommandResult::Error(e) => {
-                // Check it's not a file-not-found error
-                assert!(!e.contains("Cannot open"), "Failed to open crypt.tf: {}", e);
-                // Other errors might be OK (e.g., from executing #passwd)
+                // Some errors might be OK (e.g., from executing /passwd)
+                // but check it's not a fundamental failure
+                panic!("Failed to load crypt.tf: {}", e);
             }
             _ => {}
         }
@@ -1797,8 +1938,8 @@ mod tests {
         // Test encrypt→decrypt round trip with crypt.tf
         let mut engine = TfEngine::new();
 
-        // Load crypt.tf
-        let _ = cmd_load(&mut engine, "crypt.tf");
+        // Load crypt.tf from embedded content
+        let _ = load_from_str(&mut engine, CRYPT_TF);
 
         // Verify crypt_pwd is set
         let pwd = engine.macros.iter().find(|m| m.name == "crypt_pwd");

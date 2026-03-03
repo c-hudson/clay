@@ -1,19 +1,19 @@
 //! Macro system for TinyFugue compatibility.
 //!
 //! Implements:
-//! - #def command with flags for triggers, hooks, keybindings, attributes
-//! - #undef, #undefn, #undeft for removing macros
-//! - #list for listing macros
-//! - #purge for removing all macros
+//! - /def command with flags for triggers, hooks, keybindings, attributes
+//! - /undef, /undefn, /undeft for removing macros
+//! - /list for listing macros
+//! - /purge for removing all macros
 //! - Trigger pattern matching with capture groups
 
 use regex::Regex;
 use super::{TfEngine, TfMacro, TfTrigger, TfMatchMode, TfAttributes, TfHookEvent, TfCommandResult, TfValue};
 use super::variables;
 
-/// Parse the #def command and create a macro
+/// Parse the /def command and create a macro
 ///
-/// Syntax: #def [options] name = body
+/// Syntax: /def [options] name = body
 /// Options:
 ///   -t"pattern"  Trigger pattern
 ///   -mMODE       Match mode (simple, glob, regexp)
@@ -109,7 +109,7 @@ pub fn parse_def(args: &str) -> Result<TfMacro, String> {
     Ok(macro_def)
 }
 
-/// Options that can be parsed from #def
+/// Options that can be parsed from /def
 enum DefOption {
     Trigger(String),
     MatchMode(TfMatchMode),
@@ -440,12 +440,12 @@ pub fn match_trigger<'a>(trigger: &TfTrigger, line: &'a str) -> Option<TriggerMa
 /// Split a macro body into execution units, preserving control flow blocks as single units.
 ///
 /// This handles cases like:
-///   #if (cond) cmd1%;#else cmd2%;#endif
+///   /if (cond) cmd1%;/else cmd2%;/endif
 /// Which should be treated as ONE control flow block, not split by %;
 fn split_body_preserving_control_flow(body: &str) -> Vec<String> {
     let mut result = Vec::new();
     let mut current = String::new();
-    let mut control_depth = 0;  // Track nesting of #if/#while/#for blocks
+    let mut control_depth = 0;  // Track nesting of /if//while//for blocks
 
     // Split by %; only - in TF, only %; is a command separator in macro bodies
     // Bare ; is NOT a separator (unlike some other scripting languages)
@@ -496,13 +496,13 @@ fn split_body_preserving_control_flow(body: &str) -> Vec<String> {
 }
 
 /// Count the net change in control flow depth from a piece of text.
-/// Returns positive for opening keywords (#if, #while, #for), negative for closing (#endif, #done).
+/// Returns positive for opening keywords (/if, /while, /for), negative for closing (/endif, /done).
 fn count_control_flow_depth_change(text: &str) -> i32 {
     let lower = text.to_lowercase();
     let mut depth = 0;
 
     // We need to find all occurrences of control flow keywords
-    // This is tricky because "#if" could appear in a string, but for simplicity
+    // This is tricky because "/if" could appear in a string, but for simplicity
     // we'll scan for them as whitespace-separated tokens
 
     // Look for control flow starts
@@ -710,7 +710,7 @@ pub fn process_triggers(engine: &mut TfEngine, line: &str, world: Option<&str>) 
 pub fn list_macros(engine: &TfEngine, pattern: Option<&str>) -> String {
     let mut output = String::new();
 
-    // Convert glob pattern to regex (TF uses glob matching for #list)
+    // Convert glob pattern to regex (TF uses glob matching for /list)
     let pattern_regex = pattern.and_then(|p| {
         // Convert glob to regex: * -> .*, ? -> ., escape other regex chars
         let mut regex = String::from("^");

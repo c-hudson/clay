@@ -749,7 +749,7 @@ impl Default for EditorState {
     }
 }
 
-/// Apply TF attributes to text for #substitute command.
+/// Apply TF attributes to text for /substitute command.
 /// Attribute string format: C<color> for foreground, B for bold, etc.
 /// Examples: "Cred" = red, "Cbold" = bold, "Cgreen" = green
 fn apply_tf_attrs(text: &str, attrs: &str) -> String {
@@ -1230,7 +1230,7 @@ pub enum Command {
     /// /reload - hot reload binary
     Reload,
     /// /update - check for and install updates from GitHub
-    Update,
+    Update { force: bool },
     /// /setup - show global settings popup
     Setup,
     /// /web - show web settings popup
@@ -1336,7 +1336,10 @@ pub fn parse_command(input: &str) -> Command {
         "/version" => Command::Version,
         "/quit" => Command::Quit,
         "/reload" => Command::Reload,
-        "/update" => Command::Update,
+        "/update" => {
+            let force = args.first().map(|a| *a == "-f" || *a == "--force").unwrap_or(false);
+            Command::Update { force }
+        }
         "/setup" => Command::Setup,
         "/web" => Command::Web,
         "/actions" => {
@@ -2597,6 +2600,8 @@ pub struct App {
     pub theme_file: theme::ThemeFile,
     /// Remote client mode: WebSocket transmitter for sending commands to server
     pub ws_client_tx: Option<mpsc::UnboundedSender<WsMessage>>,
+    /// Remote client mode: pending /update request (Some(force_flag))
+    pub pending_update: Option<bool>,
     /// Activity count from server (used in remote client mode, i.e. --console)
     pub server_activity_count: usize,
     /// Remote client backfill: queue of (world_index, total_output_lines) to backfill
@@ -2679,6 +2684,7 @@ impl App {
             tf_engine: tf::TfEngine::new(),
             theme_file: theme::ThemeFile::with_defaults(),
             ws_client_tx: None, // Set when running as remote client (--console mode)
+            pending_update: None,
             server_activity_count: 0, // Activity count from server (remote client mode)
             backfill_queue: Vec::new(),
             backfill_next: None,
@@ -3524,6 +3530,13 @@ impl App {
                     Command::Font => {
                         // Font popup is handled by each client type locally
                         // Remote GUI opens its own font popup
+                    }
+                    Command::Update { force } => {
+                        // Signal to the outer run_console_client loop to handle locally
+                        self.pending_update = Some(force);
+                    }
+                    Command::Quit => {
+                        // Handled by the outer run_console_client loop
                     }
                     _ => {
                         // Unknown local command - ignore or log
@@ -4813,7 +4826,7 @@ impl App {
             self.worlds[world_idx].scroll_to_bottom();
         }
 
-        // Display TF trigger messages (from #echo commands)
+        // Display TF trigger messages (from /echo commands)
         for msg in tf_messages {
             self.add_tf_output(&msg);
         }
@@ -5771,20 +5784,9 @@ impl App {
                 // Server keeps running — /quit only affects the remote client
                 self.ws_send_to_client(client_id, WsMessage::ExecuteLocalCommand { command: "/quit".to_string() });
             }
-            Command::Update => {
-                self.add_output("Checking for updates...");
-                #[cfg(all(unix, not(target_os = "android")))]
-                {
-                    let event_tx_clone = event_tx.clone();
-                    tokio::spawn(async move {
-                        let result = check_and_download_update().await;
-                        let _ = event_tx_clone.send(AppEvent::UpdateResult(result)).await;
-                    });
-                }
-                #[cfg(any(target_os = "android", not(unix)))]
-                {
-                    self.add_output("Update is not available on this platform.");
-                }
+            Command::Update { .. } => {
+                // Bounce back to client — /update should run locally on the client's machine
+                self.ws_send_to_client(client_id, WsMessage::ExecuteLocalCommand { command: command.to_string() });
             }
             // Commands that should be blocked from remote
             Command::Reload => {
@@ -7928,19 +7930,19 @@ fn get_executable_path() -> io::Result<(PathBuf, String)> {
 }
 
 /// Get the correct GitHub release asset name for this platform
-#[cfg(all(unix, not(target_os = "android")))]
+#[cfg(not(target_os = "android"))]
 fn get_platform_asset_name() -> &'static str {
     #[cfg(all(target_os = "linux", target_env = "musl"))]
-    { "clay-linux-x86_64-musl" }
+    { "clay" }
 
     #[cfg(all(target_os = "linux", not(target_env = "musl")))]
-    { "clay-linux-x86_64" }
+    { "clay" }
 
     #[cfg(target_os = "macos")]
     { "clay-macos-universal" }
 
     #[cfg(target_os = "windows")]
-    { "clay-windows-x86_64.exe" }
+    { "clay.exe" }
 
     #[cfg(target_os = "android")]
     { "clay-termux-aarch64" }
@@ -7986,36 +7988,51 @@ fn is_newer_version(remote: &str, current: &str) -> bool {
 }
 
 /// Check GitHub for latest release and download the binary if newer
-#[cfg(all(unix, not(target_os = "android")))]
-async fn check_and_download_update() -> Result<UpdateSuccess, String> {
+#[cfg(not(target_os = "android"))]
+pub async fn check_and_download_update(force: bool) -> Result<UpdateSuccess, String> {
     let client = reqwest::Client::builder()
         .user_agent("clay-mud-client")
         .build()
         .map_err(|e| format!("HTTP client error: {}", e))?;
 
-    // Use /releases (not /releases/latest) because pre-release tags like v1.0.0-beta
-    // are excluded from the /latest endpoint
-    let releases: serde_json::Value = client
-        .get("https://api.github.com/repos/c-hudson/clay/releases?per_page=1")
-        .send()
-        .await
-        .map_err(|e| format!("Failed to check for updates: {}", e))?
-        .json()
-        .await
-        .map_err(|e| format!("Invalid response: {}", e))?;
+    // Try /releases/latest first (works for non-prerelease tags), then fall back to
+    // /releases (includes pre-releases like v1.0.0-beta)
+    let release: serde_json::Value = {
+        let resp = client
+            .get("https://api.github.com/repos/c-hudson/clay/releases/latest")
+            .send()
+            .await
+            .map_err(|e| format!("Failed to check for updates: {}", e))?;
 
-    let release = releases.as_array()
-        .and_then(|a| a.first())
-        .ok_or("No releases found")?;
+        if resp.status().is_success() {
+            resp.json().await
+                .map_err(|e| format!("Invalid response: {}", e))?
+        } else {
+            // /latest returned 404 (pre-release only) — try listing all releases
+            let releases: serde_json::Value = client
+                .get("https://api.github.com/repos/c-hudson/clay/releases?per_page=1")
+                .send()
+                .await
+                .map_err(|e| format!("Failed to check for updates: {}", e))?
+                .json()
+                .await
+                .map_err(|e| format!("Invalid response: {}", e))?;
+
+            releases.as_array()
+                .and_then(|a| a.first().cloned())
+                .ok_or("No releases found on GitHub")?
+        }
+    };
 
     // Extract version from tag_name (strip leading 'v')
     let tag = release["tag_name"]
         .as_str()
-        .ok_or("No version tag in release")?;
+        .ok_or_else(|| format!("No version tag in release (keys: {:?})",
+            release.as_object().map(|o| o.keys().take(5).collect::<Vec<_>>())))?;
     let remote_version = tag.trim_start_matches('v');
 
     // Compare versions
-    if !is_newer_version(remote_version, VERSION) {
+    if !force && !is_newer_version(remote_version, VERSION) {
         return Err(format!(
             "Already up to date (current: v{}, latest: v{})",
             VERSION, remote_version
@@ -8071,7 +8088,7 @@ async fn check_and_download_update() -> Result<UpdateSuccess, String> {
         ));
     }
 
-    // Check ELF header (Linux) or Mach-O header (macOS) to verify it's an executable
+    // Check ELF header (Linux), Mach-O header (macOS), or PE header (Windows)
     #[cfg(target_os = "linux")]
     if bytes.len() >= 4 && &bytes[0..4] != b"\x7fELF" {
         return Err("Downloaded file is not a valid ELF binary".to_string());
@@ -8083,6 +8100,10 @@ async fn check_and_download_update() -> Result<UpdateSuccess, String> {
         if !matches!(magic, 0xFEEDFACF | 0xCFFAEDFE | 0xBEBAFECA | 0xCAFEBABE) {
             return Err("Downloaded file is not a valid Mach-O binary".to_string());
         }
+    }
+    #[cfg(target_os = "windows")]
+    if bytes.len() >= 2 && &bytes[0..2] != b"MZ" {
+        return Err("Downloaded file is not a valid Windows executable".to_string());
     }
 
     // Write to temp file
@@ -8420,6 +8441,9 @@ async fn run_console_client(addr: &str) -> io::Result<()> {
     let mut backfill_timer = std::pin::pin!(tokio::time::sleep(std::time::Duration::from_millis(500)));
     let mut backfill_timer_active = !app.backfill_queue.is_empty();
 
+    // Channel for local /update results
+    let (update_tx, mut update_rx) = mpsc::channel::<Result<UpdateSuccess, String>>(1);
+
     loop {
         // Draw if needed
         if needs_redraw || app.needs_output_redraw {
@@ -8541,6 +8565,22 @@ async fn run_console_client(addr: &str) -> io::Result<()> {
                             if handle_remote_client_key(&mut app, key, &ws_tx) {
                                 break; // Quit requested
                             }
+                            // Check if an /update was requested
+                            if let Some(force) = app.pending_update.take() {
+                                app.add_output(if force { "Force updating..." } else { "Checking for updates..." });
+                                #[cfg(not(target_os = "android"))]
+                                {
+                                    let update_tx_clone = update_tx.clone();
+                                    tokio::spawn(async move {
+                                        let result = check_and_download_update(force).await;
+                                        let _ = update_tx_clone.send(result).await;
+                                    });
+                                }
+                                #[cfg(target_os = "android")]
+                                {
+                                    app.add_output("Update is not available on this platform.");
+                                }
+                            }
                             needs_redraw = true;
                         }
                         Event::Resize(_, height) => {
@@ -8569,6 +8609,22 @@ async fn run_console_client(addr: &str) -> io::Result<()> {
                                     before_seq,
                                 });
                             }
+                            // Check if an /update was requested via ExecuteLocalCommand
+                            if let Some(force) = app.pending_update.take() {
+                                app.add_output(if force { "Force updating..." } else { "Checking for updates..." });
+                                #[cfg(not(target_os = "android"))]
+                                {
+                                    let update_tx_clone = update_tx.clone();
+                                    tokio::spawn(async move {
+                                        let result = check_and_download_update(force).await;
+                                        let _ = update_tx_clone.send(result).await;
+                                    });
+                                }
+                                #[cfg(target_os = "android")]
+                                {
+                                    app.add_output("Update is not available on this platform.");
+                                }
+                            }
                             needs_redraw = true;
                         }
                     }
@@ -8579,6 +8635,55 @@ async fn run_console_client(addr: &str) -> io::Result<()> {
                         break;
                     }
                     _ => {}
+                }
+            }
+            // Handle /update result
+            result = update_rx.recv() => {
+                if let Some(result) = result {
+                    match result {
+                        Ok(success) => {
+                            #[cfg(all(unix, not(target_os = "android")))]
+                            {
+                                match get_executable_path() {
+                                    Ok((exe_path, _)) => {
+                                        use std::os::unix::fs::PermissionsExt;
+                                        if let Err(e) = std::fs::set_permissions(
+                                            &success.temp_path,
+                                            std::fs::Permissions::from_mode(0o755),
+                                        ) {
+                                            app.add_output(&format!("Failed to set permissions: {}", e));
+                                            let _ = std::fs::remove_file(&success.temp_path);
+                                        } else if let Err(e) = std::fs::rename(&success.temp_path, &exe_path) {
+                                            match std::fs::copy(&success.temp_path, &exe_path) {
+                                                Ok(_) => {
+                                                    let _ = std::fs::remove_file(&success.temp_path);
+                                                    app.add_output(&format!("Updated to Clay v{} — please restart.", success.version));
+                                                }
+                                                Err(e2) => {
+                                                    app.add_output(&format!("Failed to install update: {} (rename: {})", e2, e));
+                                                    let _ = std::fs::remove_file(&success.temp_path);
+                                                }
+                                            }
+                                        } else {
+                                            app.add_output(&format!("Updated to Clay v{} — please restart.", success.version));
+                                        }
+                                    }
+                                    Err(e) => {
+                                        app.add_output(&format!("Cannot find current binary: {}", e));
+                                        let _ = std::fs::remove_file(&success.temp_path);
+                                    }
+                                }
+                            }
+                            #[cfg(not(all(unix, not(target_os = "android"))))]
+                            {
+                                app.add_output(&format!("Update v{} downloaded to {}. Please replace the binary manually and restart.", success.version, success.temp_path.display()));
+                            }
+                        }
+                        Err(e) => {
+                            app.add_output(&e);
+                        }
+                    }
+                    needs_redraw = true;
                 }
             }
             // Backfill timer: start requesting scrollback history after initial delay
@@ -9342,6 +9447,10 @@ fn handle_remote_client_key(
                         } else {
                             app.open_actions_list_popup();
                         }
+                    }
+                    Command::Update { force } => {
+                        // Signal to the outer run_console_client loop to handle locally
+                        app.pending_update = Some(force);
                     }
                     Command::Connect { .. } => {
                         let _ = ws_tx.send(WsMessage::ConnectWorld {
@@ -13176,9 +13285,9 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                     if num_part.chars().all(|c| c.is_ascii_digit()) && !num_part.is_empty() {
                                         let pattern = rest[space_pos..].trim();
                                         if !pattern.is_empty() {
-                                            // Convert to #recall /N pattern - sync world info first
+                                            // Convert to /recall /N pattern - sync world info first
                                             app.sync_tf_world_info();
-                                            let recall_cmd = format!("#recall /{} {}", num_part, pattern);
+                                            let recall_cmd = format!("/recall /{} {}", num_part, pattern);
                                             match app.tf_engine.execute(&recall_cmd) {
                                                 tf::TfCommandResult::Recall(opts) => {
                                                     let output_lines = app.current_world().output_lines.clone();
@@ -13311,7 +13420,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                             for (i, line) in lines.into_iter().enumerate() {
                                                 let cmd = match disposition {
                                                     tf::QuoteDisposition::Send => line,
-                                                    tf::QuoteDisposition::Echo => format!("#echo {}", line),
+                                                    tf::QuoteDisposition::Echo => format!("/echo {}", line),
                                                     tf::QuoteDisposition::Exec => line,
                                                 };
                                                 let id = app.tf_engine.next_process_id;
@@ -14277,7 +14386,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                         commands_to_execute.extend(tf_result.send_commands);
                         tf_commands_to_execute.extend(tf_result.clay_commands);
                         is_gagged = is_gagged || tf_result.should_gag;
-                        // Output TF messages (from #echo etc)
+                        // Output TF messages (from /echo etc)
                         for msg in &tf_result.messages {
                             app.add_tf_output(msg);
                         }
@@ -17760,7 +17869,7 @@ async fn handle_command(cmd: &str, app: &mut App, event_tx: mpsc::Sender<AppEven
                 }
             }
         }
-        Command::Update => {
+        Command::Update { force } => {
             #[cfg(any(target_os = "android", not(unix)))]
             {
                 app.add_output("Update is not available on this platform.");
@@ -17768,10 +17877,10 @@ async fn handle_command(cmd: &str, app: &mut App, event_tx: mpsc::Sender<AppEven
 
             #[cfg(all(unix, not(target_os = "android")))]
             {
-                app.add_output("Checking for updates...");
+                app.add_output(if force { "Force updating..." } else { "Checking for updates..." });
                 let event_tx_clone = event_tx.clone();
                 tokio::spawn(async move {
-                    let result = check_and_download_update().await;
+                    let result = check_and_download_update(force).await;
                     let _ = event_tx_clone.send(AppEvent::UpdateResult(result)).await;
                 });
             }
@@ -21584,7 +21693,7 @@ mod tests {
     #[test]
     fn test_more_mode_1000_lines_single_call() {
         // Test that more-mode works with 1000 lines in a single add_output call
-        // (simulating a TF #for loop generating all output at once)
+        // (simulating a TF /for loop generating all output at once)
         let mut world = World::new("test");
         let settings = Settings { more_mode_enabled: true, ..Settings::default() };
 

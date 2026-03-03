@@ -35,7 +35,7 @@ pub struct IfState {
     pub bodies: Vec<Vec<String>>,
     /// Current branch index being collected
     pub current_branch: usize,
-    /// Whether we've seen #else
+    /// Whether we've seen /else
     pub has_else: bool,
     /// Nesting depth for nested if statements
     pub depth: usize,
@@ -145,7 +145,7 @@ fn count_control_keywords(text: &str) -> (i32, i32, i32, i32) {
 }
 
 /// Group body lines into executable units.
-/// Lines that form control flow blocks (#if...#endif, #while...#done, #for...#done)
+/// Lines that form control flow blocks (/if.../endif, /while.../done, /for.../done)
 /// are collected together as a single unit. Other lines remain separate.
 pub fn group_body_lines(body: &[String]) -> Vec<String> {
     let mut result = Vec::new();
@@ -189,7 +189,7 @@ pub fn group_body_lines(body: &[String]) -> Vec<String> {
     result
 }
 
-/// Parse a single-line #if: #if (condition) command
+/// Parse a single-line /if: /if (condition) command
 /// Returns Some((condition, command)) if valid, None otherwise
 pub fn parse_single_line_if(args: &str) -> Option<(String, String)> {
     let args = args.trim();
@@ -221,7 +221,7 @@ pub fn parse_single_line_if(args: &str) -> Option<(String, String)> {
     let rest = args[end_paren + 1..].trim();
 
     // If there's content after the condition, it might be a single-line if
-    // But if the content contains #else, #elseif, or #endif, it's actually
+    // But if the content contains /else, /elseif, or /endif, it's actually
     // a multi-line if that was joined via line continuation
     if !rest.is_empty() {
         let rest_lower = rest.to_lowercase();
@@ -236,11 +236,11 @@ pub fn parse_single_line_if(args: &str) -> Option<(String, String)> {
     }
 }
 
-/// Check if a string contains control flow keywords (#else, #elseif, #endif)
+/// Check if a string contains control flow keywords (/else, /elseif, /endif)
 /// that indicate it's a multi-line if block
 fn contains_control_flow_keyword(text: &str) -> bool {
-    // Check for #else, #elseif, #endif as commands (not inside strings)
-    // Look for patterns like ";#else", "%;#else", or just "#else" at start
+    // Check for /else, /elseif, /endif as commands (not inside strings)
+    // Look for patterns like ";/else", "%;/else", or just "/else" at start
     let keywords = ["/else", "/elseif", "/endif"];
     for keyword in &keywords {
         // Check at start
@@ -263,7 +263,7 @@ fn contains_control_flow_keyword(text: &str) -> bool {
     false
 }
 
-/// Parse the condition from a multi-line #if or #elseif
+/// Parse the condition from a multi-line /if or /elseif
 pub fn parse_condition(args: &str) -> Result<String, String> {
     let args = args.trim();
 
@@ -294,7 +294,7 @@ pub fn parse_condition(args: &str) -> Result<String, String> {
     }
 }
 
-/// Parse #for arguments: var start end [step]
+/// Parse /for arguments: var start end [step]
 pub fn parse_for_args(args: &str) -> Result<(String, i64, i64, i64), String> {
     let parts: Vec<&str> = args.split_whitespace().collect();
 
@@ -360,7 +360,7 @@ pub fn process_control_line(state: &mut ControlState, line: &str) -> ControlResu
                     if if_state.has_else {
                         return ControlResult::Error("/elseif after /else".to_string());
                     }
-                    let prefix_len = 8; // "#elseif " or "/elseif " are both 8 chars
+                    let prefix_len = 8; // "/elseif " is 8 chars
                     let args = &trimmed[prefix_len..];
                     match parse_condition(args) {
                         Ok(cond) => {
@@ -414,7 +414,7 @@ pub fn process_control_line(state: &mut ControlState, line: &str) -> ControlResu
                 }
             }
 
-            // Check for #break at our level (will be handled during execution)
+            // Check for /break at our level (will be handled during execution)
             while_state.body.push(line.to_string());
             ControlResult::Consumed
         }
@@ -550,13 +550,13 @@ pub fn execute_single_if(engine: &mut TfEngine, condition: &str, command: &str) 
 }
 
 /// Execute a complete inline control flow block (from macro execution).
-/// The input is a multi-line string containing the complete #if...#endif block.
+/// The input is a multi-line string containing the complete /if.../endif block.
 ///
 /// Example input:
 /// ```
-/// #if (cond)    cmd1
-/// #else    cmd2
-/// #endif
+/// /if (cond)    cmd1
+/// /else    cmd2
+/// /endif
 /// ```
 pub fn execute_inline_if_block(engine: &mut TfEngine, block: &str) -> Vec<TfCommandResult> {
     let mut if_state: Option<IfState> = None;
@@ -613,7 +613,7 @@ pub fn execute_inline_if_block(engine: &mut TfEngine, block: &str) -> Vec<TfComm
                     return vec![TfCommandResult::Error("/elseif after /else".to_string())];
                 }
                 // Parse elseif condition and optional body
-                let prefix_len = 7; // #elseif and /elseif are both 7 chars
+                let prefix_len = 7; // "/elseif" is 7 chars
                 let args = &trimmed[prefix_len..].trim_start();
                 match parse_condition_with_body(args) {
                     Ok((condition, body_start)) => {
@@ -679,7 +679,7 @@ pub fn execute_inline_if_block(engine: &mut TfEngine, block: &str) -> Vec<TfComm
 }
 
 /// Execute a complete inline while block (from macro execution).
-/// The input is a multi-line string containing the complete #while...#done block.
+/// The input is a multi-line string containing the complete /while.../done block.
 pub fn execute_inline_while_block(engine: &mut TfEngine, block: &str) -> Vec<TfCommandResult> {
     let _results: Vec<TfCommandResult> = vec![];
     let lines: Vec<&str> = block.lines().collect();
@@ -992,7 +992,7 @@ fn execute_for_loop(
 }
 
 /// Count the net change in control flow depth from a line of text.
-/// Returns positive for each #if/#while/#for found, negative for each #endif/#done.
+/// Returns positive for each /if//while//for found, negative for each /endif//done.
 fn count_control_flow_in_line(text: &str) -> i32 {
     let lower = text.to_lowercase();
     let mut depth = 0;
@@ -1014,7 +1014,7 @@ fn count_control_flow_in_line(text: &str) -> i32 {
 }
 
 /// Group body lines into execution units.
-/// Lines that form control flow structures (#if...#endif, #while...#done, #for...#done)
+/// Lines that form control flow structures (/if.../endif, /while.../done, /for.../done)
 /// are grouped together into single strings with newlines.
 fn group_control_flow_lines(lines: &[String]) -> Vec<String> {
     let mut result = Vec::new();
@@ -1056,7 +1056,7 @@ fn group_control_flow_lines(lines: &[String]) -> Vec<String> {
     result
 }
 
-/// Parse a condition from #if/#elseif, potentially with body content after it.
+/// Parse a condition from /if//elseif, potentially with body content after it.
 /// Returns (condition, body_content) where body_content may be empty.
 fn parse_condition_with_body(args: &str) -> Result<(String, String), String> {
     let args = args.trim();

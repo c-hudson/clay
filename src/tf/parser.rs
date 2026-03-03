@@ -79,7 +79,7 @@ fn is_tf_command_name(cmd: &str) -> bool {
         // These are also TF commands (mapped to Clay equivalents)
         "quit" | "dc" | "disconnect" | "world" | "listworlds" |
         "listsockets" | "connections" | "connect" | "addworld" | "version" |
-        // Note: "send" maps to Clay's /send command, but TF's #send has different options
+        // Note: "send" maps to Clay's /send command, but TF's /send has different options
         // so we route it through TF to handle -w flag properly
         "send"
     )
@@ -411,8 +411,8 @@ fn aggregate_results(results: Vec<TfCommandResult>) -> TfCommandResult {
 // Command Implementations
 // =============================================================================
 
-/// #set varname=value - Set a global variable
-/// Supports both #set var=value and #set var = value
+/// /set varname=value - Set a global variable
+/// Supports both /set var=value and /set var = value
 fn cmd_set(engine: &mut TfEngine, args: &str) -> TfCommandResult {
     let args = args.trim();
 
@@ -455,7 +455,7 @@ fn cmd_set(engine: &mut TfEngine, args: &str) -> TfCommandResult {
     TfCommandResult::Success(None)
 }
 
-/// #unset varname - Remove a global variable
+/// /unset varname - Remove a global variable
 fn cmd_unset(engine: &mut TfEngine, args: &str) -> TfCommandResult {
     let name = args.trim();
 
@@ -470,8 +470,8 @@ fn cmd_unset(engine: &mut TfEngine, args: &str) -> TfCommandResult {
     }
 }
 
-/// #let varname=value - Set a local variable
-/// Supports both #let var=value and #let var = value
+/// /let varname=value - Set a local variable
+/// Supports both /let var=value and /let var = value
 fn cmd_let(engine: &mut TfEngine, args: &str) -> TfCommandResult {
     let args = args.trim();
 
@@ -505,7 +505,7 @@ fn cmd_let(engine: &mut TfEngine, args: &str) -> TfCommandResult {
     TfCommandResult::Success(None)
 }
 
-/// #setenv varname value - Set an environment variable (exported to shell)
+/// /setenv varname value - Set an environment variable (exported to shell)
 fn cmd_setenv(engine: &mut TfEngine, args: &str) -> TfCommandResult {
     let parts: Vec<&str> = args.splitn(2, char::is_whitespace).collect();
 
@@ -534,7 +534,7 @@ fn cmd_setenv(engine: &mut TfEngine, args: &str) -> TfCommandResult {
     TfCommandResult::Success(None)
 }
 
-/// #echo [-w world] [-a attrs] [--] message - Display message locally
+/// /echo [-w world] [-a attrs] [--] message - Display message locally
 /// Options:
 ///   -w<world> or -w <world> - Specify world (currently ignored)
 ///   -a<attrs> - Attributes: g=gag (currently ignored), h=highlight, etc.
@@ -605,7 +605,7 @@ fn cmd_echo(engine: &TfEngine, args: &str) -> TfCommandResult {
     TfCommandResult::Success(Some(message))
 }
 
-/// #substitute [-a attrs] [--] text - Replace trigger line with substituted text
+/// /substitute [-a attrs] [--] text - Replace trigger line with substituted text
 /// Options:
 ///   -a<attrs> - Attributes: C=color (e.g., Cred, Cgreen, Cbold)
 ///   -- - End of options marker
@@ -747,7 +747,7 @@ fn attr_to_ansi(attr: &str) -> String {
     }
 }
 
-/// #send [-w world] text - Send text to MUD
+/// /send [-w world] text - Send text to MUD
 fn cmd_send(_engine: &TfEngine, args: &str) -> TfCommandResult {
     let args = args.trim();
 
@@ -773,7 +773,7 @@ fn cmd_send(_engine: &TfEngine, args: &str) -> TfCommandResult {
     TfCommandResult::SendToMud(args.to_string())
 }
 
-/// #world [name] - Switch to or connect to a world
+/// /world [name] - Switch to or connect to a world
 fn cmd_world(args: &str) -> TfCommandResult {
     let name = args.trim();
 
@@ -786,7 +786,7 @@ fn cmd_world(args: &str) -> TfCommandResult {
     }
 }
 
-/// #connect [world] - Connect to a world
+/// /connect [world] - Connect to a world
 fn cmd_connect(args: &str) -> TfCommandResult {
     let name = args.trim();
 
@@ -799,11 +799,11 @@ fn cmd_connect(args: &str) -> TfCommandResult {
     }
 }
 
-/// #addworld - Define a new world or redefine an existing world
+/// /addworld - Define a new world or redefine an existing world
 ///
 /// Command usage:
-///   #addworld [-xe] [-Ttype] name [char pass] host port
-///   #addworld [-Ttype] name
+///   /addworld [-xe] [-Ttype] name [char pass] host port
+///   /addworld [-Ttype] name
 ///
 /// Options:
 ///   -x  Use SSL/TLS for connections
@@ -811,9 +811,9 @@ fn cmd_connect(args: &str) -> TfCommandResult {
 ///   -Ttype  World type (ignored in Clay, defaults to MUD)
 ///
 /// Examples:
-///   #addworld MyMUD mud.example.com 4000
-///   #addworld -x SecureMUD secure.example.com 4443
-///   #addworld MyMUD player password mud.example.com 4000
+///   /addworld MyMUD mud.example.com 4000
+///   /addworld -x SecureMUD secure.example.com 4443
+///   /addworld MyMUD player password mud.example.com 4000
 fn cmd_addworld(args: &str) -> TfCommandResult {
     // Pass through to Clay's /addworld command which handles the actual creation
     if args.trim().is_empty() {
@@ -1199,12 +1199,12 @@ Usage: $[function(args)] or in /expr//test"#.to_string()
     }
 }
 
-/// #version - Show version info
+/// /version - Show version info
 fn cmd_version() -> TfCommandResult {
     TfCommandResult::Success(Some(crate::get_version_string()))
 }
 
-/// #expr expression - Evaluate expression and display result
+/// /expr expression - Evaluate expression and display result
 fn cmd_expr(engine: &mut TfEngine, args: &str) -> TfCommandResult {
     if args.is_empty() {
         return TfCommandResult::Error("Usage: /expr expression".to_string());
@@ -1216,7 +1216,7 @@ fn cmd_expr(engine: &mut TfEngine, args: &str) -> TfCommandResult {
     }
 }
 
-/// #eval expression - Evaluate expression and execute result as command
+/// /eval expression - Evaluate expression and execute result as command
 fn cmd_eval(engine: &mut TfEngine, args: &str) -> TfCommandResult {
     if args.is_empty() {
         return TfCommandResult::Error("Usage: /eval expression".to_string());
@@ -1239,16 +1239,16 @@ fn cmd_eval(engine: &mut TfEngine, args: &str) -> TfCommandResult {
     }
 }
 
-/// #test expression - Evaluate expression and return its value, setting %?
+/// /test expression - Evaluate expression and return its value, setting %?
 ///
 /// Evaluates the expression and returns its value (any type).
 /// Also sets the special variable %? to the result.
 /// Useful for evaluating expressions for side effects.
 ///
 /// Examples:
-///   #test 2 + 2           -> returns 4, sets %? to 4
-///   #test strlen("hello") -> returns 5, sets %? to 5
-///   #test regmatch("foo(.*)", "foobar") -> sets %P1 to "bar"
+///   /test 2 + 2           -> returns 4, sets %? to 4
+///   /test strlen("hello") -> returns 5, sets %? to 5
+///   /test regmatch("foo(.*)", "foobar") -> sets %P1 to "bar"
 fn cmd_test(engine: &mut TfEngine, args: &str) -> TfCommandResult {
     if args.is_empty() {
         return TfCommandResult::Error("Usage: /test expression".to_string());
@@ -1258,7 +1258,7 @@ fn cmd_test(engine: &mut TfEngine, args: &str) -> TfCommandResult {
         Ok(value) => {
             // Set the special %? variable to the result
             engine.set_global("?", value.clone());
-            // #test is silent - it only sets %?, doesn't produce output
+            // /test is silent - it only sets %?, doesn't produce output
             TfCommandResult::Success(None)
         }
         Err(e) => TfCommandResult::Error(format!("Expression error: {}", e)),
@@ -1280,24 +1280,24 @@ fn is_valid_var_name(name: &str) -> bool {
 // Control Flow Commands
 // =============================================================================
 
-/// #if (condition) [command] - Conditional execution
+/// /if (condition) [command] - Conditional execution
 fn cmd_if(engine: &mut TfEngine, args: &str) -> TfCommandResult {
     // Check if this is a complete inline block (from macro execution)
-    // These contain newlines and the full #if...#endif or /if.../endif structure
+    // These contain newlines and the full /if.../endif structure
     let if_args_lower = args.to_lowercase();
-    if args.contains('\n') && (if_args_lower.contains("#endif") || if_args_lower.contains("/endif")) {
+    if args.contains('\n') && if_args_lower.contains("/endif") {
         // Reconstruct the full block by prepending "/if "
         let full_block = format!("/if {}", args);
         let results = control_flow::execute_inline_if_block(engine, &full_block);
         return aggregate_inline_results(results);
     }
 
-    // Check for single-line form: #if (condition) command
+    // Check for single-line form: /if (condition) command
     if let Some((condition, command)) = control_flow::parse_single_line_if(args) {
         return control_flow::execute_single_if(engine, &condition, &command);
     }
 
-    // Multi-line form: #if (condition)
+    // Multi-line form: /if (condition)
     match control_flow::parse_condition(args) {
         Ok(condition) => {
             engine.control_state = ControlState::If(IfState::new(condition));
@@ -1332,12 +1332,12 @@ fn aggregate_inline_results(results: Vec<TfCommandResult>) -> TfCommandResult {
     }
 }
 
-/// #while (condition) - Start a while loop
+/// /while (condition) - Start a while loop
 fn cmd_while(engine: &mut TfEngine, args: &str) -> TfCommandResult {
     // Check if this is a complete inline block (from macro execution)
-    // These contain newlines and the full #while...#done or /while.../done structure
+    // These contain newlines and the full /while.../done structure
     let args_lower = args.to_lowercase();
-    if args.contains('\n') && (args_lower.contains("#done") || args_lower.contains("/done")) {
+    if args.contains('\n') && args_lower.contains("/done") {
         // Reconstruct the full block by prepending "/while "
         let full_block = format!("/while {}", args);
         let results = control_flow::execute_inline_while_block(engine, &full_block);
@@ -1353,11 +1353,11 @@ fn cmd_while(engine: &mut TfEngine, args: &str) -> TfCommandResult {
     }
 }
 
-/// #for var start end [step] - Start a for loop
+/// /for var start end [step] - Start a for loop
 fn cmd_for(engine: &mut TfEngine, args: &str) -> TfCommandResult {
     // Check if this is a complete inline block (from macro execution)
     let for_args_lower = args.to_lowercase();
-    if args.contains('\n') && (for_args_lower.contains("#done") || for_args_lower.contains("/done")) {
+    if args.contains('\n') && for_args_lower.contains("/done") {
         let full_block = format!("/for {}", args);
         let results = control_flow::execute_inline_for_block(engine, &full_block);
         return aggregate_inline_results(results);
@@ -1376,7 +1376,7 @@ fn cmd_for(engine: &mut TfEngine, args: &str) -> TfCommandResult {
 // Macro Commands
 // =============================================================================
 
-/// #def [options] name = body - Define a macro
+/// /def [options] name = body - Define a macro
 fn cmd_def(engine: &mut TfEngine, args: &str) -> TfCommandResult {
     if args.trim().is_empty() {
         // No args: list all macros
@@ -1413,7 +1413,7 @@ fn cmd_def(engine: &mut TfEngine, args: &str) -> TfCommandResult {
     }
 }
 
-/// #undef name - Undefine a macro by exact name
+/// /undef name - Undefine a macro by exact name
 fn cmd_undef(engine: &mut TfEngine, args: &str) -> TfCommandResult {
     let name = args.trim();
 
@@ -1428,7 +1428,7 @@ fn cmd_undef(engine: &mut TfEngine, args: &str) -> TfCommandResult {
     }
 }
 
-/// #undefn pattern - Undefine macros by name pattern
+/// /undefn pattern - Undefine macros by name pattern
 fn cmd_undefn(engine: &mut TfEngine, args: &str) -> TfCommandResult {
     let pattern = args.trim();
 
@@ -1440,7 +1440,7 @@ fn cmd_undefn(engine: &mut TfEngine, args: &str) -> TfCommandResult {
     TfCommandResult::Success(Some(format!("{} macro(s) undefined.", count)))
 }
 
-/// #undeft pattern - Undefine macros by trigger pattern
+/// /undeft pattern - Undefine macros by trigger pattern
 fn cmd_undeft(engine: &mut TfEngine, args: &str) -> TfCommandResult {
     let pattern = args.trim();
 
@@ -1452,7 +1452,7 @@ fn cmd_undeft(engine: &mut TfEngine, args: &str) -> TfCommandResult {
     TfCommandResult::Success(Some(format!("{} macro(s) undefined.", count)))
 }
 
-/// #list [pattern] - List macros
+/// /list [pattern] - List macros
 fn cmd_list(engine: &TfEngine, args: &str) -> TfCommandResult {
     let pattern = if args.trim().is_empty() {
         None
@@ -1463,7 +1463,7 @@ fn cmd_list(engine: &TfEngine, args: &str) -> TfCommandResult {
     TfCommandResult::Success(Some(macros::list_macros(engine, pattern)))
 }
 
-/// #purge - Remove all macros
+/// /purge - Remove all macros
 fn cmd_purge(engine: &mut TfEngine) -> TfCommandResult {
     let count = macros::purge_macros(engine);
     TfCommandResult::Success(Some(format!("{} macro(s) purged.", count)))
@@ -1473,7 +1473,7 @@ fn cmd_purge(engine: &mut TfEngine) -> TfCommandResult {
 // Hook and Keybinding Commands
 // =============================================================================
 
-/// #hook [event [command]] - Register or list hooks
+/// /hook [event [command]] - Register or list hooks
 fn cmd_hook(engine: &mut TfEngine, args: &str) -> TfCommandResult {
     let args = args.trim();
 
@@ -1508,7 +1508,7 @@ fn cmd_hook(engine: &mut TfEngine, args: &str) -> TfCommandResult {
     }
 }
 
-/// #unhook event - Remove all hooks for an event
+/// /unhook event - Remove all hooks for an event
 fn cmd_unhook(engine: &mut TfEngine, args: &str) -> TfCommandResult {
     let event_str = args.trim();
 
@@ -1525,7 +1525,7 @@ fn cmd_unhook(engine: &mut TfEngine, args: &str) -> TfCommandResult {
     }
 }
 
-/// #bind [key [= command]] - Register or list keybindings
+/// /bind [key [= command]] - Register or list keybindings
 fn cmd_bind(engine: &mut TfEngine, args: &str) -> TfCommandResult {
     let args = args.trim();
 
@@ -1552,7 +1552,7 @@ fn cmd_bind(engine: &mut TfEngine, args: &str) -> TfCommandResult {
     }
 }
 
-/// #unbind key - Remove a keybinding
+/// /unbind key - Remove a keybinding
 fn cmd_unbind(engine: &mut TfEngine, args: &str) -> TfCommandResult {
     let key = args.trim();
 
@@ -1673,7 +1673,7 @@ fn cmd_input(engine: &mut TfEngine, args: &str) -> TfCommandResult {
 
 /// Grab text from output (stub - returns empty since we don't track grab state)
 fn cmd_grab(_args: &str) -> TfCommandResult {
-    // In TF, #grab grabs the current line from output. We don't have that context here.
+    // In TF, /grab grabs the current line from output. We don't have that context here.
     // Return success but note that grab is limited.
     TfCommandResult::Success(Some("Note: /grab is not fully supported in this implementation".to_string()))
 }

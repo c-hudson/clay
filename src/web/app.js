@@ -1813,7 +1813,7 @@
                             }
                             const lineIndex = world.output_lines.length;
                             const lineSeq = (msg.seq !== undefined && msg.seq > 0) ? msg.seq + appendedLineCount : lineIndex;
-                            world.output_lines.push({ text: truncateIfNeeded(line), ts: lineTs, seq: lineSeq });
+                            world.output_lines.push({ text: truncateIfNeeded(line), ts: lineTs, seq: lineSeq, from_server: isFromServer });
                             appendedLineCount++;
                             // Verify sequence order
                             if (lineIndex > 0) {
@@ -2734,6 +2734,14 @@
             renderOutput();
         }
 
+        // Intercept /update locally — should run on the client, not the server
+        const cmdTrimmed = cmd.trim();
+        if (cmdTrimmed === '/update' || cmdTrimmed.startsWith('/update ')) {
+            elements.input.value = '';
+            executeLocalCommand(cmdTrimmed);
+            return;
+        }
+
         const sent = send({
             type: 'SendCommand',
             world_index: currentWorldIndex,
@@ -2862,6 +2870,19 @@
                     window.ipc.postMessage('quit');
                 } else {
                     window.close();
+                }
+                break;
+
+            case '/update':
+                // Update the local client binary
+                if (window.ipc && window.ipc.postMessage) {
+                    // WebView GUI: delegate to native side via IPC
+                    const forceFlag = args.length > 0 && (args[0] === '-f' || args[0] === '--force');
+                    window.ipc.postMessage(forceFlag ? 'update-force' : 'update');
+                    appendClientLine('Checking for updates...');
+                } else {
+                    // Browser: can't update
+                    appendClientLine('Update is only available in the desktop app. Download the latest version from https://github.com/c-hudson/clay/releases');
                 }
                 break;
 
@@ -3287,7 +3308,7 @@
         const ts = Math.floor(Date.now() / 1000);
         if (worldIndex >= 0 && worldIndex < worlds.length) {
             const lineIndex = worlds[worldIndex].output_lines.length;
-            worlds[worldIndex].output_lines.push({ text: clientText, ts: ts });
+            worlds[worldIndex].output_lines.push({ text: clientText, ts: ts, from_server: false });
             if (worldIndex === currentWorldIndex) {
                 appendNewLine(clientText, ts, worldIndex, lineIndex);
             }
@@ -5211,7 +5232,7 @@
         if (worldIndex >= 0 && worldIndex < worlds.length) {
             lines.forEach(line => {
                 const lineIndex = worlds[worldIndex].output_lines.length;
-                worlds[worldIndex].output_lines.push({ text: line, ts: ts });
+                worlds[worldIndex].output_lines.push({ text: line, ts: ts, from_server: false });
                 if (worldIndex === currentWorldIndex) {
                     appendNewLine(line, ts, worldIndex, lineIndex);
                 }
@@ -6944,8 +6965,12 @@
                 elements.input.selectionStart = elements.input.selectionEnd = 0;
             // Note: Ctrl+W handled by window capture-phase listener in init()
             } else if (e.key === 'l' && e.ctrlKey) {
-                // Ctrl+L: Redraw screen
+                // Ctrl+L: Redraw screen — filter out client-generated output, keep only MUD server data
                 e.preventDefault();
+                if (worlds[currentWorldIndex]) {
+                    worlds[currentWorldIndex].output_lines = worlds[currentWorldIndex].output_lines.filter(l => l.from_server !== false);
+                    worldOutputCache[currentWorldIndex] = {};
+                }
                 renderOutput();
             } else if (e.key === 'PageUp') {
                 // PageUp: Scroll output up (triggers pause via scroll handler)
@@ -7416,6 +7441,11 @@
 
     // Heartbeat ack function for Android to verify WebView responsiveness
     window.heartbeatAck = function() { return "ok"; };
+
+    // Called by native WebView GUI to show update status messages
+    window.showUpdateStatus = function(msg) {
+        appendClientLine(msg);
+    };
 
     // Expose native WebSocket check for debugging
     window.isUsingNativeWebSocket = function() {

@@ -163,7 +163,7 @@ pub struct TfProcess {
     pub priority: i32,             // -p option (higher = runs first)
 }
 
-/// Disposition for #quote command output
+/// Disposition for /quote command output
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum QuoteDisposition {
     /// Send each line to the MUD server (default when no prefix)
@@ -199,9 +199,9 @@ pub enum TfCommandResult {
         /// When backtick source is /recall, pass opts to caller for execution
         recall_opts: Option<(RecallOptions, String)>,  // (opts, prefix)
     },
-    /// Abort file loading early (#exit during load)
+    /// Abort file loading early (/exit during load)
     ExitLoad,
-    /// Not a TF command (doesn't start with #)
+    /// Not a TF command (doesn't start with /)
     NotTfCommand,
     /// Unknown TF command
     UnknownCommand(String),
@@ -314,7 +314,7 @@ pub struct TfMacro {
 /// The TinyFugue scripting engine
 #[derive(Debug, Default)]
 pub struct TfEngine {
-    /// Global variables (set with #set, persisted)
+    /// Global variables (set with /set, persisted)
     pub global_vars: HashMap<String, TfValue>,
     /// Stack of local variable scopes (for macro execution)
     pub local_vars_stack: Vec<HashMap<String, TfValue>>,
@@ -328,7 +328,7 @@ pub struct TfEngine {
     pub hooks: HashMap<TfHookEvent, Vec<String>>,  // event -> macro names
     /// Key bindings (key sequence -> macro name or command)
     pub keybindings: HashMap<String, String>,
-    /// Current working directory for #lcd
+    /// Current working directory for /lcd
     pub current_dir: Option<String>,
     /// Current control flow state (for multi-line if/while/for)
     pub control_state: control_flow::ControlState,
@@ -338,7 +338,7 @@ pub struct TfEngine {
     pub next_process_id: u32,
     /// Next macro sequence number (for TF-compatible numbering)
     pub next_macro_sequence: u32,
-    /// Tokens for files already loaded via #loaded/#require
+    /// Tokens for files already loaded via /loaded//require
     pub loaded_tokens: std::collections::HashSet<String>,
     /// Stack of files currently being loaded (for nested loads)
     pub loading_files: Vec<String>,

@@ -2276,7 +2276,7 @@ impl<'a> Evaluator<'a> {
                 }
             }
 
-            // echo(s [,attrs [,dest [,inline]]]) - function form of #echo
+            // echo(s [,attrs [,dest [,inline]]]) - function form of /echo
             // Returns 1 on success
             "echo" => {
                 if args.is_empty() {
@@ -2298,7 +2298,7 @@ impl<'a> Evaluator<'a> {
                 Ok(TfValue::Integer(1))
             }
 
-            // send(s [,world [,flags]]) - function form of #send
+            // send(s [,world [,flags]]) - function form of /send
             // Returns 1 on success
             "send" => {
                 if args.is_empty() {

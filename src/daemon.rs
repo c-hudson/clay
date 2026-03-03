@@ -909,7 +909,7 @@ pub async fn handle_daemon_ws_message(
                     }
                 }
                 // Commands that should be blocked from remote
-                Command::Quit | Command::Reload | Command::Update => {
+                Command::Reload => {
                     app.ws_broadcast(WsMessage::ServerData {
                         world_index,
                         data: "This command is not available from remote interfaces.".to_string(),
@@ -918,6 +918,10 @@ pub async fn handle_daemon_ws_message(
                         from_server: false,
                         seq: 0,
                     });
+                }
+                // Commands that execute locally on the client
+                Command::Quit | Command::Update { .. } => {
+                    app.ws_send_to_client(client_id, WsMessage::ExecuteLocalCommand { command: command.clone() });
                 }
                 // UI popup commands - send back to client for local handling
                 Command::Help | Command::Menu | Command::Font | Command::Setup | Command::Web | Command::Actions { .. } |

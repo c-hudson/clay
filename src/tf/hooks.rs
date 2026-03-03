@@ -2,8 +2,8 @@
 //!
 //! Implements:
 //! - Hook events (CONNECT, DISCONNECT, LOGIN, PROMPT, etc.)
-//! - #hook, #unhook commands for direct hook management
-//! - #bind, #unbind commands for keybindings
+//! - /hook, /unhook commands for direct hook management
+//! - /bind, /unbind commands for keybindings
 //! - Key name parsing (F1, ^A, etc.)
 
 use super::{TfEngine, TfHookEvent, TfCommandResult};
@@ -45,7 +45,7 @@ pub fn fire_hook(engine: &mut TfEngine, event: TfHookEvent) -> Vec<TfCommandResu
     results
 }
 
-/// Register a hook directly (not via #def)
+/// Register a hook directly (not via /def)
 pub fn register_hook(engine: &mut TfEngine, event: TfHookEvent, command: String) {
     // Create a unique name for this direct hook
     let name = format!("__hook_{:?}_{}", event, engine.hooks.get(&event).map(|v| v.len()).unwrap_or(0));
