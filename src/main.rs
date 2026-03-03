@@ -7993,14 +7993,20 @@ async fn check_and_download_update() -> Result<UpdateSuccess, String> {
         .build()
         .map_err(|e| format!("HTTP client error: {}", e))?;
 
-    let release: serde_json::Value = client
-        .get("https://api.github.com/repos/c-hudson/clay/releases/latest")
+    // Use /releases (not /releases/latest) because pre-release tags like v1.0.0-beta
+    // are excluded from the /latest endpoint
+    let releases: serde_json::Value = client
+        .get("https://api.github.com/repos/c-hudson/clay/releases?per_page=1")
         .send()
         .await
         .map_err(|e| format!("Failed to check for updates: {}", e))?
         .json()
         .await
         .map_err(|e| format!("Invalid response: {}", e))?;
+
+    let release = releases.as_array()
+        .and_then(|a| a.first())
+        .ok_or("No releases found")?;
 
     // Extract version from tag_name (strip leading 'v')
     let tag = release["tag_name"]
