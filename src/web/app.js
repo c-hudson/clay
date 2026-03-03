@@ -173,6 +173,7 @@
         setupArrowUpDownSelect: document.getElementById('setup-arrow-updown-select'),
         setupShiftArrowSelect: document.getElementById('setup-shift-arrow-select'),
         setupTlsProxyToggle: document.getElementById('setup-tls-proxy-toggle'),
+        setupNewLineIndicatorToggle: document.getElementById('setup-new-line-indicator-toggle'),
         setupWorldSwitchSelect: document.getElementById('setup-world-switch-select'),
         setupInputHeightValue: document.getElementById('setup-input-height-value'),
         setupHeightMinus: document.getElementById('setup-height-minus'),
@@ -328,6 +329,7 @@
     let setupArrowUpDown = 'cycle_worlds';
     let setupShiftArrowUpDown = 'input_line';
     let setupTlsProxy = false;
+    let setupNewLineIndicator = false;
     let setupInputHeightValue = 1;
     let setupGuiTheme = 'dark';
     let setupTransparency = 1.0;
@@ -408,6 +410,7 @@
     let audioContext = null;
     let ansiMusicEnabled = true;  // Will be synced from server settings
     let zwjEnabled = false;  // Will be synced from server settings
+    let newLineIndicator = false;  // Will be synced from server settings
 
     // MCMP (MUD Client Media Protocol) state
     let mcmpDefaultUrl = '';
@@ -1591,6 +1594,8 @@
                             world._max_seq = line.seq;
                         }
                     }
+                    // Initialize pending_count from server (for More indicator)
+                    if (world.pending_count === undefined) world.pending_count = 0;
                     // Don't merge pending_lines - they stay on the server and are
                     // released via PgDn/Tab, then broadcast as ServerData.
                     // This avoids duplicate lines when pending is released.
@@ -1612,6 +1617,9 @@
                     }
                     if (msg.settings.zwj_enabled !== undefined) {
                         zwjEnabled = msg.settings.zwj_enabled;
+                    }
+                    if (msg.settings.new_line_indicator !== undefined) {
+                        newLineIndicator = msg.settings.new_line_indicator;
                     }
                     if (msg.settings.tls_proxy_enabled !== undefined) {
                         tlsProxyEnabled = msg.settings.tls_proxy_enabled;
@@ -1812,21 +1820,23 @@
                                 return;
                             }
                             const lineIndex = world.output_lines.length;
-                            const lineSeq = (msg.seq !== undefined && msg.seq > 0) ? msg.seq + appendedLineCount : lineIndex;
-                            world.output_lines.push({ text: truncateIfNeeded(line), ts: lineTs, seq: lineSeq, from_server: isFromServer });
+                            const hasRealSeq = msg.seq !== undefined && msg.seq > 0;
+                            const lineSeq = hasRealSeq ? msg.seq + appendedLineCount : lineIndex;
+                            world.output_lines.push({ text: truncateIfNeeded(line), ts: lineTs, seq: lineSeq, from_server: isFromServer, _has_real_seq: hasRealSeq, marked_new: msg.marked_new || false });
                             appendedLineCount++;
-                            // Verify sequence order
-                            if (lineIndex > 0) {
-                                const prevSeq = world.output_lines[lineIndex - 1].seq;
-                                if (prevSeq !== undefined && lineSeq !== undefined && lineSeq <= prevSeq) {
-                                    console.warn('SEQ MISMATCH in world ' + msg.world_index + ': idx=' + lineIndex + ' expected seq>' + prevSeq + ' got seq=' + lineSeq);
+                            // Verify sequence order (only for messages with real server-assigned seq)
+                            if (lineIndex > 0 && msg.seq !== undefined && msg.seq > 0) {
+                                const prevLine = world.output_lines[lineIndex - 1];
+                                // Only compare against previous lines that also have real seqs
+                                if (prevLine.seq !== undefined && prevLine._has_real_seq && lineSeq <= prevLine.seq) {
+                                    console.warn('SEQ MISMATCH in world ' + msg.world_index + ': idx=' + lineIndex + ' expected seq>' + prevLine.seq + ' got seq=' + lineSeq);
                                     send({
                                         type: 'ReportSeqMismatch',
                                         world_index: msg.world_index,
-                                        expected_seq_gt: prevSeq,
+                                        expected_seq_gt: prevLine.seq,
                                         actual_seq: lineSeq,
                                         line_text: line.substring(0, 80),
-                                        source: 'web'
+                                        source: window.Android ? 'android' : 'web'
                                     });
                                 }
                             }
@@ -2011,6 +2021,13 @@
                     }
                     if (msg.settings.zwj_enabled !== undefined) {
                         zwjEnabled = msg.settings.zwj_enabled;
+                    }
+                    if (msg.settings.new_line_indicator !== undefined) {
+                        const oldNli = newLineIndicator;
+                        newLineIndicator = msg.settings.new_line_indicator;
+                        if (oldNli !== newLineIndicator) {
+                            renderOutput();
+                        }
                     }
                     if (msg.settings.tls_proxy_enabled !== undefined) {
                         tlsProxyEnabled = msg.settings.tls_proxy_enabled;
@@ -2286,7 +2303,8 @@
                             gagged: line.gagged || false,
                             from_server: line.from_server !== false,
                             seq: line.seq || 0,
-                            highlight_color: line.highlight_color
+                            highlight_color: line.highlight_color,
+                            marked_new: line.marked_new || false
                         });
                     }
                     if (msg.world_index === currentWorldIndex) {
@@ -2902,6 +2920,11 @@
         if (index >= 0 && index < worlds.length && index !== currentWorldIndex) {
             mcmpStopAll();
             currentWorldIndex = index;
+            // Clear new line indicators on displayed lines (user is now viewing them)
+            const switchedWorld = worlds[index];
+            if (switchedWorld && switchedWorld.output_lines) {
+                switchedWorld.output_lines.forEach(l => { l.marked_new = false; });
+            }
             // Reset more-mode state for new world
             paused = false;
             pendingLines = [];
@@ -3228,6 +3251,7 @@
             const lineTs = typeof lineObj === 'object' ? lineObj.ts : null;
             const lineGagged = typeof lineObj === 'object' ? lineObj.gagged : false;
             const lineHighlightColor = typeof lineObj === 'object' ? lineObj.highlight_color : null;
+            const lineMarkedNew = typeof lineObj === 'object' ? lineObj.marked_new : false;
 
             // Skip gagged lines unless showTags is enabled (F2)
             if (lineGagged && !showTags) {
@@ -3253,7 +3277,8 @@
             const displayText = showTags && tempConvertEnabled ? convertTemperatures(strippedText) : strippedText;
             // Skip Discord emoji conversion when showTags is enabled so users can see original text
             const processed = linkifyUrls(parseAnsi(insertWordBreaks(displayText)));
-            let html = tsPrefix + (showTags ? processed : convertDiscordEmojis(processed));
+            const newLinePrefix = (newLineIndicator && lineMarkedNew) ? '<span style="color:#00ff00;">▶</span> ' : '';
+            let html = tsPrefix + newLinePrefix + (showTags ? processed : convertDiscordEmojis(processed));
 
             // Apply /highlight color from action command (takes priority)
             if (lineHighlightColor !== null && lineHighlightColor !== undefined) {
@@ -4795,6 +4820,7 @@
         setupArrowUpDown = arrowUpDownMode;
         setupShiftArrowUpDown = shiftArrowUpDownMode;
         setupTlsProxy = tlsProxyEnabled;
+        setupNewLineIndicator = newLineIndicator;
         setupInputHeightValue = inputHeight;
         setupGuiTheme = guiTheme;
         setupColorOffset = colorOffsetPercent;
@@ -4833,6 +4859,11 @@
             elements.setupTlsProxyToggle.classList.add('active');
         } else {
             elements.setupTlsProxyToggle.classList.remove('active');
+        }
+        if (setupNewLineIndicator) {
+            elements.setupNewLineIndicatorToggle.classList.add('active');
+        } else {
+            elements.setupNewLineIndicatorToggle.classList.remove('active');
         }
         // World switching dropdown
         elements.setupWorldSwitchSelect.value = setupWorldSwitchMode;
@@ -4889,7 +4920,8 @@
             tls_proxy_enabled: tlsProxyEnabled,
             zwj_enabled: zwjEnabled,
             arrow_up_down_mode: arrowUpDownMode,
-            shift_arrow_up_down_mode: shiftArrowUpDownMode
+            shift_arrow_up_down_mode: shiftArrowUpDownMode,
+            new_line_indicator: newLineIndicator
         };
     }
 
@@ -4909,6 +4941,7 @@
         arrowUpDownMode = setupArrowUpDown;
         shiftArrowUpDownMode = setupShiftArrowUpDown;
         tlsProxyEnabled = setupTlsProxy;
+        newLineIndicator = setupNewLineIndicator;
         guiTheme = setupGuiTheme;
         colorOffsetPercent = setupColorOffset;
         applyTheme(guiTheme);
@@ -6969,6 +7002,8 @@
                 e.preventDefault();
                 if (worlds[currentWorldIndex]) {
                     worlds[currentWorldIndex].output_lines = worlds[currentWorldIndex].output_lines.filter(l => l.from_server !== false);
+                    // Clear new line indicators
+                    worlds[currentWorldIndex].output_lines.forEach(l => { l.marked_new = false; });
                     worldOutputCache[currentWorldIndex] = {};
                 }
                 renderOutput();
@@ -7182,6 +7217,10 @@
         };
         elements.setupTlsProxyToggle.onclick = function() {
             setupTlsProxy = !setupTlsProxy;
+            updateSetupPopupUI();
+        };
+        elements.setupNewLineIndicatorToggle.onclick = function() {
+            setupNewLineIndicator = !setupNewLineIndicator;
             updateSetupPopupUI();
         };
         elements.setupWorldSwitchSelect.onchange = function() {

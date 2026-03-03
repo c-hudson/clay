@@ -94,7 +94,7 @@ pub enum WsMessage {
     /// is_viewed: true if any interface (console/web/GUI) is viewing this world
     /// ts: timestamp in seconds since Unix epoch (when the line was received)
     /// from_server: true if data came from MUD server, false if client-generated
-    ServerData { world_index: usize, data: String, is_viewed: bool, #[serde(default)] ts: u64, #[serde(default = "default_true")] from_server: bool, #[serde(default)] seq: u64 },
+    ServerData { world_index: usize, data: String, is_viewed: bool, #[serde(default)] ts: u64, #[serde(default = "default_true")] from_server: bool, #[serde(default)] seq: u64, #[serde(default)] marked_new: bool },
     WorldConnected { world_index: usize, name: String },
     WorldDisconnected { world_index: usize },
     WorldAdded { world: Box<WorldStateMsg> },
@@ -230,6 +230,8 @@ pub enum WsMessage {
         arrow_up_down_mode: String,
         #[serde(default)]
         shift_arrow_up_down_mode: String,
+        #[serde(default)]
+        new_line_indicator: bool,
     },
 
     // Settings update confirmations (server -> client)
@@ -341,6 +343,8 @@ pub struct TimestampedLine {
     pub seq: u64, // Unique sequential number within the world (for debugging)
     #[serde(default)]
     pub highlight_color: Option<String>, // Optional highlight color from /highlight action command
+    #[serde(default)]
+    pub marked_new: bool, // true if line arrived while user wasn't viewing (unseen/pending)
 }
 
 /// World state for WebSocket protocol
@@ -381,6 +385,9 @@ pub struct WorldStateMsg {
     // Total number of output lines on the server (for lazy backfill)
     #[serde(default)]
     pub total_output_lines: usize,
+    // Number of pending lines on the server (for More indicator on connect)
+    #[serde(default)]
+    pub pending_count: usize,
 }
 
 /// World settings for WebSocket protocol
@@ -457,6 +464,8 @@ pub struct GlobalSettingsMsg {
     pub arrow_up_down_mode: String,
     #[serde(default)]
     pub shift_arrow_up_down_mode: String,
+    #[serde(default)]
+    pub new_line_indicator: bool,
     /// Theme colors from ~/clay.theme.dat (serialized as hex strings)
     #[serde(default)]
     pub theme_colors_json: String,

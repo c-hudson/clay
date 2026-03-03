@@ -201,6 +201,7 @@ pub fn save_settings_to_path(app: &App, path: &std::path::Path) -> io::Result<()
     writeln!(file, "editor_side={}", app.settings.editor_side.name())?;
     writeln!(file, "mouse_enabled={}", app.settings.mouse_enabled)?;
     writeln!(file, "zwj_enabled={}", app.settings.zwj_enabled)?;
+    writeln!(file, "new_line_indicator={}", app.settings.new_line_indicator)?;
     writeln!(file, "arrow_up_down_mode={}", app.settings.arrow_up_down_mode.name())?;
     writeln!(file, "shift_arrow_up_down_mode={}", app.settings.shift_arrow_up_down_mode.name())?;
 
@@ -643,6 +644,9 @@ pub fn load_settings_from_path(app: &mut App, path: &std::path::Path) -> io::Res
                     }
                     "zwj_enabled" => {
                         app.settings.zwj_enabled = value == "true";
+                    }
+                    "new_line_indicator" => {
+                        app.settings.new_line_indicator = value == "true";
                     }
                     "arrow_up_down_mode" => {
                         app.settings.arrow_up_down_mode = ArrowKeyMode::from_name(value);
@@ -1169,6 +1173,7 @@ pub fn save_reload_state(app: &App) -> io::Result<()> {
     writeln!(file, "editor_side={}", app.settings.editor_side.name())?;
     writeln!(file, "mouse_enabled={}", app.settings.mouse_enabled)?;
     writeln!(file, "zwj_enabled={}", app.settings.zwj_enabled)?;
+    writeln!(file, "new_line_indicator={}", app.settings.new_line_indicator)?;
     writeln!(file, "arrow_up_down_mode={}", app.settings.arrow_up_down_mode.name())?;
     writeln!(file, "shift_arrow_up_down_mode={}", app.settings.shift_arrow_up_down_mode.name())?;
 
@@ -1457,6 +1462,7 @@ pub fn load_reload_state(app: &mut App) -> io::Result<bool> {
                         gagged,
                         seq,
                         highlight_color: None,
+                        marked_new: false,
                     };
                 } else if parts.len() == 3 {
                     // Older format: timestamp|flags|text (no seq)
@@ -1471,6 +1477,7 @@ pub fn load_reload_state(app: &mut App) -> io::Result<bool> {
                         gagged,
                         seq: 0,
                         highlight_color: None,
+                        marked_new: false,
                     };
                 } else {
                     // Old format: timestamp|text (assume from_server=true for compatibility)
@@ -1481,6 +1488,7 @@ pub fn load_reload_state(app: &mut App) -> io::Result<bool> {
                         gagged: false,
                         seq: 0,
                         highlight_color: None,
+                        marked_new: false,
                     };
                 }
             }
@@ -1764,6 +1772,9 @@ pub fn load_reload_state(app: &mut App) -> io::Result<bool> {
                     "zwj_enabled" => {
                         app.settings.zwj_enabled = value == "true";
                     }
+                    "new_line_indicator" => {
+                        app.settings.new_line_indicator = value == "true";
+                    }
                     "arrow_up_down_mode" => {
                         app.settings.arrow_up_down_mode = ArrowKeyMode::from_name(value);
                     }
@@ -1991,6 +2002,7 @@ mod tests {
             zwj_enabled: true,                 // default: false
             arrow_up_down_mode: ArrowKeyMode::InputLine, // default: CycleWorlds
             shift_arrow_up_down_mode: ArrowKeyMode::CycleWorlds, // default: InputLine
+            new_line_indicator: true,             // default: false
         }
     }
 
@@ -2068,6 +2080,7 @@ mod tests {
         assert_eq!(a.zwj_enabled, b.zwj_enabled, "{context}: zwj_enabled");
         assert_eq!(a.arrow_up_down_mode.name(), b.arrow_up_down_mode.name(), "{context}: arrow_up_down_mode");
         assert_eq!(a.shift_arrow_up_down_mode.name(), b.shift_arrow_up_down_mode.name(), "{context}: shift_arrow_up_down_mode");
+        assert_eq!(a.new_line_indicator, b.new_line_indicator, "{context}: new_line_indicator");
     }
 
     /// Assert all WorldSettings fields match between two instances.
@@ -2177,6 +2190,7 @@ mod tests {
         assert_ne!(non_default.zwj_enabled, default.zwj_enabled, "zwj_enabled should differ");
         assert_ne!(non_default.arrow_up_down_mode.name(), default.arrow_up_down_mode.name(), "arrow_up_down_mode should differ");
         assert_ne!(non_default.shift_arrow_up_down_mode.name(), default.shift_arrow_up_down_mode.name(), "shift_arrow_up_down_mode should differ");
+        assert_ne!(non_default.new_line_indicator, default.new_line_indicator, "new_line_indicator should differ");
     }
 
     #[test]

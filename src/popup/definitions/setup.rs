@@ -24,6 +24,7 @@ pub const SETUP_FIELD_ZWJ: FieldId = FieldId(13);
 pub const SETUP_FIELD_ANSI_MUSIC: FieldId = FieldId(14);
 pub const SETUP_FIELD_ARROW_UP_DOWN: FieldId = FieldId(15);
 pub const SETUP_FIELD_SHIFT_ARROW_UP_DOWN: FieldId = FieldId(16);
+pub const SETUP_FIELD_NEW_LINE_INDICATOR: FieldId = FieldId(17);
 
 // Button IDs
 pub const SETUP_BTN_SAVE: ButtonId = ButtonId(1);
@@ -80,6 +81,7 @@ pub fn create_setup_popup(
     ansi_music: bool,
     arrow_up_down: &str,
     shift_arrow_up_down: &str,
+    new_line_indicator: bool,
 ) -> PopupDefinition {
     let world_switching_idx = if world_switching == "alphabetical" { 1 } else { 0 };
     let gui_theme_idx = if gui_theme == "light" { 1 } else { 0 };
@@ -171,10 +173,15 @@ pub fn create_setup_popup(
             "Ctrl+Up/Down",
             FieldKind::select(arrow_key_options(), shift_arrow_up_down_idx),
         ))
+        .with_field(Field::new(
+            SETUP_FIELD_NEW_LINE_INDICATOR,
+            "New Line Indicator",
+            FieldKind::toggle(new_line_indicator),
+        ))
         .with_button(Button::new(SETUP_BTN_CANCEL, "Cancel").with_shortcut('C'))
         .with_button(Button::new(SETUP_BTN_SAVE, "Save").primary().with_shortcut('S'))
         .with_layout(PopupLayout {
-            label_width: 17,
+            label_width: 19,
             min_width: 40,
             max_width_percent: 60,
             center_horizontal: true,
@@ -196,13 +203,13 @@ mod tests {
         let def = create_setup_popup(
             true, true, false, "unseen_first",
             false, 3, "dark", false, "", "left", false, false, true,
-            "cycle_worlds", "input_line",
+            "cycle_worlds", "input_line", false,
         );
         let state = PopupState::new(def);
 
         assert_eq!(state.definition.id, PopupId("setup"));
         assert_eq!(state.definition.title, "Setup");
-        assert_eq!(state.definition.fields.len(), 15);
+        assert_eq!(state.definition.fields.len(), 16);
         assert_eq!(state.definition.buttons.len(), 2);
     }
 
@@ -211,7 +218,7 @@ mod tests {
         let def = create_setup_popup(
             true, false, true, "alphabetical",
             true, 5, "light", true, "/custom/dict", "left", true, true, true,
-            "input_line", "cycle_worlds",
+            "input_line", "cycle_worlds", false,
         );
         let state = PopupState::new(def);
 
