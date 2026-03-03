@@ -1045,6 +1045,8 @@ pub struct Settings {
     // Arrow key behavior settings
     arrow_up_down_mode: ArrowKeyMode,       // What Up/Down does (default: CycleWorlds)
     shift_arrow_up_down_mode: ArrowKeyMode, // What Ctrl+Up/Down does (default: InputLine)
+    // New line indicator - prefix unseen/pending lines with green "+"
+    pub new_line_indicator: bool,
 }
 
 impl Default for Settings {
@@ -1084,6 +1086,7 @@ impl Default for Settings {
             zwj_enabled: false,
             arrow_up_down_mode: ArrowKeyMode::CycleWorlds,
             shift_arrow_up_down_mode: ArrowKeyMode::InputLine,
+            new_line_indicator: false,
         }
     }
 }
@@ -1805,6 +1808,7 @@ pub struct OutputLine {
     pub gagged: bool,       // true if line was gagged by an action (only shown with F2)
     pub seq: u64,           // Unique sequential number within the world (for debugging out-of-order issues)
     pub highlight_color: Option<String>, // Optional highlight color from /highlight action command
+    pub marked_new: bool,   // true if line arrived while user wasn't viewing (unseen/pending)
 }
 
 /// Maximum characters per output line (prevents performance issues with extremely long lines)
@@ -1848,6 +1852,7 @@ impl OutputLine {
             gagged: false,
             seq,
             highlight_color: None,
+            marked_new: false,
         }
     }
 
@@ -1859,6 +1864,7 @@ impl OutputLine {
             gagged: false,
             seq,
             highlight_color: None,
+            marked_new: false,
         }
     }
 
@@ -1870,11 +1876,12 @@ impl OutputLine {
             gagged: true,
             seq,
             highlight_color: None,
+            marked_new: false,
         }
     }
 
     fn new_with_timestamp(text: String, timestamp: SystemTime, seq: u64) -> Self {
-        Self { text: Self::truncate_if_needed(text), timestamp, from_server: true, gagged: false, seq, highlight_color: None }
+        Self { text: Self::truncate_if_needed(text), timestamp, from_server: true, gagged: false, seq, highlight_color: None, marked_new: false }
     }
 
     /// Format timestamp using a pre-computed "now" value for batch rendering
@@ -2283,8 +2290,9 @@ impl World {
                     }
                     for vl in &wrapped {
                         let seq = self.next_seq; self.next_seq += 1;
-                        let cl = if from_server { OutputLine::new(vl.clone(), seq) }
+                        let mut cl = if from_server { OutputLine::new(vl.clone(), seq) }
                                  else { OutputLine::new_client(vl.clone(), seq) };
+                        cl.marked_new = true;
                         self.pending_lines.push(cl);
                     }
                     if !is_current { self.unseen_lines += wrapped.len(); }
@@ -2292,8 +2300,9 @@ impl World {
                     // First max_lines visual lines -> output, rest -> pending
                     for vl in wrapped.iter().take(max_lines) {
                         let seq = self.next_seq; self.next_seq += 1;
-                        let fl = if from_server { OutputLine::new(vl.clone(), seq) }
+                        let mut fl = if from_server { OutputLine::new(vl.clone(), seq) }
                                  else { OutputLine::new_client(vl.clone(), seq) };
+                        fl.marked_new = !is_current;
                         self.output_lines.push(fl);
                         self.lines_since_pause += 1; // each pre-wrapped line is 1 visual line
                     }
@@ -2313,8 +2322,9 @@ impl World {
                         }
                         for vl in wrapped.iter().skip(max_lines) {
                             let seq = self.next_seq; self.next_seq += 1;
-                            let cl = if from_server { OutputLine::new(vl.clone(), seq) }
+                            let mut cl = if from_server { OutputLine::new(vl.clone(), seq) }
                                      else { OutputLine::new_client(vl.clone(), seq) };
+                            cl.marked_new = true;
                             self.pending_lines.push(cl);
                             if !is_current { self.unseen_lines += 1; }
                         }
@@ -2326,7 +2336,7 @@ impl World {
             // Create OutputLine with appropriate from_server flag
             let seq = self.next_seq;
             self.next_seq += 1;
-            let new_line = if from_server {
+            let mut new_line = if from_server {
                 OutputLine::new(line.to_string(), seq)
             } else {
                 OutputLine::new_client(line.to_string(), seq)
@@ -2342,6 +2352,7 @@ impl World {
                     }
                 }
 
+                new_line.marked_new = true;
                 self.pending_lines.push(new_line);
                 if !is_current { self.unseen_lines += 1; }
                 if is_partial {
@@ -2350,6 +2361,7 @@ impl World {
                 }
             } else if triggers_pause {
                 // Add line to output_lines BEFORE pausing so it's visible when we scroll to bottom
+                new_line.marked_new = !is_current;
                 self.output_lines.push(new_line);
                 self.lines_since_pause += visual_lines;
                 if !is_current {
@@ -2367,7 +2379,7 @@ impl World {
                     self.partial_in_pending = false; // It went to output_lines, not pending
                 }
             } else {
-
+                new_line.marked_new = !is_current;
                 self.output_lines.push(new_line);
                 self.lines_since_pause += visual_lines;
                 if !is_current {
@@ -2404,6 +2416,10 @@ impl World {
     pub fn mark_seen(&mut self) {
         self.unseen_lines = 0;
         self.first_unseen_at = None;
+        // Clear new line indicators on displayed lines (pending lines keep theirs)
+        for line in &mut self.output_lines {
+            line.marked_new = false;
+        }
     }
 
     /// Returns true if this world has activity (unseen lines or pending output)
@@ -2483,6 +2499,13 @@ impl World {
     fn filter_to_server_output(&mut self) {
         self.output_lines.retain(|line| line.from_server);
         self.pending_lines.retain(|line| line.from_server);
+        // Clear new line indicators (Ctrl+L clears them)
+        for line in &mut self.output_lines {
+            line.marked_new = false;
+        }
+        for line in &mut self.pending_lines {
+            line.marked_new = false;
+        }
         // Adjust scroll offset if it's now past the end
         if self.scroll_offset > 0 && self.scroll_offset >= self.output_lines.len() {
             self.scroll_offset = self.output_lines.len().saturating_sub(1);
@@ -2751,6 +2774,7 @@ impl App {
             zwj_enabled: self.settings.zwj_enabled,
             arrow_up_down_mode: self.settings.arrow_up_down_mode.name().to_string(),
             shift_arrow_up_down_mode: self.settings.shift_arrow_up_down_mode.name().to_string(),
+            new_line_indicator: self.settings.new_line_indicator,
             theme_colors_json: self.gui_theme_colors().to_json(),
         }
     }
@@ -2793,6 +2817,7 @@ impl App {
         self.settings.dictionary_path = settings.dictionary_path.clone();
         self.settings.mouse_enabled = settings.mouse_enabled;
         self.settings.zwj_enabled = settings.zwj_enabled;
+        self.settings.new_line_indicator = settings.new_line_indicator;
     }
 
     /// Ensure there's at least one world (creates initial world if needed)
@@ -3066,6 +3091,7 @@ impl App {
             self.settings.ansi_music_enabled,
             self.settings.arrow_up_down_mode.name(),
             self.settings.shift_arrow_up_down_mode.name(),
+            self.settings.new_line_indicator,
         );
         self.popup_manager.open(def);
 
@@ -3300,7 +3326,7 @@ impl App {
     /// Handle incoming WebSocket message when running as remote client
     fn handle_remote_ws_message(&mut self, msg: WsMessage) {
         match msg {
-            WsMessage::ServerData { world_index, data, from_server, seq: msg_seq, .. } => {
+            WsMessage::ServerData { world_index, data, from_server, seq: msg_seq, marked_new, .. } => {
                 if let Some(world) = self.worlds.get_mut(world_index) {
                     // Dedup: skip ServerData that has already been received (e.g., after resync)
                     if msg_seq > 0 && msg_seq <= world.max_received_seq {
@@ -3333,11 +3359,12 @@ impl App {
                             // Preserve from_server flag for Ctrl+L filtering
                             let seq = world.next_seq;
                             world.next_seq += 1;
-                            let output_line = if from_server {
+                            let mut output_line = if from_server {
                                 OutputLine::new(line.to_string(), seq)
                             } else {
                                 OutputLine::new_client(line.to_string(), seq)
                             };
+                            output_line.marked_new = marked_new;
                             world.output_lines.push(output_line);
                             // Track max received seq from server
                             if msg_seq > 0 {
@@ -3425,6 +3452,7 @@ impl App {
                             gagged: tl.gagged,
                             seq,
                             highlight_color: tl.highlight_color,
+                            marked_new: tl.marked_new,
                         });
                         if tl.seq > 0 {
                             world.max_received_seq = tl.seq;
@@ -3567,6 +3595,7 @@ impl App {
                             gagged: line.gagged,
                             seq: line.seq,
                             highlight_color: line.highlight_color,
+                            marked_new: line.marked_new,
                         };
                         world.output_lines.push(output_line);
                         if line.seq >= world.next_seq {
@@ -3599,6 +3628,7 @@ impl App {
                             gagged: line.gagged,
                             seq: line.seq,
                             highlight_color: line.highlight_color,
+                            marked_new: line.marked_new,
                         }
                     }).collect();
                     let prepended_count = new_lines.len();
@@ -3653,6 +3683,7 @@ impl App {
                     gagged: tl.gagged,
                     seq: tl.seq,
                     highlight_color: tl.highlight_color,
+                    marked_new: tl.marked_new,
                 }
             }).collect();
             // Update next_seq to continue from highest seq in output_lines
@@ -3674,6 +3705,7 @@ impl App {
                     gagged: tl.gagged,
                     seq: tl.seq,
                     highlight_color: tl.highlight_color,
+                    marked_new: tl.marked_new,
                 }
             }).collect();
             // Update next_seq if pending_lines have higher seq values
@@ -4065,6 +4097,7 @@ impl App {
             ts: current_timestamp_secs(),
             from_server: false,  // Client-generated message
             seq: 0,
+            marked_new: false,
         });
 
         // Mark output for redraw since we added content
@@ -4113,6 +4146,7 @@ impl App {
             ts: current_timestamp_secs(),
             from_server: false,  // Client-generated message
             seq: 0,
+            marked_new: false,
         });
 
         if world_idx == self.current_world_index {
@@ -4788,6 +4822,7 @@ impl App {
                     ts: current_timestamp_secs(),
                     from_server: true,
                     seq: first_seq,
+                    marked_new: !is_current,
                 });
             }
 
@@ -4877,7 +4912,8 @@ impl App {
             is_viewed: true,
             ts: disconnect_msg.timestamp.duration_since(UNIX_EPOCH).unwrap_or_default().as_secs(),
             from_server: false,
-            seq: 0,
+            seq,
+            marked_new: false,
         });
         self.ws_broadcast(WsMessage::WorldDisconnected { world_index: world_idx });
     }
@@ -5268,6 +5304,7 @@ impl App {
                             ts: current_timestamp_secs(),
                             from_server: false,
                             seq: 0,
+                            marked_new: false,
                         });
                     } else {
                         let commands = split_action_commands(&action.command);
@@ -5291,6 +5328,7 @@ impl App {
                                             ts: current_timestamp_secs(),
                                             from_server: false,
                                             seq: 0,
+                                            marked_new: false,
                                         });
                                     }
                                     tf::TfCommandResult::Success(None) => {}
@@ -5302,6 +5340,7 @@ impl App {
                                             ts: current_timestamp_secs(),
                                             from_server: false,
                                             seq: 0,
+                                            marked_new: false,
                                         });
                                     }
                                     tf::TfCommandResult::SendToMud(text) => {
@@ -5324,18 +5363,18 @@ impl App {
 
                                             if !opts.quiet {
                                                 if let Some(h) = header {
-                                                    self.ws_broadcast(WsMessage::ServerData { world_index, data: h, is_viewed: false, ts , from_server: false, seq: 0 });
+                                                    self.ws_broadcast(WsMessage::ServerData { world_index, data: h, is_viewed: false, ts , from_server: false, seq: 0, marked_new: false });
                                                 }
                                             }
                                             if matches.is_empty() {
-                                                self.ws_broadcast(WsMessage::ServerData { world_index, data: format!("\u{2728} No matches for '{}'", pattern_str), is_viewed: false, ts, from_server: false, seq: 0 });
+                                                self.ws_broadcast(WsMessage::ServerData { world_index, data: format!("\u{2728} No matches for '{}'", pattern_str), is_viewed: false, ts, from_server: false, seq: 0, marked_new: false });
                                             } else {
                                                 for m in matches {
-                                                    self.ws_broadcast(WsMessage::ServerData { world_index, data: m, is_viewed: false, ts , from_server: false, seq: 0 });
+                                                    self.ws_broadcast(WsMessage::ServerData { world_index, data: m, is_viewed: false, ts , from_server: false, seq: 0, marked_new: false });
                                                 }
                                             }
                                             if !opts.quiet {
-                                                self.ws_broadcast(WsMessage::ServerData { world_index, data: "================= Recall end =================".to_string(), is_viewed: false, ts , from_server: false, seq: 0 });
+                                                self.ws_broadcast(WsMessage::ServerData { world_index, data: "================= Recall end =================".to_string(), is_viewed: false, ts , from_server: false, seq: 0, marked_new: false });
                                             }
                                         }
                                     }
@@ -5365,6 +5404,7 @@ impl App {
                                 world_index, data: msg, is_viewed: false,
                                 ts: current_timestamp_secs(), from_server: false,
                                 seq: 0,
+                                marked_new: false,
                             });
                         }
                         tf::TfCommandResult::Success(None) => {}
@@ -5373,6 +5413,7 @@ impl App {
                                 world_index, data: format!("Error: {}", err), is_viewed: false,
                                 ts: current_timestamp_secs(), from_server: false,
                                 seq: 0,
+                                marked_new: false,
                             });
                         }
                         tf::TfCommandResult::SendToMud(text) => {
@@ -5394,18 +5435,18 @@ impl App {
                                 let ts = current_timestamp_secs();
                                 if !opts.quiet {
                                     if let Some(h) = header {
-                                        self.ws_broadcast(WsMessage::ServerData { world_index, data: h, is_viewed: false, ts, from_server: false, seq: 0 });
+                                        self.ws_broadcast(WsMessage::ServerData { world_index, data: h, is_viewed: false, ts, from_server: false, seq: 0, marked_new: false });
                                     }
                                 }
                                 if matches.is_empty() {
-                                    self.ws_broadcast(WsMessage::ServerData { world_index, data: format!("\u{2728} No matches for '{}'", pattern_str), is_viewed: false, ts, from_server: false, seq: 0 });
+                                    self.ws_broadcast(WsMessage::ServerData { world_index, data: format!("\u{2728} No matches for '{}'", pattern_str), is_viewed: false, ts, from_server: false, seq: 0, marked_new: false });
                                 } else {
                                     for m in matches {
-                                        self.ws_broadcast(WsMessage::ServerData { world_index, data: m, is_viewed: false, ts, from_server: false, seq: 0 });
+                                        self.ws_broadcast(WsMessage::ServerData { world_index, data: m, is_viewed: false, ts, from_server: false, seq: 0, marked_new: false });
                                     }
                                 }
                                 if !opts.quiet {
-                                    self.ws_broadcast(WsMessage::ServerData { world_index, data: "================= Recall end =================".to_string(), is_viewed: false, ts, from_server: false, seq: 0 });
+                                    self.ws_broadcast(WsMessage::ServerData { world_index, data: "================= Recall end =================".to_string(), is_viewed: false, ts, from_server: false, seq: 0, marked_new: false });
                                 }
                             }
                         }
@@ -5420,6 +5461,7 @@ impl App {
                                 ts: current_timestamp_secs(),
                                 from_server: false,
                                 seq: 0,
+                                marked_new: false,
                             });
                         }
                     }
@@ -5454,6 +5496,7 @@ impl App {
                     ts: current_timestamp_secs(),
                     from_server: false,
                     seq: 0,
+                    marked_new: false,
                 });
             }
             Command::Send { text, all_worlds, target_world, no_newline } => {
@@ -5493,6 +5536,7 @@ impl App {
                                 ts: current_timestamp_secs(),
                                 from_server: false,
                                 seq: 0,
+                                marked_new: false,
                             });
                         }
                     } else {
@@ -5503,6 +5547,7 @@ impl App {
                             ts: current_timestamp_secs(),
                             from_server: false,
                             seq: 0,
+                            marked_new: false,
                         });
                     }
                 } else {
@@ -5531,6 +5576,7 @@ impl App {
                         ts: current_timestamp_secs(),
                         from_server: false,
                         seq: 0,
+                        marked_new: false,
                     });
                     self.ws_broadcast(WsMessage::WorldDisconnected { world_index });
                 } else {
@@ -5541,6 +5587,7 @@ impl App {
                         ts: current_timestamp_secs(),
                         from_server: false,
                         seq: 0,
+                        marked_new: false,
                     });
                 }
             }
@@ -5561,6 +5608,7 @@ impl App {
                         ts: current_timestamp_secs(),
                         from_server: false,
                         seq: 0,
+                        marked_new: false,
                     });
                 }
             }
@@ -5584,6 +5632,7 @@ impl App {
                         ts: current_timestamp_secs(),
                         from_server: false,
                         seq: 0,
+                        marked_new: false,
                     });
                 }
             }
@@ -5596,6 +5645,7 @@ impl App {
                     ts: current_timestamp_secs(),
                     from_server: false,
                     seq: 0,
+                    marked_new: false,
                 });
             }
             Command::BanList => {
@@ -5609,6 +5659,7 @@ impl App {
                         ts: current_timestamp_secs(),
                         from_server: false,
                         seq: 0,
+                        marked_new: false,
                     });
                 } else {
                     let mut output = String::new();
@@ -5630,6 +5681,7 @@ impl App {
                         ts: current_timestamp_secs(),
                         from_server: false,
                         seq: 0,
+                        marked_new: false,
                     });
                 }
                 self.ws_send_to_client(client_id, WsMessage::BanListResponse { bans });
@@ -5645,6 +5697,7 @@ impl App {
                         ts: current_timestamp_secs(),
                         from_server: false,
                         seq: 0,
+                        marked_new: false,
                     });
                     // Broadcast updated ban list
                     self.ws_broadcast(WsMessage::BanListResponse { bans: self.ban_list.get_ban_info() });
@@ -5657,6 +5710,7 @@ impl App {
                         ts: current_timestamp_secs(),
                         from_server: false,
                         seq: 0,
+                        marked_new: false,
                     });
                     self.ws_send_to_client(client_id, WsMessage::UnbanResult { success: false, host, error: Some("No ban found".to_string()) });
                 }
@@ -5695,6 +5749,7 @@ impl App {
                     ts: current_timestamp_secs(),
                     from_server: false,
                     seq: 0,
+                    marked_new: false,
                 });
             }
             Command::Notify { message } => {
@@ -5715,6 +5770,7 @@ impl App {
                     ts: current_timestamp_secs(),
                     from_server: false,
                     seq: 0,
+                    marked_new: false,
                 });
             }
             Command::Dump => {
@@ -5765,6 +5821,7 @@ impl App {
                             ts,
                             from_server: false,
                             seq: 0,
+                            marked_new: false,
                         });
                     }
                     Err(e) => {
@@ -5775,6 +5832,7 @@ impl App {
                             ts,
                             from_server: false,
                             seq: 0,
+                            marked_new: false,
                         });
                     }
                 }
@@ -5797,6 +5855,7 @@ impl App {
                     ts: current_timestamp_secs(),
                     from_server: false,
                     seq: 0,
+                    marked_new: false,
                 });
             }
             // UI popup commands - send back to client for local handling
@@ -5812,6 +5871,7 @@ impl App {
                     ts: current_timestamp_secs(),
                     from_server: false,
                     seq: 0,
+                    marked_new: false,
                 });
             }
             // AddWorld - add or update world definition
@@ -5858,6 +5918,7 @@ impl App {
                     ts: current_timestamp_secs(),
                     from_server: false,
                     seq: 0,
+                    marked_new: false,
                 });
             }
             // Connect command - needs async follow-up
@@ -5875,6 +5936,7 @@ impl App {
                             ts: current_timestamp_secs(),
                             from_server: false,
                             seq: 0,
+                            marked_new: false,
                         });
                     }
                 }
@@ -5910,6 +5972,7 @@ impl App {
                         ts: current_timestamp_secs(),
                         from_server: false,
                         seq: 0,
+                        marked_new: false,
                     });
                 }
             }
@@ -5924,6 +5987,7 @@ impl App {
                     ts: current_timestamp_secs(),
                     from_server: false,
                     seq: 0,
+                    marked_new: false,
                 });
             }
             Command::UrbanUsage => {
@@ -5934,6 +5998,7 @@ impl App {
                     ts: current_timestamp_secs(),
                     from_server: false,
                     seq: 0,
+                    marked_new: false,
                 });
             }
             Command::TranslateUsage => {
@@ -5944,6 +6009,7 @@ impl App {
                     ts: current_timestamp_secs(),
                     from_server: false,
                     seq: 0,
+                    marked_new: false,
                 });
             }
             Command::HelpTf => {
@@ -5958,6 +6024,7 @@ impl App {
                                 ts: current_timestamp_secs(),
                                 from_server: false,
                                 seq: 0,
+                                marked_new: false,
                             });
                         }
                     }
@@ -5969,6 +6036,7 @@ impl App {
                             ts: current_timestamp_secs(),
                             from_server: false,
                             seq: 0,
+                            marked_new: false,
                         });
                     }
                 }
@@ -6029,6 +6097,7 @@ impl App {
                             ts: current_timestamp_secs(),
                             from_server: false,
                             seq: 0,
+                            marked_new: false,
                         });
                     } else {
                         // Save current world index, switch to target, connect, then restore
@@ -6087,6 +6156,7 @@ impl App {
                     is_proxy: false,
                     gmcp_user_enabled: world.gmcp_user_enabled,
                     total_output_lines: 0,
+                    pending_count: 0,
                 };
                 self.ws_broadcast(WsMessage::WorldAdded { world: Box::new(world_state) });
                 let _ = persistence::save_settings(self);
@@ -6210,7 +6280,12 @@ impl App {
                         // For release-all, cap at pending_count
                         let to_release = logical_count.min(pending_count);
 
-                        // Get text of lines that will be released (for broadcasting as ServerData)
+                        // Get seq and text of lines that will be released (for broadcasting as ServerData)
+                        let first_pending_seq = self.worlds[world_index]
+                            .pending_lines
+                            .first()
+                            .map(|l| l.seq)
+                            .unwrap_or(0);
                         let lines_to_broadcast: Vec<String> = self.worlds[world_index]
                             .pending_lines
                             .iter()
@@ -6230,7 +6305,8 @@ impl App {
                                 is_viewed: true,
                                 ts: current_timestamp_secs(),
                                 from_server: true,
-                                seq: 0, // Use 0 to bypass client dedup check — released pending lines are always new to the client
+                                seq: first_pending_seq,
+                                marked_new: false,
                             });
                         }
 
@@ -6300,7 +6376,7 @@ impl App {
                     });
                 }
             }
-            WsMessage::UpdateGlobalSettings { more_mode_enabled, spell_check_enabled, temp_convert_enabled, world_switch_mode, show_tags, debug_enabled, ansi_music_enabled, console_theme, gui_theme, gui_transparency, color_offset_percent, input_height, font_name, font_size, web_font_size_phone, web_font_size_tablet, web_font_size_desktop, web_font_weight, ws_allow_list, web_secure, http_enabled, http_port, ws_enabled: _, ws_port: _, ws_cert_file, ws_key_file, tls_proxy_enabled, dictionary_path, mouse_enabled, zwj_enabled, arrow_up_down_mode, shift_arrow_up_down_mode } => {
+            WsMessage::UpdateGlobalSettings { more_mode_enabled, spell_check_enabled, temp_convert_enabled, world_switch_mode, show_tags, debug_enabled, ansi_music_enabled, console_theme, gui_theme, gui_transparency, color_offset_percent, input_height, font_name, font_size, web_font_size_phone, web_font_size_tablet, web_font_size_desktop, web_font_weight, ws_allow_list, web_secure, http_enabled, http_port, ws_enabled: _, ws_port: _, ws_cert_file, ws_key_file, tls_proxy_enabled, dictionary_path, mouse_enabled, zwj_enabled, arrow_up_down_mode, shift_arrow_up_down_mode, new_line_indicator } => {
                 // Update global settings from remote client
                 self.settings.more_mode_enabled = more_mode_enabled;
                 self.settings.spell_check_enabled = spell_check_enabled;
@@ -6340,6 +6416,7 @@ impl App {
                 self.settings.zwj_enabled = zwj_enabled;
                 self.settings.arrow_up_down_mode = ArrowKeyMode::from_name(&arrow_up_down_mode);
                 self.settings.shift_arrow_up_down_mode = ArrowKeyMode::from_name(&shift_arrow_up_down_mode);
+                self.settings.new_line_indicator = new_line_indicator;
                 if self.settings.dictionary_path != dictionary_path {
                     self.settings.dictionary_path = dictionary_path;
                     self.spell_checker = SpellChecker::new(&self.settings.dictionary_path);
@@ -6469,6 +6546,7 @@ impl App {
                             from_server: line.from_server,
                             seq: line.seq,
                             highlight_color: line.highlight_color.clone(),
+                            marked_new: line.marked_new,
                         })
                         .collect::<Vec<_>>()
                         .into_iter()
@@ -6708,6 +6786,7 @@ impl App {
                                         from_server: line.from_server,
                                         seq: line.seq,
                                         highlight_color: line.highlight_color.clone(),
+                                        marked_new: line.marked_new,
                                     }
                                 })
                                 .collect();
@@ -6754,6 +6833,7 @@ impl App {
                                     from_server: line.from_server,
                                     seq: line.seq,
                                     highlight_color: line.highlight_color.clone(),
+                                    marked_new: line.marked_new,
                                 }
                             })
                             .collect()
@@ -6774,6 +6854,7 @@ impl App {
                                     from_server: line.from_server,
                                     seq: line.seq,
                                     highlight_color: line.highlight_color.clone(),
+                                    marked_new: line.marked_new,
                                 }
                             })
                             .collect()
@@ -6856,6 +6937,7 @@ impl App {
                         from_server: s.from_server,
                         seq: s.seq,
                         highlight_color: s.highlight_color.clone(),
+                        marked_new: s.marked_new,
                     }
                 })
                 .collect();
@@ -6899,6 +6981,7 @@ impl App {
                 is_proxy: world.proxy_pid.is_some(),
                 gmcp_user_enabled: world.gmcp_user_enabled,
                 total_output_lines: world.output_lines.len(),
+                pending_count: world.pending_lines.len(),
             }
         }).collect();
 
@@ -7347,7 +7430,12 @@ impl App {
             logical_count = 1;
         }
 
-        // Get text of lines that will be released (for broadcasting as ServerData)
+        // Get seq and text of lines that will be released (for broadcasting as ServerData)
+        let first_pending_seq = self.worlds[world_idx]
+            .pending_lines
+            .first()
+            .map(|l| l.seq)
+            .unwrap_or(0);
         let lines_to_broadcast: Vec<String> = self.worlds[world_idx]
             .pending_lines
             .iter()
@@ -7368,7 +7456,8 @@ impl App {
                 is_viewed: true,
                 ts: current_timestamp_secs(),
                 from_server: true,
-                seq: 0, // Use 0 to bypass client dedup check — released pending lines are always new to the client
+                seq: first_pending_seq,
+                marked_new: true,
             });
         }
 
@@ -8825,6 +8914,7 @@ fn handle_remote_client_key(
                 app.settings.ansi_music_enabled = settings.ansi_music;
                 app.settings.arrow_up_down_mode = ArrowKeyMode::from_name(&settings.arrow_up_down);
                 app.settings.shift_arrow_up_down_mode = ArrowKeyMode::from_name(&settings.shift_arrow_up_down);
+                app.settings.new_line_indicator = settings.new_line_indicator;
 
                 // Send UpdateGlobalSettings to daemon
                 let _ = ws_tx.send(WsMessage::UpdateGlobalSettings {
@@ -8860,6 +8950,7 @@ fn handle_remote_client_key(
                     zwj_enabled: app.settings.zwj_enabled,
                     arrow_up_down_mode: app.settings.arrow_up_down_mode.name().to_string(),
                     shift_arrow_up_down_mode: app.settings.shift_arrow_up_down_mode.name().to_string(),
+                    new_line_indicator: app.settings.new_line_indicator,
                 });
             }
             NewPopupAction::WebSaved(settings) => {
@@ -8906,6 +8997,7 @@ fn handle_remote_client_key(
                     zwj_enabled: app.settings.zwj_enabled,
                     arrow_up_down_mode: app.settings.arrow_up_down_mode.name().to_string(),
                     shift_arrow_up_down_mode: app.settings.shift_arrow_up_down_mode.name().to_string(),
+                    new_line_indicator: app.settings.new_line_indicator,
                 });
             }
             NewPopupAction::ConnectionsClose => {
@@ -9595,6 +9687,7 @@ struct SetupSettings {
     ansi_music: bool,
     arrow_up_down: String,
     shift_arrow_up_down: String,
+    new_line_indicator: bool,
 }
 
 /// Settings from the web popup
@@ -9674,6 +9767,7 @@ fn handle_new_popup_key(app: &mut App, key: KeyEvent) -> NewPopupAction {
         SETUP_FIELD_INPUT_HEIGHT, SETUP_FIELD_GUI_THEME, SETUP_FIELD_TLS_PROXY,
         SETUP_FIELD_DICTIONARY, SETUP_FIELD_EDITOR_SIDE, SETUP_FIELD_MOUSE, SETUP_FIELD_ZWJ, SETUP_FIELD_ANSI_MUSIC,
         SETUP_FIELD_ARROW_UP_DOWN, SETUP_FIELD_SHIFT_ARROW_UP_DOWN,
+        SETUP_FIELD_NEW_LINE_INDICATOR,
         SETUP_BTN_SAVE, SETUP_BTN_CANCEL,
     };
     use popup::definitions::web::{
@@ -9901,6 +9995,7 @@ fn handle_new_popup_key(app: &mut App, key: KeyEvent) -> NewPopupAction {
                         .unwrap_or("cycle_worlds").to_string(),
                     shift_arrow_up_down: state.get_selected(SETUP_FIELD_SHIFT_ARROW_UP_DOWN)
                         .unwrap_or("input_line").to_string(),
+                    new_line_indicator: state.get_bool(SETUP_FIELD_NEW_LINE_INDICATOR).unwrap_or(false),
                 }
             };
 
@@ -11918,6 +12013,7 @@ pub async fn run_app_headless(
                             ts: current_timestamp_secs(),
                             from_server: false,
                             seq: 0,
+                            marked_new: false,
                         });
                     }
                     AppEvent::Sigusr1Received => {
@@ -11973,6 +12069,7 @@ pub async fn run_app_headless(
                                 ts: current_timestamp_secs(),
                                 from_server: false,
                                 seq: 0,
+                                marked_new: false,
                             }),
                         }
                     }
@@ -12220,6 +12317,7 @@ pub async fn run_app_headless(
                                     ts: current_timestamp_secs(),
                                     from_server: false,
                                     seq: 0,
+                                    marked_new: false,
                                 });
                             }
                             tf::TfCommandResult::Error(err) => {
@@ -12234,6 +12332,7 @@ pub async fn run_app_headless(
                                     ts: current_timestamp_secs(),
                                     from_server: false,
                                     seq: 0,
+                                    marked_new: false,
                                 });
                             }
                             tf::TfCommandResult::RepeatProcess(process) => {
@@ -13753,6 +13852,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                         ts: current_timestamp_secs(),
                                         from_server: false,
                                         seq: 0,
+                                        marked_new: false,
                                     });
                                 }
 
@@ -13871,6 +13971,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                 ts: current_timestamp_secs(),
                                 from_server: false,
                                 seq: 0,
+                                marked_new: false,
                             }),
                         }
                     }
@@ -14138,6 +14239,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                     ts: current_timestamp_secs(),
                                     from_server: false,
                                     seq: 0,
+                                    marked_new: false,
                                 });
                             }
                             tf::TfCommandResult::Error(err) => {
@@ -14152,6 +14254,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                     ts: current_timestamp_secs(),
                                     from_server: false,
                                     seq: 0,
+                                    marked_new: false,
                                 });
                             }
                             tf::TfCommandResult::ClayCommand(clay_cmd) => {
@@ -14234,9 +14337,11 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
             }
         }
 
-        // Process any additional queued server events BEFORE drawing
-        // This ensures the render always shows the most current state
-        // (the select! above processes only one event; drain remaining here)
+        // Process additional queued events with a time budget for UI responsiveness.
+        // When a burst of data arrives (e.g., 11K lines), this processes events for up to
+        // 16ms, then breaks to draw and handle keyboard input. Remaining events stay in
+        // the channel and are picked up next iteration (event_rx.recv() returns immediately).
+        let drain_deadline = std::time::Instant::now() + Duration::from_millis(16);
         while let Ok(event) = event_rx.try_recv() {
             needs_draw = true;
             match event {
@@ -14425,6 +14530,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                 ts: current_timestamp_secs(),
                                 from_server: false,
                                 seq: 0,
+                                marked_new: false,
                             });
                         }
 
@@ -14529,13 +14635,19 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                             ts: current_timestamp_secs(),
                             from_server: false,
                             seq: 0,
+                            marked_new: false,
                         }),
                     }
                 }
             }
+            // Time budget exceeded — break to draw and handle keyboard input.
+            // Remaining events stay in the channel for next iteration.
+            if std::time::Instant::now() >= drain_deadline {
+                break;
+            }
         }
 
-        // Now draw with the most up-to-date state (after all events processed)
+        // Now draw with the most up-to-date state
         // Activate process tick sleep if processes were added during this iteration
         if !app.tf_engine.processes.is_empty() {
             // Only reset if the sleep is far-future (avoid resetting an already-short timer)
@@ -15126,6 +15238,7 @@ fn handle_key_event(key: KeyEvent, app: &mut App) -> KeyAction {
                 app.settings.ansi_music_enabled = settings.ansi_music;
                 app.settings.arrow_up_down_mode = ArrowKeyMode::from_name(&settings.arrow_up_down);
                 app.settings.shift_arrow_up_down_mode = ArrowKeyMode::from_name(&settings.shift_arrow_up_down);
+                app.settings.new_line_indicator = settings.new_line_indicator;
                 // Save settings to disk
                 let _ = persistence::save_settings(app);
             }
@@ -15679,7 +15792,12 @@ fn handle_key_event(key: KeyEvent, app: &mut App) -> KeyAction {
         if app.current_world().paused {
             let world_idx = app.current_world_index;
 
-            // Get text of lines that will be released (for broadcasting as ServerData)
+            // Get seq and text of lines that will be released (for broadcasting as ServerData)
+            let first_pending_seq = app.worlds[world_idx]
+                .pending_lines
+                .first()
+                .map(|l| l.seq)
+                .unwrap_or(0);
             let lines_to_broadcast: Vec<String> = app.worlds[world_idx]
                 .pending_lines
                 .iter()
@@ -15698,7 +15816,8 @@ fn handle_key_event(key: KeyEvent, app: &mut App) -> KeyAction {
                     is_viewed: true,
                     ts: current_timestamp_secs(),
                     from_server: true,
-                    seq: 0, // Use 0 to bypass client dedup check — released pending lines are always new to the client
+                    seq: first_pending_seq,
+                    marked_new: true,
                 });
             }
 
@@ -18860,8 +18979,8 @@ fn render_output_crossterm(app: &App) {
     }
 
     // Collect wrapped lines centered around scroll_offset to fill the screen
-    // Each entry is (line_text, should_highlight_f8, highlight_color_from_action)
-    let mut visual_lines: Vec<(String, bool, Option<String>)> = Vec::new();
+    // Each entry is (line_text, should_highlight_f8, highlight_color_from_action, marked_new)
+    let mut visual_lines: Vec<(String, bool, Option<String>, bool)> = Vec::new();
     let mut first_line_idx: usize = 0;
 
     let show_tags = app.show_tags;
@@ -18879,9 +18998,12 @@ fn render_output_crossterm(app: &App) {
     // Cache "now" for timestamp formatting - compute once per frame, not per line
     let cached_now = CachedNow::new();
 
-    let expand_and_wrap = |line: &OutputLine, term_width: usize, show_tags: bool, highlight_f8: bool, cached_now: &CachedNow| -> Vec<(String, bool, Option<String>)> {
+    let new_line_indicator = app.settings.new_line_indicator;
+    // The "▶ " prefix is 2 columns wide (1 for triangle + 1 for space)
+    let nli_prefix_width: usize = 2;
+    let expand_and_wrap = |line: &OutputLine, term_width: usize, show_tags: bool, highlight_f8: bool, cached_now: &CachedNow| -> Vec<(String, bool, Option<String>, bool)> {
         let expanded = match process_output_line(line, show_tags, temp_convert_enabled, zwj_enabled, cached_now) {
-            Some(text) if text.is_empty() => return vec![("".to_string(), false, None)],
+            Some(text) if text.is_empty() => return vec![("".to_string(), false, None, false)],
             Some(text) => text,
             None => return Vec::new(),
         };
@@ -18895,9 +19017,16 @@ fn render_output_crossterm(app: &App) {
             convert_discord_emojis_with_links(&with_links)
         };
         let hl_color = line.highlight_color.clone();
-        wrap_ansi_line(&with_emoji_links, term_width)
+        let mn = line.marked_new;
+        // Reduce wrap width when new line indicator prefix will be prepended
+        let wrap_width = if new_line_indicator && mn {
+            term_width.saturating_sub(nli_prefix_width)
+        } else {
+            term_width
+        };
+        wrap_ansi_line(&with_emoji_links, wrap_width)
             .into_iter()
-            .map(|s| (s, highlight_f8, hl_color.clone()))
+            .map(|s| (s, highlight_f8, hl_color.clone(), mn))
             .collect()
     };
 
@@ -18916,6 +19045,8 @@ fn render_output_crossterm(app: &App) {
             let end_pos = app.filter_popup.scroll_offset.min(filtered.len().saturating_sub(1));
 
             // Work backwards from scroll_offset to fill the screen
+            // Collect in reverse, then reverse once (avoids O(n²) insert(0, ...))
+            let mut rev_lines: Vec<(String, bool, Option<String>, bool)> = Vec::with_capacity(visible_height + 8);
             for pos in (0..=end_pos).rev() {
                 let line_idx = filtered[pos];
                 if line_idx < world.output_lines.len() {
@@ -18924,14 +19055,16 @@ fn render_output_crossterm(app: &App) {
                     let wrapped = expand_and_wrap(line, term_width, show_tags, highlight, &cached_now);
 
                     for w in wrapped.into_iter().rev() {
-                        visual_lines.insert(0, w);
+                        rev_lines.push(w);
                     }
 
-                    if visual_lines.len() >= visible_height {
+                    if rev_lines.len() >= visible_height {
                         break;
                     }
                 }
             }
+            rev_lines.reverse();
+            visual_lines = rev_lines;
 
             // If we still have room, show lines after scroll_offset
             if visual_lines.len() < visible_height {
@@ -18956,6 +19089,8 @@ fn render_output_crossterm(app: &App) {
         // Normal unfiltered rendering
         let end_line = world.scroll_offset.min(world.output_lines.len().saturating_sub(1));
 
+        // Collect lines in reverse order, then reverse once (avoids O(n²) insert(0, ...))
+        let mut rev_lines: Vec<(String, bool, Option<String>, bool)> = Vec::with_capacity(visible_height + 8);
         first_line_idx = end_line;
         for line_idx in (0..=end_line).rev() {
             first_line_idx = line_idx;
@@ -18964,13 +19099,15 @@ fn render_output_crossterm(app: &App) {
             let wrapped = expand_and_wrap(line, term_width, show_tags, highlight, &cached_now);
 
             for w in wrapped.into_iter().rev() {
-                visual_lines.insert(0, w);
+                rev_lines.push(w);
             }
 
-            if visual_lines.len() >= visible_height {
+            if rev_lines.len() >= visible_height {
                 break;
             }
         }
+        rev_lines.reverse();
+        visual_lines = rev_lines;
 
         if visual_lines.len() < visible_height && first_line_idx == 0 {
             for line_idx in (end_line + 1)..world.output_lines.len() {
@@ -19027,15 +19164,20 @@ fn render_output_crossterm(app: &App) {
         }
     }
 
-    let lines_to_show: &[(String, bool, Option<String>)] = if first_line_idx == 0 && visual_lines.len() <= visible_height {
+    let lines_to_show: &[(String, bool, Option<String>, bool)] = if first_line_idx == 0 && visual_lines.len() <= visible_height {
         &visual_lines[..visual_lines.len().min(visible_height)]
     } else {
         let display_start = visual_lines.len().saturating_sub(visible_height);
         &visual_lines[display_start..]
     };
 
-    for (row_idx, (wrapped, highlight_f8, hl_color)) in lines_to_show.iter().enumerate() {
+    for (row_idx, (wrapped, highlight_f8, hl_color, marked_new)) in lines_to_show.iter().enumerate() {
         let _ = stdout.queue(cursor::MoveTo(0, row_idx as u16));
+
+        // New line indicator: green triangle prefix for unseen/pending lines
+        if new_line_indicator && *marked_new {
+            let _ = stdout.queue(Print("\x1b[32m▶\x1b[0m "));
+        }
 
         // Determine background color: /highlight color takes priority, then F8 highlight
         let bg_code = if let Some(color) = hl_color {
