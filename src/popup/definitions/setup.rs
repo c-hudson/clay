@@ -175,7 +175,7 @@ pub fn create_setup_popup(
         ))
         .with_field(Field::new(
             SETUP_FIELD_NEW_LINE_INDICATOR,
-            "New Line Indicator",
+            "New Indicator",
             FieldKind::toggle(new_line_indicator),
         ))
         .with_button(Button::new(SETUP_BTN_CANCEL, "Cancel").with_shortcut('C'))
