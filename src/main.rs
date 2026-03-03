@@ -6208,12 +6208,7 @@ impl App {
                         // For release-all, cap at pending_count
                         let to_release = logical_count.min(pending_count);
 
-                        // Get the seq and text of lines that will be released (for broadcasting as ServerData)
-                        let first_pending_seq = self.worlds[world_index]
-                            .pending_lines
-                            .first()
-                            .map(|l| l.seq)
-                            .unwrap_or(0);
+                        // Get text of lines that will be released (for broadcasting as ServerData)
                         let lines_to_broadcast: Vec<String> = self.worlds[world_index]
                             .pending_lines
                             .iter()
@@ -6233,7 +6228,7 @@ impl App {
                                 is_viewed: true,
                                 ts: current_timestamp_secs(),
                                 from_server: true,
-                                seq: first_pending_seq,
+                                seq: 0, // Use 0 to bypass client dedup check — released pending lines are always new to the client
                             });
                         }
 
@@ -7350,12 +7345,7 @@ impl App {
             logical_count = 1;
         }
 
-        // Get the seq and text of lines that will be released (for broadcasting as ServerData)
-        let first_pending_seq = self.worlds[world_idx]
-            .pending_lines
-            .first()
-            .map(|l| l.seq)
-            .unwrap_or(0);
+        // Get text of lines that will be released (for broadcasting as ServerData)
         let lines_to_broadcast: Vec<String> = self.worlds[world_idx]
             .pending_lines
             .iter()
@@ -7376,7 +7366,7 @@ impl App {
                 is_viewed: true,
                 ts: current_timestamp_secs(),
                 from_server: true,
-                seq: first_pending_seq,
+                seq: 0, // Use 0 to bypass client dedup check — released pending lines are always new to the client
             });
         }
 
@@ -11050,7 +11040,7 @@ async fn main() -> io::Result<()> {
         println!("    --console            Run in console (TUI) mode");
         println!("    --console=host:port  Connect to a Clay server via console");
         println!("    --gui                Run in GUI (webview) mode");
-        println!("    --gui=host:port      Connect to a Clay server via GUI");
+        println!("    --gui=host[:port]    Connect to a Clay server via GUI (default port: 9000)");
         println!("    -D                   Run as headless daemon server");
         println!("    --multiuser          Run as multiuser server");
         println!("    --conf=<path>        Use custom config file (default: ~/.clay.dat)");
@@ -15574,12 +15564,7 @@ fn handle_key_event(key: KeyEvent, app: &mut App) -> KeyAction {
         if app.current_world().paused {
             let world_idx = app.current_world_index;
 
-            // Get the seq and text of lines that will be released (for broadcasting as ServerData)
-            let first_pending_seq = app.worlds[world_idx]
-                .pending_lines
-                .first()
-                .map(|l| l.seq)
-                .unwrap_or(0);
+            // Get text of lines that will be released (for broadcasting as ServerData)
             let lines_to_broadcast: Vec<String> = app.worlds[world_idx]
                 .pending_lines
                 .iter()
@@ -15598,7 +15583,7 @@ fn handle_key_event(key: KeyEvent, app: &mut App) -> KeyAction {
                     is_viewed: true,
                     ts: current_timestamp_secs(),
                     from_server: true,
-                    seq: first_pending_seq,
+                    seq: 0, // Use 0 to bypass client dedup check — released pending lines are always new to the client
                 });
             }
 

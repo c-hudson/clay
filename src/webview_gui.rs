@@ -195,16 +195,14 @@ pub fn run_remote_webgui(addr: &str) -> io::Result<()> {
         }
     }
 
-    // Parse host:port
+    // Parse host:port (default port 9000 if not specified)
     let (host, port) = if let Some(colon_pos) = addr.rfind(':') {
         let h = &addr[..colon_pos];
         let p = addr[colon_pos + 1..].parse::<u16>()
             .map_err(|_| io::Error::other(format!("Invalid port in address: {}", addr)))?;
         (h.to_string(), p)
     } else {
-        return Err(io::Error::other(
-            "Address must be in host:port format (e.g., localhost:9001)"
-        ));
+        (addr.to_string(), 9000)
     };
 
     let params = WebViewParams {
