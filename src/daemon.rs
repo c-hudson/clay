@@ -326,10 +326,10 @@ pub async fn run_daemon_server() -> io::Result<()> {
         }
 
         // Activate process tick sleep if processes were added during this iteration
-        if !app.tf_engine.processes.is_empty() {
-            if process_tick_sleep.deadline() > tokio::time::Instant::now() + std::time::Duration::from_secs(2) {
-                process_tick_sleep.as_mut().reset(tokio::time::Instant::now() + std::time::Duration::from_secs(1));
-            }
+        if !app.tf_engine.processes.is_empty()
+            && process_tick_sleep.deadline() > tokio::time::Instant::now() + std::time::Duration::from_secs(2)
+        {
+            process_tick_sleep.as_mut().reset(tokio::time::Instant::now() + std::time::Duration::from_secs(1));
         }
     }
 }
@@ -2051,10 +2051,10 @@ keep_alive_type=Generic
         }
 
         // Activate process tick sleep if processes were added during this iteration
-        if !app.tf_engine.processes.is_empty() {
-            if process_tick_sleep.deadline() > tokio::time::Instant::now() + std::time::Duration::from_secs(2) {
-                process_tick_sleep.as_mut().reset(tokio::time::Instant::now() + std::time::Duration::from_secs(1));
-            }
+        if !app.tf_engine.processes.is_empty()
+            && process_tick_sleep.deadline() > tokio::time::Instant::now() + std::time::Duration::from_secs(2)
+        {
+            process_tick_sleep.as_mut().reset(tokio::time::Instant::now() + std::time::Duration::from_secs(1));
         }
     }
 
