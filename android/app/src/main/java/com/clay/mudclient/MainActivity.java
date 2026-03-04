@@ -42,6 +42,9 @@ public class MainActivity extends AppCompatActivity {
     private static final String KEY_SAVED_PASSWORD = "savedPassword";
     private static final String KEY_SAVED_USERNAME = "savedUsername";
     private static final String KEY_AUTH_KEY = "authKey";  // Device auth key for passwordless login
+    private static final String KEY_ADVANCED_ENABLED = "advancedEnabled";
+    private static final String KEY_LOCAL_NETMASK = "localNetmask";
+    private static final String KEY_REMOTE_HOSTNAME = "remoteHostname";
 
     private static final String CHANNEL_ID_ALERTS = "clay_alerts";
     private static final String CHANNEL_ID_SERVICE = "clay_service";
@@ -722,9 +725,90 @@ public class MainActivity extends AppCompatActivity {
         });
     }
 
+    /**
+     * Resolves which hostname to use based on advanced settings.
+     * If advanced mode is enabled and both local netmask and remote hostname are set,
+     * checks the device's current IP against the netmask pattern.
+     * Returns the remote hostname if no local IP matches, standard hostname otherwise.
+     */
+    private String resolveHostname() {
+        SharedPreferences prefs = getSharedPreferences(PREFS_NAME, MODE_PRIVATE);
+        String standardHost = prefs.getString(KEY_SERVER_HOST, "192.168.2.6");
+        boolean advancedEnabled = prefs.getBoolean(KEY_ADVANCED_ENABLED, false);
+
+        if (!advancedEnabled) {
+            return standardHost;
+        }
+
+        String localNetmask = prefs.getString(KEY_LOCAL_NETMASK, "");
+        String remoteHostname = prefs.getString(KEY_REMOTE_HOSTNAME, "");
+
+        if (localNetmask.isEmpty() || remoteHostname.isEmpty()) {
+            return standardHost;
+        }
+
+        // Check if any device IP matches the local netmask
+        java.util.List<String> deviceIps = getDeviceIpAddresses();
+        for (String ip : deviceIps) {
+            if (matchesWildcard(ip, localNetmask)) {
+                android.util.Log.i("Clay", "Device IP " + ip + " matches local netmask " + localNetmask + ", using standard hostname: " + standardHost);
+                return standardHost;
+            }
+        }
+
+        android.util.Log.i("Clay", "No device IP matches local netmask " + localNetmask + ", using remote hostname: " + remoteHostname);
+        return remoteHostname;
+    }
+
+    /**
+     * Gets all non-loopback IPv4 addresses from all network interfaces.
+     */
+    private java.util.List<String> getDeviceIpAddresses() {
+        java.util.List<String> addresses = new java.util.ArrayList<>();
+        try {
+            java.util.Enumeration<java.net.NetworkInterface> interfaces = java.net.NetworkInterface.getNetworkInterfaces();
+            while (interfaces != null && interfaces.hasMoreElements()) {
+                java.net.NetworkInterface iface = interfaces.nextElement();
+                if (iface.isLoopback() || !iface.isUp()) continue;
+
+                java.util.Enumeration<java.net.InetAddress> addrs = iface.getInetAddresses();
+                while (addrs.hasMoreElements()) {
+                    java.net.InetAddress addr = addrs.nextElement();
+                    if (addr instanceof java.net.Inet4Address && !addr.isLoopbackAddress()) {
+                        addresses.add(addr.getHostAddress());
+                    }
+                }
+            }
+        } catch (Exception e) {
+            android.util.Log.w("Clay", "Failed to enumerate network interfaces: " + e.getMessage());
+        }
+        return addresses;
+    }
+
+    /**
+     * Matches an IP address against a wildcard pattern.
+     * Splits both by '.' and compares segment by segment.
+     * '*' in a pattern segment matches any value.
+     */
+    private boolean matchesWildcard(String ip, String pattern) {
+        String[] ipParts = ip.split("\\.");
+        String[] patternParts = pattern.split("\\.");
+
+        if (ipParts.length != patternParts.length) {
+            return false;
+        }
+
+        for (int i = 0; i < ipParts.length; i++) {
+            if (!patternParts[i].equals("*") && !patternParts[i].equals(ipParts[i])) {
+                return false;
+            }
+        }
+        return true;
+    }
+
     private void loadWebInterface() {
         SharedPreferences prefs = getSharedPreferences(PREFS_NAME, MODE_PRIVATE);
-        String host = prefs.getString(KEY_SERVER_HOST, "192.168.2.6");
+        String host = resolveHostname();
         int port = prefs.getInt(KEY_SERVER_PORT, 9000);
         boolean useSecure = prefs.getBoolean(KEY_USE_SECURE, false);
 
@@ -910,8 +994,9 @@ public class MainActivity extends AppCompatActivity {
         boolean useSecure = prefs.getBoolean(KEY_USE_SECURE, false);
 
         if (host != null && !host.isEmpty() && port > 0) {
+            String resolvedHost = resolveHostname();
             String protocol = useSecure ? "https" : "http";
-            String expectedUrl = protocol + "://" + host + ":" + port;
+            String expectedUrl = protocol + "://" + resolvedHost + ":" + port;
 
             // Only reload if:
             // 1. Interface hasn't been loaded yet

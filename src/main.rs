@@ -2292,7 +2292,7 @@ impl World {
                         let seq = self.next_seq; self.next_seq += 1;
                         let mut cl = if from_server { OutputLine::new(vl.clone(), seq) }
                                  else { OutputLine::new_client(vl.clone(), seq) };
-                        cl.marked_new = true;
+                        cl.marked_new = !is_current;
                         self.pending_lines.push(cl);
                     }
                     if !is_current { self.unseen_lines += wrapped.len(); }
@@ -2324,7 +2324,7 @@ impl World {
                             let seq = self.next_seq; self.next_seq += 1;
                             let mut cl = if from_server { OutputLine::new(vl.clone(), seq) }
                                      else { OutputLine::new_client(vl.clone(), seq) };
-                            cl.marked_new = true;
+                            cl.marked_new = !is_current;
                             self.pending_lines.push(cl);
                             if !is_current { self.unseen_lines += 1; }
                         }
@@ -2352,7 +2352,7 @@ impl World {
                     }
                 }
 
-                new_line.marked_new = true;
+                new_line.marked_new = !is_current;
                 self.pending_lines.push(new_line);
                 if !is_current { self.unseen_lines += 1; }
                 if is_partial {
@@ -7465,7 +7465,7 @@ impl App {
                 ts: current_timestamp_secs(),
                 from_server: true,
                 seq: first_pending_seq,
-                marked_new: true,
+                marked_new: false,
             });
         }
 
@@ -15825,7 +15825,7 @@ fn handle_key_event(key: KeyEvent, app: &mut App) -> KeyAction {
                     ts: current_timestamp_secs(),
                     from_server: true,
                     seq: first_pending_seq,
-                    marked_new: true,
+                    marked_new: false,
                 });
             }
 

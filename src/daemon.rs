@@ -1382,7 +1382,7 @@ pub async fn handle_daemon_ws_message(
                             ts: current_timestamp_secs(),
                             from_server: true,
                             seq: first_pending_seq,
-                            marked_new: true,
+                            marked_new: false,
                         });
                     }
 

@@ -5,7 +5,9 @@ import android.content.SharedPreferences;
 import android.os.Bundle;
 import android.view.View;
 import android.widget.Button;
+import android.widget.CheckBox;
 import android.widget.EditText;
+import android.widget.LinearLayout;
 import android.widget.Switch;
 import android.widget.TextView;
 
@@ -18,10 +20,17 @@ public class SettingsActivity extends AppCompatActivity {
     private static final String KEY_USE_SECURE = "useSecure";
     private static final String KEY_SAVED_USERNAME = "savedUsername";
     private static final String KEY_SAVED_PASSWORD = "savedPassword";
+    private static final String KEY_ADVANCED_ENABLED = "advancedEnabled";
+    private static final String KEY_LOCAL_NETMASK = "localNetmask";
+    private static final String KEY_REMOTE_HOSTNAME = "remoteHostname";
 
     private EditText serverHostInput;
     private EditText serverPortInput;
     private Switch secureSwitch;
+    private CheckBox advancedCheckbox;
+    private LinearLayout advancedSection;
+    private EditText localNetmaskInput;
+    private EditText remoteHostnameInput;
     private EditText serverUsernameInput;
     private EditText serverPasswordInput;
     private TextView connectionStatus;
@@ -35,6 +44,10 @@ public class SettingsActivity extends AppCompatActivity {
         serverHostInput = findViewById(R.id.serverHost);
         serverPortInput = findViewById(R.id.serverPort);
         secureSwitch = findViewById(R.id.secureSwitch);
+        advancedCheckbox = findViewById(R.id.advancedCheckbox);
+        advancedSection = findViewById(R.id.advancedSection);
+        localNetmaskInput = findViewById(R.id.localNetmask);
+        remoteHostnameInput = findViewById(R.id.remoteHostname);
         serverUsernameInput = findViewById(R.id.serverUsername);
         serverPasswordInput = findViewById(R.id.serverPassword);
         connectionStatus = findViewById(R.id.connectionStatus);
@@ -45,14 +58,26 @@ public class SettingsActivity extends AppCompatActivity {
         String savedHost = prefs.getString(KEY_SERVER_HOST, "192.168.2.6");
         int savedPort = prefs.getInt(KEY_SERVER_PORT, 9000);
         boolean savedSecure = prefs.getBoolean(KEY_USE_SECURE, false);
+        boolean savedAdvanced = prefs.getBoolean(KEY_ADVANCED_ENABLED, false);
+        String savedNetmask = prefs.getString(KEY_LOCAL_NETMASK, "");
+        String savedRemoteHost = prefs.getString(KEY_REMOTE_HOSTNAME, "");
         String savedUsername = prefs.getString(KEY_SAVED_USERNAME, "");
         String savedPassword = prefs.getString(KEY_SAVED_PASSWORD, "");
 
         serverHostInput.setText(savedHost);
         serverPortInput.setText(savedPort > 0 ? String.valueOf(savedPort) : "");
         secureSwitch.setChecked(savedSecure);
+        advancedCheckbox.setChecked(savedAdvanced);
+        advancedSection.setVisibility(savedAdvanced ? View.VISIBLE : View.GONE);
+        localNetmaskInput.setText(savedNetmask);
+        remoteHostnameInput.setText(savedRemoteHost);
         serverUsernameInput.setText(savedUsername);
         serverPasswordInput.setText(savedPassword);
+
+        // Toggle advanced section visibility
+        advancedCheckbox.setOnCheckedChangeListener((buttonView, isChecked) -> {
+            advancedSection.setVisibility(isChecked ? View.VISIBLE : View.GONE);
+        });
 
         // Check for error message from MainActivity
         String errorMessage = getIntent().getStringExtra("errorMessage");
@@ -82,6 +107,9 @@ public class SettingsActivity extends AppCompatActivity {
         String host = serverHostInput.getText().toString().trim();
         String portStr = serverPortInput.getText().toString().trim();
         boolean useSecure = secureSwitch.isChecked();
+        boolean advancedEnabled = advancedCheckbox.isChecked();
+        String localNetmask = localNetmaskInput.getText().toString().trim();
+        String remoteHostname = remoteHostnameInput.getText().toString().trim();
         String username = serverUsernameInput.getText().toString().trim();
         String password = serverPasswordInput.getText().toString();  // Don't trim password
 
@@ -117,6 +145,9 @@ public class SettingsActivity extends AppCompatActivity {
         editor.putString(KEY_SERVER_HOST, host);
         editor.putInt(KEY_SERVER_PORT, port);
         editor.putBoolean(KEY_USE_SECURE, useSecure);
+        editor.putBoolean(KEY_ADVANCED_ENABLED, advancedEnabled);
+        editor.putString(KEY_LOCAL_NETMASK, localNetmask);
+        editor.putString(KEY_REMOTE_HOSTNAME, remoteHostname);
         editor.putString(KEY_SAVED_USERNAME, username);
         editor.putString(KEY_SAVED_PASSWORD, password);
         editor.apply();

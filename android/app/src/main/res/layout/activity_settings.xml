@@ -61,6 +61,70 @@
 
     </LinearLayout>
 
+    <LinearLayout
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:orientation="horizontal"
+        android:layout_marginTop="16dp"
+        android:gravity="center_vertical">
+
+        <TextView
+            android:layout_width="0dp"
+            android:layout_height="wrap_content"
+            android:layout_weight="1"
+            android:text="Advanced"
+            android:textSize="14sp"
+            android:textColor="#e6edf3" />
+
+        <CheckBox
+            android:id="@+id/advancedCheckbox"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:buttonTint="#3fb950" />
+
+    </LinearLayout>
+
+    <LinearLayout
+        android:id="@+id/advancedSection"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:orientation="vertical"
+        android:visibility="gone"
+        android:layout_marginTop="8dp"
+        android:paddingStart="8dp">
+
+        <TextView
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="When device IP matches Local Netmask, use standard hostname above. Otherwise use Remote Hostname."
+            android:textSize="12sp"
+            android:textColor="#8b949e"
+            android:layout_marginBottom="4dp" />
+
+        <EditText
+            android:id="@+id/localNetmask"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:hint="Local Netmask (e.g., 192.168.1.*)"
+            android:inputType="text"
+            android:layout_marginTop="4dp"
+            android:textColor="#e6edf3"
+            android:textColorHint="#8b949e"
+            android:backgroundTint="#3fb950" />
+
+        <EditText
+            android:id="@+id/remoteHostname"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:hint="Remote Hostname"
+            android:inputType="text"
+            android:layout_marginTop="8dp"
+            android:textColor="#e6edf3"
+            android:textColorHint="#8b949e"
+            android:backgroundTint="#3fb950" />
+
+    </LinearLayout>
+
     <View
         android:layout_width="match_parent"
         android:layout_height="1dp"
