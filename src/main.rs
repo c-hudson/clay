@@ -2418,9 +2418,8 @@ impl World {
         self.unseen_lines = 0;
         self.first_unseen_at = None;
         self.clear_new_line_indicators();
-        for line in &mut self.pending_lines {
-            line.marked_new = false;
-        }
+        // Note: pending_lines keep their marked_new flag so the new indicator
+        // shows when they are released via Tab and rendered on screen.
     }
 
     /// Clear new line indicator flags on all output lines.
@@ -21070,10 +21069,13 @@ mod tests {
     fn test_strip_mud_tag() {
         use super::strip_mud_tag;
 
-        // Basic tag stripping
+        // Pattern 2: [name:] - colon immediately before ]
         assert_eq!(strip_mud_tag("[channel:] hello"), "hello");
         assert_eq!(strip_mud_tag("[chat:] message"), "message");
+
+        // Pattern 1: [name(content)optional]
         assert_eq!(strip_mud_tag("[ooc(player)] text"), "text");
+        assert_eq!(strip_mud_tag("[chat(Bob)extra] text"), "text");
 
         // Indented lines are NOT stripped (preserves MUSH code like [match(...)])
         assert_eq!(strip_mud_tag("  [channel:] hello"), "  [channel:] hello");
@@ -21086,12 +21088,30 @@ mod tests {
         assert_eq!(strip_mud_tag("[hello] world"), "[hello] world");
         assert_eq!(strip_mud_tag("[nochannel] text"), "[nochannel] text");
 
+        // Colon not at end should NOT be stripped (e.g., [a:b])
+        assert_eq!(strip_mud_tag("[a:b] text"), "[a:b] text");
+
+        // Bare colon with no name should NOT be stripped
+        assert_eq!(strip_mud_tag("[:] text"), "[:] text");
+
+        // Empty parens should NOT be stripped (e.g., [time()])
+        assert_eq!(strip_mud_tag("[time()] text"), "[time()] text");
+
+        // Bare paren with no name before it should NOT be stripped
+        assert_eq!(strip_mud_tag("[(foo)] text"), "[(foo)] text");
+
+        // Unclosed paren should NOT be stripped
+        assert_eq!(strip_mud_tag("[chat(Bob] text"), "[chat(Bob] text");
+
         // No brackets at start
         assert_eq!(strip_mud_tag("hello world"), "hello world");
         assert_eq!(strip_mud_tag("text [tag:] later"), "text [tag:] later");
 
-        // Empty or only tag
-        assert_eq!(strip_mud_tag("[channel:]"), "");
+        // Tag without space after ] should NOT be stripped
+        assert_eq!(strip_mud_tag("[channel:]"), "[channel:]");
+        assert_eq!(strip_mud_tag("[channel:]hello"), "[channel:]hello");
+
+        // Tag with only trailing space - space is consumed, result is empty
         assert_eq!(strip_mud_tag("[channel:] "), "");
     }
 
@@ -23177,9 +23197,12 @@ mod tests {
             // world2 should have marked_new lines in both output and pending
             // (output_height-2=22 lines in output, rest in pending, all marked_new since not current)
             TestAction::AssertState { world_name: "world2".to_string(), check: StateCheck::Paused(true) },
-            // Now mark world2 as seen via WS - should clear all marked_new including pending
+            // Mark world2 as seen via WS - clears marked_new on output_lines but NOT pending_lines
+            // (pending lines keep their indicator until released and rendered)
             TestAction::WsMarkWorldSeen("world2".to_string()),
-            TestAction::AssertMarkedNew { world_name: "world2".to_string(), expected_count: 0 },
+            // Pending lines still have marked_new, so total count > 0
+            // output_lines are cleared, pending still marked (30 - 23 = 7 lines)
+            TestAction::AssertMarkedNew { world_name: "world2".to_string(), expected_count: 7 },
         ];
 
         let events = testharness::run_test_scenario(config, actions).await;

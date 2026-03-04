@@ -279,14 +279,32 @@ pub fn strip_mud_tag(text: &str) -> String {
             }
         } else if c == '[' {
             // Found the start of a potential tag
+            // Match two specific MUD tag patterns:
+            //   [name(content)optional] - paren group inside brackets
+            //   [name:] - colon immediately before closing bracket
             let rest: String = chars.collect();
             if let Some(end) = rest.find(']') {
                 let tag = &rest[..end];
-                if tag.contains(':') || tag.contains('(') {
-                    // It's a MUD tag, skip it
+                let is_tag = if let Some(paren_start) = tag.find('(') {
+                    // Pattern 1: [name(content)optional]
+                    // Must have content before '(', non-empty content inside parens,
+                    // and a closing ')'
+                    if let Some(paren_end) = tag[paren_start..].find(')') {
+                        paren_start > 0 && paren_end > 1
+                    } else {
+                        false
+                    }
+                } else {
+                    // Pattern 2: [name:]
+                    // Must end with ':' and have content before it
+                    tag.len() > 1 && tag.ends_with(':')
+                };
+                if is_tag {
                     let after_tag = &rest[end + 1..];
-                    let after_tag = after_tag.strip_prefix(' ').unwrap_or(after_tag);
-                    return format!("{}{}{}", leading_ws, ansi_prefix, after_tag);
+                    // Perl patterns require a space after '] '
+                    if let Some(after_space) = after_tag.strip_prefix(' ') {
+                        return format!("{}{}{}", leading_ws, ansi_prefix, after_space);
+                    }
                 }
             }
             return text.to_string();

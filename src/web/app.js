@@ -2919,12 +2919,12 @@
     function switchWorldLocal(index) {
         if (index >= 0 && index < worlds.length && index !== currentWorldIndex) {
             mcmpStopAll();
-            currentWorldIndex = index;
-            // Clear new line indicators on displayed lines (user is now viewing them)
-            const switchedWorld = worlds[index];
-            if (switchedWorld && switchedWorld.output_lines) {
-                switchedWorld.output_lines.forEach(l => { l.marked_new = false; });
+            // Clear new line indicators on the world we're LEAVING (matches console behavior)
+            const oldWorld = worlds[currentWorldIndex];
+            if (oldWorld && oldWorld.output_lines) {
+                oldWorld.output_lines.forEach(l => { l.marked_new = false; });
             }
+            currentWorldIndex = index;
             // Reset more-mode state for new world
             paused = false;
             pendingLines = [];
@@ -4242,15 +4242,25 @@
                 const endBracket = rest.indexOf(']');
                 if (endBracket >= 0) {
                     const tag = rest.substring(0, endBracket);
-                    // Check if it looks like a MUD tag (contains : or parentheses)
-                    if (tag.includes(':') || tag.includes('(')) {
-                        // It's a MUD tag, skip it
-                        let afterTag = rest.substring(endBracket + 1);
-                        // Strip one space after tag if present
+                    // Match two specific MUD tag patterns:
+                    //   [name(content)optional] - paren group inside brackets
+                    //   [name:] - colon immediately before closing bracket
+                    const parenStart = tag.indexOf('(');
+                    let isTag;
+                    if (parenStart > 0) {
+                        // Pattern 1: [name(content)optional] - non-empty content inside parens
+                        const parenEnd = tag.indexOf(')', parenStart);
+                        isTag = parenEnd > parenStart + 1;
+                    } else {
+                        // Pattern 2: [name:] - colon at end with content before it
+                        isTag = tag.length > 1 && tag.endsWith(':');
+                    }
+                    if (isTag) {
+                        // Require a space after '] ' (matching Perl patterns)
+                        const afterTag = rest.substring(endBracket + 1);
                         if (afterTag.startsWith(' ')) {
-                            afterTag = afterTag.substring(1);
+                            return leadingWs + ansiPrefix + afterTag.substring(1);
                         }
-                        return leadingWs + ansiPrefix + afterTag;
                     }
                 }
                 // Not a MUD tag, return original
