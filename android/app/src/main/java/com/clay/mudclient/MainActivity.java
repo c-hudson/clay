@@ -661,7 +661,7 @@ public class MainActivity extends AppCompatActivity {
                 if (request.isForMainFrame()) {
                     connectionFailed = true;
                     runOnUiThread(() -> {
-                        openSettings("Connection failed: " + error.getDescription());
+                        openSettings("Connection failed to " + request.getUrl().getHost() + ": " + error.getDescription());
                     });
                 }
             }
@@ -717,7 +717,7 @@ public class MainActivity extends AppCompatActivity {
                 if (message != null && message.contains("WebSocket connection") &&
                     (message.contains("failed") || message.contains("error"))) {
                     runOnUiThread(() -> {
-                        openSettings("WebSocket connection failed");
+                        openSettings("WebSocket connection failed to " + (loadedInterfaceUrl != null ? loadedInterfaceUrl : "server"));
                     });
                 }
                 return super.onConsoleMessage(consoleMessage);
@@ -830,7 +830,7 @@ public class MainActivity extends AppCompatActivity {
                     if (!htmlResp.isSuccessful()) {
                         final int code = htmlResp.code();
                         htmlResp.close();
-                        runOnUiThread(() -> openSettings("HTTP " + code + " loading page"));
+                        runOnUiThread(() -> openSettings("HTTP " + code + " loading " + url));
                         return;
                     }
                     String html = htmlResp.body().string();
@@ -887,7 +887,7 @@ public class MainActivity extends AppCompatActivity {
                         loadedInterfaceUrl = url;
                     });
                 } catch (Exception e) {
-                    runOnUiThread(() -> openSettings("Failed: " + e.getMessage()));
+                    runOnUiThread(() -> openSettings("Failed to connect to " + url + ": " + e.getMessage()));
                 }
             }).start();
         } else {
