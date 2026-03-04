@@ -31,6 +31,9 @@ pub async fn run_daemon_server() -> io::Result<()> {
         eprintln!("Warning: Could not load settings: {}", e);
     }
 
+    // Pre-compile action regexes after loading settings
+    crate::compile_all_action_regexes(&mut app.settings.actions);
+
     // Ensure at least one world exists
     app.ensure_has_world();
 
@@ -1313,8 +1316,7 @@ pub async fn handle_daemon_ws_message(
         }
         WsMessage::MarkWorldSeen { world_index } => {
             if world_index < app.worlds.len() {
-                app.worlds[world_index].unseen_lines = 0;
-                app.worlds[world_index].first_unseen_at = None;
+                app.worlds[world_index].mark_seen();
                 app.ws_broadcast(WsMessage::UnseenCleared { world_index });
                 app.broadcast_activity();
                 // Trigger console redraw to update activity indicator
@@ -1727,6 +1729,9 @@ keep_alive_type=Generic
         eprintln!("Error loading multiuser settings: {}", e);
         return Ok(());
     }
+
+    // Pre-compile action regexes after loading settings
+    crate::compile_all_action_regexes(&mut app.settings.actions);
 
     // Validate: must have at least one user
     if app.users.is_empty() {

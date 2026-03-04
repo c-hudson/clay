@@ -65,6 +65,7 @@ pub use actions::{
     split_action_commands, substitute_action_args, substitute_pattern_captures,
     wildcard_to_regex, execute_recall, check_action_triggers,
     compile_action_patterns, line_matches_compiled_patterns,
+    compile_all_action_regexes,
 };
 pub use http::{HttpsServer, HttpServer, BanList, start_https_server, start_http_server, log_http_404, log_ws_auth, log_ban};
 pub use persistence::{
@@ -2416,8 +2417,10 @@ impl World {
     pub fn mark_seen(&mut self) {
         self.unseen_lines = 0;
         self.first_unseen_at = None;
-        // Note: marked_new is NOT cleared here — triangles should remain visible
-        // until Ctrl+L or switching away from the world.
+        self.clear_new_line_indicators();
+        for line in &mut self.pending_lines {
+            line.marked_new = false;
+        }
     }
 
     /// Clear new line indicator flags on all output lines.
@@ -6442,6 +6445,7 @@ impl App {
             WsMessage::UpdateActions { actions } => {
                 // Update actions from remote client
                 self.settings.actions = actions.clone();
+                compile_all_action_regexes(&mut self.settings.actions);
                 // Save settings to persist changes
                 let _ = persistence::save_settings(self);
                 // Broadcast update to all clients
@@ -9030,6 +9034,7 @@ fn handle_remote_client_key(
                     ActionsListAction::Toggle(idx) => {
                         if idx < app.settings.actions.len() {
                             app.settings.actions[idx].enabled = !app.settings.actions[idx].enabled;
+                            app.settings.actions[idx].compile_regex();
                             // Send UpdateActions to daemon
                             let _ = ws_tx.send(WsMessage::UpdateActions {
                                 actions: app.settings.actions.clone()
@@ -9163,9 +9168,11 @@ fn handle_remote_client_key(
                 if let Some(idx) = editing_index {
                     if idx < app.settings.actions.len() {
                         app.settings.actions[idx] = action;
+                        app.settings.actions[idx].compile_regex();
                     }
                 } else {
                     app.settings.actions.push(action);
+                    app.settings.actions.last_mut().unwrap().compile_regex();
                 }
                 // Send UpdateActions to daemon
                 let _ = ws_tx.send(WsMessage::UpdateActions {
@@ -10676,6 +10683,7 @@ fn handle_new_popup_key(app: &mut App, key: KeyEvent) -> NewPopupAction {
                                 owner: None,
                                 enabled,
                                 startup,
+                                compiled_regex: None,
                             };
 
                             app.popup_manager.close();
@@ -11554,6 +11562,9 @@ pub async fn run_app_headless(
             world.lines_since_pause = 0;
         }
     }
+
+    // Pre-compile action regexes after loading settings or reload state
+    compile_all_action_regexes(&mut app.settings.actions);
 
     // Load theme file (~/clay.theme.dat)
     load_theme_file(&mut app);
@@ -12488,6 +12499,9 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
             world.lines_since_pause = 0;
         }
     }
+
+    // Pre-compile action regexes after loading settings or reload state
+    compile_all_action_regexes(&mut app.settings.actions);
 
     // Load theme file (~/clay.theme.dat)
     load_theme_file(&mut app);
@@ -15290,6 +15304,7 @@ fn handle_key_event(key: KeyEvent, app: &mut App) -> KeyAction {
                         // Toggle enable/disable for the action
                         if idx < app.settings.actions.len() {
                             app.settings.actions[idx].enabled = !app.settings.actions[idx].enabled;
+                            app.settings.actions[idx].compile_regex();
                             let _ = persistence::save_settings(app);
 
                             // Update the list display in the popup
@@ -15444,10 +15459,12 @@ fn handle_key_event(key: KeyEvent, app: &mut App) -> KeyAction {
                         if let Some(idx) = editing_index {
                             if idx < app.settings.actions.len() {
                                 app.settings.actions[idx] = action.clone();
+                                app.settings.actions[idx].compile_regex();
                                 app.add_output(&format!("Action '{}' updated.", action.name));
                             }
                         } else {
                             app.settings.actions.push(action.clone());
+                            app.settings.actions.last_mut().unwrap().compile_regex();
                             app.add_output(&format!("Action '{}' created.", action.name));
                         }
                         // Save settings to disk
@@ -21690,7 +21707,7 @@ mod tests {
     // These tests use the testserver + testharness for end-to-end testing
 
     use crate::testserver;
-    use crate::testharness::{self, TestConfig, TestWorldConfig, TestEvent, TestAction, WaitCondition};
+    use crate::testharness::{self, TestConfig, TestWorldConfig, TestEvent, TestAction, WaitCondition, StateCheck};
 
     /// Helper: find a free TCP port
     fn find_free_port() -> u16 {
@@ -22916,17 +22933,383 @@ mod tests {
         let events = testharness::run_test_scenario(config, vec![]).await;
 
         // Should have WsBroadcastServerData for world1 (index 0)
-        assert!(events.iter().any(|e| matches!(e, TestEvent::WsBroadcastServerData(0))),
-            "Expected WsBroadcastServerData(0). ServerData events: {:?}",
-            events.iter().filter(|e| matches!(e, TestEvent::WsBroadcastServerData(_))).collect::<Vec<_>>());
+        assert!(events.iter().any(|e| matches!(e, TestEvent::WsBroadcastServerData(0, _))),
+            "Expected WsBroadcastServerData(0, _). ServerData events: {:?}",
+            events.iter().filter(|e| matches!(e, TestEvent::WsBroadcastServerData(_, _))).collect::<Vec<_>>());
 
         // Should have WsBroadcastServerData for world2 (index 1)
-        assert!(events.iter().any(|e| matches!(e, TestEvent::WsBroadcastServerData(1))),
-            "Expected WsBroadcastServerData(1). ServerData events: {:?}",
-            events.iter().filter(|e| matches!(e, TestEvent::WsBroadcastServerData(_))).collect::<Vec<_>>());
+        assert!(events.iter().any(|e| matches!(e, TestEvent::WsBroadcastServerData(1, _))),
+            "Expected WsBroadcastServerData(1, _). ServerData events: {:?}",
+            events.iter().filter(|e| matches!(e, TestEvent::WsBroadcastServerData(_, _))).collect::<Vec<_>>());
 
         let _ = server1.await;
         let _ = server2.await;
+    }
+
+    /// Test that output arriving on a non-current world gets marked_new=true,
+    /// while current world output gets marked_new=false.
+    #[tokio::test]
+    async fn test_marked_new_on_non_current_world() {
+        let port1 = find_free_port();
+        let port2 = find_free_port();
+
+        let server1 = tokio::spawn(testserver::run_server_port(port1, testserver::get_scenario("basic_output")));
+        let server2 = tokio::spawn(testserver::run_server_port(port2, testserver::get_scenario("basic_output")));
+
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let config = TestConfig {
+            worlds: vec![
+                TestWorldConfig {
+                    name: "world1".to_string(),
+                    host: "127.0.0.1".to_string(),
+                    port: port1,
+                    use_ssl: false,
+                    auto_login_type: AutoConnectType::Connect,
+                    username: String::new(),
+                    password: String::new(),
+                },
+                TestWorldConfig {
+                    name: "world2".to_string(),
+                    host: "127.0.0.1".to_string(),
+                    port: port2,
+                    use_ssl: false,
+                    auto_login_type: AutoConnectType::Connect,
+                    username: String::new(),
+                    password: String::new(),
+                },
+            ],
+            output_height: 24,
+            output_width: 80,
+            more_mode_enabled: false,
+            max_duration: Duration::from_secs(10),
+        };
+
+        // World 0 is current. Both worlds receive basic_output (5 lines).
+        // World 0's broadcasts should have marked_new=false, world 1's should have marked_new=true.
+        let events = testharness::run_test_scenario(config, vec![]).await;
+
+        // Current world (index 0) should have marked_new=false
+        assert!(events.iter().any(|e| matches!(e, TestEvent::WsBroadcastServerData(0, false))),
+            "Expected WsBroadcastServerData(0, false) for current world. Events: {:?}",
+            events.iter().filter(|e| matches!(e, TestEvent::WsBroadcastServerData(0, _))).collect::<Vec<_>>());
+
+        // Non-current world (index 1) should have marked_new=true
+        assert!(events.iter().any(|e| matches!(e, TestEvent::WsBroadcastServerData(1, true))),
+            "Expected WsBroadcastServerData(1, true) for non-current world. Events: {:?}",
+            events.iter().filter(|e| matches!(e, TestEvent::WsBroadcastServerData(1, _))).collect::<Vec<_>>());
+
+        // Verify no marked_new=true broadcasts for current world
+        assert!(!events.iter().any(|e| matches!(e, TestEvent::WsBroadcastServerData(0, true))),
+            "Current world should never have marked_new=true broadcasts");
+
+        let _ = server1.await;
+        let _ = server2.await;
+    }
+
+    /// Test that WsMarkWorldSeen clears marked_new flags on both output_lines and pending_lines.
+    #[tokio::test]
+    async fn test_mark_seen_clears_marked_new() {
+        let port1 = find_free_port();
+        let port2 = find_free_port();
+
+        let server1 = tokio::spawn(testserver::run_server_port(port1, testserver::get_scenario("idle")));
+        let server2 = tokio::spawn(testserver::run_server_port(port2, testserver::get_scenario("basic_output")));
+
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let config = TestConfig {
+            worlds: vec![
+                TestWorldConfig {
+                    name: "world1".to_string(),
+                    host: "127.0.0.1".to_string(),
+                    port: port1,
+                    use_ssl: false,
+                    auto_login_type: AutoConnectType::Connect,
+                    username: String::new(),
+                    password: String::new(),
+                },
+                TestWorldConfig {
+                    name: "world2".to_string(),
+                    host: "127.0.0.1".to_string(),
+                    port: port2,
+                    use_ssl: false,
+                    auto_login_type: AutoConnectType::Connect,
+                    username: String::new(),
+                    password: String::new(),
+                },
+            ],
+            output_height: 24,
+            output_width: 80,
+            more_mode_enabled: false,
+            max_duration: Duration::from_secs(10),
+        };
+
+        let actions = vec![
+            // Wait for world2 output to arrive (it's not current, so lines get marked_new)
+            TestAction::WaitForEvent(WaitCondition::TextReceivedCount(5)),
+            // Verify world2 has marked_new lines before clearing
+            TestAction::AssertMarkedNew { world_name: "world2".to_string(), expected_count: 5 },
+            // Verify unseen > 0
+            TestAction::AssertState { world_name: "world2".to_string(), check: StateCheck::UnseenLines(5) },
+            // Simulate WS client marking world2 as seen
+            TestAction::WsMarkWorldSeen("world2".to_string()),
+            // After mark_seen, all marked_new should be cleared
+            TestAction::AssertMarkedNew { world_name: "world2".to_string(), expected_count: 0 },
+            // Unseen should also be 0
+            TestAction::AssertState { world_name: "world2".to_string(), check: StateCheck::UnseenLines(0) },
+        ];
+
+        let events = testharness::run_test_scenario(config, actions).await;
+
+        // Should see WsBroadcastUnseenCleared for world2 (index 1)
+        assert!(events.iter().any(|e| matches!(e, TestEvent::WsBroadcastUnseenCleared(1))),
+            "Expected WsBroadcastUnseenCleared(1) after MarkWorldSeen. Events: {:?}",
+            events.iter().filter(|e| matches!(e, TestEvent::WsBroadcastUnseenCleared(_))).collect::<Vec<_>>());
+
+        server1.abort();
+        let _ = server2.await;
+    }
+
+    /// Test that switching worlds clears marked_new on the old world (the one being left).
+    #[tokio::test]
+    async fn test_switch_world_clears_old_world_marked_new() {
+        let port1 = find_free_port();
+        let port2 = find_free_port();
+
+        let server1 = tokio::spawn(testserver::run_server_port(port1, testserver::get_scenario("idle")));
+        let server2 = tokio::spawn(testserver::run_server_port(port2, testserver::get_scenario("basic_output")));
+
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let config = TestConfig {
+            worlds: vec![
+                TestWorldConfig {
+                    name: "world1".to_string(),
+                    host: "127.0.0.1".to_string(),
+                    port: port1,
+                    use_ssl: false,
+                    auto_login_type: AutoConnectType::Connect,
+                    username: String::new(),
+                    password: String::new(),
+                },
+                TestWorldConfig {
+                    name: "world2".to_string(),
+                    host: "127.0.0.1".to_string(),
+                    port: port2,
+                    use_ssl: false,
+                    auto_login_type: AutoConnectType::Connect,
+                    username: String::new(),
+                    password: String::new(),
+                },
+            ],
+            output_height: 24,
+            output_width: 80,
+            more_mode_enabled: false,
+            max_duration: Duration::from_secs(10),
+        };
+
+        let actions = vec![
+            // Wait for world2 output to arrive (non-current, gets marked_new)
+            TestAction::WaitForEvent(WaitCondition::TextReceivedCount(5)),
+            // Verify world2 has marked_new lines
+            TestAction::AssertMarkedNew { world_name: "world2".to_string(), expected_count: 5 },
+            // Switch to world2 (this calls mark_seen on both old and new worlds)
+            TestAction::SwitchWorld("world2".to_string()),
+            // After switching, world2's marked_new should be cleared (mark_seen was called)
+            TestAction::AssertMarkedNew { world_name: "world2".to_string(), expected_count: 0 },
+            // world1 should also have 0 (it was current, so never had marked_new)
+            TestAction::AssertMarkedNew { world_name: "world1".to_string(), expected_count: 0 },
+        ];
+
+        let events = testharness::run_test_scenario(config, actions).await;
+
+        // Should have WorldSwitched event
+        assert!(events.iter().any(|e| matches!(e, TestEvent::WorldSwitched(ref n) if n == "world2")),
+            "Expected WorldSwitched(world2)");
+
+        server1.abort();
+        let _ = server2.await;
+    }
+
+    /// Test that pending lines also get marked_new when arriving on a non-current world
+    /// and that mark_seen clears them.
+    #[tokio::test]
+    async fn test_pending_lines_marked_new_when_not_current() {
+        let port1 = find_free_port();
+        let port2 = find_free_port();
+
+        let server1 = tokio::spawn(testserver::run_server_port(port1, testserver::get_scenario("idle")));
+        let server2 = tokio::spawn(testserver::run_server_port(port2, testserver::get_scenario("more_flood")));
+
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let config = TestConfig {
+            worlds: vec![
+                TestWorldConfig {
+                    name: "world1".to_string(),
+                    host: "127.0.0.1".to_string(),
+                    port: port1,
+                    use_ssl: false,
+                    auto_login_type: AutoConnectType::Connect,
+                    username: String::new(),
+                    password: String::new(),
+                },
+                TestWorldConfig {
+                    name: "world2".to_string(),
+                    host: "127.0.0.1".to_string(),
+                    port: port2,
+                    use_ssl: false,
+                    auto_login_type: AutoConnectType::Connect,
+                    username: String::new(),
+                    password: String::new(),
+                },
+            ],
+            output_height: 24,
+            output_width: 80,
+            more_mode_enabled: true,
+            max_duration: Duration::from_secs(10),
+        };
+
+        let actions = vec![
+            // Wait for more to trigger on world2 (non-current, 30 lines flood)
+            TestAction::WaitForEvent(WaitCondition::MoreTriggered),
+            // world2 should have marked_new lines in both output and pending
+            // (output_height-2=22 lines in output, rest in pending, all marked_new since not current)
+            TestAction::AssertState { world_name: "world2".to_string(), check: StateCheck::Paused(true) },
+            // Now mark world2 as seen via WS - should clear all marked_new including pending
+            TestAction::WsMarkWorldSeen("world2".to_string()),
+            TestAction::AssertMarkedNew { world_name: "world2".to_string(), expected_count: 0 },
+        ];
+
+        let events = testharness::run_test_scenario(config, actions).await;
+
+        // Should have seen MoreTriggered for world2
+        assert!(events.iter().any(|e| matches!(e, TestEvent::MoreTriggered(ref n, _) if n == "world2")),
+            "Expected MoreTriggered for world2. Events: {:?}",
+            events.iter().filter(|e| matches!(e, TestEvent::MoreTriggered(_, _))).collect::<Vec<_>>());
+
+        server1.abort();
+        let _ = server2.await;
+    }
+
+    /// Test that activity count correctly reflects mark_seen operations.
+    #[tokio::test]
+    async fn test_activity_count_after_mark_seen() {
+        let port1 = find_free_port();
+        let port2 = find_free_port();
+        let port3 = find_free_port();
+
+        let server1 = tokio::spawn(testserver::run_server_port(port1, testserver::get_scenario("idle")));
+        let server2 = tokio::spawn(testserver::run_server_port(port2, testserver::get_scenario("basic_output")));
+        let server3 = tokio::spawn(testserver::run_server_port(port3, testserver::get_scenario("basic_output")));
+
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let config = TestConfig {
+            worlds: vec![
+                TestWorldConfig {
+                    name: "world1".to_string(),
+                    host: "127.0.0.1".to_string(),
+                    port: port1,
+                    use_ssl: false,
+                    auto_login_type: AutoConnectType::Connect,
+                    username: String::new(),
+                    password: String::new(),
+                },
+                TestWorldConfig {
+                    name: "world2".to_string(),
+                    host: "127.0.0.1".to_string(),
+                    port: port2,
+                    use_ssl: false,
+                    auto_login_type: AutoConnectType::Connect,
+                    username: String::new(),
+                    password: String::new(),
+                },
+                TestWorldConfig {
+                    name: "world3".to_string(),
+                    host: "127.0.0.1".to_string(),
+                    port: port3,
+                    use_ssl: false,
+                    auto_login_type: AutoConnectType::Connect,
+                    username: String::new(),
+                    password: String::new(),
+                },
+            ],
+            output_height: 24,
+            output_width: 80,
+            more_mode_enabled: false,
+            max_duration: Duration::from_secs(10),
+        };
+
+        let actions = vec![
+            // Wait for both non-current worlds to receive output (5 lines each = 10 total)
+            TestAction::WaitForEvent(WaitCondition::TextReceivedCount(10)),
+            // Activity should be 2 (world2 and world3 both have unseen)
+            TestAction::AssertState { world_name: "".to_string(), check: StateCheck::ActivityCount(2) },
+            // Mark world2 as seen
+            TestAction::WsMarkWorldSeen("world2".to_string()),
+            // Activity should drop to 1
+            TestAction::AssertState { world_name: "".to_string(), check: StateCheck::ActivityCount(1) },
+            // Mark world3 as seen
+            TestAction::WsMarkWorldSeen("world3".to_string()),
+            // Activity should drop to 0
+            TestAction::AssertState { world_name: "".to_string(), check: StateCheck::ActivityCount(0) },
+        ];
+
+        let events = testharness::run_test_scenario(config, actions).await;
+
+        // Should see activity change events
+        assert!(events.iter().any(|e| matches!(e, TestEvent::ActivityChanged(2))),
+            "Expected ActivityChanged(2). Events: {:?}",
+            events.iter().filter(|e| matches!(e, TestEvent::ActivityChanged(_))).collect::<Vec<_>>());
+        assert!(events.iter().any(|e| matches!(e, TestEvent::ActivityChanged(0))),
+            "Expected ActivityChanged(0). Events: {:?}",
+            events.iter().filter(|e| matches!(e, TestEvent::ActivityChanged(_))).collect::<Vec<_>>());
+
+        server1.abort();
+        let _ = server2.await;
+        let _ = server3.await;
+    }
+
+    /// Test that the current world's output never gets marked_new.
+    #[tokio::test]
+    async fn test_current_world_output_not_marked_new() {
+        let port1 = find_free_port();
+
+        let server1 = tokio::spawn(testserver::run_server_port(port1, testserver::get_scenario("basic_output")));
+
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let config = TestConfig {
+            worlds: vec![
+                TestWorldConfig {
+                    name: "world1".to_string(),
+                    host: "127.0.0.1".to_string(),
+                    port: port1,
+                    use_ssl: false,
+                    auto_login_type: AutoConnectType::Connect,
+                    username: String::new(),
+                    password: String::new(),
+                },
+            ],
+            output_height: 24,
+            output_width: 80,
+            more_mode_enabled: false,
+            max_duration: Duration::from_secs(10),
+        };
+
+        let events = testharness::run_test_scenario(config, vec![]).await;
+
+        // All ServerData broadcasts for the current (only) world should have marked_new=false
+        let server_data_events: Vec<_> = events.iter()
+            .filter(|e| matches!(e, TestEvent::WsBroadcastServerData(0, _)))
+            .collect();
+        assert!(!server_data_events.is_empty(), "Should have ServerData broadcasts");
+        assert!(server_data_events.iter().all(|e| matches!(e, TestEvent::WsBroadcastServerData(0, false))),
+            "Current world should never have marked_new=true. Events: {:?}", server_data_events);
+
+        let _ = server1.await;
     }
 
     /// Structural comparison test: verify that the JS INTERNAL_COMMANDS list in app.js

@@ -47,6 +47,8 @@ pub struct Action {
     pub enabled: bool,          // If false, action will not fire
     #[serde(default)]
     pub startup: bool,          // If true, run commands on Clay startup
+    #[serde(skip)]
+    pub compiled_regex: Option<Regex>,  // Pre-compiled regex for pattern matching
 }
 
 impl Default for Action {
@@ -60,6 +62,7 @@ impl Default for Action {
             owner: None,
             enabled: true,
             startup: false,
+            compiled_regex: None,
         }
     }
 }
@@ -67,6 +70,31 @@ impl Default for Action {
 impl Action {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Pre-compile the regex pattern for this action.
+    /// Call after changing pattern, match_type, or enabled.
+    pub fn compile_regex(&mut self) {
+        if self.pattern.is_empty() || !self.enabled {
+            self.compiled_regex = None;
+            return;
+        }
+        let regex_pattern = match self.match_type {
+            MatchType::Wildcard => wildcard_to_regex(&self.pattern),
+            MatchType::Regexp => self.pattern.clone(),
+        };
+        self.compiled_regex = RegexBuilder::new(&regex_pattern)
+            .case_insensitive(true)
+            .build()
+            .ok();
+    }
+}
+
+/// Pre-compile regexes for all actions.
+/// Call after loading settings, restoring reload state, or bulk action updates.
+pub fn compile_all_action_regexes(actions: &mut [Action]) {
+    for action in actions.iter_mut() {
+        action.compile_regex();
     }
 }
 
@@ -423,17 +451,8 @@ pub fn check_action_triggers(
             continue;
         }
 
-        // Convert pattern based on match type
-        let regex_pattern = match action.match_type {
-            MatchType::Wildcard => wildcard_to_regex(&action.pattern),
-            MatchType::Regexp => action.pattern.clone(),
-        };
-
-        // Try to compile and match the regex (case-insensitive)
-        if let Ok(regex) = RegexBuilder::new(&regex_pattern)
-            .case_insensitive(true)
-            .build()
-        {
+        // Use pre-compiled regex
+        if let Some(ref regex) = action.compiled_regex {
             if let Some(caps) = regex.captures(&plain_line) {
                 // Extract capture groups: $0 is full match, $1-$9 are groups
                 let captures: Vec<&str> = caps.iter()
