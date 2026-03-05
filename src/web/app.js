@@ -2810,6 +2810,63 @@
         }
     }
 
+    // Helper: check if character is a word character (A-Z, a-z, 0-9)
+    function isWordChar(ch) {
+        return /[A-Za-z0-9]/.test(ch);
+    }
+
+    // Transform word forward from cursor: capitalize, lowercase, or uppercase.
+    // Moves cursor to end of next word, skipping trailing spaces.
+    function transformWordForward(mode) {
+        const input = elements.input;
+        const text = input.value;
+        let pos = input.selectionStart;
+        let result = text.substring(0, pos);
+        let i = pos;
+        let atWordStart = true;
+        // Skip leading non-word characters (pass through unchanged)
+        while (i < text.length && !isWordChar(text[i])) {
+            result += text[i];
+            i++;
+        }
+        // Transform word characters
+        while (i < text.length && isWordChar(text[i])) {
+            if (mode === 'capitalize') {
+                result += atWordStart ? text[i].toUpperCase() : text[i].toLowerCase();
+            } else if (mode === 'uppercase') {
+                result += text[i].toUpperCase();
+            } else {
+                result += text[i].toLowerCase();
+            }
+            atWordStart = false;
+            i++;
+        }
+        // Skip trailing spaces
+        while (i < text.length && text[i] === ' ') {
+            result += text[i];
+            i++;
+        }
+        const newPos = result.length;
+        result += text.substring(i);
+        input.value = result;
+        input.selectionStart = input.selectionEnd = newPos;
+    }
+
+    // Delete forward to end of next word (Esc+D).
+    // Deletes non-word chars, then word chars.
+    function deleteWordForward() {
+        const input = elements.input;
+        const text = input.value;
+        const pos = input.selectionStart;
+        let i = pos;
+        // Skip non-word characters
+        while (i < text.length && !isWordChar(text[i])) i++;
+        // Skip word characters
+        while (i < text.length && isWordChar(text[i])) i++;
+        input.value = text.substring(0, pos) + text.substring(i);
+        input.selectionStart = input.selectionEnd = pos;
+    }
+
     // Execute a command locally (called from server via ExecuteLocalCommand message).
     // The server's parse_command() is the single source of truth for command parsing.
     // This function only handles the UI/popup side of commands.
@@ -3041,10 +3098,17 @@
         '  Ctrl+Up/Down               Move cursor up/down lines',
         '  Alt+Up/Down                Resize input area',
         '  Ctrl+U                     Clear input',
-        '  Ctrl+W                     Delete word',
+        '  Ctrl+W                     Delete word before cursor',
+        '  Ctrl+K                     Delete to end of line',
+        '  Ctrl+D                     Delete character under cursor',
+        '  Ctrl+A/Home                Jump to start of line',
+        '  Ctrl+E/End                 Jump to end of line',
+        '  Esc+D                      Delete word forward',
+        '  Esc+C                      Capitalize word forward',
+        '  Esc+L                      Lowercase word forward',
+        '  Esc+U                      Uppercase word forward',
         '  Ctrl+P/N                   Command history',
         '  Ctrl+Q                     Spell suggestions',
-        '  Ctrl+A, Home/End           Jump to start/end',
         '  Tab                        Command completion',
         '',
         'Output:',
@@ -4119,7 +4183,7 @@
     }
 
     // Format a timestamp for display
-    // Returns "HH:MM>" for today, "DD/MM HH:MM>" for previous days
+    // Returns "MM/DD HH:MM>" timestamp prefix
     function formatTimestamp(ts) {
         if (!ts) return '';
 
@@ -4131,8 +4195,8 @@
         const day = date.getDate().toString().padStart(2, '0');
         const month = (date.getMonth() + 1).toString().padStart(2, '0');
 
-        // Always show day/month for debugging ordering issues
-        return `${day}/${month} ${hours}:${minutes}> `;
+        // Always show month/day with time
+        return `${month}/${day} ${hours}:${minutes}> `;
     }
 
     // Convert a color name to CSS color value (for /highlight command)
@@ -6326,6 +6390,16 @@
             wasAtBottomBeforeResize = isAtBottom();
         }, { passive: true });
 
+        // Strip zero-width spaces from copied text (inserted by insertWordBreaks for wrapping)
+        document.addEventListener('copy', function(e) {
+            const selection = window.getSelection();
+            if (selection && selection.toString().length > 0) {
+                const cleaned = selection.toString().replace(/\u200B/g, '');
+                e.clipboardData.setData('text/plain', cleaned);
+                e.preventDefault();
+            }
+        });
+
         // Window resize handler to update separator fill and maintain scroll position
         window.addEventListener('resize', function() {
             // If we were at the bottom before resize, stay at bottom
@@ -6937,6 +7011,26 @@
                 lastEscapeTime = 0;
                 e.preventDefault();
                 requestOldestPendingWorld();
+            } else if (e.key === 'c' && (e.altKey || isRecentEscape())) {
+                // Alt+c or Escape+c: Capitalize word forward
+                lastEscapeTime = 0;
+                e.preventDefault();
+                transformWordForward('capitalize');
+            } else if (e.key === 'l' && (e.altKey || isRecentEscape())) {
+                // Alt+l or Escape+l: Lowercase word forward
+                lastEscapeTime = 0;
+                e.preventDefault();
+                transformWordForward('lowercase');
+            } else if (e.key === 'u' && (e.altKey || isRecentEscape())) {
+                // Alt+u or Escape+u: Uppercase word forward
+                lastEscapeTime = 0;
+                e.preventDefault();
+                transformWordForward('uppercase');
+            } else if (e.key === 'd' && (e.altKey || isRecentEscape())) {
+                // Alt+d or Escape+d: Delete word forward
+                lastEscapeTime = 0;
+                e.preventDefault();
+                deleteWordForward();
             } else if (e.key === 'ArrowUp' && e.altKey) {
                 // Alt+Up: Increase input height
                 e.preventDefault();
@@ -7006,6 +7100,26 @@
                 // Ctrl+A: Move cursor to beginning of line
                 e.preventDefault();
                 elements.input.selectionStart = elements.input.selectionEnd = 0;
+            } else if (e.key === 'e' && e.ctrlKey) {
+                // Ctrl+E: Move cursor to end of line
+                e.preventDefault();
+                const len = elements.input.value.length;
+                elements.input.selectionStart = elements.input.selectionEnd = len;
+            } else if (e.key === 'k' && e.ctrlKey) {
+                // Ctrl+K: Kill to end of line
+                e.preventDefault();
+                const pos = elements.input.selectionStart;
+                elements.input.value = elements.input.value.substring(0, pos);
+                elements.input.selectionStart = elements.input.selectionEnd = pos;
+            } else if (e.key === 'd' && e.ctrlKey) {
+                // Ctrl+D: Delete character under cursor
+                e.preventDefault();
+                const pos = elements.input.selectionStart;
+                const text = elements.input.value;
+                if (pos < text.length) {
+                    elements.input.value = text.substring(0, pos) + text.substring(pos + 1);
+                    elements.input.selectionStart = elements.input.selectionEnd = pos;
+                }
             // Note: Ctrl+W handled by window capture-phase listener in init()
             } else if (e.key === 'l' && e.ctrlKey) {
                 // Ctrl+L: Redraw screen — filter out client-generated output, keep only MUD server data

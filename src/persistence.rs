@@ -1199,6 +1199,9 @@ pub fn save_reload_state(app: &App) -> io::Result<()> {
         writeln!(file, "is_tls={}", world.is_tls)?;
         writeln!(file, "was_connected={}", world.was_connected)?;
         writeln!(file, "telnet_mode={}", world.telnet_mode)?;
+        if let Some(enc) = world.negotiated_encoding {
+            writeln!(file, "negotiated_encoding={}", enc.iana_name())?;
+        }
         writeln!(file, "uses_wont_echo_prompt={}", world.uses_wont_echo_prompt)?;
         writeln!(file, "next_seq={}", world.next_seq)?;
         if !world.prompt.is_empty() {
@@ -1425,6 +1428,7 @@ pub fn load_reload_state(app: &mut App) -> io::Result<bool> {
         is_tls: bool,
         was_connected: bool,
         telnet_mode: bool,
+        negotiated_encoding: Option<Encoding>,
         uses_wont_echo_prompt: bool,
         prompt: String,
         settings: WorldSettings,
@@ -1529,6 +1533,7 @@ pub fn load_reload_state(app: &mut App) -> io::Result<bool> {
                         is_tls: false,
                         was_connected: false,
                         telnet_mode: false,
+                        negotiated_encoding: None,
                         uses_wont_echo_prompt: false,
                         prompt: String::new(),
                         settings: WorldSettings::default(),
@@ -1803,6 +1808,7 @@ pub fn load_reload_state(app: &mut App) -> io::Result<bool> {
                             "is_tls" => tw.is_tls = value == "true",
                             "was_connected" => tw.was_connected = value == "true",
                             "telnet_mode" => tw.telnet_mode = value == "true",
+                            "negotiated_encoding" => tw.negotiated_encoding = Encoding::from_iana_name(value),
                             "uses_wont_echo_prompt" => tw.uses_wont_echo_prompt = value == "true",
                             "prompt" => {
                                 // Prompts always end with a single trailing space (normalized on receive)
@@ -1909,6 +1915,7 @@ pub fn load_reload_state(app: &mut App) -> io::Result<bool> {
         world.is_tls = tw.is_tls;
         world.was_connected = tw.was_connected;
         world.telnet_mode = tw.telnet_mode;
+        world.negotiated_encoding = tw.negotiated_encoding;
         world.uses_wont_echo_prompt = tw.uses_wont_echo_prompt;
         world.prompt = tw.prompt;
         world.socket_fd = tw.socket_fd;

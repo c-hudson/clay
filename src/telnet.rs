@@ -28,8 +28,16 @@ pub const TELNET_OPT_SGA: u8 = 3;     // Suppress Go Ahead
 pub const TELNET_OPT_TTYPE: u8 = 24;  // Terminal Type
 pub const TELNET_OPT_EOR: u8 = 25;    // End of Record
 pub const TELNET_OPT_NAWS: u8 = 31;   // Negotiate About Window Size
+pub const TELNET_OPT_CHARSET: u8 = 42; // CHARSET (RFC 2066)
 pub const TELNET_OPT_MSDP: u8 = 69;   // MUD Server Data Protocol
 pub const TELNET_OPT_GMCP: u8 = 201;  // Generic MUD Communication Protocol
+
+// CHARSET subnegotiation opcodes (RFC 2066)
+const CHARSET_REQUEST: u8 = 1;
+const CHARSET_ACCEPTED: u8 = 2;
+const CHARSET_REJECTED: u8 = 3;
+const CHARSET_TTABLE_IS: u8 = 4;
+const CHARSET_TTABLE_REJECTED: u8 = 7;
 
 // MSDP sub-negotiation markers
 pub const MSDP_VAR: u8 = 1;
@@ -126,6 +134,7 @@ pub struct TelnetResult {
     pub msdp_data: Vec<(String, String)>,  // (variable_name, value_json)
     pub gmcp_negotiated: bool,  // True if server sent WILL GMCP
     pub msdp_negotiated: bool,  // True if server sent WILL MSDP
+    pub charset_request: Option<Vec<String>>,  // Charsets offered by server via CHARSET REQUEST
 }
 
 /// Process telnet sequences in incoming data.
@@ -142,6 +151,7 @@ pub fn process_telnet(data: &[u8]) -> TelnetResult {
     let mut msdp_data = Vec::new();
     let mut gmcp_negotiated = false;
     let mut msdp_negotiated = false;
+    let mut charset_request: Option<Vec<String>> = None;
     let mut i = 0;
 
     while i < data.len() {
@@ -177,6 +187,9 @@ pub fn process_telnet(data: &[u8]) -> TelnetResult {
                                 // Accept MSDP
                                 responses.extend_from_slice(&[TELNET_IAC, TELNET_DO, option]);
                                 msdp_negotiated = true;
+                            } else if option == TELNET_OPT_CHARSET {
+                                // Accept CHARSET negotiation (RFC 2066)
+                                responses.extend_from_slice(&[TELNET_IAC, TELNET_DO, option]);
                             } else {
                                 responses.extend_from_slice(&[TELNET_IAC, TELNET_DONT, option]);
                             }
@@ -240,6 +253,18 @@ pub fn process_telnet(data: &[u8]) -> TelnetResult {
                                     let pairs = parse_msdp_pairs(payload);
                                     msdp_data.extend(pairs);
                                 }
+                                // Check for CHARSET subnegotiation (option 42, RFC 2066)
+                                if sb_data.len() >= 3 && sb_data[0] == TELNET_OPT_CHARSET {
+                                    if sb_data[1] == CHARSET_REQUEST {
+                                        charset_request = Some(parse_charset_request(&sb_data[1..]));
+                                    } else if sb_data[1] == CHARSET_TTABLE_IS {
+                                        // We don't support TTABLEs — reject
+                                        responses.extend_from_slice(&[
+                                            TELNET_IAC, TELNET_SB, TELNET_OPT_CHARSET, CHARSET_TTABLE_REJECTED,
+                                            TELNET_IAC, TELNET_SE,
+                                        ]);
+                                    }
+                                }
                                 i += 2;
                                 break;
                             } else if data[i + 1] == TELNET_IAC {
@@ -302,6 +327,7 @@ pub fn process_telnet(data: &[u8]) -> TelnetResult {
         msdp_data,
         gmcp_negotiated,
         msdp_negotiated,
+        charset_request,
     }
 }
 
@@ -470,6 +496,63 @@ pub fn build_msdp_set(variable: &str, value: &str) -> Vec<u8> {
     msg.extend_from_slice(value.as_bytes());
     msg.extend_from_slice(&[TELNET_IAC, TELNET_SE]);
     msg
+}
+
+/// Parse a CHARSET REQUEST payload into a list of charset names.
+/// Format: REQUEST <sep> [TTABLE <version>] <charset1> <sep> <charset2> ...
+fn parse_charset_request(data: &[u8]) -> Vec<String> {
+    // data[0] is REQUEST opcode (already checked by caller)
+    if data.len() < 3 {
+        return Vec::new();
+    }
+    let sep = data[1];
+    let mut start = 2;
+
+    // Check for optional TTABLE flag (byte value 1) followed by version byte
+    if start < data.len() && data[start] == 1 {
+        // Skip TTABLE flag and version byte
+        start += 2;
+    }
+
+    // Split remaining bytes by separator into charset names
+    let mut charsets = Vec::new();
+    let mut name_start = start;
+    for i in start..data.len() {
+        if data[i] == sep {
+            if i > name_start {
+                if let Ok(name) = std::str::from_utf8(&data[name_start..i]) {
+                    let trimmed = name.trim();
+                    if !trimmed.is_empty() {
+                        charsets.push(trimmed.to_string());
+                    }
+                }
+            }
+            name_start = i + 1;
+        }
+    }
+    // Last charset (after final separator or no trailing separator)
+    if name_start < data.len() {
+        if let Ok(name) = std::str::from_utf8(&data[name_start..]) {
+            let trimmed = name.trim();
+            if !trimmed.is_empty() {
+                charsets.push(trimmed.to_string());
+            }
+        }
+    }
+    charsets
+}
+
+/// Build a CHARSET ACCEPTED subnegotiation response
+pub fn build_charset_accepted(charset_name: &str) -> Vec<u8> {
+    let mut msg = vec![TELNET_IAC, TELNET_SB, TELNET_OPT_CHARSET, CHARSET_ACCEPTED];
+    msg.extend_from_slice(charset_name.as_bytes());
+    msg.extend_from_slice(&[TELNET_IAC, TELNET_SE]);
+    msg
+}
+
+/// Build a CHARSET REJECTED subnegotiation response
+pub fn build_charset_rejected() -> Vec<u8> {
+    vec![TELNET_IAC, TELNET_SB, TELNET_OPT_CHARSET, CHARSET_REJECTED, TELNET_IAC, TELNET_SE]
 }
 
 /// Check if there's an incomplete ANSI escape sequence or telnet sequence at the end.
@@ -646,5 +729,82 @@ impl KeepAliveType {
             "generic" => KeepAliveType::Generic,
             _ => KeepAliveType::Nop,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_charset_will_do_negotiation() {
+        // Server sends IAC WILL CHARSET → client should respond IAC DO CHARSET
+        let data = [TELNET_IAC, TELNET_WILL, TELNET_OPT_CHARSET];
+        let result = process_telnet(&data);
+        assert!(result.telnet_detected);
+        assert_eq!(result.responses, vec![TELNET_IAC, TELNET_DO, TELNET_OPT_CHARSET]);
+    }
+
+    #[test]
+    fn test_charset_request_parsing() {
+        // IAC SB CHARSET REQUEST <space> UTF-8 <space> ISO-8859-1 IAC SE
+        let mut data = vec![TELNET_IAC, TELNET_SB, TELNET_OPT_CHARSET, CHARSET_REQUEST, b' '];
+        data.extend_from_slice(b"UTF-8");
+        data.push(b' ');
+        data.extend_from_slice(b"ISO-8859-1");
+        data.extend_from_slice(&[TELNET_IAC, TELNET_SE]);
+        let result = process_telnet(&data);
+        assert!(result.telnet_detected);
+        let charsets = result.charset_request.unwrap();
+        assert_eq!(charsets, vec!["UTF-8", "ISO-8859-1"]);
+    }
+
+    #[test]
+    fn test_charset_request_with_ttable() {
+        // IAC SB CHARSET REQUEST <sep> TTABLE(1) <version> UTF-8 <sep> IBM437 IAC SE
+        let sep = b';';
+        let mut data = vec![TELNET_IAC, TELNET_SB, TELNET_OPT_CHARSET, CHARSET_REQUEST, sep];
+        data.push(1); // TTABLE flag
+        data.push(1); // TTABLE version
+        data.extend_from_slice(b"UTF-8");
+        data.push(sep);
+        data.extend_from_slice(b"IBM437");
+        data.extend_from_slice(&[TELNET_IAC, TELNET_SE]);
+        let result = process_telnet(&data);
+        let charsets = result.charset_request.unwrap();
+        assert_eq!(charsets, vec!["UTF-8", "IBM437"]);
+    }
+
+    #[test]
+    fn test_build_charset_accepted() {
+        let msg = build_charset_accepted("UTF-8");
+        assert_eq!(msg, vec![
+            TELNET_IAC, TELNET_SB, TELNET_OPT_CHARSET, CHARSET_ACCEPTED,
+            b'U', b'T', b'F', b'-', b'8',
+            TELNET_IAC, TELNET_SE,
+        ]);
+    }
+
+    #[test]
+    fn test_build_charset_rejected() {
+        let msg = build_charset_rejected();
+        assert_eq!(msg, vec![
+            TELNET_IAC, TELNET_SB, TELNET_OPT_CHARSET, CHARSET_REJECTED,
+            TELNET_IAC, TELNET_SE,
+        ]);
+    }
+
+    #[test]
+    fn test_charset_ttable_is_rejected() {
+        // Server sends TTABLE-IS → we should respond with TTABLE-REJECTED
+        let mut data = vec![TELNET_IAC, TELNET_SB, TELNET_OPT_CHARSET, CHARSET_TTABLE_IS];
+        data.extend_from_slice(b"some ttable data");
+        data.extend_from_slice(&[TELNET_IAC, TELNET_SE]);
+        let result = process_telnet(&data);
+        assert!(result.responses.contains(&CHARSET_TTABLE_REJECTED));
+        assert_eq!(result.responses, vec![
+            TELNET_IAC, TELNET_SB, TELNET_OPT_CHARSET, CHARSET_TTABLE_REJECTED,
+            TELNET_IAC, TELNET_SE,
+        ]);
     }
 }

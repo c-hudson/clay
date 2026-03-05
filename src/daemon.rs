@@ -306,6 +306,11 @@ pub async fn run_daemon_server() -> io::Result<()> {
                         // Print system messages (including connection rejections) to console
                         println!("{}", msg);
                     }
+                    AppEvent::CharsetRequested(ref world_name, ref charsets) => {
+                        if let Some(world_idx) = app.find_world_index(world_name) {
+                            app.handle_charset_requested(world_idx, charsets);
+                        }
+                    }
                     AppEvent::ApiLookupResult(client_id, world_index, result) => {
                         match result {
                             Ok(text) => app.ws_send_to_client(client_id, WsMessage::SetInputBuffer { text }),
@@ -1973,7 +1978,7 @@ keep_alive_type=Generic
                         let key = (world_index, username.clone());
                         if let Some(conn) = app.user_connections.get_mut(&key) {
                             let encoding = if world_index < app.worlds.len() {
-                                app.worlds[world_index].settings.encoding
+                                app.worlds[world_index].effective_encoding()
                             } else {
                                 Encoding::Utf8
                             };
@@ -2025,7 +2030,7 @@ keep_alive_type=Generic
                         let key = (world_index, username.clone());
                         if let Some(conn) = app.user_connections.get_mut(&key) {
                             let encoding = if world_index < app.worlds.len() {
-                                app.worlds[world_index].settings.encoding
+                                app.worlds[world_index].effective_encoding()
                             } else {
                                 Encoding::Utf8
                             };
@@ -2039,6 +2044,14 @@ keep_alive_type=Generic
                                     prompt: conn.prompt.clone(),
                                 }, Some(&username));
                             }
+                        }
+                    }
+                    AppEvent::CharsetRequested(ref world_name, ref charsets) => {
+                        // In multiuser mode, charset negotiation applies to world-level encoding
+                        if let Some(world_idx) = app.find_world_index(world_name) {
+                            app.handle_charset_requested(world_idx, charsets);
+                        } else if !world_name.is_empty() {
+                            // world_name might be empty for multiuser reader tasks
                         }
                     }
                     _ => {} // Ignore other events in multiuser mode
@@ -2182,6 +2195,9 @@ pub async fn connect_multiuser_world(
                                 if result.telnet_detected {
                                     let _ = event_tx_read.send(AppEvent::MultiuserTelnetDetected(world_index, username_read.clone())).await;
                                 }
+                                if let Some(ref charsets) = result.charset_request {
+                                    let _ = event_tx_read.send(AppEvent::CharsetRequested(String::new(), charsets.clone())).await;
+                                }
                                 if let Some(prompt_bytes) = result.prompt {
                                     let _ = event_tx_read.send(AppEvent::MultiuserPrompt(world_index, username_read.clone(), prompt_bytes)).await;
                                 }
@@ -2215,6 +2231,9 @@ pub async fn connect_multiuser_world(
                                 }
                                 if result.telnet_detected {
                                     let _ = event_tx_read.send(AppEvent::MultiuserTelnetDetected(world_index, username_read.clone())).await;
+                                }
+                                if let Some(ref charsets) = result.charset_request {
+                                    let _ = event_tx_read.send(AppEvent::CharsetRequested(String::new(), charsets.clone())).await;
                                 }
                                 if let Some(prompt_bytes) = result.prompt {
                                     let _ = event_tx_read.send(AppEvent::MultiuserPrompt(world_index, username_read.clone(), prompt_bytes)).await;
@@ -2389,6 +2408,9 @@ pub async fn connect_daemon_world(
                                 if !result.responses.is_empty() {
                                     let _ = telnet_tx.send(WriteCommand::Raw(result.responses)).await;
                                 }
+                                if let Some(ref charsets) = result.charset_request {
+                                    let _ = event_tx_read.send(AppEvent::CharsetRequested(world_name_read.clone(), charsets.clone())).await;
+                                }
                                 if !result.cleaned.is_empty() {
                                     let _ = event_tx_read.send(AppEvent::ServerData(world_name_read.clone(), result.cleaned)).await;
                                 }
@@ -2415,6 +2437,9 @@ pub async fn connect_daemon_world(
                                 let result = process_telnet(&to_send);
                                 if !result.responses.is_empty() {
                                     let _ = telnet_tx.send(WriteCommand::Raw(result.responses)).await;
+                                }
+                                if let Some(ref charsets) = result.charset_request {
+                                    let _ = event_tx_read.send(AppEvent::CharsetRequested(world_name_read.clone(), charsets.clone())).await;
                                 }
                                 if !result.cleaned.is_empty() {
                                     let _ = event_tx_read.send(AppEvent::ServerData(world_name_read.clone(), result.cleaned)).await;

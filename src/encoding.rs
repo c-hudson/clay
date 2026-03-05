@@ -1,6 +1,6 @@
 use ratatui::style::Color;
 
-#[derive(Clone, Copy, PartialEq, Default)]
+#[derive(Clone, Copy, PartialEq, Debug, Default)]
 pub enum Encoding {
     #[default]
     Utf8,
@@ -215,6 +215,28 @@ impl Encoding {
             Encoding::Utf8 => Encoding::Fansi,
             Encoding::Latin1 => Encoding::Utf8,
             Encoding::Fansi => Encoding::Latin1,
+        }
+    }
+
+    /// Map an IANA charset name (case-insensitive) to a Clay Encoding.
+    /// Returns None if the charset is not supported.
+    pub fn from_iana_name(name: &str) -> Option<Encoding> {
+        match name.to_uppercase().as_str() {
+            "UTF-8" | "UTF8" => Some(Encoding::Utf8),
+            "US-ASCII" | "ASCII" => Some(Encoding::Utf8), // ASCII is a subset of UTF-8
+            "ISO-8859-1" | "ISO_8859-1" | "ISO_8859-1:1987" | "LATIN1" | "L1"
+            | "WINDOWS-1252" | "CP1252" | "ISO-8859-15" | "LATIN-9" => Some(Encoding::Latin1),
+            "IBM437" | "CP437" | "437" => Some(Encoding::Fansi),
+            _ => None,
+        }
+    }
+
+    /// Return the canonical IANA charset name for this encoding.
+    pub fn iana_name(&self) -> &'static str {
+        match self {
+            Encoding::Utf8 => "UTF-8",
+            Encoding::Latin1 => "ISO-8859-1",
+            Encoding::Fansi => "IBM437",
         }
     }
 }
@@ -1099,4 +1121,48 @@ fn emoji_name_to_unicode(name: &str) -> Option<String> {
         _ => return None,
     };
     Some(emoji.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_from_iana_name_utf8() {
+        assert_eq!(Encoding::from_iana_name("UTF-8"), Some(Encoding::Utf8));
+        assert_eq!(Encoding::from_iana_name("utf-8"), Some(Encoding::Utf8));
+        assert_eq!(Encoding::from_iana_name("UTF8"), Some(Encoding::Utf8));
+        assert_eq!(Encoding::from_iana_name("US-ASCII"), Some(Encoding::Utf8));
+        assert_eq!(Encoding::from_iana_name("ascii"), Some(Encoding::Utf8));
+    }
+
+    #[test]
+    fn test_from_iana_name_latin1() {
+        assert_eq!(Encoding::from_iana_name("ISO-8859-1"), Some(Encoding::Latin1));
+        assert_eq!(Encoding::from_iana_name("iso-8859-1"), Some(Encoding::Latin1));
+        assert_eq!(Encoding::from_iana_name("LATIN1"), Some(Encoding::Latin1));
+        assert_eq!(Encoding::from_iana_name("WINDOWS-1252"), Some(Encoding::Latin1));
+        assert_eq!(Encoding::from_iana_name("CP1252"), Some(Encoding::Latin1));
+    }
+
+    #[test]
+    fn test_from_iana_name_fansi() {
+        assert_eq!(Encoding::from_iana_name("IBM437"), Some(Encoding::Fansi));
+        assert_eq!(Encoding::from_iana_name("CP437"), Some(Encoding::Fansi));
+        assert_eq!(Encoding::from_iana_name("437"), Some(Encoding::Fansi));
+    }
+
+    #[test]
+    fn test_from_iana_name_unknown() {
+        assert_eq!(Encoding::from_iana_name("EBCDIC"), None);
+        assert_eq!(Encoding::from_iana_name("SHIFT_JIS"), None);
+        assert_eq!(Encoding::from_iana_name(""), None);
+    }
+
+    #[test]
+    fn test_iana_name() {
+        assert_eq!(Encoding::Utf8.iana_name(), "UTF-8");
+        assert_eq!(Encoding::Latin1.iana_name(), "ISO-8859-1");
+        assert_eq!(Encoding::Fansi.iana_name(), "IBM437");
+    }
 }

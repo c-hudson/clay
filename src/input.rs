@@ -236,6 +236,96 @@ impl InputArea {
         self.adjust_viewport();
     }
 
+    /// Delete from cursor position to end of line (Ctrl+K)
+    pub fn kill_to_end(&mut self) {
+        self.buffer.truncate(self.cursor_position);
+    }
+
+    /// Delete forward to end of next word (Esc+D).
+    /// Deletes non-word chars, then word chars, stopping before the first
+    /// alphanumeric character of the next word.
+    pub fn delete_word_forward(&mut self) {
+        if self.cursor_position >= self.buffer.len() {
+            return;
+        }
+        let after: Vec<char> = self.buffer[self.cursor_position..].chars().collect();
+        let mut i = 0;
+        // Skip non-word characters first
+        while i < after.len() && !after[i].is_alphanumeric() {
+            i += 1;
+        }
+        // Then skip word characters
+        while i < after.len() && after[i].is_alphanumeric() {
+            i += 1;
+        }
+        // Calculate byte offset to delete
+        let byte_offset: usize = after[..i].iter().map(|c| c.len_utf8()).sum();
+        let end = self.cursor_position + byte_offset;
+        self.buffer.replace_range(self.cursor_position..end, "");
+    }
+
+    /// Move cursor to end of next word, converting characters to lowercase (Esc+L).
+    /// Word characters are A-Z, a-z, 0-9. Skips trailing spaces.
+    pub fn lowercase_word(&mut self) {
+        self.transform_word(|_, c| c.to_lowercase().next().unwrap_or(c))
+    }
+
+    /// Move cursor to end of next word, converting characters to uppercase (Esc+U).
+    /// Word characters are A-Z, a-z, 0-9. Skips trailing spaces.
+    pub fn uppercase_word(&mut self) {
+        self.transform_word(|_, c| c.to_uppercase().next().unwrap_or(c))
+    }
+
+    /// Move cursor to end of next word, capitalizing first letter of each word (Esc+C).
+    /// Word characters are A-Z, a-z, 0-9. Skips trailing spaces.
+    pub fn capitalize_word(&mut self) {
+        self.transform_word(|is_start, c| {
+            if is_start {
+                c.to_uppercase().next().unwrap_or(c)
+            } else {
+                c.to_lowercase().next().unwrap_or(c)
+            }
+        })
+    }
+
+    /// Helper: transform characters from cursor to end of next word, then skip trailing spaces.
+    /// The closure receives (is_word_start, char) and returns the replacement char.
+    fn transform_word<F>(&mut self, transform: F)
+    where
+        F: Fn(bool, char) -> char,
+    {
+        if self.cursor_position >= self.buffer.len() {
+            return;
+        }
+        let before = self.buffer[..self.cursor_position].to_string();
+        let after: Vec<char> = self.buffer[self.cursor_position..].chars().collect();
+        let mut i = 0;
+        let mut result = String::new();
+        let mut at_word_start = true;
+
+        // Skip leading non-word characters (pass through unchanged)
+        while i < after.len() && !after[i].is_alphanumeric() {
+            result.push(after[i]);
+            i += 1;
+        }
+        // Transform word characters
+        while i < after.len() && after[i].is_alphanumeric() {
+            result.push(transform(at_word_start, after[i]));
+            at_word_start = false;
+            i += 1;
+        }
+        // Skip trailing spaces (pass through unchanged, but cursor moves past them)
+        while i < after.len() && after[i] == ' ' {
+            result.push(after[i]);
+            i += 1;
+        }
+
+        let rest: String = after[i..].iter().collect();
+        self.cursor_position = before.len() + result.len();
+        self.buffer = before + &result + &rest;
+        self.adjust_viewport();
+    }
+
     /// Get the column position within the current line (0-indexed, in display width)
     fn cursor_column(&self) -> usize {
         if self.width == 0 {

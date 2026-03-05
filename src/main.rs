@@ -50,7 +50,8 @@ pub use telnet::{
     WriteCommand, StreamReader, StreamWriter, AutoConnectType, KeepAliveType,
     process_telnet, find_safe_split_point, build_naws_subnegotiation, build_ttype_response, TelnetResult,
     build_gmcp_message, build_msdp_request, build_msdp_set,
-    TELNET_IAC, TELNET_NOP, TELNET_GA, TELNET_OPT_NAWS,
+    build_charset_accepted, build_charset_rejected,
+    TELNET_IAC, TELNET_NOP, TELNET_GA, TELNET_OPT_NAWS, TELNET_OPT_CHARSET,
 };
 pub use spell::{SpellChecker, SpellState};
 pub use input::{InputArea, display_width, display_width_chars, chars_for_display_width};
@@ -1890,8 +1891,8 @@ impl OutputLine {
         let ts_secs = self.timestamp.duration_since(UNIX_EPOCH).unwrap_or_default().as_secs() as i64;
         let lt = local_time_from_epoch(ts_secs);
 
-        // Always show day/month for debugging ordering issues
-        format!("{:02}/{:02} {:02}:{:02}>", lt.day, lt.month, lt.hour, lt.minute)
+        // Always show month/day with time
+        format!("{:02}/{:02} {:02}:{:02}>", lt.month, lt.day, lt.hour, lt.minute)
     }
 }
 
@@ -1929,6 +1930,7 @@ pub struct World {
     proxy_socket_fd: Option<i64>,   // Placeholder on non-Unix (never used)
     is_tls: bool,                // Track if using TLS
     telnet_mode: bool,           // True if telnet negotiation detected
+    pub negotiated_encoding: Option<Encoding>, // Encoding negotiated via TELNET CHARSET (RFC 2066)
     pub prompt: String,              // Current prompt detected via telnet GA
     pub prompt_count: usize,         // Number of prompts received since connect (for auto-login)
     last_send_time: Option<std::time::Instant>, // For keepalive timing
@@ -1999,6 +2001,7 @@ impl World {
             proxy_socket_fd: None,
             is_tls: false,
             telnet_mode: false,
+            negotiated_encoding: None,
             prompt: String::new(),
             prompt_count: 0,
             last_send_time: None,
@@ -2110,6 +2113,7 @@ impl World {
         self.connected = false;
         self.socket_fd = None;
         self.telnet_mode = false;
+        self.negotiated_encoding = None;
         self.naws_enabled = false;
         self.naws_sent_size = None;
         self.reader_name = None;
@@ -2126,6 +2130,11 @@ impl World {
             self.close_log_file();
             self.prompt.clear();
         }
+    }
+
+    /// Return the effective encoding for this world: negotiated charset if available, otherwise configured encoding.
+    pub fn effective_encoding(&self) -> Encoding {
+        self.negotiated_encoding.unwrap_or(self.settings.encoding)
     }
 
     /// Write a line to the log file with timestamp prefix
@@ -4563,7 +4572,7 @@ impl App {
 
         // Consider "current" if console OR any web/GUI client is viewing this world
         let is_current = world_idx == self.current_world_index || self.ws_client_viewing(world_idx);
-        let decoded_data = self.worlds[world_idx].settings.encoding.decode(bytes);
+        let decoded_data = self.worlds[world_idx].effective_encoding().decode(bytes);
 
         // Extract ANSI music sequences FIRST, before any other processing
         let (data, music_sequences) = if self.settings.ansi_music_enabled {
@@ -4957,10 +4966,50 @@ impl App {
         }
     }
 
+    /// Handle CharsetRequested event (RFC 2066 TELNET CHARSET).
+    /// Selects the best charset from the offered list that Clay supports.
+    fn handle_charset_requested(&mut self, world_idx: usize, charsets: &[String]) {
+        // Priority order: UTF-8 > Latin1 > Fansi
+        // First pass: look for UTF-8 (highest capability)
+        // Second pass: accept first supported charset from offered list
+        let mut best: Option<(Encoding, &str)> = None;
+        for name in charsets {
+            if let Some(enc) = Encoding::from_iana_name(name) {
+                match enc {
+                    Encoding::Utf8 => {
+                        // UTF-8 is always preferred — accept immediately
+                        best = Some((enc, "UTF-8"));
+                        break;
+                    }
+                    _ => {
+                        if best.is_none() {
+                            best = Some((enc, match enc {
+                                Encoding::Latin1 => "ISO-8859-1",
+                                Encoding::Fansi => "IBM437",
+                                Encoding::Utf8 => unreachable!(),
+                            }));
+                        }
+                    }
+                }
+            }
+        }
+
+        if let Some(ref tx) = self.worlds[world_idx].command_tx {
+            if let Some((enc, iana_name)) = best {
+                let response = build_charset_accepted(iana_name);
+                let _ = tx.try_send(WriteCommand::Raw(response));
+                self.worlds[world_idx].negotiated_encoding = Some(enc);
+            } else {
+                let response = build_charset_rejected();
+                let _ = tx.try_send(WriteCommand::Raw(response));
+            }
+        }
+    }
+
     /// Handle Prompt event.
     fn handle_prompt(&mut self, world_idx: usize, prompt_bytes: &[u8]) {
         self.worlds[world_idx].last_receive_time = Some(std::time::Instant::now());
-        let encoding = self.worlds[world_idx].settings.encoding;
+        let encoding = self.worlds[world_idx].effective_encoding();
         let prompt_text = encoding.decode(prompt_bytes);
         let prompt_normalized = crate::util::normalize_prompt(&prompt_text);
 
@@ -5391,6 +5440,12 @@ impl App {
                                     tf::TfCommandResult::RepeatProcess(process) => {
                                         self.tf_engine.processes.push(process);
                                     }
+                                    tf::TfCommandResult::Quote { mut lines, disposition, world, delay_secs, recall_opts } => {
+                                        self.handle_ws_quote_result(world_index, &mut lines, disposition, &world, delay_secs, recall_opts);
+                                        if disposition == tf::QuoteDisposition::Send && !lines.is_empty() {
+                                            sent_to_server = true;
+                                        }
+                                    }
                                     _ => {}
                                 }
                             } else if world_index < self.worlds.len() {
@@ -5462,6 +5517,9 @@ impl App {
                         }
                         tf::TfCommandResult::RepeatProcess(process) => {
                             self.tf_engine.processes.push(process);
+                        }
+                        tf::TfCommandResult::Quote { mut lines, disposition, world, delay_secs, recall_opts } => {
+                            self.handle_ws_quote_result(world_index, &mut lines, disposition, &world, delay_secs, recall_opts);
                         }
                         _ => {
                             self.ws_broadcast(WsMessage::ServerData {
@@ -6053,6 +6111,131 @@ impl App {
             }
         }
         WsAsyncAction::Done
+    }
+
+    /// Handle TfCommandResult::Quote from a WebSocket client command.
+    /// Mirrors the console Quote handling but uses synchronous ws_broadcast/try_send.
+    fn handle_ws_quote_result(
+        &mut self,
+        world_index: usize,
+        lines: &mut Vec<String>,
+        disposition: tf::QuoteDisposition,
+        world: &Option<String>,
+        delay_secs: f64,
+        recall_opts: Option<(tf::RecallOptions, String)>,
+    ) {
+        // If this is a /quote with backtick /recall, execute the recall now
+        if let Some((opts, recall_prefix)) = recall_opts {
+            if world_index < self.worlds.len() {
+                let output_lines = self.worlds[world_index].output_lines.clone();
+                let (matches, _header) = execute_recall(&opts, &output_lines);
+                *lines = matches.iter()
+                    .map(|line| format!("{}{}", recall_prefix, line))
+                    .collect();
+                if lines.is_empty() {
+                    let pattern_str = opts.pattern.as_deref().unwrap_or("*");
+                    self.ws_broadcast(WsMessage::ServerData {
+                        world_index, data: format!("(no recall matches for '{}')", pattern_str),
+                        is_viewed: false, ts: current_timestamp_secs(), from_server: false, seq: 0, marked_new: false,
+                    });
+                }
+            }
+        }
+
+        // Determine target world index
+        let target_idx = if let Some(ref world_name) = world {
+            self.worlds.iter().position(|w| w.name == *world_name).unwrap_or(world_index)
+        } else {
+            world_index
+        };
+        let target_world_name = if target_idx < self.worlds.len() {
+            Some(self.worlds[target_idx].name.clone())
+        } else {
+            None
+        };
+
+        if delay_secs > 0.0 && lines.len() > 1 {
+            // Schedule as processes with delays
+            let delay = std::time::Duration::from_secs_f64(delay_secs);
+            let now = std::time::Instant::now();
+            for (i, line) in lines.drain(..).enumerate() {
+                let cmd = match disposition {
+                    tf::QuoteDisposition::Send => line,
+                    tf::QuoteDisposition::Echo => format!("/echo {}", line),
+                    tf::QuoteDisposition::Exec => line,
+                };
+                let id = self.tf_engine.next_process_id;
+                self.tf_engine.next_process_id += 1;
+                let process = tf::TfProcess {
+                    id,
+                    command: cmd,
+                    interval: delay,
+                    count: Some(1),
+                    remaining: Some(1),
+                    next_run: now + delay * i as u32,
+                    world: target_world_name.clone(),
+                    synchronous: false,
+                    on_prompt: false,
+                    priority: 0,
+                };
+                self.tf_engine.processes.push(process);
+            }
+        } else {
+            // Send immediately (no delay or single line)
+            for line in lines.drain(..) {
+                match disposition {
+                    tf::QuoteDisposition::Send => {
+                        if target_idx < self.worlds.len() {
+                            if self.worlds[target_idx].connected {
+                                if let Some(tx) = &self.worlds[target_idx].command_tx {
+                                    let _ = tx.try_send(WriteCommand::Text(line));
+                                    self.worlds[target_idx].last_send_time = Some(std::time::Instant::now());
+                                }
+                            } else {
+                                self.ws_broadcast(WsMessage::ServerData {
+                                    world_index, data: "Not connected".to_string(),
+                                    is_viewed: false, ts: current_timestamp_secs(), from_server: false, seq: 0, marked_new: false,
+                                });
+                                break;
+                            }
+                        }
+                    }
+                    tf::QuoteDisposition::Echo => {
+                        self.ws_broadcast(WsMessage::ServerData {
+                            world_index, data: line,
+                            is_viewed: false, ts: current_timestamp_secs(), from_server: false, seq: 0, marked_new: false,
+                        });
+                    }
+                    tf::QuoteDisposition::Exec => {
+                        // Execute each line as a TF command
+                        let result = self.tf_engine.execute(&line);
+                        match result {
+                            tf::TfCommandResult::SendToMud(text) => {
+                                if target_idx < self.worlds.len() {
+                                    if let Some(tx) = &self.worlds[target_idx].command_tx {
+                                        let _ = tx.try_send(WriteCommand::Text(text));
+                                        self.worlds[target_idx].last_send_time = Some(std::time::Instant::now());
+                                    }
+                                }
+                            }
+                            tf::TfCommandResult::Success(Some(msg)) => {
+                                self.ws_broadcast(WsMessage::ServerData {
+                                    world_index, data: msg,
+                                    is_viewed: false, ts: current_timestamp_secs(), from_server: false, seq: 0, marked_new: false,
+                                });
+                            }
+                            tf::TfCommandResult::Error(err) => {
+                                self.ws_broadcast(WsMessage::ServerData {
+                                    world_index, data: format!("Error: {}", err),
+                                    is_viewed: false, ts: current_timestamp_secs(), from_server: false, seq: 0, marked_new: false,
+                                });
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+            }
+        }
     }
 
     /// Handle a full WsMessage from a client. Returns WsAsyncAction for operations
@@ -7490,6 +7673,7 @@ pub enum AppEvent {
     WontEchoSeen(String),         // world_name - IAC WONT ECHO detected (for timeout-based prompts)
     NawsRequested(String),        // world_name - server sent DO NAWS (we should send window size)
     TtypeRequested(String),       // world_name - server sent SB TTYPE SEND (we should send terminal type)
+    CharsetRequested(String, Vec<String>), // world_name, offered charsets - server sent CHARSET REQUEST (RFC 2066)
     SystemMessage(String),       // message to display in current world's output
     Sigusr1Received,             // SIGUSR1 received - trigger hot reload (not available on Android)
     // Background connection events
@@ -9276,12 +9460,49 @@ fn handle_remote_client_key(
         return false;
     }
 
+    // Handle Escape+c (Alt+c) to capitalize word
+    if key.code == Char('c') && (key.modifiers.contains(KeyModifiers::ALT) || recent_escape) {
+        app.last_escape = None;
+        app.input.capitalize_word();
+        return false;
+    }
+
+    // Handle Escape+l (Alt+l) to lowercase word
+    if key.code == Char('l') && (key.modifiers.contains(KeyModifiers::ALT) || recent_escape) {
+        app.last_escape = None;
+        app.input.lowercase_word();
+        return false;
+    }
+
+    // Handle Escape+u (Alt+u) to uppercase word
+    if key.code == Char('u') && (key.modifiers.contains(KeyModifiers::ALT) || recent_escape) {
+        app.last_escape = None;
+        app.input.uppercase_word();
+        return false;
+    }
+
+    // Handle Escape+d (Alt+d) to delete word forward
+    if key.code == Char('d') && (key.modifiers.contains(KeyModifiers::ALT) || recent_escape) {
+        app.last_escape = None;
+        app.input.delete_word_forward();
+        return false;
+    }
+
     match (key.modifiers, key.code) {
         (KeyModifiers::CONTROL, Char('u')) => {
             app.input.clear();
         }
         (KeyModifiers::CONTROL, Char('w')) => {
             app.input.delete_word_before_cursor();
+        }
+        (KeyModifiers::CONTROL, Char('e')) => {
+            app.input.end();
+        }
+        (KeyModifiers::CONTROL, Char('k')) => {
+            app.input.kill_to_end();
+        }
+        (KeyModifiers::CONTROL, Char('d')) => {
+            app.input.delete_char_forward();
         }
         (KeyModifiers::CONTROL, Char('a')) | (_, Home) => {
             app.input.home();
@@ -12693,6 +12914,11 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                             .await;
                                     }
 
+                                    // Notify if CHARSET was requested (RFC 2066)
+                                    if let Some(ref charsets) = result.charset_request {
+                                        let _ = event_tx_read.send(AppEvent::CharsetRequested(world_name.clone(), charsets.clone())).await;
+                                    }
+
                                     // Notify GMCP/MSDP negotiation and data
                                     if result.gmcp_negotiated {
                                         let _ = event_tx_read.send(AppEvent::GmcpNegotiated(world_name.clone())).await;
@@ -12900,6 +13126,9 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                             }
                                             if result.ttype_requested {
                                                 let _ = event_tx_read.send(AppEvent::TtypeRequested(world_name.clone())).await;
+                                            }
+                                            if let Some(ref charsets) = result.charset_request {
+                                                let _ = event_tx_read.send(AppEvent::CharsetRequested(world_name.clone(), charsets.clone())).await;
                                             }
                                             if result.gmcp_negotiated {
                                                 let _ = event_tx_read.send(AppEvent::GmcpNegotiated(world_name.clone())).await;
@@ -13740,6 +13969,11 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                             app.handle_ttype_requested(world_idx);
                         }
                     }
+                    AppEvent::CharsetRequested(ref world_name, ref charsets) => {
+                        if let Some(world_idx) = app.find_world_index(world_name) {
+                            app.handle_charset_requested(world_idx, charsets);
+                        }
+                    }
                     AppEvent::GmcpNegotiated(ref world_name) => {
                         if let Some(world_idx) = app.find_world_index(world_name) {
                             app.handle_gmcp_negotiated(world_idx);
@@ -14445,6 +14679,11 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                 AppEvent::TtypeRequested(ref world_name) => {
                     if let Some(world_idx) = app.find_world_index(world_name) {
                         app.handle_ttype_requested(world_idx);
+                    }
+                }
+                AppEvent::CharsetRequested(ref world_name, ref charsets) => {
+                    if let Some(world_idx) = app.find_world_index(world_name) {
+                        app.handle_charset_requested(world_idx, charsets);
                     }
                 }
                 AppEvent::Prompt(ref world_name, prompt_bytes) => {
@@ -15862,6 +16101,34 @@ fn handle_key_event(key: KeyEvent, app: &mut App) -> KeyAction {
         return KeyAction::None;
     }
 
+    // Handle Escape+c (Alt+c) to capitalize word
+    if key.code == KeyCode::Char('c') && (key.modifiers.contains(KeyModifiers::ALT) || recent_escape) {
+        app.last_escape = None;
+        app.input.capitalize_word();
+        return KeyAction::None;
+    }
+
+    // Handle Escape+l (Alt+l) to lowercase word
+    if key.code == KeyCode::Char('l') && (key.modifiers.contains(KeyModifiers::ALT) || recent_escape) {
+        app.last_escape = None;
+        app.input.lowercase_word();
+        return KeyAction::None;
+    }
+
+    // Handle Escape+u (Alt+u) to uppercase word
+    if key.code == KeyCode::Char('u') && (key.modifiers.contains(KeyModifiers::ALT) || recent_escape) {
+        app.last_escape = None;
+        app.input.uppercase_word();
+        return KeyAction::None;
+    }
+
+    // Handle Escape+d (Alt+d) to delete word forward
+    if key.code == KeyCode::Char('d') && (key.modifiers.contains(KeyModifiers::ALT) || recent_escape) {
+        app.last_escape = None;
+        app.input.delete_word_forward();
+        return KeyAction::None;
+    }
+
     // Ctrl+Up/Down - configurable behavior (same as Shift+Up/Down)
     if key.code == KeyCode::Up && key.modifiers.contains(KeyModifiers::CONTROL) && !key.modifiers.contains(KeyModifiers::ALT) {
         match app.settings.shift_arrow_up_down_mode {
@@ -16060,6 +16327,26 @@ fn handle_key_event(key: KeyEvent, app: &mut App) -> KeyAction {
             app.input.delete_word_before_cursor();
             app.spell_state.reset();
             app.suggestion_message = None;
+            app.last_input_was_delete = true;
+            KeyAction::None
+        }
+
+        // Go to end of line
+        (KeyModifiers::CONTROL, KeyCode::Char('e')) => {
+            app.input.end();
+            KeyAction::None
+        }
+
+        // Kill to end of line
+        (KeyModifiers::CONTROL, KeyCode::Char('k')) => {
+            app.input.kill_to_end();
+            app.last_input_was_delete = true;
+            KeyAction::None
+        }
+
+        // Delete character under cursor
+        (KeyModifiers::CONTROL, KeyCode::Char('d')) => {
+            app.input.delete_char_forward();
             app.last_input_was_delete = true;
             KeyAction::None
         }
@@ -17528,6 +17815,9 @@ async fn handle_command(cmd: &str, app: &mut App, event_tx: mpsc::Sender<AppEven
                                                     if result.ttype_requested {
                                                         let _ = event_tx_read.send(AppEvent::TtypeRequested(read_world_name.clone())).await;
                                                     }
+                                                    if let Some(ref charsets) = result.charset_request {
+                                                        let _ = event_tx_read.send(AppEvent::CharsetRequested(read_world_name.clone(), charsets.clone())).await;
+                                                    }
                                                     if result.gmcp_negotiated {
                                                         let _ = event_tx_read.send(AppEvent::GmcpNegotiated(read_world_name.clone())).await;
                                                     }
@@ -17773,6 +18063,9 @@ async fn handle_command(cmd: &str, app: &mut App, event_tx: mpsc::Sender<AppEven
                                                     }
                                                     if result.ttype_requested {
                                                         let _ = event_tx_read.send(AppEvent::TtypeRequested(read_world_name.clone())).await;
+                                                    }
+                                                    if let Some(ref charsets) = result.charset_request {
+                                                        let _ = event_tx_read.send(AppEvent::CharsetRequested(read_world_name.clone(), charsets.clone())).await;
                                                     }
                                                     if result.wont_echo_seen {
                                                         let _ = event_tx_read.send(AppEvent::WontEchoSeen(read_world_name.clone())).await;
@@ -20405,6 +20698,71 @@ mod tests {
 
         input.end();
         assert_eq!(input.cursor_position, 6);
+    }
+
+    #[test]
+    fn test_kill_to_end() {
+        let mut input = InputArea::new(3);
+        input.buffer = "hello world".to_string();
+        input.cursor_position = 5;
+        input.kill_to_end();
+        assert_eq!(input.buffer, "hello");
+        assert_eq!(input.cursor_position, 5);
+
+        // Kill at end does nothing
+        input.kill_to_end();
+        assert_eq!(input.buffer, "hello");
+    }
+
+    #[test]
+    fn test_delete_word_forward() {
+        let mut input = InputArea::new(3);
+        input.buffer = "hello world test".to_string();
+        input.cursor_position = 0;
+        input.delete_word_forward();
+        assert_eq!(input.buffer, " world test");
+        assert_eq!(input.cursor_position, 0);
+
+        // From middle of text with leading spaces
+        input.buffer = "hello  world".to_string();
+        input.cursor_position = 5;
+        input.delete_word_forward();
+        assert_eq!(input.buffer, "hello");
+        assert_eq!(input.cursor_position, 5);
+    }
+
+    #[test]
+    fn test_capitalize_word() {
+        let mut input = InputArea::new(3);
+        input.buffer = "hello world".to_string();
+        input.cursor_position = 0;
+        input.capitalize_word();
+        assert_eq!(input.buffer, "Hello world");
+        assert_eq!(input.cursor_position, 6); // past "Hello "
+
+        input.capitalize_word();
+        assert_eq!(input.buffer, "Hello World");
+        assert_eq!(input.cursor_position, 11);
+    }
+
+    #[test]
+    fn test_lowercase_word() {
+        let mut input = InputArea::new(3);
+        input.buffer = "HELLO WORLD".to_string();
+        input.cursor_position = 0;
+        input.lowercase_word();
+        assert_eq!(input.buffer, "hello WORLD");
+        assert_eq!(input.cursor_position, 6); // past "hello "
+    }
+
+    #[test]
+    fn test_uppercase_word() {
+        let mut input = InputArea::new(3);
+        input.buffer = "hello world".to_string();
+        input.cursor_position = 0;
+        input.uppercase_word();
+        assert_eq!(input.buffer, "HELLO world");
+        assert_eq!(input.cursor_position, 6); // past "HELLO "
     }
 
     #[test]
