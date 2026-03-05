@@ -2642,6 +2642,8 @@ pub struct App {
     pub ws_client_tx: Option<mpsc::UnboundedSender<WsMessage>>,
     /// Remote client mode: pending /update request (Some(force_flag))
     pub pending_update: Option<bool>,
+    /// Remote client mode: pending /reload request (re-exec local binary)
+    pub pending_reload: bool,
     /// Activity count from server (used in remote client mode, i.e. --console)
     pub server_activity_count: usize,
     /// Remote client backfill: queue of (world_index, total_output_lines) to backfill
@@ -2725,6 +2727,7 @@ impl App {
             theme_file: theme::ThemeFile::with_defaults(),
             ws_client_tx: None, // Set when running as remote client (--console mode)
             pending_update: None,
+            pending_reload: false,
             server_activity_count: 0, // Activity count from server (remote client mode)
             backfill_queue: Vec::new(),
             backfill_next: None,
@@ -8849,6 +8852,36 @@ async fn run_console_client(addr: &str) -> io::Result<()> {
                             if handle_remote_client_key(&mut app, key, &ws_tx) {
                                 break; // Quit requested
                             }
+                            // Check if a /reload was requested (re-exec local binary)
+                            if app.pending_reload {
+                                app.pending_reload = false;
+                                #[cfg(all(unix, not(target_os = "android")))]
+                                {
+                                    let _ = crossterm::terminal::disable_raw_mode();
+                                    let _ = crossterm::execute!(
+                                        std::io::stdout(),
+                                        crossterm::terminal::LeaveAlternateScreen
+                                    );
+                                    if let Ok((exe, _)) = get_executable_path() {
+                                        use std::os::unix::process::CommandExt;
+                                        let args: Vec<String> = std::env::args().skip(1).collect();
+                                        let err = std::process::Command::new(&exe).args(&args).exec();
+                                        // If exec failed, restore terminal and show error
+                                        let _ = crossterm::terminal::enable_raw_mode();
+                                        let _ = crossterm::execute!(
+                                            std::io::stdout(),
+                                            crossterm::terminal::EnterAlternateScreen
+                                        );
+                                        app.add_output(&format!("Reload failed: {}", err));
+                                    } else {
+                                        app.add_output("Reload failed: cannot find executable path");
+                                    }
+                                }
+                                #[cfg(not(all(unix, not(target_os = "android"))))]
+                                {
+                                    app.add_output("Reload is not available on this platform.");
+                                }
+                            }
                             // Check if an /update was requested
                             if let Some(force) = app.pending_update.take() {
                                 app.add_output(if force { "Force updating..." } else { "Checking for updates..." });
@@ -9522,6 +9555,10 @@ fn handle_remote_client_key(
         (KeyModifiers::CONTROL, Char('f')) | (_, Right) => {
             app.input.move_cursor_right();
         }
+        (KeyModifiers::CONTROL, Char('r')) => {
+            // Reload local remote client binary
+            app.pending_reload = true;
+        }
         (KeyModifiers::CONTROL, Char('l')) => {
             // Redraw screen - filter output to only show server data
             app.current_world_mut().filter_to_server_output();
@@ -9778,6 +9815,10 @@ fn handle_remote_client_key(
                     Command::Update { force } => {
                         // Signal to the outer run_console_client loop to handle locally
                         app.pending_update = Some(force);
+                    }
+                    Command::Reload => {
+                        // Reload the local remote client binary
+                        app.pending_reload = true;
                     }
                     Command::Connect { .. } => {
                         let _ = ws_tx.send(WsMessage::ConnectWorld {

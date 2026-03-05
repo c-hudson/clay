@@ -3294,8 +3294,10 @@
 
         // WebView mode: show image splash instead of text splash
         if (window.WEBVIEW_MODE && world.showing_splash) {
+            // On Windows WebView2, custom protocol "clay://" is served as "http://clay.localhost/"
+            const imgBase = window.location.origin || 'clay://localhost';
             elements.output.innerHTML = '<div style="display:flex;flex-direction:column;align-items:center;justify-content:center;height:100%;gap:5px;">' +
-                '<img src="clay://localhost/clay2.png" alt="Clay" style="width:200px;height:200px;">' +
+                '<img src="' + imgBase + '/clay2.png" alt="Clay" style="width:200px;height:200px;">' +
                 '<div style="color:#ff87ff;font-style:italic;">A 90dies mud client written today</div>' +
                 '<div style="color:#888;">/help for how to use clay</div>' +
                 '</div>';
