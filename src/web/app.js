@@ -6798,10 +6798,13 @@
             if (elements.authModal.classList.contains('visible')) return;
 
             // Prevent browser's quick find (/) and focus input instead
+            // But allow '/' in any text input or textarea (e.g., web settings path fields)
             if (e.key === '/' && document.activeElement !== elements.input &&
                 document.activeElement !== elements.filterInput &&
                 document.activeElement !== elements.actionFilter &&
-                document.activeElement !== elements.worldFilter) {
+                document.activeElement !== elements.worldFilter &&
+                document.activeElement.tagName !== 'INPUT' &&
+                document.activeElement.tagName !== 'TEXTAREA') {
                 e.preventDefault();
                 elements.input.focus();
                 return;

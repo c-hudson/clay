@@ -8,7 +8,7 @@
     --input-bg: var(--theme-bg-deep, #0a0a0a);
     --border-color: var(--theme-border-medium, #404040);
     --accent-color: var(--theme-accent, #00cdcd);
-    --error-color: var(--theme-error, #cd0000);
+    --error-color: var(--theme-error, #dc2626);
     --success-color: var(--theme-success, #00cd00);
     --warning-color: var(--theme-highlight, #cdcd00);
     --separator-color: var(--theme-border-medium, #404040);
@@ -1014,8 +1014,8 @@ body.device-phone #output-container { padding: 6px 10px; }
 }
 
 .modal-buttons button.btn-danger {
-    background: #dc2626;
-    border-color: #dc2626;
+    background: var(--theme-error, #dc2626);
+    border-color: var(--theme-error, #dc2626);
     color: #ffffff;
     margin-right: auto;
 }
@@ -1445,7 +1445,7 @@ body.device-phone #output-container { padding: 6px 10px; }
     gap: 8px;
     padding: 12px 16px;
     border-top: 1px solid var(--theme-border-subtle, rgba(255, 255, 255, 0.06));
-    background: var(--theme-bg, #141418);
+    background: var(--theme-bg-elevated, #1a1a1f);
 }
 
 .world-editor-modal-content .btn {
@@ -1483,8 +1483,8 @@ body.device-phone #output-container { padding: 6px 10px; }
 }
 
 .world-editor-modal-content .btn-danger {
-    background: #dc2626;
-    border-color: #dc2626;
+    background: var(--theme-error, #dc2626);
+    border-color: var(--theme-error, #dc2626);
     color: #ffffff;
     font-weight: 700;
     margin-right: auto;

@@ -2266,15 +2266,17 @@ impl World {
                 self.write_log_line(line);
             }
 
-            // Calculate visual lines FIRST (before pause check) to properly handle long wrapped lines
-            let visual_lines = visual_line_count(line, output_width as usize);
+            // Use wrap_ansi_line for accurate visual line count — visual_line_count uses
+            // character-based division which undercounts when word wrapping pushes words
+            // to the next line, causing more-mode to pause too late.
+            let visual_lines = wrap_ansi_line(line, output_width as usize).len().max(1);
 
             // Track if this line goes to pending (for partial tracking)
             let goes_to_pending = self.paused && settings.more_mode_enabled;
             // Use projected line count (current + this line's visual lines) for pause trigger
             let triggers_pause = !goes_to_pending
                 && settings.more_mode_enabled
-                && (self.lines_since_pause + visual_lines) > max_lines;
+                && (self.lines_since_pause + visual_lines) >= max_lines;
 
             // Pre-wrap oversized lines: call wrap_ansi_line once and store each visual
             // line as a separate OutputLine. This caches the wrap result so the renderer
@@ -2304,8 +2306,10 @@ impl World {
                     }
                     if !is_current { self.unseen_lines += wrapped.len(); }
                 } else {
-                    // First max_lines visual lines -> output, rest -> pending
-                    for vl in wrapped.iter().take(max_lines) {
+                    // Fill remaining screen space, rest -> pending
+                    let remaining = max_lines.saturating_sub(self.lines_since_pause);
+                    let take_count = remaining.min(wrapped.len());
+                    for vl in wrapped.iter().take(take_count) {
                         let seq = self.next_seq; self.next_seq += 1;
                         let mut fl = if from_server { OutputLine::new(vl.clone(), seq) }
                                  else { OutputLine::new_client(vl.clone(), seq) };
@@ -2313,21 +2317,23 @@ impl World {
                         self.output_lines.push(fl);
                         self.lines_since_pause += 1; // each pre-wrapped line is 1 visual line
                     }
-                    if !is_current {
+                    if !is_current && take_count > 0 {
                         if self.unseen_lines == 0 && self.first_unseen_at.is_none() {
                             self.first_unseen_at = Some(std::time::Instant::now());
                         }
-                        self.unseen_lines += wrapped.len().min(max_lines);
+                        self.unseen_lines += take_count;
                     }
-                    self.scroll_to_bottom();
+                    if take_count > 0 {
+                        self.scroll_to_bottom();
+                    }
                     self.paused = true;
 
                     // Remaining visual lines -> pending
-                    if wrapped.len() > max_lines {
+                    if wrapped.len() > take_count {
                         if self.pending_lines.is_empty() {
                             self.pending_since = Some(std::time::Instant::now());
                         }
-                        for vl in wrapped.iter().skip(max_lines) {
+                        for vl in wrapped.iter().skip(take_count) {
                             let seq = self.next_seq; self.next_seq += 1;
                             let mut cl = if from_server { OutputLine::new(vl.clone(), seq) }
                                      else { OutputLine::new_client(vl.clone(), seq) };
@@ -2367,23 +2373,64 @@ impl World {
                     self.partial_in_pending = true;
                 }
             } else if triggers_pause {
-                // Add line to output_lines BEFORE pausing so it's visible when we scroll to bottom
-                new_line.marked_new = !is_current;
-                self.output_lines.push(new_line);
-                self.lines_since_pause += visual_lines;
-                if !is_current {
-                    if self.unseen_lines == 0 && self.first_unseen_at.is_none() {
-                        self.first_unseen_at = Some(std::time::Instant::now());
+                // Calculate how many visual lines can still fit on screen
+                let remaining = max_lines.saturating_sub(self.lines_since_pause);
+
+                if !is_partial && visual_lines > 1 && remaining < visual_lines {
+                    // Split the wrapped line: fit what we can on screen, rest goes to pending
+                    let wrapped = wrap_ansi_line(line, output_width as usize);
+                    let take_count = remaining.min(wrapped.len());
+
+                    for vl in wrapped.iter().take(take_count) {
+                        let seq = self.next_seq; self.next_seq += 1;
+                        let mut fl = if from_server { OutputLine::new(vl.clone(), seq) }
+                                 else { OutputLine::new_client(vl.clone(), seq) };
+                        fl.marked_new = !is_current;
+                        self.output_lines.push(fl);
+                        self.lines_since_pause += 1;
                     }
-                    self.unseen_lines += 1;
-                }
-                // Scroll to show the triggering line, then pause for subsequent lines
-                self.scroll_to_bottom();
-                self.paused = true;
-                // Note: pending_since will be set when the NEXT line arrives and goes to pending_lines
-                if is_partial {
-                    self.partial_line = line.to_string();
-                    self.partial_in_pending = false; // It went to output_lines, not pending
+                    if !is_current && take_count > 0 {
+                        if self.unseen_lines == 0 && self.first_unseen_at.is_none() {
+                            self.first_unseen_at = Some(std::time::Instant::now());
+                        }
+                        self.unseen_lines += take_count;
+                    }
+                    if take_count > 0 {
+                        self.scroll_to_bottom();
+                    }
+                    self.paused = true;
+
+                    // Remaining visual lines go to pending
+                    if wrapped.len() > take_count {
+                        if self.pending_lines.is_empty() {
+                            self.pending_since = Some(std::time::Instant::now());
+                        }
+                        for vl in wrapped.iter().skip(take_count) {
+                            let seq = self.next_seq; self.next_seq += 1;
+                            let mut cl = if from_server { OutputLine::new(vl.clone(), seq) }
+                                     else { OutputLine::new_client(vl.clone(), seq) };
+                            cl.marked_new = !is_current;
+                            self.pending_lines.push(cl);
+                            if !is_current { self.unseen_lines += 1; }
+                        }
+                    }
+                } else {
+                    // Single visual line or fits in remaining space - add whole line
+                    new_line.marked_new = !is_current;
+                    self.output_lines.push(new_line);
+                    self.lines_since_pause += visual_lines;
+                    if !is_current {
+                        if self.unseen_lines == 0 && self.first_unseen_at.is_none() {
+                            self.first_unseen_at = Some(std::time::Instant::now());
+                        }
+                        self.unseen_lines += 1;
+                    }
+                    self.scroll_to_bottom();
+                    self.paused = true;
+                    if is_partial {
+                        self.partial_line = line.to_string();
+                        self.partial_in_pending = false;
+                    }
                 }
             } else {
                 new_line.marked_new = !is_current;
@@ -13772,12 +13819,16 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                         }
                                     }
                                 }
+                                // Don't skip draw — button clicks may open new popups
+                                // whose hit_areas need to be populated by the render pass
                             }
                             MouseEventKind::Drag(MouseButton::Left) => {
                                 handle_popup_mouse_highlight_drag(&mut app, mouse.column, mouse.row);
+                                continue;
                             }
                             MouseEventKind::Up(MouseButton::Left) => {
                                 handle_popup_mouse_highlight_end(&mut app);
+                                continue;
                             }
                             MouseEventKind::ScrollUp => {
                                 if let Some(state) = app.popup_manager.current_mut() {
@@ -13788,6 +13839,7 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                 if let Some(state) = app.popup_manager.current() {
                                     popup::console_renderer::render_popup_content_direct(state, &tc);
                                 }
+                                continue;
                             }
                             MouseEventKind::ScrollDown => {
                                 if let Some(state) = app.popup_manager.current_mut() {
@@ -13798,11 +13850,13 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                                 if let Some(state) = app.popup_manager.current() {
                                     popup::console_renderer::render_popup_content_direct(state, &tc);
                                 }
+                                continue;
                             }
-                            _ => {}
+                            _ => { continue; }
                         }
+                    } else {
+                        continue;
                     }
-                    continue;
                 }
                 if let Event::Key(key) = event {
                     if key.kind != KeyEventKind::Press { continue; }
@@ -15336,7 +15390,11 @@ fn handle_popup_mouse_click(app: &mut App, column: u16, row: u16) -> bool {
                         return false;
                     }
                     popup::ElementSelection::Button(button_id) => {
-                        state.selected = popup::ElementSelection::Button(*button_id);
+                        let button_id = *button_id;
+                        if state.editing {
+                            state.commit_edit();
+                        }
+                        state.selected = popup::ElementSelection::Button(button_id);
                         return true; // Caller should trigger button action
                     }
                     popup::ElementSelection::None => {}
@@ -15366,8 +15424,38 @@ fn screen_to_content_line(app: &App, column: u16, row: u16) -> Option<(popup::Fi
 }
 
 /// Start a mouse highlight on mouse down in a content area.
-/// Returns true if the click was in a content area (highlight started).
+/// Returns true if the click was in a content area (highlight started or scrollbar clicked).
 fn handle_popup_mouse_highlight_start(app: &mut App, column: u16, row: u16) -> bool {
+    // Check for scrollbar clicks first (rightmost column of content areas with overflow)
+    if let Some(state) = app.popup_manager.current() {
+        for ca in &state.content_areas {
+            let scrollbar_x = ca.area.x + ca.area.width.saturating_sub(1);
+            if column == scrollbar_x
+                && row >= ca.area.y && row < ca.area.y + ca.area.height
+                && ca.total_lines > ca.area.height as usize
+            {
+                let visible = ca.area.height as usize;
+                let total = ca.total_lines;
+                let max_scroll = total.saturating_sub(visible);
+                let scroll = ca.scroll_offset;
+                let thumb_size = (visible as f64 / total as f64 * visible as f64).max(1.0) as usize;
+                let thumb_pos = if max_scroll == 0 { 0 } else {
+                    (scroll as f64 / max_scroll as f64 * (visible - thumb_size) as f64) as usize
+                };
+                let click_row = (row - ca.area.y) as usize;
+                let page = visible.saturating_sub(1).max(1);
+                if click_row < thumb_pos {
+                    let state = app.popup_manager.current_mut().unwrap();
+                    state.mouse_scroll_up_by(page);
+                } else if click_row >= thumb_pos + thumb_size {
+                    let state = app.popup_manager.current_mut().unwrap();
+                    state.mouse_scroll_down_by(page);
+                }
+                return true;
+            }
+        }
+    }
+
     if let Some((field_id, line)) = screen_to_content_line(app, column, row) {
         if let Some(state) = app.popup_manager.current_mut() {
             // Select this field

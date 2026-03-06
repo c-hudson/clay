@@ -1665,6 +1665,45 @@ impl PopupState {
         self.scroll_any_content_down(1);
     }
 
+    /// Handle mouse scrollbar click: scroll up by amount (lists or content)
+    pub fn mouse_scroll_up_by(&mut self, amount: usize) {
+        for field in &mut self.definition.fields {
+            match &mut field.kind {
+                FieldKind::List { scroll_offset, .. } => {
+                    *scroll_offset = scroll_offset.saturating_sub(amount);
+                    return;
+                }
+                FieldKind::ScrollableContent { scroll_offset, .. } => {
+                    *scroll_offset = scroll_offset.saturating_sub(amount);
+                    return;
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// Handle mouse scrollbar click: scroll down by amount (lists or content)
+    pub fn mouse_scroll_down_by(&mut self, amount: usize) {
+        let actual_height = self.actual_content_height;
+        for field in &mut self.definition.fields {
+            match &mut field.kind {
+                FieldKind::List { items, scroll_offset, visible_height, .. } => {
+                    let effective_height = actual_height.unwrap_or(*visible_height);
+                    let max_scroll = items.len().saturating_sub(effective_height);
+                    *scroll_offset = (*scroll_offset + amount).min(max_scroll);
+                    return;
+                }
+                FieldKind::ScrollableContent { lines, scroll_offset, visible_height } => {
+                    let effective_height = actual_height.unwrap_or(*visible_height);
+                    let max_scroll = lines.len().saturating_sub(effective_height);
+                    *scroll_offset = (*scroll_offset + amount).min(max_scroll);
+                    return;
+                }
+                _ => {}
+            }
+        }
+    }
+
     /// Scroll any scrollable content field up (regardless of selection)
     fn scroll_any_content_up(&mut self, amount: usize) {
         for field in &mut self.definition.fields {

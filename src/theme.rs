@@ -109,7 +109,7 @@ impl ThemeColors {
             accent_dim: ThemeColor::new(0x00, 0x40, 0x80), // #004080
             highlight: ThemeColor::new(0xe8, 0xc4, 0x6a),  // #e8c46a
             success: ThemeColor::new(0x7e, 0xcf, 0x8b),    // #7ecf8b
-            error: ThemeColor::new(0xb1, 0x0a, 0x0a),      // #b10a0a
+            error: ThemeColor::new(0xdc, 0x26, 0x26),      // #dc2626
             error_dim: ThemeColor::new(0x5f, 0x00, 0x00),   // #5f0000
 
             // UI elements
