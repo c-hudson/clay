@@ -1649,7 +1649,8 @@ impl PopupState {
                 return;
             }
         }
-        self.scroll_up(1);
+        // Scroll the first scrollable content field (works even when button is selected)
+        self.scroll_any_content_up(1);
     }
 
     /// Handle mouse scroll down: moves list selection or scrolls content
@@ -1660,7 +1661,31 @@ impl PopupState {
                 return;
             }
         }
-        self.scroll_down(1);
+        // Scroll the first scrollable content field (works even when button is selected)
+        self.scroll_any_content_down(1);
+    }
+
+    /// Scroll any scrollable content field up (regardless of selection)
+    fn scroll_any_content_up(&mut self, amount: usize) {
+        for field in &mut self.definition.fields {
+            if let FieldKind::ScrollableContent { scroll_offset, .. } = &mut field.kind {
+                *scroll_offset = scroll_offset.saturating_sub(amount);
+                return;
+            }
+        }
+    }
+
+    /// Scroll any scrollable content field down (regardless of selection)
+    fn scroll_any_content_down(&mut self, amount: usize) {
+        let actual_height = self.actual_content_height;
+        for field in &mut self.definition.fields {
+            if let FieldKind::ScrollableContent { lines, scroll_offset, visible_height } = &mut field.kind {
+                let effective_height = actual_height.unwrap_or(*visible_height);
+                let max_scroll = lines.len().saturating_sub(effective_height);
+                *scroll_offset = (*scroll_offset + amount).min(max_scroll);
+                return;
+            }
+        }
     }
 
     /// Get the currently selected item in a list field

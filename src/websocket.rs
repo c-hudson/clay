@@ -151,6 +151,8 @@ pub enum WsMessage {
     CreateWorld { name: String },
     /// Request to release pending lines (count = number to release, 0 = all)
     ReleasePending { world_index: usize, count: usize },
+    /// Selective flush: release only highlighted pending lines, discard rest
+    SelectiveFlush { world_index: usize },
     MarkWorldSeen { world_index: usize },
     /// Update client's view state (world index and visible lines for more-mode calculation)
     UpdateViewState { world_index: usize, visible_lines: usize },
@@ -693,6 +695,20 @@ impl WebSocketServer {
         }
     }
 
+    /// Send InitialState to a client AND atomically mark received_initial_state = true.
+    /// Uses a spawned task with write().await to avoid the race condition where
+    /// try_write() silently fails due to concurrent read locks.
+    pub fn send_initial_state_and_mark(&self, client_id: u64, msg: WsMessage) {
+        let clients = self.clients.clone();
+        tokio::spawn(async move {
+            let mut guard = clients.write().await;
+            if let Some(client) = guard.get_mut(&client_id) {
+                let _ = client.tx.send(msg);
+                client.received_initial_state = true;
+            }
+        });
+    }
+
     /// Get the current whitelisted host (for saving state)
     pub fn get_whitelisted_host(&self) -> Option<String> {
         self.whitelisted_host.read().unwrap().clone()
@@ -785,6 +801,17 @@ impl WebSocketServer {
                     let _ = client.tx.send(msg.clone());
                 }
             }
+        } else {
+            // Lock contention - fall back to async broadcast to avoid silently dropping messages
+            let clients = self.clients.clone();
+            tokio::spawn(async move {
+                let clients_guard = clients.read().await;
+                for client in clients_guard.values() {
+                    if client.authenticated && client.received_initial_state {
+                        let _ = client.tx.send(msg.clone());
+                    }
+                }
+            });
         }
     }
 

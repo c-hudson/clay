@@ -173,7 +173,7 @@ Clay is a terminal-based MUD (Multi-User Dungeon) client built with ratatui/cros
 - **FilterPopup**: Modal filter popup for searching/filtering output text (F4)
 - **Encoding**: Character encoding enum (Utf8, Latin1, Fansi) with decode method
 - **StreamReader/StreamWriter**: Wrapper enums supporting both plain TCP and TLS streams
-- **OutputLine**: Output line with timestamp and `from_server` flag (true = MUD server data, false = client-generated)
+- **OutputLine**: Output line with timestamp, `from_server` flag (true = MUD server data, false = client-generated), and `marked_new` flag (true if line arrived while user wasn't viewing this world)
 
 ### Screen Layout
 
@@ -476,15 +476,28 @@ This logic applies to all interfaces (console, web, GUI). Remote clients query t
 - `Ctrl+W` - Delete word before cursor
 - `Ctrl+P/N` - Previous/Next command history
 - `Ctrl+Q` - Spell suggestions / cycle and replace
+- `Ctrl+G` - Terminal bell/beep
+- `Ctrl+T` - Transpose two characters before cursor
+- `Ctrl+V` - Insert next character literally (console only, not web)
 - `Ctrl+A` or `Home/End` - Jump to start/end (Ctrl+A = start only)
 - `Tab` - Command completion (when input starts with `/` or `#`); more-mode takes priority if paused
+- `Escape` then `Space` - Collapse multiple spaces around cursor to one
+- `Escape` then `-` - Jump to matching bracket (`()[]{}`)
+- `Escape` then `.` or `_` - Insert last word from previous history entry
+- `Escape` then `p` - Search history backward (entries starting with current input)
+- `Escape` then `n` - Search history forward (continues backward search)
+- `Escape` then `Backspace` - Delete word backward (punctuation-delimited)
 
 **Output Scrollback:**
 - `PageUp` - Scroll back in history (enables more-pause)
 - `PageDown` - Scroll forward (unpauses if at bottom)
 - `Tab` - Release one screenful of pending lines (when paused); scroll down like PgDn (when viewing history)
 - `Escape` then `j` - Jump to end, release all pending lines
+- `Escape` then `J` (uppercase) - Selective flush: keep only highlighted pending lines, discard rest
+- `Escape` then `h` - Half-page scroll up or release half screenful of pending
 - `Alt+w` (or `Escape` then `w`) - Switch to world with activity (priority: oldest pending → unseen output → previous world)
+- `Escape` then `b` - Switch to previous world (same as `fg -<`)
+- `Escape` then `f` - Switch to next world (same as `fg ->`)
 - `F4` - Open filter popup to search output
 
 **General:**
@@ -934,12 +947,24 @@ Note: HTTP automatically starts the non-secure WebSocket server if not already r
 - `PageUp/PageDown` - Scroll output history
 - `Tab` - Release one screenful when paused; scroll down one screenful otherwise (like `more`)
 - `Escape+j` - Jump to end, release all pending
+- `Escape+J` - Selective flush (keep highlighted pending, discard rest)
 - `Escape+w` or `Alt+w` - Switch to world with activity (oldest pending/unseen)
+- `Escape+b` - Switch to previous world
+- `Escape+f` - Switch to next world
+- `Escape+h` - Half-page scroll/release
 - `Ctrl+P/N` - Command history navigation
 - `Ctrl+U` - Clear input
 - `Ctrl+W` - Delete word before cursor
 - `Ctrl+A` - Move cursor to beginning of line
+- `Ctrl+G` - Bell (no-op in browser)
+- `Ctrl+T` - Transpose characters
 - `Alt+Up/Down` - Resize input area
+- `Escape+Space` - Collapse multiple spaces to one
+- `Escape+-` - Goto matching bracket
+- `Escape+.` / `Escape+_` - Insert last word of previous history
+- `Escape+p` - Search history backward
+- `Escape+n` - Search history forward
+- `Escape+Backspace` - Delete word back (punctuation-delimited)
 - `F2` - Toggle MUD tag display (show/hide tags and timestamps)
 - `F4` - Open filter popup to search output
 - `F8` - Toggle action pattern highlighting
@@ -1226,7 +1251,12 @@ Opened with `F4`:
 
 Toggle with `F2`:
 
-- MUD tags are prefixes like `[channel:]` or `[channel(player)]` at the start of lines
+- MUD tags are prefixes matching two specific patterns at the start of lines:
+  - `[name:] ` — colon immediately before `]`, e.g., `[Public:] Hello`
+  - `[name(content)optional] ` — non-empty parens, e.g., `[Chat(Bob)] Hello`
+  - A space after `] ` is required — `[tag:]text` without space is not stripped
+  - Empty parens are not matched — `[time()]` is not a tag
+  - Leading ANSI color codes before `[` are preserved
 - When hidden (default), tags are stripped from display but preserved in buffer
 - When shown, full lines including tags are displayed with timestamps
 - **Timestamps**: Each line shows when it was received
@@ -1249,6 +1279,7 @@ Actions are automated triggers that match incoming MUD output against patterns a
 - ANSI color codes are stripped before pattern matching
 - World-specific actions only match for their configured world (empty = all worlds)
 - When a pattern matches, the action's commands are executed (sent to the server)
+- Regexes are pre-compiled on the `Action` struct (`compiled_regex` field) and recompiled only when the action is created, edited, toggled, or loaded from settings
 
 **Match Types:**
 - Each action has a configurable match type: **Regexp** (default) or **Wildcard**
@@ -1405,7 +1436,7 @@ Tab completion for commands when input starts with `/`:
 
 **Behavior:**
 - Press `Tab` when input starts with `/` to cycle through matching commands
-- Matches internal commands: `/help`, `/disconnect`, `/dc`, `/send`, `/worlds`, `/connections`, `/setup`, `/web`, `/actions`, `/keepalive`, `/reload`, `/quit`, `/gag`
+- Matches internal commands: `/help`, `/disconnect`, `/dc`, `/send`, `/worlds`, `/connections`, `/setup`, `/web`, `/actions`, `/reload`, `/quit`, `/gag`
 - Also matches manual actions (actions with empty patterns)
 - Completion is case-insensitive
 - Pressing `Tab` multiple times cycles through all matches alphabetically

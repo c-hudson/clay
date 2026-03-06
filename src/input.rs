@@ -34,6 +34,8 @@ pub struct InputArea {
     pub history: Vec<String>,
     pub history_index: Option<usize>,
     pub temp_input: String,
+    pub search_prefix: Option<String>,  // Prefix being searched (set on first ^[p/^[n)
+    pub search_index: Option<usize>,    // Position in history during search
 }
 
 impl InputArea {
@@ -48,6 +50,8 @@ impl InputArea {
             history: Vec::new(),
             history_index: None,
             temp_input: String::new(),
+            search_prefix: None,
+            search_index: None,
         }
     }
 
@@ -501,6 +505,202 @@ impl InputArea {
 
         let word: String = chars[start..end].iter().collect();
         Some((start, end, word))
+    }
+
+    /// Transpose the two characters before the cursor (Ctrl+T).
+    /// If at end, swap last two chars. Otherwise swap char before cursor with char at cursor, advance cursor.
+    pub fn transpose_chars(&mut self) {
+        let chars: Vec<char> = self.buffer.chars().collect();
+        if chars.len() < 2 {
+            return;
+        }
+        let char_pos = self.buffer[..self.cursor_position].chars().count();
+        if char_pos == 0 {
+            return;
+        }
+        let (a, b) = if char_pos >= chars.len() {
+            // At end: swap last two chars
+            (chars.len() - 2, chars.len() - 1)
+        } else {
+            // Swap char before cursor with char at cursor, advance cursor
+            (char_pos - 1, char_pos)
+        };
+        let mut new_chars = chars;
+        new_chars.swap(a, b);
+        self.buffer = new_chars.into_iter().collect();
+        // Position cursor after the swapped pair
+        let new_char_pos = b + 1;
+        self.cursor_position = self.buffer.chars().take(new_char_pos).map(|c| c.len_utf8()).sum();
+        self.adjust_viewport();
+    }
+
+    /// Collapse multiple spaces around cursor to a single space (Esc+Space).
+    pub fn collapse_spaces(&mut self) {
+        let chars: Vec<char> = self.buffer.chars().collect();
+        let char_pos = self.buffer[..self.cursor_position].chars().count();
+        if chars.is_empty() {
+            return;
+        }
+        // Find extent of space run around cursor
+        let mut start = char_pos;
+        while start > 0 && chars[start - 1] == ' ' {
+            start -= 1;
+        }
+        let mut end = char_pos;
+        while end < chars.len() && chars[end] == ' ' {
+            end += 1;
+        }
+        if end - start <= 1 {
+            return; // 0 or 1 space, nothing to collapse
+        }
+        // Replace run with single space
+        let before: String = chars[..start].iter().collect();
+        let after: String = chars[end..].iter().collect();
+        self.buffer = format!("{} {}", before, after);
+        self.cursor_position = before.len() + 1; // After the single space
+        self.adjust_viewport();
+    }
+
+    /// Insert last word from previous history entry (Esc+. / Esc+_).
+    pub fn last_argument(&mut self) {
+        if self.history.is_empty() {
+            return;
+        }
+        let prev = &self.history[self.history.len() - 1];
+        if let Some(word) = prev.split_whitespace().last() {
+            let word = word.to_string();
+            self.buffer.insert_str(self.cursor_position, &word);
+            self.cursor_position += word.len();
+            self.adjust_viewport();
+        }
+    }
+
+    /// Move cursor to matching bracket (Esc+-).
+    pub fn goto_matching_bracket(&mut self) {
+        let chars: Vec<char> = self.buffer.chars().collect();
+        let char_pos = self.buffer[..self.cursor_position].chars().count();
+        if char_pos >= chars.len() {
+            return;
+        }
+        let ch = chars[char_pos];
+        let (open, close, forward) = match ch {
+            '(' => ('(', ')', true),
+            '[' => ('[', ']', true),
+            '{' => ('{', '}', true),
+            ')' => ('(', ')', false),
+            ']' => ('[', ']', false),
+            '}' => ('{', '}', false),
+            _ => return,
+        };
+        let mut depth = 0i32;
+        if forward {
+            for i in char_pos..chars.len() {
+                if chars[i] == open { depth += 1; }
+                if chars[i] == close { depth -= 1; }
+                if depth == 0 {
+                    self.cursor_position = chars[..i].iter().map(|c| c.len_utf8()).sum();
+                    self.adjust_viewport();
+                    return;
+                }
+            }
+        } else {
+            for i in (0..=char_pos).rev() {
+                if chars[i] == close { depth += 1; }
+                if chars[i] == open { depth -= 1; }
+                if depth == 0 {
+                    self.cursor_position = chars[..i].iter().map(|c| c.len_utf8()).sum();
+                    self.adjust_viewport();
+                    return;
+                }
+            }
+        }
+    }
+
+    /// Delete word backward stopping at punctuation boundaries (Esc+Backspace).
+    /// Like delete_word_before_cursor but treats non-alphanumeric as word boundaries.
+    pub fn backward_kill_word_punctuation(&mut self) {
+        if self.cursor_position == 0 {
+            return;
+        }
+        let before_cursor: String = self.buffer[..self.cursor_position].to_string();
+        let mut chars: Vec<char> = before_cursor.chars().collect();
+
+        // Skip whitespace immediately before cursor
+        while !chars.is_empty() && chars.last().is_some_and(|c| c.is_whitespace()) {
+            chars.pop();
+        }
+
+        // Delete until we hit whitespace or a different character class
+        // If starting on punctuation, delete punctuation. If on alnum, delete alnum.
+        if let Some(&last) = chars.last() {
+            if last.is_alphanumeric() {
+                while !chars.is_empty() && chars.last().is_some_and(|c| c.is_alphanumeric()) {
+                    chars.pop();
+                }
+            } else {
+                // Punctuation: delete one run of non-alnum non-whitespace
+                while !chars.is_empty() && chars.last().is_some_and(|c| !c.is_alphanumeric() && !c.is_whitespace()) {
+                    chars.pop();
+                }
+            }
+        }
+
+        let new_before: String = chars.into_iter().collect();
+        let after_cursor = &self.buffer[self.cursor_position..];
+        self.cursor_position = new_before.len();
+        self.buffer = new_before + after_cursor;
+        self.adjust_viewport();
+    }
+
+    /// Search history backward for entries starting with current prefix (Esc+p).
+    pub fn history_search_backward(&mut self) {
+        if self.history.is_empty() {
+            return;
+        }
+        // On first call, save current input as search prefix
+        if self.search_prefix.is_none() {
+            self.search_prefix = Some(self.buffer.clone());
+            self.search_index = Some(self.history.len()); // Start past end
+        }
+        let prefix = self.search_prefix.clone().unwrap_or_default();
+        let start = self.search_index.unwrap_or(self.history.len());
+        // Scan backward from start-1
+        if start == 0 {
+            return; // Already at beginning
+        }
+        for i in (0..start).rev() {
+            if self.history[i].starts_with(&prefix) {
+                self.search_index = Some(i);
+                self.buffer = self.history[i].clone();
+                self.cursor_position = self.buffer.len();
+                self.adjust_viewport();
+                return;
+            }
+        }
+    }
+
+    /// Search history forward for entries starting with current prefix (Esc+n).
+    pub fn history_search_forward(&mut self) {
+        if self.search_prefix.is_none() {
+            return; // No active search
+        }
+        let prefix = self.search_prefix.clone().unwrap_or_default();
+        let start = self.search_index.unwrap_or(0);
+        // Scan forward from start+1
+        for i in (start + 1)..self.history.len() {
+            if self.history[i].starts_with(&prefix) {
+                self.search_index = Some(i);
+                self.buffer = self.history[i].clone();
+                self.cursor_position = self.buffer.len();
+                self.adjust_viewport();
+                return;
+            }
+        }
+        // Past end: restore original input
+        self.buffer = prefix;
+        self.cursor_position = self.buffer.len();
+        self.search_index = Some(self.history.len());
+        self.adjust_viewport();
     }
 
     pub fn replace_word(&mut self, start: usize, end: usize, new_word: &str) {

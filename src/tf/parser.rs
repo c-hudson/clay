@@ -1586,18 +1586,20 @@ fn cmd_listvar(engine: &TfEngine, args: &str) -> TfCommandResult {
     let mut vars: Vec<(&String, &TfValue)> = engine.global_vars.iter().collect();
     vars.sort_by_key(|(k, _)| k.as_str());
 
+    // Pre-compile glob regex once before the loop
+    let compiled_glob = if !pattern.is_empty() && (pattern.contains('*') || pattern.contains('?')) {
+        let regex_pattern = pattern.replace("*", ".*").replace("?", ".");
+        regex::Regex::new(&format!("^{}$", regex_pattern)).ok()
+    } else {
+        None
+    };
+
     let mut output = Vec::new();
     for (name, value) in vars {
         // If pattern given, filter by glob match
         if !pattern.is_empty() {
-            let matches = if pattern.contains('*') || pattern.contains('?') {
-                // Glob pattern matching
-                let regex_pattern = pattern
-                    .replace("*", ".*")
-                    .replace("?", ".");
-                regex::Regex::new(&format!("^{}$", regex_pattern))
-                    .map(|r| r.is_match(name))
-                    .unwrap_or(false)
+            let matches = if let Some(ref re) = compiled_glob {
+                re.is_match(name)
             } else {
                 // Substring match
                 name.contains(pattern)

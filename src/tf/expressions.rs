@@ -1430,11 +1430,14 @@ impl<'a> Evaluator<'a> {
                 // Clear previous captures
                 self.engine.regex_captures.clear();
 
-                // Compile regex
-                let regex = match Regex::new(&pattern) {
-                    Ok(r) => r,
-                    Err(e) => return Err(format!("Invalid regex: {}", e)),
-                };
+                // Get or compile regex (cached)
+                if !self.regex_cache.contains_key(&pattern) {
+                    match Regex::new(&pattern) {
+                        Ok(r) => { self.regex_cache.insert(pattern.clone(), r); }
+                        Err(e) => return Err(format!("Invalid regex: {}", e)),
+                    }
+                }
+                let regex = self.regex_cache.get(&pattern).unwrap();
 
                 // Try to match
                 if let Some(caps) = regex.captures(&text) {

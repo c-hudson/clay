@@ -46,8 +46,23 @@ pub enum TestEvent {
     WsBroadcastReleased(usize, usize),
     /// WS broadcast: UnseenCleared { world_index }
     WsBroadcastUnseenCleared(usize),
-    /// WS broadcast: ServerData { world_index, ... }
-    WsBroadcastServerData(usize),
+    /// WS broadcast: ServerData { world_index, marked_new }
+    WsBroadcastServerData(usize, bool),
+}
+
+/// State checks for AssertState action
+#[derive(Debug, Clone)]
+pub enum StateCheck {
+    /// Assert world.unseen_lines == expected
+    UnseenLines(usize),
+    /// Assert world.paused == expected
+    Paused(bool),
+    /// Assert world.pending_lines.len() == expected
+    PendingCount(usize),
+    /// Assert world.output_lines.len() == expected
+    OutputLineCount(usize),
+    /// Assert app.activity_count() == expected (world_name ignored)
+    ActivityCount(usize),
 }
 
 /// Configuration for a test world
@@ -91,6 +106,10 @@ pub enum TestAction {
     WsMarkWorldSeen(String),
     /// Simulate WS client sending a command to a world
     WsSendCommand { world_name: String, command: String },
+    /// Assert count of marked_new lines (output_lines + pending_lines)
+    AssertMarkedNew { world_name: String, expected_count: usize },
+    /// Assert a specific world/app state value
+    AssertState { world_name: String, check: StateCheck },
 }
 
 /// Conditions to wait for
@@ -389,6 +408,69 @@ pub async fn run_test_scenario(
                     check_state_changes(&mut app, &mut events, &mut prev_activity, &mut prev_unseen, &mut prev_paused);
                     continue;
                 }
+                TestAction::AssertMarkedNew { world_name, expected_count } => {
+                    let world_name = world_name.clone();
+                    let expected_count = *expected_count;
+                    action_iter.next();
+                    if let Some(idx) = app.find_world_index(&world_name) {
+                        let actual = app.worlds[idx].output_lines.iter()
+                            .filter(|l| l.marked_new).count()
+                            + app.worlds[idx].pending_lines.iter()
+                            .filter(|l| l.marked_new).count();
+                        assert_eq!(actual, expected_count,
+                            "World '{}': expected {} marked_new lines, got {} (output: {}, pending: {})",
+                            world_name, expected_count, actual,
+                            app.worlds[idx].output_lines.iter().filter(|l| l.marked_new).count(),
+                            app.worlds[idx].pending_lines.iter().filter(|l| l.marked_new).count());
+                    } else {
+                        panic!("AssertMarkedNew: world '{}' not found", world_name);
+                    }
+                    check_state_changes(&mut app, &mut events, &mut prev_activity, &mut prev_unseen, &mut prev_paused);
+                    continue;
+                }
+                TestAction::AssertState { world_name, check } => {
+                    let world_name = world_name.clone();
+                    let check = check.clone();
+                    action_iter.next();
+                    match &check {
+                        StateCheck::ActivityCount(expected) => {
+                            let actual = app.activity_count();
+                            assert_eq!(actual, *expected,
+                                "Expected activity count {}, got {}", expected, actual);
+                        }
+                        _ => {
+                            if let Some(idx) = app.find_world_index(&world_name) {
+                                match &check {
+                                    StateCheck::UnseenLines(expected) => {
+                                        assert_eq!(app.worlds[idx].unseen_lines, *expected,
+                                            "World '{}': expected unseen_lines {}, got {}",
+                                            world_name, expected, app.worlds[idx].unseen_lines);
+                                    }
+                                    StateCheck::Paused(expected) => {
+                                        assert_eq!(app.worlds[idx].paused, *expected,
+                                            "World '{}': expected paused={}, got {}",
+                                            world_name, expected, app.worlds[idx].paused);
+                                    }
+                                    StateCheck::PendingCount(expected) => {
+                                        assert_eq!(app.worlds[idx].pending_lines.len(), *expected,
+                                            "World '{}': expected pending_count {}, got {}",
+                                            world_name, expected, app.worlds[idx].pending_lines.len());
+                                    }
+                                    StateCheck::OutputLineCount(expected) => {
+                                        assert_eq!(app.worlds[idx].output_lines.len(), *expected,
+                                            "World '{}': expected output_line_count {}, got {}",
+                                            world_name, expected, app.worlds[idx].output_lines.len());
+                                    }
+                                    StateCheck::ActivityCount(_) => unreachable!(),
+                                }
+                            } else {
+                                panic!("AssertState: world '{}' not found", world_name);
+                            }
+                        }
+                    }
+                    check_state_changes(&mut app, &mut events, &mut prev_activity, &mut prev_unseen, &mut prev_paused);
+                    continue;
+                }
             }
         } else {
             // No more actions - check if all connections are done
@@ -575,8 +657,8 @@ fn check_state_changes(
                 WsMessage::UnseenCleared { world_index } => {
                     events.push(TestEvent::WsBroadcastUnseenCleared(world_index));
                 }
-                WsMessage::ServerData { world_index, .. } => {
-                    events.push(TestEvent::WsBroadcastServerData(world_index));
+                WsMessage::ServerData { world_index, marked_new, .. } => {
+                    events.push(TestEvent::WsBroadcastServerData(world_index, marked_new));
                 }
                 _ => {
                     // Other WsMessage variants are not tracked

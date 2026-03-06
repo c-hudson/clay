@@ -19,20 +19,23 @@ A terminal-based MUD (Multi-User Dungeon) client built with Rust featuring multi
 - **Telnet Protocol** - Full telnet negotiation with keepalive support (SGA, TTYPE, EOR, NAWS)
 - **Auto-Login** - Configurable automatic login (Connect, Prompt, MOO modes)
 - **Hot Reload** - Update the binary without losing connections (`/reload`)
+- **Crash Recovery** - Automatic restart with state preservation on panic
 - **Self-Update** - Download and install latest release from GitHub (`/update`)
 - **TLS Proxy** - Optional proxy to preserve TLS connections across hot reload
 - **Spell Check** - Built-in spell checking with suggestions
+- **Command Completion** - Tab completion for `/` commands and action names
 - **Output Filtering** - Search/filter output with F4
 - **File Logging** - Per-world output logging
 - **ANSI Music** - BBS-style music playback (web/GUI interfaces)
 - **GMCP Media** - Server-driven sound effects and music via Client.Media protocol
-- **Actions/Triggers** - Pattern matching with regex or wildcard, auto-commands
+- **Actions/Triggers** - Pattern matching with regex or wildcard, auto-commands, startup actions
 - **TinyFugue Compatibility** - Full TF command support (`/def`, `/set`, `/if`, `/load`, etc.)
 - **Themes** - Customizable color themes for GUI/web via `~/clay.theme.dat` with browser-based theme editor
 - **Notes Editor** - Per-world split-screen notes editor (`/edit`)
 - **Termux Support** - Runs on Android via Termux
 - **Android App** - WebSocket client with push notifications via `/notify`
-- **Daemon Mode** - Run headless as a background process
+- **Daemon Mode** - Run headless as a background process (`-D`)
+- **Multiuser Mode** - Shared server with per-user worlds and actions (`--multiuser`)
 
 ## Installation
 
@@ -109,6 +112,15 @@ cargo build --release --no-default-features --features rustls-backend
 
 # Run as remote console client
 ./clay --console=hostname:port
+
+# Run as headless daemon server
+./clay -D
+
+# Run as multiuser server
+./clay --multiuser
+
+# Use custom config file (default: ~/.clay.dat)
+./clay --conf=/path/to/config.dat
 ```
 
 ## Commands
@@ -163,22 +175,62 @@ Clay will parse `/addworld` commands from your TF config file and create corresp
 
 ## Controls
 
+**World Switching:**
+
 | Key | Action |
 |-----|--------|
 | `Up/Down` | Switch between active worlds |
+| `Shift+Up/Down` | Cycle through all worlds |
+| `Escape b` | Previous world |
+| `Escape f` | Next world |
+| `Escape w` | Switch to world with activity |
+
+**Input Editing:**
+
+| Key | Action |
+|-----|--------|
+| `Left/Right` | Move cursor |
+| `Ctrl+A` / `Home` | Jump to start of line |
+| `Ctrl+E` / `End` | Jump to end of line |
+| `Ctrl+U` | Clear input |
+| `Ctrl+W` | Delete word backward |
+| `Ctrl+K` | Kill to end of line |
+| `Ctrl+D` | Delete character forward |
+| `Ctrl+T` | Transpose two characters before cursor |
+| `Ctrl+V` | Insert next character literally (console only) |
+| `Ctrl+G` | Terminal bell |
+| `Ctrl+P/N` | Previous/next command history |
+| `Ctrl+Q` | Spell suggestions |
+| `Tab` | Command completion (when input starts with `/`) |
+| `Escape Space` | Collapse multiple spaces to one |
+| `Escape -` | Jump to matching bracket `()[]{}` |
+| `Escape .` / `_` | Insert last word from previous history |
+| `Escape p` | Search history backward by prefix |
+| `Escape n` | Search history forward by prefix |
+| `Escape Backspace` | Delete word backward (punctuation-delimited) |
+| `Escape c/l/u` | Capitalize / lowercase / uppercase word |
+| `Escape d` | Delete word forward |
+| `Alt+Up/Down` | Resize input area (1-15 lines) |
+
+**Output & Scrollback:**
+
+| Key | Action |
+|-----|--------|
 | `PageUp/PageDown` | Scroll output history |
 | `Tab` | Release one screenful (when paused) |
 | `Escape j` | Jump to end, release all pending |
-| `Escape w` | Switch to world with activity |
-| `Ctrl+P/N` | Command history |
-| `Ctrl+U` | Clear input |
-| `Ctrl+W` | Delete word |
-| `Ctrl+Q` | Spell suggestions |
-| `Ctrl+L` | Redraw screen |
+| `Escape J` | Selective flush: keep highlighted pending, discard rest |
+| `Escape h` | Half-page scroll up or release half screenful |
+| `Ctrl+L` | Redraw screen (keep only server data) |
+
+**General:**
+
+| Key | Action |
+|-----|--------|
 | `Ctrl+R` | Hot reload |
 | `F1` | Help |
-| `F2` | Toggle MUD tag display |
-| `F4` | Filter output |
+| `F2` | Toggle MUD tag display with timestamps |
+| `F4` | Filter/search output |
 | `F8` | Toggle action highlighting |
 | `F9` | Toggle GMCP media audio |
 | `Ctrl+C` (x2) | Quit |
@@ -220,11 +272,14 @@ Access via browser at `http://localhost:9000`.
 Actions match incoming MUD output against patterns and execute commands:
 
 1. Open `/actions` to create triggers
-2. Set a pattern (regex or wildcard)
-3. Set command(s) to execute when matched
+2. Set a pattern (regex or wildcard) — leave empty for manual-only actions
+3. Set command(s) to execute when matched (semicolon-separated)
 4. Use `$1`-`$9` for captured groups, `$0` for full match
+5. Use `/gag` in commands to hide matched lines, `/highlight` to color them
 
 Example: Pattern `* tells you: *` with command `/echo Got tell from $1`
+
+Actions can also be invoked manually by typing `/actionname` in the input. Enable "Startup" on an action to run its commands on Clay start, reload, and crash recovery.
 
 ## Themes
 
