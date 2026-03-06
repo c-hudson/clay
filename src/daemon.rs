@@ -289,9 +289,7 @@ pub async fn run_daemon_server() -> io::Result<()> {
                         if matches!(*msg, WsMessage::AuthRequest { .. }) {
                             // Send initial state after successful authentication
                             let initial_state = app.build_initial_state();
-                            app.ws_send_to_client(client_id, initial_state);
-                            // Mark client as having received initial state so it receives broadcasts
-                            app.ws_mark_initial_state_sent(client_id);
+                            app.ws_send_initial_state_and_mark(client_id, initial_state);
                         } else {
                             handle_daemon_ws_message(&mut app, client_id, *msg, &event_tx).await;
                         }
@@ -592,33 +590,26 @@ pub async fn handle_daemon_ws_message(
                     marked_new: false,
                     });
                 }
-                Command::HelpTf => {
-                    // Execute TF help command and send the result
-                    match app.tf_engine.execute("#help") {
-                        crate::tf::TfCommandResult::Success(Some(msg)) => {
-                            for line in msg.lines() {
-                                app.ws_broadcast(WsMessage::ServerData {
-                                    world_index,
-                                    data: line.to_string(),
-                                    is_viewed: false,
-                                    ts: current_timestamp_secs(),
-                                    from_server: false,
-                                    seq: 0,
-                                marked_new: false,
-                                });
-                            }
+                Command::HelpTopic { ref topic } => {
+                    use crate::popup::definitions::help::get_topic_help;
+                    let help_text = if let Some(lines) = get_topic_help(topic) {
+                        lines.join("\n")
+                    } else {
+                        match app.tf_engine.execute(&format!("#help {}", topic)) {
+                            crate::tf::TfCommandResult::Success(Some(msg)) => msg,
+                            _ => format!("No help available for '{}'", topic),
                         }
-                        _ => {
-                            app.ws_broadcast(WsMessage::ServerData {
-                                world_index,
-                                data: "TF help not available.".to_string(),
-                                is_viewed: false,
-                                ts: current_timestamp_secs(),
-                                from_server: false,
-                                seq: 0,
+                    };
+                    for line in help_text.lines() {
+                        app.ws_broadcast(WsMessage::ServerData {
+                            world_index,
+                            data: line.to_string(),
+                            is_viewed: false,
+                            ts: current_timestamp_secs(),
+                            from_server: false,
+                            seq: 0,
                             marked_new: false,
-                            });
-                        }
+                        });
                     }
                 }
                 Command::Unknown { cmd } => {
@@ -736,29 +727,6 @@ pub async fn handle_daemon_ws_message(
                         app.ws_broadcast(WsMessage::ServerData {
                             world_index,
                             data: format!("Flushed {} lines from output buffer.", line_count),
-                            is_viewed: false,
-                            ts: current_timestamp_secs(),
-                            from_server: false,
-                            seq: 0,
-                        marked_new: false,
-                        });
-                    }
-                }
-                Command::Keepalive => {
-                    if world_index < app.worlds.len() {
-                        let world = &app.worlds[world_index];
-                        let info = format!(
-                            "Keepalive: {} ({})",
-                            world.settings.keep_alive_type.name(),
-                            if world.settings.keep_alive_type == KeepAliveType::Custom {
-                                world.settings.keep_alive_cmd.clone()
-                            } else {
-                                world.settings.keep_alive_type.name().to_string()
-                            }
-                        );
-                        app.ws_broadcast(WsMessage::ServerData {
-                            world_index,
-                            data: info,
                             is_viewed: false,
                             ts: current_timestamp_secs(),
                             from_server: false,
@@ -1260,8 +1228,13 @@ pub async fn handle_daemon_ws_message(
             app.settings.web_secure = web_secure;
             app.settings.http_enabled = http_enabled;
             app.settings.http_port = http_port;
-            app.settings.websocket_cert_file = ws_cert_file;
-            app.settings.websocket_key_file = ws_key_file;
+            // Only update cert/key if non-empty (remote clients send empty for security)
+            if !ws_cert_file.is_empty() {
+                app.settings.websocket_cert_file = ws_cert_file;
+            }
+            if !ws_key_file.is_empty() {
+                app.settings.websocket_key_file = ws_key_file;
+            }
             app.settings.tls_proxy_enabled = tls_proxy_enabled;
             app.settings.mouse_enabled = mouse_enabled;
             app.settings.zwj_enabled = zwj_enabled;
@@ -1400,6 +1373,34 @@ pub async fn handle_daemon_ws_message(
 
                     app.broadcast_activity();
                 }
+            }
+        }
+        WsMessage::SelectiveFlush { world_index } => {
+            if world_index < app.worlds.len() && app.worlds[world_index].paused {
+                let pending = std::mem::take(&mut app.worlds[world_index].pending_lines);
+                let mut kept = Vec::new();
+                for line in pending {
+                    if line.highlight_color.is_some() {
+                        kept.push(line);
+                    }
+                }
+                for line in &kept {
+                    let ws_data = line.text.replace('\r', "") + "\n";
+                    app.ws_broadcast_to_world(world_index, WsMessage::ServerData {
+                        world_index,
+                        data: ws_data,
+                        is_viewed: true,
+                        ts: current_timestamp_secs(),
+                        from_server: line.from_server,
+                        seq: line.seq,
+                        marked_new: false,
+                    });
+                }
+                app.worlds[world_index].output_lines.extend(kept);
+                app.worlds[world_index].paused = false;
+                app.worlds[world_index].lines_since_pause = 0;
+                app.ws_broadcast(WsMessage::PendingLinesUpdate { world_index, count: 0 });
+                app.broadcast_activity();
             }
         }
         WsMessage::ReportSeqMismatch { world_index, expected_seq_gt, actual_seq, line_text, source } => {
@@ -2669,7 +2670,7 @@ pub async fn handle_multiuser_ws_message(
             if let Some(ref uname) = username {
                 let initial_state = build_multiuser_initial_state(app, uname);
                 if let Some(ws) = &app.ws_server {
-                    ws.send_to_client(client_id, initial_state);
+                    ws.send_initial_state_and_mark(client_id, initial_state);
                 }
             }
         }
@@ -2775,9 +2776,7 @@ pub async fn handle_multiuser_ws_message(
             if let Some(ref uname) = username {
                 let initial_state = build_multiuser_initial_state(app, uname);
                 if let Some(ws) = &app.ws_server {
-                    ws.send_to_client(client_id, initial_state);
-                    // Mark client as having received initial state so it receives broadcasts
-                    ws.mark_initial_state_sent(client_id);
+                    ws.send_initial_state_and_mark(client_id, initial_state);
                 }
             }
         }
@@ -2819,6 +2818,20 @@ pub async fn handle_multiuser_ws_message(
                     // Broadcast to all clients of this owner
                     if let Some(ws) = &app.ws_server {
                         ws.broadcast_to_owner(WsMessage::PendingReleased { world_index, count: release_count }, world.owner.as_deref());
+                    }
+                }
+            }
+        }
+        WsMessage::SelectiveFlush { world_index } => {
+            if let Some(world) = app.worlds.get_mut(world_index) {
+                if world.owner.as_ref() == username.as_ref() && world.paused {
+                    let pending = std::mem::take(&mut world.pending_lines);
+                    let kept: Vec<OutputLine> = pending.into_iter().filter(|l| l.highlight_color.is_some()).collect();
+                    world.output_lines.extend(kept);
+                    world.paused = false;
+                    world.lines_since_pause = 0;
+                    if let Some(ws) = &app.ws_server {
+                        ws.broadcast_to_owner(WsMessage::PendingLinesUpdate { world_index, count: 0 }, world.owner.as_deref());
                     }
                 }
             }

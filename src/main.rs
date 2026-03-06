@@ -1224,10 +1224,10 @@ pub struct ClientViewState {
 #[derive(Debug, Clone, PartialEq)]
 #[allow(clippy::enum_variant_names)]
 pub enum Command {
-    /// /help - show help popup
+    /// /help [topic] - show help popup (or topic-specific help)
     Help,
-    /// /help tf - show TF commands help
-    HelpTf,
+    /// /help <topic> - show help for a specific topic
+    HelpTopic { topic: String },
     /// /version - show version info
     Version,
     /// /quit - exit application
@@ -1252,7 +1252,7 @@ pub enum Command {
     WorldConnectNoLogin { name: String },
     /// /worlds <name> - switch to or connect to named world
     WorldSwitch { name: String },
-    /// /connect [host port [ssl]] - connect to server
+    /// /connect [host port [ssl]] - connect to server (internal use by buttons/TF)
     Connect { host: Option<String>, port: Option<String>, ssl: bool },
     /// /disconnect or /dc - disconnect current world
     Disconnect,
@@ -1264,8 +1264,6 @@ pub enum Command {
     Font,
     /// /send [-W] [-w<world>] [-n] <text> - send text
     Send { text: String, all_worlds: bool, target_world: Option<String>, no_newline: bool },
-    /// /keepalive - show keepalive settings
-    Keepalive,
     /// /gag <pattern> - gag lines matching pattern
     Gag { pattern: String },
     /// /ban - show banned hosts
@@ -1332,8 +1330,8 @@ pub fn parse_command(input: &str) -> Command {
 
     match cmd.as_str() {
         "/help" => {
-            if !args.is_empty() && args[0].eq_ignore_ascii_case("tf") {
-                Command::HelpTf
+            if !args.is_empty() {
+                Command::HelpTopic { topic: args[0].to_lowercase() }
             } else {
                 Command::Help
             }
@@ -1363,7 +1361,6 @@ pub fn parse_command(input: &str) -> Command {
         "/menu" => Command::Menu,
         "/font" => Command::Font,
         "/send" => parse_send_command(args, trimmed),
-        "/keepalive" => Command::Keepalive,
         "/gag" => {
             if args.is_empty() {
                 Command::Unknown { cmd: trimmed.to_string() }
@@ -2426,9 +2423,9 @@ impl World {
     pub fn mark_seen(&mut self) {
         self.unseen_lines = 0;
         self.first_unseen_at = None;
-        self.clear_new_line_indicators();
-        // Note: pending_lines keep their marked_new flag so the new indicator
-        // shows when they are released via Tab and rendered on screen.
+        // Note: marked_new indicators are NOT cleared here. They persist while
+        // viewing the world and are only cleared when switching AWAY from it
+        // (via clear_new_line_indicators in switch_world).
     }
 
     /// Clear new line indicator flags on all output lines.
@@ -2599,6 +2596,7 @@ pub struct App {
     pub popup_manager: popup::PopupManager,
     pub last_ctrl_c: Option<std::time::Instant>,
     pub last_escape: Option<std::time::Instant>, // For Escape+key sequences (Alt emulation)
+    pub literal_next: bool, // When true, next keypress inserts literally (Ctrl+V)
     pub show_tags: bool, // F2 toggles - false = hide tags (default), true = show tags
     pub highlight_actions: bool, // F8 toggles - highlight lines matching action patterns
     // WebSocket server (ws:// or wss:// depending on web_secure setting)
@@ -2664,6 +2662,11 @@ pub struct App {
     pub media_music_key: Option<(usize, String)>,
     /// Event channel sender for async media process delivery
     pub event_tx: Option<mpsc::Sender<AppEvent>>,
+    /// Currently playing ANSI music process (console playback via mpv/ffplay)
+    /// Tracked so we can kill it before starting a new sequence
+    pub ansi_music_child: Option<std::process::Child>,
+    /// Counter for unique ANSI music WAV filenames (avoids overwriting while player reads)
+    pub ansi_music_counter: u32,
     /// Test-only: log of all messages passed to ws_broadcast() and ws_broadcast_to_world()
     #[cfg(test)]
     pub ws_broadcast_log: std::sync::Arc<std::sync::Mutex<Vec<WsMessage>>>,
@@ -2704,6 +2707,7 @@ impl App {
             popup_manager: popup::PopupManager::new(),
             last_ctrl_c: None,
             last_escape: None,
+            literal_next: false,
             show_tags: false, // Default: hide tags
             highlight_actions: false, // Default: don't highlight action matches
             ws_server: None,
@@ -2741,6 +2745,8 @@ impl App {
             media_processes: std::collections::HashMap::new(),
             media_music_key: None,
             event_tx: None,
+            ansi_music_child: None,
+            ansi_music_counter: 0,
             #[cfg(test)]
             ws_broadcast_log: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
         }
@@ -3558,6 +3564,16 @@ impl App {
                     }
                     Command::Help => {
                         self.open_help_popup_new();
+                    }
+                    Command::HelpTopic { ref topic } => {
+                        use popup::definitions::help::{get_topic_help, create_topic_help_popup, HELP_FIELD_CONTENT};
+                        if let Some(lines) = get_topic_help(topic) {
+                            self.popup_manager.open(create_topic_help_popup(lines));
+                            if let Some(state) = self.popup_manager.current_mut() {
+                                state.select_field(HELP_FIELD_CONTENT);
+                            }
+                        }
+                        // TF help not available in this context
                     }
                     Command::Setup => {
                         self.open_setup_popup_new();
@@ -4383,6 +4399,45 @@ impl App {
         }
     }
 
+    /// Play ANSI music notes on the console via mpv/ffplay.
+    /// Kills any currently playing ANSI music first to prevent overlapping playback.
+    /// Uses unique filenames to avoid overwriting a WAV file while the player reads it.
+    fn play_ansi_music_console(&mut self, notes: &[crate::ansi_music::MusicNote]) {
+        let player_cmd = match self.media_player_cmd {
+            Some(ref cmd) => cmd.clone(),
+            None => return,
+        };
+
+        // Kill any currently playing ANSI music process
+        if let Some(mut child) = self.ansi_music_child.take() {
+            let _ = child.kill();
+            let _ = child.wait(); // Reap to avoid zombie
+        }
+
+        let wav_data = generate_wav_from_notes(notes);
+        let _ = std::fs::create_dir_all(&self.media_cache_dir);
+
+        // Use a unique filename so we don't overwrite a file the previous player
+        // might still be reading (even after kill, there can be a brief delay)
+        self.ansi_music_counter = self.ansi_music_counter.wrapping_add(1);
+        let wav_path = self.media_cache_dir.join(format!("ansi_music_{}.wav", self.ansi_music_counter % 4));
+
+        if std::fs::write(&wav_path, &wav_data).is_ok() {
+            let wav_path_str = wav_path.to_string_lossy().to_string();
+            let mut cmd = std::process::Command::new(&player_cmd);
+            match player_cmd.as_str() {
+                "mpv" => { cmd.args(["--no-video", "--no-terminal", &wav_path_str]); }
+                "ffplay" => { cmd.args(["-nodisp", "-autoexit", &wav_path_str]); }
+                _ => { cmd.arg(&wav_path_str); }
+            }
+            cmd.stdout(std::process::Stdio::null());
+            cmd.stderr(std::process::Stdio::null());
+            if let Ok(child) = cmd.spawn() {
+                self.ansi_music_child = Some(child);
+            }
+        }
+    }
+
     /// Broadcast a message to all authenticated WebSocket clients and the embedded GUI (if any)
     pub(crate) fn ws_broadcast(&self, msg: WsMessage) {
         #[cfg(test)]
@@ -4475,15 +4530,35 @@ impl App {
         }
     }
 
-    /// Mark a client as having received its InitialState
-    /// After this, the client will receive broadcasts (prevents duplicate messages)
-    fn ws_mark_initial_state_sent(&self, client_id: u64) {
-        // client_id 0 is the embedded GUI - doesn't need this tracking
+    /// Send InitialState to a client AND atomically mark it as having received InitialState.
+    /// This prevents a race condition where ws_send_to_client spawns an async task that
+    /// holds a read lock on clients, causing the subsequent try_write() in
+    /// mark_initial_state_sent to silently fail. When that happens, received_initial_state
+    /// stays false and broadcast_to_world_viewers never sends ServerData to the client.
+    fn ws_send_initial_state_and_mark(&self, client_id: u64, msg: WsMessage) {
+        // client_id 0 is the embedded GUI - send directly, no tracking needed
         if client_id == 0 {
+            if let Some(ref tx) = self.gui_tx {
+                let _ = tx.send(msg);
+                if let Some(ref repaint) = self.gui_repaint {
+                    repaint();
+                }
+            }
             return;
         }
         if let Some(ref server) = self.ws_server {
-            server.mark_initial_state_sent(client_id);
+            let clients = server.clients.clone();
+            tokio::spawn(async move {
+                // Use a write lock so we can both send AND mark atomically.
+                // This avoids the race where a spawned read-lock task from
+                // ws_send_to_client blocks a subsequent try_write() in
+                // mark_initial_state_sent, leaving received_initial_state = false.
+                let mut clients_guard = clients.write().await;
+                if let Some(client) = clients_guard.get_mut(&client_id) {
+                    let _ = client.tx.send(msg);
+                    client.received_initial_state = true;
+                }
+            });
         }
     }
 
@@ -4593,29 +4668,10 @@ impl App {
         }
 
         // Console ANSI music playback via system player
+        // Concatenate all sequences into one to avoid rapid kill/restart
         if !music_sequences.is_empty() {
-            if let Some(ref player_cmd) = self.media_player_cmd {
-                for notes in &music_sequences {
-                    let wav_data = generate_wav_from_notes(notes);
-                    let _ = std::fs::create_dir_all(&self.media_cache_dir);
-                    let wav_path = self.media_cache_dir.join("ansi_music.wav");
-                    if std::fs::write(&wav_path, &wav_data).is_ok() {
-                        let wav_path_str = wav_path.to_string_lossy().to_string();
-                        let player = player_cmd.clone();
-                        std::thread::spawn(move || {
-                            let mut cmd = std::process::Command::new(&player);
-                            match player.as_str() {
-                                "mpv" => { cmd.args(["--no-video", "--no-terminal", &wav_path_str]); }
-                                "ffplay" => { cmd.args(["-nodisp", "-autoexit", &wav_path_str]); }
-                                _ => { cmd.arg(&wav_path_str); }
-                            }
-                            cmd.stdout(std::process::Stdio::null());
-                            cmd.stderr(std::process::Stdio::null());
-                            let _ = cmd.status();
-                        });
-                    }
-                }
-            }
+            let all_notes: Vec<crate::ansi_music::MusicNote> = music_sequences.iter().flatten().cloned().collect();
+            self.play_ansi_music_console(&all_notes);
         }
 
         let world_name_for_triggers = self.worlds[world_idx].name.clone();
@@ -5221,8 +5277,7 @@ impl App {
                     multiuser_mode: false,
                 });
                 let initial_state = self.build_initial_state();
-                self.ws_send_to_client(client_id, initial_state);
-                self.ws_mark_initial_state_sent(client_id);
+                self.ws_send_initial_state_and_mark(client_id, initial_state);
                 let world_idx = current_world
                     .filter(|&w| w < self.worlds.len())
                     .unwrap_or(self.current_world_index);
@@ -5271,8 +5326,7 @@ impl App {
     /// Handle initial WsClientMessage (AuthRequest) after authentication.
     fn handle_ws_auth_initial_state(&mut self, client_id: u64, current_world: Option<usize>) {
         let initial_state = self.build_initial_state();
-        self.ws_send_to_client(client_id, initial_state);
-        self.ws_mark_initial_state_sent(client_id);
+        self.ws_send_initial_state_and_mark(client_id, initial_state);
         let world_idx = current_world
             .filter(|&w| w < self.worlds.len())
             .unwrap_or(self.current_world_index);
@@ -5683,30 +5737,6 @@ impl App {
                     });
                 }
             }
-            Command::Keepalive => {
-                // Show keepalive settings for this world
-                if world_index < self.worlds.len() {
-                    let world = &self.worlds[world_index];
-                    let info = format!(
-                        "Keepalive: {} ({})",
-                        world.settings.keep_alive_type.name(),
-                        if world.settings.keep_alive_type == KeepAliveType::Custom {
-                            world.settings.keep_alive_cmd.clone()
-                        } else {
-                            world.settings.keep_alive_type.name().to_string()
-                        }
-                    );
-                    self.ws_broadcast(WsMessage::ServerData {
-                        world_index,
-                        data: info,
-                        is_viewed: false,
-                        ts: current_timestamp_secs(),
-                        from_server: false,
-                        seq: 0,
-                        marked_new: false,
-                    });
-                }
-            }
             Command::Gag { pattern } => {
                 // TODO: Implement gag patterns storage
                 self.ws_broadcast(WsMessage::ServerData {
@@ -5789,26 +5819,7 @@ impl App {
             Command::TestMusic => {
                 let test_notes = generate_test_music_notes();
                 // Play locally on console via mpv/ffplay
-                if let Some(ref player_cmd) = self.media_player_cmd {
-                    let wav_data = generate_wav_from_notes(&test_notes);
-                    let _ = std::fs::create_dir_all(&self.media_cache_dir);
-                    let wav_path = self.media_cache_dir.join("ansi_music.wav");
-                    if std::fs::write(&wav_path, &wav_data).is_ok() {
-                        let wav_path_str = wav_path.to_string_lossy().to_string();
-                        let player = player_cmd.clone();
-                        std::thread::spawn(move || {
-                            let mut cmd = std::process::Command::new(&player);
-                            match player.as_str() {
-                                "mpv" => { cmd.args(["--no-video", "--no-terminal", &wav_path_str]); }
-                                "ffplay" => { cmd.args(["-nodisp", "-autoexit", &wav_path_str]); }
-                                _ => { cmd.arg(&wav_path_str); }
-                            }
-                            cmd.stdout(std::process::Stdio::null());
-                            cmd.stderr(std::process::Stdio::null());
-                            let _ = cmd.status();
-                        });
-                    }
-                }
+                self.play_ansi_music_console(&test_notes);
                 self.ws_broadcast(WsMessage::AnsiMusic {
                     world_index,
                     notes: test_notes,
@@ -6083,33 +6094,28 @@ impl App {
                     marked_new: false,
                 });
             }
-            Command::HelpTf => {
-                // Execute TF help command and send the result
-                match self.tf_engine.execute("#help") {
-                    tf::TfCommandResult::Success(Some(msg)) => {
-                        for line in msg.lines() {
-                            self.ws_send_to_client(client_id, WsMessage::ServerData {
-                                world_index,
-                                data: line.to_string(),
-                                is_viewed: false,
-                                ts: current_timestamp_secs(),
-                                from_server: false,
-                                seq: 0,
-                                marked_new: false,
-                            });
-                        }
+            Command::HelpTopic { ref topic } => {
+                // Try Clay help first, then TF help
+                use popup::definitions::help::get_topic_help;
+                let help_text = if let Some(lines) = get_topic_help(topic) {
+                    lines.join("\n")
+                } else {
+                    // Try TF help
+                    match self.tf_engine.execute(&format!("#help {}", topic)) {
+                        tf::TfCommandResult::Success(Some(msg)) => msg,
+                        _ => format!("No help available for '{}'", topic),
                     }
-                    _ => {
-                        self.ws_send_to_client(client_id, WsMessage::ServerData {
-                            world_index,
-                            data: "TF help not available.".to_string(),
-                            is_viewed: false,
-                            ts: current_timestamp_secs(),
-                            from_server: false,
-                            seq: 0,
-                            marked_new: false,
-                        });
-                    }
+                };
+                for line in help_text.lines() {
+                    self.ws_send_to_client(client_id, WsMessage::ServerData {
+                        world_index,
+                        data: line.to_string(),
+                        is_viewed: false,
+                        ts: current_timestamp_secs(),
+                        from_server: false,
+                        seq: 0,
+                        marked_new: false,
+                    });
                 }
             }
         }
@@ -6605,8 +6611,13 @@ impl App {
                 self.settings.http_enabled = http_enabled;
                 self.settings.http_port = http_port;
                 // ws_enabled and ws_port are legacy — ignored
-                self.settings.websocket_cert_file = ws_cert_file;
-                self.settings.websocket_key_file = ws_key_file;
+                // Only update cert/key if non-empty (remote clients send empty for security)
+                if !ws_cert_file.is_empty() {
+                    self.settings.websocket_cert_file = ws_cert_file;
+                }
+                if !ws_key_file.is_empty() {
+                    self.settings.websocket_key_file = ws_key_file;
+                }
                 self.settings.tls_proxy_enabled = tls_proxy_enabled;
                 self.settings.mouse_enabled = mouse_enabled;
                 self.settings.zwj_enabled = zwj_enabled;
@@ -6717,9 +6728,7 @@ impl App {
             WsMessage::RequestState => {
                 // Client requested full state resync - send initial state
                 let initial_state = self.build_initial_state();
-                self.ws_send_to_client(client_id, initial_state);
-                // Mark client as having received initial state so it receives broadcasts
-                self.ws_mark_initial_state_sent(client_id);
+                self.ws_send_initial_state_and_mark(client_id, initial_state);
                 // Set client's initial world so broadcast_to_world_viewers works immediately
                 self.ws_set_client_world(client_id, Some(self.current_world_index));
                 // Also send current activity count
@@ -7570,6 +7579,47 @@ impl App {
             world.paused = true;
         }
         // Mark output for redraw
+        self.needs_output_redraw = true;
+    }
+
+    fn scroll_output_up_by(&mut self, lines: usize) {
+        let more_mode = self.settings.more_mode_enabled;
+        let visible_height = (self.output_height as usize).max(1);
+        let width = (self.output_width as usize).max(1);
+        let world = self.current_world_mut();
+
+        let mut min_offset = 0usize;
+        let mut visual_lines = 0usize;
+        for (idx, line) in world.output_lines.iter().enumerate() {
+            visual_lines += visual_line_count(&line.text, width);
+            if visual_lines >= visible_height {
+                min_offset = idx;
+                break;
+            }
+            min_offset = idx;
+        }
+
+        if world.scroll_offset <= min_offset {
+            if more_mode && !world.paused {
+                world.paused = true;
+            }
+            return;
+        }
+
+        let mut visual_lines_moved = 0;
+        let mut new_offset = world.scroll_offset;
+        while visual_lines_moved < lines {
+            visual_lines_moved += visual_line_count(&world.output_lines[new_offset].text, width);
+            if new_offset == 0 {
+                break;
+            }
+            new_offset -= 1;
+        }
+
+        world.scroll_offset = new_offset.max(min_offset);
+        if more_mode && !world.paused {
+            world.paused = true;
+        }
         self.needs_output_redraw = true;
     }
 
@@ -8759,12 +8809,25 @@ async fn run_console_client(addr: &str) -> io::Result<()> {
                 }
             }
 
-            // Handle Ctrl+L terminal clear request
+            // Handle Ctrl+L terminal reset and redraw request
             if app.needs_terminal_clear {
+                // Full terminal reset: unconditionally tear down and re-setup
+                let _ = execute!(std::io::stdout(), crossterm::event::DisableMouseCapture);
+                app.mouse_capture_active = false;
+                let _ = crossterm::terminal::disable_raw_mode();
+                let _ = execute!(std::io::stdout(), crossterm::terminal::LeaveAlternateScreen);
+                crossterm::terminal::enable_raw_mode()?;
                 execute!(
                     std::io::stdout(),
-                    crossterm::terminal::Clear(crossterm::terminal::ClearType::All)
+                    crossterm::terminal::EnterAlternateScreen,
+                    crossterm::terminal::Clear(crossterm::terminal::ClearType::All),
+                    crossterm::cursor::MoveTo(0, 0)
                 )?;
+                // Re-enable mouse capture only if a popup is currently visible
+                if app.settings.mouse_enabled && app.has_new_popup() {
+                    let _ = execute!(std::io::stdout(), crossterm::event::EnableMouseCapture);
+                    app.mouse_capture_active = true;
+                }
                 terminal.clear()?;
                 app.needs_terminal_clear = false;
             }
@@ -9045,6 +9108,21 @@ fn handle_remote_client_key(
                 match parsed {
                     Command::Help => {
                         app.open_help_popup_new();
+                    }
+                    Command::HelpTopic { ref topic } => {
+                        use popup::definitions::help::{get_topic_help, create_topic_help_popup, HELP_FIELD_CONTENT};
+                        if let Some(lines) = get_topic_help(topic) {
+                            app.popup_manager.open(create_topic_help_popup(lines));
+                            if let Some(state) = app.popup_manager.current_mut() {
+                                state.select_field(HELP_FIELD_CONTENT);
+                            }
+                        } else {
+                            // Send to server for TF help
+                            let _ = ws_tx.send(WsMessage::SendCommand {
+                                world_index: app.current_world_index,
+                                command: format!("/tfhelp {}", topic),
+                            });
+                        }
                     }
                     Command::Version => {
                         app.add_output(&get_version_string());
@@ -9456,6 +9534,15 @@ fn handle_remote_client_key(
         return false;
     }
 
+    // Ctrl+V literal next: insert next character literally
+    if app.literal_next {
+        app.literal_next = false;
+        if let KeyCode::Char(c) = key.code {
+            app.input.insert_char(c);
+        }
+        return false;
+    }
+
     // Helper to check if escape was pressed recently (for Escape+key sequences)
     let recent_escape = app.last_escape
         .map(|t| t.elapsed() < std::time::Duration::from_millis(500))
@@ -9465,6 +9552,15 @@ fn handle_remote_client_key(
     if key.code == Esc && key.modifiers.is_empty() {
         app.last_escape = Some(std::time::Instant::now());
         return false;
+    }
+
+    // Clear history search state on any non-search key
+    if !(key.code == Char('p') && (key.modifiers.contains(KeyModifiers::ALT) || recent_escape))
+        && !(key.code == Char('n') && (key.modifiers.contains(KeyModifiers::ALT) || recent_escape))
+        && key.code != Esc
+    {
+        app.input.search_prefix = None;
+        app.input.search_index = None;
     }
 
     // Handle Escape+j (Alt+j) to jump to end - release all pending
@@ -9521,6 +9617,95 @@ fn handle_remote_client_key(
         return false;
     }
 
+    // Handle Escape+Space to collapse multiple spaces to one
+    if key.code == Char(' ') && recent_escape {
+        app.last_escape = None;
+        app.input.collapse_spaces();
+        return false;
+    }
+
+    // Handle Escape+- to goto matching bracket
+    if key.code == Char('-') && recent_escape {
+        app.last_escape = None;
+        app.input.goto_matching_bracket();
+        return false;
+    }
+
+    // Handle Escape+. / Escape+_ to insert last word of previous history
+    if (key.code == Char('.') || key.code == Char('_'))
+        && (key.modifiers.contains(KeyModifiers::ALT) || recent_escape)
+    {
+        app.last_escape = None;
+        app.input.last_argument();
+        return false;
+    }
+
+    // Handle Escape+J (uppercase) for selective flush
+    if key.code == Char('J') && (key.modifiers.contains(KeyModifiers::ALT) || recent_escape) {
+        app.last_escape = None;
+        let _ = ws_tx.send(WsMessage::SelectiveFlush {
+            world_index: app.current_world_index,
+        });
+        return false;
+    }
+
+    // Handle Escape+b to switch to previous world
+    if key.code == Char('b') && (key.modifiers.contains(KeyModifiers::ALT) || recent_escape) {
+        app.last_escape = None;
+        let _ = ws_tx.send(WsMessage::CalculatePrevWorld { current_index: app.current_world_index });
+        return false;
+    }
+
+    // Handle Escape+f to switch to next world
+    if key.code == Char('f') && (key.modifiers.contains(KeyModifiers::ALT) || recent_escape) {
+        app.last_escape = None;
+        let _ = ws_tx.send(WsMessage::CalculateNextWorld { current_index: app.current_world_index });
+        return false;
+    }
+
+    // Handle Escape+h for half-page scroll/release
+    if key.code == Char('h') && (key.modifiers.contains(KeyModifiers::ALT) || recent_escape) {
+        app.last_escape = None;
+        let half = (app.output_height as usize).saturating_sub(2) / 2;
+        let has_pending = !app.current_world().pending_lines.is_empty() || app.current_world().pending_count > 0;
+        if app.current_world().paused && has_pending {
+            let release_count = half.max(1);
+            let _ = ws_tx.send(WsMessage::ReleasePending {
+                world_index: app.current_world_index,
+                count: release_count,
+            });
+        } else {
+            // Scroll up half page locally
+            let scroll_amount = half.max(1);
+            let current_offset = app.current_world().scroll_offset;
+            let new_offset = current_offset.saturating_sub(scroll_amount);
+            app.current_world_mut().scroll_offset = new_offset;
+            app.needs_output_redraw = true;
+        }
+        return false;
+    }
+
+    // Handle Escape+p for history search backward
+    if key.code == Char('p') && (key.modifiers.contains(KeyModifiers::ALT) || recent_escape) {
+        app.last_escape = None;
+        app.input.history_search_backward();
+        return false;
+    }
+
+    // Handle Escape+n for history search forward
+    if key.code == Char('n') && (key.modifiers.contains(KeyModifiers::ALT) || recent_escape) {
+        app.last_escape = None;
+        app.input.history_search_forward();
+        return false;
+    }
+
+    // Handle Escape+Backspace for delete word back (punctuation-delimited)
+    if key.code == Backspace && (key.modifiers.contains(KeyModifiers::ALT) || recent_escape) {
+        app.last_escape = None;
+        app.input.backward_kill_word_punctuation();
+        return false;
+    }
+
     match (key.modifiers, key.code) {
         (KeyModifiers::CONTROL, Char('u')) => {
             app.input.clear();
@@ -9565,6 +9750,18 @@ fn handle_remote_client_key(
             // Signal main loop to clear terminal and redraw everything
             app.needs_terminal_clear = true;
             app.needs_output_redraw = true;
+        }
+        // Terminal bell (Ctrl+G)
+        (KeyModifiers::CONTROL, Char('g')) => {
+            print!("\x07");
+        }
+        // Transpose characters (Ctrl+T)
+        (KeyModifiers::CONTROL, Char('t')) => {
+            app.input.transpose_chars();
+        }
+        // Literal next character (Ctrl+V)
+        (KeyModifiers::CONTROL, Char('v')) => {
+            app.literal_next = true;
         }
         (KeyModifiers::CONTROL, Up) => {
             // Ctrl+Up - configurable behavior (same as Shift+Up)
@@ -9730,6 +9927,20 @@ fn handle_remote_client_key(
                     Command::Quit => return true,
                     Command::Help => {
                         app.open_help_popup_new();
+                    }
+                    Command::HelpTopic { ref topic } => {
+                        use popup::definitions::help::{get_topic_help, create_topic_help_popup, HELP_FIELD_CONTENT};
+                        if let Some(lines) = get_topic_help(topic) {
+                            app.popup_manager.open(create_topic_help_popup(lines));
+                            if let Some(state) = app.popup_manager.current_mut() {
+                                state.select_field(HELP_FIELD_CONTENT);
+                            }
+                        } else {
+                            let _ = ws_tx.send(WsMessage::SendCommand {
+                                world_index: app.current_world_index,
+                                command: format!("/tfhelp {}", topic),
+                            });
+                        }
                     }
                     Command::Version => {
                         app.add_output(&get_version_string());
@@ -13600,6 +13811,24 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                         KeyAction::Redraw => {
                             // Filter output to only show server data (remove client-generated lines)
                             app.current_world_mut().filter_to_server_output();
+                            // Full terminal reset: unconditionally tear down and re-setup
+                            // Always disable mouse capture to clear any stuck state
+                            let _ = execute!(std::io::stdout(), DisableMouseCapture);
+                            app.mouse_capture_active = false;
+                            disable_raw_mode()?;
+                            execute!(std::io::stdout(), LeaveAlternateScreen)?;
+                            enable_raw_mode()?;
+                            execute!(
+                                std::io::stdout(),
+                                EnterAlternateScreen,
+                                Clear(ClearType::All),
+                                cursor::MoveTo(0, 0)
+                            )?;
+                            // Re-enable mouse capture only if a popup is currently visible
+                            if app.settings.mouse_enabled && app.has_new_popup() {
+                                let _ = execute!(std::io::stdout(), EnableMouseCapture);
+                                app.mouse_capture_active = true;
+                            }
                             terminal.clear()?;
                             app.needs_output_redraw = true;
                         }
@@ -16012,7 +16241,7 @@ fn handle_key_event(key: KeyEvent, app: &mut App) -> KeyAction {
                 let internal_commands = vec![
                     // Clay-specific commands
                     "/help", "/disconnect", "/dc", "/worlds", "/world", "/connections",
-                    "/setup", "/web", "/actions", "/keepalive", "/reload", "/update", "/quit", "/gag",
+                    "/setup", "/web", "/actions", "/reload", "/update", "/quit", "/gag",
                     "/testmusic", "/dump", "/edit", "/tag", "/menu", "/notify",
                     // TF commands (now available with / prefix)
                     "/set", "/unset", "/let", "/echo", "/send", "/beep", "/quote",
@@ -16021,7 +16250,7 @@ fn handle_key_event(key: KeyEvent, app: &mut App) -> KeyAction {
                     "/undeft", "/list", "/purge", "/bind", "/unbind", "/load", "/save",
                     "/lcd", "/time", "/version", "/ps", "/kill", "/sh", "/recall",
                     "/setenv", "/listvar", "/repeat", "/fg", "/trigger", "/input",
-                    "/grab", "/ungag", "/exit", "/connect", "/addworld",
+                    "/grab", "/ungag", "/exit", "/addworld",
                     // TF-specific versions (for conflicting commands)
                     "/tfhelp", "/tfgag",
                 ];
@@ -16079,6 +16308,15 @@ fn handle_key_event(key: KeyEvent, app: &mut App) -> KeyAction {
         }
     }
 
+    // Ctrl+V literal next: insert next character literally
+    if app.literal_next {
+        app.literal_next = false;
+        if let KeyCode::Char(c) = key.code {
+            app.input.insert_char(c);
+        }
+        return KeyAction::None;
+    }
+
     // Helper to check if escape was pressed recently (for Escape+key sequences)
     let recent_escape = app.last_escape
         .map(|t| t.elapsed() < Duration::from_millis(500))
@@ -16088,6 +16326,16 @@ fn handle_key_event(key: KeyEvent, app: &mut App) -> KeyAction {
     if key.code == KeyCode::Esc && key.modifiers.is_empty() {
         app.last_escape = Some(std::time::Instant::now());
         return KeyAction::None;
+    }
+
+    // Clear history search state on any non-search key
+    // (Esc+p and Esc+n will re-set these as needed)
+    if !(key.code == KeyCode::Char('p') && (key.modifiers.contains(KeyModifiers::ALT) || recent_escape))
+        && !(key.code == KeyCode::Char('n') && (key.modifiers.contains(KeyModifiers::ALT) || recent_escape))
+        && key.code != KeyCode::Esc
+    {
+        app.input.search_prefix = None;
+        app.input.search_index = None;
     }
 
     // Handle Escape+j (Alt+j) to jump to end - release all pending
@@ -16167,6 +16415,159 @@ fn handle_key_event(key: KeyEvent, app: &mut App) -> KeyAction {
     if key.code == KeyCode::Char('d') && (key.modifiers.contains(KeyModifiers::ALT) || recent_escape) {
         app.last_escape = None;
         app.input.delete_word_forward();
+        return KeyAction::None;
+    }
+
+    // Handle Escape+Space to collapse multiple spaces to one
+    if key.code == KeyCode::Char(' ') && recent_escape {
+        app.last_escape = None;
+        app.input.collapse_spaces();
+        return KeyAction::None;
+    }
+
+    // Handle Escape+- to goto matching bracket
+    if key.code == KeyCode::Char('-') && recent_escape {
+        app.last_escape = None;
+        app.input.goto_matching_bracket();
+        return KeyAction::None;
+    }
+
+    // Handle Escape+. / Escape+_ to insert last word of previous history
+    if (key.code == KeyCode::Char('.') || key.code == KeyCode::Char('_'))
+        && (key.modifiers.contains(KeyModifiers::ALT) || recent_escape)
+    {
+        app.last_escape = None;
+        app.input.last_argument();
+        return KeyAction::None;
+    }
+
+    // Handle Escape+J (uppercase) for selective flush - keep highlighted pending lines
+    if key.code == KeyCode::Char('J') && (key.modifiers.contains(KeyModifiers::ALT) || recent_escape) {
+        app.last_escape = None;
+        if app.current_world().paused {
+            let world_idx = app.current_world_index;
+            // Keep lines with highlight_color, discard rest
+            let pending = std::mem::take(&mut app.worlds[world_idx].pending_lines);
+            let mut kept = Vec::new();
+            let mut discarded_count = 0usize;
+            for line in pending {
+                if line.highlight_color.is_some() {
+                    kept.push(line);
+                } else {
+                    discarded_count += 1;
+                }
+            }
+            // Move kept lines to output
+            for line in &kept {
+                let ws_data = line.text.replace('\r', "") + "\n";
+                app.ws_broadcast_to_world(world_idx, WsMessage::ServerData {
+                    world_index: world_idx,
+                    data: ws_data,
+                    is_viewed: true,
+                    ts: current_timestamp_secs(),
+                    from_server: line.from_server,
+                    seq: line.seq,
+                    marked_new: false,
+                });
+            }
+            app.worlds[world_idx].output_lines.extend(kept);
+            app.worlds[world_idx].paused = false;
+            app.worlds[world_idx].lines_since_pause = 0;
+            let _ = discarded_count; // suppress unused warning
+            app.ws_broadcast(WsMessage::PendingLinesUpdate { world_index: world_idx, count: 0 });
+            app.broadcast_activity();
+            app.needs_output_redraw = true;
+        }
+        return KeyAction::None;
+    }
+
+    // Handle Escape+b to switch to previous world
+    if key.code == KeyCode::Char('b') && (key.modifiers.contains(KeyModifiers::ALT) || recent_escape) {
+        app.last_escape = None;
+        app.prev_world();
+        return KeyAction::SwitchedWorld(app.current_world_index);
+    }
+
+    // Handle Escape+f to switch to next world
+    if key.code == KeyCode::Char('f') && (key.modifiers.contains(KeyModifiers::ALT) || recent_escape) {
+        app.last_escape = None;
+        app.next_world();
+        return KeyAction::SwitchedWorld(app.current_world_index);
+    }
+
+    // Handle Escape+h for half-page scroll/release
+    if key.code == KeyCode::Char('h') && (key.modifiers.contains(KeyModifiers::ALT) || recent_escape) {
+        app.last_escape = None;
+        let half = (app.output_height as usize).saturating_sub(2) / 2;
+        if app.current_world().paused && !app.current_world().pending_lines.is_empty() {
+            // Release half a screenful of pending lines
+            let visual_budget = half.max(1);
+            let output_width = app.output_width as usize;
+            let world_idx = app.current_world_index;
+            let mut released = 0;
+            let mut visual_used = 0;
+            let pending_len = app.worlds[world_idx].pending_lines.len();
+            for i in 0..pending_len {
+                let line = &app.worlds[world_idx].pending_lines[i];
+                let line_visual = if output_width > 0 {
+                    (line.text.len() / output_width) + 1
+                } else {
+                    1
+                };
+                if visual_used + line_visual > visual_budget && released > 0 {
+                    break;
+                }
+                visual_used += line_visual;
+                released += 1;
+            }
+            if released > 0 {
+                let lines: Vec<_> = app.worlds[world_idx].pending_lines.drain(..released).collect();
+                let first_seq = lines.first().map(|l| l.seq).unwrap_or(0);
+                let ws_data: String = lines.iter().map(|l| l.text.replace('\r', "")).collect::<Vec<_>>().join("\n") + "\n";
+                app.worlds[world_idx].output_lines.extend(lines);
+                app.ws_broadcast_to_world(world_idx, WsMessage::ServerData {
+                    world_index: world_idx,
+                    data: ws_data,
+                    is_viewed: true,
+                    ts: current_timestamp_secs(),
+                    from_server: true,
+                    seq: first_seq,
+                    marked_new: false,
+                });
+                if app.worlds[world_idx].pending_lines.is_empty() {
+                    app.worlds[world_idx].paused = false;
+                    app.worlds[world_idx].lines_since_pause = 0;
+                }
+                let pending_count = app.worlds[world_idx].pending_lines.len();
+                app.ws_broadcast(WsMessage::PendingLinesUpdate { world_index: world_idx, count: pending_count });
+                app.broadcast_activity();
+            }
+        } else {
+            // Scroll up half a page
+            app.scroll_output_up_by(half.max(1));
+        }
+        app.needs_output_redraw = true;
+        return KeyAction::None;
+    }
+
+    // Handle Escape+p for history search backward
+    if key.code == KeyCode::Char('p') && (key.modifiers.contains(KeyModifiers::ALT) || recent_escape) {
+        app.last_escape = None;
+        app.input.history_search_backward();
+        return KeyAction::None;
+    }
+
+    // Handle Escape+n for history search forward
+    if key.code == KeyCode::Char('n') && (key.modifiers.contains(KeyModifiers::ALT) || recent_escape) {
+        app.last_escape = None;
+        app.input.history_search_forward();
+        return KeyAction::None;
+    }
+
+    // Handle Escape+Backspace for delete word back (punctuation-delimited)
+    if key.code == KeyCode::Backspace && (key.modifiers.contains(KeyModifiers::ALT) || recent_escape) {
+        app.last_escape = None;
+        app.input.backward_kill_word_punctuation();
         return KeyAction::None;
     }
 
@@ -16407,6 +16808,24 @@ fn handle_key_event(key: KeyEvent, app: &mut App) -> KeyAction {
         // Spell check
         (KeyModifiers::CONTROL, KeyCode::Char('q')) => {
             app.handle_spell_check();
+            KeyAction::None
+        }
+
+        // Terminal bell (Ctrl+G)
+        (KeyModifiers::CONTROL, KeyCode::Char('g')) => {
+            print!("\x07");
+            KeyAction::None
+        }
+
+        // Transpose characters (Ctrl+T)
+        (KeyModifiers::CONTROL, KeyCode::Char('t')) => {
+            app.input.transpose_chars();
+            KeyAction::None
+        }
+
+        // Literal next character (Ctrl+V)
+        (KeyModifiers::CONTROL, KeyCode::Char('v')) => {
+            app.literal_next = true;
             KeyAction::None
         }
 
@@ -17496,16 +17915,27 @@ async fn handle_command(cmd: &str, app: &mut App, event_tx: mpsc::Sender<AppEven
         Command::Help => {
             app.open_help_popup_new();
         }
-        Command::HelpTf => {
-            // Execute TF help command and display the result
-            match app.tf_engine.execute("#help") {
-                tf::TfCommandResult::Success(Some(msg)) => {
-                    for line in msg.lines() {
-                        app.add_output(line);
-                    }
+        Command::HelpTopic { ref topic } => {
+            // Try Clay help first, then TF help
+            use popup::definitions::help::{get_topic_help, create_topic_help_popup, HELP_FIELD_CONTENT};
+            if let Some(lines) = get_topic_help(topic) {
+                app.popup_manager.open(create_topic_help_popup(lines));
+                if let Some(state) = app.popup_manager.current_mut() {
+                    state.select_field(HELP_FIELD_CONTENT);
                 }
-                _ => {
-                    app.add_output("TF help not available.");
+            } else {
+                // Try TF help
+                match app.tf_engine.execute(&format!("#help {}", topic)) {
+                    tf::TfCommandResult::Success(Some(msg)) => {
+                        let lines: Vec<String> = msg.lines().map(|l| l.to_string()).collect();
+                        app.popup_manager.open(create_topic_help_popup(lines));
+                        if let Some(state) = app.popup_manager.current_mut() {
+                            state.select_field(HELP_FIELD_CONTENT);
+                        }
+                    }
+                    _ => {
+                        app.add_output(&format!("No help available for '{}'", topic));
+                    }
                 }
             }
         }
@@ -17622,37 +18052,6 @@ async fn handle_command(cmd: &str, app: &mut App, event_tx: mpsc::Sender<AppEven
             }).collect();
             let output = util::format_worlds_list(&worlds_info);
             app.add_output(&output);
-        }
-        Command::Keepalive => {
-            // Show keepalive settings for all worlds
-            let current_idx = app.current_world_index;
-            let lines: Vec<String> = app.worlds.iter().enumerate().map(|(idx, world)| {
-                let current = if idx == current_idx { "*" } else { " " };
-                let connected = if world.connected { "x" } else { " " };
-                let type_str = world.settings.keep_alive_type.name();
-                let cmd_str = if world.settings.keep_alive_cmd.is_empty() {
-                    "(none)".to_string()
-                } else {
-                    world.settings.keep_alive_cmd.clone()
-                };
-                let last_nop = match world.last_nop_time {
-                    Some(t) => format!("{:.0}s ago", t.elapsed().as_secs_f64()),
-                    None => "never".to_string(),
-                };
-                format!(
-                    "{}{} {:15} type={:8} cmd={:30} last={}",
-                    current, connected, world.name, type_str, cmd_str, last_nop
-                )
-            }).collect();
-
-            app.add_output("");
-            app.add_output("Keepalive Settings for All Worlds:");
-            app.add_output("─".repeat(70).as_str());
-            for line in lines {
-                app.add_output(&line);
-            }
-            app.add_output("─".repeat(70).as_str());
-            app.add_output("(*=current, x=connected)");
         }
         Command::Actions { world } => {
             if let Some(world_name) = world {
@@ -18408,6 +18807,7 @@ async fn handle_command(cmd: &str, app: &mut App, event_tx: mpsc::Sender<AppEven
         }
         Command::TestMusic => {
             let test_notes = generate_test_music_notes();
+            app.play_ansi_music_console(&test_notes);
             app.ws_broadcast(WsMessage::AnsiMusic {
                 world_index: app.current_world_index,
                 notes: test_notes,
@@ -19359,6 +19759,8 @@ fn render_output_crossterm(app: &App) {
     let new_line_indicator = app.settings.new_line_indicator;
     // The "▶ " prefix is 2 columns wide (1 for triangle + 1 for space)
     let nli_prefix_width: usize = 2;
+    // Minimum old (non-new) context lines to show at top when switching worlds
+    let min_old_context: usize = if new_line_indicator { 2 } else { 0 };
     let expand_and_wrap = |line: &OutputLine, term_width: usize, show_tags: bool, highlight_f8: bool, cached_now: &CachedNow| -> Vec<(String, bool, Option<String>, bool)> {
         let expanded = match process_output_line(line, show_tags, temp_convert_enabled, zwj_enabled, cached_now) {
             Some(text) if text.is_empty() => return vec![("".to_string(), false, None, false)],
@@ -19450,17 +19852,27 @@ fn render_output_crossterm(app: &App) {
         // Collect lines in reverse order, then reverse once (avoids O(n²) insert(0, ...))
         let mut rev_lines: Vec<(String, bool, Option<String>, bool)> = Vec::with_capacity(visible_height + 8);
         first_line_idx = end_line;
+        let mut old_visual_count: usize = 0;
         for line_idx in (0..=end_line).rev() {
             first_line_idx = line_idx;
             let line = &world.output_lines[line_idx];
             let highlight = should_highlight(line);
             let wrapped = expand_and_wrap(line, term_width, show_tags, highlight, &cached_now);
 
+            let is_new = line.marked_new;
             for w in wrapped.into_iter().rev() {
                 rev_lines.push(w);
             }
+            if !is_new {
+                old_visual_count += 1;
+            }
 
-            if rev_lines.len() >= visible_height {
+            // Need enough lines to fill screen, plus old context lines at top
+            if rev_lines.len() >= visible_height && old_visual_count >= min_old_context {
+                break;
+            }
+            // Safety limit: don't collect more than 2x screen height
+            if rev_lines.len() >= visible_height * 2 {
                 break;
             }
         }
@@ -19525,8 +19937,27 @@ fn render_output_crossterm(app: &App) {
     let lines_to_show: &[(String, bool, Option<String>, bool)] = if first_line_idx == 0 && visual_lines.len() <= visible_height {
         &visual_lines[..visual_lines.len().min(visible_height)]
     } else {
-        let display_start = visual_lines.len().saturating_sub(visible_height);
-        &visual_lines[display_start..]
+        let mut display_start = visual_lines.len().saturating_sub(visible_height);
+        // When new_line_indicator is enabled and we collected extra old context lines,
+        // adjust display_start backwards to include at least min_old_context non-new lines
+        if new_line_indicator && visual_lines.len() > visible_height {
+            let mut old_count = 0;
+            for (i, (_,_,_,mn)) in visual_lines[display_start..].iter().enumerate() {
+                if !mn {
+                    old_count += 1;
+                }
+                if old_count >= min_old_context {
+                    break;
+                }
+                // If not enough old lines in current window, try starting earlier
+                if i == visual_lines[display_start..].len() - 1 && old_count < min_old_context {
+                    let needed = min_old_context - old_count;
+                    display_start = display_start.saturating_sub(needed);
+                }
+            }
+        }
+        let end = (display_start + visible_height).min(visual_lines.len());
+        &visual_lines[display_start..end]
     };
 
     for (row_idx, (wrapped, highlight_f8, hl_color, marked_new)) in lines_to_show.iter().enumerate() {
@@ -23426,9 +23857,11 @@ mod tests {
         let _ = server2.await;
     }
 
-    /// Test that WsMarkWorldSeen clears marked_new flags on both output_lines and pending_lines.
+    /// Test that WsMarkWorldSeen clears unseen count but preserves marked_new indicators.
+    /// marked_new indicators persist while viewing the world and are only cleared when
+    /// switching away from it.
     #[tokio::test]
-    async fn test_mark_seen_clears_marked_new() {
+    async fn test_mark_seen_preserves_marked_new() {
         let port1 = find_free_port();
         let port2 = find_free_port();
 
@@ -23473,9 +23906,9 @@ mod tests {
             TestAction::AssertState { world_name: "world2".to_string(), check: StateCheck::UnseenLines(5) },
             // Simulate WS client marking world2 as seen
             TestAction::WsMarkWorldSeen("world2".to_string()),
-            // After mark_seen, all marked_new should be cleared
-            TestAction::AssertMarkedNew { world_name: "world2".to_string(), expected_count: 0 },
-            // Unseen should also be 0
+            // After mark_seen, marked_new should be PRESERVED (only cleared when switching away)
+            TestAction::AssertMarkedNew { world_name: "world2".to_string(), expected_count: 5 },
+            // Unseen should be 0 (mark_seen clears unseen count)
             TestAction::AssertState { world_name: "world2".to_string(), check: StateCheck::UnseenLines(0) },
         ];
 
@@ -23490,7 +23923,8 @@ mod tests {
         let _ = server2.await;
     }
 
-    /// Test that switching worlds clears marked_new on the old world (the one being left).
+    /// Test that switching worlds clears marked_new on the old world (the one being left)
+    /// but preserves marked_new on the new world (so indicators remain visible).
     #[tokio::test]
     async fn test_switch_world_clears_old_world_marked_new() {
         let port1 = find_free_port();
@@ -23533,11 +23967,11 @@ mod tests {
             TestAction::WaitForEvent(WaitCondition::TextReceivedCount(5)),
             // Verify world2 has marked_new lines
             TestAction::AssertMarkedNew { world_name: "world2".to_string(), expected_count: 5 },
-            // Switch to world2 (this calls mark_seen on both old and new worlds)
+            // Switch to world2 (clears indicators on old world, preserves on new)
             TestAction::SwitchWorld("world2".to_string()),
-            // After switching, world2's marked_new should be cleared (mark_seen was called)
-            TestAction::AssertMarkedNew { world_name: "world2".to_string(), expected_count: 0 },
-            // world1 should also have 0 (it was current, so never had marked_new)
+            // After switching, world2's marked_new should be PRESERVED (indicators stay visible)
+            TestAction::AssertMarkedNew { world_name: "world2".to_string(), expected_count: 5 },
+            // world1 should have 0 (it was current, so never had marked_new)
             TestAction::AssertMarkedNew { world_name: "world1".to_string(), expected_count: 0 },
         ];
 
@@ -23552,7 +23986,7 @@ mod tests {
     }
 
     /// Test that pending lines also get marked_new when arriving on a non-current world
-    /// and that mark_seen clears them.
+    /// and that mark_seen preserves them (indicators only cleared when switching away).
     #[tokio::test]
     async fn test_pending_lines_marked_new_when_not_current() {
         let port1 = find_free_port();
@@ -23596,12 +24030,10 @@ mod tests {
             // world2 should have marked_new lines in both output and pending
             // (output_height-2=22 lines in output, rest in pending, all marked_new since not current)
             TestAction::AssertState { world_name: "world2".to_string(), check: StateCheck::Paused(true) },
-            // Mark world2 as seen via WS - clears marked_new on output_lines but NOT pending_lines
-            // (pending lines keep their indicator until released and rendered)
+            // Mark world2 as seen via WS - marked_new preserved on both output and pending lines
             TestAction::WsMarkWorldSeen("world2".to_string()),
-            // Pending lines still have marked_new, so total count > 0
-            // output_lines are cleared, pending still marked (30 - 23 = 7 lines)
-            TestAction::AssertMarkedNew { world_name: "world2".to_string(), expected_count: 7 },
+            // All lines (output + pending) still have marked_new (30 total)
+            TestAction::AssertMarkedNew { world_name: "world2".to_string(), expected_count: 30 },
         ];
 
         let events = testharness::run_test_scenario(config, actions).await;
@@ -23768,8 +24200,8 @@ mod tests {
         // When adding a new command to parse_command(), add it here too.
         let mut rust_commands: Vec<String> = vec![
             "help", "version", "quit", "reload", "update", "setup", "web", "actions",
-            "connections", "l", "worlds", "world", "connect", "disconnect", "dc",
-            "flush", "menu", "send", "keepalive", "gag", "ban", "unban",
+            "connections", "l", "worlds", "world", "disconnect", "dc",
+            "flush", "menu", "send", "gag", "ban", "unban",
             "testmusic", "dump", "notify", "addworld", "edit", "tag", "tags",
             "dict", "urban", "translate", "tr", "font",
         ].into_iter().map(|s| s.to_string()).collect();

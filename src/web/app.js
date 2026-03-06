@@ -420,6 +420,10 @@
 
     let tlsProxyEnabled = false;  // TLS proxy for connection preservation over hot reload
     let tempConvertEnabled = false;  // Temperature conversion (32F -> 32F(0C))
+    let mouseEnabled = true;  // Console mouse support
+    let debugEnabled = false;  // Debug logging
+    let dictionaryPath = '';  // Custom dictionary path
+    let spellCheckEnabled = true;  // Spell checking
     let prevInputLen = 0;  // Track previous input length for temp conversion
     let skipTempConversion = null;  // Temperature to skip re-converting (after user undid conversion)
 
@@ -493,8 +497,8 @@
     // This list is verified by test_command_parity_js_vs_rust in main.rs
     const INTERNAL_COMMANDS = [
         'help', 'version', 'quit', 'reload', 'update', 'setup', 'web', 'actions',
-        'worlds', 'world', 'connections', 'l', 'connect', 'disconnect', 'dc',
-        'flush', 'menu', 'send', 'keepalive', 'gag', 'ban', 'unban',
+        'worlds', 'world', 'connections', 'l', 'disconnect', 'dc',
+        'flush', 'menu', 'send', 'gag', 'ban', 'unban',
         'testmusic', 'dump', 'notify', 'addworld', 'edit', 'tag', 'tags',
         'dict', 'urban', 'translate', 'tr', 'font',
     ];
@@ -1627,6 +1631,18 @@
                     if (msg.settings.temp_convert_enabled !== undefined) {
                         tempConvertEnabled = msg.settings.temp_convert_enabled;
                     }
+                    if (msg.settings.mouse_enabled !== undefined) {
+                        mouseEnabled = msg.settings.mouse_enabled;
+                    }
+                    if (msg.settings.debug_enabled !== undefined) {
+                        debugEnabled = msg.settings.debug_enabled;
+                    }
+                    if (msg.settings.dictionary_path !== undefined) {
+                        dictionaryPath = msg.settings.dictionary_path;
+                    }
+                    if (msg.settings.spell_check_enabled !== undefined) {
+                        spellCheckEnabled = msg.settings.spell_check_enabled;
+                    }
                     // Web settings
                     if (msg.settings.web_secure !== undefined) {
                         webSecure = msg.settings.web_secure;
@@ -1913,6 +1929,13 @@
                 }
                 break;
 
+            case 'WorldCreated':
+                // Server created a new world at our request - open the editor
+                if (msg.world_index !== undefined && msg.world_index < worlds.length) {
+                    openWorldEditorPopup(msg.world_index);
+                }
+                break;
+
             case 'WorldRemoved':
                 if (msg.world_index !== undefined && msg.world_index < worlds.length) {
                     worlds.splice(msg.world_index, 1);
@@ -2034,6 +2057,18 @@
                     }
                     if (msg.settings.temp_convert_enabled !== undefined) {
                         tempConvertEnabled = msg.settings.temp_convert_enabled;
+                    }
+                    if (msg.settings.mouse_enabled !== undefined) {
+                        mouseEnabled = msg.settings.mouse_enabled;
+                    }
+                    if (msg.settings.debug_enabled !== undefined) {
+                        debugEnabled = msg.settings.debug_enabled;
+                    }
+                    if (msg.settings.dictionary_path !== undefined) {
+                        dictionaryPath = msg.settings.dictionary_path;
+                    }
+                    if (msg.settings.spell_check_enabled !== undefined) {
+                        spellCheckEnabled = msg.settings.spell_check_enabled;
                     }
                     if (msg.settings.world_switch_mode !== undefined) {
                         worldSwitchMode = msg.settings.world_switch_mode;
@@ -2865,6 +2900,154 @@
         while (i < text.length && isWordChar(text[i])) i++;
         input.value = text.substring(0, pos) + text.substring(i);
         input.selectionStart = input.selectionEnd = pos;
+    }
+
+    // Transpose two characters before cursor (Ctrl+T)
+    function transposeChars() {
+        const input = elements.input;
+        const text = input.value;
+        const pos = input.selectionStart;
+        if (text.length < 2 || pos === 0) return;
+        let a, b;
+        if (pos >= text.length) {
+            a = text.length - 2; b = text.length - 1;
+        } else {
+            a = pos - 1; b = pos;
+        }
+        const chars = text.split('');
+        const tmp = chars[a]; chars[a] = chars[b]; chars[b] = tmp;
+        input.value = chars.join('');
+        input.selectionStart = input.selectionEnd = b + 1;
+    }
+
+    // Collapse multiple spaces around cursor to one (Esc+Space)
+    function collapseSpaces() {
+        const input = elements.input;
+        const text = input.value;
+        const pos = input.selectionStart;
+        let start = pos;
+        while (start > 0 && text[start - 1] === ' ') start--;
+        let end = pos;
+        while (end < text.length && text[end] === ' ') end++;
+        if (end - start <= 1) return;
+        input.value = text.substring(0, start) + ' ' + text.substring(end);
+        input.selectionStart = input.selectionEnd = start + 1;
+    }
+
+    // Insert last word of previous history entry (Esc+. / Esc+_)
+    function lastArgument() {
+        if (commandHistory.length === 0) return;
+        const prev = commandHistory[commandHistory.length - 1];
+        const words = prev.trim().split(/\s+/);
+        if (words.length === 0) return;
+        const word = words[words.length - 1];
+        const input = elements.input;
+        const text = input.value;
+        const pos = input.selectionStart;
+        input.value = text.substring(0, pos) + word + text.substring(pos);
+        input.selectionStart = input.selectionEnd = pos + word.length;
+    }
+
+    // Move cursor to matching bracket (Esc+-)
+    function gotoMatchingBracket() {
+        const input = elements.input;
+        const text = input.value;
+        const pos = input.selectionStart;
+        if (pos >= text.length) return;
+        const ch = text[pos];
+        const pairs = {'(': ['(', ')', true], '[': ['[', ']', true], '{': ['{', '}', true],
+                        ')': ['(', ')', false], ']': ['[', ']', false], '}': ['{', '}', false]};
+        const pair = pairs[ch];
+        if (!pair) return;
+        const [open, close, forward] = pair;
+        let depth = 0;
+        if (forward) {
+            for (let i = pos; i < text.length; i++) {
+                if (text[i] === open) depth++;
+                if (text[i] === close) depth--;
+                if (depth === 0) { input.selectionStart = input.selectionEnd = i; return; }
+            }
+        } else {
+            for (let i = pos; i >= 0; i--) {
+                if (text[i] === close) depth++;
+                if (text[i] === open) depth--;
+                if (depth === 0) { input.selectionStart = input.selectionEnd = i; return; }
+            }
+        }
+    }
+
+    // Delete word backward stopping at punctuation boundaries (Esc+Backspace)
+    function backwardKillWordPunctuation() {
+        const input = elements.input;
+        const text = input.value;
+        let pos = input.selectionStart;
+        if (pos === 0) return;
+        // Skip whitespace
+        while (pos > 0 && text[pos - 1] === ' ') pos--;
+        const endPos = pos;
+        if (pos > 0) {
+            const last = text[pos - 1];
+            if (/[a-zA-Z0-9]/.test(last)) {
+                while (pos > 0 && /[a-zA-Z0-9]/.test(text[pos - 1])) pos--;
+            } else {
+                while (pos > 0 && !/[a-zA-Z0-9\s]/.test(text[pos - 1])) pos--;
+            }
+        }
+        input.value = text.substring(0, pos) + text.substring(input.selectionStart);
+        input.selectionStart = input.selectionEnd = pos;
+    }
+
+    // History search state
+    let searchPrefix = null;
+    let searchIndex = -1;
+
+    function clearHistorySearch() {
+        searchPrefix = null;
+        searchIndex = -1;
+    }
+
+    // Search history backward for entries starting with current prefix (Esc+p)
+    function historySearchBackward() {
+        if (commandHistory.length === 0) return;
+        if (searchPrefix === null) {
+            searchPrefix = elements.input.value;
+            searchIndex = commandHistory.length;
+        }
+        for (let i = searchIndex - 1; i >= 0; i--) {
+            if (commandHistory[i].startsWith(searchPrefix)) {
+                searchIndex = i;
+                elements.input.value = commandHistory[i];
+                elements.input.selectionStart = elements.input.selectionEnd = commandHistory[i].length;
+                return;
+            }
+        }
+    }
+
+    // Search history forward for entries starting with current prefix (Esc+n)
+    function historySearchForward() {
+        if (searchPrefix === null) return;
+        for (let i = searchIndex + 1; i < commandHistory.length; i++) {
+            if (commandHistory[i].startsWith(searchPrefix)) {
+                searchIndex = i;
+                elements.input.value = commandHistory[i];
+                elements.input.selectionStart = elements.input.selectionEnd = commandHistory[i].length;
+                return;
+            }
+        }
+        // Past end: restore original
+        elements.input.value = searchPrefix;
+        elements.input.selectionStart = elements.input.selectionEnd = searchPrefix.length;
+        searchIndex = commandHistory.length;
+    }
+
+    // Send selective flush command
+    function selectiveFlush() {
+        if (ws && ws.readyState === WebSocket.OPEN) {
+            ws.send(JSON.stringify({
+                type: 'SelectiveFlush',
+                world_index: currentWorldIndex
+            }));
+        }
     }
 
     // Execute a command locally (called from server via ExecuteLocalCommand message).
@@ -4826,7 +5009,7 @@
             return 'An action with this name already exists';
         }
         // Check for internal command conflicts
-        const internalCommands = ['help', 'connect', 'disconnect', 'dc', 'setup', 'world', 'worlds', 'l', 'keepalive', 'reload', 'quit', 'actions', 'gag'];
+        const internalCommands = ['help', 'disconnect', 'dc', 'setup', 'world', 'worlds', 'l', 'reload', 'quit', 'actions', 'gag'];
         if (internalCommands.includes(name.toLowerCase())) {
             return 'Cannot use internal command name';
         }
@@ -4969,7 +5152,7 @@
         return {
             type: 'UpdateGlobalSettings',
             more_mode_enabled: moreModeEnabled,
-            spell_check_enabled: true,
+            spell_check_enabled: spellCheckEnabled,
             temp_convert_enabled: tempConvertEnabled,
             world_switch_mode: worldSwitchMode,
             show_tags: showTags,
@@ -4997,7 +5180,10 @@
             zwj_enabled: zwjEnabled,
             arrow_up_down_mode: arrowUpDownMode,
             shift_arrow_up_down_mode: shiftArrowUpDownMode,
-            new_line_indicator: newLineIndicator
+            new_line_indicator: newLineIndicator,
+            mouse_enabled: mouseEnabled,
+            debug_enabled: debugEnabled,
+            dictionary_path: dictionaryPath
         };
     }
 
@@ -5628,11 +5814,11 @@
             counter++;
             name = baseName + ' ' + counter;
         }
-        // Send command to create and edit new world
+        // Send CreateWorld message - server creates the world, broadcasts WorldAdded,
+        // and sends WorldCreated back to us so we can open the editor
         send({
-            type: 'SendCommand',
-            command: '/worlds ' + name,
-            world_index: currentWorldIndex
+            type: 'CreateWorld',
+            name: name
         });
         closeWorldSelectorPopup();
     }
@@ -6903,6 +7089,37 @@
                 e.preventDefault();
                 requestOldestPendingWorld();
                 elements.input.focus();
+            } else if (e.key === 'b' && (e.altKey || isRecentEscape())) {
+                // Esc+b: Previous world
+                lastEscapeTime = 0;
+                e.preventDefault();
+                requestPrevWorld();
+                elements.input.focus();
+            } else if (e.key === 'f' && (e.altKey || isRecentEscape())) {
+                // Esc+f: Next world
+                lastEscapeTime = 0;
+                e.preventDefault();
+                requestNextWorld();
+                elements.input.focus();
+            } else if (e.key === 'h' && (e.altKey || isRecentEscape())) {
+                // Esc+h: Half-page scroll/release
+                lastEscapeTime = 0;
+                e.preventDefault();
+                const halfPage = Math.floor(elements.outputContainer.clientHeight / 2);
+                const world = worlds[currentWorldIndex];
+                const serverPending = world ? (world.pending_count || 0) : 0;
+                if (pendingLines.length > 0 || serverPending > 0) {
+                    releaseScreenful(); // Release half (approx)
+                } else {
+                    elements.outputContainer.scrollBy(0, -halfPage);
+                }
+                elements.input.focus();
+            } else if (e.key === 'J' && (e.altKey || isRecentEscape())) {
+                // Esc+Shift+J: Selective flush
+                lastEscapeTime = 0;
+                e.preventDefault();
+                selectiveFlush();
+                elements.input.focus();
             } else if (e.key === 'PageUp') {
                 e.preventDefault();
                 elements.outputContainer.scrollBy(0, -elements.outputContainer.clientHeight);
@@ -6973,6 +7190,10 @@
 
         // Keyboard controls (console-style) - input-specific
         elements.input.addEventListener('keydown', function(e) {
+            // Clear history search state on non-search keys
+            if (e.key !== 'Escape' && !((e.key === 'p' || e.key === 'n') && (e.altKey || isRecentEscape()))) {
+                clearHistorySearch();
+            }
             if (e.key === 'Enter') {
                 // Send command (also releases all pending) - both Enter and Shift+Enter
                 e.preventDefault();
@@ -7033,6 +7254,45 @@
                 lastEscapeTime = 0;
                 e.preventDefault();
                 deleteWordForward();
+            } else if (e.key === ' ' && isRecentEscape()) {
+                // Esc+Space: Collapse spaces
+                lastEscapeTime = 0;
+                e.preventDefault();
+                collapseSpaces();
+            } else if (e.key === '-' && isRecentEscape()) {
+                // Esc+-: Goto matching bracket
+                lastEscapeTime = 0;
+                e.preventDefault();
+                gotoMatchingBracket();
+            } else if ((e.key === '.' || e.key === '_') && (e.altKey || isRecentEscape())) {
+                // Esc+. / Esc+_: Insert last argument from previous history
+                lastEscapeTime = 0;
+                e.preventDefault();
+                lastArgument();
+            } else if (e.key === 'p' && (e.altKey || isRecentEscape())) {
+                // Esc+p: History search backward
+                lastEscapeTime = 0;
+                e.preventDefault();
+                historySearchBackward();
+                return; // Don't clear search state
+            } else if (e.key === 'n' && (e.altKey || isRecentEscape())) {
+                // Esc+n: History search forward
+                lastEscapeTime = 0;
+                e.preventDefault();
+                historySearchForward();
+                return; // Don't clear search state
+            } else if (e.key === 'Backspace' && (e.altKey || isRecentEscape())) {
+                // Esc+Backspace: Delete word back (punctuation-delimited)
+                lastEscapeTime = 0;
+                e.preventDefault();
+                backwardKillWordPunctuation();
+            } else if (e.key === 'g' && e.ctrlKey) {
+                // Ctrl+G: Bell (no-op in browser)
+                e.preventDefault();
+            } else if (e.key === 't' && e.ctrlKey) {
+                // Ctrl+T: Transpose chars
+                e.preventDefault();
+                transposeChars();
             } else if (e.key === 'ArrowUp' && e.altKey) {
                 // Alt+Up: Increase input height
                 e.preventDefault();
