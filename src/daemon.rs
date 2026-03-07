@@ -1335,12 +1335,9 @@ pub async fn handle_daemon_ws_message(
                     }
                     let to_release = logical_count.min(pending_count);
 
-                    // Get the seq and text of lines that will be released (for broadcasting)
-                    let first_pending_seq = app.worlds[world_index]
-                        .pending_lines
-                        .first()
-                        .map(|l| l.seq)
-                        .unwrap_or(0);
+                    // Get text and marked_new flag of lines that will be released
+                    let has_marked_new = app.worlds[world_index].pending_lines.iter()
+                        .take(to_release).any(|l| l.marked_new);
                     let lines_to_broadcast: Vec<String> = app.worlds[world_index]
                         .pending_lines
                         .iter()
@@ -1361,8 +1358,11 @@ pub async fn handle_daemon_ws_message(
                             is_viewed: true,
                             ts: current_timestamp_secs(),
                             from_server: true,
-                            seq: first_pending_seq,
-                            marked_new: false,
+                            // Use seq 0 to bypass client-side dedup check. Released pending
+                            // lines have old seqs that may be lower than _max_seq if new data
+                            // arrived after reconnect, causing false duplicate detection.
+                            seq: 0,
+                            marked_new: has_marked_new,
                         });
                     }
 

@@ -298,6 +298,8 @@ pub async fn run_test_scenario(
     let mut prev_activity = app.activity_count();
     let mut prev_unseen: Vec<usize> = app.worlds.iter().map(|w| w.unseen_lines).collect();
     let mut prev_paused: Vec<bool> = app.worlds.iter().map(|w| w.paused).collect();
+    // Track simulated WS client's current world (for MarkWorldSeen indicator clearing)
+    let mut ws_client_world: Option<usize> = None;
 
     // Process actions and events
     let mut action_iter = actions.into_iter().peekable();
@@ -386,6 +388,13 @@ pub async fn run_test_scenario(
                     let name = name.clone();
                     action_iter.next();
                     if let Some(idx) = app.find_world_index(&name) {
+                        // Clear new line indicators on the old world (like real handler)
+                        if let Some(old_idx) = ws_client_world {
+                            if old_idx != idx && old_idx < app.worlds.len() {
+                                app.worlds[old_idx].clear_new_line_indicators();
+                            }
+                        }
+                        ws_client_world = Some(idx);
                         app.worlds[idx].mark_seen();
                         // Broadcast UnseenCleared like the real WS handler does
                         app.ws_broadcast(WsMessage::UnseenCleared { world_index: idx });

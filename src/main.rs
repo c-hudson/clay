@@ -6312,6 +6312,10 @@ impl App {
                 if world_index < self.worlds.len() {
                     self.worlds[world_index].lines_since_pause = 0;
                     self.worlds[world_index].last_user_command_time = Some(std::time::Instant::now());
+                    // Clear paused flag if no pending lines (matches console Enter behavior)
+                    if self.worlds[world_index].pending_lines.is_empty() {
+                        self.worlds[world_index].paused = false;
+                    }
                     // Update client's viewing world to ensure they receive output
                     // (fixes race condition where client sends command before UpdateViewState)
                     let dimensions = self.ws_client_worlds.get(&client_id).and_then(|s| s.dimensions);
@@ -6443,12 +6447,14 @@ impl App {
                     // Check if client is switching to a different world
                     let old_world_idx = self.ws_client_worlds.get(&client_id).map(|s| s.world_index);
                     let switched = old_world_idx.map(|old| old != world_index).unwrap_or(true);
-                    // Reset lines_since_pause for the old world if switching away and more-mode hasn't triggered
+                    // When switching away from the old world, clear its new line indicators
+                    // and reset lines_since_pause if more-mode hasn't triggered
                     if let Some(old_idx) = old_world_idx {
-                        if old_idx != world_index && old_idx < self.worlds.len()
-                            && self.worlds[old_idx].pending_lines.is_empty()
-                        {
-                            self.worlds[old_idx].lines_since_pause = 0;
+                        if old_idx != world_index && old_idx < self.worlds.len() {
+                            self.worlds[old_idx].clear_new_line_indicators();
+                            if self.worlds[old_idx].pending_lines.is_empty() {
+                                self.worlds[old_idx].lines_since_pause = 0;
+                            }
                         }
                     }
                     // Track which world this client is viewing (sync cache)
@@ -6529,12 +6535,9 @@ impl App {
                         // For release-all, cap at pending_count
                         let to_release = logical_count.min(pending_count);
 
-                        // Get seq and text of lines that will be released (for broadcasting as ServerData)
-                        let first_pending_seq = self.worlds[world_index]
-                            .pending_lines
-                            .first()
-                            .map(|l| l.seq)
-                            .unwrap_or(0);
+                        // Get text and marked_new flag of lines that will be released
+                        let has_marked_new = self.worlds[world_index].pending_lines.iter()
+                            .take(to_release).any(|l| l.marked_new);
                         let lines_to_broadcast: Vec<String> = self.worlds[world_index]
                             .pending_lines
                             .iter()
@@ -6554,8 +6557,11 @@ impl App {
                                 is_viewed: true,
                                 ts: current_timestamp_secs(),
                                 from_server: true,
-                                seq: first_pending_seq,
-                                marked_new: false,
+                                // Use seq 0 to bypass client-side dedup check. Released pending
+                                // lines have old seqs that may be lower than _max_seq if new data
+                                // arrived after reconnect, causing false duplicate detection.
+                                seq: 0,
+                                marked_new: has_marked_new,
                             });
                         }
 
@@ -7724,12 +7730,9 @@ impl App {
             logical_count = 1;
         }
 
-        // Get seq and text of lines that will be released (for broadcasting as ServerData)
-        let first_pending_seq = self.worlds[world_idx]
-            .pending_lines
-            .first()
-            .map(|l| l.seq)
-            .unwrap_or(0);
+        // Get text and marked_new flag of lines that will be released
+        let has_marked_new = self.worlds[world_idx].pending_lines.iter()
+            .take(logical_count).any(|l| l.marked_new);
         let lines_to_broadcast: Vec<String> = self.worlds[world_idx]
             .pending_lines
             .iter()
@@ -7750,8 +7753,9 @@ impl App {
                 is_viewed: true,
                 ts: current_timestamp_secs(),
                 from_server: true,
-                seq: first_pending_seq,
-                marked_new: false,
+                // Use seq 0 to bypass client-side dedup check (see ReleasePending handler)
+                seq: 0,
+                marked_new: has_marked_new,
             });
         }
 
@@ -16432,12 +16436,8 @@ fn handle_key_event(key: KeyEvent, app: &mut App) -> KeyAction {
         if app.current_world().paused {
             let world_idx = app.current_world_index;
 
-            // Get seq and text of lines that will be released (for broadcasting as ServerData)
-            let first_pending_seq = app.worlds[world_idx]
-                .pending_lines
-                .first()
-                .map(|l| l.seq)
-                .unwrap_or(0);
+            // Get text and marked_new flag of lines that will be released
+            let has_marked_new = app.worlds[world_idx].pending_lines.iter().any(|l| l.marked_new);
             let lines_to_broadcast: Vec<String> = app.worlds[world_idx]
                 .pending_lines
                 .iter()
@@ -16456,8 +16456,9 @@ fn handle_key_event(key: KeyEvent, app: &mut App) -> KeyAction {
                     is_viewed: true,
                     ts: current_timestamp_secs(),
                     from_server: true,
-                    seq: first_pending_seq,
-                    marked_new: false,
+                    // Use seq 0 to bypass client-side dedup check (see ReleasePending handler)
+                    seq: 0,
+                    marked_new: has_marked_new,
                 });
             }
 

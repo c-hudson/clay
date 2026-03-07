@@ -1857,7 +1857,13 @@
                                 }
                             }
                             if (msg.world_index === currentWorldIndex) {
-                                handleIncomingLine(line, lineTs, msg.world_index, lineIndex);
+                                // Released pending lines (seq=0, from_server=true) bypass local
+                                // more-mode to avoid flickering the More indicator
+                                if (!hasRealSeq && isFromServer) {
+                                    appendNewLine(line, lineTs, msg.world_index, lineIndex);
+                                } else {
+                                    handleIncomingLine(line, lineTs, msg.world_index, lineIndex);
+                                }
                             }
                             // Note: Don't track unseen_lines locally - server handles centralized tracking
                             // and sends UnseenUpdate messages to keep all clients in sync
