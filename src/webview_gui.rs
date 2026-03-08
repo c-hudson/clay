@@ -197,20 +197,32 @@ pub fn run_remote_webgui(addr: &str) -> io::Result<()> {
         }
     }
 
+    // Strip ws:// or wss:// prefix if provided, remember the protocol
+    let (addr_stripped, explicit_protocol) = if let Some(rest) = addr.strip_prefix("wss://") {
+        (rest, Some("wss"))
+    } else if let Some(rest) = addr.strip_prefix("ws://") {
+        (rest, Some("ws"))
+    } else {
+        (addr, None)
+    };
+
     // Parse host:port (default port 9000 if not specified)
-    let (host, port) = if let Some(colon_pos) = addr.rfind(':') {
-        let h = &addr[..colon_pos];
-        let p = addr[colon_pos + 1..].parse::<u16>()
+    let (host, port) = if let Some(colon_pos) = addr_stripped.rfind(':') {
+        let h = &addr_stripped[..colon_pos];
+        let p = addr_stripped[colon_pos + 1..].parse::<u16>()
             .map_err(|_| io::Error::other(format!("Invalid port in address: {}", addr)))?;
         (h.to_string(), p)
     } else {
-        (addr.to_string(), 9000)
+        (addr_stripped.to_string(), 9000)
     };
+
+    // Default to wss:// for security (the JS client will fall back to ws:// if it fails)
+    let protocol = explicit_protocol.unwrap_or("wss").to_string();
 
     let params = WebViewParams {
         ws_host: host,
         ws_port: port,
-        ws_protocol: "ws".to_string(),
+        ws_protocol: protocol,
         auto_password: None,
         theme_css: load_user_theme_css(),
     };

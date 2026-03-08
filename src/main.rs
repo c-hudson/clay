@@ -8838,14 +8838,10 @@ async fn run_console_client(addr: &str) -> io::Result<()> {
             // Check current popup visibility
             let any_popup_visible = app.has_new_popup() || app.confirm_dialog.visible;
 
-            // If transitioning to popup, clear ratatui buffer for clean popup rendering
-            if any_popup_visible && !app.popup_was_visible {
-                execute!(
-                    std::io::stdout(),
-                    crossterm::terminal::Clear(crossterm::terminal::ClearType::All)
-                )?;
-                terminal.clear()?;
-            }
+            // When transitioning to popup, we intentionally do NOT clear the terminal.
+            // The crossterm-rendered output stays on screen behind the popup, and the
+            // popup renderer handles clearing only its own area. This preserves the
+            // colored MUD output that ratatui's ANSI handling can't reproduce well.
             app.popup_was_visible = any_popup_visible;
 
             // Toggle mouse capture when popup visibility changes
@@ -15251,11 +15247,10 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                 || app.filter_popup.visible
                 || app.has_new_popup();
 
-            // If transitioning from no popup to popup, clear ratatui's buffer so it fully redraws
-            // the popup area without artifacts from stale buffer state
-            if any_popup_visible && !app.popup_was_visible {
-                terminal.clear()?;
-            }
+            // When transitioning to popup, we intentionally do NOT clear the terminal or
+            // ratatui's buffer. The crossterm-rendered output stays on screen behind the popup,
+            // and the popup renderer handles clearing only its own area. This preserves
+            // the colored MUD output that ratatui's ANSI handling can't reproduce well.
 
             // Detect popup visibility change before updating
             let popup_visibility_changed = any_popup_visible != app.popup_was_visible;
@@ -20167,30 +20162,35 @@ fn render_output_area(f: &mut Frame, app: &App, area: Rect) {
     let visible_height = area.height as usize;
     let area_width = area.width as usize;
 
-    // Clear the output area first
-    f.render_widget(ratatui::widgets::Clear, area);
-
     // Check if showing splash screen - ratatui handles splash rendering
     if world.showing_splash {
+        f.render_widget(ratatui::widgets::Clear, area);
         let output_text = render_splash_centered(world, visible_height, area_width);
         let output_paragraph = Paragraph::new(output_text);
         f.render_widget(output_paragraph, area);
         return;
     }
 
-    // Check if any popup is visible or editor is visible - ratatui handles output in these cases
-    let any_popup_visible = app.confirm_dialog.visible
-        || app.filter_popup.visible
-        || app.has_new_popup();
+    // Check if any overlay popup is visible (setup, help, world selector, etc.)
+    let has_overlay_popup = app.confirm_dialog.visible || app.has_new_popup();
 
-    // If no popup is visible and editor is not visible, raw crossterm will handle output rendering
-    // (it provides better ANSI color handling)
-    // Just clear the area and return - crossterm will fill it in
-    if !any_popup_visible && !app.editor.visible {
+    // If an overlay popup is visible (but not the editor), skip output rendering entirely.
+    // The crossterm-rendered output already on screen stays visible behind the popup,
+    // and the popup renderer clears/fills only its own area. This preserves the colored
+    // MUD output that ratatui's ANSI handling can't reproduce well.
+    if has_overlay_popup && !app.editor.visible {
         return;
     }
 
-    // Popup or editor is visible - render output with ratatui (crossterm is skipped in these cases)
+    // If no overlay popup and no editor, raw crossterm will handle output rendering
+    // (it provides better ANSI color handling)
+    // Clear the area so ratatui doesn't show stale content - crossterm will fill it in
+    if !app.editor.visible {
+        f.render_widget(ratatui::widgets::Clear, area);
+        return;
+    }
+
+    // Editor is visible - render output with ratatui (crossterm is skipped)
     // First, fill the entire output area with background to cover any crossterm remnants
     let theme = app.settings.theme;
     let background = ratatui::widgets::Block::default().style(Style::default().bg(theme.bg()));
