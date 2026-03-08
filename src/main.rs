@@ -2657,6 +2657,8 @@ pub struct App {
     pub https_server: Option<HttpsServer>,
     // Track if popup was visible last frame (for terminal clear on transition)
     pub popup_was_visible: bool,
+    // One-shot flag: render crossterm output even when popup is visible (after terminal.clear)
+    pub force_output_under_popup: bool,
     /// Cache of each WS client's view state (for activity indicator and more-mode)
     /// Maps client_id -> ClientViewState (world_index + visible_lines)
     pub ws_client_worlds: std::collections::HashMap<u64, ClientViewState>,
@@ -2764,6 +2766,7 @@ impl App {
             #[cfg(feature = "rustls-backend")]
             https_server: None,
             popup_was_visible: false,
+            force_output_under_popup: false,
             ws_client_worlds: std::collections::HashMap::new(),
             is_master: true, // Console app is always master (remote GUI is separate execution path)
             is_reload: false, // Set to true in run_app if started from hot reload
@@ -8838,10 +8841,14 @@ async fn run_console_client(addr: &str) -> io::Result<()> {
             // Check current popup visibility
             let any_popup_visible = app.has_new_popup() || app.confirm_dialog.visible;
 
-            // When transitioning to popup, we intentionally do NOT clear the terminal.
-            // The crossterm-rendered output stays on screen behind the popup, and the
-            // popup renderer handles clearing only its own area. This preserves the
-            // colored MUD output that ratatui's ANSI handling can't reproduce well.
+            // When transitioning to popup: terminal.clear() resets ratatui's buffers
+            // then restore crossterm output so colored MUD output stays behind popup.
+            if any_popup_visible && !app.popup_was_visible {
+                terminal.clear()?;
+                app.force_output_under_popup = true;
+                render_output_crossterm(&app);
+                app.force_output_under_popup = false;
+            }
             app.popup_was_visible = any_popup_visible;
 
             // Toggle mouse capture when popup visibility changes
@@ -15247,10 +15254,18 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                 || app.filter_popup.visible
                 || app.has_new_popup();
 
-            // When transitioning to popup, we intentionally do NOT clear the terminal or
-            // ratatui's buffer. The crossterm-rendered output stays on screen behind the popup,
-            // and the popup renderer handles clearing only its own area. This preserves
-            // the colored MUD output that ratatui's ANSI handling can't reproduce well.
+            // When transitioning to popup: terminal.clear() resets ratatui's buffers to
+            // EMPTY so the diff will write ALL popup cells (full coverage, no bleed-through).
+            // Then restore crossterm output before ratatui draws, so colored MUD output
+            // stays visible behind the popup. Since render_output_area returns early when
+            // popup is visible, ratatui's output cells stay EMPTY matching the cleared
+            // previous buffer → no diff → crossterm output preserved.
+            if any_popup_visible && !app.popup_was_visible {
+                terminal.clear()?;
+                app.force_output_under_popup = true;
+                render_output_crossterm(&app);
+                app.force_output_under_popup = false;
+            }
 
             // Detect popup visibility change before updating
             let popup_visibility_changed = any_popup_visible != app.popup_was_visible;
@@ -19749,11 +19764,16 @@ fn render_output_crossterm(app: &App) {
     use std::io::Write;
     use crossterm::{style::Print, QueueableCommand};
 
-    // Skip if showing splash screen, any popup is visible, or editor is visible
+    // Skip if showing splash screen or editor is visible
     // When editor is visible, ratatui handles all rendering for the split-screen layout
+    // When a popup is visible, skip UNLESS force_under_popup is set (to restore output
+    // behind popup after terminal.clear())
     let any_popup_visible = app.confirm_dialog.visible
         || app.has_new_popup();
-    if app.current_world().showing_splash || any_popup_visible || app.editor.visible {
+    if app.current_world().showing_splash || app.editor.visible {
+        return;
+    }
+    if any_popup_visible && !app.force_output_under_popup {
         return;
     }
 
