@@ -2657,8 +2657,6 @@ pub struct App {
     pub https_server: Option<HttpsServer>,
     // Track if popup was visible last frame (for terminal clear on transition)
     pub popup_was_visible: bool,
-    // One-shot flag: render crossterm output even when popup is visible (after terminal.clear)
-    pub force_output_under_popup: bool,
     /// Cache of each WS client's view state (for activity indicator and more-mode)
     /// Maps client_id -> ClientViewState (world_index + visible_lines)
     pub ws_client_worlds: std::collections::HashMap<u64, ClientViewState>,
@@ -2766,7 +2764,6 @@ impl App {
             #[cfg(feature = "rustls-backend")]
             https_server: None,
             popup_was_visible: false,
-            force_output_under_popup: false,
             ws_client_worlds: std::collections::HashMap::new(),
             is_master: true, // Console app is always master (remote GUI is separate execution path)
             is_reload: false, // Set to true in run_app if started from hot reload
@@ -8842,12 +8839,10 @@ async fn run_console_client(addr: &str) -> io::Result<()> {
             let any_popup_visible = app.has_new_popup() || app.confirm_dialog.visible;
 
             // When transitioning to popup: terminal.clear() resets ratatui's buffers
-            // then restore crossterm output so colored MUD output stays behind popup.
+            // On popup transition: clear ratatui buffers for full popup coverage.
+            // Crossterm restores output AFTER ratatui, skipping popup rows.
             if any_popup_visible && !app.popup_was_visible {
                 terminal.clear()?;
-                app.force_output_under_popup = true;
-                render_output_crossterm(&app);
-                app.force_output_under_popup = false;
             }
             app.popup_was_visible = any_popup_visible;
 
@@ -15254,17 +15249,11 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
                 || app.filter_popup.visible
                 || app.has_new_popup();
 
-            // When transitioning to popup: terminal.clear() resets ratatui's buffers to
-            // EMPTY so the diff will write ALL popup cells (full coverage, no bleed-through).
-            // Then restore crossterm output before ratatui draws, so colored MUD output
-            // stays visible behind the popup. Since render_output_area returns early when
-            // popup is visible, ratatui's output cells stay EMPTY matching the cleared
-            // previous buffer → no diff → crossterm output preserved.
+            // When transitioning to popup: terminal.clear() resets ratatui's buffers so
+            // the diff will write ALL popup cells (full coverage, no bleed-through).
+            // Crossterm output is restored AFTER ratatui draws, clipped to avoid the popup.
             if any_popup_visible && !app.popup_was_visible {
                 terminal.clear()?;
-                app.force_output_under_popup = true;
-                render_output_crossterm(&app);
-                app.force_output_under_popup = false;
             }
 
             // Detect popup visibility change before updating
@@ -15298,7 +15287,8 @@ async fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
             terminal.draw(|f| ui(f, &mut app))?;
 
             // Render output area with crossterm only when needed (optimization)
-            // Also redraw when popup visibility changes
+            // Also redraw when popup visibility changes (including popup open/close)
+            // When a popup is visible, crossterm renders output but skips popup rows
             if app.needs_output_redraw || popup_visibility_changed {
                 render_output_crossterm(&app);
                 app.needs_output_redraw = false;
@@ -19766,16 +19756,27 @@ fn render_output_crossterm(app: &App) {
 
     // Skip if showing splash screen or editor is visible
     // When editor is visible, ratatui handles all rendering for the split-screen layout
-    // When a popup is visible, skip UNLESS force_under_popup is set (to restore output
-    // behind popup after terminal.clear())
-    let any_popup_visible = app.confirm_dialog.visible
-        || app.has_new_popup();
     if app.current_world().showing_splash || app.editor.visible {
         return;
     }
-    if any_popup_visible && !app.force_output_under_popup {
-        return;
-    }
+
+    // Get popup area for row clipping (skip rows overlapping the popup)
+    let popup_rect = if app.has_new_popup() {
+        app.popup_manager.current().and_then(|s| s.rendered_area)
+    } else if app.confirm_dialog.visible {
+        // Confirm dialog is small and centered - approximate its area
+        let w = app.output_width;
+        let h = app.output_height + app.input_height + 1;
+        let pw = 40u16.min(w.saturating_sub(4));
+        let ph = 5u16;
+        Some(ratatui::layout::Rect::new(
+            w.saturating_sub(pw) / 2,
+            h.saturating_sub(ph) / 2,
+            pw, ph,
+        ))
+    } else {
+        None
+    };
 
     let mut stdout = std::io::stdout();
 
@@ -20065,7 +20066,16 @@ fn render_output_crossterm(app: &App) {
     };
 
     for (row_idx, (wrapped, highlight_f8, hl_color, marked_new)) in lines_to_show.iter().enumerate() {
-        let _ = stdout.queue(cursor::MoveTo(0, row_idx as u16));
+        let row_y = row_idx as u16;
+
+        // Skip rows that overlap with the popup area (ratatui already rendered those)
+        if let Some(ref pr) = popup_rect {
+            if row_y >= pr.y && row_y < pr.y + pr.height {
+                continue;
+            }
+        }
+
+        let _ = stdout.queue(cursor::MoveTo(0, row_y));
 
         // New line indicator: green triangle prefix for unseen/pending lines
         if new_line_indicator && *marked_new {
@@ -20103,7 +20113,14 @@ fn render_output_crossterm(app: &App) {
     }
 
     for row_idx in lines_to_show.len()..visible_height {
-        let _ = stdout.queue(cursor::MoveTo(0, row_idx as u16));
+        let row_y = row_idx as u16;
+        // Skip rows that overlap with the popup area
+        if let Some(ref pr) = popup_rect {
+            if row_y >= pr.y && row_y < pr.y + pr.height {
+                continue;
+            }
+        }
+        let _ = stdout.queue(cursor::MoveTo(0, row_y));
         let _ = stdout.queue(Print("\x1b[K"));
     }
 
